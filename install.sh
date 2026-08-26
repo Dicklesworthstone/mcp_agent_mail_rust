@@ -3012,13 +3012,15 @@ validate_binary_transaction_phase_marker() {
   local journal="$1"
   local phase="$2"
   local marker="$journal/phase.$phase"
-  local first="" second="" extra=""
+  local first="" second="" extra="" line_count=""
   validate_installer_owned_regular_file "$marker" "Binary transaction phase marker" 600 || return 1
   IFS= read -r first <"$marker" || return 1
   second=$(sed -n '2p' "$marker") || return 1
   extra=$(sed -n '3p' "$marker") || return 1
+  line_count=$(wc -l <"$marker" 2>/dev/null | tr -d '[:space:]') || return 1
   if [ "$first" != "phase=$phase" ] || \
-     [ "$second" != "metadata_sha256=$TXN_METADATA_HASH" ] || [ -n "$extra" ]; then
+     [ "$second" != "metadata_sha256=$TXN_METADATA_HASH" ] || \
+     [ -n "$extra" ] || [ "$line_count" != "2" ]; then
     err "Binary transaction phase marker is malformed: $marker"
     return 1
   fi
@@ -3028,15 +3030,16 @@ read_binary_transaction_metadata() {
   local journal="$1"
   local metadata="$journal/metadata"
   local witness_file="$journal/metadata.sha256"
-  local witness="" extra="" actual=""
-  local l1="" l2="" l3="" l4="" l5="" l6="" l7="" l8=""
+  local witness="" extra="" actual="" witness_lines=""
+  local l1="" l2="" l3="" l4="" l5="" l6="" l7="" l8="" l9=""
 
   validate_binary_transaction_directory "$journal" || return 1
   validate_installer_owned_regular_file "$metadata" "Binary transaction metadata" 600 || return 1
   validate_installer_owned_regular_file "$witness_file" "Binary transaction metadata witness" 600 || return 1
   IFS= read -r witness <"$witness_file" || return 1
   extra=$(sed -n '2p' "$witness_file") || return 1
-  [[ "$witness" =~ ^[a-f0-9]{64}$ ]] && [ -z "$extra" ] || {
+  witness_lines=$(wc -l <"$witness_file" 2>/dev/null | tr -d '[:space:]') || return 1
+  [[ "$witness" =~ ^[a-f0-9]{64}$ ]] && [ -z "$extra" ] && [ "$witness_lines" = "1" ] || {
     err "Binary transaction metadata witness is malformed: $witness_file"
     return 1
   }
@@ -3054,7 +3057,8 @@ read_binary_transaction_metadata() {
     IFS= read -r l5 || return 1
     IFS= read -r l6 || return 1
     IFS= read -r l7 || return 1
-    if IFS= read -r l8; then return 1; fi
+    IFS= read -r l8 || return 1
+    if IFS= read -r l9; then return 1; fi
   } <"$metadata"
   [ "$l1" = "schema=1" ] || return 1
   case "$l2" in nonce=*) TXN_NONCE="${l2#nonce=}" ;; *) return 1 ;; esac
@@ -3408,6 +3412,8 @@ publish_binary_transaction_new() {
     return 1
   }
   validate_binary_transaction_hash "$staged" "$new_hash" "Staged $stem binary" || return 1
+  chmod 755 "$staged" || return 1
+  sync_installer_paths_durably "$staged" "$journal" || return 1
   move_installer_entry_no_replace "$staged" "$dest" "Publish new $stem binary" || return 1
   sync_installer_paths_durably "$dest" "$journal" "$install_dir"
 }
@@ -3468,7 +3474,7 @@ prepare_binary_pair_transaction() {
     err "Could not stage both binaries in the durable transaction journal."
     return 1
   fi
-  chmod 755 "$preparing/new-server" "$preparing/new-cli" || return 1
+  chmod 700 "$preparing/new-server" "$preparing/new-cli" || return 1
   validate_binary_transaction_hash "$preparing/new-server" "$TXN_NEW_SERVER_HASH" \
     "Journaled server binary" || return 1
   validate_binary_transaction_hash "$preparing/new-cli" "$TXN_NEW_CLI_HASH" \
@@ -3490,9 +3496,9 @@ new_cli_sha256=$TXN_NEW_CLI_HASH"
   persist_binary_transaction_phase "$preparing" "00-prepared" || return 1
   validate_binary_transaction_directory "$preparing" || return 1
   move_installer_entry_no_replace "$preparing" "$active" "Publish binary transaction authority" || return 1
+  BINARY_TRANSACTION_ACTIVE_INSTALL_DIR="$install_dir"
   sync_installer_paths_durably "$active" "$install_dir" || return 1
   validate_binary_transaction_directory "$active" || return 1
-  BINARY_TRANSACTION_ACTIVE_INSTALL_DIR="$install_dir"
 }
 
 abort_binary_pair_transaction() {
@@ -3521,38 +3527,61 @@ install_binary_pair_transactional() {
     err "Could not recover the previous binary transaction; refusing a new install."
     return 1
   fi
-  prepare_binary_pair_transaction "$server_src" "$cli_src" "$install_dir" || return 1
+  if ! prepare_binary_pair_transaction "$server_src" "$cli_src" "$install_dir"; then
+    if installer_entry_exists "$(binary_transaction_active_path "$install_dir")"; then
+      abort_binary_pair_transaction "$install_dir" "Binary transaction preparation failed after authority publication."
+    fi
+    return 1
+  fi
   journal=$(binary_transaction_active_path "$install_dir")
   if [ "$inject_after_phase_for_test" = "prepared" ]; then
     warn "Injected interruption after durable prepared phase."
     return 97
   fi
 
-  persist_binary_transaction_phase "$journal" "10-preserve-server" \
-    || abort_binary_pair_transaction "$install_dir" "Could not persist server-preservation intent."
+  if ! persist_binary_transaction_phase "$journal" "10-preserve-server"; then
+    abort_binary_pair_transaction "$install_dir" "Could not persist server-preservation intent."
+    return 1
+  fi
   if [ "$inject_after_phase_for_test" = "preserve-server" ]; then return 97; fi
-  preserve_binary_transaction_original "$journal" "$install_dir" server "$BIN_SERVER" \
-    "$TXN_HAD_SERVER" "$TXN_OLD_SERVER_HASH" \
-    || abort_binary_pair_transaction "$install_dir" "Could not preserve the existing server binary."
+  if ! preserve_binary_transaction_original "$journal" "$install_dir" server "$BIN_SERVER" \
+      "$TXN_HAD_SERVER" "$TXN_OLD_SERVER_HASH"; then
+    abort_binary_pair_transaction "$install_dir" "Could not preserve the existing server binary."
+    return 1
+  fi
 
-  persist_binary_transaction_phase "$journal" "20-preserve-cli" \
-    || abort_binary_pair_transaction "$install_dir" "Could not persist CLI-preservation intent."
+  if ! persist_binary_transaction_phase "$journal" "20-preserve-cli"; then
+    abort_binary_pair_transaction "$install_dir" "Could not persist CLI-preservation intent."
+    return 1
+  fi
   if [ "$inject_after_phase_for_test" = "preserve-cli" ]; then return 97; fi
-  preserve_binary_transaction_original "$journal" "$install_dir" cli "$BIN_CLI" \
-    "$TXN_HAD_CLI" "$TXN_OLD_CLI_HASH" \
-    || abort_binary_pair_transaction "$install_dir" "Could not preserve the existing CLI binary."
+  if ! preserve_binary_transaction_original "$journal" "$install_dir" cli "$BIN_CLI" \
+      "$TXN_HAD_CLI" "$TXN_OLD_CLI_HASH"; then
+    abort_binary_pair_transaction "$install_dir" "Could not preserve the existing CLI binary."
+    return 1
+  fi
 
-  persist_binary_transaction_phase "$journal" "30-publish-server" \
-    || abort_binary_pair_transaction "$install_dir" "Could not persist server-publication intent."
+  if ! persist_binary_transaction_phase "$journal" "30-publish-server"; then
+    abort_binary_pair_transaction "$install_dir" "Could not persist server-publication intent."
+    return 1
+  fi
   if [ "$inject_after_phase_for_test" = "publish-server" ]; then return 97; fi
-  publish_binary_transaction_new "$journal" "$install_dir" server "$BIN_SERVER" "$TXN_NEW_SERVER_HASH" \
-    || abort_binary_pair_transaction "$install_dir" "Could not publish the new server binary."
+  if ! publish_binary_transaction_new "$journal" "$install_dir" server "$BIN_SERVER" \
+      "$TXN_NEW_SERVER_HASH"; then
+    abort_binary_pair_transaction "$install_dir" "Could not publish the new server binary."
+    return 1
+  fi
 
-  persist_binary_transaction_phase "$journal" "40-publish-cli" \
-    || abort_binary_pair_transaction "$install_dir" "Could not persist CLI-publication intent."
+  if ! persist_binary_transaction_phase "$journal" "40-publish-cli"; then
+    abort_binary_pair_transaction "$install_dir" "Could not persist CLI-publication intent."
+    return 1
+  fi
   if [ "$inject_after_phase_for_test" = "publish-cli" ]; then return 97; fi
-  publish_binary_transaction_new "$journal" "$install_dir" cli "$BIN_CLI" "$TXN_NEW_CLI_HASH" \
-    || abort_binary_pair_transaction "$install_dir" "Could not publish the new CLI binary."
+  if ! publish_binary_transaction_new "$journal" "$install_dir" cli "$BIN_CLI" \
+      "$TXN_NEW_CLI_HASH"; then
+    abort_binary_pair_transaction "$install_dir" "Could not publish the new CLI binary."
+    return 1
+  fi
 
   installed_server_hash=$(file_sha256_hex "$install_dir/$BIN_SERVER" 2>/dev/null || true)
   installed_cli_hash=$(file_sha256_hex "$install_dir/$BIN_CLI" 2>/dev/null || true)
@@ -3563,10 +3592,14 @@ install_binary_pair_transactional() {
       "Post-install verification failed; recovery will restore the previous binary pair."
     return 1
   fi
-  sync_installer_paths_durably "$install_dir/$BIN_SERVER" "$install_dir/$BIN_CLI" "$install_dir" \
-    || abort_binary_pair_transaction "$install_dir" "Could not durably flush the verified binary pair."
-  persist_binary_transaction_phase "$journal" "50-commit-ready" \
-    || abort_binary_pair_transaction "$install_dir" "Could not persist binary transaction commit intent."
+  if ! sync_installer_paths_durably "$install_dir/$BIN_SERVER" "$install_dir/$BIN_CLI" "$install_dir"; then
+    abort_binary_pair_transaction "$install_dir" "Could not durably flush the verified binary pair."
+    return 1
+  fi
+  if ! persist_binary_transaction_phase "$journal" "50-commit-ready"; then
+    abort_binary_pair_transaction "$install_dir" "Could not persist binary transaction commit intent."
+    return 1
+  fi
   if [ "$inject_after_phase_for_test" = "commit-ready" ]; then return 97; fi
   archive_binary_transaction "$journal" "$install_dir" committed || return 1
   return 0
