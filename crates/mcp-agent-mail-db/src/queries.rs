@@ -27009,10 +27009,11 @@ mod tests {
         rt.block_on(async {
             let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
-            let project = ensure_project(&cx, &pool, &format!("/tmp/am-thread-participants-{base}"))
-                .await
-                .into_result()
-                .expect("ensure project");
+            let project =
+                ensure_project(&cx, &pool, &format!("/tmp/am-thread-participants-{base}"))
+                    .await
+                    .into_result()
+                    .expect("ensure project");
             let project_id = project.id.expect("project id");
 
             let mut agent_ids = Vec::new();
