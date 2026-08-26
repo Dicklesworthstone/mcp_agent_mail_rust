@@ -4752,6 +4752,34 @@ pub async fn update_project_sibling_status(
             ));
         }
 
+        let select_sql = format!(
+            "{PROJECT_SIBLING_SELECT} WHERE s.project_a_id = ? AND s.project_b_id = ? LIMIT 1"
+        );
+        let select_params = [Value::BigInt(project_a_id), Value::BigInt(project_b_id)];
+        let existing_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &select_sql, &select_params).await)
+        );
+        let Some(existing_row) = existing_rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found(
+                "Project sibling suggestion",
+                format!("{project_a_id},{project_b_id}"),
+            ));
+        };
+        let existing = match decode_project_sibling_suggestion(existing_row) {
+            Ok(suggestion) => suggestion,
+            Err(error) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(error);
+            }
+        };
+        if existing.status == status {
+            try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+            return Outcome::Ok(existing);
+        }
+
         let update_params = [
             Value::Text(status.as_str().to_string()),
             Value::BigInt(now),
@@ -4775,29 +4803,17 @@ pub async fn update_project_sibling_status(
                 .await
             )
         );
-        if changed == 0 {
+        if changed != 1 {
             rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::not_found(
-                "Project sibling suggestion",
-                format!("{project_a_id},{project_b_id}"),
-            ));
+            return Outcome::Err(DbError::Internal(format!(
+                "sibling suggestion transition affected {changed} rows; expected exactly one"
+            )));
         }
 
-        let select_sql = format!(
-            "{PROJECT_SIBLING_SELECT} WHERE s.project_a_id = ? AND s.project_b_id = ? LIMIT 1"
-        );
         let rows = try_in_tx!(
             cx,
             &tracked,
-            map_sql_outcome(
-                traw_query(
-                    cx,
-                    &tracked,
-                    &select_sql,
-                    &[Value::BigInt(project_a_id), Value::BigInt(project_b_id)],
-                )
-                .await
-            )
+            map_sql_outcome(traw_query(cx, &tracked, &select_sql, &select_params).await)
         );
         let Some(row) = rows.first() else {
             rollback_tx(cx, &tracked).await;
@@ -16447,6 +16463,21 @@ mod tests {
             assert!(confirmed.confirmed_ts.is_some());
             assert_eq!(confirmed.dismissed_ts, None);
             assert!(confirmed.evaluated_ts > 10);
+
+            let confirmed_again = update_project_sibling_status(
+                &cx,
+                &pool,
+                101,
+                202,
+                ProjectSiblingStatus::Confirmed,
+            )
+            .await
+            .into_result()
+            .expect("repeat confirm suggestion");
+            assert_eq!(
+                confirmed_again, confirmed,
+                "idempotent retries must preserve the original audit timestamps"
+            );
 
             let dismissed = update_project_sibling_status(
                 &cx,

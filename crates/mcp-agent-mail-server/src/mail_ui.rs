@@ -5578,10 +5578,19 @@ fn handle_sibling_update(
     match spin_block_on(queries::update_project_sibling_status(
         cx, pool, project_id, other_id, status,
     )) {
-        asupersync::Outcome::Ok(suggestion) => json_ok(&serde_json::json!({
-            "status": suggestion.status.as_str(),
-            "suggestion": suggestion,
-        })),
+        asupersync::Outcome::Ok(suggestion) => {
+            tracing::info!(
+                project_id,
+                other_id,
+                suggestion_id = suggestion.id,
+                status = suggestion.status.as_str(),
+                "project_sibling_status_updated"
+            );
+            json_ok(&serde_json::json!({
+                "status": suggestion.status.as_str(),
+                "suggestion": suggestion,
+            }))
+        }
         asupersync::Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument {
             message,
             ..
