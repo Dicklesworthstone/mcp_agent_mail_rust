@@ -371,7 +371,7 @@ New-Item -ItemType Directory -Path $workDir -Force | Out-Null
 try {
     function global:Get-SafeCosignPath { return "Invoke-FakeCosign" }
     function global:Invoke-FakeCosign {
-        $script:ObservedCosignArgs = @($args)
+        $global:ObservedCosignArgs = @($args)
         foreach ($name in @("SIGSTORE_ROOT_FILE", "SIGSTORE_REKOR_PUBLIC_KEY", "SIGSTORE_CT_LOG_PUBLIC_KEY_FILE")) {
             if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($name, "Process"))) {
                 throw "custom trust environment leaked: $name"
@@ -408,7 +408,7 @@ try {
             throw "trust environment was not restored: $($entry.Key)"
         }
     }
-    $cosignArgs = $script:ObservedCosignArgs -join [Environment]::NewLine
+    $cosignArgs = $global:ObservedCosignArgs -join [Environment]::NewLine
     if ($cosignArgs -notmatch "(?m)^--new-bundle-format$") {
         throw "cosign did not receive --new-bundle-format"
     }

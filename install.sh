@@ -554,13 +554,17 @@ capture_command_with_timeout() {
   shift
 
   CAPTURED_CMD_OUTPUT=""
+  CAPTURED_CMD_OUTPUT_EXACT=""
   CAPTURED_CMD_STATUS=0
 
   if command -v python3 >/dev/null 2>&1; then
     local output_file status_file tmp_root rc
     tmp_root="${TMP:-/tmp}"
-    output_file="${tmp_root}/am-install-capture.$$.$RANDOM.out"
-    status_file="${tmp_root}/am-install-capture.$$.$RANDOM.status"
+    output_file=$(mktemp "${tmp_root%/}/am-install-capture.XXXXXX") || return 1
+    status_file=$(mktemp "${tmp_root%/}/am-install-status.XXXXXX") || {
+      rm -f "$output_file" 2>/dev/null || true
+      return 1
+    }
 
     if python3 - "$timeout_secs" "$output_file" "$status_file" "$@" <<'PY'
 import subprocess
@@ -610,7 +614,14 @@ PY
       rc=$?
     fi
 
-    [ -f "$output_file" ] && CAPTURED_CMD_OUTPUT=$(cat "$output_file")
+    if [ -f "$output_file" ]; then
+      # Command substitution normally strips every trailing newline. Preserve
+      # exact bytes behind a non-newline sentinel so version identity checks
+      # can accept one normal LF while rejecting extra blank lines.
+      CAPTURED_CMD_OUTPUT_EXACT=$(cat "$output_file"; printf '\034')
+      CAPTURED_CMD_OUTPUT_EXACT="${CAPTURED_CMD_OUTPUT_EXACT%$'\034'}"
+      CAPTURED_CMD_OUTPUT=$(cat "$output_file")
+    fi
     [ -f "$status_file" ] && CAPTURED_CMD_STATUS=$(cat "$status_file")
     rm -f "$output_file" "$status_file" 2>/dev/null || true
 
@@ -630,15 +641,23 @@ PY
     timeout_bin="gtimeout"
   else
     CAPTURED_CMD_OUTPUT="No bounded command runner is available (requires python3, timeout, or gtimeout)."
+    CAPTURED_CMD_OUTPUT_EXACT="$CAPTURED_CMD_OUTPUT"
     CAPTURED_CMD_STATUS=125
     return 125
   fi
 
-  if CAPTURED_CMD_OUTPUT=$("$timeout_bin" --signal=KILL "$timeout_secs" "$@" 2>&1); then
-    CAPTURED_CMD_STATUS=0
-    return 0
+  local fallback_output_file fallback_rc
+  fallback_output_file=$(mktemp "${TMP:-/tmp}/am-install-capture.XXXXXX") || return 1
+  if "$timeout_bin" --signal=KILL "$timeout_secs" "$@" >"$fallback_output_file" 2>&1; then
+    fallback_rc=0
+  else
+    fallback_rc=$?
   fi
-  CAPTURED_CMD_STATUS=$?
+  CAPTURED_CMD_OUTPUT_EXACT=$(cat "$fallback_output_file"; printf '\034')
+  CAPTURED_CMD_OUTPUT_EXACT="${CAPTURED_CMD_OUTPUT_EXACT%$'\034'}"
+  CAPTURED_CMD_OUTPUT=$(cat "$fallback_output_file")
+  rm -f "$fallback_output_file" 2>/dev/null || true
+  CAPTURED_CMD_STATUS="$fallback_rc"
   return "$CAPTURED_CMD_STATUS"
 }
 
@@ -6523,10 +6542,12 @@ binary_version_matches_exact() {
   local expected_output="$2"
 
   CAPTURED_CMD_OUTPUT=""
+  CAPTURED_CMD_OUTPUT_EXACT=""
   CAPTURED_CMD_STATUS=0
   [ -x "$binary_path" ] || return 1
   capture_command_with_timeout 3 "$binary_path" --version || return 1
-  [ "$CAPTURED_CMD_OUTPUT" = "$expected_output" ]
+  [ "$CAPTURED_CMD_OUTPUT_EXACT" = "$expected_output" ] || \
+    [ "$CAPTURED_CMD_OUTPUT_EXACT" = "${expected_output}"$'\n' ]
 }
 
 verify_release_binaries_exact() {

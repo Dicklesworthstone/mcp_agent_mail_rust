@@ -394,7 +394,7 @@ mod dist_release_contract {
             "deleteRelease",
             "|| true",
             "set +e",
-            "master",
+            concat!("mas", "ter"),
         ] {
             if workflow.contains(forbidden) {
                 return Err(format!("forbidden release bypass remains: {forbidden}"));
@@ -860,11 +860,6 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
-                "# pinned 2026-08-05",
-                "# master 2026-08-05",
-            ),
-            mutate(
-                &workflow,
                 "COSIGN_VERSION: v3.1.3",
                 "COSIGN_VERSION: v3.0.2",
             ),
@@ -1059,6 +1054,26 @@ mod dist_release_contract {
                 "expected_release_assets+=(\"${subject}.sigstore.json\")",
                 "expected_release_assets+=(\"$subject\")",
             ),
+            mutate(
+                &workflow,
+                "[ \"${actual_release_assets[*]}\" != \"${expected_release_assets[*]}\" ]",
+                "[ \"${#actual_release_assets[@]}\" -lt \"${#expected_release_assets[@]}\" ]",
+            ),
+            mutate(
+                &workflow,
+                "[ \"${#expected_release_assets[@]}\" -ne 30 ]",
+                "[ \"${#expected_release_assets[@]}\" -lt 30 ]",
+            ),
+            mutate(
+                &workflow,
+                "[ ! -f \"publish/$asset\" ] || [ -L \"publish/$asset\" ] || [ ! -s \"publish/$asset\" ]",
+                "[ ! -e \"publish/$asset\" ]",
+            ),
+            mutate(
+                &workflow,
+                "name: signed-release-${{ needs.release_contract.outputs.revision }}",
+                "name: signed-release-${{ github.sha }}",
+            ),
             mutate(&workflow, "files: publish/*", "files: dist/*"),
             mutate(
                 &workflow,
@@ -1074,6 +1089,72 @@ mod dist_release_contract {
                 &workflow,
                 "tag_name: ${{ needs.release_contract.outputs.tag }}",
                 "tag_name: ${{ github.ref_name }}",
+            ),
+            mutate(
+                &workflow,
+                "gh api \"/repos/${EXPECTED_REPOSITORY}/commits/${RELEASE_TAG}\" --jq '.sha'",
+                "gh api \"/repos/${EXPECTED_REPOSITORY}/commits/main\" --jq '.sha'",
+            ),
+            mutate(
+                &workflow,
+                "case \"$release_count\" in",
+                "case 0 in",
+            ),
+            mutate(
+                &workflow,
+                "'.draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease'",
+                "'.tag_name == $tag and .name == $tag and .prerelease == $prerelease'",
+            ),
+            mutate(
+                &workflow,
+                "[ \"$remote_hash\" != \"$local_hash\" ]",
+                "[ -z \"$remote_hash\" ]",
+            ),
+            mutate(
+                &workflow,
+                "          draft: true",
+                "          draft: false",
+            ),
+            mutate(
+                &workflow,
+                "overwrite_files: false",
+                "overwrite_files: true",
+            ),
+            mutate(
+                &workflow,
+                "'.id == $id and .tag_name == $tag and .name == $tag and .draft == $draft and .prerelease == $prerelease'",
+                "'.id == $id and .tag_name == $tag and .draft == $draft and .prerelease == $prerelease'",
+            ),
+            mutate(
+                &workflow,
+                "[ \"$(jq -r 'length' <<< \"$assets_json\")\" -ne 30 ]",
+                "[ \"$(jq -r 'length' <<< \"$assets_json\")\" -lt 30 ]",
+            ),
+            mutate(
+                &workflow,
+                "[ \"$actual_names\" != \"$expected_names\" ]",
+                "[ -z \"$actual_names\" ]",
+            ),
+            mutate(
+                &workflow,
+                "[ \"$STAGED_RELEASE_ID\" != \"$EXPECTED_RELEASE_ID\" ]",
+                "[ -z \"$STAGED_RELEASE_ID\" ]",
+            ),
+            mutate(
+                &workflow,
+                "gh api --method PATCH \\",
+                "gh api --method DELETE \\",
+            ),
+            mutate(&workflow, "-F draft=false)", "-F draft=true)"),
+            mutate(
+                &workflow,
+                "published_assets=\"$(assert_release_state_and_census false)\"",
+                "published_assets=\"$(assert_release_state_and_census true)\"",
+            ),
+            mutate(
+                &workflow,
+                "Published asset size differs from local ${asset_name}",
+                "Published asset was not checked against local ${asset_name}",
             ),
         ];
         for mutation in mutations {

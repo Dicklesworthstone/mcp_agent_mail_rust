@@ -744,13 +744,17 @@ for bad_archive in extra nested missing symlink; do
 done
 
 version_root="$tmp/version-fixtures"
-mkdir -p "$version_root/good" "$version_root/wrong-cli" "$version_root/wrong-server"
+mkdir -p "$version_root/good" "$version_root/wrong-cli" "$version_root/wrong-server" \
+    "$version_root/extra-lines"
 make_version_fixture "$version_root/good/am" 'am 9.9.9'
 make_version_fixture "$version_root/good/mcp-agent-mail" 'mcp-agent-mail 9.9.9'
 make_version_fixture "$version_root/wrong-cli/am" 'am 9.9.8'
 make_version_fixture "$version_root/wrong-cli/mcp-agent-mail" 'mcp-agent-mail 9.9.9'
 make_version_fixture "$version_root/wrong-server/am" 'am 9.9.9'
 make_version_fixture "$version_root/wrong-server/mcp-agent-mail" 'mcp-agent-mail 9.9.8'
+printf '#!/usr/bin/env bash\nprintf "am 9.9.9\\n\\n"\n' >"$version_root/extra-lines/am"
+chmod +x "$version_root/extra-lines/am"
+make_version_fixture "$version_root/extra-lines/mcp-agent-mail" 'mcp-agent-mail 9.9.9'
 
 run_version_case() {
     local fixture_dir="$1"
@@ -767,7 +771,7 @@ run_version_case() {
 }
 
 run_version_case "$version_root/good"
-for bad_versions in wrong-cli wrong-server; do
+for bad_versions in wrong-cli wrong-server extra-lines; do
     if run_version_case "$version_root/$bad_versions"; then
         echo "FAIL: $bad_versions fixture must be rejected before replacement" >&2
         exit 1

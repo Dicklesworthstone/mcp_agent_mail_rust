@@ -2525,6 +2525,256 @@ mod tests {
     }
 
     #[test]
+    fn resolved_legacy_paths_consume_one_retained_project_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_env = tmp.path().join(".env");
+        fs::write(
+            &project_env,
+            "DATABASE_URL=sqlite+aiosqlite:///./original.sqlite3\nSTORAGE_ROOT=./original-storage\n",
+        )
+        .unwrap();
+
+        let snapshot = capture_legacy_env_snapshot_with_reader(
+            tmp.path(),
+            &[],
+            false,
+            read_env_authority_text,
+        )
+        .expect("capture one project env snapshot");
+        fs::write(
+            &project_env,
+            "DATABASE_URL=sqlite+aiosqlite:///./changed.sqlite3\nSTORAGE_ROOT=./changed-storage\n",
+        )
+        .unwrap();
+
+        let database =
+            resolve_database_path_from_snapshot(tmp.path(), None, None, &snapshot).unwrap();
+        let storage =
+            resolve_storage_root_from_snapshot(tmp.path(), None, None, &snapshot).unwrap();
+        assert_eq!(database.source, ResolvedSource::ProjectEnv);
+        assert_eq!(database.path, tmp.path().join("original.sqlite3"));
+        assert_eq!(storage.source, ResolvedSource::ProjectEnv);
+        assert_eq!(storage.path, tmp.path().join("original-storage"));
+    }
+
+    #[test]
+    fn explicit_and_process_values_remain_above_env_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = LegacyEnvSnapshot {
+            project: Some(EnvAuthoritySnapshot {
+                path: tmp.path().join(".env"),
+                values: parse_env_file_map(
+                    "DATABASE_URL=sqlite:///project.sqlite3\nSTORAGE_ROOT=./project-storage\n",
+                ),
+            }),
+            user: None,
+        };
+        let explicit_db = tmp.path().join("explicit.sqlite3");
+
+        let database = resolve_database_path_from_snapshot(
+            tmp.path(),
+            Some(&explicit_db),
+            Some("sqlite:///process.sqlite3"),
+            &snapshot,
+        )
+        .unwrap();
+        let storage = resolve_storage_root_from_snapshot(
+            tmp.path(),
+            None,
+            Some("./process-storage"),
+            &snapshot,
+        )
+        .unwrap();
+        assert_eq!(database.source, ResolvedSource::Explicit);
+        assert_eq!(database.path, explicit_db);
+        assert_eq!(storage.source, ResolvedSource::ProcessEnv);
+        assert_eq!(storage.path, tmp.path().join("process-storage"));
+    }
+
+    #[test]
+    fn legacy_env_snapshot_rejects_project_leaf_content_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_env = tmp.path().join(".env");
+        fs::write(&project_env, "DATABASE_URL=sqlite:///first.sqlite3\n").unwrap();
+        let changed = std::cell::Cell::new(false);
+
+        let error = capture_legacy_env_snapshot_with_reader(
+            tmp.path(),
+            &[],
+            false,
+            |path| {
+                let observed = read_env_authority_text(path)?;
+                if path == project_env && observed.is_some() && !changed.replace(true) {
+                    fs::write(path, "DATABASE_URL=sqlite:///second.sqlite3\n")?;
+                }
+                Ok(observed)
+            },
+        )
+        .expect_err("a drifting project authority must be rejected");
+        assert!(error.to_string().contains("changed while capturing"));
+    }
+
+    #[test]
+    fn legacy_env_snapshot_rejects_invalid_utf8_and_oversized_project_authorities() {
+        let invalid_root = tempfile::tempdir().unwrap();
+        fs::write(invalid_root.path().join(".env"), [0xff, 0xfe]).unwrap();
+        let invalid_error = capture_legacy_env_snapshot_with_reader(
+            invalid_root.path(),
+            &[],
+            false,
+            read_env_authority_text,
+        )
+        .expect_err("invalid UTF-8 must be rejected");
+        assert!(invalid_error.to_string().contains("valid UTF-8"));
+
+        let oversized_root = tempfile::tempdir().unwrap();
+        let oversized_len = usize::try_from(
+            mcp_agent_mail_core::config::ENV_AUTHORITY_FILE_MAX_BYTES + 1,
+        )
+        .unwrap();
+        fs::write(oversized_root.path().join(".env"), vec![b'x'; oversized_len]).unwrap();
+        let oversized_error = capture_legacy_env_snapshot_with_reader(
+            oversized_root.path(),
+            &[],
+            false,
+            read_env_authority_text,
+        )
+        .expect_err("oversized env authority must be rejected");
+        assert!(oversized_error.to_string().contains("exceeding"));
+    }
+
+    #[test]
+    fn legacy_env_snapshot_rejects_higher_user_authority_appearing_during_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user_dir = tmp.path().join("user-config");
+        fs::create_dir(&user_dir).unwrap();
+        let primary = user_dir.join("config.env");
+        let fallback = user_dir.join("fallback.env");
+        fs::write(&fallback, "STORAGE_ROOT=./fallback\n").unwrap();
+        let appeared = std::cell::Cell::new(false);
+
+        let error = capture_legacy_env_snapshot_with_reader(
+            tmp.path(),
+            &[primary.clone(), fallback.clone()],
+            true,
+            |path| {
+                let observed = read_env_authority_text(path)?;
+                if path == fallback && observed.is_some() && !appeared.replace(true) {
+                    fs::write(&primary, "STORAGE_ROOT=./higher\n")?;
+                }
+                Ok(observed)
+            },
+        )
+        .expect_err("an appearing higher-priority authority must stop fallback");
+        assert!(error.to_string().contains("changed while capturing"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_env_snapshot_rejects_project_leaf_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("real-project.env");
+        fs::write(&target, "DATABASE_URL=sqlite:///redirected.sqlite3\n").unwrap();
+        symlink(&target, tmp.path().join(".env")).unwrap();
+
+        let error = capture_legacy_env_snapshot_with_reader(
+            tmp.path(),
+            &[],
+            false,
+            read_env_authority_text,
+        )
+        .expect_err("a symlinked project authority must be rejected");
+        assert!(error.to_string().contains("unsafe legacy environment authority"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_env_snapshot_rejects_project_parent_swap() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let moved_project = tmp.path().join("project-bound");
+        fs::create_dir(&project).unwrap();
+        let project_env = project.join(".env");
+        fs::write(&project_env, "DATABASE_URL=sqlite:///source.sqlite3\n").unwrap();
+        let swapped = std::cell::Cell::new(false);
+
+        let error = capture_legacy_env_snapshot_with_reader(
+            &project,
+            &[],
+            false,
+            |path| {
+                let observed = read_env_authority_text(path)?;
+                if path == project_env && observed.is_some() && !swapped.replace(true) {
+                    fs::rename(&project, &moved_project)?;
+                    symlink(&moved_project, &project)?;
+                }
+                Ok(observed)
+            },
+        )
+        .expect_err("a swapped project parent must be rejected");
+        assert!(error.to_string().contains("unsafe legacy environment authority"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_env_snapshot_rejects_user_leaf_symlink_without_fallback() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let user_dir = tmp.path().join("user-config");
+        fs::create_dir(&user_dir).unwrap();
+        let target = user_dir.join("real.env");
+        let primary = user_dir.join("config.env");
+        let fallback = user_dir.join("fallback.env");
+        fs::write(&target, "STORAGE_ROOT=./redirected\n").unwrap();
+        fs::write(&fallback, "STORAGE_ROOT=./fallback\n").unwrap();
+        symlink(&target, &primary).unwrap();
+
+        let error = capture_legacy_env_snapshot_with_reader(
+            tmp.path(),
+            &[primary, fallback],
+            true,
+            read_env_authority_text,
+        )
+        .expect_err("an unsafe higher-priority user authority must stop fallback");
+        assert!(error.to_string().contains("unsafe legacy environment authority"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_env_snapshot_rejects_user_parent_swap() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let user_dir = tmp.path().join("user-config");
+        let moved_user_dir = tmp.path().join("user-config-bound");
+        fs::create_dir(&user_dir).unwrap();
+        let user_env = user_dir.join("config.env");
+        fs::write(&user_env, "STORAGE_ROOT=./source-storage\n").unwrap();
+        let swapped = std::cell::Cell::new(false);
+
+        let error = capture_legacy_env_snapshot_with_reader(
+            tmp.path(),
+            std::slice::from_ref(&user_env),
+            true,
+            |path| {
+                let observed = read_env_authority_text(path)?;
+                if path == user_env && observed.is_some() && !swapped.replace(true) {
+                    fs::rename(&user_dir, &moved_user_dir)?;
+                    symlink(&moved_user_dir, &user_dir)?;
+                }
+                Ok(observed)
+            },
+        )
+        .expect_err("a swapped user authority parent must be rejected");
+        assert!(error.to_string().contains("unsafe legacy environment authority"));
+    }
+
+    #[test]
     fn parse_database_value_supports_sqlite_aiosqlite() {
         let tmp = tempfile::tempdir().unwrap();
         let parsed = parse_database_value(
