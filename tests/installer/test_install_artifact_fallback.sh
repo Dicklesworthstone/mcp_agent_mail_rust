@@ -939,6 +939,7 @@ for required_text in \
     'Assert-ExactBinaryVersion -BinaryPath $serverSource -ExpectedOutput "mcp-agent-mail $requestedNormalized" -Phase "Staged"' \
     'Assert-ExactBinaryVersion -BinaryPath $serverExe -ExpectedOutput "mcp-agent-mail $ExpectedVersion" -Phase "Post-install"' \
     '$installerMutex = Enter-InstallerMutex -InstallDir $Dest' \
+    '"Global\mcp-agent-mail-install-$digest"' \
     '-PostInstallVerifier $postInstallVerifier' \
     'Installed binary bytes differ from the verified staged pair.' \
     'Archive-member and exact-version checks remain mandatory.' \

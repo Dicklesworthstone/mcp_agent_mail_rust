@@ -367,16 +367,12 @@ mod dist_release_contract {
     fn validate(workflow: &str) -> Result<(), String> {
         validate_action_pins(workflow)?;
 
-        if workflow.contains("workflow_dispatch") {
-            return Err("dist publication must not be dispatchable from a branch".to_string());
-        }
-        if workflow.contains("continue-on-error") {
-            return Err("release gates must not continue after errors".to_string());
-        }
         if workflow.contains("sidecar_name=\"${sidecar_name#") {
             return Err("checksum sidecar names must not be normalized".to_string());
         }
         for forbidden in [
+            "workflow_dispatch",
+            "continue-on-error",
             "No install.sh found",
             "No install.ps1 found",
             "sigstore/cosign-installer@",
@@ -390,6 +386,12 @@ mod dist_release_contract {
             "--insecure-ignore-sct",
             "--insecure-ignore-tlog",
             "--new-bundle-format=false",
+            "overwrite_files: true",
+            "--method DELETE",
+            "deleteRelease",
+            "|| true",
+            "set +e",
+            "master",
         ] {
             if workflow.contains(forbidden) {
                 return Err(format!("forbidden release bypass remains: {forbidden}"));
@@ -399,11 +401,54 @@ mod dist_release_contract {
         for (action, expected) in [
             (CHECKOUT_ACTION, 5),
             (TOOLCHAIN_ACTION, 3),
-            (UPLOAD_ACTION, 1),
-            (DOWNLOAD_ACTION, 1),
+            (UPLOAD_ACTION, 2),
+            (DOWNLOAD_ACTION, 2),
             (RELEASE_ACTION, 1),
         ] {
             require_exactly(workflow, action, expected)?;
+        }
+        require_once(
+            workflow,
+            "uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2",
+        )?;
+
+        let exact_matrix = concat!(
+            "        include:\n",
+            "          - os: ubuntu-latest\n",
+            "            target: x86_64-unknown-linux-gnu\n",
+            "          # Statically-linked musl build — runs on any x86_64 Linux regardless\n",
+            "          # of host glibc (Debian 12, Ubuntu 22.04, RHEL 9, Amazon Linux 2023,\n",
+            "          # Alpine, etc.). Keeps the gnu artifact for distros that prefer it.\n",
+            "          - os: ubuntu-latest\n",
+            "            target: x86_64-unknown-linux-musl\n",
+            "          - os: ubuntu-24.04-arm\n",
+            "            target: aarch64-unknown-linux-gnu\n",
+            "          - os: macos-15-intel\n",
+            "            target: x86_64-apple-darwin\n",
+            "          - os: macos-15\n",
+            "            target: aarch64-apple-darwin\n",
+            "          - os: windows-latest\n",
+            "            target: x86_64-pc-windows-msvc",
+        );
+        require_once(workflow, exact_matrix)?;
+        require_exactly(workflow, "            target: ", RELEASE_TARGETS.len())?;
+        for target in RELEASE_TARGETS {
+            require_once(workflow, &format!("            target: {target}"))?;
+        }
+
+        let exact_archive_array = concat!(
+            "          expected_archives=(\n",
+            "            mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz\n",
+            "            mcp-agent-mail-x86_64-unknown-linux-musl.tar.xz\n",
+            "            mcp-agent-mail-aarch64-unknown-linux-gnu.tar.xz\n",
+            "            mcp-agent-mail-x86_64-apple-darwin.tar.xz\n",
+            "            mcp-agent-mail-aarch64-apple-darwin.tar.xz\n",
+            "            mcp-agent-mail-x86_64-pc-windows-msvc.zip\n",
+            "          )",
+        );
+        require_exactly(workflow, exact_archive_array, 2)?;
+        for archive in RELEASE_ARCHIVES {
+            require_exactly(workflow, archive, 2)?;
         }
 
         let required_once = [
@@ -418,7 +463,6 @@ mod dist_release_contract {
             "tag_version=\"${REF_NAME#v}\"",
             "[ \"$tag_version\" != \"$manifest_version\" ]",
             "if [[ \"$tag_version\" == *-* ]]; then",
-            "if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}",
             "cargo metadata --locked --no-deps --format-version 1 >/dev/null",
             "cargo check --locked --workspace --all-targets",
             "cargo clippy --locked --workspace --all-targets -- -D warnings",
@@ -430,60 +474,160 @@ mod dist_release_contract {
             "$serverVersion -ne \"mcp-agent-mail $env:EXPECTED_VERSION\"",
             "[System.IO.File]::WriteAllText(",
             "\"$hash  $zipName`n\"",
-            "COSIGN_VERSION: v3.1.3",
-            "COSIGN_LINUX_AMD64_SHA256: 4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71",
-            "curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \\",
-            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64",
-            "actual_sha256=\"$(sha256sum \"$cosign_path\" | awk '{print $1}')\"",
-            "[ \"$actual_sha256\" != \"$COSIGN_LINUX_AMD64_SHA256\" ]",
-            "mapfile -t cosign_versions < <(\"$cosign_path\" version | awk '$1 == \"GitVersion:\" {print $2}')",
-            "[ \"${#cosign_versions[@]}\" -ne 1 ] || [ \"${cosign_versions[0]}\" != \"$COSIGN_VERSION\" ]",
-            "printf 'COSIGN_BIN=%s\\n' \"$cosign_path\" >> \"$GITHUB_ENV\"",
             "expected_download_entries+=(\"$artifact\" \"${artifact}.sha256\")",
             "mapfile -t actual_download_entries < <(find dist -mindepth 1 -maxdepth 1 -printf '%f\\n' | sort)",
+            "[ \"${actual_download_entries[*]}\" != \"${expected_download_entries[*]}\" ]",
             "mapfile -t sidecar_lines < \"dist/${artifact}.sha256\"",
             "[ \"${#sidecar_lines[@]}\" -ne 1 ]",
             "[ \"$sidecar_name\" != \"$artifact\" ]",
+            "[ \"$actual_hash\" != \"$sidecar_hash\" ]",
             "cp -- \"dist/$artifact\" \"dist/${artifact}.sha256\" publish/",
             "cp -- install.sh install.ps1 publish/",
-            "expected_payloads=(install.sh install.ps1)",
-            "expected_payloads+=(\"$artifact\" \"${artifact}.sha256\")",
             "shasum -a 256 \"${expected_payloads[@]}\" > SHA256SUMS",
             "[ \"${#sums_lines[@]}\" -ne \"${#expected_payloads[@]}\" ]",
             "'$2 == payload && NF == 2 {print $1}'",
             "[ \"${#sums_hashes[@]}\" -ne 1 ]",
+            "[ \"$actual_hash\" != \"${sums_hashes[0]}\" ]",
             "names = sorted(member.name for member in members)",
             "names != [\"am\", \"mcp-agent-mail\"]",
+            "any(not member.isfile() or member.size <= 0 for member in members)",
             "names = sorted(member.filename for member in members)",
             "names != [\"am.exe\", \"mcp-agent-mail.exe\"]",
+            "member.is_dir() or member.file_size <= 0 or stat.S_IFMT(mode) not in (0, stat.S_IFREG)",
             "expected_workflow_ref=\"${EXPECTED_REPOSITORY}/.github/workflows/dist.yml@refs/tags/${RELEASE_TAG}\"",
             "[ \"$GITHUB_WORKFLOW_REF_VALUE\" != \"$expected_workflow_ref\" ]",
             "expected_certificate_identity=\"https://github.com/${expected_workflow_ref}\"",
-            "signed_subjects=(\"${expected_payloads[@]}\" SHA256SUMS)",
             "\"$COSIGN_BIN\" sign-blob --yes --bundle \"${subject}.sigstore.json\" \"$subject\"",
-            "\"$COSIGN_BIN\" verify-blob \\",
-            "--certificate-identity \"$expected_certificate_identity\"",
-            "--certificate-oidc-issuer \"https://token.actions.githubusercontent.com\"",
-            "--certificate-github-workflow-repository \"$EXPECTED_REPOSITORY\"",
-            "--certificate-github-workflow-ref \"refs/tags/${RELEASE_TAG}\"",
-            "--certificate-github-workflow-sha \"$EXPECTED_REVISION\"",
-            "--certificate-github-workflow-trigger \"push\"",
-            "expected_release_assets=(\"${signed_subjects[@]}\")",
-            "expected_release_assets+=(\"${subject}.sigstore.json\")",
             "mapfile -t actual_release_assets < <(find . -mindepth 1 -maxdepth 1 -printf '%f\\n' | sort)",
+            "[ \"$checked_out_revision\" != \"$EXPECTED_REVISION\" ] || [ \"$remote_revision\" != \"$EXPECTED_REVISION\" ]",
+            "Release tag moved after preflight; refusing publication",
+            "path: publish/*",
+            "if-no-files-found: error",
+            "retention-days: 1",
+            "compression-level: 0",
+            "mapfile -t actual_release_assets < <(find publish -mindepth 1 -maxdepth 1 -printf '%f\\n' | sort)",
+            "[ ! -f \"publish/$asset\" ] || [ -L \"publish/$asset\" ] || [ ! -s \"publish/$asset\" ]",
+            "expected_certificate_identity=\"https://github.com/${EXPECTED_REPOSITORY}/.github/workflows/dist.yml@refs/tags/${RELEASE_TAG}\"",
+            "list_matching_releases() {",
+            "verify_existing_assets_are_matching_subset() {",
+            "case \"$release_count\" in",
+            "[ \"${#expected_names[@]}\" -ne 30 ]",
+            "[ \"$asset_count\" -gt 30 ]",
+            "[ -z \"${expected_set[$asset_name]+present}\" ] || [ -n \"${seen[$asset_name]+present}\" ]",
+            "Existing draft asset size differs from local ${asset_name}",
+            "Existing draft asset bytes differ from local ${asset_name}",
+            "'{tag_name: $tag, target_commitish: $revision, name: $tag, draft: true, prerelease: $prerelease, generate_release_notes: true}'",
+            "Refusing to mutate a published or metadata-mismatched release for ${RELEASE_TAG}",
+            "Refusing ambiguous release state: ${release_count} releases match ${RELEASE_TAG}",
+            "Expected exactly one draft after preflight",
+            "'.id == $id and .draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease'",
+            "Draft is not uniquely discoverable by its release tag",
+            "verify_existing_assets_are_matching_subset \"$release_id\"",
+            "printf 'release_id=%s\\n' \"$release_id\" >> \"$GITHUB_OUTPUT\"",
+            "token: ${{ github.token }}",
             "tag_name: ${{ needs.release_contract.outputs.tag }}",
+            "          name: ${{ needs.release_contract.outputs.tag }}",
             "prerelease: ${{ needs.release_contract.outputs.prerelease }}",
+            "preserve_order: true",
+            "overwrite_files: false",
             "fail_on_unmatched_files: true",
             "files: publish/*",
-            "if [ \"$checked_out_revision\" != \"$EXPECTED_REVISION\" ] || [ \"$remote_revision\" != \"$EXPECTED_REVISION\" ]; then",
-            "Release tag moved after preflight; refusing publication",
+            "STAGED_RELEASE_ID: ${{ steps.stage_release.outputs.id }}",
+            "load_remote_assets() {",
+            "assert_release_state_and_census() {",
+            "'.id == $id and .tag_name == $tag and .name == $tag and .draft == $draft and .prerelease == $prerelease'",
+            "[ \"$(jq -r 'length' <<< \"$assets_json\")\" -ne 30 ]",
+            "[ \"$actual_names\" != \"$expected_names\" ]",
+            "[ \"$STAGED_RELEASE_ID\" != \"$EXPECTED_RELEASE_ID\" ]",
+            "draft_assets=\"$(assert_release_state_and_census true)\"",
+            "Draft asset bytes differ from local ${asset_name}",
+            "gh api --method PATCH \\",
+            "-F draft=false)",
+            "[ \"$(jq -r '.draft' <<< \"$finalized_release\")\" != false ]",
+            "published_assets=\"$(assert_release_state_and_census false)\"",
+            "Published asset size differs from local ${asset_name}",
         ];
         for needle in required_once {
             require_once(workflow, needle)?;
         }
 
+        require_exactly(
+            workflow,
+            "if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}",
+            2,
+        )?;
+        require_exactly(workflow, "set -euo pipefail", 15)?;
+        require_exactly(workflow, "contents: read", 2)?;
         require_exactly(workflow, "contents: write", 1)?;
         require_exactly(workflow, "id-token: write", 1)?;
+        require_once(
+            workflow,
+            concat!(
+                "  sign:\n",
+                "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}\n",
+                "    needs: [release_contract, lint, test, build]\n",
+                "    runs-on: ubuntu-latest\n",
+                "    timeout-minutes: 45\n",
+                "    permissions:\n",
+                "      contents: read\n",
+                "      id-token: write\n\n",
+                "    steps:",
+            ),
+        )?;
+        require_once(
+            workflow,
+            concat!(
+                "  release:\n",
+                "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}\n",
+                "    needs: [release_contract, sign]\n",
+                "    runs-on: ubuntu-latest\n",
+                "    timeout-minutes: 60\n",
+                "    permissions:\n",
+                "      contents: write\n\n",
+                "    steps:",
+            ),
+        )?;
+        require_once(
+            workflow,
+            concat!(
+                "      - name: Upload signed release envelope\n",
+                "        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2\n",
+                "        with:\n",
+                "          name: signed-release-${{ needs.release_contract.outputs.revision }}\n",
+                "          path: publish/*\n",
+                "          if-no-files-found: error\n",
+                "          retention-days: 1\n",
+                "          compression-level: 0",
+            ),
+        )?;
+        require_once(
+            workflow,
+            concat!(
+                "      - name: Download signed release envelope\n",
+                "        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0\n",
+                "        with:\n",
+                "          name: signed-release-${{ needs.release_contract.outputs.revision }}\n",
+                "          path: publish",
+            ),
+        )?;
+        require_once(
+            workflow,
+            concat!(
+                "      - name: Upload exact assets to draft release\n",
+                "        id: stage_release\n",
+                "        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2\n",
+                "        with:\n",
+                "          token: ${{ github.token }}\n",
+                "          tag_name: ${{ needs.release_contract.outputs.tag }}\n",
+                "          name: ${{ needs.release_contract.outputs.tag }}\n",
+                "          draft: true\n",
+                "          prerelease: ${{ needs.release_contract.outputs.prerelease }}\n",
+                "          preserve_order: true\n",
+                "          overwrite_files: false\n",
+                "          fail_on_unmatched_files: true\n",
+                "          files: publish/*",
+            ),
+        )?;
         require_exactly(workflow, "persist-credentials: false", 5)?;
         require_exactly(
             workflow,
@@ -497,6 +641,55 @@ mod dist_release_contract {
         )?;
         require_exactly(workflow, "rustc --version --verbose", 3)?;
         require_exactly(workflow, "cargo --version --verbose", 3)?;
+        for needle in [
+            "- name: Install verified Cosign",
+            "COSIGN_VERSION: v3.1.3",
+            "COSIGN_LINUX_AMD64_SHA256: 4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71",
+            "curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \\",
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64",
+            "actual_sha256=\"$(sha256sum \"$cosign_path\" | awk '{print $1}')\"",
+            "[ \"$actual_sha256\" != \"$COSIGN_LINUX_AMD64_SHA256\" ]",
+            "mapfile -t cosign_versions < <(\"$cosign_path\" version | awk '$1 == \"GitVersion:\" {print $2}')",
+            "[ \"${#cosign_versions[@]}\" -ne 1 ] || [ \"${cosign_versions[0]}\" != \"$COSIGN_VERSION\" ]",
+            "printf 'COSIGN_BIN=%s\\n' \"$cosign_path\" >> \"$GITHUB_ENV\"",
+            "expected_payloads=(install.sh install.ps1)",
+            "expected_payloads+=(\"$artifact\" \"${artifact}.sha256\")",
+            "signed_subjects=(\"${expected_payloads[@]}\" SHA256SUMS)",
+            "\"$COSIGN_BIN\" verify-blob \\",
+            "--new-bundle-format \\",
+            "--certificate-identity \"$expected_certificate_identity\"",
+            "--certificate-oidc-issuer \"https://token.actions.githubusercontent.com\"",
+            "--certificate-github-workflow-repository \"$EXPECTED_REPOSITORY\"",
+            "--certificate-github-workflow-ref \"refs/tags/${RELEASE_TAG}\"",
+            "--certificate-github-workflow-sha \"$EXPECTED_REVISION\"",
+            "--certificate-github-workflow-trigger \"push\"",
+            "unset SIGSTORE_ROOT_FILE SIGSTORE_REKOR_PUBLIC_KEY SIGSTORE_CT_LOG_PUBLIC_KEY_FILE",
+            "expected_release_assets=(\"${signed_subjects[@]}\")",
+            "expected_release_assets+=(\"${subject}.sigstore.json\")",
+            "[ \"${actual_release_assets[*]}\" != \"${expected_release_assets[*]}\" ]",
+            "[ \"${#expected_release_assets[@]}\" -ne 30 ]",
+            "[ \"$remote_hash\" != \"$local_hash\" ]",
+        ] {
+            require_exactly(workflow, needle, 2)?;
+        }
+        require_exactly(
+            workflow,
+            "name: signed-release-${{ needs.release_contract.outputs.revision }}",
+            2,
+        )?;
+        require_exactly(workflow, "GH_TOKEN: ${{ github.token }}", 2)?;
+        require_exactly(workflow, "assert_tag_revision() {", 2)?;
+        require_exactly(
+            workflow,
+            "gh api \"/repos/${EXPECTED_REPOSITORY}/commits/${RELEASE_TAG}\" --jq '.sha'",
+            2,
+        )?;
+        require_exactly(workflow, "draft: true", 2)?;
+        require_exactly(
+            workflow,
+            "if [[ ! \"$asset_id\" =~ ^[0-9]+$ ]] || [[ ! \"$asset_size\" =~ ^[0-9]+$ ]]; then",
+            2,
+        )?;
         require_once(
             workflow,
             &format!("BEADS_RUST_COMMIT: {BEADS_RUST_COMMIT}"),
@@ -526,9 +719,20 @@ mod dist_release_contract {
                 "signed_subjects=(\"${expected_payloads[@]}\" SHA256SUMS)",
                 "\"$COSIGN_BIN\" sign-blob --yes --bundle \"${subject}.sigstore.json\" \"$subject\"",
                 "\"$COSIGN_BIN\" verify-blob \\",
+                "--new-bundle-format \\",
                 "expected_release_assets=(\"${signed_subjects[@]}\")",
-                "- name: Revalidate release tag immediately before publication",
-                "- name: Create GitHub Release",
+                "- name: Revalidate release tag immediately before signed handoff",
+                "- name: Upload signed release envelope",
+                "  release:",
+                "- name: Download signed release envelope",
+                "- name: Re-census and verify signed release envelope",
+                "- name: Revalidate tag and prepare isolated draft",
+                "- name: Upload exact assets to draft release",
+                "overwrite_files: false",
+                "- name: Verify draft bytes, finalize, and verify public census",
+                "draft_assets=\"$(assert_release_state_and_census true)\"",
+                "gh api --method PATCH \\",
+                "published_assets=\"$(assert_release_state_and_census false)\"",
             ],
         )?;
 
@@ -623,6 +827,7 @@ mod dist_release_contract {
                 &workflow,
                 "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64",
                 "https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64",
+            ),
             mutate(
                 &workflow,
                 "curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \\",

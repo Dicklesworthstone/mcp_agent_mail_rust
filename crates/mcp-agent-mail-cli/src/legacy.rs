@@ -745,10 +745,10 @@ fn run_legacy_import(opts: ImportOptions, fmt: output::CliOutputFormat) -> CliRe
 
 fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
     let root = resolve_search_root(opts.search_root.clone());
-    let db_resolved = resolve_database_path(&root, opts.db.as_deref())?;
-    let storage_resolved = resolve_storage_root(&root, opts.storage_root.as_deref())?;
-    let source_db = db_resolved.path;
-    let source_storage = storage_resolved.path;
+    let resolved =
+        resolve_legacy_authorities(&root, opts.db.as_deref(), opts.storage_root.as_deref())?;
+    let source_db = resolved.database.path.clone();
+    let source_storage = resolved.storage.path.clone();
     if !source_db.exists() {
         return Err(CliError::InvalidArgument(format!(
             "source DB missing: {}",
@@ -826,12 +826,7 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
     } else {
         Some(LegacySourceSnapshot::capture(&source_db)?)
     };
-    let detect = build_detect_report_with_source_snapshot(
-        &root,
-        opts.db.as_deref(),
-        opts.storage_root.as_deref(),
-        source_snapshot.as_ref(),
-    )?;
+    let detect = build_detect_report_from_resolved(&root, &resolved, source_snapshot.as_ref())?;
     if opts.auto && !detect.detected {
         return Err(CliError::InvalidArgument(
             "no legacy installation detected; run `am legacy detect` to inspect details"
@@ -1250,17 +1245,18 @@ fn build_detect_report(
     explicit_db: Option<&Path>,
     explicit_storage_root: Option<&Path>,
 ) -> CliResult<LegacyDetectReport> {
-    build_detect_report_with_source_snapshot(search_root, explicit_db, explicit_storage_root, None)
+    let resolved =
+        resolve_legacy_authorities(search_root, explicit_db, explicit_storage_root)?;
+    build_detect_report_from_resolved(search_root, &resolved, None)
 }
 
-fn build_detect_report_with_source_snapshot(
+fn build_detect_report_from_resolved(
     search_root: &Path,
-    explicit_db: Option<&Path>,
-    explicit_storage_root: Option<&Path>,
+    resolved: &ResolvedLegacyAuthorities,
     source_snapshot: Option<&LegacySourceSnapshot>,
 ) -> CliResult<LegacyDetectReport> {
-    let db_resolved = resolve_database_path(search_root, explicit_db)?;
-    let storage_resolved = resolve_storage_root(search_root, explicit_storage_root)?;
+    let db_resolved = &resolved.database;
+    let storage_resolved = &resolved.storage;
 
     let mut markers = Vec::new();
     if let Some(marker) = detect_pyproject_marker(search_root) {
@@ -1285,7 +1281,7 @@ fn build_detect_report_with_source_snapshot(
             path: Some(search_root.join(".venv").display().to_string()),
         });
     }
-    if let Some(marker) = detect_env_marker(search_root) {
+    if let Some(marker) = detect_env_marker(&resolved.env) {
         markers.push(marker);
     }
     if db_resolved.exists {
@@ -1308,7 +1304,7 @@ fn build_detect_report_with_source_snapshot(
     let db_signature = if !db_resolved.exists {
         None
     } else if let Some(snapshot) = source_snapshot {
-        if snapshot.original_path() != db_resolved.path {
+        if snapshot.original_path() != db_resolved.path.as_path() {
             return Err(CliError::Other(format!(
                 "legacy detector snapshot source {} does not match resolved database {}",
                 snapshot.original_path().display(),
@@ -1417,14 +1413,14 @@ fn build_detect_report_with_source_snapshot(
             path: db_resolved.path.display().to_string(),
             source: db_resolved.source,
             exists: db_resolved.exists,
-            raw_value: db_resolved.raw_value,
+            raw_value: db_resolved.raw_value.clone(),
             error: None,
         },
         storage_root: ResolvedPathInfo {
             path: storage_resolved.path.display().to_string(),
             source: storage_resolved.source,
             exists: storage_resolved.exists,
-            raw_value: storage_resolved.raw_value,
+            raw_value: storage_resolved.raw_value.clone(),
             error: None,
         },
         markers,
@@ -1915,12 +1911,8 @@ fn parse_database_value(
     })
 }
 
-fn read_env_file_map(path: &Path) -> BTreeMap<String, String> {
+fn parse_env_file_map(text: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    let text = match fs::read_to_string(path) {
-        Ok(v) => v,
-        Err(_) => return out,
-    };
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -1950,30 +1942,87 @@ fn read_env_file_map(path: &Path) -> BTreeMap<String, String> {
     out
 }
 
-fn discover_user_env_file_from(home: &Path, native_config_dir: Option<&Path>) -> Option<PathBuf> {
-    let mut candidates = Vec::with_capacity(6);
-    for dir in [
-        Some(home.join(".config").join("mcp-agent-mail")),
-        native_config_dir.map(Path::to_path_buf),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        for file_name in ["config.env", ".env"] {
-            let candidate = dir.join(file_name);
-            if !candidates.iter().any(|existing| existing == &candidate) {
-                candidates.push(candidate);
-            }
-        }
-    }
-    candidates.push(home.join(".mcp_agent_mail").join(".env"));
-    candidates.push(home.join("mcp_agent_mail").join(".env"));
-    candidates.into_iter().find(|path| path.is_file())
+fn capture_legacy_env_snapshot(search_root: &Path) -> CliResult<LegacyEnvSnapshot> {
+    let user_candidates = user_env_authority_candidates();
+    capture_legacy_env_snapshot_with_reader(
+        search_root,
+        &user_candidates,
+        read_env_authority_text,
+    )
 }
 
-fn discover_user_env_file() -> Option<PathBuf> {
-    let home = home_dir()?;
-    discover_user_env_file_from(&home, None)
+fn capture_legacy_env_snapshot_with_reader(
+    search_root: &Path,
+    user_candidates: &[PathBuf],
+    mut read_authority: impl FnMut(&Path) -> std::io::Result<Option<String>>,
+) -> CliResult<LegacyEnvSnapshot> {
+    let project_path = search_root.join(".env");
+    let project_text = read_legacy_env_authority(&project_path, &mut read_authority)?;
+
+    let mut selected_user: Option<(usize, String)> = None;
+    for (index, path) in user_candidates.iter().enumerate() {
+        if let Some(text) = read_legacy_env_authority(path, &mut read_authority)? {
+            selected_user = Some((index, text));
+            break;
+        }
+    }
+
+    // A single import plan must never combine values obtained on separate,
+    // drifting path lookups. Re-probe every authority that influenced
+    // precedence before returning the parsed snapshot. The low-level reader
+    // independently binds each present file and its parent while reading it.
+    require_unchanged_env_authority(
+        &project_path,
+        project_text.as_deref(),
+        &mut read_authority,
+    )?;
+    let user_probe_len = selected_user
+        .as_ref()
+        .map_or(user_candidates.len(), |(index, _)| index + 1);
+    for (index, path) in user_candidates.iter().take(user_probe_len).enumerate() {
+        let expected = selected_user
+            .as_ref()
+            .filter(|(selected_index, _)| *selected_index == index)
+            .map(|(_, text)| text.as_str());
+        require_unchanged_env_authority(path, expected, &mut read_authority)?;
+    }
+
+    let project = project_text.map(|text| EnvAuthoritySnapshot {
+        path: project_path,
+        values: parse_env_file_map(&text),
+    });
+    let user = selected_user.map(|(index, text)| EnvAuthoritySnapshot {
+        path: user_candidates[index].clone(),
+        values: parse_env_file_map(&text),
+    });
+    Ok(LegacyEnvSnapshot { project, user })
+}
+
+fn read_legacy_env_authority(
+    path: &Path,
+    read_authority: &mut impl FnMut(&Path) -> std::io::Result<Option<String>>,
+) -> CliResult<Option<String>> {
+    read_authority(path).map_err(|error| {
+        CliError::InvalidArgument(format!(
+            "refusing unsafe legacy environment authority {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn require_unchanged_env_authority(
+    path: &Path,
+    expected: Option<&str>,
+    read_authority: &mut impl FnMut(&Path) -> std::io::Result<Option<String>>,
+) -> CliResult<()> {
+    let observed = read_legacy_env_authority(path, read_authority)?;
+    if observed.as_deref() != expected {
+        return Err(CliError::InvalidArgument(format!(
+            "legacy environment authority {} changed while capturing one import snapshot",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn resolve_search_root(search_root: Option<PathBuf>) -> PathBuf {
@@ -2425,15 +2474,10 @@ mod tests {
     }
 
     #[test]
-    fn read_env_file_map_parses_key_values() {
-        let tmp = tempfile::tempdir().unwrap();
-        let env = tmp.path().join(".env");
-        fs::write(
-            &env,
+    fn parse_env_file_map_parses_key_values() {
+        let map = parse_env_file_map(
             "DATABASE_URL=sqlite+aiosqlite:///./storage.sqlite3\nSTORAGE_ROOT=~/.mcp_agent_mail_git_mailbox_repo\n",
-        )
-        .unwrap();
-        let map = read_env_file_map(&env);
+        );
         assert_eq!(
             map.get("DATABASE_URL").unwrap(),
             "sqlite+aiosqlite:///./storage.sqlite3"
@@ -2445,16 +2489,10 @@ mod tests {
     }
 
     #[test]
-    fn read_env_file_map_parses_export_prefix() {
-        let tmp = tempfile::tempdir().unwrap();
-        let env = tmp.path().join(".env");
-        fs::write(
-            &env,
+    fn parse_env_file_map_parses_export_prefix() {
+        let map = parse_env_file_map(
             "export DATABASE_URL=sqlite+aiosqlite:///./storage.sqlite3\nexport STORAGE_ROOT=~/mailbox\n",
-        )
-        .unwrap();
-
-        let map = read_env_file_map(&env);
+        );
         assert_eq!(
             map.get("DATABASE_URL").unwrap(),
             "sqlite+aiosqlite:///./storage.sqlite3"
@@ -2463,16 +2501,10 @@ mod tests {
     }
 
     #[test]
-    fn read_env_file_map_parses_export_with_tabs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let env = tmp.path().join(".env");
-        fs::write(
-            &env,
+    fn parse_env_file_map_parses_export_with_tabs() {
+        let map = parse_env_file_map(
             "export\tDATABASE_URL=sqlite+aiosqlite:///./tabbed.sqlite3\n",
-        )
-        .unwrap();
-
-        let map = read_env_file_map(&env);
+        );
         assert_eq!(
             map.get("DATABASE_URL").unwrap(),
             "sqlite+aiosqlite:///./tabbed.sqlite3"
@@ -2560,7 +2592,7 @@ mod tests {
     }
 
     #[test]
-    fn discover_user_env_file_prefers_portable_installer_path_on_macos() {
+    fn legacy_env_snapshot_prefers_first_user_authority_candidate() {
         let tmp = tempfile::tempdir().unwrap();
         let portable = tmp.path().join(".config/mcp-agent-mail");
         let native = tmp
@@ -2580,9 +2612,26 @@ mod tests {
         )
         .unwrap();
 
-        let selected =
-            discover_user_env_file_from(tmp.path(), Some(&native)).expect("selected env file");
-        assert_eq!(selected, portable.join("config.env"));
+        let portable_env = portable.join("config.env");
+        let native_env = native.join("config.env");
+        let snapshot = capture_legacy_env_snapshot_with_reader(
+            tmp.path(),
+            &[portable_env.clone(), native_env],
+            read_env_authority_text,
+        )
+        .expect("capture env snapshot");
+        assert_eq!(
+            snapshot.user.as_ref().map(|authority| &authority.path),
+            Some(&portable_env)
+        );
+        assert_eq!(
+            snapshot
+                .user
+                .as_ref()
+                .and_then(|authority| authority.values.get("DATABASE_URL"))
+                .map(String::as_str),
+            Some("sqlite:////portable.sqlite3")
+        );
     }
 
     #[test]

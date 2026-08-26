@@ -227,6 +227,10 @@ $destDir = Join-Path $root "dest"
 New-Item -ItemType Directory -Path $srcDir -Force | Out-Null
 New-Item -ItemType Directory -Path $destDir -Force | Out-Null
 try {
+    $normalizedDest = Assert-SafeInstallDirectory -InstallDir ($destDir + [IO.Path]::DirectorySeparatorChar)
+    if ($normalizedDest -cne $destDir) {
+        throw "install directory normalization retained a trailing separator"
+    }
     $amSrc = Join-Path $srcDir "am.exe"
     $serverSrc = Join-Path $srcDir "mcp-agent-mail.exe"
     Set-Content -LiteralPath $amSrc -Value "new-am" -NoNewline

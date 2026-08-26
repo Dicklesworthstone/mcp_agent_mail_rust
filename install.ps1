@@ -486,6 +486,9 @@ function Assert-SafeInstallDirectory {
     if ([string]::IsNullOrWhiteSpace($root)) {
         throw "Install directory has no filesystem root: $InstallDir"
     }
+    if ($fullPath.Length -gt $root.Length) {
+        $fullPath = $fullPath.TrimEnd([char[]]@('\', '/'))
+    }
     $current = $root
     $relative = $fullPath.Substring($root.Length)
     foreach ($segment in ($relative -split '[\\/]')) {
@@ -512,14 +515,23 @@ function Enter-InstallerMutex {
         [int]$TimeoutMilliseconds = 30000
     )
 
+    $normalizedPath = [System.IO.Path]::GetFullPath($InstallDir)
+    $pathRoot = [System.IO.Path]::GetPathRoot($normalizedPath)
+    if ($normalizedPath.Length -gt $pathRoot.Length) {
+        $normalizedPath = $normalizedPath.TrimEnd([char[]]@('\', '/'))
+    }
+
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
-        $bytes = [Text.Encoding]::UTF8.GetBytes($InstallDir.ToLowerInvariant())
+        $bytes = [Text.Encoding]::UTF8.GetBytes($normalizedPath.ToLowerInvariant())
         $digest = ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join ""
     } finally {
         $sha.Dispose()
     }
-    $mutex = [Threading.Mutex]::new($false, "Local\mcp-agent-mail-install-$digest")
+    # The Global namespace coordinates local-console and RDP sessions that can
+    # write the same per-user destination. The path digest keeps unrelated
+    # destinations independent.
+    $mutex = [Threading.Mutex]::new($false, "Global\mcp-agent-mail-install-$digest")
     $acquired = $false
     try {
         try {
