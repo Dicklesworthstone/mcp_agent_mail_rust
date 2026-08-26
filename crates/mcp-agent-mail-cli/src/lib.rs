@@ -41118,8 +41118,10 @@ mod tests {
 
     #[test]
     fn unsafe_user_env_authority_stops_dispatch_before_side_effects() {
-        let mut config = Config::default();
-        config.user_env_authority_error = Some("unsafe user config authority".to_string());
+        let config = Config {
+            user_env_authority_error: Some("unsafe user config authority".to_string()),
+            ..Config::default()
+        };
         let dispatch_called = std::cell::Cell::new(false);
         let result = dispatch_after_user_env_guard(
             true,
@@ -41295,8 +41297,10 @@ mod tests {
 
     #[test]
     fn unsafe_user_env_authority_skips_service_mailbox_inspection() {
-        let mut config = Config::default();
-        config.user_env_authority_error = Some("unsafe user config authority".to_string());
+        let config = Config {
+            user_env_authority_error: Some("unsafe user config authority".to_string()),
+            ..Config::default()
+        };
         let inspection_called = std::cell::Cell::new(false);
 
         let report = trusted_mailbox_owner_report_with(&config, |_| {

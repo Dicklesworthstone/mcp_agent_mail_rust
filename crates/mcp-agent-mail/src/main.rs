@@ -1326,8 +1326,10 @@ mod tests {
 
     #[test]
     fn unsafe_user_env_authority_rejects_before_port_probe() {
-        let mut config = Config::default();
-        config.user_env_authority_error = Some("unsafe user config authority".to_string());
+        let config = Config {
+            user_env_authority_error: Some("unsafe user config authority".to_string()),
+            ..Config::default()
+        };
         let mut probe_called = false;
 
         let error = validate_then_decide_reuse_preflight(&config, false, || {
