@@ -328,4 +328,112 @@ try {
 }
 '
 
+e2e_case_banner "5) Sigstore verification isolates trust and forces the modern parser"
+run_pwsh_case \
+    "case_05_sigstore_isolation" \
+    "Verify-SigstoreBundle clears custom trust only for cosign and restores caller state" \
+'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $InstallPath,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -gt 0) {
+    throw "failed to parse install.ps1"
+}
+function Load-InstallFunction([string]$Name) {
+    $fnAst = $ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+    }, $true) | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+    if ($null -eq $fnAst) {
+        throw "function not found: $Name"
+    }
+    Invoke-Expression ("function global:{0} {1}" -f $Name, $fnAst.Body.Extent.Text)
+}
+foreach ($name in @(
+    "Write-Info",
+    "Write-Ok",
+    "Invoke-VersionProbeBounded",
+    "Assert-SafeCosignVersion",
+    "Get-SafeCosignPath",
+    "Verify-SigstoreBundle"
+)) {
+    Load-InstallFunction $name
+}
+
+$root = Join-Path ([System.IO.Path]::GetTempPath()) ("am-sigstore-test-" + [Guid]::NewGuid().ToString("N"))
+$binDir = Join-Path $root "bin"
+$workDir = Join-Path $root "work"
+New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+try {
+    $shimPath = Join-Path $binDir "cosign"
+    $shimContent = @"
+#!/usr/bin/env pwsh
+if (`$args.Count -eq 1 -and `$args[0] -eq "version") {
+    Write-Output "GitVersion: v`$env:COSIGN_VERSION_OUTPUT"
+    exit 0
+}
+foreach (`$name in @("SIGSTORE_ROOT_FILE", "SIGSTORE_REKOR_PUBLIC_KEY", "SIGSTORE_CT_LOG_PUBLIC_KEY_FILE")) {
+    if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable(`$name, "Process"))) {
+        Write-Error "custom trust environment leaked: `$name"
+        exit 43
+    }
+}
+[IO.File]::WriteAllText(`$env:COSIGN_TEST_LOG, (`$args -join [Environment]::NewLine))
+exit 0
+"@
+    [IO.File]::WriteAllText($shimPath, $shimContent, [Text.UTF8Encoding]::new($false))
+    $chmod = Get-Command chmod -CommandType Application -ErrorAction Stop
+    & $chmod.Source +x $shimPath
+
+    $env:Path = "$binDir$([IO.Path]::PathSeparator)$env:Path"
+    $env:COSIGN_VERSION_OUTPUT = "3.1.3"
+    $env:COSIGN_TEST_LOG = Join-Path $root "cosign.log"
+    $trustValues = @{
+        SIGSTORE_ROOT_FILE = "attacker-root"
+        SIGSTORE_REKOR_PUBLIC_KEY = "attacker-rekor"
+        SIGSTORE_CT_LOG_PUBLIC_KEY_FILE = "attacker-ctfe"
+    }
+    foreach ($entry in $trustValues.GetEnumerator()) {
+        [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+    }
+
+    function global:Download-File {
+        param([string]$Url, [string]$OutFile)
+        Set-Content -LiteralPath $OutFile -Value "{`"mediaType`":`"application/vnd.dev.sigstore.bundle.v0.3+json`"}" -NoNewline
+    }
+    $artifact = Join-Path $root "release.zip"
+    Set-Content -LiteralPath $artifact -Value "artifact" -NoNewline
+    $global:CosignIdentity = "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/v9.9.9"
+    $global:CosignOidcIssuer = "https://token.actions.githubusercontent.com"
+
+    Verify-SigstoreBundle `
+        -FilePath $artifact `
+        -AssetUrl "https://example.invalid/release.zip" `
+        -WorkDir $workDir
+
+    foreach ($entry in $trustValues.GetEnumerator()) {
+        $restored = [Environment]::GetEnvironmentVariable($entry.Key, "Process")
+        if ($restored -cne $entry.Value) {
+            throw "trust environment was not restored: $($entry.Key)"
+        }
+    }
+    $cosignArgs = Get-Content -LiteralPath $env:COSIGN_TEST_LOG -Raw
+    if ($cosignArgs -notmatch "(?m)^--new-bundle-format$") {
+        throw "cosign did not receive --new-bundle-format"
+    }
+    if ($cosignArgs -notmatch [regex]::Escape($global:CosignIdentity)) {
+        throw "cosign did not receive the exact certificate identity"
+    }
+} finally {
+    if (Test-Path -LiteralPath $root) {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+'
+
 e2e_summary

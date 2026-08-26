@@ -19,9 +19,9 @@
 #   --quiet            Suppress non-error output
 #   --verbose          Enable detailed installer diagnostics
 #   --no-gum           Disable gum formatting even if available
-#   --no-verify        UNSAFE: skip checksum + signature checks (shape/version checks remain)
+#   --no-verify        UNSAFE: downloaded code executes without cryptographic verification
 #   --offline          Skip network preflight checks
-#   --force            Force reinstall even if already at version
+#   --force            Reinstall without probing the already-installed version
 #   --migrate          Force Python->Rust migration/displacement when Python install detected
 #   --no-migrate       Skip and remember Python->Rust migration/displacement
 #   --no-service       Do not install/modify/restart any background service
@@ -6784,8 +6784,9 @@ Options:
   --no-gum           Disable gum formatting even if available
   --no-verify        UNSAFE: skip checksum + Sigstore checks; archive shape and
                      exact staged/installed version checks remain mandatory
-                     (only for a trusted local artifact)
-  --force            Force reinstall even if same version is installed
+                     Downloaded binaries execute during those version probes;
+                     malicious bytes can run arbitrary code (trusted artifacts only)
+  --force            Reinstall without probing the already-installed version
   --migrate          Force Python->Rust migration/displacement when Python install is detected
   --no-migrate       Skip and remember Python->Rust migration/displacement
   --no-service       Do not install/modify/restart any background service

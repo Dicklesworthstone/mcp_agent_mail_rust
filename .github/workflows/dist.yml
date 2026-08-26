@@ -625,6 +625,7 @@ jobs:
               "$COSIGN_BIN" sign-blob --yes --bundle "${subject}.sigstore.json" "$subject"
               test -s "${subject}.sigstore.json"
               "$COSIGN_BIN" verify-blob \
+                --new-bundle-format \
                 --bundle "${subject}.sigstore.json" \
                 --certificate-identity "$expected_certificate_identity" \
                 --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
@@ -655,7 +656,7 @@ jobs:
             exit 1
           fi
 
-      - name: Revalidate release tag immediately before publication
+      - name: Revalidate release tag immediately before signed handoff
         env:
           EXPECTED_REVISION: ${{ needs.release_contract.outputs.revision }}
           RELEASE_TAG: ${{ needs.release_contract.outputs.tag }}
@@ -773,6 +774,7 @@ jobs:
             (
               unset SIGSTORE_ROOT_FILE SIGSTORE_REKOR_PUBLIC_KEY SIGSTORE_CT_LOG_PUBLIC_KEY_FILE
               "$COSIGN_BIN" verify-blob \
+                --new-bundle-format \
                 --bundle "${subject}.sigstore.json" \
                 --certificate-identity "$expected_certificate_identity" \
                 --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
@@ -971,7 +973,7 @@ jobs:
                 --arg tag "$RELEASE_TAG" \
                 --argjson draft "$expected_draft" \
                 --argjson prerelease "$EXPECTED_PRERELEASE" \
-                '.id == $id and .tag_name == $tag and .draft == $draft and .prerelease == $prerelease' \
+                '.id == $id and .tag_name == $tag and .name == $tag and .draft == $draft and .prerelease == $prerelease' \
                 >/dev/null <<< "$release_json"; then
               echo "Release state does not match the expected tag, id, draft, and prerelease contract" >&2
               exit 1
@@ -997,6 +999,10 @@ jobs:
           assert_tag_revision
           draft_assets="$(assert_release_state_and_census true)"
           while IFS=$'\t' read -r asset_id asset_name asset_size; do
+            if [[ ! "$asset_id" =~ ^[0-9]+$ ]] || [[ ! "$asset_size" =~ ^[0-9]+$ ]]; then
+              echo "Draft returned malformed asset metadata" >&2
+              exit 1
+            fi
             local_size="$(stat --format='%s' "publish/$asset_name")"
             if [ "$asset_size" != "$local_size" ]; then
               echo "Draft asset size differs from local ${asset_name}" >&2
@@ -1025,6 +1031,10 @@ jobs:
           assert_tag_revision
           published_assets="$(assert_release_state_and_census false)"
           while IFS=$'\t' read -r asset_name asset_size; do
+            if [[ ! "$asset_size" =~ ^[0-9]+$ ]]; then
+              echo "Published release returned malformed asset metadata" >&2
+              exit 1
+            fi
             local_size="$(stat --format='%s' "publish/$asset_name")"
             if [ "$asset_size" != "$local_size" ]; then
               echo "Published asset size differs from local ${asset_name}" >&2

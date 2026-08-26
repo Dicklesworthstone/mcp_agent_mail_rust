@@ -265,8 +265,24 @@ mod dist_release_contract {
     const DOWNLOAD_ACTION: &str =
         "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093";
     const RELEASE_ACTION: &str =
-        "softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe";
+        "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65";
     const BEADS_RUST_COMMIT: &str = "a3f89e6624661259ffa73f876d105656c5b5246e";
+    const RELEASE_TARGETS: [&str; 6] = [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+    ];
+    const RELEASE_ARCHIVES: [&str; 6] = [
+        "mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz",
+        "mcp-agent-mail-x86_64-unknown-linux-musl.tar.xz",
+        "mcp-agent-mail-aarch64-unknown-linux-gnu.tar.xz",
+        "mcp-agent-mail-x86_64-apple-darwin.tar.xz",
+        "mcp-agent-mail-aarch64-apple-darwin.tar.xz",
+        "mcp-agent-mail-x86_64-pc-windows-msvc.zip",
+    ];
 
     fn workspace_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -342,8 +358,8 @@ mod dist_release_contract {
                 return Err(format!("action on line {} has an empty pin comment", line_index + 1));
             }
         }
-        if action_count != 11 {
-            return Err(format!("expected 11 pinned actions, found {action_count}"));
+        if action_count != 13 {
+            return Err(format!("expected 13 pinned actions, found {action_count}"));
         }
         Ok(())
     }

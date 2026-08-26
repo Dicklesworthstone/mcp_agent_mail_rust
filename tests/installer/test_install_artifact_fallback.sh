@@ -897,7 +897,7 @@ ps_gate_end_line=$(awk -v first="$ps_sigstore_line" -v last="$ps_members_line" \
     'NR > first && NR < last && $0 == "    }" { line = NR } END { print line }' "$INSTALL_PS1")
 ps_staged_version_line=$(grep -nF 'Assert-ExactBinaryVersion -BinaryPath $amSource -ExpectedOutput "am $requestedNormalized" -Phase "Staged"' "$INSTALL_PS1" | cut -d: -f1)
 ps_replace_line=$(grep -nF '    Install-BinariesAtomically `' "$INSTALL_PS1" | cut -d: -f1)
-ps_post_version_line=$(grep -nF 'Verify-Install -InstallDir $Dest -ExpectedVersion $requestedNormalized' "$INSTALL_PS1" | cut -d: -f1)
+ps_post_version_line=$(grep -nF 'Verify-Install -InstallDir $VerifiedInstallDir -ExpectedVersion $requestedNormalized' "$INSTALL_PS1" | cut -d: -f1)
 ps_callback_line=$(grep -nF '& $PostInstallVerifier $InstallDir' "$INSTALL_PS1" | cut -d: -f1)
 ps_commit_line=$(grep -nF '        $committed = $true' "$INSTALL_PS1" | cut -d: -f1)
 ps_backup_cleanup_line=$(grep -nF '        if ($committed) {' "$INSTALL_PS1" | cut -d: -f1)
