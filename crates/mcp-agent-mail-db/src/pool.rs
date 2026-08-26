@@ -13420,9 +13420,7 @@ pub fn get_cached_pool(config: &DbPoolConfig) -> Option<DbPool> {
     DbPool::from_shared_pool_with_authority(config, shared_pool, false, authority).ok()
 }
 
-fn compatible_cached_memory_pool(
-    authority: &DbPoolAuthority,
-) -> Option<Arc<Pool<DbConn>>> {
+fn compatible_cached_memory_pool(authority: &DbPoolAuthority) -> Option<Arc<Pool<DbConn>>> {
     if authority.sqlite_identity.is_some() {
         return None;
     }
