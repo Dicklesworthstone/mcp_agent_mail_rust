@@ -812,44 +812,56 @@ pub fn save_token_to_env_file(env_path: &Path, token: &str) -> Result<(), SetupE
         return Err(SetupError::Other("Token must not contain newlines".into()));
     }
     ensure_setup_parent_dir(env_path, "token env file")?;
-    validate_setup_file_target(env_path, "token env file")?;
+    with_secret_config_git_protection(env_path, |authority| {
+        validate_setup_file_target(env_path, "token env file")?;
 
-    // Keep token reads under the same no-follow, regular-file-only contract as
-    // setup config reads. An `exists()` + `read_to_string()` pair leaves a
-    // symlink/FIFO substitution window between validation and the read.
-    let existing_content = read_setup_file(env_path, "token env file")?.map(|(content, _)| content);
+        // Keep token reads under the same no-follow, regular-file-only contract as
+        // setup config reads. An `exists()` + `read_to_string()` pair leaves a
+        // symlink/FIFO substitution window between validation and the read.
+        let existing_file =
+            read_setup_file_with_authority(env_path, "token env file", Some(authority))?;
+        let existing_content = existing_file
+            .as_ref()
+            .map(|snapshot| snapshot.content.as_str());
 
-    let content = existing_content.as_deref().map_or_else(
-        || format!("HTTP_BEARER_TOKEN={token}\n"),
-        |existing| {
-            let mut found = false;
-            let updated: Vec<String> = existing
-                .lines()
-                .map(|line| {
-                    if line.trim_start().starts_with("HTTP_BEARER_TOKEN=") {
-                        found = true;
-                        format!("HTTP_BEARER_TOKEN={token}")
-                    } else {
-                        line.to_string()
-                    }
-                })
-                .collect();
-            if found {
-                updated.join("\n") + "\n"
-            } else {
-                let sep = if existing.ends_with('\n') { "" } else { "\n" };
-                format!("{existing}{sep}HTTP_BEARER_TOKEN={token}\n")
-            }
-        },
-    );
+        let content = existing_content.map_or_else(
+            || format!("HTTP_BEARER_TOKEN={token}\n"),
+            |existing| {
+                let mut found = false;
+                let updated: Vec<String> = existing
+                    .lines()
+                    .map(|line| {
+                        if line.trim_start().starts_with("HTTP_BEARER_TOKEN=") {
+                            found = true;
+                            format!("HTTP_BEARER_TOKEN={token}")
+                        } else {
+                            line.to_string()
+                        }
+                    })
+                    .collect();
+                if found {
+                    updated.join("\n") + "\n"
+                } else {
+                    let sep = if existing.ends_with('\n') { "" } else { "\n" };
+                    format!("{existing}{sep}HTTP_BEARER_TOKEN={token}\n")
+                }
+            },
+        );
 
-    ensure_secret_config_not_git_tracked(env_path)?;
-    // Always replace the destination atomically, even when its bytes already
-    // match.  Content equality says nothing about the credential file's mode
-    // or link topology: an idempotent setup run must still repair a
-    // world-readable file and detach an attacker-controlled hard link.
-    write_setup_file_atomic(env_path, content.as_bytes(), 0o600, "token env file")?;
-    Ok(())
+        // Always replace the destination atomically, even when its bytes already
+        // match. Content equality says nothing about the credential file's mode
+        // or link topology: an idempotent setup run must still repair a
+        // world-readable file and detach an attacker-controlled hard link.
+        write_setup_file_atomic_with_authority(
+            env_path,
+            content.as_bytes(),
+            0o600,
+            "token env file",
+            existing_file.as_ref(),
+            false,
+            Some(authority),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -894,6 +906,7 @@ pub fn merge_mcp_server(
 /// reports success while OMP still suppresses Agent Mail. Keep the generic
 /// JSON merge policy unchanged for other clients and reconcile OMP's native
 /// enablement contract only for OMP actions.
+#[allow(clippy::too_many_lines)]
 fn merge_omp_mcp_server(
     existing: Option<&str>,
     server_name: &str,
@@ -1207,15 +1220,10 @@ pub fn ensure_gitignore_entries(
 ) -> Result<bool, SetupError> {
     ensure_setup_parent_dir(gitignore_path, "gitignore file")?;
     validate_setup_file_target(gitignore_path, "gitignore file")?;
-    let existing = match setup_read_file_options().open(gitignore_path) {
-        Ok(mut file) => {
-            let mut content = String::new();
-            file.read_to_string(&mut content)?;
-            content
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error.into()),
-    };
+    let existing_file = read_setup_file(gitignore_path, "gitignore file")?;
+    let existing = existing_file
+        .as_ref()
+        .map_or_else(String::new, |snapshot| snapshot.content.clone());
     let existing_lines: Vec<&str> = existing.lines().collect();
 
     let mut new_lines = Vec::new();
@@ -1238,7 +1246,14 @@ pub fn ensure_gitignore_entries(
         content.push('\n');
     }
 
-    write_setup_file_atomic(gitignore_path, content.as_bytes(), 0o644, "gitignore file")?;
+    write_setup_file_atomic(
+        gitignore_path,
+        content.as_bytes(),
+        0o644,
+        "gitignore file",
+        existing_file.as_ref(),
+        false,
+    )?;
     Ok(true)
 }
 
@@ -1590,6 +1605,7 @@ fn omp_claude_user_base(params: &SetupParams, home: &Path) -> Result<(PathBuf, P
     Ok((home.join(".claude.json"), home.join(".claude")))
 }
 
+#[allow(clippy::too_many_lines)]
 fn omp_mcp_authority_sources(params: &SetupParams) -> Vec<OmpMcpAuthoritySource> {
     use OmpMcpAuthorityFormat::{
         CodexToml, Native, OpenCodeJsonc, Standalone, StandardJson, Unsupported, VsCodeJson,
@@ -1664,7 +1680,7 @@ fn omp_mcp_authority_sources(params: &SetupParams) -> Vec<OmpMcpAuthoritySource>
                 );
             }
             Err(path) => {
-                push_omp_mcp_authority_source(&mut sources, path, Unsupported, ClaudeUser, false)
+                push_omp_mcp_authority_source(&mut sources, path, Unsupported, ClaudeUser, false);
             }
         }
     } else {
@@ -1862,17 +1878,17 @@ fn omp_project_settings_paths(params: &SetupParams) -> Vec<PathBuf> {
 #[must_use]
 pub fn omp_settings_authority_paths(params: &SetupParams) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Ok((user_yml, user_yaml)) = omp_active_user_settings_paths(params) {
-        paths.push(user_yml.clone());
-        if user_yml
+    if let Ok((preferred_settings, fallback_settings)) = omp_active_user_settings_paths(params) {
+        paths.push(preferred_settings.clone());
+        if preferred_settings
             .symlink_metadata()
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
         {
-            paths.push(user_yaml.clone());
-            if user_yaml
+            paths.push(fallback_settings.clone());
+            if fallback_settings
                 .symlink_metadata()
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-                && let Some(agent_dir) = user_yml.parent()
+                && let Some(agent_dir) = preferred_settings.parent()
             {
                 paths.push(agent_dir.join("settings.json"));
                 paths.push(agent_dir.join("agent.db"));
@@ -2262,6 +2278,28 @@ impl AgentPlatform {
 // Atomic file writes
 // ---------------------------------------------------------------------------
 
+// Agent configuration files are control-plane inputs, not bulk data. Bound
+// every setup read both before and during I/O so an untrusted sparse or growing
+// file cannot force setup/status to allocate without limit.
+const SETUP_CONFIG_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+fn setup_metadata_is_link_like(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn invalid_setup_path(label: &str, path: &Path, reason: impl fmt::Display) -> SetupError {
     SetupError::Other(format!("{label} {}: {}", reason, path.display()))
 }
@@ -2284,7 +2322,7 @@ fn check_setup_real_directory(
     path: &Path,
     label: &str,
     create_missing: bool,
-) -> Result<(), SetupError> {
+) -> Result<bool, SetupError> {
     ensure_no_parent_traversal(path, label)?;
 
     let mut current = PathBuf::new();
@@ -2298,16 +2336,17 @@ fn check_setup_real_directory(
                 current.push(segment);
                 match std::fs::symlink_metadata(&current) {
                     Ok(metadata) => {
-                        if metadata.file_type().is_symlink()
+                        let link_like = setup_metadata_is_link_like(&metadata);
+                        if link_like
                             && crate::disk::is_trusted_system_directory_alias(&current)
                         {
                             continue;
                         }
-                        if metadata.file_type().is_symlink() {
+                        if link_like {
                             return Err(invalid_setup_path(
                                 label,
                                 &current,
-                                "must not traverse symlinked directories",
+                                "must not traverse symlinked directories or reparse-point directories",
                             ));
                         }
                         if !metadata.file_type().is_dir() {
@@ -2324,26 +2363,32 @@ fn check_setup_real_directory(
                         std::fs::create_dir(&current)?;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(invalid_setup_path(
-                            label,
-                            &current,
-                            "directory component does not exist",
-                        ));
+                        return Ok(false);
                     }
                     Err(error) => return Err(error.into()),
                 }
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn ensure_setup_real_directory(path: &Path, label: &str) -> Result<(), SetupError> {
-    check_setup_real_directory(path, label, true)
+    let present = check_setup_real_directory(path, label, true)?;
+    debug_assert!(present, "create-missing directory walk must end present");
+    Ok(())
 }
 
 fn validate_setup_real_directory(path: &Path, label: &str) -> Result<(), SetupError> {
-    check_setup_real_directory(path, label, false)
+    if check_setup_real_directory(path, label, false)? {
+        Ok(())
+    } else {
+        Err(invalid_setup_path(
+            label,
+            path,
+            "directory component does not exist",
+        ))
+    }
 }
 
 fn ensure_setup_parent_dir(path: &Path, label: &str) -> Result<(), SetupError> {
@@ -2361,8 +2406,13 @@ fn validate_setup_file_target(path: &Path, label: &str) -> Result<(), SetupError
     }
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                return Err(invalid_setup_path(label, path, "must not be a symlink"));
+            let link_like = setup_metadata_is_link_like(&metadata);
+            if link_like {
+                return Err(invalid_setup_path(
+                    label,
+                    path,
+                    "must not be a symlink or reparse point",
+                ));
             }
             if !metadata.file_type().is_file() {
                 return Err(invalid_setup_path(label, path, "must be a file path"));
@@ -2374,6 +2424,7 @@ fn validate_setup_file_target(path: &Path, label: &str) -> Result<(), SetupError
     Ok(())
 }
 
+#[cfg(not(all(unix, any(target_vendor = "apple", target_os = "linux"))))]
 fn setup_new_file_options(permissions: u32) -> std::fs::OpenOptions {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -2387,30 +2438,137 @@ fn setup_new_file_options(permissions: u32) -> std::fs::OpenOptions {
     options
 }
 
-fn setup_read_file_options() -> std::fs::OpenOptions {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-    }
-    options
+#[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+struct SetupDirectoryAuthority {
+    fd: std::os::fd::OwnedFd,
 }
 
-fn read_setup_file(path: &Path, label: &str) -> Result<Option<(String, u32)>, SetupError> {
-    let mut file = match setup_read_file_options().open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+#[cfg(not(all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+struct SetupDirectoryAuthority;
+
+#[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+fn setup_directory_authority_path(path: &Path) -> PathBuf {
+    #[cfg(target_vendor = "apple")]
+    {
+        for (alias, canonical) in [
+            (Path::new("/var"), Path::new("/private/var")),
+            (Path::new("/tmp"), Path::new("/private/tmp")),
+            (Path::new("/etc"), Path::new("/private/etc")),
+        ] {
+            if path.starts_with(alias) && crate::disk::is_trusted_system_directory_alias(alias) {
+                return canonical.join(path.strip_prefix(alias).unwrap_or(Path::new("")));
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
+#[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+fn open_setup_directory_authority(path: &Path) -> std::io::Result<SetupDirectoryAuthority> {
+    use rustix::fs::{CWD, Mode, OFlags, openat};
+
+    let path = setup_directory_authority_path(path);
+    let flags = OFlags::RDONLY
+        | OFlags::CLOEXEC
+        | OFlags::DIRECTORY
+        | OFlags::NOFOLLOW
+        | OFlags::NONBLOCK;
+    let anchor = if path.is_absolute() {
+        Path::new("/")
+    } else {
+        Path::new(".")
     };
+    let mut fd = openat(CWD, anchor, flags, Mode::empty()).map_err(std::io::Error::from)?;
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unsupported Unix setup path prefix in {}", path.display()),
+                ));
+            }
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("parent traversal in setup directory {}", path.display()),
+                ));
+            }
+            std::path::Component::Normal(segment) => {
+                fd = openat(&fd, segment, flags, Mode::empty())
+                    .map_err(std::io::Error::from)?;
+            }
+        }
+    }
+    Ok(SetupDirectoryAuthority { fd })
+}
+
+#[cfg(not(all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+fn open_setup_directory_authority(path: &Path) -> std::io::Result<SetupDirectoryAuthority> {
+    let _ = path;
+    Ok(SetupDirectoryAuthority)
+}
+
+#[derive(Debug)]
+struct SetupFileSnapshot {
+    content: String,
+    permissions: u32,
+    link_count: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn snapshot_open_setup_file(
+    mut file: std::fs::File,
+    path: &Path,
+    label: &str,
+) -> Result<SetupFileSnapshot, SetupError> {
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(invalid_setup_path(label, path, "must be a regular file"));
     }
 
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
+    #[cfg(unix)]
+    let link_count = {
+        use std::os::unix::fs::MetadataExt as _;
+
+        metadata.nlink()
+    };
+    #[cfg(not(unix))]
+    let link_count = 1;
+    if metadata.len() > SETUP_CONFIG_FILE_MAX_BYTES {
+        return Err(invalid_setup_path(
+            label,
+            path,
+            format!(
+                "is {} bytes, exceeding the {}-byte setup config limit",
+                metadata.len(),
+                SETUP_CONFIG_FILE_MAX_BYTES
+            ),
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len().min(64 * 1024)).unwrap_or(64 * 1024),
+    );
+    Read::by_ref(&mut file)
+        .take(SETUP_CONFIG_FILE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > SETUP_CONFIG_FILE_MAX_BYTES {
+        return Err(invalid_setup_path(
+            label,
+            path,
+            "grew beyond the setup config size limit during read",
+        ));
+    }
+    let content = String::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{label} {} is not valid UTF-8: {error}", path.display()),
+        )
+    })?;
 
     #[cfg(unix)]
     let permissions = {
@@ -2420,9 +2578,72 @@ fn read_setup_file(path: &Path, label: &str) -> Result<Option<(String, u32)>, Se
     #[cfg(not(unix))]
     let permissions = 0o777;
 
-    Ok(Some((content, permissions)))
+    Ok(SetupFileSnapshot {
+        content,
+        permissions,
+        link_count,
+        #[cfg(unix)]
+        device: {
+            use std::os::unix::fs::MetadataExt as _;
+            metadata.dev()
+        },
+        #[cfg(unix)]
+        inode: {
+            use std::os::unix::fs::MetadataExt as _;
+            metadata.ino()
+        },
+    })
 }
 
+fn read_setup_file_with_authority(
+    path: &Path,
+    label: &str,
+    authority: Option<&SetupDirectoryAuthority>,
+) -> Result<Option<SetupFileSnapshot>, SetupError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    {
+        let owned_authority;
+        let authority = if let Some(authority) = authority {
+            authority
+        } else {
+            if !parent.as_os_str().is_empty()
+                && !check_setup_real_directory(parent, label, false)?
+            {
+                return Ok(None);
+            }
+            owned_authority = open_setup_directory_authority(parent)?;
+            &owned_authority
+        };
+        revalidate_setup_directory_authority(parent, authority)?;
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| invalid_setup_path(label, path, "must name a file"))?;
+        snapshot_setup_authority_leaf(authority, file_name, path, label)
+    }
+
+    #[cfg(not(all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+    {
+        let _ = authority;
+        if !parent.as_os_str().is_empty()
+            && !check_setup_real_directory(parent, label, false)?
+        {
+            return Ok(None);
+        }
+        let file = match crate::disk::open_regular_file_no_follow(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        snapshot_open_setup_file(file, path, label).map(Some)
+    }
+}
+
+fn read_setup_file(path: &Path, label: &str) -> Result<Option<SetupFileSnapshot>, SetupError> {
+    read_setup_file_with_authority(path, label, None)
+}
+
+#[cfg(not(all(unix, any(target_vendor = "apple", target_os = "linux"))))]
 fn create_unique_setup_file(
     parent: &Path,
     file_name: &str,
@@ -2445,38 +2666,407 @@ fn create_unique_setup_file(
     )))
 }
 
+#[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+fn create_unique_setup_file_at(
+    authority: &SetupDirectoryAuthority,
+    file_name: &str,
+    suffix: &str,
+    permissions: u32,
+) -> Result<(String, std::fs::File), SetupError> {
+    use rustix::fs::{Mode, OFlags, fchmod, openat};
+
+    let pid = std::process::id();
+    let now = crate::timestamps::now_micros();
+    for attempt in 0..1024 {
+        let candidate = format!(".{file_name}.{pid}.{now}.{attempt}.{suffix}");
+        match openat(
+            &authority.fd,
+            candidate.as_str(),
+            OFlags::WRONLY
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::CLOEXEC
+                | OFlags::NOFOLLOW,
+            Mode::from_raw_mode(permissions),
+        ) {
+            Ok(fd) => {
+                let file = std::fs::File::from(fd);
+                fchmod(&file, Mode::from_raw_mode(permissions)).map_err(std::io::Error::from)?;
+                return Ok((candidate, file));
+            }
+            Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => return Err(std::io::Error::from(error).into()),
+        }
+    }
+    Err(SetupError::Other(format!(
+        "could not create unique temporary setup file for {file_name}"
+    )))
+}
+
+#[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+fn snapshot_setup_authority_leaf(
+    authority: &SetupDirectoryAuthority,
+    file_name: &std::ffi::OsStr,
+    display_path: &Path,
+    label: &str,
+) -> Result<Option<SetupFileSnapshot>, SetupError> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let fd = match openat(
+        &authority.fd,
+        file_name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(error) => return Err(std::io::Error::from(error).into()),
+    };
+    snapshot_open_setup_file(std::fs::File::from(fd), display_path, label).map(Some)
+}
+
+#[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+fn setup_snapshots_match(expected: &SetupFileSnapshot, observed: &SetupFileSnapshot) -> bool {
+    expected.content == observed.content
+        && expected.permissions == observed.permissions
+        && expected.link_count == observed.link_count
+        && expected.device == observed.device
+        && expected.inode == observed.inode
+}
+
+#[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+fn revalidate_setup_directory_authority(
+    path: &Path,
+    authority: &SetupDirectoryAuthority,
+) -> Result<(), SetupError> {
+    use rustix::fs::fstat;
+
+    let observed = open_setup_directory_authority(path)?;
+    let expected_stat = fstat(&authority.fd).map_err(std::io::Error::from)?;
+    let observed_stat = fstat(&observed.fd).map_err(std::io::Error::from)?;
+    if expected_stat.st_dev != observed_stat.st_dev || expected_stat.st_ino != observed_stat.st_ino {
+        return Err(invalid_setup_path(
+            "setup directory authority",
+            path,
+            "changed identity during the config transaction",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+fn revalidate_setup_directory_authority(
+    path: &Path,
+    authority: &SetupDirectoryAuthority,
+) -> Result<(), SetupError> {
+    let _ = authority;
+    validate_setup_real_directory(path, "setup directory authority")
+}
+
+#[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+fn retain_exchanged_setup_file(
+    authority: &SetupDirectoryAuthority,
+    temp_name: &str,
+    file_name: &str,
+    suffix: &str,
+) -> Result<(), SetupError> {
+    use rustix::fs::{RenameFlags, renameat_with};
+
+    let pid = std::process::id();
+    let now = crate::timestamps::now_micros();
+    for attempt in 0..1024 {
+        let retained = format!(".{file_name}.{pid}.{now}.{attempt}.{suffix}");
+        match renameat_with(
+            &authority.fd,
+            temp_name,
+            &authority.fd,
+            retained.as_str(),
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => return Err(std::io::Error::from(error).into()),
+        }
+    }
+    Err(SetupError::Other(format!(
+        "could not retain replaced setup file for {file_name}"
+    )))
+}
+
+#[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+fn write_setup_backup_at(
+    authority: &SetupDirectoryAuthority,
+    file_name: &str,
+    content: &[u8],
+    permissions: u32,
+) -> Result<(), SetupError> {
+    use rustix::fs::fsync;
+
+    let (_backup_name, mut output) =
+        create_unique_setup_file_at(authority, file_name, "bak", permissions)?;
+    output.write_all(content)?;
+    output.sync_all()?;
+    drop(output);
+    fsync(&authority.fd).map_err(std::io::Error::from)?;
+    Ok(())
+}
+
+#[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+fn write_setup_file_atomic_bound(
+    path: &Path,
+    content: &[u8],
+    permissions: u32,
+    label: &str,
+    expected: Option<&SetupFileSnapshot>,
+    backup_existing: bool,
+    authority: Option<&SetupDirectoryAuthority>,
+) -> Result<(), SetupError> {
+    write_setup_file_atomic_bound_with_authority_and_hook(
+        path,
+        content,
+        permissions,
+        label,
+        expected,
+        backup_existing,
+        authority,
+        || Ok(()),
+    )
+}
+
+#[cfg(all(
+    test,
+    unix,
+    any(target_vendor = "apple", target_os = "linux")
+))]
+fn write_setup_file_atomic_bound_with_hook(
+    path: &Path,
+    content: &[u8],
+    permissions: u32,
+    label: &str,
+    expected: Option<&SetupFileSnapshot>,
+    backup_existing: bool,
+    before_publish: impl FnOnce() -> Result<(), SetupError>,
+) -> Result<(), SetupError> {
+    write_setup_file_atomic_bound_with_authority_and_hook(
+        path,
+        content,
+        permissions,
+        label,
+        expected,
+        backup_existing,
+        None,
+        before_publish,
+    )
+}
+
+#[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn write_setup_file_atomic_bound_with_authority_and_hook(
+    path: &Path,
+    content: &[u8],
+    permissions: u32,
+    label: &str,
+    expected: Option<&SetupFileSnapshot>,
+    backup_existing: bool,
+    authority: Option<&SetupDirectoryAuthority>,
+    before_publish: impl FnOnce() -> Result<(), SetupError>,
+) -> Result<(), SetupError> {
+    use rustix::fs::{RenameFlags, fsync, renameat_with};
+
+    ensure_setup_parent_dir(path, label)?;
+    validate_setup_file_target(path, label)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| invalid_setup_path(label, path, "must name a file"))?;
+    let display_name = file_name.to_string_lossy();
+    let owned_authority;
+    let authority = if let Some(authority) = authority {
+        authority
+    } else {
+        owned_authority = open_setup_directory_authority(parent)?;
+        &owned_authority
+    };
+    revalidate_setup_directory_authority(parent, authority)?;
+    let (temp_name, mut temp_file) =
+        create_unique_setup_file_at(authority, &display_name, "tmp", permissions)?;
+    temp_file.write_all(content)?;
+    temp_file.sync_all()?;
+    drop(temp_file);
+    revalidate_setup_directory_authority(parent, authority)?;
+    before_publish()?;
+
+    if let Some(expected) = expected {
+        renameat_with(
+            &authority.fd,
+            temp_name.as_str(),
+            &authority.fd,
+            file_name,
+            RenameFlags::EXCHANGE,
+        )
+        .map_err(std::io::Error::from)?;
+        let observed = snapshot_setup_authority_leaf(
+            authority,
+            std::ffi::OsStr::new(&temp_name),
+            path,
+            label,
+        );
+        let observed = match observed {
+            Ok(Some(observed)) if setup_snapshots_match(expected, &observed) => observed,
+            Ok(Some(_) | None) | Err(_) => {
+                renameat_with(
+                    &authority.fd,
+                    temp_name.as_str(),
+                    &authority.fd,
+                    file_name,
+                    RenameFlags::EXCHANGE,
+                )
+                .map_err(std::io::Error::from)?;
+                fsync(&authority.fd).map_err(std::io::Error::from)?;
+                return Err(invalid_setup_path(
+                    label,
+                    path,
+                    "changed identity, content, permissions, or link topology before publication",
+                ));
+            }
+        };
+        if backup_existing
+            && let Err(error) = write_setup_backup_at(
+                authority,
+                &display_name,
+                observed.content.as_bytes(),
+                permissions,
+            )
+        {
+            renameat_with(
+                &authority.fd,
+                temp_name.as_str(),
+                &authority.fd,
+                file_name,
+                RenameFlags::EXCHANGE,
+            )
+            .map_err(std::io::Error::from)?;
+            fsync(&authority.fd).map_err(std::io::Error::from)?;
+            return Err(error);
+        }
+        if let Err(error) = retain_exchanged_setup_file(
+            authority,
+            &temp_name,
+            &display_name,
+            "replaced",
+        ) {
+            renameat_with(
+                &authority.fd,
+                temp_name.as_str(),
+                &authority.fd,
+                file_name,
+                RenameFlags::EXCHANGE,
+            )
+            .map_err(std::io::Error::from)?;
+            fsync(&authority.fd).map_err(std::io::Error::from)?;
+            return Err(error);
+        }
+    } else {
+        renameat_with(
+            &authority.fd,
+            temp_name.as_str(),
+            &authority.fd,
+            file_name,
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(std::io::Error::from)?;
+    }
+
+    fsync(&authority.fd).map_err(std::io::Error::from)?;
+    revalidate_setup_directory_authority(parent, authority)
+}
+
 fn write_setup_file_atomic(
     path: &Path,
     content: &[u8],
     permissions: u32,
     label: &str,
+    expected: Option<&SetupFileSnapshot>,
+    backup_existing: bool,
 ) -> Result<(), SetupError> {
-    ensure_setup_parent_dir(path, label)?;
-    validate_setup_file_target(path, label)?;
-
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| invalid_setup_path(label, path, "must name a file"))?
-        .to_string_lossy();
-    let (temp, mut file) = create_unique_setup_file(parent, &file_name, "tmp", permissions)?;
-    file.write_all(content)?;
-    file.sync_all()?;
-    drop(file);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(permissions))?;
-    }
-
-    validate_setup_file_target(path, label)?;
-    std::fs::rename(&temp, path)?;
-    #[cfg(unix)]
-    std::fs::File::open(parent)?.sync_all()?;
-    Ok(())
+    write_setup_file_atomic_with_authority(
+        path,
+        content,
+        permissions,
+        label,
+        expected,
+        backup_existing,
+        None,
+    )
 }
 
+fn write_setup_file_atomic_with_authority(
+    path: &Path,
+    content: &[u8],
+    permissions: u32,
+    label: &str,
+    expected: Option<&SetupFileSnapshot>,
+    backup_existing: bool,
+    authority: Option<&SetupDirectoryAuthority>,
+) -> Result<(), SetupError> {
+    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    {
+        write_setup_file_atomic_bound(
+            path,
+            content,
+            permissions,
+            label,
+            expected,
+            backup_existing,
+            authority,
+        )
+    }
+
+    #[cfg(not(all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+    {
+        let _ = authority;
+        ensure_setup_parent_dir(path, label)?;
+        validate_setup_file_target(path, label)?;
+
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| invalid_setup_path(label, path, "must name a file"))?
+            .to_string_lossy();
+        let (temp, mut file) = create_unique_setup_file(parent, &file_name, "tmp", permissions)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
+
+        if backup_existing
+            && let Some(existing) = expected
+        {
+            write_setup_backup(
+                existing.content.as_bytes(),
+                parent,
+                &file_name,
+                permissions,
+            )?;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(permissions))?;
+        }
+
+        validate_setup_file_target(path, label)?;
+        std::fs::rename(&temp, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+}
+
+#[cfg(not(all(unix, any(target_vendor = "apple", target_os = "linux"))))]
 fn write_setup_backup(
     content: &[u8],
     backup_parent: &Path,
@@ -2626,7 +3216,7 @@ fn resolve_secret_git_context(
 
 fn verify_secret_gitignore_protection(
     repo_root: &Path,
-    representative_paths: [String; 4],
+    representative_paths: [String; 5],
 ) -> Result<(), SetupError> {
     for representative in representative_paths {
         // `git check-ignore` does not accept the global `--literal-pathspecs`
@@ -2677,6 +3267,7 @@ fn protect_untracked_secret_config(
         format!("/{escaped_relative}"),
         format!("{prefix}.{escaped_basename}.*.tmp"),
         format!("{prefix}.{escaped_basename}.*.bak"),
+        format!("{prefix}.{escaped_basename}.*.replaced"),
         format!("/{escaped_relative}.bak*"),
     ];
     let gitignore = repo_root.join(".gitignore");
@@ -2695,6 +3286,9 @@ fn protect_untracked_secret_config(
                 .trim_start_matches('/')
                 .to_string(),
             format!("{directory}/.{basename}.probe.bak")
+                .trim_start_matches('/')
+                .to_string(),
+            format!("{directory}/.{basename}.probe.replaced")
                 .trim_start_matches('/')
                 .to_string(),
             format!("{relative}.bak"),
@@ -2741,16 +3335,16 @@ fn check_secret_config_git_exposure_locked(
 /// Adding a path to `.gitignore` does not make an already tracked file safe:
 /// the next `git diff` or commit would still expose the credential. This check
 /// therefore refuses tracked targets, then atomically appends anchored ignore
-/// rules for the live file and every adjacent backup/temp name used by setup
-/// and doctor. If Git cannot answer reliably, it fails closed.
+/// rules for the live file and every adjacent backup/temp/replaced name used by
+/// setup and doctor. If Git cannot answer reliably, it fails closed.
 fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Result<(), SetupError> {
     let Some((repo_root, relative)) = resolve_secret_git_context(path, secure_gitignore)? else {
         return Ok(());
     };
-    // Hold one cooperative lock across the tracked-file probe, .gitignore
-    // read/append, and post-write verification. Locking only the individual
-    // Git commands leaves the intervening atomic file rewrite exposed to a
-    // lost-update race between concurrent setup/doctor processes.
+    // Serialize the tracked-file probe and any .gitignore update. Callers that
+    // also mutate credential bytes must use
+    // `with_secret_config_git_protection` so this same authority remains held
+    // through the write and post-write verification.
     let secret_mutex = secure_gitignore.then(|| crate::GitRepoLocks::global().lock_for(&repo_root));
     let _secret_mutex_guard = secret_mutex.as_ref().map(|mutex| {
         mutex
@@ -2780,6 +3374,49 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
     check_secret_config_git_exposure_locked(path, &repo_root, &relative, secure_gitignore)
 }
 
+fn with_secret_config_git_protection<T>(
+    path: &Path,
+    operation: impl FnOnce(&SetupDirectoryAuthority) -> Result<T, SetupError>,
+) -> Result<T, SetupError> {
+    ensure_setup_parent_dir(path, "secret config")?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let authority = open_setup_directory_authority(parent)?;
+    revalidate_setup_directory_authority(parent, &authority)?;
+
+    let Some((repo_root, relative)) = resolve_secret_git_context(path, true)? else {
+        let result = operation(&authority)?;
+        revalidate_setup_directory_authority(parent, &authority)?;
+        return Ok(result);
+    };
+    let secret_mutex = crate::GitRepoLocks::global().lock_for(&repo_root);
+    let _secret_mutex_guard = secret_mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let secret_flock_guard = crate::RepoFlock::acquire(&repo_root).map_err(|error| {
+        SetupError::Other(format!(
+            "cannot serialize secret-config write in {}: {error}",
+            repo_root.display()
+        ))
+    })?;
+    if !secret_flock_guard.is_real() {
+        return Err(SetupError::Other(format!(
+            "cannot serialize secret-config write in {} because its Git lock sentinel is unavailable",
+            repo_root.display()
+        )));
+    }
+
+    check_secret_config_git_exposure_locked(path, &repo_root, &relative, true)?;
+    revalidate_setup_directory_authority(parent, &authority)?;
+    let result = operation(&authority)?;
+    revalidate_setup_directory_authority(parent, &authority)?;
+    check_secret_config_git_exposure_locked(path, &repo_root, &relative, true)?;
+    revalidate_setup_directory_authority(parent, &authority)?;
+    Ok(result)
+}
+
 /// Read-only preflight for a secret-bearing config write.
 pub fn preflight_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupError> {
     check_secret_config_git_exposure(path, false)
@@ -2795,15 +3432,26 @@ pub fn write_config_atomic(
     action: &ConfigAction,
     contains_literal_secret: bool,
 ) -> Result<ActionOutcome, SetupError> {
-    let parent = action.file_path.parent().unwrap_or_else(|| Path::new("."));
+    write_config_atomic_inner(action, contains_literal_secret, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn write_config_atomic_inner(
+    action: &ConfigAction,
+    contains_literal_secret: bool,
+    authority: Option<&SetupDirectoryAuthority>,
+) -> Result<ActionOutcome, SetupError> {
     ensure_setup_parent_dir(&action.file_path, "config file")?;
     validate_setup_file_target(&action.file_path, "config file")?;
 
     // Read through the same no-follow discipline as the write path. Treating
     // an arbitrary read failure as "missing" would let setup overwrite an
     // unreadable or non-UTF config without a backup.
-    let existing_file = read_setup_file(&action.file_path, "config file")?;
-    let existing = existing_file.as_ref().map(|(content, _)| content.clone());
+    let existing_file =
+        read_setup_file_with_authority(&action.file_path, "config file", authority)?;
+    let existing = existing_file
+        .as_ref()
+        .map(|snapshot| snapshot.content.clone());
 
     // Never widen an existing config's permissions. Conversely, when setup is
     // adding a secret to a previously broad file, tighten it to the action's
@@ -2811,23 +3459,26 @@ pub fn write_config_atomic(
     // the pre-update contents.
     let effective_permissions = existing_file
         .as_ref()
-        .map_or(action.permissions, |(_, mode)| {
+        .map_or(action.permissions, |snapshot| {
             #[cfg(unix)]
             {
-                *mode & action.permissions
+                snapshot.permissions & action.permissions
             }
             #[cfg(not(unix))]
             {
-                let _ = mode;
+                let _ = snapshot;
                 action.permissions
             }
         });
     #[cfg(unix)]
     let permissions_need_tightening = existing_file
         .as_ref()
-        .is_some_and(|(_, mode)| *mode != effective_permissions);
+        .is_some_and(|snapshot| snapshot.permissions != effective_permissions);
     #[cfg(not(unix))]
     let permissions_need_tightening = false;
+    let topology_needs_detaching = existing_file
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.link_count != 1);
 
     let new_content = match &action.content {
         ConfigContent::JsonMerge {
@@ -2878,40 +3529,35 @@ pub fn write_config_atomic(
         content.contains("Bearer ") || content.contains("HTTP_BEARER_TOKEN")
     });
     let output_contains_literal_secret = new_content.contains("Bearer ");
-    if contains_literal_secret || existing_may_contain_secret || output_contains_literal_secret {
-        ensure_secret_config_not_git_tracked(&action.file_path)?;
+    let secret_write =
+        contains_literal_secret || existing_may_contain_secret || output_contains_literal_secret;
+    if secret_write && authority.is_none() {
+        return with_secret_config_git_protection(&action.file_path, |authority| {
+            // Re-read and re-render after acquiring the repository authority.
+            // Otherwise the caller could carry stale bytes across the lock
+            // boundary and overwrite a concurrent, serialized config update.
+            write_config_atomic_inner(action, contains_literal_secret, Some(authority))
+        });
     }
 
     // Check if unchanged
-    if existing.as_deref() == Some(&new_content) && !permissions_need_tightening {
+    if existing.as_deref() == Some(&new_content)
+        && !permissions_need_tightening
+        && !topology_needs_detaching
+    {
         return Ok(ActionOutcome::Unchanged);
     }
 
     let was_existing = existing.is_some();
 
-    // Backup existing file
-    if action.backup && was_existing {
-        let file_name = action
-            .file_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
-        write_setup_backup(
-            existing
-                .as_deref()
-                .expect("an existing setup file has pre-update content")
-                .as_bytes(),
-            parent,
-            &file_name,
-            effective_permissions,
-        )?;
-    }
-
-    write_setup_file_atomic(
+    write_setup_file_atomic_with_authority(
         &action.file_path,
         new_content.as_bytes(),
         effective_permissions,
         "config file",
+        existing_file.as_ref(),
+        action.backup,
+        authority,
     )?;
 
     if was_existing {
@@ -3155,6 +3801,7 @@ impl fmt::Display for ConfigDriftRisk {
 
 /// Status of a single config file.
 #[derive(Debug, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ConfigFileStatus {
     #[serde(skip_serializing)]
     pub path: String,
@@ -3289,7 +3936,7 @@ struct OmpMcpAliasInspection {
 }
 
 impl OmpMcpAliasInspection {
-    fn has_drift(&self) -> bool {
+    const fn has_drift(&self) -> bool {
         !self.conflict_paths.is_empty() || !self.unsupported_paths.is_empty()
     }
 }
@@ -3315,7 +3962,7 @@ struct OmpSettingsAuthorityInspection {
 }
 
 impl OmpSettingsAuthorityInspection {
-    fn has_drift(&self) -> bool {
+    const fn has_drift(&self) -> bool {
         self.unsupported_path.is_some() || !self.project_config_enabled
     }
 }
@@ -3353,15 +4000,15 @@ enum OmpSettingsParseError {
 
 fn config_status_file_observation(
     path: &Path,
-    content: &Result<Option<(String, u32)>, SetupError>,
+    content: &Result<Option<SetupFileSnapshot>, SetupError>,
 ) -> ConfigStatusFileObservation {
     use sha2::{Digest as _, Sha256};
 
     match content {
-        Ok(Some((content, _))) => ConfigStatusFileObservation {
+        Ok(Some(snapshot)) => ConfigStatusFileObservation {
             path: path.display().to_string(),
             exists: true,
-            content_sha256: Some(hex::encode(Sha256::digest(content.as_bytes()))),
+            content_sha256: Some(hex::encode(Sha256::digest(snapshot.content.as_bytes()))),
         },
         Ok(None) => ConfigStatusFileObservation {
             path: path.display().to_string(),
@@ -3376,6 +4023,7 @@ fn config_status_file_observation(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn config_file_status_for_action(
     action: &ConfigAction,
     params: &SetupParams,
@@ -3464,9 +4112,9 @@ fn config_file_status_for_action(
     }
 
     let mut analysis = match &content {
-        Ok(Some((content, _))) => analyze_config_content(
+        Ok(Some(snapshot)) => analyze_config_content(
             &action.file_path,
-            content,
+            &snapshot.content,
             expected_url,
             expected_auth.as_deref(),
             expected_timeout,
@@ -3484,12 +4132,12 @@ fn config_file_status_for_action(
     };
 
     if action.platform == AgentPlatform::Omp
-        && let Ok(Some((content, _))) = &content
+        && let Ok(Some(snapshot)) = &content
     {
         let is_active_user_config =
             omp_active_user_config_path(params).is_ok_and(|path| path == action.file_path);
         apply_omp_config_contract(
-            content,
+            &snapshot.content,
             &mut analysis,
             expected_url,
             expected_auth.as_deref(),
@@ -3658,6 +4306,7 @@ fn omp_native_entry_is_expected_http(entry: &Value) -> bool {
         && connection.url.is_some()
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_omp_native_entries_contract(
     native_entries: &[(&str, &Value)],
     analysis: &mut ConfigContentAnalysis,
@@ -3826,24 +4475,21 @@ fn inspect_omp_disabled_servers_contract(
 }
 
 fn inspect_omp_active_user_config(params: &SetupParams) -> OmpActiveUserConfigInspection {
-    let path = match omp_active_user_config_path(params) {
-        Ok(path) => path,
-        Err(_) => {
-            let path = params
-                .omp_user_config_path_override
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("<unresolved-omp-user-config>"));
-            return OmpActiveUserConfigInspection {
-                observation: ConfigStatusFileObservation {
-                    path: path.display().to_string(),
-                    exists: false,
-                    content_sha256: None,
-                },
-                path,
-                disabled: false,
-                unsupported: true,
-            };
-        }
+    let Ok(path) = omp_active_user_config_path(params) else {
+        let path = params
+            .omp_user_config_path_override
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("<unresolved-omp-user-config>"));
+        return OmpActiveUserConfigInspection {
+            observation: ConfigStatusFileObservation {
+                path: path.display().to_string(),
+                exists: false,
+                content_sha256: None,
+            },
+            path,
+            disabled: false,
+            unsupported: true,
+        };
     };
     let content = read_setup_file(&path, "OMP active-profile user config");
     let observation = config_status_file_observation(&path, &content);
@@ -3856,7 +4502,7 @@ fn inspect_omp_active_user_config(params: &SetupParams) -> OmpActiveUserConfigIn
                 unsupported: false,
             };
         }
-        Ok(Some((content, _))) => content,
+        Ok(Some(snapshot)) => snapshot.content,
         Err(_) => {
             return OmpActiveUserConfigInspection {
                 path,
@@ -3866,16 +4512,13 @@ fn inspect_omp_active_user_config(params: &SetupParams) -> OmpActiveUserConfigIn
             };
         }
     };
-    let object = match serde_json::from_str::<Value>(&content) {
-        Ok(Value::Object(object)) => object,
-        Ok(_) | Err(_) => {
-            return OmpActiveUserConfigInspection {
-                path,
-                observation,
-                disabled: false,
-                unsupported: true,
-            };
-        }
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&content) else {
+        return OmpActiveUserConfigInspection {
+            path,
+            observation,
+            disabled: false,
+            unsupported: true,
+        };
     };
     let (disabled, unsupported) =
         inspect_omp_disabled_servers_contract(&object, &OMP_SERVER_ALIASES[..1]);
@@ -3920,7 +4563,6 @@ impl OmpMcpConnection {
             return false;
         }
         match self.effective_transport() {
-            "stdio" => self.command.is_some(),
             "http" | "sse" => self.url.is_some(),
             // OMP's capability validator admits historical/unknown transport
             // spellings when a command is present. Its legacy conversion then
@@ -3991,6 +4633,7 @@ fn omp_mcp_enabled_value(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn omp_mcp_json_connection(
     entry: &Map<String, Value>,
     format: OmpMcpAuthorityFormat,
@@ -4234,9 +4877,10 @@ fn inspect_omp_runtime_server_lists(
     })?;
     let content =
         read_setup_file(&path, "OMP active-profile MCP runtime lists").map_err(|_| path.clone())?;
-    let Some((content, _)) = content else {
+    let Some(snapshot) = content else {
         return Ok(Default::default());
     };
+    let content = snapshot.content;
     let Value::Object(document) =
         serde_json::from_str::<Value>(&content).map_err(|_| path.clone())?
     else {
@@ -4257,6 +4901,7 @@ fn inspect_omp_runtime_server_lists(
     Ok((disabled, enabled))
 }
 
+#[allow(clippy::too_many_lines)]
 fn inspect_omp_mcp_aliases(params: &SetupParams, action_path: &Path) -> OmpMcpAliasInspection {
     let mut inspection = OmpMcpAliasInspection {
         observations: Vec::new(),
@@ -4326,7 +4971,7 @@ fn inspect_omp_mcp_aliases(params: &SetupParams, action_path: &Path) -> OmpMcpAl
         }
         let content = match content {
             Ok(None) => continue,
-            Ok(Some((content, _))) => content,
+            Ok(Some(snapshot)) => snapshot.content,
             Err(_) => {
                 inspection.unsupported_paths.push(source.path);
                 continue;
@@ -4418,6 +5063,7 @@ fn inspect_omp_mcp_aliases(params: &SetupParams, action_path: &Path) -> OmpMcpAl
     inspection
 }
 
+#[allow(clippy::too_many_lines)]
 fn normalize_jsonc(content: &str) -> Result<String, ()> {
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let bytes = content.as_bytes();
@@ -4588,7 +5234,7 @@ fn inspect_omp_settings_file(
     let value = match content {
         Ok(None) if required => OmpSettingsFileValue::Unsupported,
         Ok(None) => OmpSettingsFileValue::Missing,
-        Ok(Some((content, _))) => match parse_omp_settings_document(&content, format) {
+        Ok(Some(snapshot)) => match parse_omp_settings_document(&snapshot.content, format) {
             Ok(root) => OmpSettingsFileValue::Parsed(root),
             Err(OmpSettingsParseError::Invalid)
                 if matches!(invalid_policy, OmpSettingsInvalidPolicy::Skip) =>
@@ -4656,11 +5302,10 @@ fn omp_project_config_is_enabled(mcp: Option<&Value>) -> bool {
     match value {
         // The SDK applies `?? true` before the loader's JavaScript truthiness
         // check, so an explicit null behaves like the default true.
-        Value::Null => true,
+        Value::Null | Value::Array(_) | Value::Object(_) => true,
         Value::Bool(value) => *value,
         Value::Number(value) => value.as_f64().is_none_or(|value| value != 0.0),
         Value::String(value) => !value.is_empty(),
-        Value::Array(_) | Value::Object(_) => true,
     }
 }
 
@@ -4748,7 +5393,7 @@ fn inspect_omp_settings_authority(params: &SetupParams) -> OmpSettingsAuthorityI
         effective_source: None,
         unsupported_path: None,
     };
-    let Ok((user_yml, user_yaml)) = omp_active_user_settings_paths(params) else {
+    let Ok((preferred_settings, fallback_settings)) = omp_active_user_settings_paths(params) else {
         inspection.unsupported_path = Some(
             params
                 .omp_user_config_path_override
@@ -4759,7 +5404,7 @@ fn inspect_omp_settings_authority(params: &SetupParams) -> OmpSettingsAuthorityI
     };
     let preferred = merge_omp_settings_file(
         &mut inspection,
-        &user_yml,
+        &preferred_settings,
         false,
         OmpSettingsFormat::Yaml,
         OmpSettingsInvalidPolicy::FailClosed,
@@ -4771,7 +5416,7 @@ fn inspect_omp_settings_authority(params: &SetupParams) -> OmpSettingsAuthorityI
     if matches!(preferred, OmpSettingsFileValue::Missing) {
         let fallback = merge_omp_settings_file(
             &mut inspection,
-            &user_yaml,
+            &fallback_settings,
             false,
             OmpSettingsFormat::Yaml,
             OmpSettingsInvalidPolicy::FailClosed,
@@ -4781,8 +5426,8 @@ fn inspect_omp_settings_authority(params: &SetupParams) -> OmpSettingsAuthorityI
             return inspection;
         }
         if matches!(fallback, OmpSettingsFileValue::Missing) {
-            let Some(agent_dir) = user_yml.parent() else {
-                inspection.unsupported_path = Some(user_yml);
+            let Some(agent_dir) = preferred_settings.parent() else {
+                inspection.unsupported_path = Some(preferred_settings);
                 return inspection;
             };
             let legacy_settings = agent_dir.join("settings.json");
@@ -6574,6 +7219,10 @@ mod tests {
             "secret artifacts leaked: {status}"
         );
         assert!(!status.contains(".bak"), "backup leaked: {status}");
+        assert!(
+            !status.contains(".replaced"),
+            "retained predecessor leaked: {status}"
+        );
     }
 
     #[test]
@@ -6638,6 +7287,10 @@ mod tests {
             "secret artifacts leaked: {status}"
         );
         assert!(!status.contains(".bak"), "backup leaked: {status}");
+        assert!(
+            !status.contains(".replaced"),
+            "retained predecessor leaked: {status}"
+        );
     }
 
     #[test]
@@ -7149,7 +7802,7 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let sentinel = project.join("operator-owned");
         std::fs::write(&sentinel, "sentinel\n").unwrap();
-        let _missing_process_home = EnvVarGuard::unset(TEST_OMP_HOME_DIR_OVERRIDE_KEY);
+        let missing_process_home = EnvVarGuard::unset(TEST_OMP_HOME_DIR_OVERRIDE_KEY);
 
         for mut params in [
             SetupParams {
@@ -7188,7 +7841,7 @@ mod tests {
             assert!(!project.join(".gitignore").exists());
         }
 
-        drop(_missing_process_home);
+        drop(missing_process_home);
         let process_home = temp.path().join("process-home");
         let _absolute_process_home = EnvVarGuard::set(
             TEST_OMP_HOME_DIR_OVERRIDE_KEY,
@@ -7606,6 +8259,297 @@ mod tests {
         ));
         assert_eq!(std::fs::read(&path).unwrap(), original);
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn write_config_atomic_refuses_oversized_existing_config() {
+        let tmp = setup_real_tempdir();
+        let path = tmp.path().join("config.json");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(SETUP_CONFIG_FILE_MAX_BYTES + 1).unwrap();
+        drop(file);
+
+        let action = ConfigAction {
+            platform: AgentPlatform::Cursor,
+            file_path: path.clone(),
+            description: "test".into(),
+            content: ConfigContent::JsonFull(json!({"new": true})),
+            permissions: 0o600,
+            backup: true,
+        };
+        let error = write_config_atomic(&action, false)
+            .expect_err("oversized setup config must fail before parsing or backup");
+
+        assert!(error.to_string().contains("setup config limit"), "{error}");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            SETUP_CONFIG_FILE_MAX_BYTES + 1
+        );
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_atomic_detaches_hard_linked_existing_config() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let tmp = setup_real_tempdir();
+        let outside = tmp.path().join("outside.json");
+        let linked = tmp.path().join("config.json");
+        let original = "{\n  \"new\": true\n}\n";
+        std::fs::write(&outside, original).unwrap();
+        std::fs::hard_link(&outside, &linked).unwrap();
+
+        let action = ConfigAction {
+            platform: AgentPlatform::Cursor,
+            file_path: linked.clone(),
+            description: "test".into(),
+            content: ConfigContent::JsonFull(json!({"new": true})),
+            permissions: 0o600,
+            backup: true,
+        };
+        let outcome = write_config_atomic(&action, false)
+            .expect("hard-linked setup config must detach through atomic replacement");
+
+        assert_eq!(outcome, ActionOutcome::Updated);
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&linked).unwrap(), original);
+        assert_ne!(
+            std::fs::metadata(&outside).unwrap().ino(),
+            std::fs::metadata(&linked).unwrap().ino(),
+            "the rewritten config must no longer share the peer inode"
+        );
+    }
+
+    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    #[test]
+    fn write_setup_file_atomic_detects_same_content_leaf_replacement() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = setup_real_tempdir();
+        let path = tmp.path().join("config.json");
+        let displaced = tmp.path().join("concurrent-displaced.json");
+        let original = b"{\n  \"owner\": \"concurrent\"\n}\n";
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let expected = read_setup_file(&path, "config file").unwrap().unwrap();
+
+        let error = write_setup_file_atomic_bound_with_hook(
+            &path,
+            b"{\n  \"Authorization\": \"Bearer attempted-secret\"\n}\n",
+            0o600,
+            "config file",
+            Some(&expected),
+            false,
+            || {
+                std::fs::rename(&path, &displaced)?;
+                std::fs::write(&path, original)?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+                Ok(())
+            },
+        )
+        .expect_err("an inode replacement with identical bytes must fail the CAS");
+
+        assert!(error.to_string().contains("changed identity"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read(&displaced).unwrap(), original);
+        let retained_temp = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .expect("the no-deletion contract retains the unpublished tempfile");
+        assert!(
+            std::fs::read_to_string(retained_temp.path())
+                .unwrap()
+                .contains("attempted-secret")
+        );
+        assert_eq!(
+            retained_temp.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    #[test]
+    fn write_setup_file_atomic_refuses_absent_to_present_race() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = setup_real_tempdir();
+        let path = tmp.path().join("config.json");
+        let concurrent = b"{\n  \"owner\": \"concurrent\"\n}\n";
+
+        let error = write_setup_file_atomic_bound_with_hook(
+            &path,
+            b"{\n  \"Authorization\": \"Bearer attempted-secret\"\n}\n",
+            0o600,
+            "config file",
+            None,
+            false,
+            || {
+                std::fs::write(&path, concurrent)?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+                Ok(())
+            },
+        )
+        .expect_err("a concurrently created target must win over a stale absent snapshot");
+
+        assert!(
+            matches!(error, SetupError::Io(ref source) if source.kind() == std::io::ErrorKind::AlreadyExists),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), concurrent);
+        let retained_temp = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .expect("the no-deletion contract retains the unpublished tempfile");
+        assert!(
+            std::fs::read_to_string(retained_temp.path())
+                .unwrap()
+                .contains("attempted-secret")
+        );
+        assert_eq!(
+            retained_temp.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    #[test]
+    fn write_setup_file_atomic_keeps_parent_swap_inside_bound_authority() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let tmp = setup_real_tempdir();
+        let live_parent = tmp.path().join("live");
+        let displaced_parent = tmp.path().join("displaced");
+        let attacker_parent = tmp.path().join("attacker");
+        std::fs::create_dir(&live_parent).unwrap();
+        std::fs::create_dir(&attacker_parent).unwrap();
+        let path = live_parent.join("config.json");
+
+        let error = write_setup_file_atomic_bound_with_hook(
+            &path,
+            b"{\n  \"Authorization\": \"Bearer bound-secret\"\n}\n",
+            0o600,
+            "config file",
+            None,
+            false,
+            || {
+                std::fs::rename(&live_parent, &displaced_parent)?;
+                symlink(&attacker_parent, &live_parent)?;
+                Ok(())
+            },
+        )
+        .expect_err("a parent pathname swap must make the transaction report failure");
+
+        assert!(!attacker_parent.join("config.json").exists(), "{error}");
+        assert!(!path.exists(), "the swapped pathname must not receive the secret");
+        let bound_target = displaced_parent.join("config.json");
+        assert!(
+            std::fs::read_to_string(&bound_target)
+                .unwrap()
+                .contains("bound-secret")
+        );
+        assert_eq!(
+            std::fs::metadata(bound_target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn secret_config_git_guard_spans_the_credential_write() {
+        let tmp = setup_real_tempdir();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .arg(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let repo_root = std::fs::canonicalize(tmp.path()).unwrap();
+        let path = tmp.path().join("secret.json");
+
+        with_secret_config_git_protection(&path, |authority| {
+            let contender_repo = repo_root.clone();
+            let competing_add = std::thread::spawn(move || -> std::io::Result<bool> {
+                match crate::RepoFlock::acquire_with_timeout(
+                    &contender_repo,
+                    std::time::Duration::from_millis(25),
+                ) {
+                    Ok(guard) => {
+                        assert!(guard.is_real());
+                        Ok(Command::new("git")
+                            .arg("-C")
+                            .arg(&contender_repo)
+                            .args(["add", "-f", "--", "secret.json"])
+                            .status()?
+                            .success())
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => Ok(false),
+                    Err(error) => Err(error),
+                }
+            })
+            .join()
+            .expect("the competing Git writer must not panic")
+            .expect("the competing Git writer must fail only on lock contention");
+            assert!(
+                !competing_add,
+                "the repository flock must block a concurrent forced git-add at the credential write seam"
+            );
+            write_setup_file_atomic_with_authority(
+                &path,
+                b"{\n  \"Authorization\": \"Bearer test-secret\"\n}\n",
+                0o600,
+                "secret config",
+                None,
+                false,
+                Some(authority),
+            )
+        })
+        .unwrap();
+
+        assert!(std::fs::read_to_string(&path).unwrap().contains("test-secret"));
+        assert!(
+            !Command::new("git")
+                .arg("-C")
+                .arg(&repo_root)
+                .args(["ls-files", "--error-unmatch", "--", "secret.json"])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "the blocked concurrent add must not expose the credential in the index"
+        );
+        let reacquired = crate::RepoFlock::acquire_with_timeout(
+            &repo_root,
+            std::time::Duration::from_millis(250),
+        )
+        .expect("the credential transaction must release its repository flock");
+        assert!(reacquired.is_real());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_setup_file_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = setup_real_tempdir();
+        let outside_dir = tmp.path().join("outside");
+        let linked_dir = tmp.path().join("linked");
+        std::fs::create_dir(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("config.json"), "{}\n").unwrap();
+        symlink(&outside_dir, &linked_dir).unwrap();
+
+        let error = read_setup_file(&linked_dir.join("config.json"), "config status file")
+            .expect_err("read authority must reject a symlinked parent");
+        assert!(
+            error
+                .to_string()
+                .contains("must not traverse symlinked directories"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
@@ -8922,6 +9866,7 @@ http_headers = { Authorization = "Bearer tok" }
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn check_status_omp_secondary_sources_shadow_same_name_but_reject_distinct_aliases() {
         let tmp = tempfile::tempdir().unwrap();
         let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
@@ -9087,7 +10032,7 @@ http_headers = { Authorization = "Bearer tok" }
         )
         .unwrap();
         let unsafe_override = intermediate.join("../unsafe-claude-authority");
-        let _claude_override =
+        let claude_override =
             EnvVarGuard::set("CLAUDE_CONFIG_DIR", unsafe_override.display().to_string());
 
         assert!(
@@ -9117,7 +10062,7 @@ http_headers = { Authorization = "Bearer tok" }
             "bytes at the rejected raw path must not influence alias liveness"
         );
 
-        drop(_claude_override);
+        drop(claude_override);
         let missing_home_tmp = setup_real_tempdir();
         let project_dir = missing_home_tmp.path().join("project");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -9181,7 +10126,10 @@ http_headers = { Authorization = "Bearer tok" }
         .unwrap();
         let deny_wins = first_setup_status_file(&params);
         assert!(!deny_wins.omp_mcp_alias_drift);
-        assert!(deny_wins.drift_reasons.is_empty());
+        assert_eq!(
+            deny_wins.drift_reasons,
+            Vec::<ConfigDriftReason>::new()
+        );
 
         std::fs::write(&user, r#"{"enabledServers":["mcp_agent_mail"]}"#).unwrap();
         let forced_live = first_setup_status_file(&params);
@@ -9193,7 +10141,10 @@ http_headers = { Authorization = "Bearer tok" }
         );
 
         std::fs::write(&user, r#"{"disabledServers":["mcp_agent_mail"]}"#).unwrap();
-        assert!(first_setup_status_file(&params).drift_reasons.is_empty());
+        assert_eq!(
+            first_setup_status_file(&params).drift_reasons,
+            Vec::<ConfigDriftReason>::new()
+        );
 
         std::fs::write(&user, "{}\n").unwrap();
         assert!(
@@ -9368,7 +10319,7 @@ http_headers = { Authorization = "Bearer tok" }
                 tmp.path().join("ignored-agent").display().to_string(),
             );
             let params = SetupParams {
-                project_dir: named_project.clone(),
+                project_dir: named_project,
                 agents: Some(vec![AgentPlatform::Omp]),
                 token: "named-profile-token".to_string(),
                 skip_hooks: true,
@@ -9436,7 +10387,10 @@ http_headers = { Authorization = "Bearer tok" }
         std::fs::create_dir_all(user_settings.parent().unwrap()).unwrap();
 
         let default_enabled = first_setup_status_file(&params);
-        assert!(default_enabled.drift_reasons.is_empty());
+        assert_eq!(
+            default_enabled.drift_reasons,
+            Vec::<ConfigDriftReason>::new()
+        );
         assert!(!default_enabled.omp_settings_config_drift);
         assert!(
             default_enabled
@@ -9509,12 +10463,12 @@ http_headers = { Authorization = "Bearer tok" }
         let home = params.home_dir_override.as_ref().unwrap();
         let default_settings = home.join(".omp/agent/config.yml");
         let active_user_mcp = home.join(".omp/profiles/work/agent/mcp.json");
-        let active_yml = home.join(".omp/profiles/work/agent/config.yml");
-        let active_yaml = home.join(".omp/profiles/work/agent/config.yaml");
+        let preferred_settings = home.join(".omp/profiles/work/agent/config.yml");
+        let fallback_settings = home.join(".omp/profiles/work/agent/config.yaml");
         std::fs::create_dir_all(default_settings.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(active_yaml.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(fallback_settings.parent().unwrap()).unwrap();
         std::fs::write(&default_settings, "mcp:\n  enableProjectConfig: true\n").unwrap();
-        std::fs::write(&active_yaml, "mcp:\n  enableProjectConfig: false\n").unwrap();
+        std::fs::write(&fallback_settings, "mcp:\n  enableProjectConfig: false\n").unwrap();
         params.omp_user_config_path_override = Some(active_user_mcp);
 
         let named_fallback = first_setup_status_file(&params);
@@ -9528,11 +10482,14 @@ http_headers = { Authorization = "Bearer tok" }
                 .contains("~/.omp/profiles/work/agent/config.yaml")
         );
 
-        std::fs::write(&active_yml, "mcp:\n  enableProjectConfig: true\n").unwrap();
-        assert!(first_setup_status_file(&params).drift_reasons.is_empty());
+        std::fs::write(&preferred_settings, "mcp:\n  enableProjectConfig: true\n").unwrap();
+        assert_eq!(
+            first_setup_status_file(&params).drift_reasons,
+            Vec::<ConfigDriftReason>::new()
+        );
 
         std::fs::write(
-            &active_yml,
+            &preferred_settings,
             "defaults: &disabled\n  enableProjectConfig: false\nmcp:\n  <<: *disabled\n",
         )
         .unwrap();
@@ -9542,7 +10499,7 @@ http_headers = { Authorization = "Bearer tok" }
             "YAML merge keys must affect the same effective leaf as OMP's Bun YAML loader"
         );
 
-        std::fs::write(&active_yml, "mcp: [\n").unwrap();
+        std::fs::write(&preferred_settings, "mcp: [\n").unwrap();
         let malformed = first_setup_status_file(&params);
         assert_eq!(
             malformed.primary_drift_reason,
@@ -9551,7 +10508,7 @@ http_headers = { Authorization = "Bearer tok" }
         assert!(malformed.omp_settings_config_drift);
         assert!(malformed.remediation.contains("config.yml"));
 
-        std::fs::write(&active_yml, "mcp:\n  enableProjectConfig: true\n").unwrap();
+        std::fs::write(&preferred_settings, "mcp:\n  enableProjectConfig: true\n").unwrap();
         let missing_overlay = tmp.path().join("missing-overlay.yml");
         params.omp_settings_overlay_paths = vec![missing_overlay.clone()];
         let missing = first_setup_status_file(&params);
@@ -9790,7 +10747,11 @@ http_headers = { Authorization = "Bearer tok" }
         let opencode = params.project_dir.join("opencode.jsonc");
         std::fs::write(
             &opencode,
-            r#"{"mcp":{"enableProjectConfig":"{env:OMP_PROJECT_CONFIG}"}}"#,
+            concat!(
+                r#"{"mcp":{"enableProjectConfig":"{"#,
+                "env:OMP_PROJECT_CONFIG",
+                r#"}"}}"#
+            ),
         )
         .unwrap();
         let dynamic_authority = first_setup_status_file(&params);
@@ -9802,7 +10763,11 @@ http_headers = { Authorization = "Bearer tok" }
 
         std::fs::write(
             &opencode,
-            r#"{"apiKey":"{env:UNRELATED_KEY}","mcp":{"enableProjectConfig":true}}"#,
+            concat!(
+                r#"{"apiKey":"{"#,
+                "env:UNRELATED_KEY",
+                r#"}","mcp":{"enableProjectConfig":true}}"#
+            ),
         )
         .unwrap();
         assert_eq!(

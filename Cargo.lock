@@ -5594,6 +5594,7 @@ dependencies = [
  "nix",
  "proptest",
  "regex",
+ "rustix",
  "same-file",
  "serde",
  "serde_json",

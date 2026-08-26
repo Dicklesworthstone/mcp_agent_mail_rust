@@ -33,6 +33,7 @@ fs2.workspace = true
 globset.workspace = true
 # `fs` feature provides `nix::sys::statvfs` for inode probes in `host_health`.
 nix = { workspace = true, features = ["fs"] }
+rustix.workspace = true
 tracing.workspace = true
 
 [features]

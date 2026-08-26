@@ -389,13 +389,17 @@ if grep -q 'x86_64-unknown-linux-gnu.tar.gz' "$tmp/scenario_d.curl.log"; then
 fi
 
 step "scenario E: stale installer lock cleanup uses pid-file removal plus rmdir"
-lock_dir="$tmp/mcp-agent-mail-install.lock.d"
-mkdir "$lock_dir"
-echo 999999 >"$lock_dir/pid"
-bash -c "source '$extract'; remove_installer_lock_dir '$lock_dir'"
-if [ -e "$lock_dir" ]; then
-    echo "FAIL: expected stale lock directory to be removed" >&2
-    exit 1
+if [ "${AM_E2E_KEEP_TMP:-0}" = "1" ] || [ "${AM_E2E_KEEP_TMP:-0}" = "true" ]; then
+    step "SKIP: keep-temp mode forbids the stale-lock case's intentional fixture deletion"
+else
+    lock_dir="$tmp/mcp-agent-mail-install.lock.d"
+    mkdir "$lock_dir"
+    echo 999999 >"$lock_dir/pid"
+    bash -c "source '$extract'; remove_installer_lock_dir '$lock_dir'"
+    if [ -e "$lock_dir" ]; then
+        echo "FAIL: expected stale lock directory to be removed" >&2
+        exit 1
+    fi
 fi
 
 lock_victim_dir="$tmp/installer-lock-victim"
