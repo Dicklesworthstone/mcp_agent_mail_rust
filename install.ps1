@@ -586,6 +586,7 @@ function Exit-InstallerMutex {
 
 $script:ActiveBinaryTransactionInstallDir = $null
 $script:BinaryTransactionRecoveryActive = $false
+$script:BinaryTransactionExitRecoveryAttempted = $false
 
 function Initialize-InstallerNativeMethods {
     if ($null -ne ("McpAgentMailInstallerNativeMethods" -as [type])) {
@@ -1137,6 +1138,7 @@ function Restore-BinaryTransactionTarget {
         if ($destinationHash -cne $NewHash) { throw "Rollback cannot identify the exact new $Stem destination." }
         if (($HadOriginal -ceq "1") -ne $hasBackup) { throw "Rollback $Stem backup state is invalid." }
         Move-InstallerEntryNoReplaceDurable -Source $destination -Destination $quarantined -Label "Quarantine new $Stem binary"
+        Assert-BinaryTransactionHash -Path $quarantined -ExpectedHash $NewHash -Label "Quarantined new $Stem binary"
         $hasDestination = $false
         $destinationHash = ""
     }
@@ -1151,6 +1153,7 @@ function Restore-BinaryTransactionTarget {
         if ($hasBackup) {
             if (Test-InstallerEntryExists -Path $destination) { throw "Rollback $Stem destination is occupied." }
             Move-InstallerEntryNoReplaceDurable -Source $backup -Destination $destination -Label "Restore old $Stem binary"
+            Assert-BinaryTransactionHash -Path $destination -ExpectedHash $OldHash -Label "Restored $Stem binary"
         } else {
             Assert-BinaryTransactionHash -Path $destination -ExpectedHash $OldHash -Label "Restored $Stem binary"
         }
@@ -1169,6 +1172,7 @@ function Archive-BinaryTransaction {
     if ($Outcome -cnotin @("committed", "rolled-back")) { throw "Invalid transaction outcome." }
     $history = Join-Path $InstallDir ".mcp-agent-mail-install-transaction.$Outcome.$Nonce"
     Move-InstallerEntryNoReplaceDurable -Source $Journal -Destination $history -Label "Archive $Outcome binary transaction"
+    Assert-InstallerOwnedEntry -Path $history -Label "Archived binary transaction" -Directory
     $script:ActiveBinaryTransactionInstallDir = $null
 }
 
@@ -1313,8 +1317,10 @@ function Move-BinaryTransactionOriginal {
         return
     }
     Assert-BinaryTransactionHash -Path $destination -ExpectedHash $OldHash -Label "Original $Stem binary"
-    Move-InstallerEntryNoReplaceDurable -Source $destination -Destination (Join-Path $Journal "old-$Stem") `
+    $backup = Join-Path $Journal "old-$Stem"
+    Move-InstallerEntryNoReplaceDurable -Source $destination -Destination $backup `
         -Label "Preserve old $Stem binary"
+    Assert-BinaryTransactionHash -Path $backup -ExpectedHash $OldHash -Label "Preserved $Stem binary"
 }
 
 function Move-BinaryTransactionNew {
@@ -1327,6 +1333,7 @@ function Move-BinaryTransactionNew {
     if (Test-InstallerEntryExists -Path $destination) { throw "The $Stem destination is occupied before publication." }
     Assert-BinaryTransactionHash -Path $staged -ExpectedHash $NewHash -Label "Staged $Stem binary"
     Move-InstallerEntryNoReplaceDurable -Source $staged -Destination $destination -Label "Publish new $Stem binary"
+    Assert-BinaryTransactionHash -Path $destination -ExpectedHash $NewHash -Label "Published $Stem binary"
 }
 
 function Install-BinariesAtomically {
@@ -1338,7 +1345,14 @@ function Install-BinariesAtomically {
         [string]$InterruptAfterPhaseForTest = ""
     )
     $InstallDir = Assert-SafeInstallDirectory -InstallDir $InstallDir
-    Recover-BinaryPairTransaction -InstallDir $InstallDir
+    try {
+        Recover-BinaryPairTransaction -InstallDir $InstallDir
+    } catch {
+        # The outer installer finally block must not retry an already-failed
+        # foreground recovery against the same ambiguous authority.
+        $script:BinaryTransactionExitRecoveryAttempted = $true
+        throw
+    }
     $leaveJournalForTest = $false
     try {
         $transaction = New-BinaryPairTransaction -AmSource $AmSource -ServerSource $ServerSource -InstallDir $InstallDir
@@ -1386,6 +1400,7 @@ function Install-BinariesAtomically {
             Recover-BinaryPairTransaction -InstallDir $InstallDir
         } catch {
             $script:ActiveBinaryTransactionInstallDir = $InstallDir
+            $script:BinaryTransactionExitRecoveryAttempted = $true
             throw "Atomic binary replacement failed and recovery failed closed; active journal retained. Recovery error: $($_.Exception.Message). Root error: $installError"
         }
         throw "Atomic binary replacement failed. The previous binary pair was restored without deleting transaction evidence. Root error: $installError"
@@ -1602,7 +1617,12 @@ try {
     # directories and phase siblings from a pre-publication interruption are
     # retained evidence but are deliberately ignored by recovery.
     $script:ActiveBinaryTransactionInstallDir = $Dest
-    Recover-BinaryPairTransaction -InstallDir $Dest
+    try {
+        Recover-BinaryPairTransaction -InstallDir $Dest
+    } catch {
+        $script:BinaryTransactionExitRecoveryAttempted = $true
+        throw
+    }
     $script:ActiveBinaryTransactionInstallDir = $null
 
     if (-not $Force -and (Test-InstalledReleaseVersion -InstallDir $Dest -ExpectedVersion $requestedNormalized)) {
@@ -1684,7 +1704,9 @@ try {
 } finally {
     $transactionRecoveryError = $null
     if ($null -ne $script:ActiveBinaryTransactionInstallDir -and
-        -not $script:BinaryTransactionRecoveryActive) {
+        -not $script:BinaryTransactionRecoveryActive -and
+        -not $script:BinaryTransactionExitRecoveryAttempted) {
+        $script:BinaryTransactionExitRecoveryAttempted = $true
         try {
             # PowerShell runs finally blocks for terminating errors and
             # catchable pipeline interruption (including Ctrl+C). Recovery

@@ -3306,6 +3306,8 @@ rollback_binary_transaction_target() {
     fi
     move_installer_entry_no_replace "$dest" "$quarantined" "Quarantine new $stem binary" || return 1
     sync_installer_paths_durably "$quarantined" "$journal" "$install_dir" || return 1
+    validate_binary_transaction_hash "$quarantined" "$new_hash" \
+      "Quarantined new $stem binary" || return 1
     dest_hash=""
   fi
 
@@ -3328,6 +3330,7 @@ rollback_binary_transaction_target() {
       }
       move_installer_entry_no_replace "$backup" "$dest" "Restore old $stem binary" || return 1
       sync_installer_paths_durably "$dest" "$journal" "$install_dir" || return 1
+      validate_binary_transaction_hash "$dest" "$old_hash" "Restored $stem binary" || return 1
     else
       validate_binary_transaction_hash "$dest" "$old_hash" "Restored $stem binary" || return 1
     fi
@@ -3349,6 +3352,7 @@ archive_binary_transaction() {
   fi
   move_installer_entry_no_replace "$journal" "$history" "Archive $outcome binary transaction" || return 1
   sync_installer_paths_durably "$history" "$install_dir" || return 1
+  validate_binary_transaction_directory "$history" || return 1
   BINARY_TRANSACTION_ACTIVE_INSTALL_DIR=""
 }
 
@@ -3438,7 +3442,8 @@ preserve_binary_transaction_original() {
   fi
   validate_binary_transaction_hash "$dest" "$old_hash" "Original $stem binary" || return 1
   move_installer_entry_no_replace "$dest" "$backup" "Preserve old $stem binary" || return 1
-  sync_installer_paths_durably "$backup" "$journal" "$install_dir"
+  sync_installer_paths_durably "$backup" "$journal" "$install_dir" || return 1
+  validate_binary_transaction_hash "$backup" "$old_hash" "Preserved $stem binary"
 }
 
 publish_binary_transaction_new() {
@@ -3457,7 +3462,8 @@ publish_binary_transaction_new() {
   chmod 755 "$staged" || return 1
   sync_installer_paths_durably "$staged" "$journal" || return 1
   move_installer_entry_no_replace "$staged" "$dest" "Publish new $stem binary" || return 1
-  sync_installer_paths_durably "$dest" "$journal" "$install_dir"
+  sync_installer_paths_durably "$dest" "$journal" "$install_dir" || return 1
+  validate_binary_transaction_hash "$dest" "$new_hash" "Published $stem binary"
 }
 
 prepare_binary_pair_transaction() {
@@ -3507,7 +3513,10 @@ prepare_binary_pair_transaction() {
     TXN_OLD_CLI_HASH=$(file_sha256_hex "$cli_dest") || return 1
   fi
 
-  mkdir "$preparing" || return 1
+  # Apply the private mode in the mkdir syscall itself; chmod alone would
+  # leave a caller-umask-dependent window where another user could enter the
+  # non-authoritative staging directory before it is published.
+  (umask 077; mkdir "$preparing") || return 1
   chmod 700 "$preparing" || return 1
   validate_binary_transaction_directory "$preparing" || return 1
   sync_installer_paths_durably "$preparing" "$install_dir" || return 1

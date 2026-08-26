@@ -256,6 +256,7 @@ New-Item -ItemType Directory -Path $srcDir -Force | Out-Null
 try {
     $script:ActiveBinaryTransactionInstallDir = $null
     $script:BinaryTransactionRecoveryActive = $false
+    $script:BinaryTransactionExitRecoveryAttempted = $false
     $amSrc = Join-Path $srcDir "am.exe"
     $serverSrc = Join-Path $srcDir "mcp-agent-mail.exe"
     Set-Content -LiteralPath $amSrc -Value "new-am" -NoNewline
