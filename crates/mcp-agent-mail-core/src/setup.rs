@@ -794,7 +794,7 @@ pub fn resolve_existing_token(
 
 /// Read `HTTP_BEARER_TOKEN=...` from a .env file.
 fn read_env_file_token(path: &Path) -> Result<Option<String>, SetupError> {
-    let Some(content) = crate::config::read_user_env_authority_text(path)? else {
+    let Some(content) = crate::config::read_env_authority_text(path)? else {
         return Ok(None);
     };
     for line in content.lines() {

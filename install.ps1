@@ -7,7 +7,7 @@
   Options:
     -Version vX.Y.Z   Install a specific release tag (default: latest)
     -Dest PATH        Install directory (default: %LOCALAPPDATA%\Programs\mcp-agent-mail)
-    -Force            Reinstall even if the same version is already present
+    -Force            Reinstall without probing the already-installed version
     -NoVerify         UNSAFE: skip checksum + Sigstore checks; downloaded code still executes
     -Verify           Explicitly require archive verification (already the default)
 #>

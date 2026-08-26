@@ -3236,8 +3236,14 @@ static DOTENV_VALUES: OnceLock<HashMap<String, String>> = OnceLock::new();
 static USER_ENV_LOAD: OnceLock<UserEnvLoad> = OnceLock::new();
 static PROCESS_ENV_OVERRIDES: OnceLock<std::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
 
-/// Maximum accepted size for one user credential/config authority.
-pub(crate) const USER_ENV_FILE_MAX_BYTES: u64 = 1024 * 1024;
+/// Maximum accepted size for one environment-file authority.
+///
+/// This bound applies both to the installer-managed user configuration and to
+/// callers such as legacy import that deliberately inspect another env file
+/// through the same no-follow reader.
+pub const ENV_AUTHORITY_FILE_MAX_BYTES: u64 = 1024 * 1024;
+
+const USER_ENV_FILE_MAX_BYTES: u64 = ENV_AUTHORITY_FILE_MAX_BYTES;
 
 #[derive(Debug)]
 struct UserEnvLoad {
@@ -3692,13 +3698,18 @@ fn read_user_env_candidate(path: &Path) -> io::Result<Option<Vec<u8>>> {
     read_user_env_candidate_with_hooks(path, || {}, || {})
 }
 
-/// Read one explicitly selected user configuration authority as bounded UTF-8.
+/// Read one explicitly selected environment-file authority as bounded UTF-8.
 ///
-/// Setup uses this fresh (uncached) seam when repairing the canonical
-/// `config.env`. Keeping it beside runtime discovery ensures the recovery path
-/// gets the same regular-file, no-follow, parent-binding, and identity
-/// revalidation guarantees as normal configuration loading.
-pub(crate) fn read_user_env_authority_text(path: &Path) -> io::Result<Option<String>> {
+/// Setup and legacy import use this fresh (uncached) seam. Keeping it beside
+/// runtime discovery ensures every caller gets the same regular-file,
+/// no-follow, parent-binding, size-bound, and identity-revalidation guarantees
+/// as normal user configuration loading.
+///
+/// # Errors
+///
+/// Returns an error when an existing authority is unsafe, unreadable,
+/// oversized, invalid UTF-8, or changes identity during the read.
+pub fn read_env_authority_text(path: &Path) -> io::Result<Option<String>> {
     let Some(bytes) = read_user_env_candidate(path)? else {
         return Ok(None);
     };
@@ -3708,6 +3719,19 @@ pub(crate) fn read_user_env_authority_text(path: &Path) -> io::Result<Option<Str
             format!("{} is not valid UTF-8: {error}", path.display()),
         )
     })
+}
+
+/// Return the current process's user env-file authority candidates in exact
+/// precedence order.
+///
+/// This is the same list consumed by [`Config::from_env`]. Exposing the ordered
+/// paths lets one-shot migration commands take a fresh, bounded snapshot
+/// without consulting the process-global configuration cache.
+#[must_use]
+pub fn user_env_authority_candidates() -> Vec<PathBuf> {
+    let home = configured_home_dir().filter(|path| path.is_absolute());
+    let xdg = xdg_config_dir();
+    user_env_file_candidates(home.as_deref(), xdg.as_deref())
 }
 
 fn load_user_env_values_from_with_reader(

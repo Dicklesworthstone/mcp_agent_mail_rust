@@ -12,6 +12,7 @@ use crate::{CliError, CliResult, SetupCommand, handle_setup, output};
 use chrono::Utc;
 use clap::{Args, Subcommand};
 use mcp_agent_mail_core::Config;
+use mcp_agent_mail_core::config::{read_env_authority_text, user_env_authority_candidates};
 use mcp_agent_mail_core::disk::{
     is_sqlite_memory_database_url, sqlite_file_path_from_database_url,
 };
@@ -177,6 +178,25 @@ struct ResolvedPath {
     source: ResolvedSource,
     exists: bool,
     raw_value: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct EnvAuthoritySnapshot {
+    path: PathBuf,
+    values: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LegacyEnvSnapshot {
+    project: Option<EnvAuthoritySnapshot>,
+    user: Option<EnvAuthoritySnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedLegacyAuthorities {
+    database: ResolvedPath,
+    storage: ResolvedPath,
+    env: LegacyEnvSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1536,12 +1556,9 @@ fn detect_legacy_script_marker(search_root: &Path) -> Option<LegacyMarker> {
     None
 }
 
-fn detect_env_marker(search_root: &Path) -> Option<LegacyMarker> {
-    let env_file = search_root.join(".env");
-    if !env_file.exists() {
-        return None;
-    }
-    let map = read_env_file_map(&env_file);
+fn detect_env_marker(snapshot: &LegacyEnvSnapshot) -> Option<LegacyMarker> {
+    let project = snapshot.project.as_ref()?;
+    let map = &project.values;
     let legacy_db = map
         .get("DATABASE_URL")
         .is_some_and(|value| value.contains("sqlite+aiosqlite:///"));
@@ -1555,7 +1572,7 @@ fn detect_env_marker(search_root: &Path) -> Option<LegacyMarker> {
             severity: MarkerSeverity::High,
             detail: "project .env contains legacy Python DATABASE_URL/STORAGE_ROOT markers"
                 .to_string(),
-            path: Some(env_file.display().to_string()),
+            path: Some(project.path.display().to_string()),
         });
     }
     None
@@ -1666,6 +1683,26 @@ fn inspect_db_signature(snapshot: &LegacySourceSnapshot) -> LegacyDbSignature {
 }
 
 fn resolve_database_path(search_root: &Path, explicit: Option<&Path>) -> CliResult<ResolvedPath> {
+    let process_value = if explicit.is_none() {
+        process_env_value_for_legacy("DATABASE_URL")?
+    } else {
+        None
+    };
+    let snapshot = capture_legacy_env_snapshot(search_root)?;
+    resolve_database_path_from_snapshot(
+        search_root,
+        explicit,
+        process_value.as_deref(),
+        &snapshot,
+    )
+}
+
+fn resolve_database_path_from_snapshot(
+    search_root: &Path,
+    explicit: Option<&Path>,
+    process_value: Option<&str>,
+    snapshot: &LegacyEnvSnapshot,
+) -> CliResult<ResolvedPath> {
     if let Some(path) = explicit {
         let normalized = normalize_input_path(&path.to_string_lossy(), search_root);
         return Ok(ResolvedPath {
@@ -1676,21 +1713,24 @@ fn resolve_database_path(search_root: &Path, explicit: Option<&Path>) -> CliResu
         });
     }
 
-    if let Ok(v) = std::env::var("DATABASE_URL") {
-        return parse_database_value(&v, search_root, ResolvedSource::ProcessEnv);
+    if let Some(value) = process_value {
+        return parse_database_value(value, search_root, ResolvedSource::ProcessEnv);
     }
 
-    let project_env = search_root.join(".env");
-    let map = read_env_file_map(&project_env);
-    if let Some(v) = map.get("DATABASE_URL") {
-        return parse_database_value(v, search_root, ResolvedSource::ProjectEnv);
+    if let Some(value) = snapshot
+        .project
+        .as_ref()
+        .and_then(|authority| authority.values.get("DATABASE_URL"))
+    {
+        return parse_database_value(value, search_root, ResolvedSource::ProjectEnv);
     }
 
-    if let Some(user_env) = discover_user_env_file() {
-        let map = read_env_file_map(&user_env);
-        if let Some(v) = map.get("DATABASE_URL") {
-            return parse_database_value(v, search_root, ResolvedSource::UserEnv);
-        }
+    if let Some(value) = snapshot
+        .user
+        .as_ref()
+        .and_then(|authority| authority.values.get("DATABASE_URL"))
+    {
+        return parse_database_value(value, search_root, ResolvedSource::UserEnv);
     }
 
     parse_database_value(
@@ -1701,6 +1741,26 @@ fn resolve_database_path(search_root: &Path, explicit: Option<&Path>) -> CliResu
 }
 
 fn resolve_storage_root(search_root: &Path, explicit: Option<&Path>) -> CliResult<ResolvedPath> {
+    let process_value = if explicit.is_none() {
+        process_env_value_for_legacy("STORAGE_ROOT")?
+    } else {
+        None
+    };
+    let snapshot = capture_legacy_env_snapshot(search_root)?;
+    resolve_storage_root_from_snapshot(
+        search_root,
+        explicit,
+        process_value.as_deref(),
+        &snapshot,
+    )
+}
+
+fn resolve_storage_root_from_snapshot(
+    search_root: &Path,
+    explicit: Option<&Path>,
+    process_value: Option<&str>,
+    snapshot: &LegacyEnvSnapshot,
+) -> CliResult<ResolvedPath> {
     if let Some(path) = explicit {
         let normalized = normalize_input_path(&path.to_string_lossy(), search_root);
         return Ok(ResolvedPath {
@@ -1711,39 +1771,42 @@ fn resolve_storage_root(search_root: &Path, explicit: Option<&Path>) -> CliResul
         });
     }
 
-    if let Ok(v) = std::env::var("STORAGE_ROOT") {
-        let path = normalize_input_path(&v, search_root);
+    if let Some(value) = process_value {
+        let path = normalize_input_path(value, search_root);
         return Ok(ResolvedPath {
             exists: path.exists(),
             path,
             source: ResolvedSource::ProcessEnv,
-            raw_value: Some(v),
+            raw_value: Some(value.to_string()),
         });
     }
 
-    let project_env = search_root.join(".env");
-    let map = read_env_file_map(&project_env);
-    if let Some(v) = map.get("STORAGE_ROOT") {
-        let path = normalize_input_path(v, search_root);
+    if let Some(value) = snapshot
+        .project
+        .as_ref()
+        .and_then(|authority| authority.values.get("STORAGE_ROOT"))
+    {
+        let path = normalize_input_path(value, search_root);
         return Ok(ResolvedPath {
             exists: path.exists(),
             path,
             source: ResolvedSource::ProjectEnv,
-            raw_value: Some(v.clone()),
+            raw_value: Some(value.clone()),
         });
     }
 
-    if let Some(user_env) = discover_user_env_file() {
-        let map = read_env_file_map(&user_env);
-        if let Some(v) = map.get("STORAGE_ROOT") {
-            let path = normalize_input_path(v, search_root);
-            return Ok(ResolvedPath {
-                exists: path.exists(),
-                path,
-                source: ResolvedSource::UserEnv,
-                raw_value: Some(v.clone()),
-            });
-        }
+    if let Some(value) = snapshot
+        .user
+        .as_ref()
+        .and_then(|authority| authority.values.get("STORAGE_ROOT"))
+    {
+        let path = normalize_input_path(value, search_root);
+        return Ok(ResolvedPath {
+            exists: path.exists(),
+            path,
+            source: ResolvedSource::UserEnv,
+            raw_value: Some(value.clone()),
+        });
     }
 
     let value = "~/.mcp_agent_mail_git_mailbox_repo";
@@ -1754,6 +1817,51 @@ fn resolve_storage_root(search_root: &Path, explicit: Option<&Path>) -> CliResul
         source: ResolvedSource::Default,
         raw_value: Some(value.to_string()),
     })
+}
+
+fn resolve_legacy_authorities(
+    search_root: &Path,
+    explicit_database: Option<&Path>,
+    explicit_storage: Option<&Path>,
+) -> CliResult<ResolvedLegacyAuthorities> {
+    let process_database = if explicit_database.is_none() {
+        process_env_value_for_legacy("DATABASE_URL")?
+    } else {
+        None
+    };
+    let process_storage = if explicit_storage.is_none() {
+        process_env_value_for_legacy("STORAGE_ROOT")?
+    } else {
+        None
+    };
+    let env = capture_legacy_env_snapshot(search_root)?;
+    let database = resolve_database_path_from_snapshot(
+        search_root,
+        explicit_database,
+        process_database.as_deref(),
+        &env,
+    )?;
+    let storage = resolve_storage_root_from_snapshot(
+        search_root,
+        explicit_storage,
+        process_storage.as_deref(),
+        &env,
+    )?;
+    Ok(ResolvedLegacyAuthorities {
+        database,
+        storage,
+        env,
+    })
+}
+
+fn process_env_value_for_legacy(key: &str) -> CliResult<Option<String>> {
+    match std::env::var(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(CliError::InvalidArgument(format!(
+            "process environment authority {key} is not valid UTF-8"
+        ))),
+    }
 }
 
 fn resolve_legacy_database_url_path(db_path: &Path, search_root: &Path) -> PathBuf {
