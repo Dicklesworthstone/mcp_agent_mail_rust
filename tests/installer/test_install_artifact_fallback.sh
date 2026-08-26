@@ -979,67 +979,227 @@ for bad_versions in wrong-cli wrong-server extra-lines nul-byte; do
     fi
 done
 
-step "scenario K: Unix pair replacement is digest-bound and rolls back as one unit"
+step "scenario K: Unix pair journal converges old-old or new-new across every durable phase"
 transaction_root="$tmp/transaction-fixtures"
 mkdir -p "$transaction_root/old" "$transaction_root/new" \
-    "$transaction_root/wrong" "$transaction_root/install"
+    "$transaction_root/wrong" "$transaction_root/cases"
 make_version_fixture "$transaction_root/old/am" 'am 9.9.8'
 make_version_fixture "$transaction_root/old/mcp-agent-mail" 'mcp-agent-mail 9.9.8'
 make_version_fixture "$transaction_root/new/am" 'am 9.9.9'
 make_version_fixture "$transaction_root/new/mcp-agent-mail" 'mcp-agent-mail 9.9.9'
 make_version_fixture "$transaction_root/wrong/am" 'am 9.9.9'
 make_version_fixture "$transaction_root/wrong/mcp-agent-mail" 'mcp-agent-mail 9.9.8'
-cp "$transaction_root/old/am" "$transaction_root/install/am"
-cp "$transaction_root/old/mcp-agent-mail" "$transaction_root/install/mcp-agent-mail"
 
-run_transaction_case() {
+run_transaction_interrupt() {
     local source_dir="$1"
-    local fault_after_first_replace="${2:-0}"
-    EXTRACT="$extract" TX_ROOT="$transaction_root" SOURCE_DIR="$source_dir" \
-        FAULT_AFTER_FIRST_REPLACE="$fault_after_first_replace" bash -c '
-            set -euo pipefail
+    local install_dir="$2"
+    local phase="$3"
+    EXTRACT="$extract" SOURCE_DIR="$source_dir" INSTALL_DIR="$install_dir" \
+        INTERRUPT_PHASE="$phase" bash -c '
+            set -uo pipefail
             source "$EXTRACT"
-            TMP="$TX_ROOT"
             BIN_CLI=am
             BIN_SERVER=mcp-agent-mail
             VERSION=v9.9.9
             EXPECTED_RELEASE_VERSION=9.9.9
+            set +e
             install_binary_pair_transactional \
                 "$SOURCE_DIR/mcp-agent-mail" "$SOURCE_DIR/am" \
-                "$TX_ROOT/install" "$FAULT_AFTER_FIRST_REPLACE"
+                "$INSTALL_DIR" "$INTERRUPT_PHASE"
+            rc=$?
+            [ "$rc" -eq 97 ]
         '
 }
 
-if run_transaction_case "$transaction_root/new" 1; then
-    echo "FAIL: injected failure after the first replacement must abort the pair transaction" >&2
-    exit 1
-fi
-if ! cmp -s "$transaction_root/old/am" "$transaction_root/install/am" || \
-    ! cmp -s "$transaction_root/old/mcp-agent-mail" "$transaction_root/install/mcp-agent-mail"; then
-    echo "FAIL: first-replacement failure did not restore the old binary pair byte-for-byte" >&2
-    exit 1
-fi
+run_transaction_recovery() {
+    local install_dir="$1"
+    local phase="${2:-}"
+    EXTRACT="$extract" INSTALL_DIR="$install_dir" RECOVERY_PHASE="$phase" bash -c '
+        set -euo pipefail
+        source "$EXTRACT"
+        BIN_CLI=am
+        BIN_SERVER=mcp-agent-mail
+        recover_binary_pair_transaction "$INSTALL_DIR" "$RECOVERY_PHASE"
+    '
+}
 
-run_transaction_case "$transaction_root/new"
-if ! cmp -s "$transaction_root/new/am" "$transaction_root/install/am" || \
-    ! cmp -s "$transaction_root/new/mcp-agent-mail" "$transaction_root/install/mcp-agent-mail"; then
-    echo "FAIL: successful pair transaction did not preserve staged bytes exactly" >&2
-    exit 1
-fi
+assert_old_pair() {
+    local install_dir="$1"
+    cmp -s "$transaction_root/old/am" "$install_dir/am" && \
+        cmp -s "$transaction_root/old/mcp-agent-mail" "$install_dir/mcp-agent-mail"
+}
 
-if run_transaction_case "$transaction_root/wrong"; then
+assert_new_pair() {
+    local install_dir="$1"
+    cmp -s "$transaction_root/new/am" "$install_dir/am" && \
+        cmp -s "$transaction_root/new/mcp-agent-mail" "$install_dir/mcp-agent-mail"
+}
+
+transaction_interruptions=(
+    prepared
+    preserve-server preserve-server-moved
+    preserve-cli preserve-cli-moved
+    publish-server publish-server-moved
+    publish-cli publish-cli-moved
+    commit-ready
+)
+
+for install_kind in upgrade fresh; do
+    for phase in "${transaction_interruptions[@]}"; do
+        install_dir="$transaction_root/cases/${install_kind}-${phase}"
+        mkdir -p "$install_dir"
+        if [ "$install_kind" = "upgrade" ]; then
+            cp "$transaction_root/old/am" "$install_dir/am"
+            cp "$transaction_root/old/mcp-agent-mail" "$install_dir/mcp-agent-mail"
+        fi
+        run_transaction_interrupt "$transaction_root/new" "$install_dir" "$phase"
+        active_journal="$install_dir/.mcp-agent-mail-install-transaction.active"
+        if [ ! -d "$active_journal" ] || [ -L "$active_journal" ]; then
+            echo "FAIL: $install_kind/$phase did not retain a real active journal" >&2
+            exit 1
+        fi
+        run_transaction_recovery "$install_dir"
+        if [ -e "$active_journal" ] || [ -L "$active_journal" ]; then
+            echo "FAIL: $install_kind/$phase recovery did not archive the active journal" >&2
+            exit 1
+        fi
+        if [ "$phase" = "commit-ready" ]; then
+            if ! assert_new_pair "$install_dir"; then
+                echo "FAIL: $install_kind/$phase did not converge to new-new" >&2
+                exit 1
+            fi
+            expected_outcome=committed
+        else
+            if [ "$install_kind" = "upgrade" ]; then
+                if ! assert_old_pair "$install_dir"; then
+                    echo "FAIL: $install_kind/$phase did not converge to old-old" >&2
+                    exit 1
+                fi
+            elif [ -e "$install_dir/am" ] || [ -L "$install_dir/am" ] || \
+                 [ -e "$install_dir/mcp-agent-mail" ] || [ -L "$install_dir/mcp-agent-mail" ]; then
+                echo "FAIL: fresh/$phase rollback did not restore absent-absent" >&2
+                exit 1
+            fi
+            expected_outcome=rolled-back
+        fi
+        history_count=$(find "$install_dir" -maxdepth 1 \
+            -name ".mcp-agent-mail-install-transaction.${expected_outcome}.*" | wc -l | tr -d '[:space:]')
+        if [ "$history_count" -ne 1 ]; then
+            echo "FAIL: $install_kind/$phase did not retain exactly one $expected_outcome journal" >&2
+            exit 1
+        fi
+        # Recovery is idempotent once the authority has moved to history.
+        run_transaction_recovery "$install_dir"
+    done
+done
+
+normal_dir="$transaction_root/cases/normal"
+mkdir -p "$normal_dir"
+cp "$transaction_root/old/am" "$normal_dir/am"
+cp "$transaction_root/old/mcp-agent-mail" "$normal_dir/mcp-agent-mail"
+EXTRACT="$extract" SOURCE_DIR="$transaction_root/new" INSTALL_DIR="$normal_dir" bash -c '
+    set -euo pipefail
+    source "$EXTRACT"
+    BIN_CLI=am
+    BIN_SERVER=mcp-agent-mail
+    VERSION=v9.9.9
+    EXPECTED_RELEASE_VERSION=9.9.9
+    install_binary_pair_transactional "$SOURCE_DIR/mcp-agent-mail" "$SOURCE_DIR/am" "$INSTALL_DIR"
+'
+assert_new_pair "$normal_dir" || { echo "FAIL: normal transaction did not commit new-new" >&2; exit 1; }
+
+wrong_dir="$transaction_root/cases/wrong-version"
+mkdir -p "$wrong_dir"
+cp "$transaction_root/new/am" "$wrong_dir/am"
+cp "$transaction_root/new/mcp-agent-mail" "$wrong_dir/mcp-agent-mail"
+if EXTRACT="$extract" SOURCE_DIR="$transaction_root/wrong" INSTALL_DIR="$wrong_dir" bash -c '
+    set -euo pipefail
+    source "$EXTRACT"
+    BIN_CLI=am
+    BIN_SERVER=mcp-agent-mail
+    VERSION=v9.9.9
+    EXPECTED_RELEASE_VERSION=9.9.9
+    install_binary_pair_transactional "$SOURCE_DIR/mcp-agent-mail" "$SOURCE_DIR/am" "$INSTALL_DIR"
+'; then
     echo "FAIL: installed version mismatch must abort the pair transaction" >&2
     exit 1
 fi
-if ! cmp -s "$transaction_root/new/am" "$transaction_root/install/am" || \
-    ! cmp -s "$transaction_root/new/mcp-agent-mail" "$transaction_root/install/mcp-agent-mail"; then
-    echo "FAIL: post-install version failure did not restore the prior binary pair" >&2
+assert_new_pair "$wrong_dir" || { echo "FAIL: version failure did not restore the prior pair" >&2; exit 1; }
+
+for marker_fault in partial publish-boundary; do
+    marker_dir="$transaction_root/cases/marker-${marker_fault}"
+    mkdir -p "$marker_dir"
+    cp "$transaction_root/old/am" "$marker_dir/am"
+    cp "$transaction_root/old/mcp-agent-mail" "$marker_dir/mcp-agent-mail"
+    run_transaction_interrupt "$transaction_root/new" "$marker_dir" prepared
+    marker_mode=1
+    expected_rc=97
+    if [ "$marker_fault" = "publish-boundary" ]; then marker_mode=2; expected_rc=98; fi
+    EXTRACT="$extract" INSTALL_DIR="$marker_dir" MARKER_MODE="$marker_mode" EXPECTED_RC="$expected_rc" bash -c '
+        set -uo pipefail
+        source "$EXTRACT"
+        BIN_CLI=am
+        BIN_SERVER=mcp-agent-mail
+        journal=$(binary_transaction_active_path "$INSTALL_DIR")
+        read_binary_transaction_metadata "$journal" || exit 1
+        set +e
+        persist_binary_transaction_phase "$journal" 10-preserve-server "$MARKER_MODE"
+        rc=$?
+        [ "$rc" -eq "$EXPECTED_RC" ]
+    '
+    if [ -e "$marker_dir/.mcp-agent-mail-install-transaction.active/phase.10-preserve-server" ]; then
+        echo "FAIL: $marker_fault marker became authoritative before atomic publication" >&2
+        exit 1
+    fi
+    run_transaction_recovery "$marker_dir"
+    assert_old_pair "$marker_dir" || { echo "FAIL: $marker_fault marker recovery changed old-old" >&2; exit 1; }
+done
+
+rollback_dir="$transaction_root/cases/rollback-interrupt"
+mkdir -p "$rollback_dir"
+cp "$transaction_root/old/am" "$rollback_dir/am"
+cp "$transaction_root/old/mcp-agent-mail" "$rollback_dir/mcp-agent-mail"
+run_transaction_interrupt "$transaction_root/new" "$rollback_dir" publish-server-moved
+if run_transaction_recovery "$rollback_dir" rollback-ready; then
+    echo "FAIL: rollback phase injection must interrupt recovery" >&2
     exit 1
 fi
-if find "$transaction_root/install" -maxdepth 1 -name '*.bak.preinstall-*' -print -quit | grep -q .; then
-    echo "FAIL: completed or successfully rolled-back transaction retained an unexpected backup" >&2
+run_transaction_recovery "$rollback_dir"
+assert_old_pair "$rollback_dir" || { echo "FAIL: interrupted rollback did not resume to old-old" >&2; exit 1; }
+run_transaction_recovery "$rollback_dir"
+
+corrupt_dir="$transaction_root/cases/corrupt-journal"
+mkdir -p "$corrupt_dir"
+cp "$transaction_root/old/am" "$corrupt_dir/am"
+cp "$transaction_root/old/mcp-agent-mail" "$corrupt_dir/mcp-agent-mail"
+run_transaction_interrupt "$transaction_root/new" "$corrupt_dir" prepared
+printf 'tampered\n' >>"$corrupt_dir/.mcp-agent-mail-install-transaction.active/metadata"
+if run_transaction_recovery "$corrupt_dir"; then
+    echo "FAIL: corrupted journal metadata must fail closed" >&2
     exit 1
 fi
+assert_old_pair "$corrupt_dir" || { echo "FAIL: corrupted journal recovery modified old binaries" >&2; exit 1; }
+[ -d "$corrupt_dir/.mcp-agent-mail-install-transaction.active" ] || {
+    echo "FAIL: corrupted active journal was not retained" >&2; exit 1;
+}
+
+unexpected_dir="$transaction_root/cases/unexpected-destination"
+mkdir -p "$unexpected_dir"
+cp "$transaction_root/old/am" "$unexpected_dir/am"
+cp "$transaction_root/old/mcp-agent-mail" "$unexpected_dir/mcp-agent-mail"
+run_transaction_interrupt "$transaction_root/new" "$unexpected_dir" publish-server
+printf 'user-modified-server' >"$unexpected_dir/mcp-agent-mail"
+if run_transaction_recovery "$unexpected_dir"; then
+    echo "FAIL: unexpected destination bytes must fail closed" >&2
+    exit 1
+fi
+if [ "$(cat "$unexpected_dir/mcp-agent-mail")" != "user-modified-server" ]; then
+    echo "FAIL: recovery clobbered unexpected destination bytes" >&2
+    exit 1
+fi
+[ -d "$unexpected_dir/.mcp-agent-mail-install-transaction.active" ] || {
+    echo "FAIL: ambiguous active journal was not retained" >&2; exit 1;
+}
 
 staged_version_line=$(grep -nF 'verify_release_binaries_exact "$SERVER_BIN" "$CLI_BIN" "Staged"' "$INSTALL_SH" | cut -d: -f1)
 replace_line=$(grep -nF 'install_binary_pair_transactional "$SERVER_BIN" "$CLI_BIN" "$DEST"' "$INSTALL_SH" | cut -d: -f1)
