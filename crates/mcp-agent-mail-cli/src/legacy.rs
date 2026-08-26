@@ -3219,7 +3219,7 @@ mod tests {
 
         match err {
             CliError::InvalidArgument(msg) => {
-                assert!(msg.contains("target storage root to be a directory path"));
+                assert!(msg.contains("target storage root must be a directory"));
                 assert!(msg.contains(&target_storage_file.display().to_string()));
             }
             other => panic!("expected invalid argument, got {other:?}"),
