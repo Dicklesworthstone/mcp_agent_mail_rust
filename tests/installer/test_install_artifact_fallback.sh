@@ -1322,7 +1322,7 @@ for required_text in \
     '[McpAgentMailInstallerNativeMethods]::MoveFileExW($Source, $Destination, [uint32]0x8)' \
     'MOVEFILE_REPLACE_EXISTING is' \
     'Recover-BinaryPairTransaction -InstallDir $Dest' \
-    'phase "50-commit-ready"' \
+    '-Phase "50-commit-ready"' \
     '-PostInstallVerifier $postInstallVerifier' \
     'Installed binary bytes differ from the verified staged pair.' \
     'Archive-member and exact-version checks remain mandatory.' \
