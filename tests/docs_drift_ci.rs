@@ -530,7 +530,8 @@ mod dist_release_contract {
             "Refusing ambiguous release state: ${release_count} releases match ${RELEASE_TAG}",
             "Expected exactly one draft after preflight",
             "'.id == $id and .draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease'",
-            "Draft is not uniquely discoverable by its release tag",
+            "direct_release=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/${release_id}\")\"",
+            "Draft id no longer resolves to the isolated release contract",
             "verify_existing_assets_are_matching_subset \"$release_id\"",
             "printf 'release_id=%s\\n' \"$release_id\" >> \"$GITHUB_OUTPUT\"",
             "token: ${{ github.token }}",
@@ -544,6 +545,7 @@ mod dist_release_contract {
             "STAGED_RELEASE_ID: ${{ steps.stage_release.outputs.id }}",
             "load_remote_assets() {",
             "assert_release_state_and_census() {",
+            "release_json=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}\")\"",
             "'.id == $id and .tag_name == $tag and .name == $tag and .draft == $draft and .prerelease == $prerelease'",
             "[ \"$(jq -r 'length' <<< \"$assets_json\")\" -ne 30 ]",
             "[ \"$actual_names\" != \"$expected_names\" ]",
@@ -555,6 +557,10 @@ mod dist_release_contract {
             "[ \"$(jq -r '.draft' <<< \"$finalized_release\")\" != false ]",
             "published_assets=\"$(assert_release_state_and_census false)\"",
             "Published asset size differs from local ${asset_name}",
+            "Published asset bytes differ from local ${asset_name}",
+            "published_by_tag=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/tags/${RELEASE_TAG}\")\"",
+            "'.id == $id and .draft == false and .tag_name == $tag and .name == $tag and .prerelease == $prerelease'",
+            "Published release is not discoverable by the expected tag and metadata",
         ];
         for needle in required_once {
             require_once(workflow, needle)?;
@@ -677,10 +683,10 @@ mod dist_release_contract {
             "expected_release_assets+=(\"${subject}.sigstore.json\")",
             "[ \"${actual_release_assets[*]}\" != \"${expected_release_assets[*]}\" ]",
             "[ \"${#expected_release_assets[@]}\" -ne 30 ]",
-            "[ \"$remote_hash\" != \"$local_hash\" ]",
         ] {
             require_exactly(workflow, needle, 2)?;
         }
+        require_exactly(workflow, "[ \"$remote_hash\" != \"$local_hash\" ]", 3)?;
         require_exactly(
             workflow,
             "name: signed-release-${{ needs.release_contract.outputs.revision }}",
@@ -698,7 +704,7 @@ mod dist_release_contract {
         require_exactly(
             workflow,
             "if [[ ! \"$asset_id\" =~ ^[0-9]+$ ]] || [[ ! \"$asset_size\" =~ ^[0-9]+$ ]]; then",
-            2,
+            3,
         )?;
         require_once(
             workflow,
@@ -1118,6 +1124,16 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
+                "direct_release=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/${release_id}\")\"",
+                "direct_release=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/tags/${RELEASE_TAG}\")\"",
+            ),
+            mutate(
+                &workflow,
+                "release_json=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}\")\"",
+                "release_json=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/tags/${RELEASE_TAG}\")\"",
+            ),
+            mutate(
+                &workflow,
                 "[ \"$remote_hash\" != \"$local_hash\" ]",
                 "[ -z \"$remote_hash\" ]",
             ),
@@ -1166,6 +1182,16 @@ mod dist_release_contract {
                 &workflow,
                 "Published asset size differs from local ${asset_name}",
                 "Published asset was not checked against local ${asset_name}",
+            ),
+            mutate(
+                &workflow,
+                "Published asset bytes differ from local ${asset_name}",
+                "Published asset digest was not checked against local ${asset_name}",
+            ),
+            mutate(
+                &workflow,
+                "published_by_tag=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/tags/${RELEASE_TAG}\")\"",
+                "published_by_tag=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}\")\"",
             ),
         ];
         for mutation in mutations {

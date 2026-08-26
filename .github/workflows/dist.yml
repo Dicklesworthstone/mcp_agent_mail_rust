@@ -923,10 +923,14 @@ jobs:
             echo "Draft state changed during preflight" >&2
             exit 1
           fi
-          direct_release="$(gh api "/repos/${EXPECTED_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
-          if [ "$(jq -r '.id' <<< "$direct_release")" != "$release_id" ] \
-              || [ "$(jq -r '.draft' <<< "$direct_release")" != true ]; then
-            echo "Draft is not uniquely discoverable by its release tag" >&2
+          direct_release="$(gh api "/repos/${EXPECTED_REPOSITORY}/releases/${release_id}")"
+          if ! jq -e \
+              --argjson id "$release_id" \
+              --arg tag "$RELEASE_TAG" \
+              --argjson prerelease "$EXPECTED_PRERELEASE" \
+              '.id == $id and .draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease' \
+              >/dev/null <<< "$direct_release"; then
+            echo "Draft id no longer resolves to the isolated release contract" >&2
             exit 1
           fi
           verify_existing_assets_are_matching_subset "$release_id"
@@ -977,7 +981,7 @@ jobs:
             local release_json assets_json
             local expected_names actual_names
 
-            release_json="$(gh api "/repos/${EXPECTED_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+            release_json="$(gh api "/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}")"
             if ! jq -e \
                 --argjson id "$EXPECTED_RELEASE_ID" \
                 --arg tag "$RELEASE_TAG" \
@@ -1040,8 +1044,8 @@ jobs:
           fi
           assert_tag_revision
           published_assets="$(assert_release_state_and_census false)"
-          while IFS=$'\t' read -r asset_name asset_size; do
-            if [[ ! "$asset_size" =~ ^[0-9]+$ ]]; then
+          while IFS=$'\t' read -r asset_id asset_name asset_size; do
+            if [[ ! "$asset_id" =~ ^[0-9]+$ ]] || [[ ! "$asset_size" =~ ^[0-9]+$ ]]; then
               echo "Published release returned malformed asset metadata" >&2
               exit 1
             fi
@@ -1050,4 +1054,26 @@ jobs:
               echo "Published asset size differs from local ${asset_name}" >&2
               exit 1
             fi
-          done < <(jq -r '.[] | [.name, .size] | @tsv' <<< "$published_assets")
+            local_hash="$(sha256sum "publish/$asset_name" | awk '{print $1}')"
+            remote_hash="$(gh api \
+              -H 'Accept: application/octet-stream' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/${EXPECTED_REPOSITORY}/releases/assets/${asset_id}" \
+              | sha256sum | awk '{print $1}')"
+            if [ "$remote_hash" != "$local_hash" ]; then
+              echo "Published asset bytes differ from local ${asset_name}" >&2
+              exit 1
+            fi
+          done < <(jq -r '.[] | [.id, .name, .size] | @tsv' <<< "$published_assets")
+
+          published_by_tag="$(gh api "/repos/${EXPECTED_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          if ! jq -e \
+              --argjson id "$EXPECTED_RELEASE_ID" \
+              --arg tag "$RELEASE_TAG" \
+              --argjson prerelease "$EXPECTED_PRERELEASE" \
+              '.id == $id and .draft == false and .tag_name == $tag and .name == $tag and .prerelease == $prerelease' \
+              >/dev/null <<< "$published_by_tag"; then
+            echo "Published release is not discoverable by the expected tag and metadata" >&2
+            exit 1
+          fi
+          assert_tag_revision
