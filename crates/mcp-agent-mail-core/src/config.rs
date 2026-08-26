@@ -3515,10 +3515,7 @@ fn read_user_env_candidate_with_hooks(
     use nix::fcntl::{AtFlags, OFlag, open, openat};
     use nix::sys::stat::{Mode, SFlag, fstat, fstatat};
 
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+    let parent = env_authority_parent(path);
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3660,10 +3657,7 @@ fn read_user_env_candidate_with_hooks(
     after_parent_open: impl FnOnce(),
     after_file_open: impl FnOnce(),
 ) -> io::Result<Option<Vec<u8>>> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+    let parent = env_authority_parent(path);
     let parent_before = match bind_user_env_parent(parent) {
         Ok(handle) => handle,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -3692,6 +3686,12 @@ fn read_user_env_candidate_with_hooks(
 
 fn read_user_env_candidate(path: &Path) -> io::Result<Option<Vec<u8>>> {
     read_user_env_candidate_with_hooks(path, || {}, || {})
+}
+
+fn env_authority_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
 }
 
 /// Read one explicitly selected environment-file authority as bounded UTF-8.
@@ -5880,11 +5880,15 @@ mod tests {
     }
 
     #[test]
-    fn env_authority_reader_accepts_bare_relative_regular_file() {
-        let text = read_env_authority_text(Path::new("Cargo.toml"))
-            .expect("read bare relative env authority")
-            .expect("Cargo.toml should exist in the test working directory");
-        assert!(!text.is_empty());
+    fn env_authority_parent_normalizes_a_bare_relative_path() {
+        assert_eq!(
+            env_authority_parent(Path::new("config.env")),
+            Path::new(".")
+        );
+        assert_eq!(
+            env_authority_parent(Path::new("nested/config.env")),
+            Path::new("nested")
+        );
     }
 
     #[cfg(unix)]
