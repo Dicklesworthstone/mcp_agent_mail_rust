@@ -5558,8 +5558,10 @@ fn handle_sibling_update(
     other_id: i64,
     body: &str,
 ) -> Result<Option<String>, (u16, String)> {
-    let payload: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| (400, format!("Invalid JSON: {e}")))?;
+    let payload: serde_json::Value = match serde_json::from_str(body) {
+        Ok(payload) => payload,
+        Err(_) => return json_err(400, "Invalid JSON"),
+    };
 
     let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
