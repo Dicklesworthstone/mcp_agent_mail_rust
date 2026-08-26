@@ -186,7 +186,9 @@ try {
         throw "expected checksum mismatch to throw"
     }
 } finally {
-    if (Test-Path -LiteralPath $tmp) {
+    if ([Environment]::GetEnvironmentVariable("AM_E2E_KEEP_TMP") -ceq "1") {
+        Write-Host "AM_E2E_KEEP_TMP=1 retaining checksum test artifact: $tmp"
+    } elseif (Test-Path -LiteralPath $tmp) {
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     }
 }
@@ -435,11 +437,15 @@ try {
         throw "missing source failure left an active authority"
     }
 } finally {
-    if (Test-Path -LiteralPath $root) {
+    if ([Environment]::GetEnvironmentVariable("AM_E2E_KEEP_TMP") -ceq "1") {
+        Write-Host "AM_E2E_KEEP_TMP=1 retaining atomic transaction artifacts: $root"
+    } elseif (Test-Path -LiteralPath $root) {
         Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 '
+
+e2e_log "NOTE: case 4 injects terminating function faults; it does not claim Windows host Ctrl+C coverage."
 
 e2e_case_banner "5) Sigstore verification isolates trust and forces the modern parser"
 run_pwsh_case \
@@ -525,7 +531,9 @@ try {
         throw "cosign did not receive the exact certificate identity"
     }
 } finally {
-    if (Test-Path -LiteralPath $root) {
+    if ([Environment]::GetEnvironmentVariable("AM_E2E_KEEP_TMP") -ceq "1") {
+        Write-Host "AM_E2E_KEEP_TMP=1 retaining Sigstore test artifacts: $root"
+    } elseif (Test-Path -LiteralPath $root) {
         Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

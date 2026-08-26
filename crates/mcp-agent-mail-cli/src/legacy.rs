@@ -3744,8 +3744,8 @@ mod tests {
             "error should be annotated: {message}"
         );
         assert!(
-            message.contains("broken symlink"),
-            "original failure must be preserved: {message}"
+            message.contains("symlink or reparse-point entry"),
+            "original link-like-entry failure must be preserved: {message}"
         );
         assert!(
             message.contains(".failed-"),
@@ -3788,8 +3788,8 @@ mod tests {
             latest
                 .failure_reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("broken symlink")),
-            "failure_reason should carry the original error: {:?}",
+                .is_some_and(|reason| reason.contains("symlink or reparse-point entry")),
+            "failure_reason should carry the original link-like-entry error: {:?}",
             latest.failure_reason
         );
         assert!(!latest.integrity_check_ok);

@@ -22,6 +22,10 @@ step() { echo "[ARTIFACT_FALLBACK_TEST $(ts)] $*" >&2; }
 
 tmp="$(mktemp -d)"
 cleanup_tmp() {
+    if [ "${AM_E2E_KEEP_TMP:-0}" = "1" ] || [ "${AM_E2E_KEEP_TMP:-0}" = "true" ]; then
+        step "retaining temporary directory (AM_E2E_KEEP_TMP=1): $tmp"
+        return
+    fi
     if command -v python3 >/dev/null 2>&1; then
         python3 - "$tmp" <<'PY' || true
 import pathlib
@@ -132,6 +136,8 @@ extract_function() {
     extract_function prepare_binary_pair_transaction
     extract_function abort_binary_pair_transaction
     extract_function install_binary_pair_transactional
+    extract_function handle_binary_transaction_signal
+    extract_function cleanup
 } >"$extract"
 
 for required in establish_release_contract set_artifact_url check_network \
@@ -1108,6 +1114,114 @@ EXTRACT="$extract" SOURCE_DIR="$transaction_root/new" INSTALL_DIR="$normal_dir" 
     install_binary_pair_transactional "$SOURCE_DIR/mcp-agent-mail" "$SOURCE_DIR/am" "$INSTALL_DIR"
 '
 assert_new_pair "$normal_dir" || { echo "FAIL: normal transaction did not commit new-new" >&2; exit 1; }
+
+# Exercise the production TERM and EXIT traps after a real persisted mutation
+# window. The signal path must preserve its conventional 128+signal exit code,
+# recover while the installer lock would still be held, and leave exactly one
+# retained rollback history journal.
+signal_dir="$transaction_root/cases/signal-term"
+signal_log="$transaction_root/cases/signal-term.log"
+mkdir -p "$signal_dir"
+cp "$transaction_root/old/am" "$signal_dir/am"
+cp "$transaction_root/old/mcp-agent-mail" "$signal_dir/mcp-agent-mail"
+signal_rc=0
+EXTRACT="$extract" SOURCE_DIR="$transaction_root/new" INSTALL_DIR="$signal_dir" \
+    bash -c '
+        set -uo pipefail
+        source "$EXTRACT"
+        BIN_CLI=am
+        BIN_SERVER=mcp-agent-mail
+        VERSION=v9.9.9
+        EXPECTED_RELEASE_VERSION=9.9.9
+        TMP=""
+        LOCKED=0
+        dump_verbose_tail() { :; }
+        trap cleanup EXIT
+        trap "handle_binary_transaction_signal TERM 143" TERM
+        set +e
+        install_binary_pair_transactional \
+            "$SOURCE_DIR/mcp-agent-mail" "$SOURCE_DIR/am" \
+            "$INSTALL_DIR" publish-server-moved
+        rc=$?
+        set -e
+        [ "$rc" -eq 97 ]
+        [ -d "$(binary_transaction_active_path "$INSTALL_DIR")" ]
+        kill -TERM "$$"
+        exit 99
+    ' >"$signal_log" 2>&1 || signal_rc=$?
+if [ "$signal_rc" -ne 143 ]; then
+    echo "FAIL: TERM transaction subprocess exited $signal_rc instead of 143" >&2
+    cat "$signal_log" >&2
+    exit 1
+fi
+assert_old_pair "$signal_dir" || {
+    echo "FAIL: TERM recovery did not converge the mutated pair to old-old" >&2
+    exit 1
+}
+if [ -e "$signal_dir/.mcp-agent-mail-install-transaction.active" ] || \
+   [ -L "$signal_dir/.mcp-agent-mail-install-transaction.active" ]; then
+    echo "FAIL: TERM recovery retained active authority after successful rollback" >&2
+    exit 1
+fi
+signal_history_count=$(find "$signal_dir" -maxdepth 1 \
+    -name '.mcp-agent-mail-install-transaction.rolled-back.*' | wc -l | tr -d '[:space:]')
+if [ "$signal_history_count" -ne 1 ]; then
+    echo "FAIL: TERM recovery did not retain exactly one rollback history journal" >&2
+    exit 1
+fi
+if grep -Fq 'Exit-time binary transaction recovery failed closed' "$signal_log"; then
+    echo "FAIL: EXIT trap retried recovery after TERM signal handling" >&2
+    exit 1
+fi
+
+# A corrupt authority makes the real signal-time recovery fail. This is the
+# causal guard test: the TERM handler reports the failure once, preserves exit
+# 143 and active evidence, and the EXIT trap must not make a second attempt.
+signal_corrupt_dir="$transaction_root/cases/signal-term-corrupt"
+signal_corrupt_log="$transaction_root/cases/signal-term-corrupt.log"
+mkdir -p "$signal_corrupt_dir"
+cp "$transaction_root/old/am" "$signal_corrupt_dir/am"
+cp "$transaction_root/old/mcp-agent-mail" "$signal_corrupt_dir/mcp-agent-mail"
+run_transaction_interrupt "$transaction_root/new" "$signal_corrupt_dir" prepared
+printf 'tampered\n' >>"$signal_corrupt_dir/.mcp-agent-mail-install-transaction.active/metadata"
+signal_corrupt_rc=0
+EXTRACT="$extract" INSTALL_DIR="$signal_corrupt_dir" bash -c '
+    set -uo pipefail
+    source "$EXTRACT"
+    BIN_CLI=am
+    BIN_SERVER=mcp-agent-mail
+    TMP=""
+    LOCKED=0
+    BINARY_TRANSACTION_ACTIVE_INSTALL_DIR="$INSTALL_DIR"
+    dump_verbose_tail() { :; }
+    trap cleanup EXIT
+    trap "handle_binary_transaction_signal TERM 143" TERM
+    kill -TERM "$$"
+    exit 99
+' >"$signal_corrupt_log" 2>&1 || signal_corrupt_rc=$?
+if [ "$signal_corrupt_rc" -ne 143 ]; then
+    echo "FAIL: corrupt TERM subprocess exited $signal_corrupt_rc instead of 143" >&2
+    cat "$signal_corrupt_log" >&2
+    exit 1
+fi
+signal_mismatch_count=$(grep -cF 'Binary transaction metadata hash witness does not match' \
+    "$signal_corrupt_log" || true)
+if [ "$signal_mismatch_count" -ne 1 ] || \
+   ! grep -Fq 'Recovery after TERM failed closed; the active journal was retained.' \
+       "$signal_corrupt_log" || \
+   grep -Fq 'Exit-time binary transaction recovery failed closed' "$signal_corrupt_log"; then
+    echo "FAIL: corrupt TERM recovery was retried or reported ambiguously" >&2
+    cat "$signal_corrupt_log" >&2
+    exit 1
+fi
+assert_old_pair "$signal_corrupt_dir" || {
+    echo "FAIL: corrupt TERM recovery modified the old pair" >&2
+    exit 1
+}
+[ -d "$signal_corrupt_dir/.mcp-agent-mail-install-transaction.active" ] || {
+    echo "FAIL: corrupt TERM recovery did not retain active evidence" >&2
+    exit 1
+}
 
 wrong_dir="$transaction_root/cases/wrong-version"
 mkdir -p "$wrong_dir"
