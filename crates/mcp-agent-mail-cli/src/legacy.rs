@@ -1684,7 +1684,7 @@ fn resolve_database_path(search_root: &Path, explicit: Option<&Path>) -> CliResu
     } else {
         None
     };
-    let snapshot = capture_legacy_env_snapshot(search_root)?;
+    let snapshot = capture_legacy_env_snapshot(search_root, process_value.is_none())?;
     resolve_database_path_from_snapshot(
         search_root,
         explicit,
@@ -1742,7 +1742,7 @@ fn resolve_storage_root(search_root: &Path, explicit: Option<&Path>) -> CliResul
     } else {
         None
     };
-    let snapshot = capture_legacy_env_snapshot(search_root)?;
+    let snapshot = capture_legacy_env_snapshot(search_root, process_value.is_none())?;
     resolve_storage_root_from_snapshot(
         search_root,
         explicit,
@@ -1830,7 +1830,9 @@ fn resolve_legacy_authorities(
     } else {
         None
     };
-    let env = capture_legacy_env_snapshot(search_root)?;
+    let needs_user_authority = (explicit_database.is_none() && process_database.is_none())
+        || (explicit_storage.is_none() && process_storage.is_none());
+    let env = capture_legacy_env_snapshot(search_root, needs_user_authority)?;
     let database = resolve_database_path_from_snapshot(
         search_root,
         explicit_database,
@@ -1942,11 +1944,15 @@ fn parse_env_file_map(text: &str) -> BTreeMap<String, String> {
     out
 }
 
-fn capture_legacy_env_snapshot(search_root: &Path) -> CliResult<LegacyEnvSnapshot> {
+fn capture_legacy_env_snapshot(
+    search_root: &Path,
+    include_user_authority: bool,
+) -> CliResult<LegacyEnvSnapshot> {
     let user_candidates = user_env_authority_candidates();
     capture_legacy_env_snapshot_with_reader(
         search_root,
         &user_candidates,
+        include_user_authority,
         read_env_authority_text,
     )
 }
@@ -1954,16 +1960,19 @@ fn capture_legacy_env_snapshot(search_root: &Path) -> CliResult<LegacyEnvSnapsho
 fn capture_legacy_env_snapshot_with_reader(
     search_root: &Path,
     user_candidates: &[PathBuf],
+    include_user_authority: bool,
     mut read_authority: impl FnMut(&Path) -> std::io::Result<Option<String>>,
 ) -> CliResult<LegacyEnvSnapshot> {
     let project_path = search_root.join(".env");
     let project_text = read_legacy_env_authority(&project_path, &mut read_authority)?;
 
     let mut selected_user: Option<(usize, String)> = None;
-    for (index, path) in user_candidates.iter().enumerate() {
-        if let Some(text) = read_legacy_env_authority(path, &mut read_authority)? {
-            selected_user = Some((index, text));
-            break;
+    if include_user_authority {
+        for (index, path) in user_candidates.iter().enumerate() {
+            if let Some(text) = read_legacy_env_authority(path, &mut read_authority)? {
+                selected_user = Some((index, text));
+                break;
+            }
         }
     }
 
@@ -1976,9 +1985,13 @@ fn capture_legacy_env_snapshot_with_reader(
         project_text.as_deref(),
         &mut read_authority,
     )?;
-    let user_probe_len = selected_user
-        .as_ref()
-        .map_or(user_candidates.len(), |(index, _)| index + 1);
+    let user_probe_len = if include_user_authority {
+        selected_user
+            .as_ref()
+            .map_or(user_candidates.len(), |(index, _)| index + 1)
+    } else {
+        0
+    };
     for (index, path) in user_candidates.iter().take(user_probe_len).enumerate() {
         let expected = selected_user
             .as_ref()
@@ -2617,6 +2630,7 @@ mod tests {
         let snapshot = capture_legacy_env_snapshot_with_reader(
             tmp.path(),
             &[portable_env.clone(), native_env],
+            true,
             read_env_authority_text,
         )
         .expect("capture env snapshot");

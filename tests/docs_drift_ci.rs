@@ -386,6 +386,9 @@ mod dist_release_contract {
             "--insecure-ignore-sct",
             "--insecure-ignore-tlog",
             "--new-bundle-format=false",
+            "SIGSTORE_ROOT_FILE:",
+            "SIGSTORE_REKOR_PUBLIC_KEY:",
+            "SIGSTORE_CT_LOG_PUBLIC_KEY_FILE:",
             "overwrite_files: true",
             "--method DELETE",
             "deleteRelease",
@@ -678,6 +681,7 @@ mod dist_release_contract {
             2,
         )?;
         require_exactly(workflow, "GH_TOKEN: ${{ github.token }}", 2)?;
+        require_exactly(workflow, "SIGSTORE_", 6)?;
         require_exactly(workflow, "assert_tag_revision() {", 2)?;
         require_exactly(
             workflow,
@@ -815,6 +819,52 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
+                RELEASE_ACTION,
+                "softprops/action-gh-release@v2.6.2",
+            ),
+            mutate(
+                &workflow,
+                "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2",
+                "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.4.2",
+            ),
+            mutate(
+                &workflow,
+                "            target: x86_64-unknown-linux-musl",
+                "            target: aarch64-unknown-linux-musl",
+            ),
+            mutate(
+                &workflow,
+                "            mcp-agent-mail-x86_64-unknown-linux-musl.tar.xz",
+                "            mcp-agent-mail-aarch64-unknown-linux-musl.tar.xz",
+            ),
+            mutate(&workflow, "set -euo pipefail", "set -eu"),
+            mutate(
+                &workflow,
+                "needs: [release_contract, lint, test, build]",
+                "needs: [release_contract, build]",
+            ),
+            mutate(
+                &workflow,
+                "needs: [release_contract, sign]",
+                "needs: [release_contract, build]",
+            ),
+            mutate(
+                &workflow,
+                "permissions:\n      contents: read\n      id-token: write",
+                "permissions:\n      contents: write\n      id-token: write",
+            ),
+            mutate(
+                &workflow,
+                "permissions:\n      contents: write\n\n    steps:",
+                "permissions:\n      contents: write\n      id-token: write\n\n    steps:",
+            ),
+            mutate(
+                &workflow,
+                "# pinned 2026-08-05",
+                "# master 2026-08-05",
+            ),
+            mutate(
+                &workflow,
                 "COSIGN_VERSION: v3.1.3",
                 "COSIGN_VERSION: v3.0.2",
             ),
@@ -881,6 +931,16 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
+                "[ \"${actual_download_entries[*]}\" != \"${expected_download_entries[*]}\" ]",
+                "[ \"${#actual_download_entries[@]}\" -lt \"${#expected_download_entries[@]}\" ]",
+            ),
+            mutate(
+                &workflow,
+                "[ \"$actual_hash\" != \"$sidecar_hash\" ]",
+                "[ -z \"$actual_hash\" ]",
+            ),
+            mutate(
+                &workflow,
                 "cp -- install.sh install.ps1 publish/",
                 "cp -- install.sh publish/",
             ),
@@ -911,6 +971,11 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
+                "[ \"$actual_hash\" != \"${sums_hashes[0]}\" ]",
+                "[ -z \"$actual_hash\" ]",
+            ),
+            mutate(
+                &workflow,
                 "'$2 == payload && NF == 2 {print $1}'",
                 "'$2 == payload || $2 == (\"./\" payload) {print $1}'",
             ),
@@ -926,6 +991,11 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
+                "any(not member.isfile() or member.size <= 0 for member in members)",
+                "any(member.size <= 0 for member in members)",
+            ),
+            mutate(
+                &workflow,
                 "names = sorted(member.filename for member in members)",
                 "names = sorted(member.filename.removeprefix(\"./\") for member in members)",
             ),
@@ -933,6 +1003,11 @@ mod dist_release_contract {
                 &workflow,
                 "names != [\"am.exe\", \"mcp-agent-mail.exe\"]",
                 "names != [\"mcp-agent-mail.exe\"]",
+            ),
+            mutate(
+                &workflow,
+                "member.is_dir() or member.file_size <= 0 or stat.S_IFMT(mode) not in (0, stat.S_IFREG)",
+                "member.is_dir() or member.file_size <= 0",
             ),
             mutate(
                 &workflow,
@@ -948,6 +1023,16 @@ mod dist_release_contract {
                 &workflow,
                 "\"$COSIGN_BIN\" verify-blob \\",
                 "true \\",
+            ),
+            mutate(
+                &workflow,
+                "--new-bundle-format \\",
+                "--new-bundle-format=false \\",
+            ),
+            mutate(
+                &workflow,
+                "unset SIGSTORE_ROOT_FILE SIGSTORE_REKOR_PUBLIC_KEY SIGSTORE_CT_LOG_PUBLIC_KEY_FILE",
+                "unset SIGSTORE_REKOR_PUBLIC_KEY SIGSTORE_CT_LOG_PUBLIC_KEY_FILE",
             ),
             mutate(
                 &workflow,
