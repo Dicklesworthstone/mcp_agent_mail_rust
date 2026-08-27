@@ -106,7 +106,10 @@ v0.3.13 and amd64-only since June (GH#256).
   progress across a 940-agent cold start, and advertises an immediately due
   follow-up deadline while dirty work remains. This prevents a valid population
   larger than the 512-effect executor queue from being materialized in one
-  multi-second burst.
+  multi-second burst. `am robot health` now also derives `health_level` from its
+  aggregate probe verdict, so failed live-server probes cannot coexist with a
+  misleading green headline; the former capacity-only signal remains available
+  as `capacity_health_level`.
 
 - **ATC no longer writes liveness-mail by default (GH#264).** The executor now
   defaults to `shadow` (including for missing or unknown configuration), so
