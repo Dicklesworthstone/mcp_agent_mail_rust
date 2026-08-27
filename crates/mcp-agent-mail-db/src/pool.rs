@@ -20543,25 +20543,25 @@ mod tests {
         let alias_b = dir.path().join("database-alias-b");
         symlink(&target_a, &alias_a).expect("create first database parent alias");
         symlink(&target_b, &alias_b).expect("create second database parent alias");
-        let db_a = alias_a.join("mail.sqlite3");
-        let db_b = alias_b.join("mail.sqlite3");
-        let db_a_string = db_a.to_str().expect("UTF-8 alias path");
-        let db_b_string = db_b.to_str().expect("UTF-8 alias path");
+        let high_byte_db = alias_a.join("mail.sqlite3");
+        let lower_byte_db = alias_b.join("mail.sqlite3");
+        let high_byte_url_path = high_byte_db.to_str().expect("UTF-8 alias path");
+        let lower_byte_url_path = lower_byte_db.to_str().expect("UTF-8 alias path");
 
         assert_eq!(
-            normalize_sqlite_identity_path(db_a_string),
-            normalize_sqlite_identity_path(db_b_string),
+            normalize_sqlite_identity_path(high_byte_url_path),
+            normalize_sqlite_identity_path(lower_byte_url_path),
             "fixture must collide under the former lossy String database identity"
         );
         assert_ne!(
-            normalize_file_sqlite_identity(db_a_string),
-            normalize_file_sqlite_identity(db_b_string),
+            normalize_file_sqlite_identity(high_byte_url_path),
+            normalize_file_sqlite_identity(lower_byte_url_path),
             "allocator authority must retain the canonical target's native bytes"
         );
 
         let storage_root = dir.path().join("shared-storage");
         let config_a = DbPoolConfig {
-            database_url: format!("sqlite:///{db_a_string}"),
+            database_url: format!("sqlite:///{high_byte_url_path}"),
             storage_root: Some(storage_root.clone()),
             min_connections: 0,
             max_connections: 1,
@@ -20570,7 +20570,7 @@ mod tests {
             ..Default::default()
         };
         let config_b = DbPoolConfig {
-            database_url: format!("sqlite:///{db_b_string}"),
+            database_url: format!("sqlite:///{lower_byte_url_path}"),
             ..config_a.clone()
         };
         let pool_a = DbPool::new(&config_a).expect("create first database authority");

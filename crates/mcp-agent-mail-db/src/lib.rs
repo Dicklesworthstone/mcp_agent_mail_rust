@@ -13,6 +13,7 @@
 //! to/from `chrono::NaiveDateTime` for API compatibility.
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 #![allow(
     clippy::result_large_err,
     clippy::match_same_arms,

@@ -4763,7 +4763,7 @@ pub async fn update_project_sibling_status(
         ));
     }
 
-    let (project_a_id, project_b_id) = if project_id < other_id {
+    let (smaller_id, larger_id) = if project_id < other_id {
         (project_id, other_id)
     } else {
         (other_id, project_id)
@@ -4802,7 +4802,7 @@ pub async fn update_project_sibling_status(
                     cx,
                     &tracked,
                     "SELECT COUNT(*) FROM projects WHERE id IN (?, ?)",
-                    &[Value::BigInt(project_a_id), Value::BigInt(project_b_id)],
+                    &[Value::BigInt(smaller_id), Value::BigInt(larger_id)],
                 )
                 .await
             )
@@ -4815,14 +4815,14 @@ pub async fn update_project_sibling_status(
             rollback_tx(cx, &tracked).await;
             return Outcome::Err(DbError::not_found(
                 "Project pair",
-                format!("{project_a_id},{project_b_id}"),
+                format!("{smaller_id},{larger_id}"),
             ));
         }
 
         let select_sql = format!(
             "{PROJECT_SIBLING_SELECT} WHERE s.project_a_id = ? AND s.project_b_id = ? LIMIT 1"
         );
-        let select_params = [Value::BigInt(project_a_id), Value::BigInt(project_b_id)];
+        let select_params = [Value::BigInt(smaller_id), Value::BigInt(larger_id)];
         let existing_rows = try_in_tx!(
             cx,
             &tracked,
@@ -4832,7 +4832,7 @@ pub async fn update_project_sibling_status(
             rollback_tx(cx, &tracked).await;
             return Outcome::Err(DbError::not_found(
                 "Project sibling suggestion",
-                format!("{project_a_id},{project_b_id}"),
+                format!("{smaller_id},{larger_id}"),
             ));
         };
         let existing = match decode_project_sibling_suggestion(existing_row) {
@@ -4852,8 +4852,8 @@ pub async fn update_project_sibling_status(
             Value::BigInt(now),
             confirmed_ts.clone(),
             dismissed_ts.clone(),
-            Value::BigInt(project_a_id),
-            Value::BigInt(project_b_id),
+            Value::BigInt(smaller_id),
+            Value::BigInt(larger_id),
         ];
         let changed = try_in_tx!(
             cx,
@@ -16466,8 +16466,8 @@ mod tests {
     async fn insert_project_sibling_for_test(
         cx: &Cx,
         pool: &DbPool,
-        project_a_id: i64,
-        project_b_id: i64,
+        smaller_id: i64,
+        larger_id: i64,
         score: f64,
     ) {
         let conn = acquire_conn(cx, pool)
@@ -16481,10 +16481,10 @@ mod tests {
                 &tracked,
                 "INSERT INTO project_sibling_suggestions \
                  (project_a_id, project_b_id, score, status, rationale, created_ts, evaluated_ts) \
-                 VALUES (?, ?, ?, 'suggested', 'shared workspace', 10, 10)",
+                VALUES (?, ?, ?, 'suggested', 'shared workspace', 10, 10)",
                 &[
-                    Value::BigInt(project_a_id),
-                    Value::BigInt(project_b_id),
+                    Value::BigInt(smaller_id),
+                    Value::BigInt(larger_id),
                     Value::Double(score),
                 ],
             )
@@ -16786,35 +16786,31 @@ mod tests {
         });
 
         let start = Arc::new(std::sync::Barrier::new(2));
-        let handles: Vec<_> = (0..2)
-            .map(|_| {
-                let pool = pool.clone();
-                let start = Arc::clone(&start);
-                std::thread::spawn(move || {
-                    let rt = RuntimeBuilder::current_thread()
-                        .build()
-                        .expect("build thread runtime");
-                    start.wait();
-                    rt.block_on(async {
-                        let cx = Cx::current().expect("runtime installs sibling test context");
-                        update_project_sibling_status(
-                            &cx,
-                            &pool,
-                            402,
-                            401,
-                            ProjectSiblingStatus::Confirmed,
-                        )
-                        .await
-                        .into_result()
-                        .expect("concurrent confirm")
-                    })
+        let spawn_confirm = || {
+            let pool = pool.clone();
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build thread runtime");
+                start.wait();
+                rt.block_on(async {
+                    let cx = Cx::current().expect("runtime installs sibling test context");
+                    update_project_sibling_status(
+                        &cx,
+                        &pool,
+                        402,
+                        401,
+                        ProjectSiblingStatus::Confirmed,
+                    )
+                    .await
+                    .into_result()
+                    .expect("concurrent confirm")
                 })
             })
-            .collect();
-        let results: Vec<_> = handles
-            .into_iter()
-            .map(|handle| handle.join().expect("join concurrent confirm"))
-            .collect();
+        };
+        let handles = [spawn_confirm(), spawn_confirm()];
+        let results = handles.map(|handle| handle.join().expect("join concurrent confirm"));
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0], results[1]);

@@ -478,9 +478,9 @@ fn window_size_boundary() {
     let result = diversify(hits, &metadata, &config);
 
     // Hits beyond window (index 5..14) should be in original relative order
-    for i in 5..15 {
+    for (i, result_hit) in result.hits.iter().enumerate().take(15).skip(5) {
         assert_eq!(
-            result.hits[i].doc_id, i as i64,
+            result_hit.doc_id, i as i64,
             "hit beyond window at position {i} should be unchanged"
         ); // assertions 28..37
     }
