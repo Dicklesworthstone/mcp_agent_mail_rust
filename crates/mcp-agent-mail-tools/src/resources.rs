@@ -3920,7 +3920,7 @@ fn reservation_pathspec_ls_files_libgit2(
     status_opts.pathspec(pathspec);
 
     if let Ok(statuses) = repo.statuses(Some(&mut status_opts)) {
-        for se in statuses.iter() {
+        for se in &statuses {
             let Ok(path_str) = se.path() else { continue };
             let candidate = repo_root.join(path_str);
             let modified_us = std::fs::metadata(&candidate)

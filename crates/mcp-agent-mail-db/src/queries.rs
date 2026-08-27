@@ -27845,7 +27845,7 @@ mod tests {
                     .await
                     .into_result()
                     .expect("list unknown-thread participants");
-            assert!(names.is_empty());
+            assert_eq!(names, [] as [std::string::String; 0]);
         });
     }
 

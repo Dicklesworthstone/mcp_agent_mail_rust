@@ -673,13 +673,8 @@ pub fn verdict_prefers_archive_snapshot_reads(verdict: &MailboxHealthVerdict) ->
         .iter()
         .filter(|probe| !probe.passed)
         .all(|probe| probe.name == "archive_db_parity");
-    if only_archive_parity_failures
-        && verdict.archive_drift.state == MailboxArchiveDriftState::DbAhead
-    {
-        return false;
-    }
-
-    true
+    !(only_archive_parity_failures
+        && verdict.archive_drift.state == MailboxArchiveDriftState::DbAhead)
 }
 
 /// Whether read surfaces using the primary FrankenSQLite path should prefer
@@ -703,13 +698,8 @@ pub fn verdict_prefers_archive_snapshot_reads_for_primary_read_surface(
         .iter()
         .filter(|probe| !probe.passed)
         .all(|probe| probe.name == "db_sanity");
-    if only_db_sanity_failures
-        && crate::pool::sqlite_primary_read_path_is_healthy(sqlite_path).unwrap_or(false)
-    {
-        return false;
-    }
-
-    true
+    !(only_db_sanity_failures
+        && crate::pool::sqlite_primary_read_path_is_healthy(sqlite_path).unwrap_or(false))
 }
 
 /// Compute the state from probe results.

@@ -1761,17 +1761,7 @@ fn test_config_env_overrides_active() -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .is_empty();
-    if !process_overrides_empty {
-        return true;
-    }
-    #[cfg(test)]
-    {
-        TEST_ENV_OVERRIDES.with(|cell| !cell.borrow().is_empty())
-    }
-    #[cfg(not(test))]
-    {
-        false
-    }
+    !process_overrides_empty
 }
 
 fn global_config_cache_get() -> Config {

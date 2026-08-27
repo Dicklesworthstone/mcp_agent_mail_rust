@@ -500,10 +500,7 @@ fn active_archive_artifact_diverges(
         return true;
     }
     // Active DB row -> the archive must not record this reservation as released.
-    if ts_is_positive(view.released_ts) != ts_is_positive(row.released_ts) {
-        return true;
-    }
-    false
+    ts_is_positive(view.released_ts) != ts_is_positive(row.released_ts)
 }
 
 /// Pure decision for reconcile-on-read: given the project's active DB

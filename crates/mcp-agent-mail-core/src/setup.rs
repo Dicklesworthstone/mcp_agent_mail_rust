@@ -2298,20 +2298,7 @@ impl AgentPlatform {
 const SETUP_CONFIG_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 fn setup_metadata_is_link_like(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    metadata.file_type().is_symlink()
 }
 
 fn invalid_setup_path(label: &str, path: &Path, reason: impl fmt::Display) -> SetupError {
