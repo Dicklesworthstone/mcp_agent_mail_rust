@@ -16,7 +16,7 @@
 //! are built on top of these two primitives.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::time::Instant;
@@ -3969,7 +3969,7 @@ pub struct AtcEngine {
     /// Incremental liveness review schedule.
     liveness_schedule: BinaryHeap<Reverse<ScheduledAgentReview>>,
     /// Agents that must be reevaluated immediately due to policy changes.
-    dirty_agents: HashSet<String>,
+    dirty_agents: BTreeSet<String>,
     /// Per-project conflict graphs.
     conflict_graphs: HashMap<String, ProjectConflictGraph>,
     /// Projects whose conflict state has changed since the last cached render.
@@ -4149,7 +4149,7 @@ impl AtcEngine {
             sorted_agent_names: Vec::new(),
             agent_order_dirty: false,
             liveness_schedule: BinaryHeap::new(),
-            dirty_agents: HashSet::new(),
+            dirty_agents: BTreeSet::new(),
             conflict_graphs: HashMap::new(),
             dirty_projects: HashSet::new(),
             session_summary: SessionSummary::default(),
@@ -6170,7 +6170,16 @@ impl AtcEngine {
 
         let reported_mode = self.budget_mode();
         let reported_fallback_reason = self.current_release_guard_reason();
-        let next_due_micros = self.next_scheduled_review_micros();
+        // Policy refreshes enqueue agents in `dirty_agents` independently of
+        // their ordinary liveness deadlines. If a bounded tick leaves dirty
+        // work behind, publish an already-due deadline so the operator loop
+        // resumes at its 250ms floor instead of sleeping until the earliest
+        // (possibly hours-away) scheduled review.
+        let next_due_micros = if self.dirty_agents.is_empty() {
+            self.next_scheduled_review_micros()
+        } else {
+            Some(now_micros)
+        };
 
         let kernel = AtcKernelTelemetry {
             due_agents: liveness.due_agents,
@@ -11259,6 +11268,15 @@ mod alien_enhancement_tests {
         engine.mark_agents_dirty();
 
         let mut reviewed = HashSet::with_capacity(POPULATION);
+        let first_batch = engine.pop_due_agents(i64::MAX, MAX_LIVENESS_REVIEWS_PER_TICK);
+        assert_eq!(
+            first_batch,
+            (0..MAX_LIVENESS_REVIEWS_PER_TICK)
+                .map(|index| format!("DirtyAgent{index:04}"))
+                .collect::<Vec<_>>(),
+            "dirty hydration order must be stable across processes and restarts"
+        );
+        reviewed.extend(first_batch);
         while !engine.dirty_agents.is_empty() {
             let due = engine.pop_due_agents(i64::MAX, MAX_LIVENESS_REVIEWS_PER_TICK);
             assert!(
@@ -11270,6 +11288,29 @@ mod alien_enhancement_tests {
         }
 
         assert_eq!(reviewed.len(), POPULATION);
+    }
+
+    #[test]
+    fn dirty_backlog_publishes_an_immediate_resume_deadline() {
+        let mut engine = AtcEngine::new_for_testing();
+        for index in 0..(MAX_LIVENESS_REVIEWS_PER_TICK + 1) {
+            engine.register_agent(&format!("ResumeAgent{index:04}"), "codex-cli", None);
+        }
+        engine.liveness_schedule.clear();
+        engine.mark_agents_dirty();
+
+        let now_micros = 42_000_000;
+        let report = engine.run_tick(now_micros);
+        assert_eq!(
+            report.summary.kernel.due_agents,
+            MAX_LIVENESS_REVIEWS_PER_TICK
+        );
+        assert_eq!(report.summary.kernel.dirty_agents, 1);
+        assert_eq!(
+            report.summary.kernel.next_due_micros,
+            Some(now_micros),
+            "remaining dirty work must keep the operator loop at its bounded tick floor"
+        );
     }
 
     #[test]
