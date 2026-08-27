@@ -7,7 +7,7 @@
 //! - **CI replay**: 100 agents across 10 projects using isolated SQLite/storage.
 //! - **Scenario A**: Registration storm — 1000 agents register across 50 threads.
 //! - **Scenario B**: Message burst — 100 agents send 10 messages each.
-//! - **Scenario C**: Mixed workload — 60s sustained mixed read/write operations.
+//! - **Scenario C**: Mixed workload — 30s sustained mixed read/write operations.
 //! - **Scenario D**: Thundering herd — 500 concurrent `fetch_inbox` on one project.
 //!
 //! Each scenario collects per-operation latencies, reports p50/p95/p99/max,
@@ -105,6 +105,48 @@ fn make_load_pool(max_connections: usize) -> (DbPool, tempfile::TempDir) {
     };
     let pool = DbPool::new(&config).expect("create pool");
     (pool, dir)
+}
+
+/// Prove that a load scenario leaves a database structurally sound both while
+/// the writer pool is live and after every pooled connection has been dropped
+/// and a fresh pool reopens the same file. The second leg is load-bearing for
+/// GH#257: several field incidents first became undeniable at the next
+/// integrity/restart boundary rather than as an API error during the write.
+fn assert_full_integrity_before_and_after_reopen(pool: DbPool, scenario: &str) {
+    let sqlite_path = pool.sqlite_path().to_string();
+    let live = pool
+        .run_full_integrity_check()
+        .unwrap_or_else(|error| panic!("{scenario}: live full integrity check failed: {error}"));
+    assert!(
+        live.ok,
+        "{scenario}: live database failed full integrity check: {:?}",
+        live.details
+    );
+
+    drop(pool);
+
+    let reopened = DbPool::new_without_startup_init(&DbPoolConfig {
+        database_url: format!("sqlite:///{sqlite_path}"),
+        storage_root: Path::new(&sqlite_path)
+            .parent()
+            .map(|parent| parent.join("storage")),
+        max_connections: 4,
+        min_connections: 0,
+        acquire_timeout_ms: 120_000,
+        max_lifetime_ms: 3_600_000,
+        run_migrations: true,
+        warmup_connections: 0,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
+    })
+    .unwrap_or_else(|error| panic!("{scenario}: fresh pool reopen failed: {error}"));
+    let after_reopen = reopened.run_full_integrity_check().unwrap_or_else(|error| {
+        panic!("{scenario}: reopened full integrity check failed: {error}")
+    });
+    assert!(
+        after_reopen.ok,
+        "{scenario}: reopened database failed full integrity check: {:?}",
+        after_reopen.details
+    );
 }
 
 fn cap(s: &str) -> String {
@@ -1658,6 +1700,7 @@ fn load_scenario_b_message_burst() {
         "SLO: p99 < 500ms, got {:.1}ms",
         report.p99 as f64 / 1000.0
     );
+    assert_full_integrity_before_and_after_reopen(pool, "100-agent message burst");
 }
 
 // ---------------------------------------------------------------------------
@@ -1970,6 +2013,7 @@ fn load_scenario_c_mixed_workload() {
         "SLO: combined p99 < 1s, got {:.1}ms",
         combined_r.p99 as f64 / 1000.0
     );
+    assert_full_integrity_before_and_after_reopen(pool, "30-second mixed workload");
 }
 
 // ---------------------------------------------------------------------------
