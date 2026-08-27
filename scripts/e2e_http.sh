@@ -1186,30 +1186,110 @@ PAYLOAD_PROJECT_B7="$(jsonrpc_tools_call_payload "ensure_project" "${PROJECT_ARG
 http_post_json "run7_ensure_project_b" "${API7}" "${PAYLOAD_PROJECT_B7}" "${AUTHZ7}"
 e2e_assert_eq "project B ensure HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run7_ensure_project_b_status.txt")"
 
-stop_server "${PID7}"
-trap - EXIT
-
 read -r PROJECT_A_ID7 PROJECT_B_ID7 < <(
-python3 - "${DB7}" <<'PY'
+python3 - "${DB7}" "${PROJECT_A7}" "${PROJECT_B7}" <<'PY'
 import sqlite3, sys
-db_path = sys.argv[1]
+db_path, project_a_key, project_b_key = sys.argv[1:]
 with sqlite3.connect(db_path) as conn:
-    rows = conn.execute("SELECT id FROM projects ORDER BY id").fetchall()
-    if len(rows) != 2:
-        raise SystemExit(f"expected exactly two seed projects, found {len(rows)}")
-    project_a, project_b = (int(rows[0][0]), int(rows[1][0]))
-    conn.execute(
-        """INSERT INTO project_sibling_suggestions
-           (project_a_id, project_b_id, score, status, rationale, created_ts, evaluated_ts)
-           VALUES (?, ?, 0.97, 'suggested', 'shared backend workspace', 10, 10)""",
-        (project_a, project_b),
-    )
-    conn.commit()
+    project_a_row = conn.execute(
+        "SELECT id FROM projects WHERE human_key = ?", (project_a_key,)
+    ).fetchone()
+    project_b_row = conn.execute(
+        "SELECT id FROM projects WHERE human_key = ?", (project_b_key,)
+    ).fetchone()
+    if project_a_row is None or project_b_row is None:
+        raise SystemExit("production discovery fixture projects are missing")
+    project_a, project_b = (int(project_a_row[0]), int(project_b_row[0]))
 print(project_a, project_b)
 PY
 )
 e2e_save_artifact "run7_seed_ids.txt" "project_a_id=${PROJECT_A_ID7}
 project_b_id=${PROJECT_B_ID7}"
+
+RUN7_DISCOVERY_STATE="$(python3 - "${DB7}" <<'PY'
+import json, sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as conn:
+    rows = conn.execute(
+        """SELECT project_a_id, project_b_id, score, status, rationale,
+                  created_ts, evaluated_ts, confirmed_ts, dismissed_ts
+           FROM project_sibling_suggestions"""
+    ).fetchall()
+if len(rows) != 1:
+    raise SystemExit(f"expected one production-discovered sibling row, found {len(rows)}")
+row = rows[0]
+print(json.dumps({
+    "project_a_id": row[0],
+    "project_b_id": row[1],
+    "score": row[2],
+    "status": row[3],
+    "rationale": row[4],
+    "created_ts": row[5],
+    "evaluated_ts": row[6],
+    "confirmed_ts": row[7],
+    "dismissed_ts": row[8],
+}, sort_keys=True))
+PY
+)"
+e2e_save_artifact "run7_discovery_db_state.json" "${RUN7_DISCOVERY_STATE}"
+e2e_assert_eq "discovery persists suggested state" "suggested" "$(json_get_field "${RUN7_DISCOVERY_STATE}" "status")"
+e2e_assert_eq "discovery canonicalizes project A" "${PROJECT_A_ID7}" "$(json_get_field "${RUN7_DISCOVERY_STATE}" "project_a_id")"
+e2e_assert_eq "discovery canonicalizes project B" "${PROJECT_B_ID7}" "$(json_get_field "${RUN7_DISCOVERY_STATE}" "project_b_id")"
+if python3 - "${RUN7_DISCOVERY_STATE}" <<'PY'
+import json, sys
+raise SystemExit(0 if float(json.loads(sys.argv[1])["score"]) >= 0.92 else 1)
+PY
+then
+    e2e_pass "production discovery score reaches the visible threshold"
+else
+    e2e_fail "production discovery score is below the visible threshold"
+fi
+
+e2e_case_banner "Project read surfaces render the creation-seeded suggestion without writing"
+http_request "run7_projects_static" "GET" "${URL7}/mail/projects?__static_export=1" "${AUTHZ7}"
+e2e_assert_eq "static projects surface is 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run7_projects_static_status.txt")"
+http_request "run7_projects_discovery" "GET" "${URL7}/mail/projects" "${AUTHZ7}"
+e2e_assert_eq "live projects surface is 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run7_projects_discovery_status.txt")"
+
+e2e_assert_eq \
+    "discovery renders exactly one forward suggestion element" \
+    "1" \
+    "$(mail_sibling_element_count "${E2E_ARTIFACT_DIR}/run7_projects_discovery_body.txt" suggested "${PROJECT_A_ID7}" "${PROJECT_B_ID7}")"
+e2e_assert_eq \
+    "discovery renders exactly one reverse suggestion element" \
+    "1" \
+    "$(mail_sibling_element_count "${E2E_ARTIFACT_DIR}/run7_projects_discovery_body.txt" suggested "${PROJECT_B_ID7}" "${PROJECT_A_ID7}")"
+
+RUN7_AFTER_READS_STATE="$(python3 - "${DB7}" <<'PY'
+import json, sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as conn:
+    rows = conn.execute(
+        """SELECT project_a_id, project_b_id, score, status, rationale,
+                  created_ts, evaluated_ts, confirmed_ts, dismissed_ts
+           FROM project_sibling_suggestions"""
+    ).fetchall()
+if len(rows) != 1:
+    raise SystemExit(f"expected one sibling row after project reads, found {len(rows)}")
+row = rows[0]
+print(json.dumps({
+    "project_a_id": row[0],
+    "project_b_id": row[1],
+    "score": row[2],
+    "status": row[3],
+    "rationale": row[4],
+    "created_ts": row[5],
+    "evaluated_ts": row[6],
+    "confirmed_ts": row[7],
+    "dismissed_ts": row[8],
+}, sort_keys=True))
+PY
+)"
+e2e_assert_eq \
+    "static and live project reads preserve the exact sibling row" \
+    "${RUN7_DISCOVERY_STATE}" \
+    "${RUN7_AFTER_READS_STATE}"
+
+stop_server "${PID7}"
+trap - EXIT
 
 PORT7="$(pick_port)"
 URL7="http://127.0.0.1:${PORT7}"

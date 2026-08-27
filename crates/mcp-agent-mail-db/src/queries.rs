@@ -101,6 +101,7 @@ fn sha256_hex(data: &str) -> String {
 struct TrackedConnection<'conn> {
     inner: &'conn crate::DbConn,
     transaction_write_intent: TransactionWriteIntent,
+    retire_after_deferred_checkpoint: Option<&'conn AtomicBool>,
 }
 
 impl<'conn> TrackedConnection<'conn> {
@@ -108,6 +109,24 @@ impl<'conn> TrackedConnection<'conn> {
         Self {
             inner,
             transaction_write_intent: TransactionWriteIntent::default(),
+            retire_after_deferred_checkpoint: None,
+        }
+    }
+
+    fn with_retirement_signal(
+        inner: &'conn crate::DbConn,
+        retire_after_deferred_checkpoint: &'conn AtomicBool,
+    ) -> Self {
+        Self {
+            inner,
+            transaction_write_intent: TransactionWriteIntent::default(),
+            retire_after_deferred_checkpoint: Some(retire_after_deferred_checkpoint),
+        }
+    }
+
+    fn retire_after_deferred_checkpoint(&self) {
+        if let Some(signal) = self.retire_after_deferred_checkpoint {
+            signal.store(true, Ordering::Release);
         }
     }
 }
@@ -1232,11 +1251,99 @@ fn recent_contact_union_sql(item_count: usize) -> &'static str {
     &cache[capped]
 }
 
-async fn acquire_conn(
-    cx: &Cx,
-    pool: &DbPool,
-) -> Outcome<sqlmodel_pool::PooledConnection<crate::DbConn>, DbError> {
-    map_sql_outcome(pool.acquire(cx).await)
+/// Retirement-aware owner for one pooled FrankenSQLite checkout.
+///
+/// A contended fail-fast post-commit checkpoint leaves the durable commit on
+/// the connection worker until that worker closes. The flag lets the tracked
+/// transaction request retirement without taking ownership away from its
+/// caller. Detaching closes only this checkout; pool waiters recheck capacity
+/// on their bounded 100ms acquisition loop.
+struct RetirablePooledHandle {
+    inner: Option<sqlmodel_pool::PooledConnection<crate::DbConn>>,
+    retire_after_deferred_checkpoint: AtomicBool,
+}
+
+impl RetirablePooledHandle {
+    fn new(inner: sqlmodel_pool::PooledConnection<crate::DbConn>) -> Self {
+        Self {
+            inner: Some(inner),
+            retire_after_deferred_checkpoint: AtomicBool::new(false),
+        }
+    }
+
+    fn inner(&self) -> &sqlmodel_pool::PooledConnection<crate::DbConn> {
+        self.inner
+            .as_ref()
+            .expect("retirable pooled handle accessed after drop")
+    }
+}
+
+impl std::ops::Deref for RetirablePooledHandle {
+    type Target = crate::DbConn;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner()
+    }
+}
+
+impl std::ops::DerefMut for RetirablePooledHandle {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner
+            .as_mut()
+            .expect("retirable pooled handle mutably accessed after drop")
+    }
+}
+
+impl Drop for RetirablePooledHandle {
+    fn drop(&mut self) {
+        let Some(pooled) = self.inner.take() else {
+            return;
+        };
+        if !self
+            .retire_after_deferred_checkpoint
+            .load(Ordering::Acquire)
+        {
+            drop(pooled);
+            return;
+        }
+
+        let db_path = pooled.path().to_string();
+        let connection = pooled.detach();
+        if let Err(error) = connection.close_without_checkpoint_sync() {
+            tracing::warn!(
+                db_path = %db_path,
+                error = %error,
+                "deferred_checkpoint_connection_retirement_failed"
+            );
+        }
+    }
+}
+
+/// Outer checkout layer retained for the existing `&*conn` call pattern: one
+/// explicit dereference yields the retirement-aware handle, while ordinary
+/// method calls continue through it to `DbConn`.
+struct AcquiredConnection {
+    handle: RetirablePooledHandle,
+}
+
+impl std::ops::Deref for AcquiredConnection {
+    type Target = RetirablePooledHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
+}
+
+impl std::ops::DerefMut for AcquiredConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.handle
+    }
+}
+
+async fn acquire_conn(cx: &Cx, pool: &DbPool) -> Outcome<AcquiredConnection, DbError> {
+    map_sql_outcome(pool.acquire(cx).await).map(|inner| AcquiredConnection {
+        handle: RetirablePooledHandle::new(inner),
+    })
 }
 
 fn canonical_table_columns(
@@ -1540,8 +1647,35 @@ pub(crate) async fn ensure_file_backed_atc_pool_initialized(
     }
 }
 
-fn tracked(conn: &crate::DbConn) -> TrackedConnection<'_> {
-    TrackedConnection::new(conn)
+trait TrackedConnectionSource {
+    fn db_conn(&self) -> &crate::DbConn;
+
+    fn retirement_signal(&self) -> Option<&AtomicBool> {
+        None
+    }
+}
+
+impl TrackedConnectionSource for crate::DbConn {
+    fn db_conn(&self) -> &crate::DbConn {
+        self
+    }
+}
+
+impl TrackedConnectionSource for RetirablePooledHandle {
+    fn db_conn(&self) -> &crate::DbConn {
+        self
+    }
+
+    fn retirement_signal(&self) -> Option<&AtomicBool> {
+        Some(&self.retire_after_deferred_checkpoint)
+    }
+}
+
+fn tracked<T: TrackedConnectionSource + ?Sized>(conn: &T) -> TrackedConnection<'_> {
+    match conn.retirement_signal() {
+        Some(signal) => TrackedConnection::with_retirement_signal(conn.db_conn(), signal),
+        None => TrackedConnection::new(conn.db_conn()),
+    }
 }
 
 // =============================================================================
@@ -1596,21 +1730,103 @@ async fn begin_concurrent_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcom
     }
 }
 
-/// Commit the current transaction and publish file-backed writes to fresh handles.
+/// Commit the current transaction and opportunistically publish it to
+/// canonical SQLite readers without waiting for their snapshots.
+///
+/// FrankenSQLite makes a successful COMMIT durable for its own handles, but a
+/// canonical SQLite process only sees those frames after checkpoint backfill.
+/// The publication attempt must remain strictly best-effort: with the normal
+/// 20-second request `busy_timeout`, FrankenSQLite's PASSIVE checkpoint waits
+/// behind an unrelated canonical read snapshot and can consume the enclosing
+/// HTTP deadline after the transaction already committed. Temporarily using a
+/// zero lock-wait preserves the uncontended fresh-handle visibility contract
+/// while deferring contended publication to the structured periodic pool
+/// maintenance task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalCheckpointProgress {
+    busy: i64,
+    log: i64,
+    checkpointed: i64,
+}
+
+impl WalCheckpointProgress {
+    fn fully_published(self) -> bool {
+        let non_wal_sentinel = self.log == -1 && self.checkpointed == -1;
+        let wal_fully_backfilled = self.log >= 0 && self.checkpointed >= self.log;
+        self.busy == 0 && (non_wal_sentinel || wal_fully_backfilled)
+    }
+}
+
+fn wal_checkpoint_progress(rows: &[SqlRow]) -> Option<WalCheckpointProgress> {
+    let row = rows.first()?;
+    let busy = row.get(0).and_then(value_as_i64)?;
+    let log = row.get(1).and_then(value_as_i64)?;
+    let checkpointed = row.get(2).and_then(value_as_i64)?;
+    Some(WalCheckpointProgress {
+        busy,
+        log,
+        checkpointed,
+    })
+}
+
 async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
     match map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await) {
         Outcome::Ok(_) => {
             if tracked.inner.path() != ":memory:" {
-                // FrankenSQLite can otherwise keep a successful COMMIT private
-                // to the pooled connection until a later close. The checkpoint
-                // gives post-commit probes and sibling processes the same view
-                // immediately after the write path returns.
-                if let Err(error) = tracked.inner.execute_raw("PRAGMA wal_checkpoint(PASSIVE)") {
+                let mut retire = false;
+                match tracked.inner.execute_raw("PRAGMA busy_timeout = 0;") {
+                    Ok(()) => match tracked
+                        .inner
+                        .query_sync("PRAGMA wal_checkpoint(PASSIVE);", &[])
+                    {
+                        Ok(rows)
+                            if wal_checkpoint_progress(&rows)
+                                .is_some_and(WalCheckpointProgress::fully_published) =>
+                        {
+                            // Canonical publication completed without waiting.
+                        }
+                        Ok(rows) => {
+                            retire = true;
+                            let progress = wal_checkpoint_progress(&rows);
+                            tracing::debug!(
+                                db_path = %tracked.inner.path(),
+                                checkpoint_busy = ?progress.map(|value| value.busy),
+                                checkpoint_log = ?progress.map(|value| value.log),
+                                checkpointed = ?progress.map(|value| value.checkpointed),
+                                "post_commit_checkpoint_deferred_by_contention"
+                            );
+                        }
+                        Err(error) => {
+                            retire = true;
+                            tracing::debug!(
+                                db_path = %tracked.inner.path(),
+                                error = %error,
+                                "post_commit_checkpoint_deferred_by_contention"
+                            );
+                        }
+                    },
+                    Err(error) => {
+                        retire = true;
+                        tracing::warn!(
+                            db_path = %tracked.inner.path(),
+                            error = %error,
+                            "post_commit_fail_fast_checkpoint_setup_failed"
+                        );
+                    }
+                }
+                if let Err(error) = tracked.inner.execute_raw(&format!(
+                    "PRAGMA busy_timeout = {};",
+                    mcp_agent_mail_core::config::DB_RUNTIME_BUSY_TIMEOUT_MS
+                )) {
+                    retire = true;
                     tracing::warn!(
                         db_path = %tracked.inner.path(),
                         error = %error,
-                        "post_commit_checkpoint_failed_after_successful_commit"
+                        "post_commit_busy_timeout_restore_failed"
                     );
+                }
+                if retire {
+                    tracked.retire_after_deferred_checkpoint();
                 }
             }
             Outcome::Ok(())
@@ -1623,9 +1839,9 @@ async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbEr
 
 /// End a transaction that has only observed database state.
 ///
-/// This intentionally bypasses [`commit_tx`]: that helper checkpoints the WAL
-/// after writes, while authoritative guard reads must not cause any durable
-/// database or WAL mutation of their own.
+/// This intentionally bypasses [`commit_tx`]: that helper attempts canonical
+/// publication after writes, while authoritative guard reads must not cause
+/// any durable database or WAL mutation of their own.
 async fn commit_read_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
     map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await).map(|_| ())
 }
@@ -3841,7 +4057,7 @@ where
 /// attempts made, the wall-clock time spent, and honest fallback guidance
 /// instead of advising yet another blind retry (br-bvq1x.4.3 / D3).
 async fn run_with_mvcc_retry_with_budget<T, F, Fut>(
-    _cx: &Cx,
+    cx: &Cx,
     operation: &'static str,
     max: u32,
     mut op: F,
@@ -3868,6 +4084,11 @@ where
         inner: Box::new(e),
     };
     for attempt in 0..=max {
+        if cx.checkpoint().is_err() {
+            return Outcome::Cancelled(cx.cancel_reason().unwrap_or_else(|| {
+                CancelReason::user("database operation cancelled before retry attempt")
+            }));
+        }
         match op().await {
             Outcome::Err(e) if is_mvcc_error(&e) && attempt < max => {
                 MVCC_RETRIES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3878,7 +4099,9 @@ where
                     operation,
                     "MVCC write conflict, retrying whole transaction"
                 );
-                mvcc_backoff(attempt);
+                if let Err(reason) = mvcc_backoff(cx, attempt) {
+                    return Outcome::Cancelled(reason);
+                }
             }
             Outcome::Err(e) if is_plain_write_contention_error(&e) && attempt < max => {
                 tracing::warn!(
@@ -3888,7 +4111,9 @@ where
                     operation,
                     "SQLite write contention, retrying whole transaction"
                 );
-                mvcc_backoff(attempt);
+                if let Err(reason) = mvcc_backoff(cx, attempt) {
+                    return Outcome::Cancelled(reason);
+                }
             }
             Outcome::Err(e) if is_mvcc_error(&e) => {
                 MVCC_EXHAUSTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3943,17 +4168,19 @@ where
 /// Interplay with the dispatch deadline (br-ovy6e): each attempt may also
 /// block up to the runtime `busy_timeout`
 /// ([`mcp_agent_mail_core::config::DB_RUNTIME_BUSY_TIMEOUT_MS`], 20s) inside
-/// SQLite, so the absolute worst case for a fully lock-starved write is
+/// SQLite, so an uncancelled, fully lock-starved write can still consume
 /// ~17 × 20s + ~30s ≈ 370s. That total cannot be squeezed under the 30s
 /// [`mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS`] by constant
 /// tweaks without gutting the #98 contention budget (even one 20s busy wait
-/// plus the required ~20s of backoff already exceeds 30s). The invariant this
-/// layering guarantees instead is that every *individual* blocking SQLite
-/// wait is bounded at 20s < 30s dispatch deadline < 60s deadline+hard-grace,
-/// so a contended worker thread always returns to Rust code well before the
-/// dispatch layer would have to zombify a thread stuck inside one SQLite
-/// call.
-fn mvcc_backoff(attempt: u32) {
+/// plus the required ~20s of backoff already exceeds 30s). Request
+/// cancellation is therefore part of this layer's contract: after the current
+/// SQLite call returns, cancellation prevents every later attempt and
+/// interrupts backoff within one 25ms sleep slice. The current blocking SQLite
+/// wait remains bounded at 20s < 30s dispatch deadline < 60s
+/// deadline+hard-grace, so a contended worker thread returns to cancellation-
+/// aware Rust code before the dispatch layer would have to zombify a thread
+/// stuck inside one SQLite call.
+fn mvcc_backoff(cx: &Cx, attempt: u32) -> std::result::Result<(), CancelReason> {
     use crate::retry::RetryConfig;
     let config = RetryConfig {
         base_delay: std::time::Duration::from_millis(25),
@@ -3961,7 +4188,24 @@ fn mvcc_backoff(attempt: u32) {
         use_circuit_breaker: false,
         ..Default::default()
     };
-    std::thread::sleep(config.delay_for_attempt(attempt));
+    let delay = config.delay_for_attempt(attempt);
+    let deadline = std::time::Instant::now() + delay;
+    loop {
+        if cx.checkpoint().is_err() {
+            return Err(cx.cancel_reason().unwrap_or_else(|| {
+                CancelReason::user("database operation cancelled during retry backoff")
+            }));
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        // This path deliberately runs on a blocking worker, but cancellation
+        // still needs a bounded observation latency. Sleeping in short slices
+        // prevents an abandoned request from waiting out the full 3-second
+        // backoff and entering another potentially 20-second SQLite call.
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(25)));
+    }
 }
 
 /// Snapshot of MVCC retry metrics for health/diagnostics.
@@ -4101,11 +4345,17 @@ pub async fn ensure_project(
             Value::Text(row.human_key.clone()),
             Value::BigInt(row.created_at),
         ];
-        try_in_tx!(
+        let inserted = try_in_tx!(
             cx,
             &tracked,
             map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
         );
+        if inserted > 1 {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(format!(
+                "project insert affected {inserted} rows for slug={slug}; expected at most one"
+            )));
+        }
 
         let rows = try_in_tx!(
             cx,
@@ -4125,6 +4375,20 @@ pub async fn ensure_project(
                 return Outcome::Err(e);
             }
         };
+
+        // Initial sibling discovery belongs to project creation, where the
+        // write transaction is already held. Performing this work from the
+        // projects GET route forced a fresh BEGIN IMMEDIATE during startup
+        // maintenance and could consume the entire HTTP request deadline.
+        // The creator that actually inserted the row owns seeding; a racing
+        // ON CONFLICT loser observes the winner's committed suggestions.
+        if inserted == 1 {
+            try_in_tx!(
+                cx,
+                &tracked,
+                seed_project_sibling_suggestions_for_new_project(cx, &tracked, &fresh).await
+            );
+        }
 
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
         Outcome::Ok(fresh)
@@ -4703,10 +4967,7 @@ struct ProjectSiblingRefreshCandidate {
     existing: Option<ProjectSiblingSuggestion>,
 }
 
-fn project_sibling_needs_refresh(
-    existing: Option<&ProjectSiblingSuggestion>,
-    now: i64,
-) -> bool {
+fn project_sibling_needs_refresh(existing: Option<&ProjectSiblingSuggestion>, now: i64) -> bool {
     let Some(suggestion) = existing else {
         return true;
     };
@@ -4731,9 +4992,7 @@ fn bounded_project_similarity(left: &str, right: &str) -> f64 {
     let mut current = vec![0usize; right_bytes.len() + 1];
     for left_byte in left_bytes {
         for (right_index, right_byte) in right_bytes.iter().enumerate() {
-            current[right_index + 1] = if left_byte.to_ascii_lowercase()
-                == right_byte.to_ascii_lowercase()
-            {
+            current[right_index + 1] = if left_byte.eq_ignore_ascii_case(right_byte) {
                 previous[right_index] + 1
             } else {
                 previous[right_index + 1].max(current[right_index])
@@ -4796,6 +5055,101 @@ fn project_sibling_similarity(
     }
 
     (score.clamp(0.0, 1.0), reasons.join(", "))
+}
+
+/// Seed bounded sibling candidates while the new project's creation
+/// transaction already owns the write lock.
+///
+/// The caller owns commit/rollback. Only a genuinely inserted project may be
+/// passed here: existing projects keep their review decisions, while explicit
+/// maintenance uses [`refresh_project_sibling_suggestions`].
+async fn seed_project_sibling_suggestions_for_new_project(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    new_project: &ProjectRow,
+) -> Outcome<usize, DbError> {
+    let Some(new_project_id) = new_project.id else {
+        return Outcome::Err(DbError::Internal(
+            "cannot seed sibling suggestions for a project without an id".to_string(),
+        ));
+    };
+    let other_rows = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT id, slug, human_key, created_at FROM projects \
+             WHERE id <> ? ORDER BY id DESC LIMIT ?",
+            &[
+                Value::BigInt(new_project_id),
+                Value::BigInt(
+                    i64::try_from(PROJECT_SIBLING_REFRESH_LIMIT)
+                        .expect("project sibling refresh limit fits i64"),
+                ),
+            ],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    let now = now_micros();
+    let mut inserted = 0usize;
+    for row in &other_rows {
+        if cx.checkpoint().is_err() {
+            return Outcome::Cancelled(
+                cx.cancel_reason()
+                    .unwrap_or_else(|| CancelReason::user("project sibling seeding cancelled")),
+            );
+        }
+        let other_project = match decode_project_row(row) {
+            Ok(project) => project,
+            Err(error) => return Outcome::Err(error),
+        };
+        let Some(other_project_id) = other_project.id else {
+            return Outcome::Err(DbError::Internal(
+                "project sibling seeding read a project without an id".to_string(),
+            ));
+        };
+        let (score, rationale) = project_sibling_similarity(new_project, &other_project);
+        let smaller_id = new_project_id.min(other_project_id);
+        let larger_id = new_project_id.max(other_project_id);
+        let changed = match map_sql_outcome(
+            traw_execute(
+                cx,
+                tracked,
+                "INSERT INTO project_sibling_suggestions \
+                 (project_a_id, project_b_id, score, status, rationale, \
+                  created_ts, evaluated_ts, confirmed_ts, dismissed_ts) \
+                 VALUES (?, ?, ?, 'suggested', ?, ?, ?, NULL, NULL) \
+                 ON CONFLICT(project_a_id, project_b_id) DO NOTHING",
+                &[
+                    Value::BigInt(smaller_id),
+                    Value::BigInt(larger_id),
+                    Value::Double(score),
+                    Value::Text(rationale),
+                    Value::BigInt(now),
+                    Value::BigInt(now),
+                ],
+            )
+            .await,
+        ) {
+            Outcome::Ok(changed) => changed,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        if changed > 1 {
+            return Outcome::Err(DbError::Internal(format!(
+                "project sibling seed affected {changed} rows for pair \
+                 {smaller_id},{larger_id}; expected at most one"
+            )));
+        }
+        inserted += usize::try_from(changed).expect("bounded sibling seed count fits usize");
+    }
+    Outcome::Ok(inserted)
 }
 
 const PROJECT_SIBLING_SELECT: &str = "SELECT s.id, s.status, s.score, s.rationale, s.evaluated_ts, \
@@ -4883,9 +5237,10 @@ pub async fn refresh_project_sibling_suggestions(
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
         if cx.checkpoint().is_err() {
             rollback_tx(cx, &tracked).await;
-            return Outcome::Cancelled(cx.cancel_reason().unwrap_or_else(|| {
-                CancelReason::user("project sibling refresh cancelled")
-            }));
+            return Outcome::Cancelled(
+                cx.cancel_reason()
+                    .unwrap_or_else(|| CancelReason::user("project sibling refresh cancelled")),
+            );
         }
 
         let now = now_micros();
@@ -5002,9 +5357,10 @@ pub async fn refresh_project_sibling_suggestions(
         for candidate in candidates {
             if cx.checkpoint().is_err() {
                 rollback_tx(cx, &tracked).await;
-                return Outcome::Cancelled(cx.cancel_reason().unwrap_or_else(|| {
-                    CancelReason::user("project sibling refresh cancelled")
-                }));
+                return Outcome::Cancelled(
+                    cx.cancel_reason()
+                        .unwrap_or_else(|| CancelReason::user("project sibling refresh cancelled")),
+                );
             }
             let (score, rationale) =
                 project_sibling_similarity(&candidate.left_project, &candidate.right_project);
@@ -9002,7 +9358,9 @@ async fn fetch_inbox_impl(
                     error = %error,
                     "inbox read hit transient contention; retrying"
                 );
-                mvcc_backoff(attempt);
+                if let Err(reason) = mvcc_backoff(cx, attempt) {
+                    return Outcome::Cancelled(reason);
+                }
             }
             other => break other,
         }
@@ -16642,6 +17000,58 @@ mod tests {
     }
 
     #[test]
+    fn mvcc_retry_stops_before_work_and_during_backoff_when_cancelled() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        rt.block_on(async move {
+            let expired_cx = Cx::for_request_with_budget(
+                asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+            );
+            let pre_cancel_calls = AtomicU64::new(0);
+            let before_work: Outcome<(), DbError> =
+                run_with_mvcc_retry_with_budget(&expired_cx, "cancel_before_work", 16, || {
+                    pre_cancel_calls.fetch_add(1, Ordering::Relaxed);
+                    async { Outcome::Err(DbError::ResourceBusy("database is locked".into())) }
+                })
+                .await;
+            assert!(matches!(before_work, Outcome::Cancelled(_)));
+            assert_eq!(
+                pre_cancel_calls.load(Ordering::Relaxed),
+                0,
+                "a cancelled request must not enter another SQLite attempt"
+            );
+
+            let cx = Cx::for_testing();
+            let cancel_from_attempt = cx.clone();
+            let retry_calls = AtomicU64::new(0);
+            let started = std::time::Instant::now();
+            let during_backoff: Outcome<(), DbError> =
+                run_with_mvcc_retry_with_budget(&cx, "cancel_during_backoff", 16, || {
+                    retry_calls.fetch_add(1, Ordering::Relaxed);
+                    cancel_from_attempt.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("mounted HTTP dispatch timed out"),
+                    );
+                    async { Outcome::Err(DbError::ResourceBusy("database is locked".into())) }
+                })
+                .await;
+            assert!(matches!(during_backoff, Outcome::Cancelled(_)));
+            assert_eq!(
+                retry_calls.load(Ordering::Relaxed),
+                1,
+                "cancellation after a busy result must prevent all later retries"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "cancellation must interrupt the retry delay promptly"
+            );
+        });
+    }
+
+    #[test]
     fn mvcc_retry_success_and_non_busy_errors_pass_through_unwrapped() {
         use asupersync::runtime::RuntimeBuilder;
         let rt = RuntimeBuilder::current_thread()
@@ -17171,6 +17581,585 @@ mod tests {
     }
 
     #[test]
+    fn project_sibling_similarity_is_bounded_and_respects_visibility_threshold() {
+        let backend = ProjectRow {
+            id: Some(501),
+            slug: "backend_core".to_string(),
+            human_key: "/workspace/backend_core".to_string(),
+            created_at: 1,
+        };
+        let frontend = ProjectRow {
+            id: Some(502),
+            slug: "backend_core_ui".to_string(),
+            human_key: "/workspace/backend_core_ui".to_string(),
+            created_at: 2,
+        };
+        let (high_score, high_rationale) = project_sibling_similarity(&backend, &frontend);
+        assert!(high_score >= PROJECT_SIBLING_MIN_SUGGESTION_SCORE);
+        assert_ne!(high_rationale, "");
+
+        let unrelated = ProjectRow {
+            id: Some(503),
+            slug: "zulu".to_string(),
+            human_key: "/workspace/zulu".to_string(),
+            created_at: 3,
+        };
+        let alpha = ProjectRow {
+            id: Some(504),
+            slug: "alpha".to_string(),
+            human_key: "/workspace/alpha".to_string(),
+            created_at: 4,
+        };
+        let (low_score, low_rationale) = project_sibling_similarity(&alpha, &unrelated);
+        assert_eq!(low_score, 0.85);
+        assert!(low_score < PROJECT_SIBLING_MIN_SUGGESTION_SCORE);
+        assert!(low_rationale.contains("same parent directory"));
+
+        let mut duplicate = backend.clone();
+        duplicate.id = Some(505);
+        duplicate.slug = "backend-core-alias".to_string();
+        let (duplicate_score, _) = project_sibling_similarity(&backend, &duplicate);
+        assert_eq!(duplicate_score, 0.0);
+
+        let long_left = "a".repeat(PROJECT_SIBLING_SIMILARITY_INPUT_LIMIT * 20);
+        let long_right = "b".repeat(PROJECT_SIBLING_SIMILARITY_INPUT_LIMIT * 20);
+        let bounded_score = bounded_project_similarity(&long_left, &long_right);
+        assert!((0.0..=1.0).contains(&bounded_score));
+        assert_eq!(bounded_score, 0.0);
+    }
+
+    #[test]
+    fn project_sibling_creation_seeds_bounded_canonical_suggestions_atomically() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("project-sibling-create-seed");
+
+        rt.block_on(async {
+            let first = ensure_project(&cx, &pool, "/workspace/backend_core")
+                .await
+                .into_result()
+                .expect("create first sibling project");
+            let first_id = first.id.expect("first project id");
+            assert_eq!(
+                list_project_sibling_suggestions(&cx, &pool)
+                    .await
+                    .into_result()
+                    .expect("list before second project")
+                    .len(),
+                0
+            );
+
+            let second = ensure_project(&cx, &pool, "/workspace/backend_core_ui")
+                .await
+                .into_result()
+                .expect("create second sibling project");
+            let second_id = second.id.expect("second project id");
+            let seeded = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list creation-seeded sibling");
+            assert_eq!(seeded.len(), 1);
+            assert_eq!(seeded[0].project_a.id, first_id.min(second_id));
+            assert_eq!(seeded[0].project_b.id, first_id.max(second_id));
+            assert_eq!(seeded[0].status, ProjectSiblingStatus::Suggested);
+            assert!(seeded[0].score >= PROJECT_SIBLING_MIN_SUGGESTION_SCORE);
+
+            let evaluated_ts = seeded[0].evaluated_ts;
+            ensure_project(&cx, &pool, "/workspace/backend_core_ui")
+                .await
+                .into_result()
+                .expect("repeat second project lookup");
+            let after_repeat = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list after repeated project lookup");
+            assert_eq!(after_repeat.len(), 1);
+            assert_eq!(after_repeat[0].evaluated_ts, evaluated_ts);
+        });
+    }
+
+    #[test]
+    fn project_sibling_creation_considers_recent_projects_after_older_unrelated_rows() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("project-sibling-recent-seed");
+
+        rt.block_on(async {
+            for human_key in [
+                "/workspace/alpha",
+                "/workspace/bravo",
+                "/workspace/charlie",
+                "/workspace/delta",
+            ] {
+                ensure_project(&cx, &pool, human_key)
+                    .await
+                    .into_result()
+                    .expect("create older unrelated project");
+            }
+
+            let backend = ensure_project(&cx, &pool, "/workspace/backend_core")
+                .await
+                .into_result()
+                .expect("create recent sibling project");
+            let backend_ui = ensure_project(&cx, &pool, "/workspace/backend_core_ui")
+                .await
+                .into_result()
+                .expect("create newest sibling project");
+            let backend_id = backend.id.expect("backend project id");
+            let backend_ui_id = backend_ui.id.expect("backend UI project id");
+            let expected_pair = (backend_id.min(backend_ui_id), backend_id.max(backend_ui_id));
+
+            let suggestions = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list creation-seeded siblings");
+            let sibling = suggestions
+                .iter()
+                .find(|suggestion| {
+                    (suggestion.project_a.id, suggestion.project_b.id) == expected_pair
+                })
+                .expect("newest related projects must be evaluated together");
+            assert!(sibling.score >= PROJECT_SIBLING_MIN_SUGGESTION_SCORE);
+            assert_eq!(sibling.status, ProjectSiblingStatus::Suggested);
+
+            let newest_pairs = suggestions
+                .iter()
+                .filter(|suggestion| {
+                    suggestion.project_a.id == backend_ui_id
+                        || suggestion.project_b.id == backend_ui_id
+                })
+                .count();
+            assert_eq!(newest_pairs, PROJECT_SIBLING_REFRESH_LIMIT);
+        });
+    }
+
+    #[test]
+    fn project_sibling_refresh_inserts_canonical_rows_and_honors_ttl() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("project-sibling-refresh");
+
+        rt.block_on(async {
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(511),
+                    slug: "backend_core".to_string(),
+                    human_key: "/workspace/backend_core".to_string(),
+                    created_at: 1,
+                },
+            )
+            .await;
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(512),
+                    slug: "backend_core_ui".to_string(),
+                    human_key: "/workspace/backend_core_ui".to_string(),
+                    created_at: 2,
+                },
+            )
+            .await;
+
+            let first = refresh_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("initial sibling refresh");
+            assert_eq!(
+                first,
+                ProjectSiblingRefreshSummary {
+                    evaluated: 1,
+                    inserted: 1,
+                    refreshed: 0,
+                }
+            );
+            let first_rows = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list initial sibling refresh");
+            assert_eq!(first_rows.len(), 1);
+            assert_eq!(first_rows[0].project_a.id, 511);
+            assert_eq!(first_rows[0].project_b.id, 512);
+            assert!(first_rows[0].score >= PROJECT_SIBLING_MIN_SUGGESTION_SCORE);
+            let evaluated_ts = first_rows[0].evaluated_ts;
+
+            let second = refresh_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("fresh sibling refresh should be a no-op");
+            assert_eq!(second, ProjectSiblingRefreshSummary::default());
+            let second_rows = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list after fresh no-op");
+            assert_eq!(second_rows[0].evaluated_ts, evaluated_ts);
+        });
+    }
+
+    #[test]
+    fn project_sibling_refresh_normalizes_reversed_rows_without_duplication() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("project-sibling-reversed");
+
+        rt.block_on(async {
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(521),
+                    slug: "backend_core".to_string(),
+                    human_key: "/workspace/backend_core".to_string(),
+                    created_at: 1,
+                },
+            )
+            .await;
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(522),
+                    slug: "backend_core_ui".to_string(),
+                    human_key: "/workspace/backend_core_ui".to_string(),
+                    created_at: 2,
+                },
+            )
+            .await;
+            insert_project_sibling_for_test(&cx, &pool, 522, 521, 0.1).await;
+
+            let summary = refresh_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("refresh reversed row");
+            assert_eq!(summary.evaluated, 1);
+            assert_eq!(summary.inserted, 0);
+            assert_eq!(summary.refreshed, 1);
+
+            let rows = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list normalized row");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].project_a.id, 521);
+            assert_eq!(rows[0].project_b.id, 522);
+            assert!(rows[0].score >= PROJECT_SIBLING_MIN_SUGGESTION_SCORE);
+        });
+    }
+
+    #[test]
+    fn project_sibling_refresh_preserves_decisions_and_dismiss_cooldown() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("project-sibling-decisions");
+
+        rt.block_on(async {
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(531),
+                    slug: "backend_core".to_string(),
+                    human_key: "/workspace/backend_core".to_string(),
+                    created_at: 1,
+                },
+            )
+            .await;
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(532),
+                    slug: "backend_core_ui".to_string(),
+                    human_key: "/workspace/backend_core_ui".to_string(),
+                    created_at: 2,
+                },
+            )
+            .await;
+            refresh_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("seed sibling suggestion");
+
+            let confirmed = update_project_sibling_status(
+                &cx,
+                &pool,
+                532,
+                531,
+                ProjectSiblingStatus::Confirmed,
+            )
+            .await
+            .into_result()
+            .expect("confirm suggestion");
+            let confirmed_ts = confirmed.confirmed_ts.expect("confirmed timestamp");
+            let stale_evaluated_ts = now_micros() - PROJECT_SIBLING_REFRESH_TTL_MICROS - 1;
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire stale-confirm fixture connection");
+            let tracked_conn = tracked(&*conn);
+            map_sql_outcome(
+                traw_execute(
+                    &cx,
+                    &tracked_conn,
+                    "UPDATE project_sibling_suggestions SET evaluated_ts = ? WHERE id = ?",
+                    &[
+                        Value::BigInt(stale_evaluated_ts),
+                        Value::BigInt(confirmed.id),
+                    ],
+                )
+                .await,
+            )
+            .into_result()
+            .expect("age confirmed suggestion");
+            drop(conn);
+
+            let confirmed_refresh = refresh_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("refresh confirmed suggestion");
+            assert_eq!(confirmed_refresh.refreshed, 1);
+            let confirmed_rows = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list refreshed confirmed suggestion");
+            assert_eq!(confirmed_rows[0].status, ProjectSiblingStatus::Confirmed);
+            assert_eq!(confirmed_rows[0].confirmed_ts, Some(confirmed_ts));
+            assert_eq!(confirmed_rows[0].dismissed_ts, None);
+
+            let dismissed = update_project_sibling_status(
+                &cx,
+                &pool,
+                531,
+                532,
+                ProjectSiblingStatus::Dismissed,
+            )
+            .await
+            .into_result()
+            .expect("dismiss suggestion");
+            let dismissed_ts = dismissed.dismissed_ts.expect("dismissed timestamp");
+            let within_cooldown_ts = now_micros() - 6 * 24 * 60 * 60 * 1_000_000;
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire cooldown fixture connection");
+            let tracked_conn = tracked(&*conn);
+            map_sql_outcome(
+                traw_execute(
+                    &cx,
+                    &tracked_conn,
+                    "UPDATE project_sibling_suggestions SET evaluated_ts = ? WHERE id = ?",
+                    &[
+                        Value::BigInt(within_cooldown_ts),
+                        Value::BigInt(dismissed.id),
+                    ],
+                )
+                .await,
+            )
+            .into_result()
+            .expect("age dismissed suggestion within cooldown");
+            drop(conn);
+
+            let blocked_refresh = refresh_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("dismiss cooldown refresh");
+            assert_eq!(blocked_refresh, ProjectSiblingRefreshSummary::default());
+            let blocked_rows = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list cooldown-protected suggestion");
+            assert_eq!(blocked_rows[0].evaluated_ts, within_cooldown_ts);
+            assert_eq!(blocked_rows[0].dismissed_ts, Some(dismissed_ts));
+
+            let expired_cooldown_ts = now_micros() - PROJECT_SIBLING_DISMISS_COOLDOWN_MICROS - 1;
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire expired-cooldown fixture connection");
+            let tracked_conn = tracked(&*conn);
+            map_sql_outcome(
+                traw_execute(
+                    &cx,
+                    &tracked_conn,
+                    "UPDATE project_sibling_suggestions SET evaluated_ts = ? WHERE id = ?",
+                    &[
+                        Value::BigInt(expired_cooldown_ts),
+                        Value::BigInt(dismissed.id),
+                    ],
+                )
+                .await,
+            )
+            .into_result()
+            .expect("expire dismissed suggestion cooldown");
+            drop(conn);
+
+            let expired_refresh = refresh_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("refresh after dismiss cooldown");
+            assert_eq!(expired_refresh.refreshed, 1);
+            let expired_rows = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list refreshed dismissed suggestion");
+            assert_eq!(expired_rows[0].status, ProjectSiblingStatus::Dismissed);
+            assert_eq!(expired_rows[0].confirmed_ts, None);
+            assert_eq!(expired_rows[0].dismissed_ts, Some(dismissed_ts));
+            assert!(expired_rows[0].evaluated_ts > expired_cooldown_ts);
+        });
+    }
+
+    #[test]
+    fn project_sibling_refresh_enforces_pair_limit_and_cancellation() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let healthy_cx = Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("project-sibling-limits");
+
+        rt.block_on(async {
+            for id in 541..=545 {
+                insert_project_row_for_test(
+                    &healthy_cx,
+                    &pool,
+                    &ProjectRow {
+                        id: Some(id),
+                        slug: format!("project-{id}"),
+                        human_key: format!("/workspace/project-{id}"),
+                        created_at: id,
+                    },
+                )
+                .await;
+            }
+
+            let cancelled_cx = Cx::for_request_with_budget(
+                asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+            );
+            let cancelled = refresh_project_sibling_suggestions(&cancelled_cx, &pool).await;
+            assert!(matches!(cancelled, Outcome::Cancelled(_)));
+            let rows_after_cancel = list_project_sibling_suggestions(&healthy_cx, &pool)
+                .await
+                .into_result()
+                .expect("list after cancelled refresh");
+            assert_eq!(rows_after_cancel.len(), 0);
+
+            let summary = refresh_project_sibling_suggestions(&healthy_cx, &pool)
+                .await
+                .into_result()
+                .expect("bounded refresh");
+            assert_eq!(summary.evaluated, PROJECT_SIBLING_REFRESH_LIMIT);
+            assert_eq!(summary.inserted, PROJECT_SIBLING_REFRESH_LIMIT);
+            let rows = list_project_sibling_suggestions(&healthy_cx, &pool)
+                .await
+                .into_result()
+                .expect("list bounded refresh");
+            assert_eq!(rows.len(), PROJECT_SIBLING_REFRESH_LIMIT);
+            assert!(
+                rows.iter().all(|row| row.project_a.id < row.project_b.id),
+                "new sibling rows must always use canonical orientation"
+            );
+        });
+    }
+
+    #[test]
+    fn concurrent_project_sibling_refreshes_converge_without_duplicates() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) =
+            create_file_pool_with_schema_for_test_with_max("project-sibling-refresh-race", 2);
+        rt.block_on(async {
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(551),
+                    slug: "backend_core".to_string(),
+                    human_key: "/workspace/backend_core".to_string(),
+                    created_at: 1,
+                },
+            )
+            .await;
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(552),
+                    slug: "backend_core_ui".to_string(),
+                    human_key: "/workspace/backend_core_ui".to_string(),
+                    created_at: 2,
+                },
+            )
+            .await;
+        });
+
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let spawn_refresh = || {
+            let pool = pool.clone();
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build thread runtime");
+                start.wait();
+                rt.block_on(async {
+                    let cx = Cx::current().expect("runtime installs sibling refresh context");
+                    refresh_project_sibling_suggestions(&cx, &pool)
+                        .await
+                        .into_result()
+                        .expect("concurrent sibling refresh")
+                })
+            })
+        };
+        let handles = [spawn_refresh(), spawn_refresh()];
+        let summaries = handles.map(|handle| handle.join().expect("join sibling refresh"));
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.inserted)
+                .sum::<usize>(),
+            1
+        );
+
+        rt.block_on(async {
+            let rows = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list after concurrent refreshes");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].project_a.id, 551);
+            assert_eq!(rows[0].project_b.id, 552);
+        });
+    }
+
+    #[test]
     fn cache_scope_for_pool_distinguishes_memory_pools() {
         let config = crate::pool::DbPoolConfig {
             database_url: "sqlite:///:memory:".to_string(),
@@ -17215,7 +18204,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect("acquire a");
-            crate::schema::migrate_to_latest_base(&cx, &*conn_a)
+            crate::schema::migrate_to_latest_base(&cx, &**conn_a)
                 .await
                 .into_result()
                 .expect("migrate a");
@@ -17224,7 +18213,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect("acquire b");
-            crate::schema::migrate_to_latest_base(&cx, &*conn_b)
+            crate::schema::migrate_to_latest_base(&cx, &**conn_b)
                 .await
                 .into_result()
                 .expect("migrate b");
@@ -20377,6 +21366,250 @@ mod tests {
             "agent must be visible to a fresh canonical handle"
         );
         drop(pool);
+    }
+
+    #[test]
+    fn post_commit_checkpoint_requires_complete_progress_tuple() {
+        let conn = crate::DbConn::open_file(":memory:".to_string()).expect("open test database");
+        let cases = [
+            (
+                "SELECT 0 AS busy, -1 AS log, -1 AS checkpointed",
+                true,
+                "non-WAL sentinel",
+            ),
+            (
+                "SELECT 0 AS busy, 5 AS log, 5 AS checkpointed",
+                true,
+                "fully backfilled WAL",
+            ),
+            (
+                "SELECT 0 AS busy, 5 AS log, 4 AS checkpointed",
+                false,
+                "PASSIVE checkpoint with unbackfilled frames",
+            ),
+            (
+                "SELECT 1 AS busy, 5 AS log, 5 AS checkpointed",
+                false,
+                "busy checkpoint",
+            ),
+            (
+                "SELECT 0 AS busy, -2 AS log, -2 AS checkpointed",
+                false,
+                "malformed negative counts",
+            ),
+        ];
+
+        for (sql, expected, case) in cases {
+            let rows = conn.query_sync(sql, &[]).expect("query checkpoint tuple");
+            let progress = wal_checkpoint_progress(&rows).expect("decode checkpoint tuple");
+            assert_eq!(progress.fully_published(), expected, "{case}: {progress:?}");
+        }
+
+        let malformed = conn
+            .query_sync("SELECT 0 AS busy, 5 AS log", &[])
+            .expect("query malformed checkpoint tuple");
+        assert_eq!(
+            wal_checkpoint_progress(&malformed),
+            None,
+            "missing progress columns must fail closed"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn commit_tx_does_not_wait_for_external_reader_checkpoint() {
+        const READER_PATH_ENV: &str = "MCP_AGENT_MAIL_COMMIT_READER_PATH";
+        const READER_READY: &str = "commit-reader-ready";
+        const TEST_NAME: &str =
+            "queries::tests::commit_tx_does_not_wait_for_external_reader_checkpoint";
+
+        if let Some(db_path) = std::env::var_os(READER_PATH_ENV) {
+            use std::io::{BufRead as _, Write as _};
+
+            let reader = crate::CanonicalDbConn::open_file(
+                std::path::PathBuf::from(db_path).to_string_lossy().as_ref(),
+            )
+            .expect("child opens external canonical reader");
+            reader
+                .execute_raw("BEGIN;")
+                .expect("child begins external read transaction");
+            reader
+                .query_sync("SELECT COUNT(*) FROM projects", &[])
+                .expect("child pins external read snapshot");
+            println!("{READER_READY}");
+            std::io::stdout()
+                .flush()
+                .expect("flush external reader witness");
+
+            let mut release = String::new();
+            std::io::stdin()
+                .lock()
+                .read_line(&mut release)
+                .expect("read external reader release signal");
+            assert_eq!(release.trim(), "release");
+            reader
+                .execute_raw("ROLLBACK;")
+                .expect("child releases external read transaction");
+            return;
+        }
+
+        use std::io::{BufRead as _, Write as _};
+        use std::process::Stdio;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().expect("external-reader tempdir");
+        let db_path = directory.path().join("external-reader.sqlite3");
+        let pool = crate::create_pool(&crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create external-reader pool");
+        let setup_runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build external-reader setup runtime");
+        let setup_cx = asupersync::Cx::for_testing();
+        setup_runtime
+            .block_on(ensure_project(
+                &setup_cx,
+                &pool,
+                "/workspace/commit-reader-baseline",
+            ))
+            .into_result()
+            .expect("initialize external-reader schema and baseline row");
+
+        let mut reader = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg(TEST_NAME)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(READER_PATH_ENV, &db_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn external canonical reader child");
+        let mut reader_stdout = std::io::BufReader::new(
+            reader
+                .stdout
+                .take()
+                .expect("capture external reader stdout"),
+        );
+        let mut ready = false;
+        loop {
+            let mut line = String::new();
+            if reader_stdout
+                .read_line(&mut line)
+                .expect("read external reader witness")
+                == 0
+            {
+                break;
+            }
+            if line.contains(READER_READY) {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "external reader exited before publishing readiness");
+
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let writer_pool = pool.clone();
+        let writer = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build external-reader writer runtime");
+            let cx = asupersync::Cx::for_testing();
+            let result = runtime.block_on(ensure_project(
+                &cx,
+                &writer_pool,
+                "/workspace/commit-must-not-checkpoint",
+            ));
+            result_tx
+                .send(result)
+                .expect("publish external-reader writer result");
+        });
+
+        let prompt_result = result_rx.recv_timeout(Duration::from_secs(3));
+        writeln!(
+            reader
+                .stdin
+                .as_mut()
+                .expect("external reader stdin remains available"),
+            "release"
+        )
+        .expect("release external canonical reader");
+        let reader_status = reader.wait().expect("wait for external reader child");
+        assert!(reader_status.success(), "external reader child failed");
+
+        let completed_while_reader_held = prompt_result.is_ok();
+        let result = match prompt_result {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => result_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("writer must finish after releasing external reader"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("external-reader writer disconnected")
+            }
+        };
+        writer.join().expect("join external-reader writer");
+        let project = result
+            .into_result()
+            .expect("writer commits project while external reader is active");
+
+        assert!(
+            completed_while_reader_held,
+            "COMMIT must not run a checkpoint that waits for an unrelated external reader"
+        );
+        assert_eq!(
+            project.human_key, "/workspace/commit-must-not-checkpoint",
+            "writer returns the committed project"
+        );
+
+        let pooled = setup_runtime
+            .block_on(pool.acquire(&setup_cx))
+            .into_result()
+            .expect("reacquire writer connection after commit");
+        let timeout_rows = pooled
+            .query_sync("PRAGMA busy_timeout;", &[])
+            .expect("read restored runtime busy timeout");
+        assert_eq!(
+            timeout_rows
+                .first()
+                .and_then(|row| row.get(0))
+                .and_then(value_as_i64),
+            Some(
+                i64::try_from(mcp_agent_mail_core::config::DB_RUNTIME_BUSY_TIMEOUT_MS)
+                    .expect("runtime busy timeout fits i64")
+            ),
+            "post-commit publication must restore the connection's request lock-wait policy"
+        );
+        drop(pooled);
+
+        pool.wal_checkpoint_passive()
+            .expect("structured maintenance publishes deferred committed frames");
+        let verify = crate::CanonicalDbConn::open_file(
+            db_path
+                .to_str()
+                .expect("external-reader database path is UTF-8"),
+        )
+        .expect("open fresh canonical durability observer");
+        let rows = verify
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM projects WHERE human_key = ?",
+                &[Value::Text(
+                    "/workspace/commit-must-not-checkpoint".to_string(),
+                )],
+            )
+            .expect("query fresh canonical durability observer");
+        assert_eq!(
+            rows.first()
+                .and_then(|row| row.get_named::<i64>("count").ok()),
+            Some(1),
+            "structured maintenance publishes deferred WAL frames to a fresh canonical handle"
+        );
     }
 
     #[test]
@@ -28919,7 +30152,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect("acquire a");
-            crate::schema::migrate_to_latest_base(&cx, &*conn_a)
+            crate::schema::migrate_to_latest_base(&cx, &**conn_a)
                 .await
                 .into_result()
                 .expect("migrate a");
@@ -28928,7 +30161,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect("acquire b");
-            crate::schema::migrate_to_latest_base(&cx, &*conn_b)
+            crate::schema::migrate_to_latest_base(&cx, &**conn_b)
                 .await
                 .into_result()
                 .expect("migrate b");

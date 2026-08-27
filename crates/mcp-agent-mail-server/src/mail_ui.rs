@@ -86,11 +86,6 @@ pub fn dispatch_with_cx(
     // remains the GET path when no live pool exists in this process
     // (CLI/static-export contexts and tests).
     let cached_live_owner = mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env());
-    let refresh_project_siblings = should_refresh_project_siblings(
-        method,
-        query,
-        cached_live_owner.is_some(),
-    );
     let read_pool_owner = if method == "GET" && cached_live_owner.is_none() {
         open_mail_ui_read_pool()?
     } else {
@@ -130,7 +125,7 @@ pub fn dispatch_with_cx(
             )
         }
         // Explicit projects list route (legacy Python: GET /mail/projects).
-        "/projects" => render_projects_list(cx, read_pool, refresh_project_siblings),
+        "/projects" => render_projects_list(cx, read_pool),
         _ if sub.starts_with("/api/") => {
             handle_api_route(sub, query, method, body, cx, read_pool, &live_pool)
         }
@@ -1444,10 +1439,6 @@ fn is_static_export_request(query: &str) -> bool {
     extract_query_bool(query, "__static_export").unwrap_or(false)
 }
 
-fn should_refresh_project_siblings(method: &str, query: &str, has_live_pool: bool) -> bool {
-    method == "GET" && has_live_pool && !is_static_export_request(query)
-}
-
 fn is_synthetic_project_identifier(slug: &str) -> bool {
     let Some(rest) = slug.strip_prefix("[unknown-project-") else {
         return false;
@@ -2727,23 +2718,7 @@ struct IndexSiblingBuckets {
     suggested: Vec<IndexSibling>,
 }
 
-fn render_index(
-    cx: &Cx,
-    pool: &DbPool,
-    refresh_project_siblings: bool,
-) -> Result<Option<String>, (u16, String)> {
-    if refresh_project_siblings {
-        let summary = block_on_outcome(
-            cx,
-            queries::refresh_project_sibling_suggestions(cx, pool),
-        )?;
-        tracing::debug!(
-            evaluated = summary.evaluated,
-            inserted = summary.inserted,
-            refreshed = summary.refreshed,
-            "project_sibling_suggestions_refreshed"
-        );
-    }
+fn render_index(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)> {
     let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
     let mut agent_counts = block_on_outcome(cx, queries::count_agents_by_project(cx, pool))?;
     let total_agents = agent_counts.values().sum();
@@ -2828,14 +2803,10 @@ fn render_index(
 // Route: GET /mail/projects — explicit projects list (Python parity)
 // ---------------------------------------------------------------------------
 
-fn render_projects_list(
-    cx: &Cx,
-    pool: &DbPool,
-    refresh_project_siblings: bool,
-) -> Result<Option<String>, (u16, String)> {
+fn render_projects_list(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)> {
     // Reuse the index renderer — Python's /mail/projects renders the same template
     // as the old /mail root (project list view).
-    render_index(cx, pool, refresh_project_siblings)
+    render_index(cx, pool)
 }
 
 // ---------------------------------------------------------------------------
@@ -5718,22 +5689,18 @@ mod fresh_eyes_regression_tests {
         }
     }
 
-    fn seed_project_sibling(cx: &Cx, pool: &DbPool, lower_id: i64, upper_id: i64, score: f64) {
-        let conn = match block_on(pool.acquire(cx)) {
-            Outcome::Ok(conn) => conn,
-            Outcome::Err(error) => panic!("pool error: {error}"),
-            Outcome::Cancelled(_) => panic!("pool acquisition cancelled"),
-            Outcome::Panicked(panic) => {
-                panic!("pool acquisition panicked: {}", panic.message())
-            }
-        };
-        conn.execute_raw(&format!(
-            "INSERT INTO project_sibling_suggestions \
-             (project_a_id, project_b_id, score, status, rationale, created_ts, evaluated_ts) \
-             VALUES ({lower_id}, {upper_id}, {score}, 'suggested', \
-                     'shared workspace roots', 10, 10)"
-        ))
-        .expect("seed project sibling suggestion");
+    fn assert_project_sibling_seeded(cx: &Cx, pool: &DbPool, project_id: i64, other_id: i64) {
+        let lower_id = project_id.min(other_id);
+        let upper_id = project_id.max(other_id);
+        let rows = outcome_ok(block_on(queries::list_project_sibling_suggestions(
+            cx, pool,
+        )));
+        let row = rows
+            .iter()
+            .find(|row| row.project_a.id == lower_id && row.project_b.id == upper_id)
+            .expect("project creation should seed the canonical sibling suggestion");
+        assert_eq!(row.status, queries::ProjectSiblingStatus::Suggested);
+        assert!(row.score >= queries::PROJECT_SIBLING_MIN_SUGGESTION_SCORE);
     }
 
     #[test]
@@ -6213,9 +6180,9 @@ mod fresh_eyes_regression_tests {
         outcome_ok(block_on(queries::register_agent(
             &cx, &pool, root_id, "BlueLake", "e2e", "test", None, None, None,
         )));
-        seed_project_sibling(&cx, &pool, root_id, peer_id, 0.97);
+        assert_project_sibling_seeded(&cx, &pool, root_id, peer_id);
 
-        let suggested_html = render_index(&cx, &pool, false)
+        let suggested_html = render_index(&cx, &pool)
             .expect("suggested index should render")
             .expect("suggested index html");
         assert_eq!(
@@ -6246,7 +6213,7 @@ mod fresh_eyes_regression_tests {
         assert!(response["suggestion"]["confirmed_ts"].is_number());
         assert!(response["suggestion"]["dismissed_ts"].is_null());
 
-        let confirmed_html = render_index(&cx, &pool, false)
+        let confirmed_html = render_index(&cx, &pool)
             .expect("confirmed index should render")
             .expect("confirmed index html");
         assert!(confirmed_html.contains(&format!(
@@ -6255,6 +6222,70 @@ mod fresh_eyes_regression_tests {
         assert!(confirmed_html.contains(&format!(
             "data-sibling-action=\"reset\"\n                      data-project=\"{peer_id}\"\n                      data-other=\"{root_id}\""
         )));
+    }
+
+    #[test]
+    fn project_sibling_creation_discovers_and_project_index_is_read_only() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("mail-ui-sibling-discovery");
+        outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/workspace/backend_core",
+        )));
+        outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/workspace/backend_core_ui",
+        )));
+
+        let before_render = outcome_ok(block_on(queries::list_project_sibling_suggestions(
+            &cx, &pool,
+        )));
+        assert_eq!(before_render.len(), 1);
+        let evaluated_ts = before_render[0].evaluated_ts;
+
+        let html = render_index(&cx, &pool)
+            .expect("projects index should render")
+            .expect("projects index html");
+        assert_eq!(html.matches("data-suggestion-id=\"").count(), 2);
+        let after_render = outcome_ok(block_on(queries::list_project_sibling_suggestions(
+            &cx, &pool,
+        )));
+        assert_eq!(after_render.len(), 1);
+        assert_eq!(
+            after_render[0].status,
+            queries::ProjectSiblingStatus::Suggested
+        );
+        assert!(after_render[0].score >= queries::PROJECT_SIBLING_MIN_SUGGESTION_SCORE);
+        assert_eq!(after_render[0].evaluated_ts, evaluated_ts);
+    }
+
+    #[test]
+    fn project_sibling_index_persists_but_hides_low_score_rows() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("mail-ui-low-score-sibling");
+        outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/workspace/alpha",
+        )));
+        outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/workspace/zulu",
+        )));
+
+        let html = render_index(&cx, &pool)
+            .expect("low-score projects index should render")
+            .expect("low-score projects index html");
+        assert!(!html.contains("data-suggestion-id=\""));
+
+        let rows = outcome_ok(block_on(queries::list_project_sibling_suggestions(
+            &cx, &pool,
+        )));
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].score < queries::PROJECT_SIBLING_MIN_SUGGESTION_SCORE);
     }
 
     #[test]
@@ -6327,7 +6358,7 @@ mod fresh_eyes_regression_tests {
         )));
         let root_id = project_a.id.expect("cancel project a id");
         let peer_id = project_b.id.expect("cancel project b id");
-        seed_project_sibling(&cx, &pool, root_id, peer_id, 0.96);
+        assert_project_sibling_seeded(&cx, &pool, root_id, peer_id);
 
         let cancelled_cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         cancelled_cx.cancel_with(
