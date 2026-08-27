@@ -280,6 +280,43 @@ print(obj.get(sys.argv[2], ""))
 PY
 }
 
+mail_sibling_element_count() {
+    local html_file="$1"
+    local kind="$2"
+    local project_id="$3"
+    local other_id="$4"
+    python3 - "${html_file}" "${kind}" "${project_id}" "${other_id}" <<'PY'
+from html.parser import HTMLParser
+import sys
+
+html_file, kind, project_id, other_id = sys.argv[1:]
+
+class SiblingParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.count = 0
+
+    def handle_starttag(self, _tag, attrs):
+        values = dict(attrs)
+        is_target_kind = (
+            values.get("data-sibling-confirmed") == "true"
+            if kind == "confirmed"
+            else "data-sibling-row" in values
+        )
+        if (
+            is_target_kind
+            and values.get("data-project") == project_id
+            and values.get("data-other") == other_id
+        ):
+            self.count += 1
+
+parser = SiblingParser()
+with open(html_file, encoding="utf-8") as handle:
+    parser.feed(handle.read())
+print(parser.count)
+PY
+}
+
 # ---------------------------------------------------------------------------
 # Server runner (per-config)
 # ---------------------------------------------------------------------------
@@ -1111,6 +1148,239 @@ e2e_assert_not_contains \
     "Blocking dispatch panicked"
 
 stop_server "${PID6}"
+trap - EXIT
+
+# ---------------------------------------------------------------------------
+# Run 7: persisted project-sibling transitions + restart/read/auth/CSRF
+# ---------------------------------------------------------------------------
+
+e2e_banner "Run 7: persisted project-sibling transitions"
+
+WORK7="$(e2e_mktemp "e2e_http_run7")"
+DB7="${WORK7}/db.sqlite3"
+STORAGE7="${WORK7}/storage_root"
+PROJECT_A7="${WORK7}/backend_core"
+PROJECT_B7="${WORK7}/backend_core_ui"
+mkdir -p "${PROJECT_A7}" "${PROJECT_B7}"
+PORT7="$(pick_port)"
+URL7="http://127.0.0.1:${PORT7}"
+API7="${URL7}/api/"
+TOKEN7="e2e-sibling-token"
+AUTHZ7="Authorization: Bearer ${TOKEN7}"
+
+PID7="$(start_server "run7_seed" "${PORT7}" "${DB7}" "${STORAGE7}" "${BIN}" \
+    "HTTP_BEARER_TOKEN=${TOKEN7}" \
+)"
+trap 'stop_server "${PID7}" || true' EXIT
+wait_for_server_start_or_fail "run7_seed" "${PID7}" "${PORT7}" "server run7 seed phase failed to start"
+wait_for_readiness_or_fail "run7_seed" "${PID7}" "${PORT7}" "${URL7}/health/readiness"
+
+e2e_case_banner "Create the two real projects through MCP"
+PROJECT_ARGS_A7="$(python3 -c 'import json,sys; print(json.dumps({"human_key": sys.argv[1]}))' "${PROJECT_A7}")"
+PAYLOAD_PROJECT_A7="$(jsonrpc_tools_call_payload "ensure_project" "${PROJECT_ARGS_A7}")"
+http_post_json "run7_ensure_project_a" "${API7}" "${PAYLOAD_PROJECT_A7}" "${AUTHZ7}"
+e2e_assert_eq "project A ensure HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run7_ensure_project_a_status.txt")"
+
+PROJECT_ARGS_B7="$(python3 -c 'import json,sys; print(json.dumps({"human_key": sys.argv[1]}))' "${PROJECT_B7}")"
+PAYLOAD_PROJECT_B7="$(jsonrpc_tools_call_payload "ensure_project" "${PROJECT_ARGS_B7}")"
+http_post_json "run7_ensure_project_b" "${API7}" "${PAYLOAD_PROJECT_B7}" "${AUTHZ7}"
+e2e_assert_eq "project B ensure HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run7_ensure_project_b_status.txt")"
+
+stop_server "${PID7}"
+trap - EXIT
+
+read -r PROJECT_A_ID7 PROJECT_B_ID7 < <(
+python3 - "${DB7}" <<'PY'
+import sqlite3, sys
+db_path = sys.argv[1]
+with sqlite3.connect(db_path) as conn:
+    rows = conn.execute("SELECT id FROM projects ORDER BY id").fetchall()
+    if len(rows) != 2:
+        raise SystemExit(f"expected exactly two seed projects, found {len(rows)}")
+    project_a, project_b = (int(rows[0][0]), int(rows[1][0]))
+    conn.execute(
+        """INSERT INTO project_sibling_suggestions
+           (project_a_id, project_b_id, score, status, rationale, created_ts, evaluated_ts)
+           VALUES (?, ?, 0.97, 'suggested', 'shared backend workspace', 10, 10)""",
+        (project_a, project_b),
+    )
+    conn.commit()
+print(project_a, project_b)
+PY
+)
+e2e_save_artifact "run7_seed_ids.txt" "project_a_id=${PROJECT_A_ID7}
+project_b_id=${PROJECT_B_ID7}"
+
+PORT7="$(pick_port)"
+URL7="http://127.0.0.1:${PORT7}"
+SIBLING_URL7="${URL7}/mail/api/projects/${PROJECT_B_ID7}/siblings/${PROJECT_A_ID7}"
+PID7="$(start_server "run7_transition" "${PORT7}" "${DB7}" "${STORAGE7}" "${BIN}" \
+    "HTTP_BEARER_TOKEN=${TOKEN7}" \
+)"
+trap 'stop_server "${PID7}" || true' EXIT
+wait_for_server_start_or_fail "run7_transition" "${PID7}" "${PORT7}" "server run7 transition phase failed to start"
+wait_for_readiness_or_fail "run7_transition" "${PID7}" "${PORT7}" "${URL7}/health/readiness"
+
+e2e_case_banner "Sibling mutation requires bearer authentication"
+http_post_json "run7_sibling_no_auth" "${SIBLING_URL7}" '{"action":"confirm"}'
+e2e_assert_eq "unauthenticated sibling POST is 401" "401" "$(cat "${E2E_ARTIFACT_DIR}/run7_sibling_no_auth_status.txt")"
+
+e2e_case_banner "Sibling mutation rejects cross-origin browser requests"
+http_post_json "run7_sibling_cross_origin" "${SIBLING_URL7}" '{"action":"confirm"}' \
+    "${AUTHZ7}" \
+    "Origin: https://untrusted.example"
+e2e_assert_eq "cross-origin sibling POST is 403" "403" "$(cat "${E2E_ARTIFACT_DIR}/run7_sibling_cross_origin_status.txt")"
+e2e_assert_contains \
+    "cross-origin response explains rejection" \
+    "$(cat "${E2E_ARTIFACT_DIR}/run7_sibling_cross_origin_body.json" 2>/dev/null || true)" \
+    "cross-origin request rejected"
+
+e2e_case_banner "Rejected requests cannot mutate sibling state"
+RUN7_REJECTED_STATE="$(python3 - "${DB7}" <<'PY'
+import json, sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as conn:
+    row = conn.execute(
+        """SELECT status, confirmed_ts, dismissed_ts
+           FROM project_sibling_suggestions"""
+    ).fetchone()
+print(json.dumps({
+    "status": row[0],
+    "confirmed_ts": row[1],
+    "dismissed_ts": row[2],
+}, sort_keys=True))
+PY
+)"
+e2e_save_artifact "run7_rejected_request_db_state.json" "${RUN7_REJECTED_STATE}"
+e2e_assert_eq "rejected requests preserve suggested state" "suggested" "$(json_get_field "${RUN7_REJECTED_STATE}" "status")"
+e2e_assert_eq "rejected requests do not set confirmed_ts" "None" "$(json_get_field "${RUN7_REJECTED_STATE}" "confirmed_ts")"
+e2e_assert_eq "rejected requests do not set dismissed_ts" "None" "$(json_get_field "${RUN7_REJECTED_STATE}" "dismissed_ts")"
+
+e2e_case_banner "Confirm sibling suggestion through real HTTP"
+http_post_json "run7_sibling_confirm" "${SIBLING_URL7}" '{"action":"confirm"}' "${AUTHZ7}"
+e2e_assert_eq "confirm sibling POST is 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run7_sibling_confirm_status.txt")"
+e2e_assert_contains \
+    "confirm response reports committed state" \
+    "$(cat "${E2E_ARTIFACT_DIR}/run7_sibling_confirm_body.json" 2>/dev/null || true)" \
+    '"status":"confirmed"'
+
+e2e_case_banner "Repeat confirm is idempotent"
+http_post_json "run7_sibling_confirm_retry" "${SIBLING_URL7}" '{"action":"confirm"}' "${AUTHZ7}"
+e2e_assert_eq "repeated confirm sibling POST is 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run7_sibling_confirm_retry_status.txt")"
+CONFIRMED_TS7="$(python3 - "${E2E_ARTIFACT_DIR}/run7_sibling_confirm_body.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    print(json.load(handle)["suggestion"]["confirmed_ts"])
+PY
+)"
+CONFIRMED_RETRY_TS7="$(python3 - "${E2E_ARTIFACT_DIR}/run7_sibling_confirm_retry_body.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    print(json.load(handle)["suggestion"]["confirmed_ts"])
+PY
+)"
+e2e_assert_eq "idempotent confirm preserves audit timestamp" "${CONFIRMED_TS7}" "${CONFIRMED_RETRY_TS7}"
+
+e2e_case_banner "Dismiss sibling suggestion through real HTTP"
+http_post_json "run7_sibling_dismiss" "${SIBLING_URL7}" '{"action":"dismiss"}' "${AUTHZ7}"
+e2e_assert_eq "dismiss sibling POST is 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run7_sibling_dismiss_status.txt")"
+e2e_assert_contains \
+    "dismiss response reports committed state" \
+    "$(cat "${E2E_ARTIFACT_DIR}/run7_sibling_dismiss_body.json" 2>/dev/null || true)" \
+    '"status":"dismissed"'
+
+e2e_case_banner "Reset sibling suggestion through real HTTP"
+http_post_json "run7_sibling_reset" "${SIBLING_URL7}" '{"action":"reset"}' "${AUTHZ7}"
+e2e_assert_eq "reset sibling POST is 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run7_sibling_reset_status.txt")"
+e2e_assert_contains \
+    "reset response reports suggested state" \
+    "$(cat "${E2E_ARTIFACT_DIR}/run7_sibling_reset_body.json" 2>/dev/null || true)" \
+    '"status":"suggested"'
+e2e_assert_contains \
+    "reset clears prior decision timestamps" \
+    "$(cat "${E2E_ARTIFACT_DIR}/run7_sibling_reset_body.json" 2>/dev/null || true)" \
+    '"confirmed_ts":null'
+
+e2e_case_banner "Reset is reflected by the projects read surface"
+http_request "run7_projects_after_reset" "GET" "${URL7}/mail/projects" "${AUTHZ7}"
+e2e_assert_eq "projects read surface after reset is 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run7_projects_after_reset_status.txt")"
+e2e_assert_eq \
+    "reset restores exactly one forward suggestion element" \
+    "1" \
+    "$(mail_sibling_element_count "${E2E_ARTIFACT_DIR}/run7_projects_after_reset_body.txt" suggested "${PROJECT_A_ID7}" "${PROJECT_B_ID7}")"
+e2e_assert_eq \
+    "reset restores exactly one reverse suggestion element" \
+    "1" \
+    "$(mail_sibling_element_count "${E2E_ARTIFACT_DIR}/run7_projects_after_reset_body.txt" suggested "${PROJECT_B_ID7}" "${PROJECT_A_ID7}")"
+
+e2e_case_banner "Restore confirmed state before restart proof"
+http_post_json "run7_sibling_confirm_final" "${SIBLING_URL7}" '{"action":"confirm"}' "${AUTHZ7}"
+e2e_assert_eq "final confirm sibling POST is 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run7_sibling_confirm_final_status.txt")"
+
+e2e_case_banner "Projects read surface reflects the confirmed relation"
+http_request "run7_projects_before_restart" "GET" "${URL7}/mail/projects" "${AUTHZ7}"
+e2e_assert_eq "projects read surface is 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run7_projects_before_restart_status.txt")"
+e2e_assert_eq \
+    "projects read surface has exactly one forward confirmed control" \
+    "1" \
+    "$(mail_sibling_element_count "${E2E_ARTIFACT_DIR}/run7_projects_before_restart_body.txt" confirmed "${PROJECT_A_ID7}" "${PROJECT_B_ID7}")"
+e2e_assert_eq \
+    "projects read surface has exactly one reverse confirmed control" \
+    "1" \
+    "$(mail_sibling_element_count "${E2E_ARTIFACT_DIR}/run7_projects_before_restart_body.txt" confirmed "${PROJECT_B_ID7}" "${PROJECT_A_ID7}")"
+
+stop_server "${PID7}"
+trap - EXIT
+
+RUN7_DB_STATE="$(python3 - "${DB7}" "${E2E_ARTIFACT_DIR}/run7_db_after.sqlite3" <<'PY'
+import json, sqlite3, sys
+db_path, snapshot_path = sys.argv[1:]
+with sqlite3.connect(db_path) as conn:
+    row = conn.execute(
+        """SELECT COUNT(*), MIN(status), MIN(confirmed_ts), MIN(dismissed_ts)
+           FROM project_sibling_suggestions"""
+    ).fetchone()
+    with sqlite3.connect(snapshot_path) as snapshot:
+        conn.backup(snapshot)
+print(json.dumps({
+    "row_count": row[0],
+    "status": row[1],
+    "confirmed_ts": row[2],
+    "dismissed_ts": row[3],
+}, sort_keys=True))
+PY
+)"
+e2e_save_artifact "run7_db_state.json" "${RUN7_DB_STATE}"
+e2e_assert_eq "exactly one canonical sibling row persists" "1" "$(json_get_field "${RUN7_DB_STATE}" "row_count")"
+e2e_assert_eq "database row is confirmed" "confirmed" "$(json_get_field "${RUN7_DB_STATE}" "status")"
+if [ "$(json_get_field "${RUN7_DB_STATE}" "confirmed_ts")" != "None" ]; then
+    e2e_pass "database row has confirmed_ts"
+else
+    e2e_fail "database row is missing confirmed_ts"
+fi
+e2e_assert_eq "database row clears dismissed_ts" "None" "$(json_get_field "${RUN7_DB_STATE}" "dismissed_ts")"
+
+PORT7_RESTART="$(pick_port)"
+URL7_RESTART="http://127.0.0.1:${PORT7_RESTART}"
+PID7="$(start_server "run7_restart" "${PORT7_RESTART}" "${DB7}" "${STORAGE7}" "${BIN}" \
+    "HTTP_BEARER_TOKEN=${TOKEN7}" \
+)"
+trap 'stop_server "${PID7}" || true' EXIT
+wait_for_server_start_or_fail "run7_restart" "${PID7}" "${PORT7_RESTART}" "server run7 restart phase failed to start"
+wait_for_readiness_or_fail "run7_restart" "${PID7}" "${PORT7_RESTART}" "${URL7_RESTART}/health/readiness"
+
+e2e_case_banner "Confirmed relation survives server restart"
+http_request "run7_projects_after_restart" "GET" "${URL7_RESTART}/mail/projects" "${AUTHZ7}"
+e2e_assert_eq "projects read surface after restart is 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run7_projects_after_restart_status.txt")"
+e2e_assert_eq \
+    "forward confirmed control survives restart" \
+    "1" \
+    "$(mail_sibling_element_count "${E2E_ARTIFACT_DIR}/run7_projects_after_restart_body.txt" confirmed "${PROJECT_A_ID7}" "${PROJECT_B_ID7}")"
+e2e_assert_eq \
+    "reverse confirmed control survives restart" \
+    "1" \
+    "$(mail_sibling_element_count "${E2E_ARTIFACT_DIR}/run7_projects_after_restart_body.txt" confirmed "${PROJECT_B_ID7}" "${PROJECT_A_ID7}")"
+
+stop_server "${PID7}"
 trap - EXIT
 
 # ---------------------------------------------------------------------------
