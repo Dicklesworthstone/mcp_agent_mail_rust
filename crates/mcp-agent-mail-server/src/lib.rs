@@ -6264,7 +6264,12 @@ impl AtcExecutorMode {
             Some("dry-run" | "dry_run" | "dryrun") => Self::DryRun,
             Some("canary") => Self::Canary,
             Some("live") => Self::Live,
-            _ => Self::Live,
+            // ATC observation remains active in Shadow mode, but no durable
+            // messages or reservation releases are emitted. Requiring an
+            // explicit Live/Canary opt-in prevents a fresh install with the
+            // default write mode Off from turning passive liveness sampling
+            // into an unbounded mailbox-writing workload.
+            _ => Self::Shadow,
         }
     }
 
@@ -6308,10 +6313,8 @@ fn atc_durable_experience_store_writable(pool: &mcp_agent_mail_db::DbPool) -> bo
 /// suppress real actions and durable rows) AND (b) a non-Off write mode. Write
 /// mode Off — the default, or via `AM_ATC_WRITE_MODE=off`, `ATC_LEARNING_DISABLED`,
 /// or the runtime kill switch — means the learning ledger is NOT written,
-/// regardless of executor mode. This makes durable writes off-by-default: prior
-/// to this gate the Live operator (AM_ATC_EXECUTOR_MODE defaults to Live) churned
-/// the `atc_experiences` ledger regardless of AM_ATC_WRITE_MODE, and under load
-/// its index B-tree corrupts, causing a corrupt→reconstruct→corrupt loop.
+/// regardless of executor mode. The executor independently defaults to Shadow;
+/// Live/Canary execution and experience writes both require explicit opt-in.
 fn atc_durable_writes_enabled(
     write_mode: mcp_agent_mail_core::AtcWriteMode,
     executor_mode: AtcExecutorMode,
@@ -21225,17 +21228,17 @@ first body
     }
 
     #[test]
-    fn atc_executor_mode_defaults_to_live_for_unknown_values() {
+    fn atc_executor_mode_defaults_to_shadow_for_missing_or_unknown_values() {
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("AM_ATC_EXECUTOR_MODE", "")],
             || {
-                assert_eq!(AtcExecutorMode::from_env(), AtcExecutorMode::Live);
+                assert_eq!(AtcExecutorMode::from_env(), AtcExecutorMode::Shadow);
             },
         );
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("AM_ATC_EXECUTOR_MODE", "mystery-mode")],
             || {
-                assert_eq!(AtcExecutorMode::from_env(), AtcExecutorMode::Live);
+                assert_eq!(AtcExecutorMode::from_env(), AtcExecutorMode::Shadow);
             },
         );
     }
@@ -21246,6 +21249,22 @@ first body
             &[("AM_ATC_EXECUTOR_MODE", "shadow")],
             || {
                 assert_eq!(AtcExecutorMode::from_env(), AtcExecutorMode::Shadow);
+            },
+        );
+    }
+
+    #[test]
+    fn atc_executor_mode_requires_explicit_opt_in_for_live_execution() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_EXECUTOR_MODE", "live")],
+            || {
+                assert_eq!(AtcExecutorMode::from_env(), AtcExecutorMode::Live);
+            },
+        );
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_EXECUTOR_MODE", "canary")],
+            || {
+                assert_eq!(AtcExecutorMode::from_env(), AtcExecutorMode::Canary);
             },
         );
     }

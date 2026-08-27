@@ -2425,6 +2425,51 @@ mod tests {
     use super::*;
 
     #[cfg(target_os = "linux")]
+    const LEGACY_IMPORT_REOPEN_DB_ENV: &str = "AM_TEST_LEGACY_IMPORT_REOPEN_DB";
+
+    #[cfg(target_os = "linux")]
+    fn assert_target_reopens_in_fresh_process(target_db: &Path) {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg("legacy::tests::legacy_import_target_cross_process_reopen_helper")
+        .arg("--exact")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(LEGACY_IMPORT_REOPEN_DB_ENV, target_db)
+        .output()
+        .expect("spawn fresh-process runtime reopen probe");
+        assert!(
+            output.status.success(),
+            "fresh-process runtime reopen failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("fresh-process imported target reopen succeeded"),
+            "fresh-process runtime reopen ran no causal probe: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "fresh-process helper invoked by the legacy import regression"]
+    fn legacy_import_target_cross_process_reopen_helper() {
+        let target_db = std::env::var_os(LEGACY_IMPORT_REOPEN_DB_ENV)
+            .map(PathBuf::from)
+            .expect("fresh-process reopen helper requires target DB path");
+        let conn = DbConn::open_file(target_db.display().to_string())
+            .expect("fresh process must acquire the imported target namespace");
+        conn.query_sync("SELECT COUNT(*) AS c FROM sqlite_master", &[])
+            .expect("fresh process must read the imported target");
+        drop(conn);
+        println!("fresh-process imported target reopen succeeded");
+    }
+
+    #[cfg(target_os = "linux")]
     struct LegacyTestChild {
         child: Option<std::process::Child>,
         stop_path: PathBuf,
@@ -3528,7 +3573,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_import_v20_autoindex_fixture_preserves_source_and_migrates_copy() {
+    fn legacy_import_v20_autoindex_fixture_preserves_source_and_reopens_copy() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let source_db = tmp.path().join("legacy-v20.sqlite3");
         let source_storage = tmp.path().join("legacy-storage");
@@ -3586,6 +3631,8 @@ mod tests {
             .expect("target remains readable after import");
         verify_runtime_sqlite_readable(&target_db, "target DB")
             .expect("target remains runtime-readable after import");
+        #[cfg(target_os = "linux")]
+        assert_target_reopens_in_fresh_process(&target_db);
         assert!(
             target_storage.join("legacy_import_receipts").exists(),
             "successful copy import must write its receipt under target storage"

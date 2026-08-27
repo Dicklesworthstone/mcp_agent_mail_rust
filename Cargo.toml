@@ -35,11 +35,11 @@ fastmcp-protocol = "0.7.1"
 
 # br-ba1ui: exact pins keep the shared Asupersync type universe coherent.
 # 2026-08-24: =0.4.9, lockstep with fastmcp 0.7.1 (which pins =0.4.9),
-# sqlmodel 0.4.0 (^0.4.9), and the fsqlite 0.3.9 registry baseline.
+# sqlmodel 0.4.0 (^0.4.9), and the fsqlite 0.3.11 registry baseline.
 # 0.4.9 is additive on the v0.4.3 public compatibility floor (RuntimeHandle
 # request-Cx / blocking-pool APIs, SQLite cancel correctness, owned-OTLP).
 asupersync = { version = "=0.4.9", features = ["tls-webpki-roots"] }
-fsqlite = "=0.3.9"
+fsqlite = "=0.3.11"
 
 sqlmodel = "=0.4.0"
 sqlmodel-core = "=0.4.0"
@@ -179,7 +179,7 @@ inherits = "release"     # Benchmarks use same optimizations as release
 [patch.crates-io]
 # 2026-08-22 registry adoption (asupersync =0.4.9 universe):
 # - asupersync resolves from crates.io (=0.4.9; fastmcp 0.7.1 pins =0.4.9).
-# - fsqlite family resolves from crates.io (0.3.9) — the machine-specific
+# - fsqlite family resolves from crates.io (0.3.11) — the machine-specific
 #   /data/projects/frankensqlite path patches are GONE (they broke source
 #   builds on any host without that mount).
 # - sqlmodel family resolves from crates.io (=0.4.0, published 2026-08-21,

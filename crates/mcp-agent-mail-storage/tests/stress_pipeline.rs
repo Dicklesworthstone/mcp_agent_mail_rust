@@ -30,7 +30,7 @@
     clippy::missing_const_for_fn
 )]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -160,6 +160,20 @@ fn make_large_pool(tmp: &TempDir) -> DbPool {
         cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     DbPool::new(&config).expect("create large pool")
+}
+
+fn assert_mailbox_integrity_after_pool_close(db_path: &Path) {
+    match mcp_agent_mail_db::pool::sqlite_file_is_healthy_without_family_cleanup(db_path) {
+        Ok(true) => {}
+        Ok(false) => panic!(
+            "post-soak engine and canonical integrity checks rejected {}",
+            db_path.display()
+        ),
+        Err(error) => panic!(
+            "post-soak integrity checks failed for {}: {error}",
+            db_path.display()
+        ),
+    }
 }
 
 /// RSS memory in KB (Linux only, returns 0 elsewhere).
@@ -1310,6 +1324,7 @@ fn stress_sustained_mixed_workload_30s() {
     let tmp = TempDir::new().unwrap();
     let config = test_config(tmp.path());
     let pool = make_large_pool(&tmp);
+    let db_path = PathBuf::from(pool.sqlite_path());
 
     let n_agents = 30;
     wbq_start();
@@ -1606,6 +1621,8 @@ fn stress_sustained_mixed_workload_30s() {
         total_ok > (duration_secs * target_rps / 4),
         "too few successful ops ({total_ok}) for {duration_secs}s at {target_rps} RPS"
     );
+    drop(pool);
+    assert_mailbox_integrity_after_pool_close(&db_path);
 }
 
 // ===========================================================================
@@ -3515,4 +3532,6 @@ fn stress_sustained_100_agents_60s() {
             last_avg / 1000.0,
         );
     }
+    drop(pool);
+    assert_mailbox_integrity_after_pool_close(&db_path);
 }

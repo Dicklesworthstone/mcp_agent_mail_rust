@@ -2792,9 +2792,9 @@ impl Config {
             // fully disable the learning subsystem — NOT merely flip the write
             // mode. Durable ATC experience writes (the atc_experiences ledger)
             // are driven by the operator loop, which is gated by `atc_enabled`
-            // and AM_ATC_EXECUTOR_MODE (default Live) — NOT by atc_write_mode.
-            // Setting only the write mode silently leaves the Live operator
-            // churning the ledger, whose index corrupts under sustained load.
+            // and AM_ATC_EXECUTOR_MODE — NOT by atc_write_mode. The executor
+            // now defaults to Shadow, but this top-level kill switch must also
+            // stop explicitly configured Live/Canary operators.
             // Force the top-level gate off so the documented switch truly stops it.
             config.atc_write_mode = AtcWriteMode::Off;
             config.atc_enabled = false;

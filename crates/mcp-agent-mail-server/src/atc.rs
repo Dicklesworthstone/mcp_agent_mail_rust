@@ -4917,10 +4917,12 @@ impl AtcEngine {
         self.schedule_entry_for_push(agent, incumbent_review.min(candidate_review));
     }
 
-    fn pop_due_agents(&mut self, now_micros: i64) -> Vec<String> {
-        let mut due = Vec::new();
-        let mut seen = HashSet::new();
-        while let Some(Reverse(next)) = self.liveness_schedule.peek().cloned() {
+    fn pop_due_agents(&mut self, now_micros: i64, max_reviews: usize) -> Vec<String> {
+        let mut due = Vec::with_capacity(max_reviews);
+        let mut seen = HashSet::with_capacity(max_reviews);
+        while due.len() < max_reviews
+            && let Some(Reverse(next)) = self.liveness_schedule.peek().cloned()
+        {
             if next.review_at_micros > now_micros {
                 break;
             }
@@ -4934,10 +4936,18 @@ impl AtcEngine {
                 continue;
             }
             if seen.insert(next.agent.clone()) {
+                // A policy refresh can mark the same agent dirty while it is
+                // already due in the scheduler. Consume both representations
+                // together so the next batch cannot evaluate it twice.
+                self.dirty_agents.remove(&next.agent);
                 due.push(next.agent);
             }
         }
-        for agent in self.dirty_agents.drain() {
+        while due.len() < max_reviews {
+            let Some(agent) = self.dirty_agents.iter().next().cloned() else {
+                break;
+            };
+            self.dirty_agents.remove(&agent);
             if seen.insert(agent.clone()) {
                 due.push(agent);
             }
@@ -5138,7 +5148,7 @@ impl AtcEngine {
         let fallback_active = fallback_reason.is_some();
         let incumbent_policy = self.incumbent_policy.clone();
         let candidate_policy = self.shadow_policy.candidate.clone();
-        let due_agents = self.pop_due_agents(now_micros);
+        let due_agents = self.pop_due_agents(now_micros, MAX_LIVENESS_REVIEWS_PER_TICK);
         let mut evaluation = LivenessEvaluation {
             due_agents: due_agents.len(),
             ..LivenessEvaluation::default()
@@ -9601,6 +9611,16 @@ pub struct AtcPopulationSyncStats {
     pub active_agents: usize,
 }
 
+/// Maximum number of overdue liveness reviews evaluated by one ATC tick.
+///
+/// Durable population hydration can legitimately seed thousands of agents at
+/// once. Draining every overdue scheduler entry in one tick turns that bounded
+/// snapshot into an unbounded burst of effects for the 512-entry executor
+/// queue. Eight reviews per tick clears a 940-agent cold start in under 30
+/// seconds at the operator's 250ms floor while leaving ample headroom for
+/// probes, deadlock advisories, and HTTP/MCP work.
+const MAX_LIVENESS_REVIEWS_PER_TICK: usize = 8;
+
 /// Hydrate the ATC engine from the durable DB snapshot.
 ///
 /// This seeds pre-existing agents on cold start and refreshes their latest
@@ -11188,6 +11208,68 @@ mod alien_enhancement_tests {
         assert_eq!(after.schedule_version, schedule_version);
         assert_eq!(after.next_review_micros, next_review_micros);
         assert_eq!(engine.liveness_schedule.len(), heap_len);
+    }
+
+    #[test]
+    fn overdue_population_reviews_are_bounded_and_make_fair_progress() {
+        const POPULATION: usize = 940;
+        let mut engine = AtcEngine::new_for_testing();
+        let observed_at = 1_000_000_i64;
+        let review_at = observed_at.saturating_add(30 * 24 * 60 * 60 * 1_000_000);
+
+        for index in 0..POPULATION {
+            let agent = format!("HydratedAgent{index:04}");
+            engine.register_agent(&agent, "codex-cli", Some("/tmp/hydration"));
+            engine.observe_activity(&agent, Some("/tmp/hydration"), observed_at);
+        }
+
+        let mut reviewed = HashSet::with_capacity(POPULATION);
+        let mut batches = 0_usize;
+        loop {
+            let due = engine.pop_due_agents(review_at, MAX_LIVENESS_REVIEWS_PER_TICK);
+            if due.is_empty() {
+                break;
+            }
+            assert!(
+                due.len() <= MAX_LIVENESS_REVIEWS_PER_TICK,
+                "one tick exceeded its liveness review budget"
+            );
+            for agent in due {
+                assert!(
+                    reviewed.insert(agent),
+                    "an overdue agent was reviewed twice"
+                );
+            }
+            batches = batches.saturating_add(1);
+        }
+
+        assert_eq!(reviewed.len(), POPULATION);
+        assert_eq!(batches, POPULATION.div_ceil(MAX_LIVENESS_REVIEWS_PER_TICK));
+    }
+
+    #[test]
+    fn dirty_population_reviews_remain_bounded_without_losing_agents() {
+        const POPULATION: usize = 940;
+        let mut engine = AtcEngine::new_for_testing();
+        for index in 0..POPULATION {
+            let agent = format!("DirtyAgent{index:04}");
+            engine.register_agent(&agent, "codex-cli", Some("/tmp/dirty"));
+        }
+        engine.liveness_schedule.clear();
+        engine.mark_agents_dirty();
+
+        let mut reviewed = HashSet::with_capacity(POPULATION);
+        while !engine.dirty_agents.is_empty() {
+            let due = engine.pop_due_agents(i64::MAX, MAX_LIVENESS_REVIEWS_PER_TICK);
+            assert!(
+                !due.is_empty(),
+                "dirty review batching stopped making progress"
+            );
+            assert!(due.len() <= MAX_LIVENESS_REVIEWS_PER_TICK);
+            reviewed.extend(due);
+        }
+
+        assert_eq!(reviewed.len(), POPULATION);
     }
 
     #[test]

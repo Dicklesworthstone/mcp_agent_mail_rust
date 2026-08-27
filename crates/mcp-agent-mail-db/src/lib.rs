@@ -17,7 +17,6 @@
 #![recursion_limit = "512"]
 #![forbid(unsafe_code)]
 #![allow(
-
     clippy::result_large_err,
     clippy::match_same_arms,
     clippy::sliced_string_as_bytes,
