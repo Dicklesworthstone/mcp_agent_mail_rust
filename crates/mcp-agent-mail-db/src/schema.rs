@@ -4860,6 +4860,73 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_migrations_preserve_legacy_tombstones_and_add_active_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("lifecycle_migration.db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open connection");
+        conn.execute_raw(
+            "CREATE TABLE agents (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                project_id INTEGER NOT NULL,\
+                name TEXT NOT NULL,\
+                task_description TEXT NOT NULL,\
+                last_active_ts INTEGER NOT NULL\
+            )",
+        )
+        .expect("create legacy agents table");
+        conn.execute_raw(
+            "INSERT INTO agents \
+             (project_id, name, task_description, last_active_ts) VALUES \
+             (7, 'BlueLake', '[DEREGISTERED 2026-08-24T03:22:36Z] completed', 424242),\
+             (7, 'GreenCastle', 'active', 434343)",
+        )
+        .expect("insert legacy lifecycle witnesses");
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init migrations table");
+                for migration in schema_migrations_base()
+                    .into_iter()
+                    .filter(|migration| migration.id.starts_with("v28_"))
+                {
+                    run_single_migration_with_lock_retry(&cx, conn, &migration)
+                        .await
+                        .into_result()
+                        .expect("apply lifecycle migration");
+                }
+            }
+        });
+
+        let columns = conn
+            .query_sync("PRAGMA table_info(agents)", &[])
+            .expect("inspect agent columns");
+        assert!(columns.iter().any(|row| {
+            row.get_named::<String>("name").ok().as_deref() == Some("retired_at")
+        }));
+        let ledger = conn
+            .query_sync(
+                "SELECT d.deregistered_at \
+                 FROM agent_deregistrations d JOIN agents a ON a.id = d.agent_id \
+                 WHERE a.name = 'BlueLake'",
+                &[],
+            )
+            .expect("read lifecycle ledger");
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].get_named::<i64>("deregistered_at").unwrap(), 424242);
+        let indexes = conn
+            .query_sync("PRAGMA index_list(agents)", &[])
+            .expect("inspect agent indexes");
+        assert!(indexes.iter().any(|row| {
+            row.get_named::<String>("name").ok().as_deref()
+                == Some("idx_agents_project_active")
+        }));
+    }
+
+    #[test]
     fn analyze_migration_records_when_target_table_is_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("analyze_missing_atc_table.db");
