@@ -68,7 +68,7 @@ pub fn dispatch(
 /// HTTP blocking dispatch must use this entrypoint so a request timeout
 /// cancels in-flight database work instead of merely returning while a worker
 /// continues and possibly commits the abandoned request.
-pub(crate) fn dispatch_with_cx(
+pub fn dispatch_with_cx(
     path: &str,
     query: &str,
     method: &str,
@@ -5687,13 +5687,7 @@ mod fresh_eyes_regression_tests {
         }
     }
 
-    fn seed_project_sibling(
-        cx: &Cx,
-        pool: &DbPool,
-        project_a_id: i64,
-        project_b_id: i64,
-        score: f64,
-    ) {
+    fn seed_project_sibling(cx: &Cx, pool: &DbPool, lower_id: i64, upper_id: i64, score: f64) {
         let conn = match block_on(pool.acquire(cx)) {
             Outcome::Ok(conn) => conn,
             Outcome::Err(error) => panic!("pool error: {error}"),
@@ -5705,7 +5699,7 @@ mod fresh_eyes_regression_tests {
         conn.execute_raw(&format!(
             "INSERT INTO project_sibling_suggestions \
              (project_a_id, project_b_id, score, status, rationale, created_ts, evaluated_ts) \
-             VALUES ({project_a_id}, {project_b_id}, {score}, 'suggested', \
+             VALUES ({lower_id}, {upper_id}, {score}, 'suggested', \
                      'shared workspace roots', 10, 10)"
         ))
         .expect("seed project sibling suggestion");
@@ -6183,20 +6177,12 @@ mod fresh_eyes_regression_tests {
             &pool,
             &format!("/workspace/mail-ui-sibling-b-{nonce}"),
         )));
-        let project_a_id = project_a.id.expect("project a id");
-        let project_b_id = project_b.id.expect("project b id");
+        let root_id = project_a.id.expect("project a id");
+        let peer_id = project_b.id.expect("project b id");
         outcome_ok(block_on(queries::register_agent(
-            &cx,
-            &pool,
-            project_a_id,
-            "BlueLake",
-            "e2e",
-            "test",
-            None,
-            None,
-            None,
+            &cx, &pool, root_id, "BlueLake", "e2e", "test", None, None, None,
         )));
-        seed_project_sibling(&cx, &pool, project_a_id, project_b_id, 0.97);
+        seed_project_sibling(&cx, &pool, root_id, peer_id, 0.97);
 
         let suggested_html = render_index(&cx, &pool)
             .expect("suggested index should render")
@@ -6211,26 +6197,21 @@ mod fresh_eyes_regression_tests {
             "project cards must render the agent count already computed by the server"
         );
         assert!(suggested_html.contains(&format!(
-            "data-project=\"{project_a_id}\"\n                   data-other=\"{project_b_id}\""
+            "data-project=\"{root_id}\"\n                   data-other=\"{peer_id}\""
         )));
         assert!(suggested_html.contains(&format!(
-            "data-project=\"{project_b_id}\"\n                   data-other=\"{project_a_id}\""
+            "data-project=\"{peer_id}\"\n                   data-other=\"{root_id}\""
         )));
 
-        let payload = handle_sibling_update(
-            &cx,
-            &pool,
-            project_b_id,
-            project_a_id,
-            r#"{"action":"confirm"}"#,
-        )
-        .expect("confirm route should succeed")
-        .expect("confirm route json");
+        let payload =
+            handle_sibling_update(&cx, &pool, peer_id, root_id, r#"{"action":"confirm"}"#)
+                .expect("confirm route should succeed")
+                .expect("confirm route json");
         let response: serde_json::Value =
             serde_json::from_str(&payload).expect("confirm response should parse");
         assert_eq!(response["status"], "confirmed");
-        assert_eq!(response["suggestion"]["project_a"]["id"], project_a_id);
-        assert_eq!(response["suggestion"]["project_b"]["id"], project_b_id);
+        assert_eq!(response["suggestion"]["project_a"]["id"], root_id);
+        assert_eq!(response["suggestion"]["project_b"]["id"], peer_id);
         assert!(response["suggestion"]["confirmed_ts"].is_number());
         assert!(response["suggestion"]["dismissed_ts"].is_null());
 
@@ -6238,10 +6219,10 @@ mod fresh_eyes_regression_tests {
             .expect("confirmed index should render")
             .expect("confirmed index html");
         assert!(confirmed_html.contains(&format!(
-            "data-sibling-action=\"reset\"\n                      data-project=\"{project_a_id}\"\n                      data-other=\"{project_b_id}\""
+            "data-sibling-action=\"reset\"\n                      data-project=\"{root_id}\"\n                      data-other=\"{peer_id}\""
         )));
         assert!(confirmed_html.contains(&format!(
-            "data-sibling-action=\"reset\"\n                      data-project=\"{project_b_id}\"\n                      data-other=\"{project_a_id}\""
+            "data-sibling-action=\"reset\"\n                      data-project=\"{peer_id}\"\n                      data-other=\"{root_id}\""
         )));
     }
 
@@ -6313,9 +6294,9 @@ mod fresh_eyes_regression_tests {
             &pool,
             "/workspace/mail-ui-sibling-cancel-b",
         )));
-        let project_a_id = project_a.id.expect("cancel project a id");
-        let project_b_id = project_b.id.expect("cancel project b id");
-        seed_project_sibling(&cx, &pool, project_a_id, project_b_id, 0.96);
+        let root_id = project_a.id.expect("cancel project a id");
+        let peer_id = project_b.id.expect("cancel project b id");
+        seed_project_sibling(&cx, &pool, root_id, peer_id, 0.96);
 
         let cancelled_cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         cancelled_cx.cancel_with(
@@ -6325,8 +6306,8 @@ mod fresh_eyes_regression_tests {
         let (status, payload) = handle_sibling_update(
             &cancelled_cx,
             &pool,
-            project_a_id,
-            project_b_id,
+            root_id,
+            peer_id,
             r#"{"action":"confirm"}"#,
         )
         .expect_err("cancelled transition must fail closed");
@@ -6340,7 +6321,7 @@ mod fresh_eyes_regression_tests {
         )));
         let cancelled_row = rows
             .iter()
-            .find(|row| row.project_a.id == project_a_id && row.project_b.id == project_b_id)
+            .find(|row| row.project_a.id == root_id && row.project_b.id == peer_id)
             .expect("cancelled suggestion remains readable");
         assert_eq!(
             cancelled_row.status,
