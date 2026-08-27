@@ -56,10 +56,25 @@ pub fn dispatch(
     method: &str,
     body: &str,
 ) -> Result<Option<String>, (u16, String)> {
-    // Use a real 30-second budget for production mail UI requests.
-    // Cx::for_testing() was previously used here, which provides no
-    // timeout enforcement and could let slow queries block indefinitely.
+    // Standalone callers (including static export) retain a real 30-second
+    // budget. The live HTTP server calls `dispatch_with_cx` with its own
+    // timeout-linked context so cancellation crosses the blocking boundary.
     let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+    dispatch_with_cx(path, query, method, body, &cx)
+}
+
+/// Dispatch a mail UI request with the server-owned cancellation context.
+///
+/// HTTP blocking dispatch must use this entrypoint so a request timeout
+/// cancels in-flight database work instead of merely returning while a worker
+/// continues and possibly commits the abandoned request.
+pub(crate) fn dispatch_with_cx(
+    path: &str,
+    query: &str,
+    method: &str,
+    body: &str,
+    cx: &Cx,
+) -> Result<Option<String>, (u16, String)> {
     // GH#184: when this dispatch runs inside a live server process, the
     // server's pool for this database is already open — reuse it for BOTH
     // reads and writes instead of bootstrapping a fresh observability pool
@@ -102,7 +117,7 @@ pub fn dispatch(
             let limit = extract_query_int(query, "limit", 1000).clamp(1, 1000);
             let filter_importance = extract_query_str(query, "filter_importance");
             render_unified_inbox(
-                &cx,
+                cx,
                 read_pool,
                 limit,
                 filter_importance.as_deref(),
@@ -110,14 +125,14 @@ pub fn dispatch(
             )
         }
         // Explicit projects list route (legacy Python: GET /mail/projects).
-        "/projects" => render_projects_list(&cx, read_pool),
+        "/projects" => render_projects_list(cx, read_pool),
         _ if sub.starts_with("/api/") => {
-            handle_api_route(sub, query, method, body, &cx, read_pool, &live_pool)
+            handle_api_route(sub, query, method, body, cx, read_pool, &live_pool)
         }
         _ if sub.starts_with("/archive/") => {
-            render_archive_route(sub, query, method, &cx, read_pool)
+            render_archive_route(sub, query, method, cx, read_pool)
         }
-        _ => dispatch_project_route(sub, method, body, &cx, read_pool, &live_pool, query),
+        _ => dispatch_project_route(sub, method, body, cx, read_pool, &live_pool, query),
     }
 }
 
@@ -2669,6 +2684,7 @@ fn body_excerpt(body: &str, max_len: usize) -> String {
 #[derive(Serialize)]
 struct IndexCtx {
     projects: Vec<IndexProject>,
+    total_agents: usize,
 }
 
 #[derive(Serialize)]
@@ -2704,6 +2720,8 @@ struct IndexSiblingBuckets {
 
 fn render_index(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)> {
     let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
+    let mut agent_counts = block_on_outcome(cx, queries::count_agents_by_project(cx, pool))?;
+    let total_agents = agent_counts.values().sum();
     let sibling_suggestions =
         block_on_outcome(cx, queries::list_project_sibling_suggestions(cx, pool))?;
     let mut sibling_buckets: BTreeMap<i64, IndexSiblingBuckets> = BTreeMap::new();
@@ -2759,19 +2777,24 @@ fn render_index(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)>
     let mut items: Vec<IndexProject> = Vec::with_capacity(projects.len());
     for p in &projects {
         let project_id = p.id.unwrap_or(0);
-        let agents = block_on_outcome(cx, queries::list_agents(cx, pool, project_id))?;
         let siblings = sibling_buckets.remove(&project_id).unwrap_or_default();
         items.push(IndexProject {
             id: project_id,
             slug: p.slug.clone(),
             human_key: p.human_key.clone(),
             created_at: ts_display(p.created_at),
-            agent_count: agents.len(),
+            agent_count: agent_counts.remove(&project_id).unwrap_or_default(),
             confirmed_siblings: siblings.confirmed,
             suggested_siblings: siblings.suggested,
         });
     }
-    render("mail_index.html", IndexCtx { projects: items })
+    render(
+        "mail_index.html",
+        IndexCtx {
+            projects: items,
+            total_agents,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4564,15 +4587,17 @@ fn handle_api_route(
         // Check for siblings route: {project_id}/siblings/{other_id}
         if let Some((project_id_str, siblings_rest)) = rest.split_once("/siblings/") {
             if method == "POST" {
-                let project_id: i64 = project_id_str
-                    .parse()
-                    .map_err(|_| (400, "Invalid project ID".to_string()))?;
-                let other_id: i64 = siblings_rest
-                    .parse()
-                    .map_err(|_| (400, "Invalid sibling project ID".to_string()))?;
+                let project_id: i64 = match project_id_str.parse() {
+                    Ok(project_id) => project_id,
+                    Err(_) => return json_err(400, "Invalid project ID"),
+                };
+                let other_id: i64 = match siblings_rest.parse() {
+                    Ok(other_id) => other_id,
+                    Err(_) => return json_err(400, "Invalid sibling project ID"),
+                };
                 return handle_sibling_update(cx, live_pool, project_id, other_id, body);
             }
-            return Err((405, "Method Not Allowed".to_string()));
+            return json_err(405, "Method Not Allowed");
         }
         // /api/projects/{project}/agents → JSON
         if let Some(project_slug) = rest.strip_suffix("/agents") {
@@ -6161,6 +6186,17 @@ mod fresh_eyes_regression_tests {
         )));
         let project_a_id = project_a.id.expect("project a id");
         let project_b_id = project_b.id.expect("project b id");
+        outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project_a_id,
+            "BlueLake",
+            "e2e",
+            "test",
+            None,
+            None,
+            None,
+        )));
         seed_project_sibling(&cx, &pool, project_a_id, project_b_id, 0.97);
 
         let suggested_html = render_index(&cx, &pool)
@@ -6170,6 +6206,10 @@ mod fresh_eyes_regression_tests {
             suggested_html.matches("data-suggestion-id=\"").count(),
             2,
             "the same canonical suggestion must render on both project cards"
+        );
+        assert!(
+            suggested_html.contains(">1 agent</span>"),
+            "project cards must render the agent count already computed by the server"
         );
         assert!(suggested_html.contains(&format!(
             "data-project=\"{project_a_id}\"\n                   data-other=\"{project_b_id}\""
@@ -6211,6 +6251,43 @@ mod fresh_eyes_regression_tests {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("mail-ui-sibling-errors");
 
+        let (status, payload) = handle_api_route(
+            "/api/projects/not-a-number/siblings/2",
+            "",
+            "POST",
+            r#"{"action":"confirm"}"#,
+            &cx,
+            &pool,
+            &pool,
+        )
+        .expect_err("invalid route project id must fail");
+        assert_eq!(status, 400);
+        let error: serde_json::Value =
+            serde_json::from_str(&payload).expect("invalid-id response must be JSON");
+        assert_eq!(error["error"], "Invalid project ID");
+
+        let (status, payload) = handle_api_route(
+            "/api/projects/1/siblings/2",
+            "",
+            "GET",
+            "",
+            &cx,
+            &pool,
+            &pool,
+        )
+        .expect_err("sibling mutation route must reject GET");
+        assert_eq!(status, 405);
+        let error: serde_json::Value =
+            serde_json::from_str(&payload).expect("method response must be JSON");
+        assert_eq!(error["error"], "Method Not Allowed");
+
+        let (status, payload) = handle_sibling_update(&cx, &pool, 1, 2, "{")
+            .expect_err("malformed json must fail");
+        assert_eq!(status, 400);
+        let error: serde_json::Value =
+            serde_json::from_str(&payload).expect("malformed-json response must be JSON");
+        assert_eq!(error["error"], "Invalid JSON");
+
         let (status, payload) = handle_sibling_update(
             &cx,
             &pool,
@@ -6233,6 +6310,52 @@ mod fresh_eyes_regression_tests {
                 .expect_err("missing pair must fail");
         assert_eq!(status, 404);
         assert!(payload.contains("not found"));
+
+        let project_a = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/workspace/mail-ui-sibling-cancel-a",
+        )));
+        let project_b = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/workspace/mail-ui-sibling-cancel-b",
+        )));
+        let project_a_id = project_a.id.expect("cancel project a id");
+        let project_b_id = project_b.id.expect("cancel project b id");
+        seed_project_sibling(&cx, &pool, project_a_id, project_b_id, 0.96);
+
+        let cancelled_cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        cancelled_cx.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("sibling cancellation regression"),
+        );
+        let (status, payload) = handle_sibling_update(
+            &cancelled_cx,
+            &pool,
+            project_a_id,
+            project_b_id,
+            r#"{"action":"confirm"}"#,
+        )
+        .expect_err("cancelled transition must fail closed");
+        assert_eq!(status, 503);
+        let error: serde_json::Value =
+            serde_json::from_str(&payload).expect("cancelled response must be JSON");
+        assert_eq!(error["error"], "Sibling suggestion update was cancelled");
+
+        let rows = outcome_ok(block_on(queries::list_project_sibling_suggestions(
+            &cx, &pool,
+        )));
+        let cancelled_row = rows
+            .iter()
+            .find(|row| row.project_a.id == project_a_id && row.project_b.id == project_b_id)
+            .expect("cancelled suggestion remains readable");
+        assert_eq!(
+            cancelled_row.status,
+            queries::ProjectSiblingStatus::Suggested
+        );
+        assert_eq!(cancelled_row.confirmed_ts, None);
+        assert_eq!(cancelled_row.dismissed_ts, None);
     }
 }
 

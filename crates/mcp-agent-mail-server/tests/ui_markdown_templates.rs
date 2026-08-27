@@ -58,6 +58,7 @@ fn templates_render_error_page() {
 #[derive(Serialize)]
 struct IndexCtx {
     projects: Vec<IndexProject>,
+    total_agents: usize,
 }
 
 #[derive(Serialize)]
@@ -77,6 +78,7 @@ fn templates_render_mail_index() {
             created_at: "2026-02-06T00:00:00Z".to_string(),
             agent_count: 3,
         }],
+        total_agents: 3,
     };
     let out = templates::render_template("mail_index.html", ctx).expect("render mail_index.html");
     assert!(
@@ -84,6 +86,10 @@ fn templates_render_mail_index() {
         "should produce HTML"
     );
     assert!(out.contains("test-project"), "should contain project slug");
+    assert!(
+        out.contains("Registered Agents") && out.contains(">3</p>"),
+        "index should render the real aggregate agent count"
+    );
     assert!(
         out.contains("document.modelContext.registerTool"),
         "the browser UI should retain its progressive WebMCP registration"
@@ -772,7 +778,10 @@ fn templates_missing_template_returns_error() {
 
 #[test]
 fn templates_render_index_empty_projects() {
-    let ctx = IndexCtx { projects: vec![] };
+    let ctx = IndexCtx {
+        projects: vec![],
+        total_agents: 0,
+    };
     let out = templates::render_template("mail_index.html", ctx).expect("render empty index");
     assert!(
         out.contains("<!DOCTYPE html") || out.contains("<html"),
@@ -790,7 +799,10 @@ fn templates_render_index_many_projects() {
             agent_count: i,
         })
         .collect();
-    let ctx = IndexCtx { projects };
+    let ctx = IndexCtx {
+        projects,
+        total_agents: 1_225,
+    };
     let out = templates::render_template("mail_index.html", ctx).expect("render many projects");
     assert!(out.contains("project-0"), "first project present");
     assert!(out.contains("project-49"), "last project present");
