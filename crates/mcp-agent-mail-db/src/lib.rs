@@ -15,9 +15,7 @@
 // Raised for the trait solver: proving Send/CoerceUnsized for the boxed async blocks in
 // queries.rs overflows the default limit on newer rustc. Not a defect in the code.
 #![recursion_limit = "512"]
-
 #![forbid(unsafe_code)]
-#![recursion_limit = "256"]
 #![allow(
 
     clippy::result_large_err,

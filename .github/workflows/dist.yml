@@ -18,6 +18,8 @@ env:
   FRANKENSEARCH_COMMIT: 3bbfd8c664062f8304e7a790c51794671f9214dc
   FAST_CMAES_COMMIT: 3bf11b7601b54a08ffabb55821289ecb235a504d
   BEADS_RUST_COMMIT: a3f89e6624661259ffa73f876d105656c5b5246e
+  CARGO_ZIGBUILD_VERSION: '0.23.3'
+  LINUX_GLIBC_FLOOR: '2.28'
 
 jobs:
   release_contract:
@@ -319,6 +321,24 @@ jobs:
           rustc --version --verbose
           cargo --version --verbose
 
+      - name: Install pinned Zig
+        if: contains(matrix.target, 'unknown-linux-gnu')
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.1
+
+      - name: Install pinned cargo-zigbuild
+        if: contains(matrix.target, 'unknown-linux-gnu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install --locked --version "$CARGO_ZIGBUILD_VERSION" cargo-zigbuild
+          actual_version="$(cargo zigbuild --version)"
+          if [ "$actual_version" != "cargo-zigbuild ${CARGO_ZIGBUILD_VERSION}" ]; then
+            echo "cargo-zigbuild version mismatch: ${actual_version}" >&2
+            exit 1
+          fi
+
       - name: Install musl toolchain
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -333,12 +353,19 @@ jobs:
           # x86_64 Linux regardless of host libc. Leaves other targets alone.
           RUSTFLAGS: ${{ contains(matrix.target, 'musl') && '-C target-feature=+crt-static' || '' }}
         run: |
-          cargo build --locked --release --target ${{ matrix.target }} -p mcp-agent-mail -p mcp-agent-mail-cli --no-default-features --features portable
+          set -euo pipefail
+          target='${{ matrix.target }}'
+          if [[ "$target" == *-unknown-linux-gnu ]]; then
+            cargo zigbuild --locked --release --target "${target}.${LINUX_GLIBC_FLOOR}" -p mcp-agent-mail -p mcp-agent-mail-cli --no-default-features --features portable
+          else
+            cargo build --locked --release --target "$target" -p mcp-agent-mail -p mcp-agent-mail-cli --no-default-features --features portable
+          fi
 
       - name: Create tarball (Unix)
         if: runner.os != 'Windows'
         env:
           EXPECTED_VERSION: ${{ needs.release_contract.outputs.version }}
+          RELEASE_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           mkdir -p dist staging
@@ -354,6 +381,33 @@ jobs:
               *) echo "ERROR: $f has unexpected type '$mime' — refusing to package" >&2; exit 1 ;;
             esac
           done
+          if [[ "$RELEASE_TARGET" == *-unknown-linux-gnu ]]; then
+            assert_glibc_floor() {
+              local binary="$1"
+              local max_version
+              mapfile -t glibc_versions < <(
+                LANG=C readelf -W --version-info --dyn-syms "$binary" \
+                  | sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p' \
+                  | sort -Vu
+              )
+              if [ "${#glibc_versions[@]}" -eq 0 ]; then
+                echo "ERROR: $binary exposes no readable GLIBC symbol-version requirement" >&2
+                exit 1
+              fi
+              max_version="${glibc_versions[${#glibc_versions[@]} - 1]}"
+              if [[ ! "$max_version" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+                echo "ERROR: $binary produced malformed GLIBC version ${max_version}" >&2
+                exit 1
+              fi
+              if [ "$(printf '%s\n' "$max_version" "$LINUX_GLIBC_FLOOR" | sort -V | tail -n 1)" != "$LINUX_GLIBC_FLOOR" ]; then
+                echo "ERROR: $binary requires GLIBC_${max_version}, newer than GLIBC_${LINUX_GLIBC_FLOOR}" >&2
+                exit 1
+              fi
+              printf 'Verified %s maximum GLIBC requirement is %s\n' "$binary" "$max_version"
+            }
+            assert_glibc_floor staging/mcp-agent-mail
+            assert_glibc_floor staging/am
+          fi
           # Surface verification: fail fast if binaries are swapped/mispackaged.
           staging/am --help > staging/am.help.txt
           staging/mcp-agent-mail --help > staging/mcp-agent-mail.help.txt
@@ -426,9 +480,95 @@ jobs:
           name: ${{ matrix.target }}
           path: dist/*
 
+  linux_portability:
+    name: Run x86_64 Linux release archives on Ubuntu 22.04
+    needs: [release_contract, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Download x86_64 Linux artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: x86_64-unknown-linux-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify checksums, glibc floor, versions, and command surfaces
+        env:
+          EXPECTED_VERSION: ${{ needs.release_contract.outputs.version }}
+        run: |
+          set -euo pipefail
+          expected_entries=(
+            mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz
+            mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz.sha256
+            mcp-agent-mail-x86_64-unknown-linux-musl.tar.xz
+            mcp-agent-mail-x86_64-unknown-linux-musl.tar.xz.sha256
+          )
+          mapfile -t expected_entries < <(printf '%s\n' "${expected_entries[@]}" | sort)
+          mapfile -t actual_entries < <(find dist -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+          if [ "${actual_entries[*]}" != "${expected_entries[*]}" ]; then
+            echo "Downloaded x86_64 Linux artifacts contain missing or unexpected entries" >&2
+            printf 'Expected: %s\n' "${expected_entries[@]}" >&2
+            printf 'Actual: %s\n' "${actual_entries[@]}" >&2
+            exit 1
+          fi
+          (
+            cd dist
+            sha256sum --check mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz.sha256
+            sha256sum --check mcp-agent-mail-x86_64-unknown-linux-musl.tar.xz.sha256
+          )
+
+          mkdir -p staging/gnu staging/musl
+          tar -xJf dist/mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz -C staging/gnu
+          tar -xJf dist/mcp-agent-mail-x86_64-unknown-linux-musl.tar.xz -C staging/musl
+
+          assert_glibc_floor() {
+            local binary="$1"
+            local max_version
+            mapfile -t glibc_versions < <(
+              LANG=C readelf -W --version-info --dyn-syms "$binary" \
+                | sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p' \
+                | sort -Vu
+            )
+            if [ "${#glibc_versions[@]}" -eq 0 ]; then
+              echo "ERROR: $binary exposes no readable GLIBC symbol-version requirement" >&2
+              exit 1
+            fi
+            max_version="${glibc_versions[${#glibc_versions[@]} - 1]}"
+            if [[ ! "$max_version" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+              echo "ERROR: $binary produced malformed GLIBC version ${max_version}" >&2
+              exit 1
+            fi
+            if [ "$(printf '%s\n' "$max_version" "$LINUX_GLIBC_FLOOR" | sort -V | tail -n 1)" != "$LINUX_GLIBC_FLOOR" ]; then
+              echo "ERROR: $binary requires GLIBC_${max_version}, newer than GLIBC_${LINUX_GLIBC_FLOOR}" >&2
+              exit 1
+            fi
+          }
+          assert_glibc_floor staging/gnu/mcp-agent-mail
+          assert_glibc_floor staging/gnu/am
+
+          for flavor in gnu musl; do
+            cli_version="$("staging/${flavor}/am" --version)"
+            server_version="$("staging/${flavor}/mcp-agent-mail" --version)"
+            if [ "$cli_version" != "am ${EXPECTED_VERSION}" ]; then
+              echo "${flavor} am reports ${cli_version}, expected am ${EXPECTED_VERSION}" >&2
+              exit 1
+            fi
+            if [ "$server_version" != "mcp-agent-mail ${EXPECTED_VERSION}" ]; then
+              echo "${flavor} mcp-agent-mail reports ${server_version}, expected mcp-agent-mail ${EXPECTED_VERSION}" >&2
+              exit 1
+            fi
+            "staging/${flavor}/am" --help > "staging/${flavor}/am.help.txt"
+            "staging/${flavor}/mcp-agent-mail" --help > "staging/${flavor}/mcp-agent-mail.help.txt"
+            grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)' "staging/${flavor}/am.help.txt"
+            grep -qE '(^|[[:space:]])serve([[:space:]]|$)' "staging/${flavor}/mcp-agent-mail.help.txt"
+          done
+          getconf GNU_LIBC_VERSION
+
   sign:
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-    needs: [release_contract, lint, test, build]
+    needs: [release_contract, lint, test, build, linux_portability]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:

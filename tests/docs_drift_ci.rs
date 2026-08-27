@@ -256,6 +256,7 @@ mod dist_release_contract {
     const UPLOAD_ACTION: &str = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02";
     const DOWNLOAD_ACTION: &str =
         "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093";
+    const SETUP_ZIG_ACTION: &str = "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29";
     const BEADS_RUST_COMMIT: &str = "a3f89e6624661259ffa73f876d105656c5b5246e";
     const RELEASE_TARGETS: [&str; 6] = [
         "x86_64-unknown-linux-gnu",
@@ -354,8 +355,8 @@ mod dist_release_contract {
                 ));
             }
         }
-        if action_count != 12 {
-            return Err(format!("expected 12 pinned actions, found {action_count}"));
+        if action_count != 14 {
+            return Err(format!("expected 14 pinned actions, found {action_count}"));
         }
         Ok(())
     }
@@ -403,7 +404,8 @@ mod dist_release_contract {
             (CHECKOUT_ACTION, 5),
             (TOOLCHAIN_ACTION, 3),
             (UPLOAD_ACTION, 2),
-            (DOWNLOAD_ACTION, 2),
+            (DOWNLOAD_ACTION, 3),
+            (SETUP_ZIG_ACTION, 1),
         ] {
             require_exactly(workflow, action, expected)?;
         }
@@ -444,7 +446,14 @@ mod dist_release_contract {
         );
         require_exactly(workflow, exact_archive_array, 2)?;
         for archive in RELEASE_ARCHIVES {
-            require_exactly(workflow, archive, 2)?;
+            let expected = if archive.starts_with("mcp-agent-mail-x86_64-unknown-linux-") {
+                // The two release manifests plus the portability job's exact census,
+                // checksum verification, and extraction command.
+                6
+            } else {
+                2
+            };
+            require_exactly(workflow, archive, expected)?;
         }
 
         let required_once = [
@@ -463,7 +472,20 @@ mod dist_release_contract {
             "cargo check --locked --workspace --all-targets",
             "cargo clippy --locked --workspace --all-targets -- -D warnings",
             "cargo test --locked --workspace",
-            "cargo build --locked --release --target ${{ matrix.target }}",
+            "CARGO_ZIGBUILD_VERSION: '0.23.3'",
+            "LINUX_GLIBC_FLOOR: '2.28'",
+            "version: 0.14.1",
+            "cargo install --locked --version \"$CARGO_ZIGBUILD_VERSION\" cargo-zigbuild",
+            "actual_version=\"$(cargo zigbuild --version)\"",
+            "cargo zigbuild --locked --release --target \"${target}.${LINUX_GLIBC_FLOOR}\"",
+            "cargo build --locked --release --target \"$target\"",
+            "  linux_portability:",
+            "name: Run x86_64 Linux release archives on Ubuntu 22.04",
+            "runs-on: ubuntu-22.04",
+            "pattern: x86_64-unknown-linux-*",
+            "sha256sum --check mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz.sha256",
+            "sha256sum --check mcp-agent-mail-x86_64-unknown-linux-musl.tar.xz.sha256",
+            "getconf GNU_LIBC_VERSION",
             "cli_version=\"$(staging/am --version)\"",
             "server_version=\"$(staging/mcp-agent-mail --version)\"",
             "$cliVersion -ne \"am $env:EXPECTED_VERSION\"",
@@ -545,6 +567,7 @@ mod dist_release_contract {
             "GitHub returned an invalid upload receipt for ${asset_name}",
             "validate_remote_subset \"$staged_assets\" true",
             "uploaded_asset_id=\"$(jq -r '.id' <<< \"$upload_response\")\"",
+            "[ \"$uploaded_hash\" != \"$local_hash\" ]",
             "Uploaded isolated-draft asset bytes differ from local ${asset_name}",
             "[ \"$(jq -r 'length' <<< \"$staged_assets\")\" -ne 30 ]",
             "printf 'release_id=%s\\n' \"$EXPECTED_RELEASE_ID\" >> \"$GITHUB_OUTPUT\"",
@@ -597,7 +620,14 @@ mod dist_release_contract {
             "if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}",
             2,
         )?;
-        require_exactly(workflow, "set -euo pipefail", 16)?;
+        require_exactly(workflow, "set -euo pipefail", 19)?;
+        require_exactly(workflow, "assert_glibc_floor() {", 2)?;
+        require_exactly(
+            workflow,
+            "LANG=C readelf -W --version-info --dyn-syms \"$binary\"",
+            2,
+        )?;
+        require_exactly(workflow, "newer than GLIBC_${LINUX_GLIBC_FLOOR}", 2)?;
         require_exactly(workflow, "contents: read", 2)?;
         require_exactly(workflow, "contents: write", 1)?;
         require_exactly(workflow, "id-token: write", 1)?;
@@ -606,7 +636,7 @@ mod dist_release_contract {
             concat!(
                 "  sign:\n",
                 "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}\n",
-                "    needs: [release_contract, lint, test, build]\n",
+                "    needs: [release_contract, lint, test, build, linux_portability]\n",
                 "    runs-on: ubuntu-latest\n",
                 "    timeout-minutes: 45\n",
                 "    permissions:\n",
@@ -785,6 +815,11 @@ mod dist_release_contract {
         require_in_order(
             workflow,
             &[
+                "  linux_portability:",
+                "sha256sum --check mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz.sha256",
+                "assert_glibc_floor staging/gnu/mcp-agent-mail",
+                "getconf GNU_LIBC_VERSION",
+                "  sign:",
                 "- name: Install verified Cosign",
                 "actual_sha256=\"$(sha256sum \"$cosign_path\" | awk '{print $1}')\"",
                 "[ \"$actual_sha256\" != \"$COSIGN_LINUX_AMD64_SHA256\" ]",
@@ -826,9 +861,11 @@ mod dist_release_contract {
                 "cargo clippy ",
                 "cargo test ",
                 "cargo build ",
+                "cargo zigbuild ",
             ]
             .iter()
             .any(|command| line.contains(command))
+                && !line.contains("cargo zigbuild --version")
                 && !line.contains("--locked")
             {
                 return Err(format!("release Cargo command is not locked: {line}"));
@@ -908,8 +945,24 @@ mod dist_release_contract {
             mutate(&workflow, "set -euo pipefail", "set -eu"),
             mutate(
                 &workflow,
-                "needs: [release_contract, lint, test, build]",
+                "needs: [release_contract, lint, test, build, linux_portability]",
                 "needs: [release_contract, build]",
+            ),
+            mutate(
+                &workflow,
+                "LINUX_GLIBC_FLOOR: '2.28'",
+                "LINUX_GLIBC_FLOOR: '2.39'",
+            ),
+            mutate(&workflow, SETUP_ZIG_ACTION, "mlugg/setup-zig@v2"),
+            mutate(
+                &workflow,
+                "cargo zigbuild --locked --release --target \"${target}.${LINUX_GLIBC_FLOOR}\"",
+                "cargo build --locked --release --target \"$target\"",
+            ),
+            mutate(
+                &workflow,
+                "LANG=C readelf -W --version-info --dyn-syms \"$binary\"",
+                "printf '2.28\\n'",
             ),
             mutate(
                 &workflow,
@@ -1317,10 +1370,10 @@ mod dist_release_contract {
                 "published_by_tag=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}\")\"",
             ),
         ];
-        for mutation in mutations {
+        for (index, mutation) in mutations.into_iter().enumerate() {
             assert!(
                 validate(&mutation).is_err(),
-                "dist workflow contract mutation unexpectedly passed"
+                "dist workflow contract mutation {index} unexpectedly passed"
             );
         }
     }
