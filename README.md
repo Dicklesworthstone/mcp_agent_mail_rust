@@ -12,7 +12,7 @@
 
 > "It's like Gmail for your coding agents!"
 
-A mail-like coordination layer for AI coding agents, exposed as an MCP server with 43 tools and 25 resources, Git-backed archive, SQLite indexing, an interactive 16-screen TUI, a server-rendered web UI, and an agent-first robot CLI. The Rust rewrite of the [original Python project](https://github.com/Dicklesworthstone/mcp_agent_mail) (1,700+ stars).
+A mail-like coordination layer for AI coding agents, exposed as an MCP server with 44 tools and 25 resources, Git-backed archive, SQLite indexing, an interactive 16-screen TUI, a server-rendered web UI, and an agent-first robot CLI. The Rust rewrite of the [original Python project](https://github.com/Dicklesworthstone/mcp_agent_mail) (1,700+ stars).
 
 **Supported agents:** [Claude Code](https://claude.ai/code), [Codex CLI](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Oh My Pi (OMP)](https://omp.sh), [GitHub Copilot CLI](https://docs.github.com/en/copilot), and any MCP-compatible client.
 
@@ -42,7 +42,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 - [Agent Configuration](#agent-configuration)
 - [Server Modes](#server-modes)
 - [Operator CLI Surface](#operator-cli-surface)
-- [The 43 MCP Tools](#the-43-mcp-tools)
+- [The 44 MCP Tools](#the-44-mcp-tools)
 - [TUI Operations Console](#tui-operations-console)
 - [Robot Mode (`am robot`)](#robot-mode-am-robot)
 - [File Reservations](#file-reservations-for-multi-agent-editing)
@@ -86,7 +86,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 | **Asynchronous Messaging** | Threaded inbox/outbox with subjects, CC/BCC, acknowledgments, and importance levels |
 | **Token-Efficient** | Messages stored in a per-project archive, not in agent context windows |
 | **25 MCP Resources** | Read-only inbox, thread, reservation, tooling, identity, and attention views for cheap lookups |
-| **43 MCP Tools** | Infrastructure, identity, messaging, contacts, reservations, search, macros, product bus, and build slots |
+| **44 MCP Tools** | Infrastructure, identity, messaging, contacts, reservations, search, macros, product bus, and build slots |
 | **16-Screen TUI** | Live operator cockpit for messages, threads, agents, search, reservations, metrics, health, analytics, attachments, archive browsing, and ATC |
 | **Web UI** | Server-rendered `/mail/` routes for human oversight, unified inbox review, search, attachments, and overseer messaging |
 | **Robot Mode** | 18 agent-optimized CLI subcommands with `toon`/`json`/`md` output for non-interactive workflows |
@@ -177,7 +177,7 @@ Agent Mail has been available since October 2025 and was designed around real mu
 
 **No "broadcast to all" mode.** Given the option, many agents will overuse broadcast-style messaging. That is the equivalent of default reply-all in email: lots of irrelevant noise and wasted context.
 
-**Carefully refined API ergonomics.** Bad MCP documentation and poor agent ergonomics quietly wreck reliability. Agent Mail's 43 tool definitions have gone through repeated real-world iteration so they work predictably without wasting tokens.
+**Carefully refined API ergonomics.** Bad MCP documentation and poor agent ergonomics quietly wreck reliability. Agent Mail's 44 tool definitions have gone through repeated real-world iteration so they work predictably without wasting tokens.
 
 **No git worktrees.** Worktrees can slow development velocity and create reconciliation debt when agents diverge. Agent Mail takes the opposite approach: keep agents in one shared space, surface conflicts quickly, and give them tools to coordinate through them.
 
@@ -664,7 +664,7 @@ returns `CURSOR_EXPIRED`; a cursor beyond the tail returns `CURSOR_AHEAD`.
 
 ---
 
-## The 43 MCP Tools
+## The 44 MCP Tools
 
 ### 9 Clusters
 
@@ -672,7 +672,7 @@ returns `CURSOR_EXPIRED`; a cursor beyond the tail returns `CURSOR_AHEAD`.
 |---------|-------|-------|
 | Infrastructure | 4 | `health_check`, `ensure_project`, `install_precommit_guard`, `uninstall_precommit_guard` |
 | Identity | 9 | `register_agent`, `create_agent_identity`, `retire_agent`, `unretire_agent`, `deregister_agent`, `whois`, `resolve_pane_identity`, `cleanup_pane_identities`, `list_agents` |
-| Messaging | 7 | `send_message`, `reply_message`, `fetch_inbox`, `fetch_inbox_events`, `get_message_delivery_receipt`, `acknowledge_message`, `mark_message_read` |
+| Messaging | 8 | `send_message`, `reply_message`, `fetch_inbox`, `fetch_topic`, `fetch_inbox_events`, `get_message_delivery_receipt`, `acknowledge_message`, `mark_message_read` |
 | Contacts | 4 | `request_contact`, `respond_contact`, `list_contacts`, `set_contact_policy` |
 | File Reservations | 5 | `check_file_reservation_conflicts`, `file_reservation_paths`, `renew_file_reservations`, `release_file_reservations`, `force_release_file_reservation` |
 | Search | 2 | `search_messages`, `summarize_thread` |
@@ -1122,7 +1122,7 @@ MCP Client / Operator / Browser
                      │
         ┌────────────┼────────────┬─────────────┐
         ▼            ▼            ▼             ▼
-   43 MCP Tools  25 Resources   TUI         Web UI
+   44 MCP Tools  25 Resources   TUI         Web UI
         │            │            │             │
         └────────────┴──────┬─────┴─────────────┘
                             ▼
@@ -1149,7 +1149,7 @@ mcp_agent_mail_rust/
 │   ├── mcp-agent-mail-search-core/         # Pluggable search traits
 │   ├── mcp-agent-mail-guard/               # Pre-commit guard, reservation enforcement
 │   ├── mcp-agent-mail-share/               # Snapshot, scrub, bundle, crypto, export
-│   ├── mcp-agent-mail-tools/               # 43 MCP tool implementations (9 clusters)
+│   ├── mcp-agent-mail-tools/               # 44 MCP tool implementations (9 clusters)
 │   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI (16 screens)
 │   ├── mcp-agent-mail/                     # Server binary (mcp-agent-mail)
 │   ├── mcp-agent-mail-cli/                 # CLI binary (am) with robot mode
@@ -1209,7 +1209,10 @@ $STORAGE_ROOT/                              # e.g. ~/.local/share/mcp-agent-mail
 - **Async git commit coalescer** (write-behind queue) to avoid commit storms
 - **i64 microseconds** for all timestamps (no `chrono::NaiveDateTime` in storage layer)
 - **Search V3 via frankensearch**: lexical tier ships by default in the supported search stack; semantic and hybrid fusion are compiled through the `feature = "hybrid"` gate, with portable/no-default builds retaining the deterministic lexical path.
-- **Conformance testing** against the Python reference implementation plus Rust-native extensions
+- **Compatibility testing** against intentionally retained Python wire contracts,
+  plus Rust-native durability and behavior fixtures. The Rust implementation is
+  authoritative; legacy parity never overrides reliability, security, bounded
+  work, or structured-concurrency invariants.
 - **Advisory file reservations** with symmetric fnmatch, archive reading, and rename handling
 - **`#![forbid(unsafe_code)]`** across all crates
 - **Query-only read lane** — direct mailbox reads use an existing live SQLite pool and do not wait for archive reconstruction or write-behind coalescing
@@ -1377,7 +1380,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace --all-targets
 cargo test --workspace
 
-# Conformance tests (parity with Python reference)
+# Compatibility and Rust-native conformance tests
 cargo test -p mcp-agent-mail-conformance
 
 # Run specific crate tests
@@ -1684,7 +1687,7 @@ need to do anything.
 ## FAQ
 
 **Q: How is this different from the Python version?**
-A: This is a ground-up Rust rewrite with the same conceptual model but significant improvements: a 16-screen interactive TUI, robot mode CLI, hybrid search, build slots, the product bus for cross-project coordination, and substantially better performance. The conformance test suite exercises 37 Python-parity tools plus 6 Rust-native tools, and all 25 MCP resources, against captured fixtures — ensuring format parity with the Python reference where parity is meaningful.
+A: This is a ground-up Rust rewrite with the same conceptual model but significant improvements: a 16-screen interactive TUI, robot mode CLI, hybrid search, build slots, the product bus for cross-project coordination, and substantially better performance. The conformance suite protects supported compatibility for 38 tools (37 through the captured sequential behavior fixture plus `fetch_topic` through its retained schema/description and topic-bearing router tests), covers 6 Rust-native tools, and exercises all 25 MCP resources. The Rust implementation remains authoritative.
 
 **Q: Do I need to run a separate server for each project?**
 A: No. One server handles multiple projects. Each project is identified by its absolute filesystem path as the `project_key`.

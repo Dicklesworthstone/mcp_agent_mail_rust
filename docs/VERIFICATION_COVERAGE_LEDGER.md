@@ -189,7 +189,7 @@ Dedicated `tests/*.rs` harness count by crate:
 
 - Inline coverage exists in [identity.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-tools/src/identity.rs), [messaging.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-tools/src/messaging.rs), [contacts.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-tools/src/contacts.rs), [reservations.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-tools/src/reservations.rs), [products.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-tools/src/products.rs), [search.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-tools/src/search.rs), [resources.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-tools/src/resources.rs), and [macros.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-tools/src/macros.rs).
 - Dedicated harnesses include [agent_name_parity.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-tools/tests/agent_name_parity.rs), [contact_policy_parity.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-tools/tests/contact_policy_parity.rs), [messaging_error_parity.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-tools/tests/messaging_error_parity.rs), [reservation_error_parity.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-tools/tests/reservation_error_parity.rs), [system_error_parity.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-tools/tests/system_error_parity.rs), and [validation_error_parity.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-tools/tests/validation_error_parity.rs).
-- Coverage profile: strong on `Contract` and Python-parity validation behavior; weaker on full multi-tool behavioral workflows inside the crate itself.
+- Coverage profile: strong on `Contract` and supported-compatibility validation behavior; weaker on full multi-tool behavioral workflows inside the crate itself.
 - Obvious note: higher-level behavior for tool composition appears to be validated mostly through server/CLI/E2E layers rather than rich direct tool integration tests.
 
 ### `mcp-agent-mail-share`
@@ -230,12 +230,17 @@ Dedicated `tests/*.rs` harness count by crate:
 
 ### `mcp-agent-mail-conformance`
 
-**Cluster: Python parity for tools/resources/descriptions/error codes**
+**Cluster: supported Python compatibility plus Rust-native tools/resources/descriptions/error codes**
 
 - Inline coverage in [main.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-conformance/src/main.rs) is minimal.
 - Dedicated harnesses include [conformance.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-conformance/tests/conformance.rs), [conformance_debug.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-conformance/tests/conformance_debug.rs), [contact_enforcement_outage.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-conformance/tests/contact_enforcement_outage.rs), [error_code_parity.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-conformance/tests/error_code_parity.rs), [resource_description_parity.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-conformance/tests/resource_description_parity.rs), and [tool_description_parity.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-conformance/tests/tool_description_parity.rs).
 - Coverage profile: overwhelmingly `Contract`.
-- Obvious note: the conformance layer is important but should not be confused with behavioral realism; it proves parity of envelopes and error surfaces more than end-user workflow truth.
+- Authority note: the Rust implementation is the product authority. Legacy
+  fixtures protect intentionally supported client-visible contracts; they do
+  not require preserving legacy defects or architecture when a Rust-native
+  invariant improves reliability, security, bounded work, or structured
+  concurrency.
+- Obvious note: the conformance layer is important but should not be confused with behavioral realism; it proves compatibility of envelopes and error surfaces more than end-user workflow truth. Real SQLite/archive/restart and mounted-transport evidence is decisive for workflow closure.
 - Audit flag: the visible in-tree conformance fixture corpus is surprisingly small at the filesystem level and deserves a follow-up sanity check.
 
 ### `mcp-agent-mail`

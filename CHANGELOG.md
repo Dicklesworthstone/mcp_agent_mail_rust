@@ -20,6 +20,21 @@ v0.3.13 and amd64-only since June (GH#256).
 
 ### Added
 
+- **Compatibility agent lifecycle tools (GH#255).** The MCP surface now exposes
+  `retire_agent`, `unretire_agent`, and `deregister_agent` with registration-token
+  or verified-pane authorization. Retirement is reversible; deregistration is
+  permanent for that identity. Both preserve message, reservation, and archive
+  history, remove the identity from active rosters and new-message routing, and
+  survive archive reconstruction, snapshot/export, legacy import, and restart.
+
+- **Durable message topics and project topic search (GH#259).** `send_message`
+  now accepts a validated optional topic, replies inherit their parent's topic,
+  and topic metadata survives SQLite migration, archive writes, reconstruction,
+  snapshots, CLI/robot output, and TUI rendering. `fetch_inbox(topic=...)`
+  performs exact case-insensitive recipient filtering, while the newly registered
+  compatibility `fetch_topic` tool searches the whole project without allowing
+  unrelated newer mail to displace matching rows before the result limit.
+
 - **First-class Oh My Pi (OMP) support.** Agent detection now recognizes the
   `omp` connector and `oh-my-pi` alias, while setup writes OMP's native
   authenticated HTTP MCP shape to the project config and active-profile user
@@ -85,6 +100,45 @@ v0.3.13 and amd64-only since June (GH#256).
 
 ### Fixed
 
+- **ATC hydration is bounded and fair for large recent populations (GH#258).**
+  Liveness evaluation drains at most eight scheduled or policy-dirty agents per
+  tick, deduplicates agents represented in both queues, preserves deterministic
+  progress across a 940-agent cold start, and advertises an immediately due
+  follow-up deadline while dirty work remains. This prevents a valid population
+  larger than the 512-effect executor queue from being materialized in one
+  multi-second burst.
+
+- **ATC no longer writes liveness-mail by default (GH#264).** The executor now
+  defaults to `shadow` (including for missing or unknown configuration), so
+  passive observation remains available but a fresh daemon cannot append
+  ordinary `AirTrafficControl` messages or release reservations. Durable
+  Canary/Live execution now requires an explicit executor-mode opt-in.
+
+- **Linux release artifacts have a pinned portability floor (GH#262).** Both
+  x86_64 and aarch64 GNU builds use pinned `cargo-zigbuild`/Zig tooling with a
+  maximum glibc requirement of 2.28, verified from each packaged binary. Every
+  release also publishes and executes the static x86_64 musl archive on Ubuntu
+  22.04, and the signed release-envelope census fails if any of the six platform
+  archives or their checksums are absent.
+
+- **Legacy-import targets are reopenable by a fresh runtime process (GH#268).**
+  The importer still performs canonical and FrankenSQLite validation before
+  success, and its Linux regression now launches a distinct process to acquire
+  the imported target's namespace gate and read the database. The runtime engine
+  pin includes the namespace-lifecycle fixes needed for import followed by
+  `serve-http` on the same storage volume.
+
+- **Swarm writes now end at a real integrity/restart gate (GH#257).** The
+  100-agent message burst and 30-second mixed read/write workload run a full
+  integrity check with the writer pool live, drop every pooled connection,
+  reopen the same file through a fresh pool, and run full integrity again. This
+  gate also verifies independent durable message and recipient row counts on
+  both sides of the restart, rather than treating a successful API return or
+  integrity pragma alone as proof against lost writes. It is paired with the
+  FrankenSQLite 0.3.11 line containing the pager, allocator, and autoindex
+  hardening that postdates the affected 0.3.4 release; the historical field
+  artifact itself was not reproduced in-tree.
+
 - **The published container image is unstuck (GH#256).** `ghcr.io` had served
   nothing newer than `v0.3.13` since June, and the `latest` index carried a
   single amd64 manifest — arm64 hosts had no image at all. The Dockerfile was
@@ -123,8 +177,8 @@ v0.3.13 and amd64-only since June (GH#256).
 
 - Dependency refresh: 48 crates advanced within their existing semver ranges
   (predominantly the `gix` family behind `vergen-gix`, which is build-time
-  only). The `asupersync = 0.4.9` / `sqlmodel = 0.4.0` / `fsqlite 0.3.8`
-  universe pinned on 2026-08-22 is deliberately unchanged.
+  only). The runtime remains on the `asupersync = 0.4.9` / `sqlmodel = 0.4.0`
+  universe, with FrankenSQLite advanced from 0.3.8 to the exact 0.3.11 release.
 
 
 ## [v0.3.30](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.30) — 2026-08-23 **[Release]**

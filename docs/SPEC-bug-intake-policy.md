@@ -21,7 +21,7 @@ A bug bead MUST be filed when any of the following conditions are met:
 | Panic, unwrap failure, or unhandled error on a reachable code path | `unwrap()` on user-supplied input | P0 |
 | Security boundary violation | Auth bypass, agent reads another agent's mail without permission | P0 |
 | Regression from a previously passing test or verified behavior | Conformance test that was green now fails | P0 |
-| Deviation from Python reference behavior (parity violation) | Rust `list_contacts` returns different shape than Python | P1 |
+| Unintentional deviation from a supported compatibility contract | Rust `list_contacts` drops a field used by existing clients without a migration note | P1 |
 | Integer overflow, underflow, or unsaturated arithmetic on user-facing values | `created_ts - updated_ts` without `saturating_sub` | P1 |
 | Resource leak (DB connections, file handles, WAL growth) | Pool exhaustion under normal load | P1 |
 | Incorrect error message or misleading diagnostic | Error says "not found" when the real cause is a permission check | P2 |
@@ -30,6 +30,9 @@ A bug bead MUST be filed when any of the following conditions are met:
 ### 1.2 Do NOT File When
 
 - The behavior is a **known limitation** already tracked in a bead or documented in a SPEC.
+- The behavior is an **intentional Rust-side improvement** over the legacy Python
+  implementation, is documented as such, and has native invariant/real-path
+  coverage. Python is a compatibility fixture source, not the product authority.
 - The observation is a **style preference** (formatting, naming convention) with no correctness impact -- use a separate cleanup bead instead.
 - The issue is in an **external dependency** outside this workspace (sqlmodel_rust, frankensqlite, asupersync, fastmcp_rust) -- file in the blocker ledger (br-97gc6.3.3) instead.
 - The finding is a **false alarm** from a static analysis tool that has been verified as safe -- record as a false-alarm note on the audit lane bead, not as a new bug.
@@ -70,7 +73,7 @@ Every bug bead MUST include the following fields at creation time. Incomplete fi
 | Severity | Definition | SLA |
 |----------|-----------|-----|
 | **P0 - Blocking** | Data loss, security violation, crash on reachable path, or CI gate failure. Prevents release or blocks other audit lanes. | Must be addressed in the current session or explicitly escalated. |
-| **P1 - High** | Incorrect behavior with user-visible impact. Parity violation. Potential data integrity issue under edge conditions. | Must be addressed before the subsystem audit lane can close. |
+| **P1 - High** | Incorrect behavior with user-visible impact. Supported compatibility-contract regression. Potential data integrity issue under edge conditions. | Must be addressed before the subsystem audit lane can close. |
 | **P2 - Medium** | Misleading diagnostics, documentation drift, non-critical error handling gaps. No data loss but degrades operator experience. | Should be addressed during the audit wave. May be deferred to next wave with justification. |
 | **P3 - Low** | Style, minor ergonomic issues, theoretical edge cases with no known trigger. | Track for future cleanup. May be closed as "won't fix" with documented rationale. |
 
