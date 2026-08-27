@@ -2788,11 +2788,12 @@ fn create_unique_setup_file_at(
             &authority.fd,
             candidate.as_str(),
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::from_raw_mode(permissions),
+            Mode::from_raw_mode(permissions as _),
         ) {
             Ok(fd) => {
                 let file = std::fs::File::from(fd);
-                fchmod(&file, Mode::from_raw_mode(permissions)).map_err(std::io::Error::from)?;
+                fchmod(&file, Mode::from_raw_mode(permissions as _))
+                    .map_err(std::io::Error::from)?;
                 return Ok((candidate, file));
             }
             Err(rustix::io::Errno::EXIST) => {}
