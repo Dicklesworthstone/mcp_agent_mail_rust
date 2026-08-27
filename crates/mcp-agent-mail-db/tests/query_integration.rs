@@ -241,26 +241,15 @@ fn agent_lifecycle_preserves_history_and_gates_routing_atomically() {
 
     block_on(|cx| async move {
         let retired_at = mcp_agent_mail_db::now_micros();
-        let retired = queries::set_agent_retired_at(
-            &cx,
-            &pool,
-            recipient_id,
-            Some(retired_at),
-        )
-        .await
-        .into_result()
-        .expect("retire recipient");
+        let retired = queries::set_agent_retired_at(&cx, &pool, recipient_id, Some(retired_at))
+            .await
+            .into_result()
+            .expect("retire recipient");
         assert_eq!(retired.retired_at, Some(retired_at));
-        let active = queries::list_active_agents_bounded(
-            &cx,
-            &pool,
-            project_id,
-            None,
-            None,
-        )
-        .await
-        .into_result()
-        .expect("list active agents after retirement");
+        let active = queries::list_active_agents_bounded(&cx, &pool, project_id, None, None)
+            .await
+            .into_result()
+            .expect("list active agents after retirement");
         assert!(active.iter().all(|agent| agent.id != Some(recipient_id)));
 
         let rejected = queries::create_message_with_recipients(
@@ -307,15 +296,10 @@ fn agent_lifecycle_preserves_history_and_gates_routing_atomically() {
         .expect("delivery after unretire");
 
         let deregistered_at = mcp_agent_mail_db::now_micros();
-        let deregistered = queries::deregister_agent(
-            &cx,
-            &pool,
-            recipient_id,
-            deregistered_at,
-        )
-        .await
-        .into_result()
-        .expect("deregister recipient");
+        let deregistered = queries::deregister_agent(&cx, &pool, recipient_id, deregistered_at)
+            .await
+            .into_result()
+            .expect("deregister recipient");
         assert_eq!(deregistered.contact_policy, "block_all");
         assert!(deregistered.task_description.starts_with("[DEREGISTERED "));
         assert_eq!(

@@ -1464,7 +1464,11 @@ mod tests {
         let cx = Cx::for_testing();
 
         let first = block_on(alloc.allocate(&cx, 0, dir.path()));
-        assert_eq!(expect_allocated(first), 89, "inline scan must seed the archive floor");
+        assert_eq!(
+            expect_allocated(first),
+            89,
+            "inline scan must seed the archive floor"
+        );
         assert!(!alloc.needs_archive_seed());
         assert_eq!(alloc.current_high_water(), 89);
     }

@@ -4904,9 +4904,11 @@ mod tests {
         let columns = conn
             .query_sync("PRAGMA table_info(agents)", &[])
             .expect("inspect agent columns");
-        assert!(columns.iter().any(|row| {
-            row.get_named::<String>("name").ok().as_deref() == Some("retired_at")
-        }));
+        assert!(
+            columns.iter().any(|row| {
+                row.get_named::<String>("name").ok().as_deref() == Some("retired_at")
+            })
+        );
         let ledger = conn
             .query_sync(
                 "SELECT d.deregistered_at \
@@ -4916,13 +4918,15 @@ mod tests {
             )
             .expect("read lifecycle ledger");
         assert_eq!(ledger.len(), 1);
-        assert_eq!(ledger[0].get_named::<i64>("deregistered_at").unwrap(), 424242);
+        assert_eq!(
+            ledger[0].get_named::<i64>("deregistered_at").unwrap(),
+            424242
+        );
         let indexes = conn
             .query_sync("PRAGMA index_list(agents)", &[])
             .expect("inspect agent indexes");
         assert!(indexes.iter().any(|row| {
-            row.get_named::<String>("name").ok().as_deref()
-                == Some("idx_agents_project_active")
+            row.get_named::<String>("name").ok().as_deref() == Some("idx_agents_project_active")
         }));
     }
 
