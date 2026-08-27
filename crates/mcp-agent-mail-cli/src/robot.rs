@@ -19988,6 +19988,7 @@ mod tests {
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"priority\":\"ack-overdue\""));
+        assert!(json.contains("\"topic\":\"feat.1\""));
         assert!(json.contains("\"from\":\"BlueLake\""));
     }
 
@@ -20238,6 +20239,7 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"position\":1"));
         assert!(json.contains("\"from\":\"BlueLake\""));
+        assert!(json.contains("\"topic\":\"feat.1\""));
     }
 
     #[test]
@@ -20296,6 +20298,7 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"relevance\":0.95"));
         assert!(json.contains("\"snippet\""));
+        assert!(json.contains("\"topic\":\"auth.jwt\""));
     }
 
     #[test]
@@ -20494,6 +20497,7 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"position\":3"));
         assert!(json.contains("\"from_program\":\"claude-code\""));
+        assert!(json.contains("\"topic\":\"feat.123\""));
     }
 
     #[test]
