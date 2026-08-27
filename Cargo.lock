@@ -346,6 +346,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomicwrites"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ef1bb8d1b645fe38d51dfc331d720fb5fc2c94b440c76cc79c80ff265ca33e3"
+dependencies = [
+ "rustix 0.38.44",
+ "tempfile",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -416,7 +427,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "beads_rust"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "asupersync",
@@ -447,7 +458,7 @@ dependencies = [
  "once_cell",
  "regex",
  "rich_rust",
- "rustix",
+ "rustix 1.1.4",
  "schemars",
  "semver",
  "serde",
@@ -683,7 +694,7 @@ dependencies = [
  "io-lifetimes 3.0.1",
  "ipnet",
  "maybe-owned",
- "rustix",
+ "rustix 1.1.4",
  "rustix-linux-procfs",
  "windows-sys 0.61.2",
  "winx",
@@ -698,7 +709,7 @@ dependencies = [
  "cap-primitives",
  "io-extras",
  "io-lifetimes 3.0.1",
- "rustix",
+ "rustix 1.1.4",
 ]
 
 [[package]]
@@ -1175,7 +1186,7 @@ dependencies = [
  "document-features",
  "mio",
  "parking_lot",
- "rustix",
+ "rustix 1.1.4",
  "signal-hook 0.3.18",
  "signal-hook-mio",
  "winapi",
@@ -1787,7 +1798,7 @@ dependencies = [
  "fastmcp-protocol",
  "fastmcp-transport",
  "log",
- "rustix",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "toml",
@@ -1905,7 +1916,7 @@ dependencies = [
  "asupersync",
  "fastmcp-core",
  "fastmcp-protocol",
- "rustix",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
 ]
@@ -2047,7 +2058,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -2122,7 +2133,7 @@ dependencies = [
  "libc",
  "memmap2",
  "rayon",
- "rustix",
+ "rustix 1.1.4",
  "same-file",
  "serde",
  "sha2 0.11.0",
@@ -2146,24 +2157,27 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-quill"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ahash",
  "arc-swap",
  "asupersync",
+ "atomicwrites",
  "bytemuck",
  "compact_str 0.10.0",
  "crc32fast",
  "frankensearch-core",
  "frankensearch-index",
  "rayon",
- "rustix",
+ "rustix 1.1.4",
+ "same-file",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
  "tracing",
  "wide",
+ "windows-sys 0.61.2",
  "xxhash-rust",
 ]
 
@@ -2269,7 +2283,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94e7099f6313ecacbe1256e8ff9d617b75d1bcb16a6fddef94866d225a01a14a"
 dependencies = [
  "io-lifetimes 2.0.4",
- "rustix",
+ "rustix 1.1.4",
  "windows-sys 0.59.0",
 ]
 
@@ -2289,7 +2303,7 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8640e34b88f7652208ce9e88b1a37a2ae95227d84abec377ccd3c5cfeb141ed4"
 dependencies = [
- "rustix",
+ "rustix 1.1.4",
  "windows-sys 0.59.0",
 ]
 
@@ -2849,7 +2863,7 @@ dependencies = [
  "ftui-core",
  "ftui-render",
  "nix",
- "rustix",
+ "rustix 1.1.4",
  "signal-hook 0.4.4",
 ]
 
@@ -3773,7 +3787,7 @@ dependencies = [
  "itoa",
  "libc",
  "memmap2",
- "rustix",
+ "rustix 1.1.4",
  "smallvec",
  "thiserror",
 ]
@@ -3801,7 +3815,7 @@ dependencies = [
  "itoa",
  "libc",
  "memmap2",
- "rustix",
+ "rustix 1.1.4",
  "smallvec",
  "thiserror",
 ]
@@ -4077,7 +4091,7 @@ dependencies = [
  "gix-command 0.10.0",
  "gix-config-value 0.19.1",
  "parking_lot",
- "rustix",
+ "rustix 1.1.4",
  "thiserror",
 ]
 
@@ -5328,6 +5342,12 @@ dependencies = [
 
 [[package]]
 name = "linux-raw-sys"
+version = "0.4.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
+
+[[package]]
+name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
@@ -5479,7 +5499,7 @@ checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
 
 [[package]]
 name = "mcp-agent-mail"
-version = "0.3.30"
+version = "0.3.31"
 dependencies = [
  "asupersync",
  "clap",
@@ -5507,7 +5527,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-cli"
-version = "0.3.30"
+version = "0.3.31"
 dependencies = [
  "asupersync",
  "beads_rust",
@@ -5555,7 +5575,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-conformance"
-version = "0.3.30"
+version = "0.3.31"
 dependencies = [
  "asupersync",
  "chrono",
@@ -5580,7 +5600,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-core"
-version = "0.3.30"
+version = "0.3.31"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -5597,7 +5617,7 @@ dependencies = [
  "nix",
  "proptest",
  "regex",
- "rustix",
+ "rustix 1.1.4",
  "same-file",
  "serde",
  "serde_json",
@@ -5616,7 +5636,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-db"
-version = "0.3.30"
+version = "0.3.31"
 dependencies = [
  "asupersync",
  "chrono",
@@ -5638,7 +5658,7 @@ dependencies = [
  "proptest",
  "rayon",
  "regex",
- "rustix",
+ "rustix 1.1.4",
  "safetensors",
  "same-file",
  "serde",
@@ -5664,7 +5684,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-guard"
-version = "0.3.30"
+version = "0.3.31"
 dependencies = [
  "chrono",
  "git2",
@@ -5680,7 +5700,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-search-core"
-version = "0.3.30"
+version = "0.3.31"
 dependencies = [
  "chrono",
  "criterion",
@@ -5709,7 +5729,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-server"
-version = "0.3.30"
+version = "0.3.31"
 dependencies = [
  "ammonia",
  "asupersync",
@@ -5755,7 +5775,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-share"
-version = "0.3.30"
+version = "0.3.31"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -5776,7 +5796,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-storage"
-version = "0.3.30"
+version = "0.3.31"
 dependencies = [
  "asupersync",
  "base64 0.23.1",
@@ -5804,7 +5824,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-test-helpers"
-version = "0.3.30"
+version = "0.3.31"
 dependencies = [
  "git2",
  "tempfile",
@@ -5813,7 +5833,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-tools"
-version = "0.3.30"
+version = "0.3.31"
 dependencies = [
  "arbitrary",
  "asupersync",
@@ -6526,7 +6546,7 @@ dependencies = [
  "concurrent-queue",
  "hermit-abi",
  "pin-project-lite",
- "rustix",
+ "rustix 1.1.4",
  "windows-sys 0.61.2",
 ]
 
@@ -6678,7 +6698,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -7061,6 +7081,19 @@ dependencies = [
 
 [[package]]
 name = "rustix"
+version = "0.38.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
+dependencies = [
+ "bitflags 2.13.1",
+ "errno",
+ "libc",
+ "linux-raw-sys 0.4.15",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
@@ -7068,7 +7101,7 @@ dependencies = [
  "bitflags 2.13.1",
  "errno",
  "libc",
- "linux-raw-sys",
+ "linux-raw-sys 0.12.1",
  "windows-sys 0.61.2",
 ]
 
@@ -7079,7 +7112,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fc84bf7e9aa16c4f2c758f27412dc9841341e16aa682d9c7ac308fe3ee12056"
 dependencies = [
  "once_cell",
- "rustix",
+ "rustix 1.1.4",
 ]
 
 [[package]]
@@ -8074,9 +8107,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
- "rustix",
+ "rustix 1.1.4",
  "windows-sys 0.61.2",
 ]
 
@@ -9249,7 +9282,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
- "rustix",
+ "rustix 1.1.4",
 ]
 
 [[package]]

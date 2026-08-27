@@ -10,6 +10,8 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## [Unreleased]
 
+## [v0.3.31](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.31) — 2026-08-27 **[Release]**
+
 Durability-diagnostics release: the database layer learned to explain itself.
 A dedicated corruption-forensics engine, connection-pool lease tracking, and
 startup WAL preflight replace the previous "it is broken, good luck" failure
@@ -20,19 +22,21 @@ v0.3.13 and amd64-only since June (GH#256).
 
 ### Added
 
-- **Compatibility agent lifecycle tools (GH#255).** The MCP surface now exposes
+- **First-class agent lifecycle tools (GH#255).** The MCP surface now exposes
   `retire_agent`, `unretire_agent`, and `deregister_agent` with registration-token
   or verified-pane authorization. Retirement is reversible; deregistration is
   permanent for that identity. Both preserve message, reservation, and archive
   history, remove the identity from active rosters and new-message routing, and
   survive archive reconstruction, snapshot/export, legacy import, and restart.
+  Retirement retries preserve the first durable timestamp atomically, including
+  when requests race, until an explicit unretire transition occurs.
 
 - **Durable message topics and project topic search (GH#259).** `send_message`
   now accepts a validated optional topic, replies inherit their parent's topic,
   and topic metadata survives SQLite migration, archive writes, reconstruction,
   snapshots, CLI/robot output, and TUI rendering. `fetch_inbox(topic=...)`
   performs exact case-insensitive recipient filtering, while the newly registered
-  compatibility `fetch_topic` tool searches the whole project without allowing
+  Rust-native `fetch_topic` tool searches the whole project without allowing
   unrelated newer mail to displace matching rows before the result limit.
 
 - **First-class Oh My Pi (OMP) support.** Agent detection now recognizes the
@@ -165,6 +169,19 @@ v0.3.13 and amd64-only since June (GH#256).
   checks, fixing spurious failures on `/tmp` → `/private/tmp` style aliases.
 
 ### Changed
+
+- **Rust is now the conformance authority.** The legacy Python behavior fixture
+  remains a supported client/migration contract, but its default runner now
+  requires the recorded object fields and values rather than whole-object byte
+  equality. Additive Rust response fields are accepted; arrays remain exact,
+  missing or changed legacy fields still fail, and Rust-native goldens remain
+  exact. This prevents the frozen `legacy-python@0.3.0` snapshot from vetoing
+  reliability and observability improvements that are backwards-compatible.
+  Documented per-field normalization also excludes the legacy health check's
+  unconditional `status=ok`; Rust-native tests own the fail-closed health
+  contract when durable state is unavailable. Tool and resource prose is now
+  Rust-owned; compatibility checks retain supported inventory and input types,
+  reject new mandatory inputs, and allow optionalization or clearer wording.
 
 - **`send_message.auto_contact_if_blocked` now accepts explicit JSON `null`** (GH#255 Python parity, final delta): fastmcp 0.7.1 publishes nullable `["boolean", "null"]` schemas for `Option<T>` tool parameters and treats explicit `null` as omitted at extraction, so `null` and omission both take the server-default path (`messaging_auto_handshake_on_block`). The same widening applies to every optional tool parameter this server exposes. Dependency: fastmcp family 0.7.0 → 0.7.1; the pinned dispatch contract test flipped from asserting a loud typed rejection to asserting Python-parity acceptance.
 
