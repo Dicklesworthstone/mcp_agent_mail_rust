@@ -14,6 +14,7 @@
 //! And 25 MCP resources for read-only data access.
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 #![allow(
     clippy::needless_pass_by_value,
     clippy::needless_borrows_for_generic_args,

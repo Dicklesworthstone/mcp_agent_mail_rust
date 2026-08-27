@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! GH#213: a no-name `register_agent` must NEVER mutate an existing agent.
 //!
 //! The 2026-08-15 reporter measured 4/187 (Linux) and 12/507 (Windows) acked

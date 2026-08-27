@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Parity tests verifying messaging tool error messages match the Python reference.
 //!
 //! These integration tests call actual tool functions and verify the error type,

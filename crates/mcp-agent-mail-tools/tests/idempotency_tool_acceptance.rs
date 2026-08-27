@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Tool-level acceptance tests for client-supplied idempotency keys
 //! (br-idempotency-keys-mutating-tools-h0x9k).
 //!
