@@ -4230,12 +4230,11 @@ fn merge_salvaged_database(
                 let salvaged_retired_at = if agent_columns.contains("retired_at") {
                     match row.get_named::<Option<i64>>("retired_at") {
                         Ok(value) => value,
-                        Err(integer_error) => {
-                            match row.get_named::<Option<String>>("retired_at") {
-                                Ok(None) => None,
-                                Ok(Some(value)) => {
-                                    let value = value.trim();
-                                    value.parse::<i64>().ok().or_else(|| {
+                        Err(integer_error) => match row.get_named::<Option<String>>("retired_at") {
+                            Ok(None) => None,
+                            Ok(Some(value)) => {
+                                let value = value.trim();
+                                value.parse::<i64>().ok().or_else(|| {
                                         crate::iso_to_micros(&value.replacen(' ', "T", 1))
                                     }).or_else(|| {
                                         stats.push_warning(format!(
@@ -4243,15 +4242,14 @@ fn merge_salvaged_database(
                                         ));
                                         Some(salvaged_last_active_ts)
                                     })
-                                }
-                                Err(text_error) => {
-                                    stats.push_warning(format!(
+                            }
+                            Err(text_error) => {
+                                stats.push_warning(format!(
                                         "salvaged agent {source_agent_id} has an unreadable retired_at value ({integer_error}; {text_error}); preserving the retired state with last_active_ts"
                                     ));
-                                    Some(salvaged_last_active_ts)
-                                }
+                                Some(salvaged_last_active_ts)
                             }
-                        }
+                        },
                     }
                 } else {
                     None
@@ -11643,12 +11641,9 @@ archive body
             .unwrap();
         drop(salvage_conn);
 
-        let stats = reconstruct_from_archive_with_salvage(
-            &db_path,
-            &storage_root,
-            Some(&salvage_db_path),
-        )
-        .expect("salvage merge should preserve lifecycle state");
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("salvage merge should preserve lifecycle state");
         assert!(
             stats
                 .warnings
