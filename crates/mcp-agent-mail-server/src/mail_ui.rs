@@ -86,6 +86,11 @@ pub fn dispatch_with_cx(
     // remains the GET path when no live pool exists in this process
     // (CLI/static-export contexts and tests).
     let cached_live_owner = mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env());
+    let refresh_project_siblings = should_refresh_project_siblings(
+        method,
+        query,
+        cached_live_owner.is_some(),
+    );
     let read_pool_owner = if method == "GET" && cached_live_owner.is_none() {
         open_mail_ui_read_pool()?
     } else {
@@ -125,7 +130,7 @@ pub fn dispatch_with_cx(
             )
         }
         // Explicit projects list route (legacy Python: GET /mail/projects).
-        "/projects" => render_projects_list(cx, read_pool),
+        "/projects" => render_projects_list(cx, read_pool, refresh_project_siblings),
         _ if sub.starts_with("/api/") => {
             handle_api_route(sub, query, method, body, cx, read_pool, &live_pool)
         }
@@ -1439,6 +1444,10 @@ fn is_static_export_request(query: &str) -> bool {
     extract_query_bool(query, "__static_export").unwrap_or(false)
 }
 
+fn should_refresh_project_siblings(method: &str, query: &str, has_live_pool: bool) -> bool {
+    method == "GET" && has_live_pool && !is_static_export_request(query)
+}
+
 fn is_synthetic_project_identifier(slug: &str) -> bool {
     let Some(rest) = slug.strip_prefix("[unknown-project-") else {
         return false;
@@ -2718,7 +2727,23 @@ struct IndexSiblingBuckets {
     suggested: Vec<IndexSibling>,
 }
 
-fn render_index(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)> {
+fn render_index(
+    cx: &Cx,
+    pool: &DbPool,
+    refresh_project_siblings: bool,
+) -> Result<Option<String>, (u16, String)> {
+    if refresh_project_siblings {
+        let summary = block_on_outcome(
+            cx,
+            queries::refresh_project_sibling_suggestions(cx, pool),
+        )?;
+        tracing::debug!(
+            evaluated = summary.evaluated,
+            inserted = summary.inserted,
+            refreshed = summary.refreshed,
+            "project_sibling_suggestions_refreshed"
+        );
+    }
     let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
     let mut agent_counts = block_on_outcome(cx, queries::count_agents_by_project(cx, pool))?;
     let total_agents = agent_counts.values().sum();
@@ -2757,7 +2782,9 @@ fn render_index(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)>
                     .confirmed
                     .push(for_b);
             }
-            queries::ProjectSiblingStatus::Suggested if suggestion.score >= 0.92 => {
+            queries::ProjectSiblingStatus::Suggested
+                if suggestion.score >= queries::PROJECT_SIBLING_MIN_SUGGESTION_SCORE =>
+            {
                 sibling_buckets
                     .entry(suggestion.project_a.id)
                     .or_default()
@@ -2801,10 +2828,14 @@ fn render_index(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)>
 // Route: GET /mail/projects — explicit projects list (Python parity)
 // ---------------------------------------------------------------------------
 
-fn render_projects_list(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)> {
+fn render_projects_list(
+    cx: &Cx,
+    pool: &DbPool,
+    refresh_project_siblings: bool,
+) -> Result<Option<String>, (u16, String)> {
     // Reuse the index renderer — Python's /mail/projects renders the same template
     // as the old /mail root (project list view).
-    render_index(cx, pool)
+    render_index(cx, pool, refresh_project_siblings)
 }
 
 // ---------------------------------------------------------------------------
@@ -6184,7 +6215,7 @@ mod fresh_eyes_regression_tests {
         )));
         seed_project_sibling(&cx, &pool, root_id, peer_id, 0.97);
 
-        let suggested_html = render_index(&cx, &pool)
+        let suggested_html = render_index(&cx, &pool, false)
             .expect("suggested index should render")
             .expect("suggested index html");
         assert_eq!(
@@ -6215,7 +6246,7 @@ mod fresh_eyes_regression_tests {
         assert!(response["suggestion"]["confirmed_ts"].is_number());
         assert!(response["suggestion"]["dismissed_ts"].is_null());
 
-        let confirmed_html = render_index(&cx, &pool)
+        let confirmed_html = render_index(&cx, &pool, false)
             .expect("confirmed index should render")
             .expect("confirmed index html");
         assert!(confirmed_html.contains(&format!(

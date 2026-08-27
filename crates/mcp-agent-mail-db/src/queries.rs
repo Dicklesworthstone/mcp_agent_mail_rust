@@ -4860,6 +4860,227 @@ pub async fn list_project_sibling_suggestions(
     Outcome::Ok(suggestions)
 }
 
+/// Discover or refresh a bounded set of project-sibling suggestions.
+///
+/// The refresh is a live write path. Callers serving read-only snapshots or
+/// static exports must use [`list_project_sibling_suggestions`] instead.
+/// Project and pair order are deterministic, every pair is canonical, and the
+/// whole refresh commits atomically. Existing confirmed or dismissed decisions
+/// are never reset by scoring refreshes.
+pub async fn refresh_project_sibling_suggestions(
+    cx: &Cx,
+    pool: &DbPool,
+) -> Outcome<ProjectSiblingRefreshSummary, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+
+    run_with_mvcc_retry(cx, "refresh_project_sibling_suggestions", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        if cx.checkpoint().is_err() {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Cancelled(cx.cancel_reason().unwrap_or_else(|| {
+                CancelReason::user("project sibling refresh cancelled")
+            }));
+        }
+
+        let now = now_micros();
+        let project_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, slug, human_key, created_at FROM projects \
+                     ORDER BY id ASC LIMIT ?",
+                    &[Value::BigInt(
+                        i64::try_from(PROJECT_SIBLING_PROJECT_SCAN_LIMIT)
+                            .expect("project sibling scan limit fits i64"),
+                    )],
+                )
+                .await
+            )
+        );
+        let mut projects = Vec::with_capacity(project_rows.len());
+        for row in &project_rows {
+            let project = match decode_project_row(row) {
+                Ok(project) => project,
+                Err(error) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(error);
+                }
+            };
+            if project.id.is_none() {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "project sibling refresh read a project without an id".to_string(),
+                ));
+            }
+            projects.push(project);
+        }
+        if projects.len() < 2 {
+            try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+            return Outcome::Ok(ProjectSiblingRefreshSummary::default());
+        }
+
+        let project_ids: Vec<i64> = projects.iter().filter_map(|project| project.id).collect();
+        let placeholders = vec!["?"; project_ids.len()].join(", ");
+        let existing_sql = format!(
+            "{PROJECT_SIBLING_SELECT} \
+             WHERE s.project_a_id IN ({placeholders}) \
+               AND s.project_b_id IN ({placeholders}) \
+             ORDER BY s.project_a_id ASC, s.project_b_id ASC"
+        );
+        let mut existing_params = Vec::with_capacity(project_ids.len() * 2);
+        existing_params.extend(project_ids.iter().copied().map(Value::BigInt));
+        existing_params.extend(project_ids.iter().copied().map(Value::BigInt));
+        let existing_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &existing_sql, &existing_params).await)
+        );
+        let mut existing_map = HashMap::with_capacity(existing_rows.len());
+        for row in &existing_rows {
+            let suggestion = match decode_project_sibling_suggestion(row) {
+                Ok(suggestion) => suggestion,
+                Err(error) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(error);
+                }
+            };
+            let pair = (
+                suggestion.project_a.id.min(suggestion.project_b.id),
+                suggestion.project_a.id.max(suggestion.project_b.id),
+            );
+            if existing_map.insert(pair, suggestion).is_some() {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "multiple project sibling suggestions represent canonical pair {},{}",
+                    pair.0, pair.1
+                )));
+            }
+        }
+
+        let mut candidates = Vec::with_capacity(PROJECT_SIBLING_REFRESH_LIMIT);
+        'project_pairs: for (left_index, left_project) in projects.iter().enumerate() {
+            for right_project in &projects[left_index + 1..] {
+                if candidates.len() >= PROJECT_SIBLING_REFRESH_LIMIT {
+                    break 'project_pairs;
+                }
+                if left_project.human_key == right_project.human_key {
+                    continue;
+                }
+                let left_id = left_project.id.expect("validated project id");
+                let right_id = right_project.id.expect("validated project id");
+                let pair = (left_id.min(right_id), left_id.max(right_id));
+                let existing = existing_map.get(&pair);
+                if !project_sibling_needs_refresh(existing, now) {
+                    continue;
+                }
+                candidates.push(ProjectSiblingRefreshCandidate {
+                    left_project: left_project.clone(),
+                    right_project: right_project.clone(),
+                    existing: existing.cloned(),
+                });
+            }
+        }
+
+        if candidates.is_empty() {
+            try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+            return Outcome::Ok(ProjectSiblingRefreshSummary::default());
+        }
+
+        let mut summary = ProjectSiblingRefreshSummary {
+            evaluated: candidates.len(),
+            ..ProjectSiblingRefreshSummary::default()
+        };
+        for candidate in candidates {
+            if cx.checkpoint().is_err() {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Cancelled(cx.cancel_reason().unwrap_or_else(|| {
+                    CancelReason::user("project sibling refresh cancelled")
+                }));
+            }
+            let (score, rationale) =
+                project_sibling_similarity(&candidate.left_project, &candidate.right_project);
+            let left_id = candidate.left_project.id.expect("validated project id");
+            let right_id = candidate.right_project.id.expect("validated project id");
+            let smaller_id = left_id.min(right_id);
+            let larger_id = left_id.max(right_id);
+
+            let changed = if let Some(existing) = candidate.existing {
+                let changed = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(
+                        traw_execute(
+                            cx,
+                            &tracked,
+                            "UPDATE project_sibling_suggestions \
+                             SET project_a_id = ?, project_b_id = ?, score = ?, \
+                                 rationale = ?, evaluated_ts = ? \
+                             WHERE id = ?",
+                            &[
+                                Value::BigInt(smaller_id),
+                                Value::BigInt(larger_id),
+                                Value::Double(score),
+                                Value::Text(rationale),
+                                Value::BigInt(now),
+                                Value::BigInt(existing.id),
+                            ],
+                        )
+                        .await
+                    )
+                );
+                summary.refreshed += 1;
+                changed
+            } else {
+                let changed = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(
+                        traw_execute(
+                            cx,
+                            &tracked,
+                            "INSERT INTO project_sibling_suggestions \
+                             (project_a_id, project_b_id, score, status, rationale, \
+                              created_ts, evaluated_ts, confirmed_ts, dismissed_ts) \
+                             VALUES (?, ?, ?, 'suggested', ?, ?, ?, NULL, NULL)",
+                            &[
+                                Value::BigInt(smaller_id),
+                                Value::BigInt(larger_id),
+                                Value::Double(score),
+                                Value::Text(rationale),
+                                Value::BigInt(now),
+                                Value::BigInt(now),
+                            ],
+                        )
+                        .await
+                    )
+                );
+                summary.inserted += 1;
+                changed
+            };
+            if changed != 1 {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "project sibling refresh affected {changed} rows for pair \
+                     {smaller_id},{larger_id}; expected exactly one"
+                )));
+            }
+        }
+
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(summary)
+    })
+    .await
+}
+
 /// Atomically transition an existing sibling suggestion to a new review state.
 ///
 /// Project pairs are canonicalized so callers may supply either orientation.
