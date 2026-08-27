@@ -4555,6 +4555,55 @@ pub async fn list_project_rows(cx: &Cx, pool: &DbPool) -> Outcome<Vec<ProjectRow
     Outcome::Ok(out)
 }
 
+/// Count registered agents per project in one grouped query.
+pub async fn count_agents_by_project(
+    cx: &Cx,
+    pool: &DbPool,
+) -> Outcome<BTreeMap<i64, usize>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let rows = match map_sql_outcome(
+        traw_query(
+            cx,
+            &tracked,
+            "SELECT project_id, COUNT(*) FROM agents GROUP BY project_id ORDER BY project_id",
+            &[],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    let mut counts = BTreeMap::new();
+    for row in &rows {
+        let Some(project_id) = row.get(0).and_then(value_as_i64) else {
+            return Outcome::Err(DbError::Internal(
+                "missing project_id in grouped agent count".to_string(),
+            ));
+        };
+        let Some(raw_count) = row.get(1).and_then(value_as_i64) else {
+            return Outcome::Err(DbError::Internal(
+                "missing count in grouped agent count".to_string(),
+            ));
+        };
+        let Ok(count) = usize::try_from(raw_count) else {
+            return Outcome::Err(DbError::Internal(format!(
+                "invalid grouped agent count {raw_count} for project {project_id}"
+            )));
+        };
+        counts.insert(project_id, count);
+    }
+    Outcome::Ok(counts)
+}
+
 // =============================================================================
 // Project sibling suggestions
 // =============================================================================
@@ -4610,6 +4659,22 @@ pub struct ProjectSiblingSuggestion {
     pub evaluated_ts: i64,
     pub confirmed_ts: Option<i64>,
     pub dismissed_ts: Option<i64>,
+}
+
+impl ProjectSiblingSuggestion {
+    fn decision_timestamps_match_status(&self) -> bool {
+        match self.status {
+            ProjectSiblingStatus::Suggested => {
+                self.confirmed_ts.is_none() && self.dismissed_ts.is_none()
+            }
+            ProjectSiblingStatus::Confirmed => {
+                self.confirmed_ts.is_some() && self.dismissed_ts.is_none()
+            }
+            ProjectSiblingStatus::Dismissed => {
+                self.confirmed_ts.is_none() && self.dismissed_ts.is_some()
+            }
+        }
+    }
 }
 
 const PROJECT_SIBLING_SELECT: &str =
@@ -4704,18 +4769,6 @@ pub async fn update_project_sibling_status(
     } else {
         (other_id, project_id)
     };
-    let now = now_micros();
-    let confirmed_ts = if status == ProjectSiblingStatus::Confirmed {
-        Value::BigInt(now)
-    } else {
-        Value::Null
-    };
-    let dismissed_ts = if status == ProjectSiblingStatus::Dismissed {
-        Value::BigInt(now)
-    } else {
-        Value::Null
-    };
-
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(conn) => conn,
         Outcome::Err(error) => return Outcome::Err(error),
@@ -4726,6 +4779,21 @@ pub async fn update_project_sibling_status(
 
     run_with_mvcc_retry(cx, "update_project_sibling_status", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        // Timestamp each whole-transaction attempt once it owns the write
+        // lock. A contended request can spend seconds in the retry loop;
+        // recording its pre-wait time would make the audit trail misleading.
+        let now = now_micros();
+        let confirmed_ts = if status == ProjectSiblingStatus::Confirmed {
+            Value::BigInt(now)
+        } else {
+            Value::Null
+        };
+        let dismissed_ts = if status == ProjectSiblingStatus::Dismissed {
+            Value::BigInt(now)
+        } else {
+            Value::Null
+        };
 
         let project_rows = try_in_tx!(
             cx,
@@ -4775,8 +4843,8 @@ pub async fn update_project_sibling_status(
                 return Outcome::Err(error);
             }
         };
-        if existing.status == status {
-            try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        if existing.status == status && existing.decision_timestamps_match_status() {
+            try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
             return Outcome::Ok(existing);
         }
 
@@ -16337,7 +16405,10 @@ mod tests {
         row.get_named("cnt").expect("decode count")
     }
 
-    fn create_file_pool_with_schema_for_test(label: &str) -> (tempfile::TempDir, DbPool) {
+    fn create_file_pool_with_schema_for_test_with_max(
+        label: &str,
+        max_connections: usize,
+    ) -> (tempfile::TempDir, DbPool) {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir
             .path()
@@ -16356,13 +16427,17 @@ mod tests {
         let cfg = crate::pool::DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
             min_connections: 1,
-            max_connections: 1,
+            max_connections,
             run_migrations: false,
             warmup_connections: 0,
             ..Default::default()
         };
         let pool = crate::create_pool(&cfg).expect("create pool");
         (dir, pool)
+    }
+
+    fn create_file_pool_with_schema_for_test(label: &str) -> (tempfile::TempDir, DbPool) {
+        create_file_pool_with_schema_for_test_with_max(label, 1)
     }
 
     async fn insert_project_row_for_test(cx: &Cx, pool: &DbPool, row: &ProjectRow) {
@@ -16443,9 +16518,17 @@ mod tests {
                 human_key: "/workspace/project-b".to_string(),
                 created_at: 2,
             };
+            let project_c = ProjectRow {
+                id: Some(303),
+                slug: "project-c".to_string(),
+                human_key: "/workspace/project-c".to_string(),
+                created_at: 3,
+            };
             insert_project_row_for_test(&cx, &pool, &project_a).await;
             insert_project_row_for_test(&cx, &pool, &project_b).await;
+            insert_project_row_for_test(&cx, &pool, &project_c).await;
             insert_project_sibling_for_test(&cx, &pool, 101, 202, 0.97).await;
+            insert_project_sibling_for_test(&cx, &pool, 101, 303, 0.42).await;
 
             let confirmed = update_project_sibling_status(
                 &cx,
@@ -16460,6 +16543,8 @@ mod tests {
             assert_eq!(confirmed.status, ProjectSiblingStatus::Confirmed);
             assert_eq!(confirmed.project_a.id, 101);
             assert_eq!(confirmed.project_b.id, 202);
+            assert_eq!(confirmed.score, 0.97);
+            assert_eq!(confirmed.rationale, "shared workspace");
             assert!(confirmed.confirmed_ts.is_some());
             assert_eq!(confirmed.dismissed_ts, None);
             assert!(confirmed.evaluated_ts > 10);
@@ -16507,11 +16592,52 @@ mod tests {
             assert_eq!(reset.confirmed_ts, None);
             assert_eq!(reset.dismissed_ts, None);
 
+            {
+                let conn = acquire_conn(&cx, &pool)
+                    .await
+                    .into_result()
+                    .expect("acquire legacy-state fixture connection");
+                let tracked = tracked(&*conn);
+                map_sql_outcome(
+                    traw_execute(
+                        &cx,
+                        &tracked,
+                        "UPDATE project_sibling_suggestions \
+                         SET confirmed_ts = 7 \
+                         WHERE project_a_id = 101 AND project_b_id = 202",
+                        &[],
+                    )
+                    .await,
+                )
+                .into_result()
+                .expect("seed stale reset timestamp");
+            }
+            let repaired_reset = update_project_sibling_status(
+                &cx,
+                &pool,
+                101,
+                202,
+                ProjectSiblingStatus::Suggested,
+            )
+            .await
+            .into_result()
+            .expect("repair stale reset timestamp");
+            assert_eq!(repaired_reset.status, ProjectSiblingStatus::Suggested);
+            assert_eq!(repaired_reset.confirmed_ts, None);
+            assert_eq!(repaired_reset.dismissed_ts, None);
+
             let listed = list_project_sibling_suggestions(&cx, &pool)
                 .await
                 .into_result()
                 .expect("list sibling suggestions");
-            assert_eq!(listed, vec![reset]);
+            assert_eq!(listed.len(), 2);
+            assert_eq!(listed[0], repaired_reset);
+            assert_eq!(listed[1].project_a.id, 101);
+            assert_eq!(listed[1].project_b.id, 303);
+            assert_eq!(listed[1].status, ProjectSiblingStatus::Suggested);
+            assert_eq!(listed[1].evaluated_ts, 10);
+            assert_eq!(listed[1].confirmed_ts, None);
+            assert_eq!(listed[1].dismissed_ts, None);
         });
 
         let fresh = crate::DbConn::open_file(pool.sqlite_path()).expect("open independent reader");
@@ -16566,6 +16692,22 @@ mod tests {
             insert_project_row_for_test(&cx, &pool, &project_a).await;
             insert_project_row_for_test(&cx, &pool, &project_b).await;
 
+            let non_positive = update_project_sibling_status(
+                &cx,
+                &pool,
+                0,
+                302,
+                ProjectSiblingStatus::Confirmed,
+            )
+            .await;
+            assert!(matches!(
+                non_positive,
+                Outcome::Err(DbError::InvalidArgument {
+                    field: "project_id",
+                    ..
+                })
+            ));
+
             let self_pair = update_project_sibling_status(
                 &cx,
                 &pool,
@@ -16607,6 +16749,89 @@ mod tests {
                     ..
                 })
             ));
+        });
+    }
+
+    #[test]
+    fn concurrent_duplicate_project_sibling_transitions_converge_idempotently() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) =
+            create_file_pool_with_schema_for_test_with_max("project-sibling-concurrent", 2);
+        rt.block_on(async {
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(401),
+                    slug: "project-a".to_string(),
+                    human_key: "/workspace/project-a".to_string(),
+                    created_at: 1,
+                },
+            )
+            .await;
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(402),
+                    slug: "project-b".to_string(),
+                    human_key: "/workspace/project-b".to_string(),
+                    created_at: 2,
+                },
+            )
+            .await;
+            insert_project_sibling_for_test(&cx, &pool, 401, 402, 0.99).await;
+        });
+
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let pool = pool.clone();
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let rt = RuntimeBuilder::current_thread()
+                        .build()
+                        .expect("build thread runtime");
+                    start.wait();
+                    rt.block_on(async {
+                        let cx = Cx::current().expect("runtime installs sibling test context");
+                        update_project_sibling_status(
+                            &cx,
+                            &pool,
+                            402,
+                            401,
+                            ProjectSiblingStatus::Confirmed,
+                        )
+                        .await
+                        .into_result()
+                        .expect("concurrent confirm")
+                    })
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("join concurrent confirm"))
+            .collect();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[0].status, ProjectSiblingStatus::Confirmed);
+        assert!(results[0].confirmed_ts.is_some());
+        assert_eq!(results[0].dismissed_ts, None);
+
+        rt.block_on(async {
+            let rows = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list after concurrent confirms");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0], results[0]);
         });
     }
 

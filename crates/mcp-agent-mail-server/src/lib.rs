@@ -11716,6 +11716,16 @@ impl HttpState {
     }
 
     fn handle_mail_dispatch(&self, req: &Http1Request, path: &str) -> Http1Response {
+        let cx = self.request_cx();
+        self.handle_mail_dispatch_with_cx(req, path, &cx)
+    }
+
+    fn handle_mail_dispatch_with_cx(
+        &self,
+        req: &Http1Request,
+        path: &str,
+        cx: &Cx,
+    ) -> Http1Response {
         if !matches!(req.method, Http1Method::Get | Http1Method::Post) {
             return self.error_response(req, 405, "Method Not Allowed");
         }
@@ -11731,7 +11741,7 @@ impl HttpState {
         };
         let body_str = std::str::from_utf8(&req.body).unwrap_or("");
         let is_api = Self::is_mail_json_route(path, method_str);
-        match mail_ui::dispatch(path, query_str, method_str, body_str) {
+        match mail_ui::dispatch_with_cx(path, query_str, method_str, body_str, cx) {
             Ok(Some(body)) => {
                 let content_type = if is_api {
                     "application/json"
@@ -11763,9 +11773,9 @@ impl HttpState {
         }
     }
 
-    /// GH#184: run [`Self::handle_mail_dispatch`] on the bounded, cancellable
-    /// blocking-dispatch pool with the request timeout, keeping async workers
-    /// free.
+    /// GH#184: run [`Self::handle_mail_dispatch_with_cx`] on the bounded,
+    /// cancellable blocking-dispatch pool with the request timeout, keeping
+    /// async workers free.
     ///
     /// The mail UI layer is synchronous (per-request pool access, DB queries,
     /// template rendering) and — on a large, long-lived mailbox — its pool
@@ -11800,6 +11810,7 @@ impl HttpState {
         let cors_origin = self.cors_origin(&req);
         let dispatch_timeout_secs = self.request_timeout_secs;
         let dispatch_cx = self.request_cx();
+        let worker_cx = dispatch_cx.clone();
         let method_label = format!("mail-ui:{path}");
         let result = run_cancellable_blocking_dispatch(
             method_label,
@@ -11807,7 +11818,9 @@ impl HttpState {
             dispatch_cx,
             DispatchCancel::new(),
             Arc::new(Mutex::new(Some(permit))),
-            move |_cancel| Ok(arc_self.handle_mail_dispatch(&req, &path)),
+            move |_cancel| {
+                Ok(arc_self.handle_mail_dispatch_with_cx(&req, &path, &worker_cx))
+            },
         )
         .await;
 

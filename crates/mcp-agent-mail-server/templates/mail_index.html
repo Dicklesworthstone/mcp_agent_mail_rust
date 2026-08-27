@@ -81,9 +81,9 @@
         </div>
       </div>
       <div class="space-y-2">
-        <p class="text-sm font-semibold text-slate-600 dark:text-slate-400 uppercase tracking-wide">Active Agents</p>
-        <p class="text-4xl font-bold text-slate-400 dark:text-slate-500 stat-number">—</p>
-        <p class="text-sm text-slate-500 dark:text-slate-500">Metrics coming soon</p>
+        <p class="text-sm font-semibold text-slate-600 dark:text-slate-400 uppercase tracking-wide">Registered Agents</p>
+        <p class="text-4xl font-bold text-slate-900 dark:text-white stat-number">{{ total_agents }}</p>
+        <p class="text-sm text-slate-500 dark:text-slate-500">Across all projects</p>
       </div>
     </div>
 
@@ -154,19 +154,18 @@
       <!-- Projects Grid with filtering -->
       <div :class="view === 'grid' ? 'grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6' : 'space-y-4'">
         {% for p in projects %}
-        <a href="/mail/{{ p.slug }}"
-           x-show="!searchQuery || $el.dataset.projectSearch.includes((searchQuery || '').toLowerCase())"
-           x-transition:enter="transition ease-out duration-200"
-           x-transition:enter-start="opacity-0 transform scale-95"
-           x-transition:enter-end="opacity-100 transform scale-100"
-           x-transition:leave="transition ease-in duration-150"
-           x-transition:leave-start="opacity-100 transform scale-100"
-           x-transition:leave-end="opacity-0 transform scale-95"
-           class="group relative bg-white dark:bg-slate-800 rounded-2xl p-8 shadow-soft border-2 border-slate-200 dark:border-slate-700 hover:border-primary-400 dark:hover:border-primary-600 transition-all duration-300 card-hover overflow-hidden stagger-item"
-           data-anim-delay="{{ [loop.index0 * 0.05, 1.0]|min }}"
-           data-project-card="true"
-           data-project-id="{{ p.id }}"
-           data-project-search="{{ (p.human_key ~ ' ' ~ p.slug)|lower }}">
+        <article x-show="!searchQuery || $el.dataset.projectSearch.includes((searchQuery || '').toLowerCase())"
+                 x-transition:enter="transition ease-out duration-200"
+                 x-transition:enter-start="opacity-0 transform scale-95"
+                 x-transition:enter-end="opacity-100 transform scale-100"
+                 x-transition:leave="transition ease-in duration-150"
+                 x-transition:leave-start="opacity-100 transform scale-100"
+                 x-transition:leave-end="opacity-0 transform scale-95"
+                 class="group relative bg-white dark:bg-slate-800 rounded-2xl p-8 shadow-soft border-2 border-slate-200 dark:border-slate-700 hover:border-primary-400 dark:hover:border-primary-600 transition-all duration-300 card-hover overflow-hidden stagger-item"
+                 data-anim-delay="{{ [loop.index0 * 0.05, 1.0]|min }}"
+                 data-project-card="true"
+                 data-project-id="{{ p.id }}"
+                 data-project-search="{{ (p.human_key ~ ' ' ~ p.slug)|lower }}">
 
           <!-- Decorative gradient blob -->
           <div class="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-primary-500/10 to-purple-500/10 rounded-full blur-3xl group-hover:scale-150 transition-transform duration-500 pointer-events-none"></div>
@@ -178,15 +177,15 @@
             </div>
             <div class="flex flex-col items-end gap-2">
               <span class="px-3 py-1.5 bg-gradient-to-r from-success-100 to-success-200 dark:from-success-900/30 dark:to-success-800/30 text-success-700 dark:text-success-300 text-xs font-bold rounded-full flex items-center gap-1.5 shadow-sm">
-                <span class="w-2 h-2 bg-success-500 rounded-full animate-pulse"></span>
-                Active
+                <span class="w-2 h-2 bg-success-500 rounded-full"></span>
+                Registered
               </span>
             </div>
           </div>
 
           <!-- Project Name -->
           <h3 class="relative text-xl font-bold text-slate-900 dark:text-white mb-3 group-hover:text-primary-600 dark:group-hover:text-primary-400 transition-colors line-clamp-2 min-h-[3.5rem]">
-            {{ p.human_key }}
+            <a href="/mail/{{ p.slug }}">{{ p.human_key }}</a>
           </h3>
 
           <!-- Project Meta -->
@@ -213,16 +212,14 @@
                   <div class="w-7 h-7 bg-gradient-to-br from-blue-500 to-blue-600 rounded-full border-2 border-white dark:border-slate-800 flex items-center justify-center" data-tippy-content="Agents">
                     <i data-lucide="users" class="w-3.5 h-3.5 text-white"></i>
                   </div>
-                  <div class="w-7 h-7 bg-gradient-to-br from-purple-500 to-purple-600 rounded-full border-2 border-white dark:border-slate-800 flex items-center justify-center" data-tippy-content="Messages">
-                    <i data-lucide="mail" class="w-3.5 h-3.5 text-white"></i>
-                  </div>
                 </div>
-                <span class="text-xs font-medium">0 agents • 0 msgs</span>
+                <span class="text-xs font-medium">{{ p.agent_count }} agent{{ 's' if p.agent_count != 1 else '' }}</span>
               </div>
-              <div class="flex items-center gap-2 text-primary-600 dark:text-primary-400 font-medium group-hover:gap-3 transition-all duration-300">
+              <a href="/mail/{{ p.slug }}"
+                 class="flex items-center gap-2 text-primary-600 dark:text-primary-400 font-medium group-hover:gap-3 transition-all duration-300">
                 <span class="text-xs">Open</span>
                 <i data-lucide="arrow-right" class="w-4 h-4"></i>
-              </div>
+              </a>
             </div>
           </div>
 
@@ -380,7 +377,7 @@
             {% endif %}
           </div>
           {% endif %}
-        </a>
+        </article>
         {% endfor %}
       </div>
 
@@ -643,6 +640,14 @@
         const status = payload.status || '';
         const projectA = suggestion.project_a || {};
         const projectB = suggestion.project_b || {};
+
+        // Reset turns the confirmed badge back into a scored suggestion. The
+        // server owns the score threshold and both mirrored project cards, so
+        // re-render instead of leaving a successful reset looking like delete.
+        if (status === 'suggested' && isReset) {
+          window.location.reload();
+          return;
+        }
 
         if (row) {
           // Suggestion row path (confirm/dismiss)
