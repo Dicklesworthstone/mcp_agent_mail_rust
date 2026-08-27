@@ -84,6 +84,27 @@ fn templates_render_mail_index() {
         "should produce HTML"
     );
     assert!(out.contains("test-project"), "should contain project slug");
+    assert!(
+        out.contains("document.modelContext.registerTool"),
+        "the browser UI should retain its progressive WebMCP registration"
+    );
+    assert!(
+        out.contains("agent_mail.list_projects")
+            && out.contains("agent_mail.open_project")
+            && out.contains("agent_mail.search_messages"),
+        "WebMCP should expose only the native browsing workflow"
+    );
+    assert!(
+        !out.contains("exposedTo:"),
+        "viewer tools must remain same-origin and must not be cross-origin exposed"
+    );
+    assert!(
+        out.contains("credentials: 'same-origin'")
+            && out.contains("readOnlyHint: true")
+            && out.contains("untrustedContentHint: true")
+            && out.contains("MAX_PROJECT_OUTPUT_CHARS = 1400"),
+        "WebMCP must retain the bounded, read-only browser-session boundary"
+    );
 }
 
 #[derive(Serialize)]

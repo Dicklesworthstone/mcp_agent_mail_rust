@@ -17096,6 +17096,8 @@ fn apply_cors_headers(
 /// - `X-Content-Type-Options: nosniff` — defeats MIME sniffing.
 /// - `Referrer-Policy: no-referrer` — never emit a `Referer` header.
 /// - `X-Frame-Options: DENY` — the web UI is never meant to be framed.
+/// - `Origin-Agent-Cluster: ?1` — gives progressive WebMCP support the
+///   origin-keyed document isolation required by browsers that implement it.
 ///
 /// A restrictive `Content-Security-Policy` is intentionally *not* set here:
 /// the web UI loads scripts from a CDN and relies on inline attributes, so a
@@ -17105,10 +17107,11 @@ fn apply_cors_headers(
 /// Headers are only added when absent so a specific route can still override
 /// them (none currently do).
 fn apply_security_headers(resp: &mut Http1Response) {
-    const SECURITY_HEADERS: [(&str, &str); 3] = [
+    const SECURITY_HEADERS: [(&str, &str); 4] = [
         ("x-content-type-options", "nosniff"),
         ("referrer-policy", "no-referrer"),
         ("x-frame-options", "DENY"),
+        ("origin-agent-cluster", "?1"),
     ];
     for (name, value) in SECURITY_HEADERS {
         let already_present = resp
@@ -22111,6 +22114,7 @@ first body
             Some("no-referrer")
         );
         assert_eq!(response_header(&resp, "x-frame-options"), Some("DENY"));
+        assert_eq!(response_header(&resp, "origin-agent-cluster"), Some("?1"));
     }
 
     #[test]

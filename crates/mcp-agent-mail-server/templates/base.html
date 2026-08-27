@@ -201,6 +201,166 @@
       };
     </script>
 
+    <!--
+      WebMCP is a progressive enhancement for browser-local agents. It is not
+      a remote MCP endpoint and never accepts Agent Mail credentials as a tool
+      input or returns them in tool output. These tools use the page's existing
+      browser authentication path only. Browsers without document.modelContext
+      simply skip this block.
+    -->
+    <script>
+      (function () {
+        const MAX_PROJECTS = 8;
+        const MAX_PROJECT_QUERY_LENGTH = 96;
+        const MAX_PROJECT_SLUG_LENGTH = 1024;
+        const MAX_PROJECT_OUTPUT_CHARS = 1400;
+        const MAX_QUERY_LENGTH = 200;
+        const projectSlugPattern = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
+
+        function supportedContext() {
+          const context = document.modelContext;
+          return !context || typeof context.registerTool !== 'function' ? null : context;
+        }
+
+        function projectSlug(value) {
+          const slug = typeof value === 'string' ? value.trim() : '';
+          if (slug.length > MAX_PROJECT_SLUG_LENGTH || !projectSlugPattern.test(slug)) {
+            throw new Error('INVALID_ARGUMENT: project_slug must be a slug returned by agent_mail.list_projects.');
+          }
+          return slug;
+        }
+
+        function searchQuery(value) {
+          const query = typeof value === 'string' ? value.trim() : '';
+          if (query.length === 0 || query.length > MAX_QUERY_LENGTH) {
+            throw new Error(`INVALID_ARGUMENT: query must contain 1 to ${MAX_QUERY_LENGTH} characters.`);
+          }
+          return query;
+        }
+
+        function navigate(path) {
+          if (typeof window.agentMailNavigate === 'function') {
+            window.agentMailNavigate(path);
+          } else {
+            window.location.assign(path);
+          }
+        }
+
+        async function projectCatalog(signal) {
+          const path = window.agentMailAppendAuth('/mail/api/unified-inbox?include_projects=true&limit=1');
+          const response = await fetch(path, {
+            credentials: 'same-origin',
+            headers: { Accept: 'application/json' },
+            signal,
+          });
+          if (!response.ok) {
+            throw new Error(`UPSTREAM_UNAVAILABLE: project catalog returned HTTP ${response.status}.`);
+          }
+          const payload = await response.json();
+          if (!Array.isArray(payload.projects)) {
+            throw new Error('UPSTREAM_INVALID_RESPONSE: project catalog did not contain projects.');
+          }
+          return payload.projects
+            .filter((project) => project && typeof project.slug === 'string' && typeof project.human_key === 'string')
+            .filter((project) => project.slug.length <= MAX_PROJECT_SLUG_LENGTH && projectSlugPattern.test(project.slug))
+            .map((project) => ({ slug: project.slug, humanKey: project.human_key }));
+        }
+
+        async function registerTools() {
+          const context = supportedContext();
+          if (!context) return;
+
+          await context.registerTool({
+            name: 'agent_mail.list_projects',
+            description: 'List up to eight Agent Mail projects visible in this authenticated viewer. Use a returned slug with the navigation tools. Results may contain user-controlled names.',
+            inputSchema: {
+              type: 'object',
+                properties: {
+                  query: { type: 'string', maxLength: 96, description: 'Optional text to match against project slug or key.' },
+                  limit: { type: 'integer', minimum: 1, maximum: MAX_PROJECTS, description: 'Maximum projects to return, from 1 to 8.' },
+              },
+              additionalProperties: false,
+            },
+            annotations: { readOnlyHint: true, untrustedContentHint: true },
+            execute: async ({ query = '', limit = MAX_PROJECTS } = {}, { signal } = {}) => {
+              if (
+                typeof query !== 'string'
+                || query.trim().length > MAX_PROJECT_QUERY_LENGTH
+                || !Number.isInteger(limit)
+                || limit < 1
+                || limit > MAX_PROJECTS
+              ) {
+                throw new Error('INVALID_ARGUMENT: query must contain at most 96 characters and limit must be an integer from 1 to 8.');
+              }
+              const normalizedQuery = query.trim().toLowerCase();
+              const matchingProjects = (await projectCatalog(signal))
+                .filter((project) => normalizedQuery === '' || project.slug.toLowerCase().includes(normalizedQuery) || project.humanKey.toLowerCase().includes(normalizedQuery));
+              const project_slugs = [];
+              for (const project of matchingProjects) {
+                if (project_slugs.length === limit) break;
+                const candidate = [...project_slugs, project.slug];
+                if (JSON.stringify({ project_slugs: candidate, truncated: true }).length > MAX_PROJECT_OUTPUT_CHARS) {
+                  continue;
+                }
+                project_slugs.push(project.slug);
+              }
+              return JSON.stringify({
+                project_slugs,
+                truncated: project_slugs.length < matchingProjects.length,
+              });
+            },
+          });
+
+          await context.registerTool({
+            name: 'agent_mail.open_project',
+            description: 'Navigate this authenticated Agent Mail viewer to one project. This is navigation only and never changes mail data.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                project_slug: { type: 'string', maxLength: MAX_PROJECT_SLUG_LENGTH, description: 'A slug returned by agent_mail.list_projects.' },
+              },
+              required: ['project_slug'],
+              additionalProperties: false,
+            },
+            annotations: { readOnlyHint: true, untrustedContentHint: false },
+            execute: ({ project_slug: rawSlug } = {}) => {
+              const slug = projectSlug(rawSlug);
+              navigate(`/mail/${encodeURIComponent(slug)}`);
+              return 'Navigating to the requested Agent Mail project.';
+            },
+          });
+
+          await context.registerTool({
+            name: 'agent_mail.search_messages',
+            description: 'Open the native Agent Mail search page for one project. This is navigation only and never changes mail data.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                project_slug: { type: 'string', maxLength: MAX_PROJECT_SLUG_LENGTH, description: 'A slug returned by agent_mail.list_projects.' },
+                query: { type: 'string', minLength: 1, maxLength: MAX_QUERY_LENGTH, description: 'Text to search in that project.' },
+              },
+              required: ['project_slug', 'query'],
+              additionalProperties: false,
+            },
+            annotations: { readOnlyHint: true, untrustedContentHint: false },
+            execute: ({ project_slug: rawSlug, query: rawQuery } = {}) => {
+              const slug = projectSlug(rawSlug);
+              const query = searchQuery(rawQuery);
+              navigate(`/mail/${encodeURIComponent(slug)}/search?q=${encodeURIComponent(query)}`);
+              return 'Navigating to native Agent Mail search results.';
+            },
+          });
+        }
+
+        const start = () => { void registerTools(); };
+        if (document.readyState === 'loading') {
+          document.addEventListener('DOMContentLoaded', start, { once: true });
+        } else {
+          start();
+        }
+      })();
+    </script>
+
     <!-- Tippy.js for beautiful tooltips -->
     <script src="https://unpkg.com/@popperjs/core@2"></script>
     <script src="https://unpkg.com/tippy.js@6"></script>
