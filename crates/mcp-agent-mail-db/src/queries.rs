@@ -9657,6 +9657,7 @@ pub struct SearchRow {
     pub thread_id: Option<String>,
     pub from: String,
     pub body_md: String,
+    pub topic: Option<String>,
 }
 
 pub const UNKNOWN_SENDER_DISPLAY: &str = "[unknown sender]";
@@ -9683,6 +9684,7 @@ pub struct SearchRowWithProject {
     pub from: String,
     pub body_md: String,
     pub project_id: i64,
+    pub topic: Option<String>,
 }
 
 // FTS5 unsearchable patterns that cannot produce meaningful results.
@@ -9963,7 +9965,7 @@ async fn run_like_fallback(
 
     let sql = format!(
         "SELECT m.id, m.sender_id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, \
-                COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') as from_name, m.body_md \
+                COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') as from_name, m.body_md, m.topic \
          FROM messages m \
          LEFT JOIN agents a ON a.id = m.sender_id \
          WHERE m.project_id = ? AND ({where_clause}) \
@@ -9998,7 +10000,7 @@ async fn run_like_fallback_product(
 
     let sql = format!(
         "SELECT m.id, m.sender_id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, \
-                COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') as from_name, m.body_md, m.project_id \
+                COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') as from_name, m.body_md, m.project_id, m.topic \
          FROM messages m \
          LEFT JOIN agents a ON a.id = m.sender_id \
          JOIN product_project_links ppl ON ppl.project_id = m.project_id \
@@ -10082,6 +10084,7 @@ pub async fn search_messages(
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
                 let body_md: String = row.get_as(8).unwrap_or_default();
+                let topic: Option<String> = row.get_as(9).unwrap_or_default();
 
                 out.push(SearchRow {
                     id,
@@ -10093,6 +10096,7 @@ pub async fn search_messages(
                     thread_id,
                     from,
                     body_md,
+                    topic,
                 });
             }
             Outcome::Ok(out)
@@ -10149,7 +10153,7 @@ pub async fn search_messages_for_product(
                 // Use positional access for aliased columns where ORM column name inference
                 // incorrectly parses "a.name as from_name" as "name as" instead of "from_name".
                 // Column order: id(0), sender_id(1), subject(2), importance(3), ack_required(4),
-                // created_ts(5), thread_id(6), from_name(7), body_md(8), project_id(9)
+                // created_ts(5), thread_id(6), from_name(7), body_md(8), project_id(9), topic(10)
                 let id: i64 = match row.get_named("id") {
                     Ok(v) => v,
                     Err(_) => match row.get_as(0) {
@@ -10211,6 +10215,7 @@ pub async fn search_messages_for_product(
                         None => 0,
                     },
                 };
+                let topic: Option<String> = row.get_as(10).unwrap_or_default();
 
                 out.push(SearchRowWithProject {
                     id,
@@ -10223,6 +10228,7 @@ pub async fn search_messages_for_product(
                     from,
                     body_md,
                     project_id,
+                    topic,
                 });
             }
             Outcome::Ok(out)

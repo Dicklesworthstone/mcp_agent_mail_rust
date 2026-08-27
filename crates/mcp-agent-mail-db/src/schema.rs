@@ -4725,6 +4725,89 @@ mod tests {
     }
 
     #[test]
+    fn topic_migrations_upgrade_legacy_messages_and_filter_case_insensitively() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("topic_migration.db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open connection");
+
+        conn.execute_raw(
+            "CREATE TABLE messages (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                project_id INTEGER NOT NULL,\
+                subject TEXT NOT NULL\
+            )",
+        )
+        .expect("create legacy messages table");
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init migrations table");
+                for migration in [
+                    Migration::new(
+                        "v27_add_topic_to_messages".to_string(),
+                        "add optional topic tag to messages".to_string(),
+                        "ALTER TABLE messages ADD COLUMN topic TEXT COLLATE NOCASE".to_string(),
+                        String::new(),
+                    ),
+                    Migration::new(
+                        "v27_idx_messages_project_topic".to_string(),
+                        "index message topics by project".to_string(),
+                        "CREATE INDEX IF NOT EXISTS idx_messages_project_topic \
+                         ON messages(project_id, topic)"
+                            .to_string(),
+                        String::new(),
+                    ),
+                ] {
+                    run_single_migration_with_lock_retry(&cx, conn, &migration)
+                        .await
+                        .into_result()
+                        .expect("apply topic migration");
+                }
+            }
+        });
+
+        conn.execute_raw(
+            "INSERT INTO messages (project_id, subject, topic) \
+             VALUES (7, 'migration witness', 'Br-Abc.1')",
+        )
+        .expect("insert topic witness");
+
+        let topic_columns = conn
+            .query_sync("PRAGMA table_info(messages)", &[])
+            .expect("inspect message columns");
+        assert!(
+            topic_columns.iter().any(|row| {
+                row.get_named::<String>("name").ok().as_deref() == Some("topic")
+            }),
+            "topic column should exist after migration"
+        );
+
+        let indexes = conn
+            .query_sync("PRAGMA index_list(messages)", &[])
+            .expect("inspect message indexes");
+        assert!(
+            indexes.iter().any(|row| {
+                row.get_named::<String>("name").ok().as_deref()
+                    == Some("idx_messages_project_topic")
+            }),
+            "topic lookup index should exist after migration"
+        );
+
+        let matching = conn
+            .query_sync(
+                "SELECT id FROM messages \
+                 WHERE project_id = $1 AND topic = $2 COLLATE NOCASE",
+                &[Value::BigInt(7), Value::Text("br-abc.1".to_string())],
+            )
+            .expect("query topic case-insensitively");
+        assert_eq!(matching.len(), 1, "topic lookup should ignore ASCII case");
+    }
+
+    #[test]
     fn analyze_migration_records_when_target_table_is_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("analyze_missing_atc_table.db");

@@ -7742,6 +7742,7 @@ body
   "cc": [],
   "bcc": ["Carol"],
   "thread_id": "TEST-1",
+  "topic": "br-abc.1",
   "subject": "Hello Bob",
   "importance": "normal",
   "ack_required": false,
@@ -7772,11 +7773,15 @@ Hello Bob, this is a test message.
         let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
         let rows = conn
             .query_sync(
-                "SELECT subject, body_md, thread_id, recipients_json FROM messages LIMIT 1",
+                "SELECT subject, body_md, thread_id, topic, recipients_json FROM messages LIMIT 1",
                 &[],
             )
             .unwrap();
         assert!(!rows.is_empty(), "message should exist in DB");
+        assert_eq!(
+            rows[0].get_named::<String>("topic").expect("topic"),
+            "br-abc.1"
+        );
         let recipients_json = rows[0]
             .get_named::<String>("recipients_json")
             .expect("recipients_json");
