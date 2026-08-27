@@ -2673,7 +2673,7 @@ Choose a different name (or omit the name to auto-generate one)."
 
 /// Temporarily remove an agent from active routing while preserving history.
 #[tool(
-    description = "Retire an agent without deleting its identity or history. The agent is hidden from active rosters and cannot send or receive new messages until unretired. Authorization requires either the agent registration_token or a pane bound to the agent."
+    description = "Soft-delete an agent: mark it as retired so it stops accepting new messages while preserving message history. Retired agents are hidden from active agent lists but visible in 'all agents' views.\n\nRust authorization extension: authorization requires either the agent registration_token or a pane bound to the agent."
 )]
 pub async fn retire_agent(
     ctx: &McpContext,
@@ -2732,7 +2732,7 @@ pub async fn retire_agent(
 
 /// Restore a retired agent to active routing.
 #[tool(
-    description = "Restore a retired agent to active routing. The identity and preserved history are unchanged, and the agent can send and receive new messages again. Deregistered agents cannot be unretired. Authorization requires either the agent registration_token or a pane bound to the agent."
+    description = "Restore a retired agent back to active status. The agent will resume accepting new messages.\n\nRust authorization extension: deregistered agents cannot be unretired, and authorization requires either the agent registration_token or a pane bound to the agent."
 )]
 pub async fn unretire_agent(
     ctx: &McpContext,
@@ -2780,7 +2780,7 @@ pub async fn unretire_agent(
 
 /// Permanently remove an agent from active routing without deleting history.
 #[tool(
-    description = "Deregister an agent without deleting its identity, messages, reservations, or archive history. The agent is hidden from active rosters and can no longer send or receive new messages. Deregistration is permanent for that identity. Authorization requires either the agent registration_token or a pane bound to the agent."
+    description = "Remove an agent from a project. Marks the agent as inactive and removes it from the active roster. Messages from/to the agent are preserved for audit but the agent can no longer send or receive new messages.\n\nRust authorization extension: deregistration also preserves reservations and Git archive history. It is permanent for that identity, and authorization requires either the agent registration_token or a pane bound to the agent."
 )]
 pub async fn deregister_agent(
     ctx: &McpContext,

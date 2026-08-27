@@ -132,6 +132,36 @@
       }
     },
     {
+      "name": "deregister_agent",
+      "description": "Remove an agent from a project. Marks the agent as inactive and removes it from the active roster. Messages from/to the agent are preserved for audit but the agent can no longer send or receive new messages.",
+      "inputSchema": {
+        "properties": {
+          "project_key": {
+            "type": "string"
+          },
+          "agent_name": {
+            "type": "string"
+          },
+          "registration_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name"
+        ],
+        "type": "object"
+      }
+    },
+    {
       "name": "ensure_product",
       "description": "Ensure a Product exists. If not, create one.\n\n- product_key may be a product_uid or a name\n- If both are absent, error",
       "inputSchema": {
@@ -2002,6 +2032,66 @@
       }
     },
     {
+      "name": "retire_agent",
+      "description": "Soft-delete an agent: mark it as retired so it stops accepting new messages while preserving message history. Retired agents are hidden from active agent lists but visible in 'all agents' views.",
+      "inputSchema": {
+        "properties": {
+          "project_key": {
+            "type": "string"
+          },
+          "agent_name": {
+            "type": "string"
+          },
+          "registration_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "unretire_agent",
+      "description": "Restore a retired agent back to active status. The agent will resume accepting new messages.",
+      "inputSchema": {
+        "properties": {
+          "project_key": {
+            "type": "string"
+          },
+          "agent_name": {
+            "type": "string"
+          },
+          "registration_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name"
+        ],
+        "type": "object"
+      }
+    },
+    {
       "name": "uninstall_precommit_guard",
       "description": "",
       "inputSchema": {
@@ -2066,5 +2156,5 @@
       }
     }
   ],
-  "tool_count": 40
+  "tool_count": 43
 }

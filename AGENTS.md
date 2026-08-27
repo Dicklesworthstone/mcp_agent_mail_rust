@@ -255,16 +255,16 @@ scripts/e2e_cli.sh            # CLI integration (99 assertions)
 | `mcp-agent-mail-db` | SQL queries, pool, cache coherency, FTS sanitization, stress tests (concurrent ops, pool exhaustion) |
 | `mcp-agent-mail-storage` | Git archive, commit coalescer, notification signals |
 | `mcp-agent-mail-guard` | Pre-commit reservation enforcement, symmetric fnmatch, archive reading, rename handling |
-| `mcp-agent-mail-tools` | 40 MCP tool implementations via conformance fixtures |
+| `mcp-agent-mail-tools` | 43 MCP tool implementations via conformance fixtures |
 | `mcp-agent-mail-share` | Snapshot, scrub, bundle, crypto pipeline |
 | `mcp-agent-mail-server` | HTTP handler, dispatch, TUI widgets, property tests |
 | `mcp-agent-mail-cli` | 40+ CLI commands, dual-mode matrix |
-| `mcp-agent-mail-conformance` | Parity with Python reference (34 Python-parity tools + 6 Rust-native, 25 resources) |
+| `mcp-agent-mail-conformance` | Parity with Python reference (37 Python-parity tools + 6 Rust-native, 25 resources) |
 | `tests/e2e/` | Cross-component E2E via stdio/HTTP transport |
 
 ### Test Fixtures
 
-Conformance tests use Python-generated fixtures in `tests/conformance/fixtures/` to ensure output format parity with the reference Python implementation across 34 Python-parity tools and 25 resources (6 additional Rust-native tools are tested separately).
+Conformance tests use Python-generated fixtures in `tests/conformance/fixtures/` to ensure output format parity with the reference Python implementation across 37 Python-parity tools and 25 resources (6 additional Rust-native tools are tested separately).
 
 ---
 
@@ -477,7 +477,7 @@ reflection surface:
 
 ## MCP Agent Mail — This Project
 
-**This is the project you're working on.** MCP Agent Mail is a mail-like coordination layer for coding agents, providing an MCP server with 40 tools and 25 resources, Git-backed archive, SQLite indexing, and an interactive TUI operations console.
+**This is the project you're working on.** MCP Agent Mail is a mail-like coordination layer for coding agents, providing an MCP server with 43 tools and 25 resources, Git-backed archive, SQLite indexing, and an interactive TUI operations console.
 
 ### What It Does
 
@@ -523,7 +523,7 @@ mcp_agent_mail_rust/
 │   ├── mcp-agent-mail-storage/             # Git archive, commit coalescer
 │   ├── mcp-agent-mail-guard/               # Pre-commit guard, reservation enforcement
 │   ├── mcp-agent-mail-share/               # Snapshot, scrub, bundle, crypto, export
-│   ├── mcp-agent-mail-tools/               # 40 MCP tool implementations
+│   ├── mcp-agent-mail-tools/               # 43 MCP tool implementations
 │   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI
 │   ├── mcp-agent-mail/                     # Server binary (mcp-agent-mail)
 │   ├── mcp-agent-mail-cli/                 # CLI binary (am)
@@ -550,18 +550,18 @@ mcp_agent_mail_rust/
 | `mcp-agent-mail-storage` | `src/coalesce.rs` | Async git commit coalescer (WBQ) |
 | `mcp-agent-mail-guard` | `src/lib.rs` | Pre-commit hook, reservation conflict detection |
 | `mcp-agent-mail-share` | `src/` | 8 modules: snapshot, scrub, bundle, crypto, finalize, hosting, scope |
-| `mcp-agent-mail-tools` | `src/` | 40 MCP tool implementations across 9 clusters |
+| `mcp-agent-mail-tools` | `src/` | 43 MCP tool implementations across 9 clusters |
 | `mcp-agent-mail-server` | `src/lib.rs` | Server dispatch, HTTP handler |
 | `mcp-agent-mail-server` | `src/tui_*.rs` | TUI operations console (16 screens) |
 | `mcp-agent-mail` | `src/main.rs` | Server binary entry point (dual-mode) |
 | `mcp-agent-mail-cli` | `src/main.rs` | CLI binary (`am`) entry point |
 
-### 40 MCP Tools (9 Clusters)
+### 43 MCP Tools (9 Clusters)
 
 | Cluster | Count | Tools |
 |---------|-------|-------|
 | Infrastructure | 4 | health_check, ensure_project, install_precommit_guard, uninstall_precommit_guard |
-| Identity | 6 | register_agent, create_agent_identity, whois, resolve_pane_identity, cleanup_pane_identities, list_agents |
+| Identity | 9 | register_agent, create_agent_identity, retire_agent, unretire_agent, deregister_agent, whois, resolve_pane_identity, cleanup_pane_identities, list_agents |
 | Messaging | 7 | send_message, reply_message, fetch_inbox, fetch_inbox_events, get_message_delivery_receipt, acknowledge_message, mark_message_read |
 | Contacts | 4 | request_contact, respond_contact, list_contacts, set_contact_policy |
 | File Reservations | 5 | check_file_reservation_conflicts, file_reservation_paths, renew_file_reservations, release_file_reservations, force_release_file_reservation |

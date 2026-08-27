@@ -223,6 +223,167 @@ fn send_msg(
     })
 }
 
+#[test]
+fn agent_lifecycle_preserves_history_and_gates_routing_atomically() {
+    let (pool, _dir) = make_pool();
+    let project_id = setup_project(&pool);
+    let sender_id = setup_agent(&pool, project_id, "BlueLake");
+    let recipient_id = setup_agent(&pool, project_id, "GreenCastle");
+    let historical_message_id = send_msg(
+        &pool,
+        project_id,
+        sender_id,
+        recipient_id,
+        "history witness",
+        "must survive lifecycle transitions",
+        None,
+    );
+
+    block_on(|cx| async move {
+        let retired_at = mcp_agent_mail_db::now_micros();
+        let retired = queries::set_agent_retired_at(
+            &cx,
+            &pool,
+            recipient_id,
+            Some(retired_at),
+        )
+        .await
+        .into_result()
+        .expect("retire recipient");
+        assert_eq!(retired.retired_at, Some(retired_at));
+        let active = queries::list_active_agents_bounded(
+            &cx,
+            &pool,
+            project_id,
+            None,
+            None,
+        )
+        .await
+        .into_result()
+        .expect("list active agents after retirement");
+        assert!(active.iter().all(|agent| agent.id != Some(recipient_id)));
+
+        let rejected = queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender_id,
+            "retired recipient",
+            "must reject",
+            None,
+            "normal",
+            false,
+            "[]",
+            &[(recipient_id, "to")],
+        )
+        .await;
+        assert!(matches!(
+            rejected,
+            Outcome::Err(DbError::InvalidArgument {
+                field: "agent_retired",
+                ..
+            })
+        ));
+
+        queries::set_agent_retired_at(&cx, &pool, recipient_id, None)
+            .await
+            .into_result()
+            .expect("unretire recipient");
+        queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender_id,
+            "restored recipient",
+            "must deliver",
+            None,
+            "normal",
+            false,
+            "[]",
+            &[(recipient_id, "to")],
+        )
+        .await
+        .into_result()
+        .expect("delivery after unretire");
+
+        let deregistered_at = mcp_agent_mail_db::now_micros();
+        let deregistered = queries::deregister_agent(
+            &cx,
+            &pool,
+            recipient_id,
+            deregistered_at,
+        )
+        .await
+        .into_result()
+        .expect("deregister recipient");
+        assert_eq!(deregistered.contact_policy, "block_all");
+        assert!(deregistered.task_description.starts_with("[DEREGISTERED "));
+        assert_eq!(
+            queries::get_agent_deregistered_at(&cx, &pool, recipient_id)
+                .await
+                .into_result()
+                .expect("read deregistration ledger"),
+            Some(deregistered_at)
+        );
+
+        // A retry is idempotent and cannot rewrite the authoritative first
+        // deregistration timestamp.
+        queries::deregister_agent(
+            &cx,
+            &pool,
+            recipient_id,
+            deregistered_at.saturating_add(1_000_000),
+        )
+        .await
+        .into_result()
+        .expect("repeat deregistration");
+        assert_eq!(
+            queries::get_agent_deregistered_at(&cx, &pool, recipient_id)
+                .await
+                .into_result()
+                .expect("read stable deregistration ledger"),
+            Some(deregistered_at)
+        );
+
+        let rejected = queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender_id,
+            "deregistered recipient",
+            "must reject",
+            None,
+            "normal",
+            false,
+            "[]",
+            &[(recipient_id, "to")],
+        )
+        .await;
+        assert!(matches!(
+            rejected,
+            Outcome::Err(DbError::InvalidArgument {
+                field: "agent_deregistered",
+                ..
+            })
+        ));
+
+        let cannot_unretire = queries::set_agent_retired_at(&cx, &pool, recipient_id, None).await;
+        assert!(matches!(
+            cannot_unretire,
+            Outcome::Err(DbError::InvalidArgument {
+                field: "agent_deregistered",
+                ..
+            })
+        ));
+
+        let historical = queries::get_message(&cx, &pool, historical_message_id)
+            .await
+            .into_result()
+            .expect("historical message survives");
+        assert_eq!(historical.subject, "history witness");
+    });
+}
+
 /// Update a reservation's `released_ts` via raw SQL (legacy sentinel simulation).
 fn set_reservation_released_ts(pool: &DbPool, reservation_id: i64, released_ts: i64) {
     block_on(|cx| {
