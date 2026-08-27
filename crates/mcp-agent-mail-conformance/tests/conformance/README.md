@@ -1,11 +1,18 @@
-# Conformance Fixtures (Python MCP Agent Mail)
+# Compatibility and Rust-Native Conformance Fixtures
 
-This directory contains fixture-based conformance tests that compare Rust outputs
-against the legacy Python MCP Agent Mail behavior.
+This directory contains fixture-based tests for the intentionally supported
+legacy Python wire contracts and for Rust-native behavior. The Rust
+implementation is the product authority: fixture drift is classified before it
+is fixed, and a legacy artifact never overrides a stronger Rust reliability,
+security, bounded-work, or structured-concurrency invariant.
 
 Alongside the Python reference lane, the Rust harness also loads dedicated
 Rust-native fixtures from `tests/conformance/fixtures/rust_native/*.json` for
 tools that intentionally have no Python analogue.
+
+`fixtures/tool_filter/cases.json` is a Rust-owned live-surface contract, not a
+captured Python behavior fixture. It must track the tools registered by the Rust
+router and the Rust profile/cluster filtering rules.
 
 ## Fixture Schema
 

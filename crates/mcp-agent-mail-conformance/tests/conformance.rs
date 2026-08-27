@@ -2642,6 +2642,170 @@ fn lifecycle_tools_preserve_authorization_roster_and_permanent_deregistration_co
 }
 
 #[test]
+fn topic_tools_persist_filter_and_inherit_topics_through_the_router() {
+    let _lock = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+    let env = setup_fixture_env();
+    let project_path = env.tmp.path().join("topic-project");
+    std::fs::create_dir_all(&project_path).expect("create topic fixture project");
+    let project_key = project_path.to_string_lossy().into_owned();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id = 20_000;
+
+    let invoke = |tool: &str, input: Value, req_id: &mut u64| {
+        execute_tool(
+            &env.router,
+            &cx,
+            &budget,
+            req_id,
+            tool,
+            args_from_value(&input),
+        )
+        .unwrap_or_else(|error| panic!("{tool} router failure: {error}"))
+    };
+
+    invoke(
+        "ensure_project",
+        serde_json::json!({ "human_key": &project_key }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("ensure_project failed: {error}"));
+    let sender = invoke(
+        "register_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "program": "codex-cli",
+            "model": "gpt-5",
+            "name": "GreenStone",
+            "task_description": "topic sender"
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("register sender failed: {error}"));
+    let sender_token = sender["registration_token"]
+        .as_str()
+        .expect("sender registration token")
+        .to_string();
+    let recipient = invoke(
+        "register_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "program": "codex-cli",
+            "model": "gpt-5",
+            "name": "BlueLake",
+            "task_description": "topic recipient"
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("register recipient failed: {error}"));
+    let recipient_token = recipient["registration_token"]
+        .as_str()
+        .expect("recipient registration token")
+        .to_string();
+
+    let sent = invoke(
+        "send_message",
+        serde_json::json!({
+            "project_key": &project_key,
+            "sender_name": "GreenStone",
+            "sender_token": &sender_token,
+            "to": ["BlueLake"],
+            "subject": "Topic witness",
+            "body_md": "topic body",
+            "topic": "release.v31"
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("send_message failed: {error}"));
+    let message_id = sent["deliveries"][0]["payload"]["id"]
+        .as_i64()
+        .expect("sent message id");
+    assert_eq!(sent["deliveries"][0]["payload"]["topic"], "release.v31");
+
+    let inbox = invoke(
+        "fetch_inbox",
+        serde_json::json!({
+            "project_key": &project_key,
+            "agent_name": "BlueLake",
+            "topic": "RELEASE.V31",
+            "include_bodies": true,
+            "mark_read": false
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("fetch_inbox topic filter failed: {error}"));
+    assert_eq!(inbox.as_array().map(Vec::len), Some(1));
+    assert_eq!(inbox[0]["id"].as_i64(), Some(message_id));
+    assert_eq!(inbox[0]["body_md"], "topic body");
+
+    let reply = invoke(
+        "reply_message",
+        serde_json::json!({
+            "project_key": &project_key,
+            "message_id": message_id,
+            "sender_name": "BlueLake",
+            "sender_token": &recipient_token,
+            "body_md": "topic reply"
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("reply_message failed: {error}"));
+    assert_eq!(reply["topic"], "release.v31");
+
+    let topic_messages = invoke(
+        "fetch_topic",
+        serde_json::json!({
+            "project_key": &project_key,
+            "topic_name": "Release.V31",
+            "include_bodies": true,
+            "limit": 10
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("fetch_topic failed: {error}"));
+    let topic_messages = topic_messages.as_array().expect("fetch_topic array");
+    assert_eq!(topic_messages.len(), 2);
+    assert!(
+        topic_messages
+            .iter()
+            .all(|message| message["topic"] == "release.v31")
+    );
+    assert!(
+        topic_messages
+            .iter()
+            .any(|message| message["body_md"] == "topic reply")
+    );
+
+    let invalid_topic = invoke(
+        "fetch_topic",
+        serde_json::json!({
+            "project_key": &project_key,
+            "topic_name": "../never-stored"
+        }),
+        &mut req_id,
+    )
+    .expect_err("invalid topic lookup must fail before querying");
+    assert!(
+        invalid_topic.contains("INVALID_TOPIC"),
+        "expected typed invalid-topic error, got: {invalid_topic}"
+    );
+
+    let blank_topic = invoke(
+        "fetch_topic",
+        serde_json::json!({
+            "project_key": &project_key,
+            "topic_name": "   "
+        }),
+        &mut req_id,
+    )
+    .expect_err("blank required topic lookup must fail");
+    assert!(
+        blank_topic.contains("INVALID_ARGUMENT"),
+        "expected typed blank-topic error, got: {blank_topic}"
+    );
+}
+
+#[test]
 fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
 

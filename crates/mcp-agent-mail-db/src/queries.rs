@@ -9479,6 +9479,13 @@ pub struct InboxRow {
     pub ack_ts: Option<i64>,
 }
 
+/// Project-scoped message returned by an exact topic lookup.
+#[derive(Debug, Clone)]
+pub struct TopicMessageRow {
+    pub message: MessageRow,
+    pub sender_name: String,
+}
+
 /// Fetch one durable, body-free recipient delivery page for monitor clients.
 ///
 /// The synchronous implementation is shared with direct CLI reads so daemon
@@ -9911,6 +9918,81 @@ pub async fn fetch_inbox_filtered(
     .await
 }
 
+/// Fetch project messages carrying one exact case-insensitive topic.
+///
+/// The topic predicate is applied before ordering and limiting, so unrelated
+/// newer mail cannot displace matching rows from a bounded result window.
+pub async fn fetch_topic_messages(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    topic: &str,
+    since_ts: Option<i64>,
+    limit: usize,
+    include_bodies: bool,
+) -> Outcome<Vec<TopicMessageRow>, DbError> {
+    let Ok(limit_i64) = i64::try_from(limit) else {
+        return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
+    };
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let body_select = if include_bodies {
+        "m.body_md"
+    } else {
+        "'' AS body_md"
+    };
+    let mut sql = format!(
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, \
+                {body_select}, m.importance, m.ack_required, m.created_ts, \
+                m.recipients_json, m.attachments, \
+                COALESCE(sender.name, ?) AS sender_name \
+         FROM messages m \
+         LEFT JOIN agents sender ON sender.id = m.sender_id \
+         WHERE m.project_id = ? AND m.topic = ? COLLATE NOCASE"
+    );
+    let mut params = vec![
+        Value::Text(UNKNOWN_SENDER_DISPLAY.to_string()),
+        Value::BigInt(project_id),
+        Value::Text(topic.to_string()),
+    ];
+    if let Some(since_ts) = since_ts {
+        sql.push_str(" AND m.created_ts > ?");
+        params.push(Value::BigInt(since_ts));
+    }
+    sql.push_str(" ORDER BY m.created_ts DESC, m.id DESC LIMIT ?");
+    params.push(Value::BigInt(limit_i64));
+
+    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let mut messages = Vec::with_capacity(rows.len());
+            for row in rows {
+                let message = match decode_message_row_indexed(&row) {
+                    Ok(message) => message,
+                    Err(error) => return Outcome::Err(error),
+                };
+                let sender_name = match row.get_as(12) {
+                    Ok(value) => value,
+                    Err(error) => return Outcome::Err(map_sql_error(&error)),
+                };
+                messages.push(TopicMessageRow {
+                    message,
+                    sender_name,
+                });
+            }
+            Outcome::Ok(messages)
+        }
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn fetch_inbox_impl(
     cx: &Cx,
@@ -9979,39 +10061,32 @@ async fn fetch_inbox_impl(
     }
 }
 
+fn decode_message_row_indexed(row: &SqlRow) -> std::result::Result<MessageRow, DbError> {
+    Ok(MessageRow {
+        id: Some(row.get_as(0).map_err(|error| map_sql_error(&error))?),
+        project_id: row.get_as(1).map_err(|error| map_sql_error(&error))?,
+        sender_id: row.get_as(2).map_err(|error| map_sql_error(&error))?,
+        thread_id: row.get_as(3).map_err(|error| map_sql_error(&error))?,
+        topic: row.get_as(4).map_err(|error| map_sql_error(&error))?,
+        subject: row.get_as(5).map_err(|error| map_sql_error(&error))?,
+        body_md: row.get_as(6).map_err(|error| map_sql_error(&error))?,
+        importance: row.get_as(7).map_err(|error| map_sql_error(&error))?,
+        ack_required: row.get_as(8).map_err(|error| map_sql_error(&error))?,
+        created_ts: row.get_as(9).map_err(|error| map_sql_error(&error))?,
+        recipients_json: row.get_as(10).map_err(|error| map_sql_error(&error))?,
+        attachments: row.get_as(11).map_err(|error| map_sql_error(&error))?,
+    })
+}
+
 fn decode_inbox_row_indexed(row: &SqlRow) -> std::result::Result<InboxRow, DbError> {
-    let id: i64 = row.get_as(0).map_err(|e| map_sql_error(&e))?;
-    let project_id: i64 = row.get_as(1).map_err(|e| map_sql_error(&e))?;
-    let sender_id: i64 = row.get_as(2).map_err(|e| map_sql_error(&e))?;
-    let thread_id: Option<String> = row.get_as(3).map_err(|e| map_sql_error(&e))?;
-    let topic: Option<String> = row.get_as(4).map_err(|e| map_sql_error(&e))?;
-    let subject: String = row.get_as(5).map_err(|e| map_sql_error(&e))?;
-    let body_md: String = row.get_as(6).map_err(|e| map_sql_error(&e))?;
-    let importance: String = row.get_as(7).map_err(|e| map_sql_error(&e))?;
-    let ack_required: i64 = row.get_as(8).map_err(|e| map_sql_error(&e))?;
-    let created_ts: i64 = row.get_as(9).map_err(|e| map_sql_error(&e))?;
-    let recipients_json: String = row.get_as(10).map_err(|e| map_sql_error(&e))?;
-    let attachments: String = row.get_as(11).map_err(|e| map_sql_error(&e))?;
+    let message = decode_message_row_indexed(row)?;
     let kind: String = row.get_as(12).map_err(|e| map_sql_error(&e))?;
     let sender_name: String = row.get_as(13).map_err(|e| map_sql_error(&e))?;
     let read_ts: Option<i64> = row.get_as(14).map_err(|e| map_sql_error(&e))?;
     let ack_ts: Option<i64> = row.get_as(15).map_err(|e| map_sql_error(&e))?;
 
     Ok(InboxRow {
-        message: MessageRow {
-            id: Some(id),
-            project_id,
-            sender_id,
-            thread_id,
-            topic,
-            subject,
-            body_md,
-            importance,
-            ack_required,
-            created_ts,
-            recipients_json,
-            attachments,
-        },
+        message,
         kind,
         sender_name,
         read_ts,
@@ -29821,6 +29896,20 @@ mod tests {
                 unfiltered
                     .iter()
                     .any(|row| row.message.body_md == "topic body")
+            );
+
+            let topic_messages =
+                fetch_topic_messages(&cx, &pool, project_id, "BR-ABC.1", None, 1, false)
+                    .await
+                    .into_result()
+                    .expect("fetch project topic messages");
+            assert_eq!(topic_messages.len(), 1);
+            assert_eq!(topic_messages[0].message.subject, "topic witness");
+            assert_eq!(topic_messages[0].sender_name, "GreenStone");
+            assert_eq!(topic_messages[0].message.topic.as_deref(), Some("Br-Abc.1"));
+            assert!(
+                topic_messages[0].message.body_md.is_empty(),
+                "metadata-only topic fetch should not hydrate bodies"
             );
         });
     }

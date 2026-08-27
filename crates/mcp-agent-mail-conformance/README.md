@@ -4,6 +4,22 @@ Rust-side conformance harnesses for MCP Agent Mail.
 
 This crate keeps the live Rust router honest against the legacy Python reference where parity is intentional, and it records the remaining Rust-native gaps so drift is explicit instead of accidental.
 
+## Authority boundary
+
+The Rust implementation is the product authority. Python fixtures are a
+targeted compatibility and migration safety net, not a mandate to preserve
+legacy architecture or defects. A shared contract remains parity-gated only
+when an existing client or imported mailbox depends on its observable wire
+behavior. Deliberate Rust improvements may diverge when they strengthen
+durability, security, bounded work, structured concurrency, or operator
+clarity; those changes require native invariant tests and an explicit
+compatibility note rather than a weakened implementation.
+
+Accordingly, fixture failures are evidence to classify: accidental wire drift
+is a regression, while an intentional and documented Rust-side extension is
+not. Release decisions prioritize real SQLite/archive/restart and mounted MCP
+proof over byte-for-byte agreement with an obsolete implementation.
+
 ## What lives here
 
 - Behavior parity fixtures in `tests/conformance/fixtures/python_reference.json`
@@ -16,8 +32,9 @@ This crate keeps the live Rust router honest against the legacy Python reference
 
 ## Current coverage (as of 2026-08-27)
 
-- The live Rust router exposes 43 tools.
+- The live Rust router exposes 44 tools.
 - 37 tools have Python behavior fixtures in `tests/conformance/fixtures/python_reference.json`.
+- `fetch_topic` is an additional compatibility tool covered by its retained description/schema contract plus focused topic-bearing database and router tests; mounted-transport proof remains a release gate. It is not part of the legacy sequential behavior fixture.
 - 6 tools are Rust-native extensions: `resolve_pane_identity`, `cleanup_pane_identities`, `list_agents`, `check_file_reservation_conflicts`, `fetch_inbox_events`, and `get_message_delivery_receipt`.
 - All 6 Rust-native tools are covered by dedicated golden fixtures under `tests/conformance/fixtures/rust_native/`.
 - The former tool fixture gap tracked by `br-a2k3h.3` is closed by the dedicated Rust-native fixture lane.
@@ -33,7 +50,7 @@ These classifications come from the live tool surface in `mcp_agent_mail_tools::
 the Python behavior fixture inventory in `tests/conformance/fixtures/python_reference.json`, and
 the audit record in [docs/CONFORMANCE_AUDIT_2026-04-18.md](../../docs/CONFORMANCE_AUDIT_2026-04-18.md).
 
-### Python-parity tools (37)
+### Supported Python compatibility tools (38)
 
 - `health_check` - Return the server readiness snapshot and infrastructure status.
 - `ensure_project` - Create or resolve the canonical project identity for a workspace path.
@@ -48,6 +65,7 @@ the audit record in [docs/CONFORMANCE_AUDIT_2026-04-18.md](../../docs/CONFORMANC
 - `send_message` - Create a message, persist recipients, and write archive copies.
 - `reply_message` - Reply in-thread while preserving the original thread semantics.
 - `fetch_inbox` - Read recent inbox items and record read state without mutating archive message contents.
+- `fetch_topic` - Fetch project messages carrying one exact case-insensitive topic tag.
 - `mark_message_read` - Mark a delivered message as read for one recipient.
 - `acknowledge_message` - Mark a delivered message as read and acknowledged.
 - `request_contact` - Request permission to open a contact link with another agent.

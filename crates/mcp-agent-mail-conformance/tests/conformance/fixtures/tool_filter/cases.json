@@ -1,6 +1,6 @@
 {
-  "version": "legacy-python@0.3.0",
-  "generated_at": "1970-01-01T00:00:00Z",
+  "version": "rust-supported-contract@2026-08-27",
+  "generated_at": "2026-08-27T00:00:00Z",
   "cases": [
     {
       "name": "disabled_full",
@@ -13,11 +13,13 @@
         "check_file_reservation_conflicts",
         "cleanup_pane_identities",
         "create_agent_identity",
+        "deregister_agent",
         "ensure_product",
         "ensure_project",
         "fetch_inbox",
         "fetch_inbox_events",
         "fetch_inbox_product",
+        "fetch_topic",
         "file_reservation_paths",
         "force_release_file_reservation",
         "get_message_delivery_receipt",
@@ -40,6 +42,7 @@
         "request_contact",
         "resolve_pane_identity",
         "respond_contact",
+        "retire_agent",
         "search_messages",
         "search_messages_product",
         "send_message",
@@ -47,6 +50,7 @@
         "summarize_thread",
         "summarize_thread_product",
         "uninstall_precommit_guard",
+        "unretire_agent",
         "whois"
       ]
     },
@@ -76,8 +80,10 @@
         "check_file_reservation_conflicts",
         "cleanup_pane_identities",
         "create_agent_identity",
+        "deregister_agent",
         "ensure_project",
         "fetch_inbox",
+        "fetch_topic",
         "file_reservation_paths",
         "force_release_file_reservation",
         "health_check",
@@ -92,7 +98,9 @@
         "renew_file_reservations",
         "reply_message",
         "resolve_pane_identity",
+        "retire_agent",
         "send_message",
+        "unretire_agent",
         "whois"
       ]
     },
@@ -106,9 +114,11 @@
         "acknowledge_message",
         "cleanup_pane_identities",
         "create_agent_identity",
+        "deregister_agent",
         "ensure_project",
         "fetch_inbox",
         "fetch_inbox_events",
+        "fetch_topic",
         "get_message_delivery_receipt",
         "health_check",
         "list_agents",
@@ -119,9 +129,11 @@
         "request_contact",
         "resolve_pane_identity",
         "respond_contact",
+        "retire_agent",
         "search_messages",
         "send_message",
         "set_contact_policy",
+        "unretire_agent",
         "whois"
       ]
     },
@@ -138,6 +150,7 @@
         "acknowledge_message",
         "fetch_inbox",
         "fetch_inbox_events",
+        "fetch_topic",
         "get_message_delivery_receipt",
         "health_check",
         "mark_message_read",
@@ -157,11 +170,13 @@
         "acknowledge_message",
         "cleanup_pane_identities",
         "create_agent_identity",
+        "deregister_agent",
         "ensure_product",
         "ensure_project",
         "fetch_inbox",
         "fetch_inbox_events",
         "fetch_inbox_product",
+        "fetch_topic",
         "get_message_delivery_receipt",
         "health_check",
         "install_precommit_guard",
@@ -178,6 +193,7 @@
         "request_contact",
         "resolve_pane_identity",
         "respond_contact",
+        "retire_agent",
         "search_messages",
         "search_messages_product",
         "send_message",
@@ -185,6 +201,7 @@
         "summarize_thread",
         "summarize_thread_product",
         "uninstall_precommit_guard",
+        "unretire_agent",
         "whois"
       ]
     }

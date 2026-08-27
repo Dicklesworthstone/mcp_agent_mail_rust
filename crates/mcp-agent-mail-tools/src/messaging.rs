@@ -903,17 +903,14 @@ fn validate_reply_body_limit(config: &Config, body_md: &str) -> McpResult<()> {
     Ok(())
 }
 
-fn normalize_topic_argument(topic: Option<&str>) -> McpResult<Option<String>> {
-    let Some(raw_topic) = topic else {
-        return Ok(None);
-    };
+fn normalize_topic_value(raw_topic: &str, argument: &'static str) -> McpResult<String> {
     let topic = raw_topic.trim();
     let mut chars = topic.chars();
     let valid = (1..=64).contains(&topic.len())
         && chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric())
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'));
     if valid {
-        return Ok(Some(topic.to_string()));
+        return Ok(topic.to_string());
     }
 
     Err(legacy_tool_error(
@@ -924,10 +921,31 @@ fn normalize_topic_argument(topic: Option<&str>) -> McpResult<Option<String>> {
         ),
         true,
         json!({
-            "argument": "topic",
+            "argument": argument,
             "provided": topic,
         }),
     ))
+}
+
+fn normalize_topic_argument(topic: Option<&str>) -> McpResult<Option<String>> {
+    topic
+        .map(|topic| normalize_topic_value(topic, "topic"))
+        .transpose()
+}
+
+fn normalize_topic_filter(topic: Option<&str>) -> McpResult<Option<String>> {
+    let Some(topic) = topic else {
+        return Ok(None);
+    };
+    let topic = topic.trim();
+    if topic.is_empty() {
+        return Ok(None);
+    }
+    // Every persisted topic passes the same validation on write. Rejecting a
+    // lookup that can never match avoids needless database work and prevents
+    // an unbounded read-only argument from becoming an allocation/diagnostic
+    // amplification path.
+    normalize_topic_value(topic, "topic").map(Some)
 }
 
 const fn has_any_recipients(to: &[String], cc: &[String], bcc: &[String]) -> bool {
@@ -1689,6 +1707,24 @@ pub struct InboxMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ack_ts: Option<String>,
     pub kind: String,
+    pub attachments: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_md: Option<String>,
+}
+
+/// Project-scoped message returned by `fetch_topic`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicMessage {
+    pub id: i64,
+    pub project_id: i64,
+    pub sender_id: i64,
+    pub thread_id: Option<String>,
+    pub topic: Option<String>,
+    pub subject: String,
+    pub importance: String,
+    pub ack_required: bool,
+    pub from: String,
+    pub created_ts: Option<String>,
     pub attachments: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_md: Option<String>,
@@ -3738,7 +3774,7 @@ pub async fn fetch_inbox(
     let urgent = urgent_only.unwrap_or(false);
     let unread = unread_only.unwrap_or(false);
     let ack_overdue = ack_overdue_only.unwrap_or(false);
-    let topic = normalize_topic_argument(topic.as_deref())?;
+    let topic = normalize_topic_filter(topic.as_deref())?;
     phase.set_include_bodies(include_body);
     phase.mark("argument_validation");
 
@@ -3938,6 +3974,94 @@ pub async fn fetch_inbox(
     phase.mark("json_serialization");
     emit_tail_latency_evidence(&phase.finish("ok"));
     Ok(response)
+}
+
+/// Fetch all project messages carrying one exact topic tag.
+///
+/// This is intentionally project-scoped, matching the Python reference: it is
+/// the topic-search counterpart to recipient-scoped `fetch_inbox(topic=...)`.
+#[tool(
+    description = "Fetch all messages in a project with a given topic tag, regardless of recipient.\n\nParameters\n----------\nproject_key : str\n    Project identifier.\ntopic_name : str\n    The topic tag to filter by (case-insensitive).\nlimit : int\n    Max number of messages to return (default 50).\ninclude_bodies : bool\n    Include full Markdown bodies in the payloads (default true).\nsince_ts : Optional[str]\n    ISO-8601 timestamp; only messages newer than this are returned.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, importance, topic, [body_md] }"
+)]
+pub async fn fetch_topic(
+    ctx: &McpContext,
+    project_key: String,
+    topic_name: String,
+    limit: Option<i32>,
+    include_bodies: Option<bool>,
+    since_ts: Option<String>,
+) -> McpResult<String> {
+    let topic = topic_name.trim();
+    if topic.is_empty() {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "topic_name must be a non-empty string",
+            true,
+            json!({ "argument": "topic_name" }),
+        ));
+    }
+    let topic = normalize_topic_value(topic, "topic_name")?;
+    let requested_limit = limit.unwrap_or(50).clamp(1, 1000);
+    let limit = usize::try_from(requested_limit).map_err(|_| {
+        legacy_tool_error(
+            "INVALID_LIMIT",
+            format!("limit exceeds supported range: {requested_limit}"),
+            true,
+            json!({ "provided": requested_limit, "min": 1, "max": 1000 }),
+        )
+    })?;
+    let include_bodies = include_bodies.unwrap_or(true);
+    let since_micros = if let Some(timestamp) = since_ts.as_deref() {
+        Some(mcp_agent_mail_db::iso_to_micros(timestamp).ok_or_else(|| {
+            legacy_tool_error(
+                "INVALID_TIMESTAMP",
+                format!("Invalid since_ts format: {timestamp:?}. Expected ISO-8601."),
+                true,
+                json!({
+                    "provided": timestamp,
+                    "expected_format": "YYYY-MM-DDTHH:MM:SS+HH:MM",
+                }),
+            )
+        })?)
+    } else {
+        None
+    };
+
+    let pool = get_coalescer_bypass_read_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::fetch_topic_messages(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            &topic,
+            since_micros,
+            limit,
+            include_bodies,
+        )
+        .await,
+    )?;
+
+    let messages = rows
+        .into_iter()
+        .map(|row| TopicMessage {
+            id: row.message.id.unwrap_or(0),
+            project_id: row.message.project_id,
+            sender_id: row.message.sender_id,
+            thread_id: row.message.thread_id,
+            topic: row.message.topic,
+            subject: row.message.subject,
+            importance: row.message.importance,
+            ack_required: row.message.ack_required != 0,
+            from: row.sender_name,
+            created_ts: Some(micros_to_iso(row.message.created_ts)),
+            attachments: parse_attachment_metadata_json(&row.message.attachments),
+            body_md: include_bodies.then_some(row.message.body_md),
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::to_string(&messages)
+        .map_err(|error| McpError::new(McpErrorCode::InternalError, error.to_string()))
 }
 
 /// Read durable, body-free inbox delivery events for a monitor.
@@ -5752,6 +5876,25 @@ mod tests {
         assert_eq!(data["error"]["type"], "INVALID_TOPIC");
         assert_eq!(data["error"]["data"]["argument"], "topic");
         assert_eq!(data["error"]["data"]["provided"], "");
+    }
+
+    #[test]
+    fn normalize_topic_filter_treats_blank_as_no_filter() {
+        assert_eq!(normalize_topic_filter(None).unwrap(), None);
+        assert_eq!(normalize_topic_filter(Some("   ")).unwrap(), None);
+        assert_eq!(
+            normalize_topic_filter(Some("  br-abc.1 ")).unwrap(),
+            Some("br-abc.1".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_topic_filter_rejects_values_that_cannot_exist() {
+        let err = normalize_topic_filter(Some("../never-stored"))
+            .expect_err("invalid topic lookup must fail before querying");
+        let data = err.data.expect("error payload");
+        assert_eq!(data["error"]["type"], "INVALID_TOPIC");
+        assert_eq!(data["error"]["data"]["argument"], "topic");
     }
 
     #[test]

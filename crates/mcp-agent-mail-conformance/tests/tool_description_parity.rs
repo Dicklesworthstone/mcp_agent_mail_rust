@@ -34,7 +34,6 @@ struct ToolDescriptionsFixture {
 const PYTHON_ONLY_TOOLS: &[&str] = &[
     "expire_window",
     "fetch_summary",
-    "fetch_topic",
     "list_window_identities",
     "rename_window",
     "summarize_recent",
@@ -470,7 +469,9 @@ fn rust_tool_count_matches_expected() {
 
     let expected_rust_count = shared_python_count + RUST_NATIVE_TOOLS.len();
 
-    // Rust should have the shared Python-parity tools plus declared Rust-native tools.
+    // Rust should have the supported shared-contract tools plus declared
+    // Rust-native tools. This is an inventory check, not a design-authority
+    // handoff to the legacy implementation.
     assert_eq!(
         rust_tools.len(),
         expected_rust_count,

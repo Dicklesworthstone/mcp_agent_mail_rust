@@ -280,6 +280,13 @@ pub const TOOL_META_MAP: &[(&str, ToolMeta)] = &[
         },
     ),
     (
+        "fetch_topic",
+        ToolMeta {
+            capabilities: &["messaging", "read"],
+            complexity: "medium",
+        },
+    ),
+    (
         // Coverage entry for the inbox-events tool (added by another pane).
         // Mirrors fetch_inbox (a sibling inbox read in the messaging cluster);
         // the fetch_inbox_events owner should confirm capabilities/complexity.

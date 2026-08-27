@@ -713,6 +713,13 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
     let server = add_tool(
         server,
         config,
+        "fetch_topic",
+        clusters::MESSAGING,
+        FetchTopic,
+    );
+    let server = add_tool(
+        server,
+        config,
         "fetch_inbox_events",
         clusters::MESSAGING,
         FetchInboxEvents,
