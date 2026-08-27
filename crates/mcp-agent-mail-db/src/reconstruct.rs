@@ -2212,11 +2212,23 @@ fn discover_agents(
         let last_active_ts = parse_ts_from_json(&profile, "last_active_ts")
             .unwrap_or_else(|| inception_ts.unwrap_or_else(crate::now_micros));
         let inception_ts = inception_ts.unwrap_or(last_active_ts);
+        let retired_at = parse_ts_from_json(&profile, "retired_at");
+        // Older archives encoded deregistration only through the Python-style
+        // tombstone plus block_all. Newer profiles carry the explicit ledger
+        // timestamp, but reconstruction must preserve both representations.
+        let legacy_deregistered_at = (contact_policy.eq_ignore_ascii_case("block_all")
+            && crate::models::task_description_uses_reserved_deregistered_prefix(task_description))
+        .then(|| {
+            crate::models::deregistered_task_timestamp_micros(task_description)
+                .unwrap_or(last_active_ts)
+        });
+        let deregistered_at =
+            parse_ts_from_json(&profile, "deregistered_at").or(legacy_deregistered_at);
 
         conn.execute_sync(
             "INSERT OR IGNORE INTO agents \
-             (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, retired_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 Value::BigInt(project_id),
                 Value::Text(agent_name.clone()),
@@ -2227,6 +2239,7 @@ fn discover_agents(
                 Value::BigInt(last_active_ts),
                 Value::Text(attachments_policy),
                 Value::Text(contact_policy),
+                retired_at.map_or(Value::Null, Value::BigInt),
             ],
         )
         .map_err(|e| DbError::Sqlite(format!("reconstruct: insert agent {agent_name}: {e}")))?;
@@ -2239,6 +2252,18 @@ fn discover_agents(
             "name",
             &agent_name,
         )?;
+        if let Some(deregistered_at) = deregistered_at {
+            conn.execute_sync(
+                "INSERT OR IGNORE INTO agent_deregistrations (agent_id, deregistered_at) \
+                 VALUES (?, ?)",
+                &[Value::BigInt(aid), Value::BigInt(deregistered_at)],
+            )
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "reconstruct: insert agent deregistration {agent_name}: {error}"
+                ))
+            })?;
+        }
         agent_ids.insert((project_id, agent_name), aid);
         stats.agents += 1;
     }

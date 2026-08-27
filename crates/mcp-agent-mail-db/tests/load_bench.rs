@@ -2313,6 +2313,7 @@ fn make_cache_profile_agent(idx: usize) -> AgentRow {
         contact_policy: "auto".to_string(),
         reaper_exempt: 0,
         registration_token: None,
+        retired_at: None,
     }
 }
 

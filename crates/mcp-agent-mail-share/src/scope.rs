@@ -265,7 +265,24 @@ pub fn apply_project_scope(
             }
         }
 
-        // 8. Delete agents
+        // 8. Remove lifecycle ledger rows for agents outside the selected
+        // project scope before removing their parent rows. Older snapshots do
+        // not have this table, so keep the operation schema-tolerant.
+        if table_exists(&conn, "agent_deregistrations")? {
+            exec(
+                &conn,
+                &format!(
+                    "DELETE FROM agent_deregistrations \
+                     WHERE agent_id IN (\
+                         SELECT id FROM agents WHERE project_id NOT IN ({p})\
+                     )",
+                    p = placeholders
+                ),
+                &id_values,
+            )?;
+        }
+
+        // 9. Delete agents
         exec(
             &conn,
             &format!(
@@ -275,7 +292,7 @@ pub fn apply_project_scope(
             &id_values,
         )?;
 
-        // 9. Delete recipient links that now point at filtered-out agents, then
+        // 10. Delete recipient links that now point at filtered-out agents, then
         // repair the denormalized recipients envelope for kept messages.
         exec(
             &conn,
@@ -287,14 +304,14 @@ pub fn apply_project_scope(
             sync_scope_recipients_json(&conn)?;
         }
 
-        // 10. Rebuild agent-scoped aggregates that are not protected by FK
+        // 11. Rebuild agent-scoped aggregates that are not protected by FK
         // constraints. Kept agents can otherwise retain stale counts from
         // messages trimmed out of scope.
         if table_exists(&conn, "inbox_stats")? {
             rebuild_scope_inbox_stats(&conn)?;
         }
 
-        // 11. Delete projects
+        // 12. Delete projects
         exec(
             &conn,
             &format!(

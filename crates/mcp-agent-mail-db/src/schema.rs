@@ -57,10 +57,19 @@ CREATE TABLE IF NOT EXISTS agents (
     contact_policy TEXT NOT NULL DEFAULT 'auto',
     reaper_exempt INTEGER NOT NULL DEFAULT 0,
     registration_token TEXT,
+    retired_at INTEGER,
     UNIQUE(project_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_agents_project_name ON agents(project_id, name);
 CREATE INDEX IF NOT EXISTS idx_agents_last_active_id_desc ON agents(last_active_ts DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_agents_project_active ON agents(project_id, retired_at, last_active_ts DESC);
+
+-- Explicit deregistration ledger. Agent rows and all message history remain intact.
+CREATE TABLE IF NOT EXISTS agent_deregistrations (
+    agent_id INTEGER PRIMARY KEY REFERENCES agents(id),
+    deregistered_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_deregistrations_ts ON agent_deregistrations(deregistered_at);
 
 -- Messages table
 CREATE TABLE IF NOT EXISTS messages (
@@ -2280,6 +2289,49 @@ pub fn schema_migrations() -> Vec<Migration> {
         "GH#259: index case-insensitive message topic lookups by project".to_string(),
         "CREATE INDEX IF NOT EXISTS idx_messages_project_topic \
          ON messages(project_id, topic)"
+            .to_string(),
+        String::new(),
+    ));
+
+    // ── v28: durable agent lifecycle state (GH#255) ───────────────
+    migrations.push(Migration::new(
+        "v28_add_retired_at_to_agents".to_string(),
+        "GH#255: add reversible agent retirement timestamp".to_string(),
+        "ALTER TABLE agents ADD COLUMN retired_at INTEGER".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v28_create_agent_deregistrations".to_string(),
+        "GH#255: create explicit history-preserving deregistration ledger".to_string(),
+        "CREATE TABLE IF NOT EXISTS agent_deregistrations (\
+            agent_id INTEGER PRIMARY KEY REFERENCES agents(id),\
+            deregistered_at INTEGER NOT NULL\
+        )"
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v28_idx_agents_project_active".to_string(),
+        "GH#255: index active roster filtering".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_agents_project_active \
+         ON agents(project_id, retired_at, last_active_ts DESC)"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v28_idx_agent_deregistrations_ts".to_string(),
+        "GH#255: index deregistration audit chronology".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_agent_deregistrations_ts \
+         ON agent_deregistrations(deregistered_at)"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v28_backfill_agent_deregistrations".to_string(),
+        "GH#255: recognize Python deregistration tombstones during upgrade".to_string(),
+        "INSERT OR IGNORE INTO agent_deregistrations (agent_id, deregistered_at) \
+         SELECT id, last_active_ts FROM agents \
+         WHERE task_description LIKE '[DEREGISTERED %'"
             .to_string(),
         String::new(),
     ));
@@ -4780,9 +4832,9 @@ mod tests {
             .query_sync("PRAGMA table_info(messages)", &[])
             .expect("inspect message columns");
         assert!(
-            topic_columns.iter().any(|row| {
-                row.get_named::<String>("name").ok().as_deref() == Some("topic")
-            }),
+            topic_columns
+                .iter()
+                .any(|row| { row.get_named::<String>("name").ok().as_deref() == Some("topic") }),
             "topic column should exist after migration"
         );
 

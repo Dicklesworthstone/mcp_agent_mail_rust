@@ -761,6 +761,8 @@ pub struct AgentListEntry {
     pub task_description: String,
     pub inception_ts: Option<String>,
     pub last_active_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<String>,
     pub project_id: i64,
     pub attachments_policy: String,
     pub unread_count: i64,
@@ -778,6 +780,7 @@ pub struct ProjectRef {
 pub struct AgentsListResponse {
     pub project: ProjectRef,
     pub agents: Vec<AgentListEntry>,
+    pub retired_agents: Vec<AgentListEntry>,
 }
 
 /// List agents in a project.
@@ -795,6 +798,10 @@ pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<Str
     // List agents in project
     let agents = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
+    )?;
+
+    let deregistered_agent_ids = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_deregistered_agent_ids(ctx.cx(), &pool, project_id).await,
     )?;
 
     // Get unread counts for all agents in one query
@@ -819,29 +826,42 @@ pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<Str
         unread_counts.insert(agent_id, count);
     }
 
+    let mut active_agents = Vec::new();
+    let mut retired_agents = Vec::new();
+    for agent in agents {
+        let agent_id = agent.id.unwrap_or(0);
+        if deregistered_agent_ids.contains(&agent_id) {
+            continue;
+        }
+        let retired_at = agent.retired_at.map(micros_to_iso);
+        let is_retired = retired_at.is_some();
+        let entry = AgentListEntry {
+            id: agent_id,
+            name: agent.name,
+            program: agent.program,
+            model: agent.model,
+            task_description: agent.task_description,
+            inception_ts: Some(micros_to_iso(agent.inception_ts)),
+            last_active_ts: Some(micros_to_iso(agent.last_active_ts)),
+            retired_at,
+            project_id: agent.project_id,
+            attachments_policy: agent.attachments_policy,
+            unread_count: *unread_counts.get(&agent_id).unwrap_or(&0),
+        };
+        if is_retired {
+            retired_agents.push(entry);
+        } else {
+            active_agents.push(entry);
+        }
+    }
+
     let response = AgentsListResponse {
         project: ProjectRef {
             slug: project.slug,
             human_key: project.human_key,
         },
-        agents: agents
-            .into_iter()
-            .map(|a| {
-                let agent_id = a.id.unwrap_or(0);
-                AgentListEntry {
-                    id: agent_id,
-                    name: a.name,
-                    program: a.program,
-                    model: a.model,
-                    task_description: a.task_description,
-                    inception_ts: Some(micros_to_iso(a.inception_ts)),
-                    last_active_ts: Some(micros_to_iso(a.last_active_ts)),
-                    project_id: a.project_id,
-                    attachments_policy: a.attachments_policy,
-                    unread_count: *unread_counts.get(&agent_id).unwrap_or(&0),
-                }
-            })
-            .collect(),
+        agents: active_agents,
+        retired_agents,
     };
 
     tracing::debug!("Listing agents in project {}", project_key);
@@ -1014,6 +1034,39 @@ fn build_tool_directory() -> ToolDirectory {
                     expected_frequency: "When minting fresh, short-lived identities.".to_string(),
                     required_capabilities: vec!["identity".to_string()],
                     usage_examples: vec![ToolUsageExample { hint: "New helper".to_string(), sample: "create_agent_identity(project_key='backend', name_hint='GreenCastle', program='codex', model='gpt5')".to_string() }],
+                    capabilities: vec!["identity".to_string()],
+                    complexity: "medium".to_string(),
+                },
+                ToolDirectoryEntry {
+                    name: "retire_agent".to_string(),
+                    summary: "Temporarily remove an identity from active routing without deleting history.".to_string(),
+                    use_when: "Pausing an identity that may resume later.".to_string(),
+                    related: vec!["unretire_agent".to_string(), "deregister_agent".to_string()],
+                    expected_frequency: "Occasional lifecycle maintenance.".to_string(),
+                    required_capabilities: vec!["identity".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Pause identity".to_string(), sample: "retire_agent(project_key='backend', agent_name='BlueLake', registration_token='<token>')".to_string() }],
+                    capabilities: vec!["identity".to_string()],
+                    complexity: "medium".to_string(),
+                },
+                ToolDirectoryEntry {
+                    name: "unretire_agent".to_string(),
+                    summary: "Restore a retired identity to active routing.".to_string(),
+                    use_when: "Resuming work with a retired identity.".to_string(),
+                    related: vec!["retire_agent".to_string(), "register_agent".to_string()],
+                    expected_frequency: "When a retired identity resumes work.".to_string(),
+                    required_capabilities: vec!["identity".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Resume identity".to_string(), sample: "unretire_agent(project_key='backend', agent_name='BlueLake', registration_token='<token>')".to_string() }],
+                    capabilities: vec!["identity".to_string()],
+                    complexity: "medium".to_string(),
+                },
+                ToolDirectoryEntry {
+                    name: "deregister_agent".to_string(),
+                    summary: "Permanently remove an identity from active routing while preserving history.".to_string(),
+                    use_when: "Ending an agent identity without erasing its audit trail.".to_string(),
+                    related: vec!["retire_agent".to_string(), "register_agent".to_string()],
+                    expected_frequency: "At the end of short-lived automated sessions.".to_string(),
+                    required_capabilities: vec!["identity".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "End identity".to_string(), sample: "deregister_agent(project_key='backend', agent_name='BlueLake', registration_token='<token>')".to_string() }],
                     capabilities: vec!["identity".to_string()],
                     complexity: "medium".to_string(),
                 },

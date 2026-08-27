@@ -163,22 +163,22 @@ use mcp_agent_mail_db::{
 use mcp_agent_mail_tools::{
     AcknowledgeMessage, AcquireBuildSlot, AgentsListResource, CheckFileReservationConflicts,
     CleanupPaneIdentities, ConfigEnvironmentQueryResource, ConfigEnvironmentResource,
-    CreateAgentIdentity, EnsureProduct, EnsureProject, FetchInbox, FetchInboxEvents,
-    FetchInboxProduct, FileReservationPaths, FileReservationsResource, ForceReleaseFileReservation,
-    GetMessageDeliveryReceipt, HealthCheck, IdentityProjectResource, InboxResource,
-    InstallPrecommitGuard, ListAgents, ListContacts, MacroContactHandshake,
+    CreateAgentIdentity, DeregisterAgent, EnsureProduct, EnsureProject, FetchInbox,
+    FetchInboxEvents, FetchInboxProduct, FileReservationPaths, FileReservationsResource,
+    ForceReleaseFileReservation, GetMessageDeliveryReceipt, HealthCheck, IdentityProjectResource,
+    InboxResource, InstallPrecommitGuard, ListAgents, ListContacts, MacroContactHandshake,
     MacroFileReservationCycle, MacroPrepareThread, MacroStartSession, MailboxResource,
     MailboxWithCommitsResource, MarkMessageRead, MessageDetailsResource, OutboxResource,
     ProductDetailsResource, ProductsLink, ProjectDetailsResource, ProjectsListQueryResource,
     ProjectsListResource, RegisterAgent, ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot,
     RenewFileReservations, ReplyMessage, RequestContact, ResolvePaneIdentity, RespondContact,
-    SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy, SummarizeThread,
-    SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
+    RetireAgent, SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy,
+    SummarizeThread, SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
     ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource, ToolingDirectoryQueryResource,
     ToolingDirectoryResource, ToolingLocksQueryResource, ToolingLocksResource,
     ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource, ToolingMetricsQueryResource,
     ToolingMetricsResource, ToolingRecentResource, ToolingSchemasQueryResource,
-    ToolingSchemasResource, UninstallPrecommitGuard, ViewsAckOverdueResource,
+    ToolingSchemasResource, UninstallPrecommitGuard, UnretireAgent, ViewsAckOverdueResource,
     ViewsAckRequiredResource, ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -645,6 +645,27 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
         "create_agent_identity",
         clusters::IDENTITY,
         CreateAgentIdentity,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "retire_agent",
+        clusters::IDENTITY,
+        RetireAgent,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "unretire_agent",
+        clusters::IDENTITY,
+        UnretireAgent,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "deregister_agent",
+        clusters::IDENTITY,
+        DeregisterAgent,
     );
     let server = add_tool(server, config, "whois", clusters::IDENTITY, Whois);
     let server = add_tool(
@@ -16572,6 +16593,9 @@ fn accepts_pane_id_header(tool_name: &str) -> bool {
         tool_name,
         "register_agent"
             | "create_agent_identity"
+            | "retire_agent"
+            | "unretire_agent"
+            | "deregister_agent"
             | "macro_start_session"
             | "resolve_pane_identity"
     )

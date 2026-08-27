@@ -1396,6 +1396,7 @@ mod tests {
             contact_policy: "open".to_string(),
             reaper_exempt: 0,
             registration_token: None,
+            retired_at: None,
         }
     }
 

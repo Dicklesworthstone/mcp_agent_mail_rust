@@ -266,6 +266,54 @@ fn contact_blocked_error() -> McpError {
     )
 }
 
+fn agent_retired_error(agent: &mcp_agent_mail_db::AgentRow) -> McpError {
+    legacy_tool_error(
+        "AGENT_RETIRED",
+        format!(
+            "Agent '{}' is retired and cannot send or receive new messages. Use unretire_agent to restore it first.",
+            agent.name
+        ),
+        true,
+        json!({
+            "agent_name": agent.name,
+            "retired_at": agent.retired_at.map(micros_to_iso),
+        }),
+    )
+}
+
+fn agent_deregistered_error(agent: &mcp_agent_mail_db::AgentRow) -> McpError {
+    legacy_tool_error(
+        "AGENT_DEREGISTERED",
+        format!(
+            "Agent '{}' has been deregistered and can no longer send or receive new messages.",
+            agent.name
+        ),
+        false,
+        json!({ "agent_name": agent.name }),
+    )
+}
+
+async fn ensure_agent_accepts_new_messages(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    agent: &mcp_agent_mail_db::AgentRow,
+) -> McpResult<()> {
+    let agent_id = agent
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+    if db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent_deregistered_at(ctx.cx(), pool, agent_id).await,
+    )?
+    .is_some()
+    {
+        return Err(agent_deregistered_error(agent));
+    }
+    if agent.retired_at.is_some() {
+        return Err(agent_retired_error(agent));
+    }
+    Ok(())
+}
+
 /// Whether a failed auto-handshake attempt looks like transient engine/store
 /// contention (worth one bounded retry) rather than a policy or validation
 /// refusal that retrying cannot change. Under the fsqlite 0.3.4 registry
@@ -1145,6 +1193,7 @@ async fn push_recipient(
                 return Err(e);
             }
         };
+        ensure_agent_accepts_new_messages(ctx, pool, &agent).await?;
         let key = agent.name.to_lowercase();
         recipient_map.insert(key, agent.clone());
         agent
@@ -1717,7 +1766,7 @@ pub struct ReplyMessageResponse {
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Reserved for future topic tags. Non-blank values are currently rejected until\n    topic persistence and filtering are implemented.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names fail fast; register them first.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
+    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names fail fast; register them first.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
 )]
 pub async fn send_message(
     ctx: &McpContext,
@@ -1908,6 +1957,7 @@ effective_free_bytes={free}"
         &project.human_key,
     )
     .await?;
+    ensure_agent_accepts_new_messages(ctx, &pool, &sender).await?;
     let sender_id = sender.id.unwrap_or(0);
 
     // The opt-in fail-closed profile rejects missing/unavailable proof before
@@ -2896,6 +2946,7 @@ effective_free_bytes={free}"
         &project.human_key,
     )
     .await?;
+    ensure_agent_accepts_new_messages(ctx, &pool, &sender).await?;
     let sender_id = sender.id.unwrap_or(0);
 
     // ── Sender identity verification (issue #42; GH#237 fail-closed) ──
@@ -3628,7 +3679,7 @@ effective_free_bytes={free}"
 /// - `include_bodies`: Include full message bodies (default: false)
 /// - `unread_only`: Only messages not yet marked read (default: false)
 /// - `ack_overdue_only`: Only unacknowledged ack-required messages older than the SLA (default: false)
-/// - `topic`: Reserved for future topic filtering; non-blank values are currently rejected
+/// - `topic`: Exact case-insensitive topic filter
 /// - `mark_read`: Auto-mark returned messages read (default: true). Pass false
 ///   for a non-consuming peek — e.g. `am check-inbox` hooks (GH#207) — which
 ///   must never change read state.
@@ -3641,7 +3692,7 @@ effective_free_bytes={free}"
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Retrieve recent messages for an agent and mark returned messages read.\n\nFilters\n-------\n- `urgent_only`: only messages with importance in {high, urgent}\n- `unread_only`: only recipient rows whose read_ts is unset\n- `ack_overdue_only`: only ack-required rows with no ack_ts older than the 30-minute SLA\n- `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned\n- `limit`: max number of messages (default 20)\n- `include_bodies`: include full Markdown bodies in the payloads\n- `topic`: reserved for future topic filtering; non-blank values are currently rejected\n\nUsage patterns\n--------------\n- Poll after each editing step in an agent loop to pick up coordination messages.\n- Use `since_ts` with the timestamp from your last poll for efficient incremental fetches.\n- Combine with `acknowledge_message` if `ack_required` is true.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, read_ts?, ack_ts?, importance, ack_required, kind, [body_md] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"since_ts\":\"2025-10-23T00:00:00+00:00\"\n}}}\n```\n\nmark_read : Optional[bool]\n    Default true. Set false for a non-consuming peek that never changes read state (used by `am check-inbox` and other monitoring hooks)."
+    description = "Retrieve recent messages for an agent and mark returned messages read.\n\nFilters\n-------\n- `urgent_only`: only messages with importance in {high, urgent}\n- `unread_only`: only recipient rows whose read_ts is unset\n- `ack_overdue_only`: only ack-required rows with no ack_ts older than the 30-minute SLA\n- `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned\n- `limit`: max number of messages (default 20)\n- `include_bodies`: include full Markdown bodies in the payloads\n- `topic`: exact case-insensitive topic filter\n\nUsage patterns\n--------------\n- Poll after each editing step in an agent loop to pick up coordination messages.\n- Use `since_ts` with the timestamp from your last poll for efficient incremental fetches.\n- Combine with `acknowledge_message` if `ack_required` is true.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, topic?, from, created_ts, read_ts?, ack_ts?, importance, ack_required, kind, [body_md] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"since_ts\":\"2025-10-23T00:00:00+00:00\"\n}}}\n```\n\nmark_read : Optional[bool]\n    Default true. Set false for a non-consuming peek that never changes read state (used by `am check-inbox` and other monitoring hooks)."
 )]
 pub async fn fetch_inbox(
     ctx: &McpContext,
@@ -6255,6 +6306,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: None,
+            topic: None,
             subject: "test".into(),
             importance: "normal".into(),
             ack_required: false,
@@ -6332,6 +6384,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: Some("thread-1".into()),
+            topic: None,
             subject: "test".into(),
             importance: "normal".into(),
             ack_required: false,
@@ -6363,6 +6416,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 1,
                 thread_id: None,
+                topic: None,
                 subject: "new".into(),
                 importance: "normal".into(),
                 ack_required: false,
@@ -6382,6 +6436,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 1,
                 thread_id: None,
+                topic: None,
                 subject: "already-read".into(),
                 importance: "normal".into(),
                 ack_required: false,
@@ -6401,6 +6456,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 1,
                 thread_id: None,
+                topic: None,
                 subject: "not-updated".into(),
                 importance: "normal".into(),
                 ack_required: false,
@@ -6462,6 +6518,7 @@ mod tests {
             project_id: 1,
             sender_id: 2,
             thread_id: Some("t-1".into()),
+            topic: Some("br-abc.1".into()),
             subject: "Hello".into(),
             body_md: "# Content".into(),
             importance: "high".into(),
@@ -6483,6 +6540,7 @@ mod tests {
             [] as [serde_json::Value; 0]
         );
         assert_eq!(json["importance"], "high");
+        assert_eq!(json["topic"], "br-abc.1");
         assert_eq!(json["attachments"][0]["path"], "file.webp");
     }
 
@@ -6493,6 +6551,7 @@ mod tests {
             project_id: 1,
             sender_id: 2,
             thread_id: Some("t-1".into()),
+            topic: Some("br-abc.1".into()),
             subject: "Re: Hello".into(),
             importance: "normal".into(),
             ack_required: false,
@@ -7368,6 +7427,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 1,
                 thread_id: None,
+                topic: None,
                 subject: "test".into(),
                 body_md: "body".into(),
                 importance: "normal".into(),
@@ -7393,6 +7453,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: None,
+            topic: None,
             subject: "s".into(),
             body_md: "b".into(),
             importance: "low".into(),

@@ -1276,6 +1276,7 @@ mod tests {
             ack_required: 1,
             created_ts: Some("2026-02-12T10:00:00Z".to_string()),
             thread_id: Some("br-123".to_string()),
+            topic: Some("br-abc.1".to_string()),
             from: "GoldFox".to_string(),
             project_id: 5,
             body_md: None,
@@ -1287,6 +1288,7 @@ mod tests {
         assert_eq!(parsed.importance, "high");
         assert_eq!(parsed.ack_required, 1);
         assert_eq!(parsed.thread_id, Some("br-123".to_string()));
+        assert_eq!(parsed.topic.as_deref(), Some("br-abc.1"));
         assert_eq!(parsed.from, "GoldFox");
         assert_eq!(parsed.project_id, 5);
         assert!(parsed.body_md.is_none());
@@ -1303,6 +1305,7 @@ mod tests {
             ack_required: 0,
             created_ts: None,
             thread_id: None,
+            topic: None,
             from: "Agent".to_string(),
             project_id: 1,
             body_md: None,
@@ -1322,6 +1325,7 @@ mod tests {
             ack_required: 0,
             created_ts: None,
             thread_id: None,
+            topic: None,
             from: "Agent".to_string(),
             project_id: 1,
             body_md: Some("body contents".to_string()),
@@ -1357,6 +1361,7 @@ mod tests {
                     ack_required: 1,
                     created_ts: None,
                     thread_id: None,
+                    topic: None,
                     from: "A".to_string(),
                     project_id: 1,
                     body_md: None,
@@ -1368,6 +1373,7 @@ mod tests {
                     ack_required: 0,
                     created_ts: None,
                     thread_id: None,
+                    topic: None,
                     from: "B".to_string(),
                     project_id: 2,
                     body_md: None,

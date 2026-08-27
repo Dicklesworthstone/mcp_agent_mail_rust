@@ -209,6 +209,27 @@ pub const TOOL_META_MAP: &[(&str, ToolMeta)] = &[
         },
     ),
     (
+        "retire_agent",
+        ToolMeta {
+            capabilities: &["identity", "write"],
+            complexity: "medium",
+        },
+    ),
+    (
+        "unretire_agent",
+        ToolMeta {
+            capabilities: &["identity", "write"],
+            complexity: "medium",
+        },
+    ),
+    (
+        "deregister_agent",
+        ToolMeta {
+            capabilities: &["identity", "write"],
+            complexity: "medium",
+        },
+    ),
+    (
         "whois",
         ToolMeta {
             capabilities: &["audit", "identity"],

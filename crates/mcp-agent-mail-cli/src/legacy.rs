@@ -1104,6 +1104,7 @@ fn migrate_sqlite_db(path: &Path) -> CliResult<Vec<String>> {
         .map_err(|e| CliError::Other(format!("failed to build runtime: {e}")))?;
     match rt.block_on(async { schema::migrate_to_latest_base(&cx, &conn).await }) {
         asupersync::Outcome::Ok(ids) => {
+            normalize_legacy_agent_lifecycle_timestamps(&conn)?;
             schema::enforce_runtime_fts_cleanup(&conn)
                 .map_err(|e| CliError::Other(format!("runtime FTS cleanup failed: {e}")))?;
             let _ = conn.execute_raw("PRAGMA journal_mode = WAL;");
@@ -1117,6 +1118,60 @@ fn migrate_sqlite_db(path: &Path) -> CliResult<Vec<String>> {
             Err(CliError::Other(format!("migration panicked: {p}")))
         }
     }
+}
+
+/// Convert Python DATETIME text in `agents.retired_at` to the Rust runtime's
+/// canonical UTC-microsecond integer. A duplicate-column migration correctly
+/// preserves an existing Python column, but without this value conversion a
+/// fresh Rust process would decode a retired agent as active.
+fn normalize_legacy_agent_lifecycle_timestamps(conn: &DbConn) -> CliResult<()> {
+    use mcp_agent_mail_db::sqlmodel_core::Value;
+
+    let rows = conn
+        .query_sync(
+            "SELECT id, CAST(retired_at AS TEXT) AS retired_at_text \
+             FROM agents \
+             WHERE retired_at IS NOT NULL AND typeof(retired_at) != 'integer'",
+            &[],
+        )
+        .map_err(|error| {
+            CliError::Other(format!(
+                "failed to inspect legacy agent retirement timestamps: {error}"
+            ))
+        })?;
+    for row in rows {
+        let agent_id = row.get_named::<i64>("id").map_err(|error| {
+            CliError::Other(format!("legacy retired agent row has no numeric id: {error}"))
+        })?;
+        let raw = row.get_named::<String>("retired_at_text").map_err(|error| {
+            CliError::Other(format!(
+                "legacy retired_at for agent {agent_id} is not text-decodable: {error}"
+            ))
+        })?;
+        let micros = raw
+            .parse::<i64>()
+            .ok()
+            .or_else(|| mcp_agent_mail_db::iso_to_micros(raw.trim()))
+            .or_else(|| {
+                let normalized = raw.trim().replacen(' ', "T", 1);
+                mcp_agent_mail_db::iso_to_micros(&normalized)
+            })
+            .ok_or_else(|| {
+                CliError::Other(format!(
+                    "cannot convert legacy retired_at {raw:?} for agent {agent_id}; refusing to publish a target that would reactivate the agent"
+                ))
+            })?;
+        conn.execute_sync(
+            "UPDATE agents SET retired_at = ? WHERE id = ?",
+            &[Value::BigInt(micros), Value::BigInt(agent_id)],
+        )
+        .map_err(|error| {
+            CliError::Other(format!(
+                "failed to normalize retired_at for agent {agent_id}: {error}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 fn integrity_check_ok(path: &Path) -> CliResult<bool> {
@@ -3531,8 +3586,8 @@ mod tests {
         .expect("insert v20 project");
         conn.execute_sync(
             "INSERT INTO agents (\
-                 id, project_id, name, program, model, task_description, inception_ts, last_active_ts\
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 id, project_id, name, program, model, task_description, inception_ts, last_active_ts, retired_at\
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 Value::BigInt(1),
                 Value::BigInt(1),
@@ -3542,6 +3597,7 @@ mod tests {
                 Value::Text("v20 source fixture".to_string()),
                 Value::BigInt(1),
                 Value::BigInt(1),
+                Value::Text("2026-08-24 03:22:36.123456".to_string()),
             ],
         )
         .expect("insert v20 agent");
@@ -3631,6 +3687,25 @@ mod tests {
             .expect("target remains readable after import");
         verify_runtime_sqlite_readable(&target_db, "target DB")
             .expect("target remains runtime-readable after import");
+        let target_conn = DbConn::open_file(target_db.display().to_string())
+            .expect("open normalized lifecycle target");
+        let retired = target_conn
+            .query_sync(
+                "SELECT retired_at, typeof(retired_at) AS retired_at_type \
+                 FROM agents WHERE id = 1",
+                &[],
+            )
+            .expect("read normalized lifecycle target");
+        assert_eq!(retired.len(), 1);
+        assert_eq!(
+            retired[0].get_named::<String>("retired_at_type").unwrap(),
+            "integer"
+        );
+        assert_eq!(
+            retired[0].get_named::<i64>("retired_at").unwrap(),
+            mcp_agent_mail_db::iso_to_micros("2026-08-24T03:22:36.123456").unwrap()
+        );
+        drop(target_conn);
         #[cfg(target_os = "linux")]
         assert_target_reopens_in_fresh_process(&target_db);
         assert!(

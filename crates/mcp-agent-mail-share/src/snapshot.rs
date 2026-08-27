@@ -84,7 +84,14 @@ const KNOWN_TABLES: &[KnownTable] = &[
             "contact_policy",
             "reaper_exempt",
             "registration_token",
+            "retired_at",
         ],
+    },
+    KnownTable {
+        name: "agent_deregistrations",
+        page_by_column: Some("agent_id"),
+        primary_key_columns: &["agent_id"],
+        columns: &["agent_id", "deregistered_at"],
     },
     KnownTable {
         name: "messages",

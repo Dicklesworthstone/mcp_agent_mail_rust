@@ -492,6 +492,7 @@ pub fn apply_redaction(mut result: SearchResult, policy: &RedactionPolicy) -> Se
     }
     if policy.redact_thread {
         result.thread_id = None;
+        result.topic = None;
     }
     if fields_redacted {
         result.redacted = true;
@@ -611,6 +612,7 @@ mod tests {
             ack_required: Some(false),
             created_ts: Some(1_000_000),
             thread_id: Some("thread-1".to_string()),
+            topic: Some("br-abc.1".to_string()),
             from_agent: Some(from_agent.to_string()),
             from_agent_id: Some(sender_id),
             reason_codes: Vec::new(),
@@ -859,6 +861,7 @@ mod tests {
         );
         assert!(redacted.from_agent.is_some()); // not redacted by default
         assert!(redacted.thread_id.is_some());
+        assert_eq!(redacted.topic.as_deref(), Some("br-abc.1"));
         assert!(redacted.redacted);
         assert_eq!(
             redacted.redaction_reason.as_deref(),
@@ -875,6 +878,7 @@ mod tests {
         assert!(redacted.from_agent.is_none());
         assert!(redacted.from_agent_id.is_none());
         assert!(redacted.thread_id.is_none());
+        assert!(redacted.topic.is_none());
         assert!(redacted.redacted);
     }
 
