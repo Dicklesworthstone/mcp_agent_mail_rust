@@ -189,6 +189,35 @@ fn recover_agent_rows_from_sqlite(
 
 fn fetch_agent_rows_from_sqlite(conn: &DbConn) -> Vec<AgentRow> {
     let last_active_sort = crate::tui_poller::timestamp_sort_expr("a.last_active_ts");
+    let agent_columns = conn
+        .query_sync("PRAGMA table_info(agents)", &[])
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| row.get_named::<String>("name").ok())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let has_deregistration_ledger = conn
+        .query_sync(
+            "SELECT 1 AS present FROM sqlite_master \
+             WHERE type = 'table' AND name = 'agent_deregistrations' LIMIT 1",
+            &[],
+        )
+        .is_ok_and(|rows| !rows.is_empty());
+    let mut lifecycle_predicates = Vec::with_capacity(2);
+    if agent_columns.contains("retired_at") {
+        lifecycle_predicates.push("a.retired_at IS NULL");
+    }
+    if has_deregistration_ledger {
+        lifecycle_predicates
+            .push("NOT EXISTS (SELECT 1 FROM agent_deregistrations d WHERE d.agent_id = a.id)");
+    }
+    let lifecycle_where = if lifecycle_predicates.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", lifecycle_predicates.join(" AND "))
+    };
     let query_rows = match conn.query_sync(
         &format!(
             "WITH agent_messages AS ( \
@@ -212,6 +241,7 @@ fn fetch_agent_rows_from_sqlite(conn: &DbConn) -> Vec<AgentRow> {
              FROM agents a \
              LEFT JOIN projects p ON p.id = a.project_id \
              LEFT JOIN agent_messages am ON am.agent_id = a.id \
+             {lifecycle_where} \
              GROUP BY a.id, a.project_id, project_slug, a.name, a.program, a.model, a.last_active_ts \
              ORDER BY {last_active_sort} DESC, a.id DESC \
              LIMIT {SQLITE_AGENT_RECOVERY_LIMIT}"

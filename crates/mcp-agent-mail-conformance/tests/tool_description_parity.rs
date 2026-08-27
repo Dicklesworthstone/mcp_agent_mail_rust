@@ -413,8 +413,8 @@ fn tool_input_schemas_match_python_fixture() {
 fn fixture_is_valid() {
     let fixture = load_fixture();
     assert!(
-        fixture.tools.len() >= 34,
-        "Fixture should have at least 34 tools, got {}",
+        fixture.tools.len() >= 37,
+        "Fixture should have at least 37 tools, got {}",
         fixture.tools.len()
     );
 
@@ -509,11 +509,18 @@ fn cluster_infrastructure_descriptions() {
     ]);
 }
 
-/// Identity cluster: register_agent, create_agent_identity, whois
+/// Identity cluster: registration, lifecycle, lookup, and roster tools.
 #[test]
 fn cluster_identity_descriptions() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
-    check_cluster_descriptions(&["register_agent", "create_agent_identity", "whois"]);
+    check_cluster_descriptions(&[
+        "register_agent",
+        "create_agent_identity",
+        "retire_agent",
+        "unretire_agent",
+        "deregister_agent",
+        "whois",
+    ]);
 }
 
 /// Messaging cluster: send_message, reply_message, fetch_inbox, fetch_inbox_events,

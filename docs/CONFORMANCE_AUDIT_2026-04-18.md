@@ -12,7 +12,7 @@ Scope:
 - Direct source inspection in `crates/mcp-agent-mail-tools/src/resources.rs`
 
 Headline counts:
-- Tools: 40 total = 34 python-parity + 6 rust-native fixture-backed (get_message_delivery_receipt registered 2026-08-13, GH#218)
+- Tools: 43 total = 37 python-parity + 6 rust-native fixture-backed (lifecycle parity tools added 2026-08-27, GH#255; get_message_delivery_receipt registered 2026-08-13, GH#218)
 - Resources: 25 logical templates = 23 python-parity + 2 rust-native uncovered (`resource://tooling/metrics_core`, `resource://tooling/diagnostics`)
 - Current suite state: the pre-`3813da8f` full-suite audit still records failures in `tests/conformance.rs`, and the dedicated Rust-native fixture lane now exists. A targeted `rch` verification attempt on 2026-04-18T09:59Z did not reach assertions because the remote worker ran out of disk space while compiling (`No space left on device`).
 
@@ -169,5 +169,5 @@ Timing per test / slow outliers:
 - `list_agents` is no longer an uncovered mystery state: `3813da8f` added dedicated Rust-native fixtures for it under `tests/conformance/fixtures/rust_native/`. Remaining follow-up is the drift-guard work in `br-a2k3h.6`.
 - `resource://tooling/metrics_core` and `resource://tooling/diagnostics` are registered by the live router and have Rust unit tests in `mcp-agent-mail-tools/src/resources.rs:5114-5131`, but neither has behavior fixtures in the conformance crate. Follow-up: `br-a2k3h.4` and `br-a2k3h.6`.
 - The current tool-description parity and drift-guard tests still need to be taught about the dedicated Rust-native Identity fixture lane. Follow-up: `br-a2k3h.6`.
-- Earlier same-day crate-doc count drift was folded into the documentation-alignment sweep; the live surface is now 40 tools / 25 resources (get_message_delivery_receipt added 2026-08-13).
+- Earlier same-day crate-doc count drift was folded into the documentation-alignment sweep; the live surface is now 43 tools / 25 resources (retire_agent, unretire_agent, and deregister_agent added 2026-08-27; get_message_delivery_receipt added 2026-08-13).
 - Not worth tracking as a separate bead: the apparent `tests/conformance/fixtures/python_reference.json` mismatch is only a package-root vs workspace-root path confusion. The tracked fixture is present where the package test binary expects it.

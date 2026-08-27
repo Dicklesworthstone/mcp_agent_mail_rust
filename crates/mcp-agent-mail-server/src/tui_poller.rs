@@ -1624,6 +1624,9 @@ fn fetch_agent_list_rows(conn: &DbConn) -> Vec<AgentListRow> {
     let has_program = available_columns.contains("program");
     let has_model = available_columns.contains("model");
     let has_last_active = available_columns.contains("last_active_ts");
+    let has_retired_at = available_columns.contains("retired_at");
+    let has_deregistration_ledger =
+        table_has_required_columns(conn, "agent_deregistrations", &["agent_id"]).unwrap_or(false);
 
     let raw_project_id_select = if has_project_id {
         "a.project_id AS raw_project_id"
@@ -1661,6 +1664,19 @@ fn fetch_agent_list_rows(conn: &DbConn) -> Vec<AgentListRow> {
     } else {
         "0".to_string()
     };
+    let mut lifecycle_predicates = Vec::with_capacity(2);
+    if has_retired_at {
+        lifecycle_predicates.push("a.retired_at IS NULL");
+    }
+    if has_deregistration_ledger {
+        lifecycle_predicates
+            .push("NOT EXISTS (SELECT 1 FROM agent_deregistrations d WHERE d.agent_id = a.id)");
+    }
+    let lifecycle_where = if lifecycle_predicates.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", lifecycle_predicates.join(" AND "))
+    };
     conn.query_sync(
         &format!(
             "SELECT \
@@ -1673,6 +1689,7 @@ fn fetch_agent_list_rows(conn: &DbConn) -> Vec<AgentListRow> {
                 {last_active_select} \
              FROM agents a \
              {project_join} \
+             {lifecycle_where} \
              ORDER BY {last_active_sort} DESC, a.id DESC \
              LIMIT {MAX_AGENTS}"
         ),
@@ -5988,6 +6005,50 @@ first body
         assert_eq!(agents[0].name, "NewAgent");
         assert_eq!(agents[1].name, "MidAgent");
         assert_eq!(agents[2].name, "OldAgent");
+    }
+
+    #[test]
+    fn fetch_agents_list_excludes_retired_and_deregistered_identities() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_agents_lifecycle_filter.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                program TEXT,
+                last_active_ts INTEGER,
+                retired_at INTEGER
+            )",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE agent_deregistrations (
+                agent_id INTEGER PRIMARY KEY,
+                deregistered_at INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .expect("create lifecycle ledger");
+        conn.execute_sync(
+            "INSERT INTO agents (id, name, program, last_active_ts, retired_at) VALUES
+             (1, 'ActiveAgent', 'codex', 100, NULL),
+             (2, 'RetiredAgent', 'codex', 300, 200),
+             (3, 'GoneAgent', 'codex', 400, NULL)",
+            &[],
+        )
+        .expect("insert agents");
+        conn.execute_sync(
+            "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (3, 250)",
+            &[],
+        )
+        .expect("insert deregistration");
+
+        let agents = fetch_agents_list(&conn);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "ActiveAgent");
     }
 
     #[test]

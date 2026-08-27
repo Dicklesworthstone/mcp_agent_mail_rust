@@ -10006,6 +10006,15 @@ fn build_agents_with_health(
                     (SELECT COUNT(*) FROM messages m WHERE m.sender_id = a.id) AS msg_count
              FROM agents a
              WHERE a.project_id = ?
+               AND a.retired_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM agent_deregistrations d WHERE d.agent_id = a.id
+               )
+               AND a.id = (
+                   SELECT MIN(canonical.id) FROM agents canonical
+                   WHERE canonical.project_id = a.project_id
+                     AND canonical.name = a.name COLLATE NOCASE
+               )
              ORDER BY a.last_active_ts DESC, a.id DESC",
             &[Value::BigInt(project_id)],
         )

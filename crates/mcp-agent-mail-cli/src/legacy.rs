@@ -1141,13 +1141,17 @@ fn normalize_legacy_agent_lifecycle_timestamps(conn: &DbConn) -> CliResult<()> {
         })?;
     for row in rows {
         let agent_id = row.get_named::<i64>("id").map_err(|error| {
-            CliError::Other(format!("legacy retired agent row has no numeric id: {error}"))
-        })?;
-        let raw = row.get_named::<String>("retired_at_text").map_err(|error| {
             CliError::Other(format!(
-                "legacy retired_at for agent {agent_id} is not text-decodable: {error}"
+                "legacy retired agent row has no numeric id: {error}"
             ))
         })?;
+        let raw = row
+            .get_named::<String>("retired_at_text")
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "legacy retired_at for agent {agent_id} is not text-decodable: {error}"
+                ))
+            })?;
         let micros = raw
             .parse::<i64>()
             .ok()

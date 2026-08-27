@@ -2005,6 +2005,9 @@ pub enum MailCommand {
         /// Thread ID to associate with.
         #[arg(long)]
         thread_id: Option<String>,
+        /// Optional case-insensitive topic tag (1-64 safe ASCII characters).
+        #[arg(long)]
+        topic: Option<String>,
         /// Sender token proving ownership of --from (DISCOURAGED: visible in
         /// shell history/process list — prefer --sender-token-file or the
         /// AGENT_MAIL_SENDER_TOKEN env var). If --from was registered via
@@ -2174,6 +2177,8 @@ struct PendingMailSendEnvelope {
     importance: String,
     ack_required: bool,
     thread_id: Option<String>,
+    #[serde(default)]
+    topic: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -10279,7 +10284,19 @@ fn handle_list_projects_with_database_url(
                 let id: i64 = row.get_named("id").unwrap_or(0);
                 let agents = conn
                     .query_sync(
-                        "SELECT name, program, model FROM agents WHERE project_id = ?",
+                        "SELECT a.name, a.program, a.model \
+                         FROM agents a \
+                         WHERE a.project_id = ? \
+                           AND a.retired_at IS NULL \
+                           AND NOT EXISTS ( \
+                               SELECT 1 FROM agent_deregistrations d WHERE d.agent_id = a.id \
+                           ) \
+                           AND a.id = ( \
+                               SELECT MIN(canonical.id) FROM agents canonical \
+                               WHERE canonical.project_id = a.project_id \
+                                 AND canonical.name = a.name COLLATE NOCASE \
+                           ) \
+                         ORDER BY a.last_active_ts DESC, a.id DESC",
                         &[sqlmodel_core::Value::BigInt(id)],
                     )
                     .unwrap_or_default();
@@ -35228,6 +35245,7 @@ async fn send_mail_envelope_via_server_or_local(
             &envelope.importance,
             envelope.ack_required,
             envelope.thread_id.as_deref(),
+            envelope.topic.as_deref(),
             sender_token,
         ),
     )
@@ -35271,6 +35289,7 @@ async fn send_mail_envelope_via_server_or_local(
         &envelope.importance,
         envelope.ack_required,
         envelope.thread_id.as_deref(),
+        envelope.topic.as_deref(),
         sender_token,
     ));
     let payload = match asupersync::time::timeout(
@@ -35683,6 +35702,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             importance,
             ack_required,
             thread_id,
+            topic,
             sender_token,
             sender_token_file,
             format,
@@ -35715,6 +35735,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 importance,
                 ack_required,
                 thread_id,
+                topic,
             };
             let data = send_mail_envelope_via_server_or_local(
                 &server_config,
@@ -36497,6 +36518,7 @@ fn build_server_send_message_arguments(
     importance: &str,
     ack_required: bool,
     thread_id: Option<&str>,
+    topic: Option<&str>,
     sender_token: Option<&str>,
 ) -> serde_json::Value {
     let mut arguments = serde_json::Map::from_iter([
@@ -36513,6 +36535,9 @@ fn build_server_send_message_arguments(
     }
     if let Some(thread_id) = thread_id {
         arguments.insert("thread_id".to_string(), serde_json::json!(thread_id));
+    }
+    if let Some(topic) = topic {
+        arguments.insert("topic".to_string(), serde_json::json!(topic));
     }
     if let Some(sender_token) = sender_token.filter(|t| !t.is_empty()) {
         arguments.insert("sender_token".to_string(), serde_json::json!(sender_token));
@@ -37165,21 +37190,26 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             let cx = asupersync::Cx::for_request();
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
-            let agents =
-                match mcp_agent_mail_db::queries::list_agents(&cx, &ctx.pool, proj.id.unwrap_or(0))
-                    .await
-                {
-                    asupersync::Outcome::Ok(rows) => rows,
-                    asupersync::Outcome::Err(e) => {
-                        return Err(CliError::Other(format!("list_agents failed: {e}")));
-                    }
-                    asupersync::Outcome::Cancelled(_) => {
-                        return Err(CliError::Other("request cancelled".into()));
-                    }
-                    asupersync::Outcome::Panicked(p) => {
-                        return Err(CliError::Other(format!("internal panic: {}", p.message())));
-                    }
-                };
+            let agents = match mcp_agent_mail_db::queries::list_active_agents_bounded(
+                &cx,
+                &ctx.pool,
+                proj.id.unwrap_or(0),
+                None,
+                None,
+            )
+            .await
+            {
+                asupersync::Outcome::Ok(rows) => rows,
+                asupersync::Outcome::Err(e) => {
+                    return Err(CliError::Other(format!("list_agents failed: {e}")));
+                }
+                asupersync::Outcome::Cancelled(_) => {
+                    return Err(CliError::Other("request cancelled".into()));
+                }
+                asupersync::Outcome::Panicked(p) => {
+                    return Err(CliError::Other(format!("internal panic: {}", p.message())));
+                }
+            };
 
             let data: Vec<serde_json::Value> = agents.iter().map(agent_row_to_json).collect();
             render_agent_list_payload(&serde_json::Value::Array(data), fmt);
@@ -37471,6 +37501,7 @@ fn agent_row_to_json(a: &mcp_agent_mail_db::AgentRow) -> serde_json::Value {
         "project_id": a.project_id,
         "attachments_policy": a.attachments_policy,
         "contact_policy": a.contact_policy,
+        "retired_at": a.retired_at.map(mcp_agent_mail_db::micros_to_iso),
     })
 }
 
@@ -38357,6 +38388,7 @@ fn message_row_to_json(m: &mcp_agent_mail_db::MessageRow, sender_name: &str) -> 
         "importance": m.importance,
         "ack_required": m.ack_required != 0,
         "thread_id": m.thread_id,
+        "topic": m.topic,
         "created_ts": mcp_agent_mail_db::micros_to_iso(m.created_ts),
         "from": sender_name,
     })
@@ -38556,11 +38588,13 @@ mod mail_server_cli_bridge_tests {
             true,
             None,
             None,
+            None,
         );
 
         let object = args.as_object().expect("object arguments");
         assert!(!object.contains_key("cc"));
         assert!(!object.contains_key("thread_id"));
+        assert!(!object.contains_key("topic"));
         assert!(!object.contains_key("sender_token"));
     }
 
@@ -38576,6 +38610,7 @@ mod mail_server_cli_bridge_tests {
             None,
             "high",
             true,
+            None,
             None,
             Some("secret-tok"),
         );
@@ -38596,6 +38631,7 @@ mod mail_server_cli_bridge_tests {
             None,
             "high",
             true,
+            None,
             None,
             Some(""),
         );
@@ -38625,6 +38661,7 @@ mod mail_server_cli_bridge_tests {
             importance: "normal".to_string(),
             ack_required: false,
             thread_id: Some("br-test".to_string()),
+            topic: Some("br-test.1".to_string()),
         }
     }
 
@@ -38931,6 +38968,7 @@ mod mail_server_cli_bridge_tests {
             "normal",
             false,
             Some("br-123"),
+            Some("br-123.1"),
             None,
         );
 
@@ -38942,6 +38980,10 @@ mod mail_server_cli_bridge_tests {
         assert_eq!(
             object.get("thread_id").and_then(serde_json::Value::as_str),
             Some("br-123")
+        );
+        assert_eq!(
+            object.get("topic").and_then(serde_json::Value::as_str),
+            Some("br-123.1")
         );
     }
 
@@ -82235,6 +82277,7 @@ async fn call_send_message_tool_locally(
     importance: &str,
     ack_required: bool,
     thread_id: Option<&str>,
+    topic: Option<&str>,
     sender_token: Option<&str>,
 ) -> CliResult<serde_json::Value> {
     let ctx = McpContext::new(asupersync::Cx::for_request(), 1);
@@ -82252,7 +82295,7 @@ async fn call_send_message_tool_locally(
         Some(importance.to_string()),
         Some(ack_required),
         thread_id.map(str::to_string),
-        None,
+        topic.map(str::to_string),
         None,
         None,
         sender_token.filter(|t| !t.is_empty()).map(str::to_string),

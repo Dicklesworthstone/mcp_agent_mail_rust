@@ -10842,6 +10842,10 @@ fn fetch_dashboard_db_stats_from_conn(conn: &DbConn) -> DashboardDbStats {
     let agents_list = conn
         .query_sync(
             "SELECT id, name, program, last_active_ts FROM agents \
+             WHERE retired_at IS NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM agent_deregistrations d WHERE d.agent_id = agents.id \
+               ) \
              ORDER BY last_active_ts DESC LIMIT 10",
             &[],
         )

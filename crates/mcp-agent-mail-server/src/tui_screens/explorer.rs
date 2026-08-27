@@ -186,6 +186,7 @@ struct DisplayEntry {
     sender_name: String,
     to_agents: String,
     subject: String,
+    topic: Option<String>,
     body_md: String,
     body_preview: String,
     thread_id: Option<String>,
@@ -959,7 +960,7 @@ impl MailExplorerScreen {
         };
 
         let sql = format!(
-            "SELECT DISTINCT m.id, m.subject, m.body_md, m.importance, m.ack_required, \
+            "SELECT DISTINCT m.id, m.subject, m.topic, m.body_md, m.importance, m.ack_required, \
              m.created_ts, m.thread_id, m.sender_id AS raw_sender_id, \
              m.project_id AS raw_project_id, s.name AS sender_name, p.slug AS project_slug \
              FROM message_recipients r \
@@ -1027,7 +1028,7 @@ impl MailExplorerScreen {
         };
 
         let sql = format!(
-            "SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts, \
+            "SELECT m.id, m.subject, m.topic, m.body_md, m.importance, m.ack_required, m.created_ts, \
              m.thread_id, m.sender_id AS raw_sender_id, m.project_id AS raw_project_id, \
              s.name AS sender_name, p.slug AS project_slug \
              FROM messages m \
@@ -1778,6 +1779,7 @@ fn map_entry(
         sender_name: read_agent_label(row, "sender_name", "raw_sender_id"),
         to_agents,
         subject: row.get_named("subject").unwrap_or_default(),
+        topic: row.get_named("topic").ok(),
         body_md: body,
         body_preview: preview,
         thread_id: row.get_named("thread_id").ok(),
@@ -2192,6 +2194,9 @@ fn render_detail(
     };
     lines.push(Line::raw(format!("Dir:     {dir}")));
     lines.push(Line::raw(format!("Subject: {}", entry.subject)));
+    if let Some(topic) = entry.topic.as_deref() {
+        lines.push(Line::raw(format!("Topic:   {topic}")));
+    }
     lines.push(Line::raw(format!("From:    {}", entry.sender_name)));
     lines.push(Line::raw(format!("To:      {}", entry.to_agents)));
     lines.push(Line::raw(format!("Project: {}", entry.project_slug)));
@@ -2560,6 +2565,7 @@ mod tests {
                 project_id INTEGER NOT NULL,
                 sender_id INTEGER NOT NULL,
                 subject TEXT NOT NULL,
+                topic TEXT,
                 body_md TEXT NOT NULL,
                 importance TEXT NOT NULL,
                 ack_required INTEGER NOT NULL,
@@ -2610,9 +2616,9 @@ mod tests {
                 (2, 'BlueLake'),
                 (3, 'RedFox');
              INSERT INTO messages
-                (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, thread_id)
+                (id, project_id, sender_id, subject, topic, body_md, importance, ack_required, created_ts, thread_id)
              VALUES
-                (10, 1, 1, 'Deploy notice', 'Ship it', 'high', 1, 1000, 'br-10');
+                (10, 1, 1, 'Deploy notice', 'release.v31', 'Ship it', 'high', 1, 1000, 'br-10');
              INSERT INTO message_recipients (message_id, agent_id, read_ts, ack_ts) VALUES
                 (10, 2, 1200, 1300),
                 (10, 3, NULL, NULL);",
@@ -2625,6 +2631,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         let entry = &entries[0];
         assert_eq!(entry.message_id, 10);
+        assert_eq!(entry.topic.as_deref(), Some("release.v31"));
         assert!(entry.to_agents.contains("BlueLake"));
         assert!(entry.to_agents.contains("RedFox"));
         assert_eq!(
@@ -3295,6 +3302,7 @@ mod tests {
             sender_name: "TestAgent".to_string(),
             to_agents: "OtherAgent".to_string(),
             subject: format!("Subject {id}"),
+            topic: None,
             body_md: String::new(),
             body_preview: String::new(),
             thread_id: None,
@@ -3399,6 +3407,7 @@ mod tests {
             sender_name: String::new(),
             to_agents: String::new(),
             subject: String::new(),
+            topic: None,
             body_md: String::new(),
             body_preview: String::new(),
             thread_id: None,

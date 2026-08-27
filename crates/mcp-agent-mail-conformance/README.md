@@ -14,12 +14,12 @@ This crate keeps the live Rust router honest against the legacy Python reference
 - Focused regression checks for tool filtering, error envelopes, and outage behavior
 - Automation entrypoints in `../../scripts/regen_python_parity_fixtures.sh` and `.github/workflows/conformance-fixture-regen.yml`
 
-## Current coverage (as of 2026-04-18)
+## Current coverage (as of 2026-08-27)
 
-- The live Rust router exposes 39 tools.
-- 34 tools have Python behavior fixtures in `tests/conformance/fixtures/python_reference.json`.
-- 5 tools are Rust-native extensions: `resolve_pane_identity`, `cleanup_pane_identities`, `list_agents`, `check_file_reservation_conflicts`, and `fetch_inbox_events`.
-- All 5 Rust-native tools are covered by dedicated golden fixtures under `tests/conformance/fixtures/rust_native/`.
+- The live Rust router exposes 43 tools.
+- 37 tools have Python behavior fixtures in `tests/conformance/fixtures/python_reference.json`.
+- 6 tools are Rust-native extensions: `resolve_pane_identity`, `cleanup_pane_identities`, `list_agents`, `check_file_reservation_conflicts`, `fetch_inbox_events`, and `get_message_delivery_receipt`.
+- All 6 Rust-native tools are covered by dedicated golden fixtures under `tests/conformance/fixtures/rust_native/`.
 - The former tool fixture gap tracked by `br-a2k3h.3` is closed by the dedicated Rust-native fixture lane.
 - The live Rust router exposes 25 logical resource templates after collapsing `?{query}` variants.
 - 23 resource templates have Python behavior fixtures.
@@ -33,7 +33,7 @@ These classifications come from the live tool surface in `mcp_agent_mail_tools::
 the Python behavior fixture inventory in `tests/conformance/fixtures/python_reference.json`, and
 the audit record in [docs/CONFORMANCE_AUDIT_2026-04-18.md](../../docs/CONFORMANCE_AUDIT_2026-04-18.md).
 
-### Python-parity tools (34)
+### Python-parity tools (37)
 
 - `health_check` - Return the server readiness snapshot and infrastructure status.
 - `ensure_project` - Create or resolve the canonical project identity for a workspace path.
@@ -41,6 +41,9 @@ the audit record in [docs/CONFORMANCE_AUDIT_2026-04-18.md](../../docs/CONFORMANC
 - `uninstall_precommit_guard` - Remove the reservation-enforcing Git pre-commit guard.
 - `register_agent` - Register or refresh an agent identity in a project archive.
 - `create_agent_identity` - Mint a fresh agent identity with a unique adjective-noun name.
+- `retire_agent` - Remove an identity from active routing while retaining its history.
+- `unretire_agent` - Restore a retired identity to active routing.
+- `deregister_agent` - Permanently close an identity to new routing without deleting history.
 - `whois` - Inspect an agent profile and optional recent archive commits.
 - `send_message` - Create a message, persist recipients, and write archive copies.
 - `reply_message` - Reply in-thread while preserving the original thread semantics.
@@ -70,13 +73,14 @@ the audit record in [docs/CONFORMANCE_AUDIT_2026-04-18.md](../../docs/CONFORMANC
 - `renew_build_slot` - Extend an existing build slot lease.
 - `release_build_slot` - Release an existing build slot lease.
 
-### Rust-native extensions (5)
+### Rust-native extensions (6)
 
 - `resolve_pane_identity` - Resolve the canonical agent name for a tmux pane from Rust-side identity files; there is no Python pane-identity analogue.
 - `cleanup_pane_identities` - Remove stale per-pane identity files for dead tmux panes; this is Rust-only operational cleanup tied to the pane identity model.
 - `list_agents` - List all registered agents in a project; this Rust-native identity surface is now covered by the dedicated `rust_native/` golden fixtures.
 - `check_file_reservation_conflicts` - Read-only authoritative conflict check for pre-edit/pre-commit guards (added in `08b05c76`, GH#196); covered by the dedicated `rust_native/` golden fixtures.
 - `fetch_inbox_events` - Read durable, body-free recipient delivery events with a restart-safe cursor; covered by the dedicated `rust_native/` golden fixtures.
+- `get_message_delivery_receipt` - Read durable per-recipient delivery state for a message; covered by the dedicated `rust_native/` golden fixtures.
 
 Full inventory and the current blocker record live in [docs/CONFORMANCE_AUDIT_2026-04-18.md](../../docs/CONFORMANCE_AUDIT_2026-04-18.md).
 

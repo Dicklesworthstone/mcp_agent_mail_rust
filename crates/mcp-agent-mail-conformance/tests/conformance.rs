@@ -2499,6 +2499,149 @@ fn run_rust_native_fixtures_against_rust_server_router() {
 }
 
 #[test]
+fn lifecycle_tools_preserve_authorization_roster_and_permanent_deregistration_contract() {
+    let _lock = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+    let env = setup_fixture_env();
+    let project_path = env.tmp.path().join("lifecycle-project");
+    std::fs::create_dir_all(&project_path).expect("create lifecycle fixture project");
+    let project_key = project_path.to_string_lossy().into_owned();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id = 10_000;
+
+    let invoke = |tool: &str, input: Value, req_id: &mut u64| {
+        execute_tool(
+            &env.router,
+            &cx,
+            &budget,
+            req_id,
+            tool,
+            args_from_value(&input),
+        )
+        .unwrap_or_else(|error| panic!("{tool} router failure: {error}"))
+    };
+
+    invoke(
+        "ensure_project",
+        serde_json::json!({ "human_key": &project_key }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("ensure_project failed: {error}"));
+    let registered = invoke(
+        "register_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "program": "codex-cli",
+            "model": "gpt-5",
+            "name": "SilverLake",
+            "task_description": "lifecycle conformance"
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("register_agent failed: {error}"));
+    let token = registered
+        .get("registration_token")
+        .and_then(Value::as_str)
+        .expect("registration returns authorization token")
+        .to_string();
+
+    let retire = invoke(
+        "retire_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "agent_name": "SilverLake",
+            "registration_token": &token
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("retire_agent failed: {error}"));
+    assert_eq!(retire["status"], "retired");
+    assert!(retire["retired_at"].is_string());
+
+    let retired_roster = invoke(
+        "list_agents",
+        serde_json::json!({ "project_key": &project_key }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("list_agents after retire failed: {error}"));
+    assert!(
+        retired_roster
+            .as_array()
+            .is_some_and(|agents| agents.iter().all(|agent| agent["name"] != "SilverLake")),
+        "retired identity must be absent from the active roster: {retired_roster}"
+    );
+
+    let unretire = invoke(
+        "unretire_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "agent_name": "SilverLake",
+            "registration_token": &token
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("unretire_agent failed: {error}"));
+    assert_eq!(unretire["status"], "active");
+
+    let active_roster = invoke(
+        "list_agents",
+        serde_json::json!({ "project_key": &project_key }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("list_agents after unretire failed: {error}"));
+    assert!(
+        active_roster
+            .as_array()
+            .is_some_and(|agents| agents.iter().any(|agent| agent["name"] == "SilverLake")),
+        "unretired identity must return to the active roster: {active_roster}"
+    );
+
+    let deregistered = invoke(
+        "deregister_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "agent_name": "SilverLake",
+            "registration_token": &token
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("deregister_agent failed: {error}"));
+    assert_eq!(deregistered["status"], "deregistered");
+    let first_deregistered_at = deregistered["deregistered_at"].clone();
+    assert!(first_deregistered_at.is_string());
+
+    let retry = invoke(
+        "deregister_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "agent_name": "SilverLake",
+            "registration_token": &token
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("deregister_agent retry failed: {error}"));
+    assert_eq!(
+        retry["deregistered_at"], first_deregistered_at,
+        "idempotent retry must retain the first durable event timestamp"
+    );
+
+    let unretire_error = invoke(
+        "unretire_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "agent_name": "SilverLake",
+            "registration_token": &token
+        }),
+        &mut req_id,
+    )
+    .expect_err("deregistered identity cannot be unretired");
+    assert!(
+        unretire_error.contains("AGENT_DEREGISTERED"),
+        "expected typed permanent-lifecycle error, got: {unretire_error}"
+    );
+}
+
+#[test]
 fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
 

@@ -2234,6 +2234,54 @@
           }
         }
       ]
+    },
+    "retire_agent": {
+      "cases": [
+        {
+          "name": "unknown_agent",
+          "input": {
+            "project_key": "abs-path-backend",
+            "agent_name": "MissingAgent"
+          },
+          "expect": {
+            "err": {
+              "message_contains": "not found"
+            }
+          }
+        }
+      ]
+    },
+    "unretire_agent": {
+      "cases": [
+        {
+          "name": "unknown_agent",
+          "input": {
+            "project_key": "abs-path-backend",
+            "agent_name": "MissingAgent"
+          },
+          "expect": {
+            "err": {
+              "message_contains": "not found"
+            }
+          }
+        }
+      ]
+    },
+    "deregister_agent": {
+      "cases": [
+        {
+          "name": "unknown_agent",
+          "input": {
+            "project_key": "abs-path-backend",
+            "agent_name": "MissingAgent"
+          },
+          "expect": {
+            "err": {
+              "message_contains": "not found"
+            }
+          }
+        }
+      ]
     }
   },
   "resources": {
@@ -4552,6 +4600,18 @@
                   "complexity": "medium"
                 },
                 {
+                  "name": "deregister_agent",
+                  "calls": 1,
+                  "errors": 0,
+                  "rejections": 1,
+                  "cluster": "identity",
+                  "capabilities": [
+                    "identity",
+                    "write"
+                  ],
+                  "complexity": "medium"
+                },
+                {
                   "name": "ensure_product",
                   "calls": 1,
                   "errors": 0,
@@ -4823,6 +4883,18 @@
                   "complexity": "medium"
                 },
                 {
+                  "name": "retire_agent",
+                  "calls": 1,
+                  "errors": 0,
+                  "rejections": 1,
+                  "cluster": "identity",
+                  "capabilities": [
+                    "identity",
+                    "write"
+                  ],
+                  "complexity": "medium"
+                },
+                {
                   "name": "search_messages",
                   "calls": 3,
                   "errors": 0,
@@ -4901,6 +4973,18 @@
                   "capabilities": [
                     "infrastructure",
                     "repository"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "unretire_agent",
+                  "calls": 1,
+                  "errors": 0,
+                  "rejections": 1,
+                  "cluster": "identity",
+                  "capabilities": [
+                    "identity",
+                    "write"
                   ],
                   "complexity": "medium"
                 },
@@ -4973,6 +5057,18 @@
                   "complexity": "medium"
                 },
                 {
+                  "name": "deregister_agent",
+                  "calls": 1,
+                  "errors": 0,
+                  "rejections": 1,
+                  "cluster": "identity",
+                  "capabilities": [
+                    "identity",
+                    "write"
+                  ],
+                  "complexity": "medium"
+                },
+                {
                   "name": "ensure_product",
                   "calls": 1,
                   "errors": 0,
@@ -5244,6 +5340,18 @@
                   "complexity": "medium"
                 },
                 {
+                  "name": "retire_agent",
+                  "calls": 1,
+                  "errors": 0,
+                  "rejections": 1,
+                  "cluster": "identity",
+                  "capabilities": [
+                    "identity",
+                    "write"
+                  ],
+                  "complexity": "medium"
+                },
+                {
                   "name": "search_messages",
                   "calls": 3,
                   "errors": 0,
@@ -5322,6 +5430,18 @@
                   "capabilities": [
                     "infrastructure",
                     "repository"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "unretire_agent",
+                  "calls": 1,
+                  "errors": 0,
+                  "rejections": 1,
+                  "cluster": "identity",
+                  "capabilities": [
+                    "identity",
+                    "write"
                   ],
                   "complexity": "medium"
                 },

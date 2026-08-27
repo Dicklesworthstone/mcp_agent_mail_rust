@@ -6375,27 +6375,71 @@ async fn list_agents_bounded_inner(
     // Keep this as a simple ordered scan: startup/TUI paths call this often,
     // and case-insensitive de-duplication is cheap in Rust while avoiding a
     // FrankenSQLite window-function dependency during mailbox recovery.
-    let sql = if active_only {
-        "SELECT id, project_id, name, program, model, task_description, \
-         inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-         registration_token, retired_at \
-         FROM agents \
-         WHERE project_id = ? AND retired_at IS NULL \
-           AND id NOT IN (SELECT agent_id FROM agent_deregistrations) \
-         ORDER BY last_active_ts DESC, id DESC"
-    } else {
-        "SELECT id, project_id, name, program, model, task_description, \
-         inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-         registration_token, retired_at \
-         FROM agents \
-         WHERE project_id = ? \
-         ORDER BY last_active_ts DESC, id DESC"
-    };
+    // Read every historical row before lifecycle filtering. Older databases
+    // can contain case-variant duplicates; `get_agent` routes through the
+    // lowest-id canonical row, so filtering first could expose a newer active
+    // duplicate while sends resolve to a retired canonical identity.
+    let sql = "SELECT id, project_id, name, program, model, task_description, \
+               inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+               registration_token, retired_at \
+               FROM agents \
+               WHERE project_id = ? \
+               ORDER BY last_active_ts DESC, id DESC";
     let params = [Value::BigInt(project_id)];
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
         Outcome::Ok(rows) => {
             let mut agents: Vec<AgentRow> = rows.iter().map(decode_agent_row_indexed).collect();
+            if active_only {
+                let deregistered_rows = match map_sql_outcome(
+                    traw_query(
+                        cx,
+                        &tracked,
+                        "SELECT d.agent_id \
+                         FROM agent_deregistrations d \
+                         JOIN agents a ON a.id = d.agent_id \
+                         WHERE a.project_id = ?",
+                        &params,
+                    )
+                    .await,
+                ) {
+                    Outcome::Ok(rows) => rows,
+                    Outcome::Err(error) => return Outcome::Err(error),
+                    Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                    Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+                };
+                let deregistered_ids: HashSet<i64> =
+                    deregistered_rows.iter().filter_map(row_first_i64).collect();
+
+                // Canonicalize case variants exactly like `get_agent` before
+                // evaluating lifecycle state.
+                agents.sort_by_key(|agent| agent.id.unwrap_or(i64::MAX));
+                let mut seen_names = HashSet::new();
+                agents.retain(|agent| seen_names.insert(agent.name.to_ascii_lowercase()));
+                agents.retain(|agent| {
+                    agent.retired_at.is_none()
+                        && agent
+                            .id
+                            .is_none_or(|agent_id| !deregistered_ids.contains(&agent_id))
+                });
+            } else {
+                agents.sort_by(|left, right| {
+                    right
+                        .last_active_ts
+                        .cmp(&left.last_active_ts)
+                        .then_with(|| {
+                            right
+                                .id
+                                .unwrap_or_default()
+                                .cmp(&left.id.unwrap_or_default())
+                        })
+                });
+                let mut seen_names = HashSet::new();
+                agents.retain(|agent| seen_names.insert(agent.name.to_ascii_lowercase()));
+            }
+
+            // Lifecycle canonicalization above sorts by id; restore the public
+            // most-recently-active ordering before applying floor and cap.
             agents.sort_by(|left, right| {
                 right
                     .last_active_ts
@@ -6407,9 +6451,6 @@ async fn list_agents_bounded_inner(
                             .cmp(&left.id.unwrap_or_default())
                     })
             });
-
-            let mut seen_names = HashSet::new();
-            agents.retain(|agent| seen_names.insert(agent.name.to_ascii_lowercase()));
 
             if let Some(floor) = min_last_active_ts {
                 agents.retain(|agent| agent.last_active_ts >= floor);

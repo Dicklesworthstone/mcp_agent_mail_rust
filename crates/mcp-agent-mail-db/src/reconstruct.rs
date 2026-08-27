@@ -3697,11 +3697,12 @@ fn enrich_existing_agent_from_salvage(
     salvaged_reaper_exempt: Option<bool>,
     salvaged_registration_token: Option<&str>,
     salvage_has_registration_token: bool,
+    salvaged_retired_at: Option<i64>,
     stats: &mut ReconstructStats,
 ) -> DbResult<()> {
     let existing_rows = conn
         .query_sync(
-            "SELECT program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, registration_token \
+            "SELECT program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, registration_token, retired_at \
              FROM agents WHERE id = ? LIMIT 1",
             &[Value::BigInt(agent_id)],
         )
@@ -3733,6 +3734,9 @@ fn enrich_existing_agent_from_salvage(
         .is_ok_and(|value| value != 0);
     let current_registration_token = existing_row
         .get_named::<Option<String>>("registration_token")
+        .unwrap_or_default();
+    let current_retired_at = existing_row
+        .get_named::<Option<i64>>("retired_at")
         .unwrap_or_default();
     if salvage_has_registration_token
         && let (Some(current), Some(salvaged)) = (
@@ -3827,6 +3831,14 @@ fn enrich_existing_agent_from_salvage(
         None if salvage_has_registration_token => salvaged_registration_token.map(str::to_string),
         None => current_registration_token.clone(),
     };
+    // Lifecycle restrictions are monotonic during salvage. The archive and
+    // the readable database can represent different recovery generations;
+    // clearing either side's retirement marker would silently reactivate an
+    // identity. If both carry a marker, retain the first observed event.
+    let next_retired_at = match (current_retired_at, salvaged_retired_at) {
+        (Some(current), Some(salvaged)) => Some(current.min(salvaged)),
+        (current, salvaged) => current.or(salvaged),
+    };
 
     if next_program != current_program
         || next_model != current_model
@@ -3837,6 +3849,7 @@ fn enrich_existing_agent_from_salvage(
         || next_contact_policy != current_contact_policy
         || next_reaper_exempt != current_reaper_exempt
         || next_registration_token != current_registration_token
+        || next_retired_at != current_retired_at
     {
         conn.execute_sync(
             "UPDATE agents SET \
@@ -3848,7 +3861,8 @@ fn enrich_existing_agent_from_salvage(
                  attachments_policy = ?, \
                  contact_policy = ?, \
                  reaper_exempt = ?, \
-                 registration_token = ? \
+                 registration_token = ?, \
+                 retired_at = ? \
              WHERE id = ?",
             &[
                 Value::Text(next_program),
@@ -3860,6 +3874,7 @@ fn enrich_existing_agent_from_salvage(
                 Value::Text(next_contact_policy),
                 Value::BigInt(i64::from(next_reaper_exempt)),
                 next_registration_token.map_or(Value::Null, Value::Text),
+                next_retired_at.map_or(Value::Null, Value::BigInt),
                 Value::BigInt(agent_id),
             ],
         )
@@ -3895,6 +3910,7 @@ fn merge_salvaged_database(
 
     let has_projects = table_exists(&salvage_conn, "projects")?;
     let has_agents = table_exists(&salvage_conn, "agents")?;
+    let has_agent_deregistrations = table_exists(&salvage_conn, "agent_deregistrations")?;
     let has_messages = table_exists(&salvage_conn, "messages")?;
     let has_recipients = table_exists(&salvage_conn, "message_recipients")?;
     let has_agent_links = table_exists(&salvage_conn, "agent_links")?;
@@ -3906,6 +3922,7 @@ fn merge_salvaged_database(
 
     if !(has_projects
         || has_agents
+        || has_agent_deregistrations
         || has_messages
         || has_recipients
         || has_agent_links
@@ -3933,6 +3950,61 @@ fn merge_salvaged_database(
         let mut message_id_map: HashMap<i64, i64> = HashMap::new();
         let mut reservation_id_map: HashMap<i64, i64> = HashMap::new();
         let mut product_id_map: HashMap<i64, i64> = HashMap::new();
+        // `None` means the source explicitly records a deregistration but its
+        // timestamp is absent or unreadable. The state itself remains
+        // authoritative; the agent's last-active timestamp supplies a stable
+        // fallback when the mapped row is inserted below.
+        let mut source_deregistered_agents: HashMap<i64, Option<i64>> = HashMap::new();
+        if has_agent_deregistrations {
+            let columns = table_columns(&salvage_conn, "agent_deregistrations")?;
+            if !columns.contains("agent_id") {
+                stats.push_warning(format!(
+                    "Salvage database {} table agent_deregistrations is missing required column agent_id",
+                    salvage_db_path.display()
+                ));
+            } else {
+                let select = if columns.contains("deregistered_at") {
+                    "agent_id, deregistered_at"
+                } else {
+                    "agent_id"
+                };
+                let rows = salvage_conn
+                    .query_sync(
+                        &format!("SELECT {select} FROM agent_deregistrations ORDER BY agent_id"),
+                        &[],
+                    )
+                    .map_err(|error| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: query agent deregistrations: {error}"
+                        ))
+                    })?;
+                for row in &rows {
+                    let source_agent_id = row.get_named::<i64>("agent_id").map_err(|error| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode deregistered agent id: {error}"
+                        ))
+                    })?;
+                    let deregistered_at = if columns.contains("deregistered_at") {
+                        match row.get_named::<Option<i64>>("deregistered_at") {
+                            Ok(value) => value,
+                            Err(_) => row
+                                .get_named::<Option<String>>("deregistered_at")
+                                .ok()
+                                .flatten()
+                                .and_then(|value| {
+                                    let value = value.trim();
+                                    value.parse::<i64>().ok().or_else(|| {
+                                        crate::iso_to_micros(&value.replacen(' ', "T", 1))
+                                    })
+                                }),
+                        }
+                    } else {
+                        None
+                    };
+                    source_deregistered_agents.insert(source_agent_id, deregistered_at);
+                }
+            }
+        }
         if has_projects {
             let project_columns = table_columns(&salvage_conn, "projects")?;
             let project_select = build_salvage_select(
@@ -4063,6 +4135,7 @@ fn merge_salvaged_database(
                     "contact_policy",
                     "reaper_exempt",
                     "registration_token",
+                    "retired_at",
                 ],
                 stats,
                 salvage_db_path,
@@ -4154,6 +4227,35 @@ fn merge_salvaged_database(
                 } else {
                     None
                 };
+                let salvaged_retired_at = if agent_columns.contains("retired_at") {
+                    match row.get_named::<Option<i64>>("retired_at") {
+                        Ok(value) => value,
+                        Err(integer_error) => {
+                            match row.get_named::<Option<String>>("retired_at") {
+                                Ok(None) => None,
+                                Ok(Some(value)) => {
+                                    let value = value.trim();
+                                    value.parse::<i64>().ok().or_else(|| {
+                                        crate::iso_to_micros(&value.replacen(' ', "T", 1))
+                                    }).or_else(|| {
+                                        stats.push_warning(format!(
+                                            "salvaged agent {source_agent_id} has an unparseable retired_at value; preserving the retired state with last_active_ts"
+                                        ));
+                                        Some(salvaged_last_active_ts)
+                                    })
+                                }
+                                Err(text_error) => {
+                                    stats.push_warning(format!(
+                                        "salvaged agent {source_agent_id} has an unreadable retired_at value ({integer_error}; {text_error}); preserving the retired state with last_active_ts"
+                                    ));
+                                    Some(salvaged_last_active_ts)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    None
+                };
                 let salvage_agent_source = format!("salvage agent row {source_agent_id} ({name})");
                 let salvaged_program = normalize_reconstructed_required_agent_field(
                     salvaged_program_raw.as_deref(),
@@ -4193,8 +4295,8 @@ fn merge_salvaged_database(
                 target_conn
                 .execute_sync(
                     "INSERT OR IGNORE INTO agents \
-                     (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, registration_token) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, registration_token, retired_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     &[
                         Value::BigInt(target_project_id),
                         Value::Text(name.clone()),
@@ -4209,6 +4311,7 @@ fn merge_salvaged_database(
                         salvaged_registration_token
                             .clone()
                             .map_or(Value::Null, Value::Text),
+                        salvaged_retired_at.map_or(Value::Null, Value::BigInt),
                     ],
                 )
                 .map_err(|e| {
@@ -4241,10 +4344,47 @@ fn merge_salvaged_database(
                         salvaged_reaper_exempt,
                         salvaged_registration_token.as_deref(),
                         agent_columns.contains("registration_token"),
+                        salvaged_retired_at,
                         stats,
                     )?;
                 }
+
+                let legacy_deregistered_at = (salvaged_contact_policy
+                    .eq_ignore_ascii_case("block_all")
+                    && crate::models::task_description_uses_reserved_deregistered_prefix(
+                        &salvaged_task_description,
+                    ))
+                .then(|| {
+                    crate::models::deregistered_task_timestamp_micros(&salvaged_task_description)
+                        .unwrap_or(salvaged_last_active_ts)
+                });
+                let deregistered_at = source_deregistered_agents
+                    .remove(&source_agent_id)
+                    .map(|timestamp| timestamp.unwrap_or(salvaged_last_active_ts))
+                    .or(legacy_deregistered_at);
+                if let Some(deregistered_at) = deregistered_at {
+                    target_conn
+                        .execute_sync(
+                            "INSERT OR IGNORE INTO agent_deregistrations (agent_id, deregistered_at) VALUES (?, ?)",
+                            &[
+                                Value::BigInt(target_agent_id),
+                                Value::BigInt(deregistered_at),
+                            ],
+                        )
+                        .map_err(|error| {
+                            DbError::Sqlite(format!(
+                                "reconstruct salvage: insert deregistration for agent {name}: {error}"
+                            ))
+                        })?;
+                }
             }
+        }
+
+        for source_agent_id in source_deregistered_agents.keys() {
+            stats.push_warning(format!(
+                "skipped salvaged deregistration for agent {source_agent_id}: agent is absent from the salvage identity map"
+            ));
+            stats.salvaged_rows_skipped_unmapped += 1;
         }
 
         if has_file_reservations {
@@ -6654,6 +6794,8 @@ mod tests {
             "inception_ts": "2026-02-22T12:00:00Z",
             "last_active_ts": "2026-02-22T12:00:00Z",
             "attachments_policy": "auto",
+            "retired_at": "2026-02-22T12:30:00Z",
+            "deregistered_at": "2026-02-22T13:00:00Z",
         });
         std::fs::write(
             agent_dir.join("profile.json"),
@@ -6694,6 +6836,28 @@ mod tests {
             atc_tables.is_empty(),
             "reconstruct must NOT materialize atc_* tables in the primary mailbox DB \
              (ATC telemetry is isolated in the atc.sqlite3 sidecar); found: {atc_tables:?}"
+        );
+        let lifecycle_rows = conn
+            .query_sync(
+                "SELECT a.retired_at, d.deregistered_at \
+                 FROM agents a \
+                 JOIN agent_deregistrations d ON d.agent_id = a.id \
+                 WHERE a.name = 'TestAgent'",
+                &[],
+            )
+            .expect("query reconstructed lifecycle state");
+        assert_eq!(lifecycle_rows.len(), 1);
+        assert_eq!(
+            lifecycle_rows[0]
+                .get_named::<i64>("retired_at")
+                .expect("retired_at"),
+            crate::iso_to_micros("2026-02-22T12:30:00Z").unwrap()
+        );
+        assert_eq!(
+            lifecycle_rows[0]
+                .get_named::<i64>("deregistered_at")
+                .expect("deregistered_at"),
+            crate::iso_to_micros("2026-02-22T13:00:00Z").unwrap()
         );
     }
 
@@ -11374,6 +11538,181 @@ archive body
             "auto"
         );
         assert_eq!(bob.get_named::<String>("contact_policy").unwrap(), "open");
+    }
+
+    #[test]
+    fn reconstruct_with_salvage_preserves_agent_lifecycle_restrictions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_lifecycle.db");
+        let salvage_db_path = tmp.path().join("salvage_lifecycle.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("lifecycle-project");
+        let alice_dir = project_dir.join("agents").join("Alice");
+        std::fs::create_dir_all(&alice_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"lifecycle-project","human_key":"/lifecycle-project","created_at":1}"#,
+        )
+        .unwrap();
+        // The archive candidate is active. A readable salvage database that
+        // records a restriction must not be allowed to reactivate it.
+        std::fs::write(
+            alice_dir.join("profile.json"),
+            r#"{
+                "name":"Alice",
+                "program":"codex-cli",
+                "model":"gpt-5",
+                "inception_ts":1,
+                "last_active_ts":1,
+                "attachments_policy":"auto",
+                "contact_policy":"auto"
+            }"#,
+        )
+        .unwrap();
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    human_key TEXT,
+                    created_at INTEGER
+                )",
+            )
+            .unwrap();
+        // TEXT lifecycle timestamps model the Python/legacy import shape; the
+        // target schema stores canonical integer microseconds.
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE agents (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    program TEXT,
+                    model TEXT,
+                    task_description TEXT,
+                    inception_ts INTEGER,
+                    last_active_ts INTEGER,
+                    attachments_policy TEXT,
+                    contact_policy TEXT,
+                    retired_at TEXT
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE agent_deregistrations (
+                    agent_id INTEGER PRIMARY KEY,
+                    deregistered_at TEXT
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (100, 'lifecycle-project', '/lifecycle-project', 1)",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO agents
+                 (id, project_id, name, program, model, task_description,
+                  inception_ts, last_active_ts, attachments_policy, contact_policy, retired_at)
+                 VALUES
+                    (10, 100, 'Alice', 'codex-cli', 'gpt-5', '',
+                     1, 2000000, 'auto', 'auto', '1970-01-01T00:00:02Z'),
+                    (11, 100, 'Bob', 'codex-cli', 'gpt-5', '',
+                     1, 3000000, 'auto', 'block_all', NULL),
+                    (12, 100, 'Carol', 'codex-cli', 'gpt-5',
+                     '[DEREGISTERED 1970-01-01T00:00:04Z] legacy',
+                     1, 4000000, 'auto', 'block_all', NULL),
+                    (13, 100, 'Dave', 'codex-cli', 'gpt-5', '',
+                     1, 5000000, 'auto', 'auto', 'not-a-timestamp')",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO agent_deregistrations (agent_id, deregistered_at)
+                 VALUES (11, '1970-01-01 00:00:03Z')",
+                &[],
+            )
+            .unwrap();
+        drop(salvage_conn);
+
+        let stats = reconstruct_from_archive_with_salvage(
+            &db_path,
+            &storage_root,
+            Some(&salvage_db_path),
+        )
+        .expect("salvage merge should preserve lifecycle state");
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unparseable retired_at")),
+            "malformed retirement data must be preserved fail-closed and reported"
+        );
+
+        // Reopen from disk so the assertion also covers committed restart
+        // state rather than only the connection that performed the merge.
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync("SELECT name, retired_at FROM agents ORDER BY name", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].get_named::<String>("name").unwrap(), "Alice");
+        assert_eq!(
+            rows[0].get_named::<Option<i64>>("retired_at").unwrap(),
+            Some(2_000_000)
+        );
+        assert_eq!(
+            rows[1].get_named::<Option<i64>>("retired_at").unwrap(),
+            None
+        );
+        assert_eq!(
+            rows[2].get_named::<Option<i64>>("retired_at").unwrap(),
+            None
+        );
+        assert_eq!(rows[3].get_named::<String>("name").unwrap(), "Dave");
+        assert_eq!(
+            rows[3].get_named::<Option<i64>>("retired_at").unwrap(),
+            Some(5_000_000)
+        );
+
+        let deregistrations = conn
+            .query_sync(
+                "SELECT a.name AS name, d.deregistered_at AS deregistered_at
+                 FROM agent_deregistrations d
+                 JOIN agents a ON a.id = d.agent_id
+                 ORDER BY a.name",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(deregistrations.len(), 2);
+        assert_eq!(
+            deregistrations[0].get_named::<String>("name").unwrap(),
+            "Bob"
+        );
+        assert_eq!(
+            deregistrations[0]
+                .get_named::<i64>("deregistered_at")
+                .unwrap(),
+            3_000_000
+        );
+        assert_eq!(
+            deregistrations[1].get_named::<String>("name").unwrap(),
+            "Carol"
+        );
+        assert_eq!(
+            deregistrations[1]
+                .get_named::<i64>("deregistered_at")
+                .unwrap(),
+            4_000_000
+        );
     }
 
     #[test]

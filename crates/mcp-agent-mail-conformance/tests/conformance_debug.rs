@@ -411,9 +411,9 @@ fn crate_readme_current_coverage_matches_audit_summary() {
     let readme = read_file(crate_root().join(README_RELATIVE));
     for needle in [
         "# mcp-agent-mail-conformance",
-        "## Current coverage (as of 2026-04-18)",
-        "39 tools",
-        "34 tools have Python behavior fixtures",
+        "## Current coverage (as of 2026-08-27)",
+        "43 tools",
+        "37 tools have Python behavior fixtures",
         "resolve_pane_identity",
         "cleanup_pane_identities",
         "list_agents",

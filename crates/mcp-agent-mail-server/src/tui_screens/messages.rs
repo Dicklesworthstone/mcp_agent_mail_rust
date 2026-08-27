@@ -217,6 +217,7 @@ enum SearchMethod {
 struct MessageEntry {
     id: i64,
     subject: String,
+    topic: Option<String>,
     from_agent: String,
     to_agents: String,
     project_slug: String,
@@ -235,6 +236,7 @@ struct MessageEntry {
 struct RawMessageRow {
     id: i64,
     subject: String,
+    topic: Option<String>,
     body_md: String,
     thread_id: String,
     importance: String,
@@ -1470,7 +1472,7 @@ impl MessageBrowserScreen {
         let params = [Value::BigInt(message_id)];
         let rows = query_raw_message_rows(
             conn,
-            "SELECT id, subject, body_md, thread_id, importance, ack_required, \
+            "SELECT id, subject, topic, body_md, thread_id, importance, ack_required, \
              created_ts, sender_id, project_id, recipients_json \
              FROM messages \
              WHERE id = ? \
@@ -2524,6 +2526,9 @@ impl MessageBrowserScreen {
                     Line::raw(format!("To:      {}", entry.to_agents)),
                     Line::raw(format!("Subject: {}", entry.subject)),
                 ];
+                if let Some(topic) = entry.topic.as_deref() {
+                    combined_lines.push(Line::raw(format!("Topic:   {topic}")));
+                }
                 if !entry.thread_id.is_empty() {
                     combined_lines.push(Line::raw(format!("Thread:  {}", entry.thread_id)));
                 }
@@ -3021,6 +3026,7 @@ impl MessageBrowserScreen {
                 Some(MessageEntry {
                     id: if id > 0 { id } else { -1 },
                     subject: subject.to_string(),
+                    topic: None,
                     from_agent: from.to_string(),
                     to_agents: to.join(", "),
                     project_slug: project.to_string(),
@@ -3946,7 +3952,7 @@ fn fetch_recent_messages(
             };
             (
                 format!(
-                    "SELECT id, subject, body_md, thread_id, importance, ack_required, \
+                    "SELECT id, subject, topic, body_md, thread_id, importance, ack_required, \
                      created_ts, sender_id, project_id, recipients_json \
                      FROM messages \
                      WHERE project_id = ? \
@@ -3959,7 +3965,7 @@ fn fetch_recent_messages(
         }
         None => (
             format!(
-                "SELECT id, subject, body_md, thread_id, importance, ack_required, \
+                "SELECT id, subject, topic, body_md, thread_id, importance, ack_required, \
                  created_ts, sender_id, project_id, recipients_json \
                  FROM messages \
                  ORDER BY created_ts DESC \
@@ -4024,6 +4030,7 @@ fn search_messages_unified(
         out.push(MessageEntry {
             id: row.id,
             subject: row.title,
+            topic: row.topic,
             from_agent: row.from_agent.unwrap_or_default(),
             to_agents: recipient_map.get(&row.id).cloned().unwrap_or_default(),
             project_slug,
@@ -4229,6 +4236,7 @@ fn query_raw_message_rows(conn: &DbConn, sql: &str, params: &[Value]) -> Vec<Raw
             Some(RawMessageRow {
                 id: row.get_named::<i64>("id").ok()?,
                 subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
+                topic: row.get_named::<Option<String>>("topic").ok().flatten(),
                 sender_id: row.get_named::<i64>("sender_id").ok()?,
                 project_id: row.get_named::<i64>("project_id").ok()?,
                 thread_id: row
@@ -4269,6 +4277,7 @@ fn message_entries_from_rows(
         .map(|row| MessageEntry {
             id: row.id,
             subject: row.subject,
+            topic: row.topic,
             from_agent: sender_name_map
                 .get(&row.sender_id)
                 .cloned()
@@ -5077,6 +5086,9 @@ fn render_detail_panel(
     lines.push(format!("From:    {}", msg.from_agent));
     lines.push(format!("To:      {}", msg.to_agents));
     lines.push(format!("Subject: {}", msg.subject));
+    if let Some(topic) = msg.topic.as_deref() {
+        lines.push(format!("Topic:   {topic}"));
+    }
     if !msg.thread_id.is_empty() {
         lines.push(format!("Thread:  {}", msg.thread_id));
     }
@@ -6179,6 +6191,7 @@ fn truncate_str(s: &str, max_width: usize) -> String {
 mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use ftui_harness::buffer_to_text;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
@@ -6186,6 +6199,7 @@ mod tests {
         MessageEntry {
             id,
             subject: subject.to_string(),
+            topic: None,
             from_agent: "GoldFox".to_string(),
             to_agents: "SilverWolf".to_string(),
             project_slug: "proj".to_string(),
@@ -6563,6 +6577,7 @@ first body
             screen.results.push(MessageEntry {
                 id: i,
                 subject: format!("Message {i}"),
+                topic: None,
                 from_agent: "GoldFox".to_string(),
                 to_agents: "SilverWolf".to_string(),
                 project_slug: "proj1".to_string(),
@@ -6605,6 +6620,7 @@ first body
             screen.results.push(MessageEntry {
                 id: i,
                 subject: format!("Msg {i}"),
+                topic: None,
                 from_agent: String::new(),
                 to_agents: String::new(),
                 project_slug: String::new(),
@@ -6642,6 +6658,7 @@ first body
         screen.results.push(MessageEntry {
             id: 1,
             subject: "Test".to_string(),
+            topic: None,
             from_agent: String::new(),
             to_agents: String::new(),
             project_slug: String::new(),
@@ -6675,6 +6692,7 @@ first body
         screen.results.push(MessageEntry {
             id: 7,
             subject: "JSON".to_string(),
+            topic: None,
             from_agent: "BlueLake".to_string(),
             to_agents: "GreenCastle".to_string(),
             project_slug: "proj".to_string(),
@@ -6723,6 +6741,7 @@ first body
         screen.results.push(MessageEntry {
             id: 1,
             subject: "Dense JSON".to_string(),
+            topic: None,
             from_agent: "BlueLake".to_string(),
             to_agents: "GreenCastle".to_string(),
             project_slug: "proj".to_string(),
@@ -6750,6 +6769,7 @@ first body
         screen.results.push(MessageEntry {
             id: 11,
             subject: "Copy JSON".to_string(),
+            topic: None,
             from_agent: "BlueLake".to_string(),
             to_agents: "GreenCastle".to_string(),
             project_slug: "proj".to_string(),
@@ -6786,6 +6806,7 @@ first body
         screen.results.push(MessageEntry {
             id: 12,
             subject: "JSON actions".to_string(),
+            topic: None,
             from_agent: "BlueLake".to_string(),
             to_agents: "GreenCastle".to_string(),
             project_slug: "proj".to_string(),
@@ -7386,6 +7407,7 @@ first body
         let msg = MessageEntry {
             id: -1,
             subject: "Image detail".to_string(),
+            topic: None,
             from_agent: "A".to_string(),
             to_agents: "B".to_string(),
             project_slug: "p".to_string(),
@@ -7518,6 +7540,7 @@ first body
             MessageEntry {
                 id: 1,
                 subject: "Test message".to_string(),
+                topic: Some("br-abc.1".to_string()),
                 from_agent: "GoldFox".to_string(),
                 to_agents: "SilverWolf".to_string(),
                 project_slug: "proj1".to_string(),
@@ -7532,6 +7555,7 @@ first body
             MessageEntry {
                 id: 2,
                 subject: "Another message".to_string(),
+                topic: None,
                 from_agent: "BluePeak".to_string(),
                 to_agents: "RedLake".to_string(),
                 project_slug: "proj2".to_string(),
@@ -7568,6 +7592,7 @@ first body
         let entries = vec![MessageEntry {
             id: 1,
             subject: "[review] Session 16 code review pass — fixed".to_string(),
+            topic: None,
             from_agent: "Ágent🚀Name—Wide".to_string(),
             to_agents: "Team".to_string(),
             project_slug: "proj—超長slug".to_string(),
@@ -7614,6 +7639,11 @@ first body
             None,
             0,
         );
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Topic:   release.v31"),
+            "message detail must expose the persisted topic, got:\n{text}"
+        );
     }
 
     #[test]
@@ -7627,6 +7657,7 @@ first body
         let msg = MessageEntry {
             id: 1,
             subject: "Test subject with a somewhat long title".to_string(),
+            topic: Some("release.v31".to_string()),
             from_agent: "GoldFox".to_string(),
             to_agents: "SilverWolf, BluePeak".to_string(),
             project_slug: "my-project".to_string(),
@@ -7660,6 +7691,7 @@ first body
         let msg = MessageEntry {
             id: 1,
             subject: "Scrolled".to_string(),
+            topic: None,
             from_agent: "Agent".to_string(),
             to_agents: String::new(),
             project_slug: String::new(),
@@ -7695,6 +7727,7 @@ first body
         let msg = MessageEntry {
             id: 2,
             subject: "JSON payload".to_string(),
+            topic: None,
             from_agent: "Agent".to_string(),
             to_agents: "Peer".to_string(),
             project_slug: "proj".to_string(),
@@ -7871,6 +7904,7 @@ first body
         screen.results.push(MessageEntry {
             id: 42,
             subject: "Test".to_string(),
+            topic: None,
             from_agent: String::new(),
             to_agents: String::new(),
             project_slug: String::new(),
@@ -7913,6 +7947,7 @@ first body
             screen.results.push(MessageEntry {
                 id: i * 10,
                 subject: format!("Msg {i}"),
+                topic: None,
                 from_agent: String::new(),
                 to_agents: String::new(),
                 project_slug: String::new(),
@@ -8154,6 +8189,7 @@ first body
         screen.results.push(MessageEntry {
             id: 1,
             subject: "Test".to_string(),
+            topic: None,
             from_agent: "RedFox".to_string(),
             to_agents: "BlueLake".to_string(),
             project_slug: "proj".to_string(),
@@ -8743,6 +8779,7 @@ first body
         screen.results.push(MessageEntry {
             id: 1,
             subject: "Test".to_string(),
+            topic: None,
             from_agent: String::new(),
             to_agents: String::new(),
             project_slug: "inferred-project".to_string(),
@@ -8986,6 +9023,7 @@ first body
             .map(|idx| MessageEntry {
                 id: i64::from(idx) + 1,
                 subject: format!("msg-{idx}"),
+                topic: None,
                 from_agent: "GoldFox".to_string(),
                 to_agents: "SilverWolf".to_string(),
                 project_slug: "proj".to_string(),
@@ -9105,6 +9143,7 @@ first body
         let normal = MessageEntry {
             id: 10,
             subject: "Test".to_string(),
+            topic: None,
             from_agent: "GoldHawk".to_string(),
             to_agents: "SilverFox".to_string(),
             project_slug: "proj".to_string(),

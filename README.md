@@ -177,7 +177,7 @@ Agent Mail has been available since October 2025 and was designed around real mu
 
 **No "broadcast to all" mode.** Given the option, many agents will overuse broadcast-style messaging. That is the equivalent of default reply-all in email: lots of irrelevant noise and wasted context.
 
-**Carefully refined API ergonomics.** Bad MCP documentation and poor agent ergonomics quietly wreck reliability. Agent Mail's 40 tool definitions have gone through repeated real-world iteration so they work predictably without wasting tokens.
+**Carefully refined API ergonomics.** Bad MCP documentation and poor agent ergonomics quietly wreck reliability. Agent Mail's 43 tool definitions have gone through repeated real-world iteration so they work predictably without wasting tokens.
 
 **No git worktrees.** Worktrees can slow development velocity and create reconciliation debt when agents diverge. Agent Mail takes the opposite approach: keep agents in one shared space, surface conflicts quickly, and give them tools to coordinate through them.
 
