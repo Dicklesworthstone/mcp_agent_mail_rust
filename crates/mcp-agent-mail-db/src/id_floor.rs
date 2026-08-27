@@ -558,8 +558,9 @@ async fn scan_archive_floor(cx: &Cx, storage_root: PathBuf) -> Outcome<i64, DbEr
         return Outcome::Cancelled(reason);
     }
 
+    let blocking_root = storage_root.clone();
     let scan_result = match cx
-        .spawn_blocking(move |_child_cx| max_message_id_in_archive(&storage_root))
+        .spawn_blocking(move |_child_cx| max_message_id_in_archive(&blocking_root))
     {
         Ok(mut handle) => match handle.join(cx).await {
             Ok(result) => result,
@@ -575,9 +576,21 @@ async fn scan_archive_floor(cx: &Cx, storage_root: PathBuf) -> Outcome<i64, DbEr
             if let Some(reason) = cancellation_reason(cx, "message id archive scan cancelled") {
                 return Outcome::Cancelled(reason);
             }
-            return Outcome::Err(DbError::Internal(format!(
-                "message id archive scan task admission failed: {error}"
-            )));
+            // Blocking-task admission fails when no live runtime backs this
+            // `Cx` ([ASUP-E001]: `Cx::for_testing`, embedders that dispatch
+            // tools without an asupersync runtime, late teardown windows).
+            // The scan is a bounded read-only directory walk, so degrade to
+            // running it inline on the current thread — the pre-offload
+            // behavior that shipped through v0.3.30 — instead of failing
+            // message-id allocation closed. Failing closed here turned every
+            // runtime-less dispatch that creates a message (request_contact,
+            // send_message) into a hard error and broke the conformance
+            // harness while a real mailbox would have been fine.
+            tracing::debug!(
+                error = %error,
+                "message id archive scan blocking admission unavailable; scanning inline"
+            );
+            max_message_id_in_archive(&storage_root)
         }
     };
 
@@ -1440,25 +1453,20 @@ mod tests {
     }
 
     #[test]
-    fn runtime_unavailable_archive_scan_fails_closed_and_remains_retryable() {
+    fn runtime_unavailable_archive_scan_falls_back_to_inline_scan() {
+        // A `Cx` without a live runtime (`Cx::for_testing`, runtime-less
+        // embedders) cannot admit blocking tasks. The archive scan must then
+        // run inline and still seed the floor correctly — failing closed here
+        // broke every message-creating tool call in the conformance harness.
         let dir = tempdir().unwrap();
+        write_canonical_message(dir.path(), "proj", "2026", "05", "01__88.md", 88);
         let alloc = MessageIdAllocator::new();
         let cx = Cx::for_testing();
 
         let first = block_on(alloc.allocate(&cx, 0, dir.path()));
-        assert!(matches!(
-            first,
-            Outcome::Err(error)
-                if error.to_string().contains("archive scan task admission failed")
-        ));
-        assert!(alloc.needs_archive_seed());
-        assert_eq!(alloc.current_high_water(), 0);
-
-        assert_eq!(
-            expect_allocated(allocate_from_archive(&alloc, 0, dir.path())),
-            1
-        );
+        assert_eq!(expect_allocated(first), 89, "inline scan must seed the archive floor");
         assert!(!alloc.needs_archive_seed());
+        assert_eq!(alloc.current_high_water(), 89);
     }
 
     #[test]
