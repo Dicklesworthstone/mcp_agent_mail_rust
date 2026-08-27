@@ -4677,6 +4677,127 @@ impl ProjectSiblingSuggestion {
     }
 }
 
+/// Maximum number of project pairs evaluated by one live refresh.
+pub const PROJECT_SIBLING_REFRESH_LIMIT: usize = 3;
+
+/// Minimum score rendered as a reviewable suggestion by the mail UI.
+pub const PROJECT_SIBLING_MIN_SUGGESTION_SCORE: f64 = 0.92;
+
+const PROJECT_SIBLING_REFRESH_TTL_MICROS: i64 = 12 * 60 * 60 * 1_000_000;
+const PROJECT_SIBLING_DISMISS_COOLDOWN_MICROS: i64 = 7 * 24 * 60 * 60 * 1_000_000;
+const PROJECT_SIBLING_PROJECT_SCAN_LIMIT: usize = 256;
+const PROJECT_SIBLING_SIMILARITY_INPUT_LIMIT: usize = 512;
+
+/// Bounded work performed by one sibling-suggestion refresh.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSiblingRefreshSummary {
+    pub evaluated: usize,
+    pub inserted: usize,
+    pub refreshed: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectSiblingRefreshCandidate {
+    left_project: ProjectRow,
+    right_project: ProjectRow,
+    existing: Option<ProjectSiblingSuggestion>,
+}
+
+fn project_sibling_needs_refresh(
+    existing: Option<&ProjectSiblingSuggestion>,
+    now: i64,
+) -> bool {
+    let Some(suggestion) = existing else {
+        return true;
+    };
+    let age = now.saturating_sub(suggestion.evaluated_ts).max(0);
+    if suggestion.status == ProjectSiblingStatus::Dismissed
+        && age < PROJECT_SIBLING_DISMISS_COOLDOWN_MICROS
+    {
+        return false;
+    }
+    age >= PROJECT_SIBLING_REFRESH_TTL_MICROS
+}
+
+fn bounded_project_similarity(left: &str, right: &str) -> f64 {
+    let left_bytes = &left.as_bytes()[..left.len().min(PROJECT_SIBLING_SIMILARITY_INPUT_LIMIT)];
+    let right_bytes = &right.as_bytes()[..right.len().min(PROJECT_SIBLING_SIMILARITY_INPUT_LIMIT)];
+    let total = left_bytes.len() + right_bytes.len();
+    if total == 0 {
+        return 1.0;
+    }
+
+    let mut previous = vec![0usize; right_bytes.len() + 1];
+    let mut current = vec![0usize; right_bytes.len() + 1];
+    for left_byte in left_bytes {
+        for (right_index, right_byte) in right_bytes.iter().enumerate() {
+            current[right_index + 1] = if left_byte.to_ascii_lowercase()
+                == right_byte.to_ascii_lowercase()
+            {
+                previous[right_index] + 1
+            } else {
+                previous[right_index + 1].max(current[right_index])
+            };
+        }
+        std::mem::swap(&mut previous, &mut current);
+        current.fill(0);
+    }
+
+    let total = u32::try_from(total).expect("bounded sibling similarity length fits u32");
+    2.0 * previous[right_bytes.len()] as f64 / f64::from(total)
+}
+
+fn project_sibling_similarity(
+    left_project: &ProjectRow,
+    right_project: &ProjectRow,
+) -> (f64, String) {
+    if left_project.human_key == right_project.human_key {
+        return (
+            0.0,
+            "Identical project paths identify the same project".to_string(),
+        );
+    }
+
+    let slug_ratio = bounded_project_similarity(&left_project.slug, &right_project.slug);
+    let human_key_ratio =
+        bounded_project_similarity(&left_project.human_key, &right_project.human_key);
+    let left_name = Path::new(&left_project.human_key)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let right_name = Path::new(&right_project.human_key)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let directory_name_ratio = bounded_project_similarity(left_name, right_name);
+
+    let mut score = slug_ratio.max(human_key_ratio).max(directory_name_ratio);
+    let mut reasons = Vec::with_capacity(4);
+    if slug_ratio > 0.6 {
+        reasons.push(format!("Slugs are similar ({slug_ratio:.2})"));
+    }
+    if human_key_ratio > 0.6 {
+        reasons.push(format!("Project paths align ({human_key_ratio:.2})"));
+    }
+    if directory_name_ratio > 0.6 {
+        reasons.push(format!(
+            "Directory names are similar ({directory_name_ratio:.2})"
+        ));
+    }
+
+    let left_parent = Path::new(&left_project.human_key).parent();
+    let right_parent = Path::new(&right_project.human_key).parent();
+    if left_parent.is_some() && left_parent == right_parent {
+        score = score.max(0.85);
+        reasons.push("Projects share the same parent directory".to_string());
+    }
+    if reasons.is_empty() {
+        reasons.push("Heuristic comparison found limited overlap".to_string());
+    }
+
+    (score.clamp(0.0, 1.0), reasons.join(", "))
+}
+
 const PROJECT_SIBLING_SELECT: &str = "SELECT s.id, s.status, s.score, s.rationale, s.evaluated_ts, \
             s.confirmed_ts, s.dismissed_ts, \
             a.id, a.slug, a.human_key, b.id, b.slug, b.human_key \
