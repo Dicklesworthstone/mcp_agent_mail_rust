@@ -4247,7 +4247,28 @@ pub async fn get_project_by_human_key(
                         crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
                         Outcome::Ok(row)
                     }
-                    Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", human_key)),
+                    Outcome::Ok(None) => {
+                        // `ensure_project` treats the stable slug as the project identity,
+                        // while `human_key` is informative. A read must therefore use the
+                        // same identity fallback or canonical GitHub keys that differ only
+                        // from an older row's spelling (for example owner case) will create
+                        // a write/read split: writes find the row by slug, reads report it
+                        // missing by exact human_key. Only absolute keys reach this path, so
+                        // a slug lookup is the same non-mutating resolution that
+                        // `ensure_project` would have used before deciding to create a row.
+                        if Path::new(human_key).is_absolute() {
+                            let slug =
+                                mcp_agent_mail_core::resolve_project_identity(human_key).slug;
+                            match get_project_by_slug(cx, pool, &slug).await {
+                                Outcome::Ok(row) => return Outcome::Ok(row),
+                                Outcome::Err(DbError::NotFound { .. }) => {}
+                                Outcome::Err(e) => return Outcome::Err(e),
+                                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                                Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+                            }
+                        }
+                        Outcome::Err(DbError::not_found("Project", human_key))
+                    }
                     Outcome::Err(e) => Outcome::Err(e),
                     Outcome::Cancelled(r) => Outcome::Cancelled(r),
                     Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -20613,6 +20634,35 @@ mod tests {
                 });
             },
         );
+    }
+
+    #[test]
+    fn get_project_by_human_key_reuses_stable_slug_for_canonical_github_case_alias() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("github-case-alias");
+        let legacy_key = "/repos/github.com/Dicklesworthstone/mcp_agent_mail_rust";
+        let canonical_key = "/repos/github.com/dicklesworthstone/mcp_agent_mail_rust";
+
+        rt.block_on(async {
+            let legacy = ensure_project(&cx, &pool, legacy_key)
+                .await
+                .into_result()
+                .expect("seed historical project spelling");
+            let resolved = get_project_by_human_key(&cx, &pool, canonical_key)
+                .await
+                .into_result()
+                .expect("canonical key should resolve the existing slug");
+
+            assert_eq!(resolved.id, legacy.id);
+            assert_eq!(resolved.slug, legacy.slug);
+            assert_eq!(resolved.human_key, legacy_key);
+            assert_eq!(count_projects_for_test(&cx, &pool).await, 1);
+        });
     }
 
     #[test]
