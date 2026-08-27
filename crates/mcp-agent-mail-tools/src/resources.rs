@@ -2363,6 +2363,7 @@ pub struct MessageDetails {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub body_md: String,
     pub importance: String,
@@ -2431,6 +2432,7 @@ pub async fn message_details(ctx: &McpContext, message_id: String) -> McpResult<
         project_id: msg.project_id,
         sender_id: msg.sender_id,
         thread_id: msg.thread_id,
+        topic: msg.topic,
         subject: msg.subject,
         body_md: msg.body_md,
         importance: msg.importance,
@@ -2456,6 +2458,7 @@ pub struct ThreadMessageEntry {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub importance: String,
     pub ack_required: bool,
@@ -2544,6 +2547,7 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
             project_id: row.project_id,
             sender_id: row.sender_id,
             thread_id: row.thread_id.clone(),
+            topic: row.topic.clone(),
             subject: row.subject,
             importance: row.importance,
             ack_required: row.ack_required != 0,
@@ -2600,6 +2604,7 @@ pub struct InboxResourceMessage {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub importance: String,
     pub ack_required: bool,
@@ -2698,6 +2703,7 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
                 project_id: msg.project_id,
                 sender_id: msg.sender_id,
                 thread_id: msg.thread_id.clone(),
+                topic: msg.topic.clone(),
                 subject: msg.subject.clone(),
                 importance: msg.importance.clone(),
                 ack_required: msg.ack_required != 0,
@@ -2766,6 +2772,7 @@ pub struct MailboxMessageEntrySimple {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub importance: String,
     pub ack_required: bool,
@@ -2783,6 +2790,7 @@ pub struct MailboxMessageEntryFull {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub importance: String,
     pub ack_required: bool,
@@ -2938,7 +2946,7 @@ fn outbox_query(
         || {
             (
                 format!(
-                    "SELECT id, project_id, sender_id, thread_id, subject, {body_select}, \
+                    "SELECT id, project_id, sender_id, thread_id, topic, subject, {body_select}, \
                  importance, ack_required, created_ts, attachments \
                  FROM messages \
                  WHERE project_id = ? AND sender_id = ? \
@@ -2954,7 +2962,7 @@ fn outbox_query(
         |ts| {
             (
                 format!(
-                    "SELECT id, project_id, sender_id, thread_id, subject, {body_select}, \
+                    "SELECT id, project_id, sender_id, thread_id, topic, subject, {body_select}, \
                  importance, ack_required, created_ts, attachments \
                  FROM messages \
                  WHERE project_id = ? AND sender_id = ? AND created_ts > ? \
@@ -3003,7 +3011,7 @@ fn outbox_message_from_row(
     _bcc: Vec<String>,
 ) -> OutboxMessageEntry {
     let id: i64 = row.get_as(0).unwrap_or(0);
-    let subject: String = row.get_as(4).unwrap_or_default();
+    let subject: String = row.get_as(5).unwrap_or_default();
     let summary = unavailable_commit_summary(
         "sent",
         options.agent_name,
@@ -3016,14 +3024,15 @@ fn outbox_message_from_row(
         project_id: row.get_as(1).unwrap_or(0),
         sender_id: row.get_as(2).unwrap_or(0),
         thread_id: row.get_as(3).ok(),
+        topic: row.get_as(4).ok(),
         subject,
-        importance: row.get_as(6).unwrap_or_default(),
-        ack_required: row.get_as::<i64>(7).unwrap_or(0) != 0,
-        created_ts: Some(micros_to_iso(row.get_as(8).unwrap_or(0))),
-        attachments: parse_attachment_metadata(&row.get_as::<String>(9).unwrap_or_default()),
+        importance: row.get_as(7).unwrap_or_default(),
+        ack_required: row.get_as::<i64>(8).unwrap_or(0) != 0,
+        created_ts: Some(micros_to_iso(row.get_as(9).unwrap_or(0))),
+        attachments: parse_attachment_metadata(&row.get_as::<String>(10).unwrap_or_default()),
         from: options.agent_name.to_string(),
         body_md: if options.include_bodies {
-            row.get_as(5).unwrap_or_default()
+            row.get_as(6).unwrap_or_default()
         } else {
             String::new()
         },
@@ -3154,6 +3163,7 @@ fn mailbox_simple_messages(
                     project_id: msg.project_id,
                     sender_id: msg.sender_id,
                     thread_id: msg.thread_id,
+                    topic: msg.topic,
                     subject: msg.subject,
                     importance: msg.importance,
                     ack_required: msg.ack_required != 0,
@@ -3176,6 +3186,7 @@ fn mailbox_simple_messages(
                 project_id: row.project_id,
                 sender_id: row.sender_id,
                 thread_id: row.thread_id,
+                topic: row.topic,
                 subject: row.subject,
                 importance: row.importance,
                 ack_required: row.ack_required,
@@ -3216,6 +3227,7 @@ fn mailbox_full_messages(
                     project_id: msg.project_id,
                     sender_id: msg.sender_id,
                     thread_id: msg.thread_id,
+                    topic: msg.topic,
                     subject: msg.subject,
                     importance: msg.importance,
                     ack_required: msg.ack_required != 0,
@@ -3238,6 +3250,7 @@ fn mailbox_full_messages(
                 project_id: row.project_id,
                 sender_id: row.sender_id,
                 thread_id: row.thread_id,
+                topic: row.topic,
                 subject: row.subject,
                 importance: row.importance,
                 ack_required: row.ack_required,
@@ -3314,6 +3327,7 @@ pub struct OutboxMessageEntry {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub importance: String,
     pub ack_required: bool,
@@ -3404,6 +3418,7 @@ pub struct ViewMessageEntry {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub importance: String,
     pub ack_required: bool,
@@ -3476,6 +3491,7 @@ pub async fn views_urgent_unread(ctx: &McpContext, agent: String) -> McpResult<S
                 project_id: msg.project_id,
                 sender_id: msg.sender_id,
                 thread_id: msg.thread_id.clone(),
+                topic: msg.topic.clone(),
                 subject: msg.subject.clone(),
                 importance: msg.importance.clone(),
                 ack_required: msg.ack_required != 0,
@@ -3548,6 +3564,7 @@ pub async fn views_ack_required(ctx: &McpContext, agent: String) -> McpResult<St
                 project_id: msg.project_id,
                 sender_id: msg.sender_id,
                 thread_id: msg.thread_id.clone(),
+                topic: msg.topic.clone(),
                 subject: msg.subject.clone(),
                 importance: msg.importance.clone(),
                 ack_required: true,
@@ -3579,6 +3596,7 @@ pub struct StaleAckMessageEntry {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub importance: String,
     pub ack_required: bool,
@@ -3668,6 +3686,7 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
                 project_id: msg.project_id,
                 sender_id: msg.sender_id,
                 thread_id: msg.thread_id.clone(),
+                topic: msg.topic.clone(),
                 subject: msg.subject.clone(),
                 importance: msg.importance.clone(),
                 ack_required: true,
@@ -3763,6 +3782,7 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
                 project_id: msg.project_id,
                 sender_id: msg.sender_id,
                 thread_id: msg.thread_id.clone(),
+                topic: msg.topic.clone(),
                 subject: msg.subject.clone(),
                 importance: msg.importance.clone(),
                 ack_required: true,

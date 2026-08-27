@@ -38375,6 +38375,7 @@ fn inbox_row_to_json(
         "created_ts": mcp_agent_mail_db::micros_to_iso(r.message.created_ts),
         "kind": r.kind,
         "thread_id": r.message.thread_id,
+        "topic": r.message.topic,
     });
     if include_body && let Some(obj) = v.as_object_mut() {
         obj.insert(
@@ -38395,6 +38396,7 @@ fn product_inbox_row_to_json(
         "project_id": r.message.project_id,
         "sender_id": r.message.sender_id,
         "thread_id": r.message.thread_id,
+        "topic": r.message.topic,
         "subject": r.message.subject,
         "importance": r.message.importance,
         "ack_required": r.message.ack_required != 0,
@@ -39616,6 +39618,7 @@ mod mail_server_cli_bridge_tests {
                 project_id: 7,
                 sender_id: 11,
                 thread_id: Some("br-42".to_string()),
+                topic: Some("contract-parity".to_string()),
                 subject: "Plan".to_string(),
                 body_md: "Body".to_string(),
                 importance: "high".to_string(),
@@ -39646,6 +39649,10 @@ mod mail_server_cli_bridge_tests {
             Some("br-42")
         );
         assert_eq!(
+            json.get("topic").and_then(serde_json::Value::as_str),
+            Some("contract-parity")
+        );
+        assert_eq!(
             json.get("attachments")
                 .and_then(serde_json::Value::as_array)
                 .map(Vec::len),
@@ -39665,6 +39672,7 @@ mod mail_server_cli_bridge_tests {
                 project_id: 7,
                 sender_id: 11,
                 thread_id: Some("br-43".to_string()),
+                topic: None,
                 subject: "Broken attachments".to_string(),
                 body_md: "Body".to_string(),
                 importance: "high".to_string(),

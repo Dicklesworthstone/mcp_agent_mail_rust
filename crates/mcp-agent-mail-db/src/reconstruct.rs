@@ -2386,6 +2386,9 @@ fn parse_and_insert_message(
     let subject = json_str(&msg, "subject").unwrap_or("");
     let body_md = extract_body_after_frontmatter(&content).unwrap_or("");
     let raw_thread_id = json_str(&msg, "thread_id");
+    let topic = json_str(&msg, "topic")
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let importance = json_str(&msg, "importance").unwrap_or("normal");
     let ack_required = msg
         .get("ack_required")
@@ -2503,6 +2506,7 @@ fn parse_and_insert_message(
     let thread_id_val = thread_id
         .as_deref()
         .map_or_else(|| Value::Null, |t| Value::Text(t.to_string()));
+    let topic_val = topic.map_or_else(|| Value::Null, |value| Value::Text(value.to_string()));
 
     let message_id = if let Some(cid) = canonical_id {
         // Plain INSERT: the id was verified free above. A conflict here means
@@ -2511,13 +2515,14 @@ fn parse_and_insert_message(
         // recipient rows.
         conn.execute_sync(
             "INSERT INTO messages \
-             (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (id, project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 Value::BigInt(cid),
                 Value::BigInt(project_id),
                 Value::BigInt(sender_id),
                 thread_id_val,
+                topic_val,
                 Value::Text(subject.to_string()),
                 Value::Text(body_md.to_string()),
                 Value::Text(importance.to_string()),
@@ -2532,12 +2537,13 @@ fn parse_and_insert_message(
     } else {
         conn.execute_sync(
             "INSERT INTO messages \
-             (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 Value::BigInt(project_id),
                 Value::BigInt(sender_id),
                 thread_id_val,
+                topic_val,
                 Value::Text(subject.to_string()),
                 Value::Text(body_md.to_string()),
                 Value::Text(importance.to_string()),
@@ -5104,6 +5110,7 @@ fn merge_salvaged_database(
                 &["id", "project_id", "sender_id"],
                 &[
                     "thread_id",
+                    "topic",
                     "subject",
                     "body_md",
                     "importance",
@@ -5271,6 +5278,12 @@ fn merge_salvaged_database(
                         .ok()
                         .and_then(|raw: String| sanitize_reconstructed_thread_id(raw.as_str()));
                     let thread_value = thread_id.map_or(Value::Null, Value::Text);
+                    let topic_value = row
+                        .get_named::<String>("topic")
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .map_or(Value::Null, Value::Text);
                     let (recipients_json, to_names, cc_names, bcc_names) =
                         parse_salvaged_recipients_json(
                             row.get_named::<String>("recipients_json").ok(),
@@ -5286,6 +5299,7 @@ fn merge_salvaged_database(
                         Value::BigInt(target_project_id),
                         Value::BigInt(target_sender_id),
                         thread_value,
+                        topic_value,
                         Value::Text(source_subject),
                         Value::Text(row.get_named::<String>("body_md").unwrap_or_default()),
                         Value::Text(
@@ -5304,8 +5318,8 @@ fn merge_salvaged_database(
                         target_conn
                         .execute_sync(
                             "INSERT INTO messages \
-                             (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             (project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             &values,
                         )
                         .map_err(|e| {
@@ -5326,8 +5340,8 @@ fn merge_salvaged_database(
                         target_conn
                         .execute_sync(
                             "INSERT INTO messages \
-                             (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             (id, project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             &values_with_id,
                         )
                         .map_err(|e| {

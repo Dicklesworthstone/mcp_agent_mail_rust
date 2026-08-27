@@ -466,6 +466,8 @@ pub struct ProductSearchItem {
     pub ack_required: i32,
     pub created_ts: Option<String>,
     pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub from: String,
     pub project_id: i64,
     /// Message body (Markdown). Populated only when the caller passes
@@ -685,6 +687,7 @@ pub async fn search_messages_product(
             ack_required: i32::from(r.ack_required.unwrap_or(false)),
             created_ts: r.created_ts.map(micros_to_iso),
             thread_id: r.thread_id,
+            topic: r.topic,
             from: r.from_agent.unwrap_or_default(),
             project_id: r.project_id.unwrap_or(0),
             body_md: if include_body_md { Some(r.body) } else { None },
@@ -809,6 +812,7 @@ pub async fn fetch_inbox_product(
                 project_id: msg.project_id,
                 sender_id: msg.sender_id,
                 thread_id: msg.thread_id,
+                topic: msg.topic,
                 subject: msg.subject,
                 importance: msg.importance,
                 ack_required: msg.ack_required != 0,
@@ -1898,6 +1902,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: Some("PRODUCT-LIMIT-1".to_string()),
+            topic: None,
             subject: subject.to_string(),
             body_md: format!("- {subject} point"),
             importance: "normal".to_string(),

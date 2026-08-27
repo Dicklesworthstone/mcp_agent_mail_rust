@@ -471,6 +471,8 @@ pub struct SearchResult {
     pub ack_required: Option<bool>,
     pub created_ts: Option<i64>,
     pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub from_agent: Option<String>,
     pub from_agent_id: Option<i64>,
 
@@ -512,6 +514,7 @@ impl Default for SearchResult {
             ack_required: None,
             created_ts: None,
             thread_id: None,
+            topic: None,
             from_agent: None,
             from_agent_id: None,
             to: None,

@@ -230,6 +230,11 @@ pub struct MessageRow {
     #[sqlmodel(nullable)]
     pub thread_id: Option<String>,
 
+    /// Optional case-insensitive topic tag used for mailbox filtering.
+    #[serde(default)]
+    #[sqlmodel(nullable)]
+    pub topic: Option<String>,
+
     pub subject: String,
     pub body_md: String,
 
@@ -258,6 +263,7 @@ impl Default for MessageRow {
             project_id: 0,
             sender_id: 0,
             thread_id: None,
+            topic: None,
             subject: String::new(),
             body_md: String::new(),
             importance: "normal".to_string(),

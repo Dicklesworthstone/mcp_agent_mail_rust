@@ -847,6 +847,7 @@ async fn canonicalize_message_results(
         result.ack_required = Some(detail.ack_required != 0);
         result.created_ts = Some(detail.created_ts);
         result.thread_id.clone_from(&detail.thread_id);
+        result.topic.clone_from(&detail.topic);
         result.from_agent = Some(detail.from.clone());
         result.from_agent_id = Some(detail.sender_id);
         result.to = Some(recipients.to);
@@ -6540,6 +6541,7 @@ mod tests {
             project_id,
             sender_id: 1,
             thread_id: thread_id.map(std::borrow::ToOwned::to_owned),
+            topic: None,
             subject: "subject".to_string(),
             body_md: "body".to_string(),
             importance: importance.to_string(),

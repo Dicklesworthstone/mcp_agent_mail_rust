@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS messages (
     project_id INTEGER NOT NULL REFERENCES projects(id),
     sender_id INTEGER NOT NULL REFERENCES agents(id),
     thread_id TEXT,
+    topic TEXT COLLATE NOCASE,
     subject TEXT NOT NULL,
     body_md TEXT NOT NULL,
     importance TEXT NOT NULL DEFAULT 'normal',
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_project_created ON messages(project_id, created_ts);
 CREATE INDEX IF NOT EXISTS idx_messages_project_sender_created ON messages(project_id, sender_id, created_ts);
 CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id);
+CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages(project_id, topic);
 CREATE INDEX IF NOT EXISTS idx_messages_importance ON messages(importance);
 CREATE INDEX IF NOT EXISTS idx_messages_created_ts ON messages(created_ts);
 CREATE INDEX IF NOT EXISTS idx_msg_thread_created ON messages(thread_id, created_ts);
@@ -2258,6 +2260,26 @@ pub fn schema_migrations() -> Vec<Migration> {
         "GH#218: index signal delivery receipts by message and recipient".to_string(),
         "CREATE INDEX IF NOT EXISTS idx_message_delivery_signal_receipts_message \
          ON message_delivery_signal_receipts(message_id, agent_id)"
+            .to_string(),
+        String::new(),
+    ));
+
+    // ── v27: durable message topics (GH#259) ──────────────────────────
+    //
+    // Topics are optional, case-insensitive tags. They are stored directly on
+    // the canonical message row so inbox filtering, replies, archive rebuilds,
+    // and cross-process readers all observe the same value.
+    migrations.push(Migration::new(
+        "v27_add_topic_to_messages".to_string(),
+        "GH#259: add optional case-insensitive topic tag to messages".to_string(),
+        "ALTER TABLE messages ADD COLUMN topic TEXT COLLATE NOCASE".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v27_idx_messages_project_topic".to_string(),
+        "GH#259: index case-insensitive message topic lookups by project".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_messages_project_topic \
+         ON messages(project_id, topic)"
             .to_string(),
         String::new(),
     ));

@@ -855,21 +855,29 @@ fn validate_reply_body_limit(config: &Config, body_md: &str) -> McpResult<()> {
     Ok(())
 }
 
-fn normalized_topic_argument(topic: Option<&str>) -> Option<&str> {
-    topic.map(str::trim).filter(|value| !value.is_empty())
-}
-
-fn reject_unsupported_topic_argument(topic: Option<&str>, tool_name: &str) -> McpResult<()> {
-    let Some(topic_value) = normalized_topic_argument(topic) else {
-        return Ok(());
+fn normalize_topic_argument(topic: Option<&str>) -> McpResult<Option<String>> {
+    let Some(raw_topic) = topic else {
+        return Ok(None);
     };
+    let topic = raw_topic.trim();
+    let mut chars = topic.chars();
+    let valid = (1..=64).contains(&topic.len())
+        && chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'));
+    if valid {
+        return Ok(Some(topic.to_string()));
+    }
+
     Err(legacy_tool_error(
-        "INVALID_ARGUMENT",
-        format!("{tool_name} does not support the 'topic' argument yet. Omit 'topic' and retry."),
+        "INVALID_TOPIC",
+        format!(
+            "Topic must be 1-64 characters, start with a letter or digit, and contain only \
+             alphanumerics, '.', '_', or '-'. Got: {topic:?}"
+        ),
         true,
         json!({
             "argument": "topic",
-            "value": topic_value,
+            "provided": topic,
         }),
     ))
 }
@@ -1450,6 +1458,7 @@ pub struct MessagePayload {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub body_md: String,
     pub importance: String,
@@ -1614,6 +1623,7 @@ pub struct InboxMessage {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub importance: String,
     pub ack_required: bool,
@@ -1662,6 +1672,7 @@ pub struct ReplyMessageResponse {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub importance: String,
     pub ack_required: bool,
@@ -1694,7 +1705,7 @@ pub struct ReplyMessageResponse {
 /// - `importance`: Message importance: low, normal, high, urgent (default: normal)
 /// - `ack_required`: Request acknowledgement (default: false)
 /// - `thread_id`: Associate with existing thread (optional; bare numerics must already exist)
-/// - `topic`: Reserved for future topic tags; non-blank values are currently rejected
+/// - `topic`: Optional 1-64 character case-insensitive topic tag
 /// - `auto_contact_if_blocked`: Auto-request contact if blocked (optional)
 /// - `sender_token`: Registration token for sender identity verification (optional by default; mandatory in the fail-closed profile)
 ///
@@ -1735,6 +1746,7 @@ pub async fn send_message(
     let bcc = normalize_optional_agent_names(bcc);
     let idempotency_key =
         crate::idempotency::normalize_idempotency_key(idempotency_key.as_deref())?;
+    let topic = normalize_topic_argument(topic.as_deref())?;
     // Fingerprint the normalized request payload (only when a key was supplied)
     // so a retry with the same key must carry the same logical arguments; any
     // change is a typed conflict. Computed early from raw inputs, before body/
@@ -1759,6 +1771,7 @@ pub async fn send_message(
                 ("importance", importance.clone().unwrap_or_default()),
                 ("ack_required", ack_required.unwrap_or(false).to_string()),
                 ("thread_id", thread_id.clone().unwrap_or_default()),
+                ("topic", topic.clone().unwrap_or_default()),
                 ("attachments", atts.join("\u{1f}")),
                 (
                     "convert_images",
@@ -1805,8 +1818,6 @@ pub async fn send_message(
     let thread_id = thread_id
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
-    reject_unsupported_topic_argument(topic.as_deref(), "send_message")?;
-
     let config = &Config::get();
 
     // ── Per-message size limits (subject/body) before any DB/archive work ──
@@ -2408,7 +2419,7 @@ effective_free_bytes={free}"
             fingerprint,
         };
         match db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients_idempotent(
+            mcp_agent_mail_db::queries::create_message_with_recipients_idempotent_topic(
                 ctx.cx(),
                 &pool,
                 project_id,
@@ -2416,6 +2427,7 @@ effective_free_bytes={free}"
                 &subject,
                 &final_body,
                 thread_id.as_deref(),
+                topic.as_deref(),
                 &importance_val,
                 ack_required.unwrap_or(false),
                 &attachments_json,
@@ -2432,7 +2444,7 @@ effective_free_bytes={free}"
         }
     } else {
         let row = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients(
+            mcp_agent_mail_db::queries::create_message_with_recipients_topic(
                 ctx.cx(),
                 &pool,
                 project_id,
@@ -2440,6 +2452,7 @@ effective_free_bytes={free}"
                 &subject,
                 &final_body,
                 thread_id.as_deref(),
+                topic.as_deref(),
                 &importance_val,
                 ack_required.unwrap_or(false),
                 &attachments_json,
@@ -2548,6 +2561,7 @@ effective_free_bytes={free}"
                 "subject": &message.subject,
                 "created": micros_to_iso(message.created_ts),
                 "thread_id": &message.thread_id,
+                "topic": &message.topic,
                 "project": &project.human_key,
                 "project_slug": &project.slug,
                 "importance": &message.importance,
@@ -2592,6 +2606,7 @@ effective_free_bytes={free}"
             project_id,
             sender_id,
             thread_id: message.thread_id,
+            topic: message.topic,
             subject: message.subject,
             body_md: message.body_md,
             importance: message.importance,
@@ -3362,7 +3377,7 @@ effective_free_bytes={free}"
             fingerprint,
         };
         match db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients_idempotent(
+            mcp_agent_mail_db::queries::create_message_with_recipients_idempotent_topic(
                 ctx.cx(),
                 &pool,
                 project_id,
@@ -3370,6 +3385,7 @@ effective_free_bytes={free}"
                 &subject,
                 &final_body,
                 Some(&thread_id),
+                original.topic.as_deref(),
                 &importance_val,
                 ack_required.unwrap_or(original.ack_required != 0),
                 &attachments_json,
@@ -3386,7 +3402,7 @@ effective_free_bytes={free}"
         }
     } else {
         let row = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients(
+            mcp_agent_mail_db::queries::create_message_with_recipients_topic(
                 ctx.cx(),
                 &pool,
                 project_id,
@@ -3394,6 +3410,7 @@ effective_free_bytes={free}"
                 &subject,
                 &final_body,
                 Some(&thread_id),
+                original.topic.as_deref(),
                 &importance_val,
                 ack_required.unwrap_or(original.ack_required != 0),
                 &attachments_json,
@@ -3499,6 +3516,7 @@ effective_free_bytes={free}"
                 "subject": &reply.subject,
                 "created": micros_to_iso(reply.created_ts),
                 "thread_id": &thread_id,
+                "topic": &reply.topic,
                 "project": &project.human_key,
                 "project_slug": &project.slug,
                 "importance": &reply.importance,
@@ -3544,6 +3562,7 @@ effective_free_bytes={free}"
             project_id,
             sender_id,
             thread_id: Some(thread_id.clone()),
+            topic: reply.topic.clone(),
             subject: reply.subject.clone(),
             body_md: reply.body_md.clone(),
             importance: reply.importance.clone(),
@@ -3561,6 +3580,7 @@ effective_free_bytes={free}"
             project_id,
             sender_id,
             thread_id: Some(thread_id),
+            topic: reply.topic,
             subject: reply.subject,
             importance: reply.importance,
             ack_required: reply.ack_required != 0,
@@ -3667,7 +3687,7 @@ pub async fn fetch_inbox(
     let urgent = urgent_only.unwrap_or(false);
     let unread = unread_only.unwrap_or(false);
     let ack_overdue = ack_overdue_only.unwrap_or(false);
-    reject_unsupported_topic_argument(topic.as_deref(), "fetch_inbox")?;
+    let topic = normalize_topic_argument(topic.as_deref())?;
     phase.set_include_bodies(include_body);
     phase.mark("argument_validation");
 
@@ -3713,84 +3733,24 @@ pub async fn fetch_inbox(
         None
     };
 
-    let inbox_rows = db_outcome_to_mcp_result(match (include_body, ack_overdue, unread) {
-        (true, true, _) => {
-            let threshold = mcp_agent_mail_db::now_micros() - FETCH_INBOX_ACK_OVERDUE_THRESHOLD_US;
-            mcp_agent_mail_db::queries::fetch_inbox_ack_overdue(
-                ctx.cx(),
-                &read_pool,
-                project_id,
-                agent_id,
-                urgent,
-                since_micros,
-                msg_limit,
-                threshold,
-            )
-            .await
-        }
-        (false, true, _) => {
-            let threshold = mcp_agent_mail_db::now_micros() - FETCH_INBOX_ACK_OVERDUE_THRESHOLD_US;
-            mcp_agent_mail_db::queries::fetch_inbox_ack_overdue_metadata(
-                ctx.cx(),
-                &read_pool,
-                project_id,
-                agent_id,
-                urgent,
-                since_micros,
-                msg_limit,
-                threshold,
-            )
-            .await
-        }
-        (true, false, true) => {
-            mcp_agent_mail_db::queries::fetch_inbox_unread(
-                ctx.cx(),
-                &read_pool,
-                project_id,
-                agent_id,
-                urgent,
-                since_micros,
-                msg_limit,
-            )
-            .await
-        }
-        (false, false, true) => {
-            mcp_agent_mail_db::queries::fetch_inbox_unread_metadata(
-                ctx.cx(),
-                &read_pool,
-                project_id,
-                agent_id,
-                urgent,
-                since_micros,
-                msg_limit,
-            )
-            .await
-        }
-        (true, false, false) => {
-            mcp_agent_mail_db::queries::fetch_inbox(
-                ctx.cx(),
-                &read_pool,
-                project_id,
-                agent_id,
-                urgent,
-                since_micros,
-                msg_limit,
-            )
-            .await
-        }
-        (false, false, false) => {
-            mcp_agent_mail_db::queries::fetch_inbox_metadata(
-                ctx.cx(),
-                &read_pool,
-                project_id,
-                agent_id,
-                urgent,
-                since_micros,
-                msg_limit,
-            )
-            .await
-        }
-    })?;
+    let ack_overdue_before =
+        ack_overdue.then(|| mcp_agent_mail_db::now_micros() - FETCH_INBOX_ACK_OVERDUE_THRESHOLD_US);
+    let inbox_rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::fetch_inbox_filtered(
+            ctx.cx(),
+            &read_pool,
+            project_id,
+            agent_id,
+            urgent,
+            unread,
+            since_micros,
+            msg_limit,
+            ack_overdue_before,
+            topic.as_deref(),
+            include_body,
+        )
+        .await,
+    )?;
     phase.mark("sqlite_query");
 
     let mut messages: Vec<InboxMessage> = inbox_rows
@@ -3812,6 +3772,7 @@ pub async fn fetch_inbox(
                 project_id: row.message.project_id,
                 sender_id: row.message.sender_id,
                 thread_id: row.message.thread_id,
+                topic: row.message.topic,
                 subject: row.message.subject,
                 importance: row.message.importance,
                 ack_required: row.message.ack_required != 0,
@@ -5721,38 +5682,45 @@ mod tests {
     }
 
     #[test]
-    fn normalized_topic_argument_treats_blank_as_absent() {
-        assert_eq!(normalized_topic_argument(Some("   ")), None);
-        assert_eq!(normalized_topic_argument(None), None);
+    fn normalize_topic_argument_treats_omission_as_topicless() {
+        assert_eq!(normalize_topic_argument(None).unwrap(), None);
     }
 
     #[test]
-    fn normalized_topic_argument_trims_non_blank_topic() {
+    fn normalize_topic_argument_trims_and_accepts_hierarchical_bead_ids() {
         assert_eq!(
-            normalized_topic_argument(Some("  build-updates  ")),
-            Some("build-updates")
+            normalize_topic_argument(Some("  br-abc.1  ")).unwrap(),
+            Some("br-abc.1".to_string())
         );
     }
 
     #[test]
-    fn reject_unsupported_topic_argument_allows_blank_topic() {
-        reject_unsupported_topic_argument(Some("   "), "send_message")
-            .expect("blank topic should behave like an omitted topic");
-    }
-
-    #[test]
-    fn reject_unsupported_topic_argument_rejects_non_blank_topic() {
-        let err = reject_unsupported_topic_argument(Some("build-updates"), "fetch_inbox")
-            .expect_err("non-blank topic should be rejected until implemented");
-        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
-        assert_eq!(
-            err.message,
-            "fetch_inbox does not support the 'topic' argument yet. Omit 'topic' and retry."
-        );
+    fn normalize_topic_argument_rejects_blank_topic() {
+        let err = normalize_topic_argument(Some("   ")).expect_err("blank topic must be invalid");
         let data = err.data.expect("error payload");
-        assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
+        assert_eq!(data["error"]["type"], "INVALID_TOPIC");
         assert_eq!(data["error"]["data"]["argument"], "topic");
-        assert_eq!(data["error"]["data"]["value"], "build-updates");
+        assert_eq!(data["error"]["data"]["provided"], "");
+    }
+
+    #[test]
+    fn normalize_topic_argument_rejects_unsafe_or_oversized_values() {
+        for invalid in [
+            ".",
+            "..",
+            "../foo",
+            ".hidden",
+            "a/b",
+            "has space",
+            "-leading",
+            "_leading",
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abc",
+        ] {
+            let err = normalize_topic_argument(Some(invalid))
+                .expect_err("invalid topic shape must be rejected");
+            let data = err.data.expect("error payload");
+            assert_eq!(data["error"]["type"], "INVALID_TOPIC", "{invalid}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -6312,6 +6280,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: Some("thread-1".into()),
+            topic: Some("br-abc.1".into()),
             subject: "test".into(),
             importance: "normal".into(),
             ack_required: true,
