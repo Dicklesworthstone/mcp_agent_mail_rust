@@ -60982,6 +60982,35 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn clap_parses_mail_send_topic() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "mail",
+            "send",
+            "--project",
+            "/tmp/proj",
+            "--from",
+            "BlueLake",
+            "--to",
+            "RedFox",
+            "--subject",
+            "Release",
+            "--body",
+            "Ready",
+            "--topic",
+            "release.v31",
+        ])
+        .expect("mail send should accept --topic");
+
+        match cli.command.expect("expected command") {
+            Commands::Mail {
+                action: MailCommand::Send { topic, .. },
+            } => assert_eq!(topic.as_deref(), Some("release.v31")),
+            other => panic!("expected Mail Send, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn clap_parses_mail_summarize_thread() {
         let cli = Cli::try_parse_from([
             "am",

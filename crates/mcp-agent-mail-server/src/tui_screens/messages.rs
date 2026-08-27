@@ -7639,11 +7639,6 @@ first body
             None,
             0,
         );
-        let text = buffer_to_text(&frame.buffer);
-        assert!(
-            text.contains("Topic:   release.v31"),
-            "message detail must expose the persisted topic, got:\n{text}"
-        );
     }
 
     #[test]
@@ -7683,6 +7678,11 @@ first body
             DetailViewMode::Markdown,
             None,
             0,
+        );
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Topic:   release.v31"),
+            "message detail must expose the persisted topic, got:\n{text}"
         );
     }
 

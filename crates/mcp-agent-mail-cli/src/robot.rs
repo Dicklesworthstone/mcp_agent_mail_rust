@@ -1279,6 +1279,8 @@ pub struct InboxEntry {
     pub priority: String,
     pub from: String,
     pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub thread: String,
     pub age: String,
     pub ack_status: String,
@@ -1318,6 +1320,8 @@ pub struct ThreadMessage {
     pub ack: String,
     pub subject: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
 }
 
@@ -1325,13 +1329,18 @@ impl MarkdownRenderable for Vec<ThreadMessage> {
     fn to_markdown(&self, meta: &RobotMeta, _alerts: &[RobotAlert], _actions: &[String]) -> String {
         let mut md = format!("# Thread: {}\n\n", meta.command);
         for msg in self {
+            let topic_line = msg
+                .topic
+                .as_deref()
+                .map_or_else(String::new, |topic| format!("**Topic:** {topic}\n"));
             md.push_str(&format!(
-                "## [{pos}] {from} → {to} ({age})\n**{subject}**\n\n{body}\n\n---\n\n",
+                "## [{pos}] {from} → {to} ({age})\n**{subject}**\n{topic_line}\n{body}\n\n---\n\n",
                 pos = msg.position,
                 from = msg.from,
                 to = msg.to,
                 age = msg.age,
                 subject = msg.subject,
+                topic_line = topic_line,
                 body = msg.body.as_deref().unwrap_or(""),
             ));
         }
@@ -1346,6 +1355,8 @@ pub struct SearchResult {
     pub relevance: f64,
     pub from: String,
     pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub thread: String,
     pub snippet: String,
     pub age: String,
@@ -1386,6 +1397,8 @@ pub struct MessageContext {
     pub from_model: Option<String>,
     pub to: Vec<String>,
     pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub body: String,
     pub thread: String,
     pub position: usize,
@@ -1422,11 +1435,16 @@ impl MarkdownRenderable for MessageContext {
             (Some(p), Some(m)) => format!("{} ({p}, {m})", self.from),
             _ => self.from.clone(),
         };
+        let topic_line = self
+            .topic
+            .as_deref()
+            .map_or_else(String::new, |topic| format!("**Topic:** {topic}  \n"));
         let mut md = format!(
             "## Message #{id} | Thread: {thread} ({pos} of {total})\n\n\
              **From:** {sender}  \n\
              **To:** {to}  \n\
              **Subject:** {subject}  \n\
+             {topic_line}\
              **Importance:** {importance} | **Ack:** {ack}  \n\
              **Sent:** {created} ({age})\n\n---\n\n{body}\n",
             id = self.id,
@@ -1436,6 +1454,7 @@ impl MarkdownRenderable for MessageContext {
             sender = sender_info,
             to = self.to.join(", "),
             subject = self.subject,
+            topic_line = topic_line,
             importance = self.importance,
             ack = self.ack_status,
             created = self.created,
@@ -5608,6 +5627,10 @@ fn server_inbox_row_to_entry(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            topic: row
+                .get("topic")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
             thread: canonical_thread_ref(id, thread_id),
             age: format_age(age_seconds),
             ack_status,
@@ -5884,12 +5907,12 @@ fn build_inbox_with_phase(
         "'' AS body_md"
     };
     let sql = format!(
-        "SELECT sub.id, sub.subject, sub.thread_id, sub.importance, sub.ack_required,
+        "SELECT sub.id, sub.subject, sub.topic, sub.thread_id, sub.importance, sub.ack_required,
                 sub.created_ts, sub.sender_id, sub.read_ts, sub.ack_ts, sub.body_md,
                 sub.priority_bucket,
                 COALESCE(a_sender.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name
          FROM (
-             SELECT m.id, m.subject, m.thread_id, m.importance, m.ack_required,
+             SELECT m.id, m.subject, m.topic, m.thread_id, m.importance, m.ack_required,
                     m.created_ts, m.sender_id, mr.read_ts, mr.ack_ts, {body_select},
                     CASE
                         WHEN m.importance IN ('urgent','high') AND mr.read_ts IS NULL THEN 1
@@ -5930,6 +5953,7 @@ fn build_inbox_with_phase(
         let bucket: i64 = row.get_named("priority_bucket").unwrap_or(7);
         let sender: String = row.get_named("sender_name").unwrap_or_default();
         let subject: String = row.get_named("subject").unwrap_or_default();
+        let topic: Option<String> = row.get_named("topic").ok();
         let thread_id: String = row.get_named("thread_id").unwrap_or_default();
         let thread_ref = canonical_thread_ref(id, &thread_id);
         let importance: String = row.get_named("importance").unwrap_or_default();
@@ -5976,6 +6000,7 @@ fn build_inbox_with_phase(
             priority: priority_label.to_string(),
             from: sender,
             subject,
+            topic,
             thread: thread_ref,
             age: format_age(age_seconds),
             ack_status,
@@ -6341,7 +6366,7 @@ fn build_outbox_entries(
         "'' AS body_md"
     };
     let sql = format!(
-        "SELECT m.id, m.subject, m.thread_id, m.importance, m.ack_required, m.created_ts, {body_select},
+        "SELECT m.id, m.subject, m.topic, m.thread_id, m.importance, m.ack_required, m.created_ts, {body_select},
                 COUNT(mr.agent_id) AS recipient_count,
                 SUM(CASE WHEN mr.ack_ts IS NOT NULL THEN 1 ELSE 0 END) AS acked_count
          FROM messages m
@@ -6366,6 +6391,7 @@ fn build_outbox_entries(
     for row in &rows {
         let id: i64 = row.get_named("id").unwrap_or(0);
         let subject: String = row.get_named("subject").unwrap_or_default();
+        let topic: Option<String> = row.get_named("topic").ok();
         let thread_id: String = row.get_named("thread_id").unwrap_or_default();
         let thread_ref = canonical_thread_ref(id, &thread_id);
         let importance: String = row.get_named("importance").unwrap_or_default();
@@ -6405,6 +6431,7 @@ fn build_outbox_entries(
             priority: "sent".to_string(),
             from: recipient_names,
             subject,
+            topic,
             thread: thread_ref,
             age: format_age(age_seconds),
             ack_status,
@@ -6445,8 +6472,12 @@ impl MarkdownRenderable for ThreadData {
             self.last_activity,
         );
         for msg in &self.messages {
+            let topic_line = msg
+                .topic
+                .as_deref()
+                .map_or_else(String::new, |topic| format!("**Topic**: {topic}\n"));
             md.push_str(&format!(
-                "### [{pos}] {from} → {to} | {age} | importance: {imp} | ack: {ack}\n**Subject**: {subj}\n\n{body}\n\n---\n\n",
+                "### [{pos}] {from} → {to} | {age} | importance: {imp} | ack: {ack}\n**Subject**: {subj}\n{topic_line}\n{body}\n\n---\n\n",
                 pos = msg.position,
                 from = msg.from,
                 to = msg.to,
@@ -6454,6 +6485,7 @@ impl MarkdownRenderable for ThreadData {
                 imp = msg.importance,
                 ack = msg.ack,
                 subj = msg.subject,
+                topic_line = topic_line,
                 body = msg.body.as_deref().unwrap_or("*(no body)*"),
             ));
         }
@@ -6495,7 +6527,7 @@ fn build_thread(
         "'' AS body_md"
     };
     let sql = format!(
-        "SELECT m.id, m.subject, {body_select}, m.importance, m.ack_required, m.created_ts,
+        "SELECT m.id, m.subject, m.topic, {body_select}, m.importance, m.ack_required, m.created_ts,
                 m.sender_id,
                 COALESCE(a_sender.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name,
                 COUNT(mr.agent_id) AS recipient_count,
@@ -6520,6 +6552,7 @@ fn build_thread(
     for (idx, row) in rows.iter().enumerate() {
         let msg_id: i64 = row.get_named("id").unwrap_or(0);
         let subject: String = row.get_named("subject").unwrap_or_default();
+        let topic: Option<String> = row.get_named("topic").ok();
         let body: String = row.get_named("body_md").unwrap_or_default();
         let importance: String = row.get_named("importance").unwrap_or_default();
         let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
@@ -6558,6 +6591,7 @@ fn build_thread(
             importance,
             ack: ack_status,
             subject,
+            topic,
             body: if include_bodies { Some(body) } else { None },
         });
     }
@@ -6718,7 +6752,7 @@ fn build_message(
     // Fetch the message
     let rows = conn
         .query_sync(
-            "SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required,
+            "SELECT m.id, m.subject, m.topic, m.body_md, m.importance, m.ack_required,
                     m.created_ts, m.thread_id, m.attachments,
                     COALESCE(a.name, ?1) AS sender_name, a.program, a.model
              FROM messages m
@@ -6737,6 +6771,7 @@ fn build_message(
         .ok_or_else(|| CliError::InvalidArgument(format!("message #{message_id} not found")))?;
 
     let subject: String = row.get_named("subject").unwrap_or_default();
+    let topic: Option<String> = row.get_named("topic").ok();
     let body: String = row.get_named("body_md").unwrap_or_default();
     let importance: String = row.get_named("importance").unwrap_or_default();
     let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
@@ -6842,6 +6877,7 @@ fn build_message(
         from_model: if model.is_empty() { None } else { Some(model) },
         to,
         subject,
+        topic,
         body,
         thread: thread_ref,
         position,
@@ -7012,6 +7048,7 @@ fn build_search(
 
     for row in collected.rows {
         let subject = row.title;
+        let topic = row.topic;
         let thread_ref = canonical_thread_ref_for_row(row.id, row.thread_id.as_deref());
         let importance = row.importance.unwrap_or_else(|| "normal".to_string());
         let created_ts = row.created_ts.unwrap_or(0);
@@ -7040,6 +7077,7 @@ fn build_search(
             relevance: row.score.unwrap_or(0.0),
             from: sender,
             subject,
+            topic,
             thread: thread_ref,
             snippet,
             age: format_age(age_seconds),
@@ -17490,6 +17528,7 @@ mod tests {
             priority: "high".into(),
             from: "RedHarbor".into(),
             subject: "Test".into(),
+            topic: None,
             thread: "br-123".into(),
             age: "5m".into(),
             ack_status: "pending".into(),
@@ -17566,6 +17605,7 @@ mod tests {
                 importance: "normal".into(),
                 ack: "read".into(),
                 subject: "Plan review".into(),
+                topic: Some("planning.v1".into()),
                 body: Some("Looks good.".into()),
             },
             ThreadMessage {
@@ -17576,6 +17616,7 @@ mod tests {
                 importance: "normal".into(),
                 ack: "pending".into(),
                 subject: "Re: Plan review".into(),
+                topic: Some("planning.v1".into()),
                 body: Some("Thanks!".into()),
             },
         ];
@@ -17597,6 +17638,7 @@ mod tests {
             from_model: Some("opus-4.6".into()),
             to: vec!["SilverCove".into(), "RedHarbor".into()],
             subject: "Important update".into(),
+            topic: Some("release.v31".into()),
             body: "Here are the details...".into(),
             thread: "TKT-5".into(),
             position: 3,
@@ -17613,6 +17655,7 @@ mod tests {
         let envelope = RobotEnvelope::new("robot message 42", OutputFormat::Markdown, msg);
         let md = format_output_md(&envelope, OutputFormat::Markdown).unwrap();
         assert!(md.contains("Important update"));
+        assert!(md.contains("Topic:** release.v31"));
         assert!(md.contains("GoldHawk"));
         assert!(md.contains("claude-code"));
         assert!(md.contains("SilverCove, RedHarbor"));
@@ -17628,6 +17671,7 @@ mod tests {
             priority: "ack-overdue".into(),
             from: "RedFox".into(),
             subject: "Urgent review needed".into(),
+            topic: None,
             thread: "AUTH-001".into(),
             age: "35m ago".into(),
             ack_status: "overdue".into(),
@@ -17647,6 +17691,7 @@ mod tests {
             priority: "unread".into(),
             from: "BlueLake".into(),
             subject: "FYI".into(),
+            topic: None,
             thread: "".into(),
             age: "1h ago".into(),
             ack_status: "none".into(),
@@ -17676,6 +17721,7 @@ mod tests {
                     priority: "ack-overdue".into(),
                     from: "RedFox".into(),
                     subject: "Review auth".into(),
+                    topic: None,
                     thread: "AUTH-1".into(),
                     age: "35m ago".into(),
                     ack_status: "overdue".into(),
@@ -17687,6 +17733,7 @@ mod tests {
                     priority: "urgent".into(),
                     from: "BlueLake".into(),
                     subject: "Blocking issue".into(),
+                    topic: None,
                     thread: "FEAT-1".into(),
                     age: "10m ago".into(),
                     ack_status: "required".into(),
@@ -17890,6 +17937,7 @@ mod tests {
             from_model: Some("opus-4.6".into()),
             to: vec!["RedFox".into(), "GreenCastle".into()],
             subject: "JWT implementation plan".into(),
+            topic: Some("auth.jwt".into()),
             body: "Planning JWT with JWKS rotation.".into(),
             thread: "FEAT-123".into(),
             position: 3,
@@ -17940,6 +17988,7 @@ mod tests {
                     relevance: 0.95,
                     from: "BlueLake".into(),
                     subject: "JWT plan".into(),
+                    topic: Some("auth.jwt".into()),
                     thread: "FEAT-123".into(),
                     snippet: "...JWT with JWKS rotation...".into(),
                     age: "2h ago".into(),
@@ -17949,6 +17998,7 @@ mod tests {
                     relevance: 0.87,
                     from: "RedFox".into(),
                     subject: "Auth review".into(),
+                    topic: None,
                     thread: "FEAT-123".into(),
                     snippet: "...middleware chain for auth...".into(),
                     age: "3h ago".into(),
@@ -19929,6 +19979,7 @@ mod tests {
             priority: "ack-overdue".into(),
             from: "BlueLake".into(),
             subject: "[FEAT-1] Test".into(),
+            topic: Some("feat.1".into()),
             thread: "FEAT-1".into(),
             age: "5m".into(),
             ack_status: "overdue".into(),
@@ -19953,6 +20004,7 @@ mod tests {
                 priority: "ack-overdue".into(),
                 from: "Agent1".into(),
                 subject: "Urgent".into(),
+                topic: None,
                 thread: "".into(),
                 age: "45m".into(),
                 ack_status: "overdue".into(),
@@ -19964,6 +20016,7 @@ mod tests {
                 priority: "urgent".into(),
                 from: "Agent2".into(),
                 subject: "High".into(),
+                topic: None,
                 thread: "".into(),
                 age: "10m".into(),
                 ack_status: "none".into(),
@@ -20179,6 +20232,7 @@ mod tests {
             importance: "high".into(),
             ack: "required".into(),
             subject: "[FEAT-1] Starting work".into(),
+            topic: Some("feat.1".into()),
             body: Some("I'm starting on this feature.".into()),
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -20217,6 +20271,7 @@ mod tests {
                 importance: "normal".into(),
                 ack: "none".into(),
                 subject: "[BUG-42] Login failing".into(),
+                topic: None,
                 body: Some("Users report login failures.".into()),
             }],
         };
@@ -20233,6 +20288,7 @@ mod tests {
             relevance: 0.95,
             from: "BlueLake".into(),
             subject: "JWT implementation".into(),
+            topic: Some("auth.jwt".into()),
             thread: "AUTH-1".into(),
             snippet: "...using JWT with JWKS...".into(),
             age: "2h".into(),
@@ -20358,6 +20414,7 @@ mod tests {
                 relevance: 0.91,
                 from: "BlueLake".into(),
                 subject: "Rollback plan".into(),
+                topic: None,
                 thread: "br-search".into(),
                 snippet: sensitive_body.into(),
                 age: "1m".into(),
@@ -20421,6 +20478,7 @@ mod tests {
             from_model: Some("opus-4.5".into()),
             to: vec!["RedFox".into()],
             subject: "[FEAT-123] Implementation plan".into(),
+            topic: Some("feat.123".into()),
             body: "Here is the plan...".into(),
             thread: "FEAT-123".into(),
             position: 3,
@@ -20447,6 +20505,7 @@ mod tests {
             from_model: None,
             to: vec!["Team".into()],
             subject: "Kickoff".into(),
+            topic: None,
             body: "Starting project".into(),
             thread: "INIT-1".into(),
             position: 1,
@@ -20474,6 +20533,7 @@ mod tests {
             from_model: None,
             to: vec!["Team".into()],
             subject: "Done".into(),
+            topic: None,
             body: "Task completed".into(),
             thread: "DONE-1".into(),
             position: 5,

@@ -3079,6 +3079,30 @@ mod tests {
     }
 
     #[test]
+    fn detail_renders_message_topic() {
+        let mut entry = test_entry(42, 1_000_000, Direction::Inbound);
+        entry.topic = Some("release.v31".to_string());
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 20, &mut pool);
+        let max_scroll = std::cell::Cell::new(0);
+
+        render_detail(
+            &mut frame,
+            Rect::new(0, 0, 80, 20),
+            Some(&entry),
+            0,
+            true,
+            &max_scroll,
+        );
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Topic:   release.v31"),
+            "explorer detail must expose the persisted topic, got:\n{text}"
+        );
+    }
+
+    #[test]
     fn importance_rank_ordering() {
         assert!(importance_rank("urgent") > importance_rank("high"));
         assert!(importance_rank("high") > importance_rank("normal"));
