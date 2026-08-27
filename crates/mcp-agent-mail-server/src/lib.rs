@@ -11818,9 +11818,7 @@ impl HttpState {
             dispatch_cx,
             DispatchCancel::new(),
             Arc::new(Mutex::new(Some(permit))),
-            move |_cancel| {
-                Ok(arc_self.handle_mail_dispatch_with_cx(&req, &path, &worker_cx))
-            },
+            move |_cancel| Ok(arc_self.handle_mail_dispatch_with_cx(&req, &path, &worker_cx)),
         )
         .await;
 

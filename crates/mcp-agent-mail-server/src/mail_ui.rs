@@ -2769,8 +2769,8 @@ fn render_index(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)>
                     .suggested
                     .push(for_b);
             }
-            queries::ProjectSiblingStatus::Suggested
-            | queries::ProjectSiblingStatus::Dismissed => {}
+            queries::ProjectSiblingStatus::Suggested | queries::ProjectSiblingStatus::Dismissed => {
+            }
         }
     }
 
@@ -5617,8 +5617,7 @@ fn handle_sibling_update(
             }))
         }
         asupersync::Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument {
-            message,
-            ..
+            message, ..
         }) => json_err(400, &message),
         asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
             json_err(404, "Project or sibling suggestion not found")
@@ -6281,33 +6280,26 @@ mod fresh_eyes_regression_tests {
             serde_json::from_str(&payload).expect("method response must be JSON");
         assert_eq!(error["error"], "Method Not Allowed");
 
-        let (status, payload) = handle_sibling_update(&cx, &pool, 1, 2, "{")
-            .expect_err("malformed json must fail");
+        let (status, payload) =
+            handle_sibling_update(&cx, &pool, 1, 2, "{").expect_err("malformed json must fail");
         assert_eq!(status, 400);
         let error: serde_json::Value =
             serde_json::from_str(&payload).expect("malformed-json response must be JSON");
         assert_eq!(error["error"], "Invalid JSON");
 
-        let (status, payload) = handle_sibling_update(
-            &cx,
-            &pool,
-            1,
-            2,
-            r#"{"action":"unsupported"}"#,
-        )
-        .expect_err("invalid action must fail");
+        let (status, payload) =
+            handle_sibling_update(&cx, &pool, 1, 2, r#"{"action":"unsupported"}"#)
+                .expect_err("invalid action must fail");
         assert_eq!(status, 400);
         assert!(payload.contains("Invalid action"));
 
-        let (status, payload) =
-            handle_sibling_update(&cx, &pool, 1, 1, r#"{"action":"confirm"}"#)
-                .expect_err("self-pair must fail");
+        let (status, payload) = handle_sibling_update(&cx, &pool, 1, 1, r#"{"action":"confirm"}"#)
+            .expect_err("self-pair must fail");
         assert_eq!(status, 400);
         assert!(payload.contains("cannot be its own sibling"));
 
-        let (status, payload) =
-            handle_sibling_update(&cx, &pool, 1, 2, r#"{"action":"confirm"}"#)
-                .expect_err("missing pair must fail");
+        let (status, payload) = handle_sibling_update(&cx, &pool, 1, 2, r#"{"action":"confirm"}"#)
+            .expect_err("missing pair must fail");
         assert_eq!(status, 404);
         assert!(payload.contains("not found"));
 

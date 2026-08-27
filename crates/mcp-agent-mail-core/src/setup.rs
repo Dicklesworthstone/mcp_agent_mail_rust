@@ -9115,10 +9115,8 @@ mod tests {
                 Ok(())
             },
             || {
-                outside_received_secret.set(
-                    std::fs::read(&outside)
-                        .is_ok_and(|content| content == attempted),
-                );
+                outside_received_secret
+                    .set(std::fs::read(&outside).is_ok_and(|content| content == attempted));
             },
         );
 

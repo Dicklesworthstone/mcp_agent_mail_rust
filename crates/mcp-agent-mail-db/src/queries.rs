@@ -4677,8 +4677,7 @@ impl ProjectSiblingSuggestion {
     }
 }
 
-const PROJECT_SIBLING_SELECT: &str =
-    "SELECT s.id, s.status, s.score, s.rationale, s.evaluated_ts, \
+const PROJECT_SIBLING_SELECT: &str = "SELECT s.id, s.status, s.score, s.rationale, s.evaluated_ts, \
             s.confirmed_ts, s.dismissed_ts, \
             a.id, a.slug, a.human_key, b.id, b.slug, b.human_key \
      FROM project_sibling_suggestions AS s \
@@ -16692,14 +16691,9 @@ mod tests {
             insert_project_row_for_test(&cx, &pool, &project_a).await;
             insert_project_row_for_test(&cx, &pool, &project_b).await;
 
-            let non_positive = update_project_sibling_status(
-                &cx,
-                &pool,
-                0,
-                302,
-                ProjectSiblingStatus::Confirmed,
-            )
-            .await;
+            let non_positive =
+                update_project_sibling_status(&cx, &pool, 0, 302, ProjectSiblingStatus::Confirmed)
+                    .await;
             assert!(matches!(
                 non_positive,
                 Outcome::Err(DbError::InvalidArgument {
@@ -16716,7 +16710,10 @@ mod tests {
                 ProjectSiblingStatus::Confirmed,
             )
             .await;
-            assert!(matches!(self_pair, Outcome::Err(DbError::InvalidArgument { .. })));
+            assert!(matches!(
+                self_pair,
+                Outcome::Err(DbError::InvalidArgument { .. })
+            ));
 
             let missing_project = update_project_sibling_status(
                 &cx,
