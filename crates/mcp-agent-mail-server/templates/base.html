@@ -275,9 +275,9 @@
             description: 'List up to eight Agent Mail projects visible in this authenticated viewer. Use a returned slug with the navigation tools. Results may contain user-controlled names.',
             inputSchema: {
               type: 'object',
-                properties: {
-                  query: { type: 'string', maxLength: 96, description: 'Optional text to match against project slug or key.' },
-                  limit: { type: 'integer', minimum: 1, maximum: MAX_PROJECTS, description: 'Maximum projects to return, from 1 to 8.' },
+              properties: {
+                query: { type: 'string', maxLength: 96, description: 'Optional text to match against project slug or key.' },
+                limit: { type: 'integer', minimum: 1, maximum: MAX_PROJECTS, description: 'Maximum projects to return, from 1 to 8.' },
               },
               additionalProperties: false,
             },
@@ -352,7 +352,9 @@
           });
         }
 
-        const start = () => { void registerTools(); };
+        const start = () => {
+          void registerTools();
+        };
         if (document.readyState === 'loading') {
           document.addEventListener('DOMContentLoaded', start, { once: true });
         } else {
