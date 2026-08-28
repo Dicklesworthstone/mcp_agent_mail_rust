@@ -11293,7 +11293,7 @@ mod alien_enhancement_tests {
     #[test]
     fn dirty_backlog_publishes_an_immediate_resume_deadline() {
         let mut engine = AtcEngine::new_for_testing();
-        for index in 0..(MAX_LIVENESS_REVIEWS_PER_TICK + 1) {
+        for index in 0..=MAX_LIVENESS_REVIEWS_PER_TICK {
             engine.register_agent(&format!("ResumeAgent{index:04}"), "codex-cli", None);
         }
         engine.liveness_schedule.clear();
