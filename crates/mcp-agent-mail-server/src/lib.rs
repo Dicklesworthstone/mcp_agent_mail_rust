@@ -201,6 +201,25 @@ struct InstrumentedTool<T> {
     inner: T,
 }
 
+/// Preserve Agent Mail's client-facing legacy error envelope across the MCP
+/// tool-result boundary.
+///
+/// FastMCP correctly converts handler `ToolExecutionError`s into an
+/// `isError=true` result, but the legacy result shape only carries text and
+/// therefore otherwise drops `McpError::data`. Agent Mail's tools deliberately
+/// put their stable error type and recovery metadata in that data field. Only
+/// recognized Agent Mail envelopes are serialized here; framework and opaque
+/// errors retain their original messages and sanitization behavior.
+fn preserve_legacy_tool_error_payload(mut error: McpError) -> McpError {
+    if mcp_agent_mail_tools::tool_error_code(&error).is_some()
+        && let Some(data) = error.data.as_ref()
+        && let Ok(serialized) = serde_json::to_string(data)
+    {
+        error.message = serialized;
+    }
+    error
+}
+
 struct InflightGuard {
     gauge: &'static mcp_agent_mail_core::GaugeI64,
 }
@@ -360,7 +379,7 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
             agent,
         ));
 
-        out
+        out.map_err(preserve_legacy_tool_error_payload)
     }
 
     fn call_async<'a>(
@@ -487,7 +506,12 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
                 agent,
             ));
 
-            out
+            match out {
+                fastmcp_core::Outcome::Err(error) => {
+                    fastmcp_core::Outcome::Err(preserve_legacy_tool_error_payload(error))
+                }
+                other => other,
+            }
         })
     }
 }
@@ -17962,6 +17986,70 @@ mod tests {
                 serde_json::json!({}),
             ))
         }
+    }
+
+    #[test]
+    fn fetch_topic_is_admitted_through_the_instrumented_router_boundary() {
+        let tool_index = mcp_agent_mail_tools::tool_index("fetch_topic")
+            .expect("fetch_topic must have a metrics index");
+        let mut router = fastmcp::Router::new();
+        router
+            .add_tool(InstrumentedTool {
+                tool_index,
+                tool_name: "fetch_topic",
+                inner: FetchTopic,
+            })
+            .expect("fetch_topic must satisfy both legacy and final tool admission");
+
+        assert_eq!(
+            router
+                .tools()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>(),
+            vec!["fetch_topic"]
+        );
+    }
+
+    #[test]
+    fn legacy_tool_error_payload_survives_the_router_result_boundary() {
+        let tool_index = mcp_agent_mail_tools::tool_index("acquire_build_slot")
+            .expect("acquire_build_slot must have a metrics index");
+        let mut router = fastmcp::Router::new();
+        router
+            .add_tool(InstrumentedTool {
+                tool_index,
+                tool_name: "acquire_build_slot",
+                inner: FailingTool {
+                    code: "CONTACT_REQUIRED",
+                },
+            })
+            .expect("failing test tool must be admitted");
+
+        let cx = Cx::for_testing();
+        let result = router
+            .handle_tools_call(
+                &McpContext::new(cx, 1),
+                CallToolParams {
+                    name: "failing".to_string(),
+                    arguments: Some(serde_json::json!({})),
+                    meta: None,
+                },
+                SessionState::new(),
+                None,
+                None,
+            )
+            .expect("tool-level failure must remain a successful JSON-RPC tools/call result");
+
+        assert!(result.is_error);
+        let LegacyContent::Text { text, .. } = &result.content[0] else {
+            panic!("tool error must use text content");
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(text).expect("tool error text must retain its JSON envelope");
+        assert_eq!(payload["error"]["type"], "CONTACT_REQUIRED");
+        assert_eq!(payload["error"]["message"], "synthetic failure");
+        assert_eq!(payload["error"]["recoverable"], true);
     }
 
     /// Fetch `(calls, errors, rejections)` for a tool from the full snapshot.

@@ -1165,6 +1165,17 @@ fn build_tool_directory() -> ToolDirectory {
                     complexity: "medium".to_string(),
                 },
                 ToolDirectoryEntry {
+                    name: "fetch_topic".to_string(),
+                    summary: "Fetch all project messages carrying one exact topic tag.".to_string(),
+                    use_when: "Reading a topic-scoped workflow across all recipients in a project.".to_string(),
+                    related: vec!["fetch_inbox".to_string(), "search_messages".to_string()],
+                    expected_frequency: "When resuming or reviewing a topic-scoped coordination stream.".to_string(),
+                    required_capabilities: vec!["messaging".to_string(), "read".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Read topic".to_string(), sample: "fetch_topic(project_key='backend', topic_name='release.v31')".to_string() }],
+                    capabilities: vec!["messaging".to_string(), "read".to_string()],
+                    complexity: "medium".to_string(),
+                },
+                ToolDirectoryEntry {
                     name: "fetch_inbox_events".to_string(),
                     summary: "Read body-free, oldest-first recipient delivery events with a restart-safe cursor.".to_string(),
                     use_when: "Resuming an inbox monitor without replaying or missing prior delivery events.".to_string(),
