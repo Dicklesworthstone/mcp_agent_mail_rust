@@ -14,6 +14,13 @@ tools that intentionally have no Python analogue.
 captured Python behavior fixture. It must track the tools registered by the Rust
 router and the Rust profile/cluster filtering rules.
 
+Legacy JSON objects are checked as compatibility contracts: all recorded fields
+and values must still match, while additive Rust fields are allowed. Arrays
+remain exact in length and order. Rust-native golden fixtures continue to use
+exact equality. A documented normalization pointer may exclude an intentionally
+divergent legacy field only when Rust-native invariant coverage owns the new
+contract (for example, fail-closed health status when durable state is absent).
+
 ## Fixture Schema
 
 ```json

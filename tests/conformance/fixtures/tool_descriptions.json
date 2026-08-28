@@ -1,6 +1,7 @@
 {
   "generated_at": "2026-02-15T02:39:09Z",
-  "source": "python-mcp-agent-mail",
+  "source": "legacy-python-seed-plus-rust-contract",
+  "authority": "rust-supported-compatibility",
   "tools": [
     {
       "name": "acknowledge_message",

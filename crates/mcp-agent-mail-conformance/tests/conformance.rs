@@ -248,6 +248,61 @@ fn normalize_pair(mut actual: Value, mut expected: Value, norm: &Normalize) -> (
     (actual, expected)
 }
 
+/// Check the supported legacy JSON contract without making an obsolete
+/// implementation the authority over additive Rust fields.
+///
+/// Objects are compared as contracts: every field recorded by the legacy
+/// fixture must still exist and match recursively, while additional fields in
+/// the Rust response are allowed. Arrays retain exact length and order because
+/// adding or removing an item can change client-visible pagination or routing
+/// semantics. Rust-native golden fixtures continue to use exact equality.
+fn supported_compatibility_mismatch(
+    actual: &Value,
+    expected: &Value,
+    path: &str,
+) -> Option<String> {
+    match (actual, expected) {
+        (Value::Object(actual), Value::Object(expected)) => {
+            for (key, expected_value) in expected {
+                let field_path = format!("{path}.{key}");
+                let Some(actual_value) = actual.get(key) else {
+                    return Some(format!("missing required field {field_path}"));
+                };
+                if let Some(mismatch) =
+                    supported_compatibility_mismatch(actual_value, expected_value, &field_path)
+                {
+                    return Some(mismatch);
+                }
+            }
+            None
+        }
+        (Value::Array(actual), Value::Array(expected)) => {
+            if actual.len() != expected.len() {
+                return Some(format!(
+                    "array length mismatch at {path}: actual={}, expected={}",
+                    actual.len(),
+                    expected.len()
+                ));
+            }
+            for (index, (actual_value, expected_value)) in
+                actual.iter().zip(expected).enumerate()
+            {
+                let item_path = format!("{path}[{index}]");
+                if let Some(mismatch) =
+                    supported_compatibility_mismatch(actual_value, expected_value, &item_path)
+                {
+                    return Some(mismatch);
+                }
+            }
+            None
+        }
+        _ if actual == expected => None,
+        _ => Some(format!(
+            "value mismatch at {path}: actual={actual}, expected={expected}"
+        )),
+    }
+}
+
 fn decode_json_from_tool_content(content: &[LegacyContent]) -> Result<Value, String> {
     if content.len() != 1 {
         return Err(format!(
@@ -1381,6 +1436,74 @@ fn null_auto_increment_ids_nulls_sender_id_but_keeps_attribution() {
 }
 
 #[test]
+/// The compatibility lane protects supported clients without giving the frozen
+/// legacy implementation authority over additive Rust response evolution.
+fn supported_legacy_contract_allows_additive_fields_but_not_semantic_drift() {
+    let expected = serde_json::json!({
+        "status": "ok",
+        "items": [{"id": null, "subject": "hello"}]
+    });
+    let additive = serde_json::json!({
+        "status": "ok",
+        "health_level": "green",
+        "items": [{"id": null, "subject": "hello", "topic": "br-123"}]
+    });
+    assert_eq!(
+        supported_compatibility_mismatch(&additive, &expected, "$"),
+        None,
+        "additive Rust object fields are backwards-compatible"
+    );
+
+    let missing = serde_json::json!({"items": [{"id": null, "subject": "hello"}]});
+    assert!(
+        supported_compatibility_mismatch(&missing, &expected, "$")
+            .is_some_and(|mismatch| mismatch.contains("$.status")),
+        "removing a supported legacy field must fail"
+    );
+
+    let changed = serde_json::json!({
+        "status": "degraded",
+        "items": [{"id": null, "subject": "hello"}]
+    });
+    assert!(
+        supported_compatibility_mismatch(&changed, &expected, "$")
+            .is_some_and(|mismatch| mismatch.contains("$.status")),
+        "changing a supported legacy value must fail"
+    );
+
+    let extra_item = serde_json::json!({
+        "status": "ok",
+        "items": [
+            {"id": null, "subject": "hello"},
+            {"id": null, "subject": "unexpected"}
+        ]
+    });
+    assert!(
+        supported_compatibility_mismatch(&extra_item, &expected, "$")
+            .is_some_and(|mismatch| mismatch.contains("array length mismatch")),
+        "array cardinality remains an exact compatibility contract"
+    );
+
+    let actual_health = serde_json::json!({"status": "error", "health_level": "red"});
+    let legacy_health = serde_json::json!({"status": "ok"});
+    assert!(
+        supported_compatibility_mismatch(&actual_health, &legacy_health, "$").is_some(),
+        "semantic divergence must be explicit"
+    );
+    let normalization = Normalize {
+        ignore_json_pointers: vec!["/status".to_string()],
+        replace: BTreeMap::new(),
+    };
+    let (actual_health, legacy_health) =
+        normalize_pair(actual_health, legacy_health, &normalization);
+    assert_eq!(
+        supported_compatibility_mismatch(&actual_health, &legacy_health, "$"),
+        None,
+        "a documented normalization transfers authority for that field to Rust-native tests"
+    );
+}
+
+#[test]
 fn resolved_value_rewrites_legacy_fixture_repo_paths() {
     let value = serde_json::json!({
         "install": LEGACY_FIXTURE_REPO_INSTALL_PATH,
@@ -1479,11 +1602,14 @@ fn run_fixtures_against_rust_server_router() {
                         .unwrap_or_else(|e| panic!("tool {tool_name} case {}: {e}", case.name));
                     let (actual, expected) =
                         normalize_pair(actual, expected_ok.clone(), &case.normalize);
-                    assert_eq!(
-                        actual, expected,
-                        "tool {tool_name} case {}: output mismatch",
-                        case.name
-                    );
+                    if let Some(mismatch) =
+                        supported_compatibility_mismatch(&actual, &expected, "$")
+                    {
+                        panic!(
+                            "tool {tool_name} case {}: supported compatibility mismatch: {mismatch}",
+                            case.name
+                        );
+                    }
                 }
                 (None, Some(expected_err)) => match result {
                     Ok(call_result) => {
@@ -1537,11 +1663,14 @@ fn run_fixtures_against_rust_server_router() {
                         .unwrap_or_else(|e| panic!("resource {uri} case {}: {e}", case.name));
                     let (actual, expected) =
                         normalize_pair(actual, expected_ok.clone(), &case.normalize);
-                    assert_eq!(
-                        actual, expected,
-                        "resource {uri} case {}: output mismatch",
-                        case.name
-                    );
+                    if let Some(mismatch) =
+                        supported_compatibility_mismatch(&actual, &expected, "$")
+                    {
+                        panic!(
+                            "resource {uri} case {}: supported compatibility mismatch: {mismatch}",
+                            case.name
+                        );
+                    }
                 }
                 (None, Some(expected_err)) => match result {
                     Ok(read_result) => {

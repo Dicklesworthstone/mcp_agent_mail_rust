@@ -3978,8 +3978,9 @@ pub async fn fetch_inbox(
 
 /// Fetch all project messages carrying one exact topic tag.
 ///
-/// This is intentionally project-scoped, matching the Python reference: it is
-/// the topic-search counterpart to recipient-scoped `fetch_inbox(topic=...)`.
+/// This is intentionally project-scoped under the supported Rust contract: it
+/// is the topic-search counterpart to recipient-scoped
+/// `fetch_inbox(topic=...)`.
 #[tool(
     description = "Fetch all messages in a project with a given topic tag, regardless of recipient.\n\nParameters\n----------\nproject_key : str\n    Project identifier.\ntopic_name : str\n    The topic tag to filter by (case-insensitive).\nlimit : int\n    Max number of messages to return (default 50).\ninclude_bodies : bool\n    Include full Markdown bodies in the payloads (default true).\nsince_ts : Optional[str]\n    ISO-8601 timestamp; only messages newer than this are returned.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, importance, topic, [body_md] }"
 )]

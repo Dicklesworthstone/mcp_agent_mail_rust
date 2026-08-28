@@ -70,6 +70,7 @@
               "/health_level",
               "/recovery",
               "/semantic_readiness",
+              "/status",
               "/storage_root",
               "/timeout_diagnostics",
               "/two_tier_indexing",
