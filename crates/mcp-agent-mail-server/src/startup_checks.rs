@@ -2311,13 +2311,14 @@ fn probe_database(config: &Config) -> ProbeResult {
         if is_sqlite_memory_database_url(url) {
             return ProbeResult::Ok { name: "database" };
         }
-        let Some(path) = resolve_server_database_url_sqlite_path(url) else {
+        let Ok(resolved_path) = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(url) else {
             return ProbeResult::Fail(ProbeFailure {
                 name: "database",
                 problem: format!("Invalid SQLite database URL: {url}"),
                 fix: "Use a valid SQLite URL like 'sqlite:///./storage.sqlite3'".into(),
             });
         };
+        let path = PathBuf::from(resolved_path.configured_path);
         if let Err(problem) = validate_real_file_target_path(&path, "database path") {
             return ProbeResult::Fail(ProbeFailure {
                 name: "database",
@@ -2341,10 +2342,12 @@ fn probe_database(config: &Config) -> ProbeResult {
 ///    `.bak.YYYYMMDD_HHMMSS[-NN]` file. Historical `.backup-*` generations
 ///    and `.recovery` WAL families are excluded until recovery can settle and
 ///    stage an unambiguous complete family.
-/// 2. If no healthy backup exists, reinitialize an empty database.
+/// 2. If no healthy backup exists, attempt archive-aware reconstruction while
+///    preserving live coordination state that can be salvaged safely.
 ///
-/// Startup only fails if recovery itself fails. Successful recovery
-/// logs a warning and allows startup to continue.
+/// Opaque or otherwise unsafe durable database bytes are never replaced with a
+/// blank database. Startup fails closed and preserves them for operator-led
+/// repair. Successful recovery logs a warning and allows startup to continue.
 ///
 /// Skipped when `INTEGRITY_CHECK_ON_STARTUP=false` or for in-memory databases.
 #[allow(dead_code)]
@@ -2357,19 +2360,23 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         return ProbeResult::Ok { name: "integrity" };
     }
 
-    let resolved_db_path = resolve_server_database_url_sqlite_path(&config.database_url);
-    if let Some(path) = resolved_db_path.as_ref() {
-        if let Err(problem) = validate_real_file_target_path(path, "database path") {
+    let resolved_db_path =
+        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url).ok();
+    if let Some(resolved) = resolved_db_path.as_ref() {
+        let configured_path = PathBuf::from(&resolved.configured_path);
+        if let Err(problem) = validate_real_file_target_path(&configured_path, "database path") {
             return ProbeResult::Fail(ProbeFailure {
                 name: "integrity",
                 problem,
                 fix: format!(
                     "Use a real, non-symlinked database path for {}",
-                    path.display()
+                    configured_path.display()
                 ),
             });
         }
     }
+
+    let resolved_db_path = resolved_db_path.map(|resolved| PathBuf::from(resolved.canonical_path));
 
     let database_file_missing = resolved_db_path.as_ref().is_some_and(|path| !path.exists());
 
@@ -3246,7 +3253,7 @@ mod tests {
         );
 
         let mut config = default_config();
-        config.database_url = format!("sqlite:///{}", relative_path.display());
+        config.database_url = format!("sqlite:///./{}", relative_path.display());
 
         let result = probe_database(&config);
         let ProbeResult::Fail(failure) = result else {
@@ -4574,7 +4581,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_integrity_recovers_corrupt_db_with_archive() {
+    fn probe_integrity_preserves_opaque_db_when_archive_recovery_is_unsafe() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("corrupt.db");
         let storage_root = dir.path().join("storage");
@@ -4597,14 +4604,19 @@ mod tests {
         config.storage_root = storage_root;
 
         let result = probe_integrity(&config);
+        let ProbeResult::Fail(failure) = result else {
+            panic!("opaque DB bytes must fail closed instead of blank recovery: {result:?}");
+        };
         assert!(
-            matches!(result, ProbeResult::Ok { .. }),
-            "probe_integrity should auto-recover corrupt DB; got: {result:?}"
+            failure.problem.contains("refusing blank reinitialization"),
+            "unsafe recovery must explain fail-closed preservation: {}",
+            failure.problem
         );
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"not-a-sqlite-db");
     }
 
     #[test]
-    fn probe_integrity_recovers_corrupt_db_without_archive() {
+    fn probe_integrity_preserves_opaque_db_without_archive() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("corrupt_no_archive.db");
 
@@ -4617,10 +4629,17 @@ mod tests {
         config.storage_root = dir.path().join("no-storage");
 
         let result = probe_integrity(&config);
+        let ProbeResult::Fail(failure) = result else {
+            panic!("opaque DB bytes must fail closed instead of blank recovery: {result:?}");
+        };
         assert!(
-            matches!(result, ProbeResult::Ok { .. }),
-            "probe_integrity should reinit from scratch when no archive; got: {result:?}"
+            failure
+                .problem
+                .contains("did not produce a safe validated mailbox candidate"),
+            "unsafe recovery must explain fail-closed preservation: {}",
+            failure.problem
         );
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"not-a-sqlite-db");
     }
 
     #[test]
@@ -5031,7 +5050,7 @@ second body
 
     #[cfg(unix)]
     #[test]
-    fn probe_integrity_does_not_recover_from_archive_through_symlinked_storage_root() {
+    fn probe_integrity_fails_closed_without_crossing_symlinked_storage_root() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -5053,36 +5072,21 @@ second body
 
         let mut config = default_config();
         config.database_url = format!("sqlite:///{}", db_path.display());
-        config.storage_root = linked_storage_root;
+        config.storage_root = linked_storage_root.clone();
 
         let result = probe_integrity(&config);
         assert!(
-            matches!(result, ProbeResult::Ok { .. }),
-            "probe_integrity should still recover without trusting a symlinked archive root: {result:?}"
+            matches!(
+                result,
+                ProbeResult::Fail(ProbeFailure {
+                    name: "integrity",
+                    ..
+                })
+            ),
+            "unsafe recovery must fail closed without trusting symlinked archive root: {result:?}"
         );
-
-        let conn =
-            mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref()).unwrap();
-        let table_rows = conn
-            .query_sync(
-                "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'projects'",
-                &[],
-            )
-            .unwrap();
-        let has_projects_table = table_rows[0]
-            .get_named::<i64>("count")
-            .expect("projects table count")
-            > 0;
-        if has_projects_table {
-            let rows = conn
-                .query_sync("SELECT COUNT(*) AS count FROM projects", &[])
-                .unwrap();
-            assert_eq!(
-                rows[0].get_named::<i64>("count").expect("project count"),
-                0,
-                "startup recovery must not import archive state through a symlinked storage root"
-            );
-        }
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"not-a-sqlite-db");
+        assert!(linked_storage_root.is_symlink());
     }
 
     #[cfg(unix)]

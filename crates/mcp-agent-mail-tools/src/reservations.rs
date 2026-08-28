@@ -3251,7 +3251,9 @@ pub async fn force_release_file_reservation(
 ///
 /// # Conformance
 /// Python-parity.
-#[tool(description = "")]
+#[tool(
+    description = "Install the Agent Mail pre-commit guard in a Git repository. The guard rejects commits that overlap active exclusive file reservations while preserving and chaining any existing hook."
+)]
 pub fn install_precommit_guard(
     _ctx: &McpContext,
     project_key: String,
@@ -3314,7 +3316,9 @@ pub fn install_precommit_guard(
 ///
 /// # Conformance
 /// Python-parity.
-#[tool(description = "")]
+#[tool(
+    description = "Remove the Agent Mail pre-commit guard from a Git repository while preserving other chained hook plugins and restoring any previously preserved hook."
+)]
 pub fn uninstall_precommit_guard(_ctx: &McpContext, code_repo_path: String) -> McpResult<String> {
     let repo_path = normalize_repo_path(&code_repo_path)?;
 

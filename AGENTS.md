@@ -255,16 +255,16 @@ scripts/e2e_cli.sh            # CLI integration (99 assertions)
 | `mcp-agent-mail-db` | SQL queries, pool, cache coherency, FTS sanitization, stress tests (concurrent ops, pool exhaustion) |
 | `mcp-agent-mail-storage` | Git archive, commit coalescer, notification signals |
 | `mcp-agent-mail-guard` | Pre-commit reservation enforcement, symmetric fnmatch, archive reading, rename handling |
-| `mcp-agent-mail-tools` | 44 MCP tool implementations via conformance fixtures |
+| `mcp-agent-mail-tools` | 48 MCP tool implementations via conformance fixtures |
 | `mcp-agent-mail-share` | Snapshot, scrub, bundle, crypto pipeline |
 | `mcp-agent-mail-server` | HTTP handler, dispatch, TUI widgets, property tests |
 | `mcp-agent-mail-cli` | 40+ CLI commands, dual-mode matrix |
-| `mcp-agent-mail-conformance` | Supported Python compatibility (38 tools) plus 6 Rust-native tools and 25 resources |
+| `mcp-agent-mail-conformance` | Supported Python compatibility (42 tools) plus 6 Rust-native tools and 25 resources |
 | `tests/e2e/` | Cross-component E2E via stdio/HTTP transport |
 
 ### Test Fixtures
 
-Conformance tests use Python-generated fixtures in `tests/conformance/fixtures/` to protect supported wire compatibility across 37 captured behavior tools and 25 resources. `fetch_topic` is the 38th compatibility tool and has retained schema/description plus topic-bearing router coverage; 6 additional Rust-native tools are tested separately. These fixtures do not overrule Rust-native reliability or architecture decisions.
+Conformance tests use Python-generated fixtures in `tests/conformance/fixtures/` to protect supported wire compatibility across 37 captured behavior tools and 25 resources. Five additional Python-compatible tools retain inventory/input-schema compatibility, Rust-owned non-empty descriptions, and focused coverage: `fetch_topic`, `list_window_identities`, `sweep_stale_agents`, `summarize_recent`, and `fetch_summary`. Six Rust-native tools are tested separately. These fixtures do not overrule Rust-native reliability or architecture decisions.
 
 ---
 
@@ -477,7 +477,7 @@ reflection surface:
 
 ## MCP Agent Mail — This Project
 
-**This is the project you're working on.** MCP Agent Mail is a mail-like coordination layer for coding agents, providing an MCP server with 44 tools and 25 resources, Git-backed archive, SQLite indexing, and an interactive TUI operations console.
+**This is the project you're working on.** MCP Agent Mail is a mail-like coordination layer for coding agents, providing an MCP server with 48 tools and 25 resources, Git-backed archive, SQLite indexing, and an interactive TUI operations console.
 
 ### What It Does
 
@@ -499,7 +499,7 @@ MCP Client (agent) ──── stdio/HTTP ────► mcp-agent-mail-server
                                               │
                                     ┌─────────┼─────────┐
                                     ▼         ▼         ▼
-                               44 Tools   25 Resources   TUI
+                               48 Tools   25 Resources   TUI
                                     │         │
                               mcp-agent-mail-tools
                                     │
@@ -523,7 +523,7 @@ mcp_agent_mail_rust/
 │   ├── mcp-agent-mail-storage/             # Git archive, commit coalescer
 │   ├── mcp-agent-mail-guard/               # Pre-commit guard, reservation enforcement
 │   ├── mcp-agent-mail-share/               # Snapshot, scrub, bundle, crypto, export
-│   ├── mcp-agent-mail-tools/               # 44 MCP tool implementations
+│   ├── mcp-agent-mail-tools/               # 48 MCP tool implementations
 │   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI
 │   ├── mcp-agent-mail/                     # Server binary (mcp-agent-mail)
 │   ├── mcp-agent-mail-cli/                 # CLI binary (am)
@@ -550,18 +550,18 @@ mcp_agent_mail_rust/
 | `mcp-agent-mail-storage` | `src/coalesce.rs` | Async git commit coalescer (WBQ) |
 | `mcp-agent-mail-guard` | `src/lib.rs` | Pre-commit hook, reservation conflict detection |
 | `mcp-agent-mail-share` | `src/` | 8 modules: snapshot, scrub, bundle, crypto, finalize, hosting, scope |
-| `mcp-agent-mail-tools` | `src/` | 44 MCP tool implementations across 9 clusters |
+| `mcp-agent-mail-tools` | `src/` | 48 MCP tool implementations across 9 clusters |
 | `mcp-agent-mail-server` | `src/lib.rs` | Server dispatch, HTTP handler |
 | `mcp-agent-mail-server` | `src/tui_*.rs` | TUI operations console (16 screens) |
 | `mcp-agent-mail` | `src/main.rs` | Server binary entry point (dual-mode) |
 | `mcp-agent-mail-cli` | `src/main.rs` | CLI binary (`am`) entry point |
 
-### 44 MCP Tools (9 Clusters)
+### 48 MCP Tools (9 Clusters)
 
 | Cluster | Count | Tools |
 |---------|-------|-------|
 | Infrastructure | 4 | health_check, ensure_project, install_precommit_guard, uninstall_precommit_guard |
-| Identity | 9 | register_agent, create_agent_identity, retire_agent, unretire_agent, deregister_agent, whois, resolve_pane_identity, cleanup_pane_identities, list_agents |
+| Identity | 11 | register_agent, create_agent_identity, list_window_identities, sweep_stale_agents, retire_agent, unretire_agent, deregister_agent, whois, resolve_pane_identity, cleanup_pane_identities, list_agents |
 | Messaging | 8 | send_message, reply_message, fetch_inbox, fetch_topic, fetch_inbox_events, get_message_delivery_receipt, acknowledge_message, mark_message_read |
 | Contacts | 4 | request_contact, respond_contact, list_contacts, set_contact_policy |
 | File Reservations | 5 | check_file_reservation_conflicts, file_reservation_paths, renew_file_reservations, release_file_reservations, force_release_file_reservation |

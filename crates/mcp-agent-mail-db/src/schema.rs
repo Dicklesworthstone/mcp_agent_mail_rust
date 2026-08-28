@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS messages (
     sender_id INTEGER NOT NULL REFERENCES agents(id),
     thread_id TEXT,
     topic TEXT COLLATE NOCASE,
+    reply_to INTEGER REFERENCES messages(id),
     subject TEXT NOT NULL,
     body_md TEXT NOT NULL,
     importance TEXT NOT NULL DEFAULT 'normal',
@@ -91,6 +92,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_project_sender_created ON messages(proje
 CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_importance ON messages(importance);
 CREATE INDEX IF NOT EXISTS idx_messages_created_ts ON messages(created_ts);
+CREATE INDEX IF NOT EXISTS ix_messages_reply_to ON messages(reply_to);
 CREATE INDEX IF NOT EXISTS idx_msg_thread_created ON messages(thread_id, created_ts);
 CREATE INDEX IF NOT EXISTS idx_msg_project_importance_created ON messages(project_id, importance, created_ts);
 CREATE INDEX IF NOT EXISTS idx_messages_ack_required_id ON messages(ack_required, id);
@@ -4492,6 +4494,41 @@ mod tests {
             ],
         )
         .expect("insert project");
+    }
+
+    #[test]
+    fn base_schema_creates_reply_edge_column_and_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("base_reply_edge.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        conn.execute_raw(&init_schema_sql_base())
+            .expect("apply base schema");
+
+        let columns = conn
+            .query_sync("PRAGMA table_info(messages)", &[])
+            .expect("inspect message columns");
+        assert!(
+            columns
+                .iter()
+                .any(|row| { row.get_named::<String>("name").ok().as_deref() == Some("reply_to") })
+        );
+
+        let indexes = conn
+            .query_sync("PRAGMA index_list(messages)", &[])
+            .expect("inspect message indexes");
+        assert!(indexes.iter().any(|row| {
+            row.get_named::<String>("name").ok().as_deref() == Some("ix_messages_reply_to")
+        }));
+
+        let foreign_keys = conn
+            .query_sync("PRAGMA foreign_key_list(messages)", &[])
+            .expect("inspect message foreign keys");
+        assert!(foreign_keys.iter().any(|row| {
+            row.get_named::<String>("from").ok().as_deref() == Some("reply_to")
+                && row.get_named::<String>("table").ok().as_deref() == Some("messages")
+                && row.get_named::<String>("to").ok().as_deref() == Some("id")
+        }));
     }
 
     fn insert_inbox_stats_test_agent(conn: &DbConn, name: &str) {

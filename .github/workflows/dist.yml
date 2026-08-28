@@ -15,7 +15,7 @@ concurrency:
 env:
   # Release sibling path dependencies are pinned so rerunning a tag resolves
   # the same source bytes even after their default branches advance.
-  FRANKENSEARCH_COMMIT: 3bbfd8c664062f8304e7a790c51794671f9214dc
+  FRANKENSEARCH_COMMIT: e2d24118b06e4a1a4bbff16968f70767f35d5bb3
   FAST_CMAES_COMMIT: 3bf11b7601b54a08ffabb55821289ecb235a504d
   BEADS_RUST_COMMIT: ba6ff75da25529c8cad8395352f5c5fc2162ee95
   CARGO_ZIGBUILD_VERSION: '0.23.3'

@@ -948,6 +948,19 @@ fn normalize_topic_filter(topic: Option<&str>) -> McpResult<Option<String>> {
     normalize_topic_value(topic, "topic").map(Some)
 }
 
+fn request_context_authorizes_anonymous_topic_read(ctx: &McpContext) -> bool {
+    ctx.auth().is_some()
+}
+
+fn render_topic_response(
+    json_result: &str,
+    format: Option<&str>,
+    config: &Config,
+) -> McpResult<String> {
+    mcp_agent_mail_core::apply_tool_format(json_result, format, config)
+        .map_err(|error| McpError::new(McpErrorCode::InvalidParams, error))
+}
+
 const fn has_any_recipients(to: &[String], cc: &[String], bcc: &[String]) -> bool {
     !(to.is_empty() && cc.is_empty() && bcc.is_empty())
 }
@@ -3467,7 +3480,7 @@ effective_free_bytes={free}"
             fingerprint,
         };
         match db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients_idempotent_topic(
+            mcp_agent_mail_db::queries::create_reply_with_recipients_with_topic_idempotent(
                 ctx.cx(),
                 &pool,
                 project_id,
@@ -3475,10 +3488,11 @@ effective_free_bytes={free}"
                 &subject,
                 &final_body,
                 Some(&thread_id),
-                original.topic.as_deref(),
                 &importance_val,
                 ack_required.unwrap_or(original.ack_required != 0),
                 &attachments_json,
+                original.topic.as_deref(),
+                message_id,
                 &recipient_refs,
                 claim,
             )
@@ -3492,7 +3506,7 @@ effective_free_bytes={free}"
         }
     } else {
         let row = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients_topic(
+            mcp_agent_mail_db::queries::create_reply_with_recipients_with_topic(
                 ctx.cx(),
                 &pool,
                 project_id,
@@ -3500,10 +3514,11 @@ effective_free_bytes={free}"
                 &subject,
                 &final_body,
                 Some(&thread_id),
-                original.topic.as_deref(),
                 &importance_val,
                 ack_required.unwrap_or(original.ack_required != 0),
                 &attachments_json,
+                original.topic.as_deref(),
+                message_id,
                 &recipient_refs,
             )
             .await,
@@ -3708,7 +3723,7 @@ effective_free_bytes={free}"
 /// Fetch every message carrying a project-scoped topic tag.
 #[allow(clippy::too_many_arguments)]
 #[tool(
-    description = "Fetch all messages in a project with a given topic tag, regardless of recipient.\n\nParameters\n----------\nproject_key : str\n    Project identifier.\ntopic_name : str\n    The topic tag to filter by (case-insensitive).\nlimit : int\n    Max number of messages to return (default 50).\ninclude_bodies : bool\n    Include full Markdown bodies in the payloads (default true).\nsince_ts : Optional[str]\n    ISO-8601 timestamp; only messages newer than this are returned.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, importance, topic, [body_md] }\n\nRequires an authenticated identity via agent_name plus registration_token or a bound pane identity. unread_only additionally restricts results to unread recipient rows and never marks them read."
+    description = "Fetch all messages in a project with a given topic tag, regardless of recipient.\n\nParameters\n----------\nproject_key : str\n    Project identifier.\ntopic_name : str\n    The topic tag to filter by (case-insensitive).\nlimit : int\n    Max number of messages to return (default 50).\ninclude_bodies : bool\n    Include full Markdown bodies in the payloads (default true).\nsince_ts : Optional[str]\n    ISO-8601 timestamp; only messages newer than this are returned.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, importance, topic, [body_md] }\n\nOmitting agent_name is allowed only when the current request carries verified outer transport authentication. Otherwise agent_name authenticates with registration_token; unread_only=true always requires an authenticated agent_name or bound pane identity and never marks messages read."
 )]
 pub async fn fetch_topic(
     ctx: &McpContext,
@@ -3723,7 +3738,6 @@ pub async fn fetch_topic(
     pane_id: Option<String>,
     format: Option<String>,
 ) -> McpResult<String> {
-    let _ = format;
     let topic_name = topic_name.trim();
     if topic_name.is_empty() {
         return Err(legacy_tool_error(
@@ -3733,6 +3747,7 @@ pub async fn fetch_topic(
             json!({ "argument": "topic_name" }),
         ));
     }
+    let topic_name = normalize_topic_value(topic_name, "topic_name")?;
     let msg_limit = limit.unwrap_or(50).clamp(1, 1000);
     let msg_limit = usize::try_from(msg_limit).map_err(|_| {
         legacy_tool_error(
@@ -3761,52 +3776,81 @@ pub async fn fetch_topic(
 
     let pool = get_coalescer_bypass_read_db_pool()?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
-    let viewer_name = agent_name
+    // Python leaves the base project-topic read anonymous when `agent_name` is
+    // omitted. Rust preserves that call shape only when FastMCP has committed
+    // verified auth to this request context; otherwise callers authenticate an agent.
+    // A supplied identity must never silently downgrade to anonymous, while
+    // unread filtering always authenticates because it exposes recipient state.
+    let explicit_viewer_name = agent_name
         .as_deref()
-        .filter(|name| !name.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            mcp_agent_mail_core::pane_identity::resolve_identity_with_optional_pane(
-                &project.human_key,
-                pane_id.as_deref(),
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    let viewer_id = if unread || explicit_viewer_name.is_some() {
+        let viewer_name = explicit_viewer_name
+            .or_else(|| {
+                mcp_agent_mail_core::pane_identity::resolve_identity_with_optional_pane(
+                    &project.human_key,
+                    pane_id.as_deref(),
+                )
+            })
+            .ok_or_else(|| {
+                legacy_tool_error(
+                    "AUTHENTICATION_REQUIRED",
+                    "fetch_topic with unread_only=true requires agent_name plus registration_token, or a bound pane identity.",
+                    true,
+                    json!({ "token_param": "registration_token" }),
+                )
+            })?;
+        let viewer = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::get_agent(
+                ctx.cx(),
+                &pool,
+                project.id.unwrap_or(0),
+                &viewer_name,
             )
-        })
-        .ok_or_else(|| {
-            legacy_tool_error(
+            .await,
+        )?;
+        crate::identity::authenticate_lifecycle_agent(
+            &project,
+            &viewer,
+            registration_token.as_deref(),
+            pane_id.as_deref(),
+            "fetch_topic",
+        )?;
+        let viewer_id = viewer
+            .id
+            .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+        let write_pool = get_db_pool()?;
+        db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::touch_agent(ctx.cx(), &write_pool, viewer_id).await,
+        )?;
+        db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::flush_deferred_touches(ctx.cx(), &write_pool).await,
+        )?;
+        Some(viewer_id)
+    } else {
+        if !request_context_authorizes_anonymous_topic_read(ctx) {
+            return Err(legacy_tool_error(
                 "AUTHENTICATION_REQUIRED",
-                "fetch_topic requires agent_name plus registration_token, or a bound pane identity.",
+                "fetch_topic requires agent_name plus registration_token unless this request carries verified transport authentication.",
                 true,
-                json!({ "token_param": "registration_token" }),
-            )
-        })?;
-    let viewer = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::get_agent(
-            ctx.cx(),
-            &pool,
-            project.id.unwrap_or(0),
-            &viewer_name,
-        )
-        .await,
-    )?;
-    crate::identity::authenticate_lifecycle_agent(
-        &project,
-        &viewer,
-        registration_token.as_deref(),
-        pane_id.as_deref(),
-        "fetch_topic",
-    )?;
-    let viewer_id = viewer
-        .id
-        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+                json!({
+                    "token_param": "registration_token",
+                    "outer_auth": "Use an authenticated transport request to omit agent_name",
+                }),
+            ));
+        }
+        None
+    };
 
     let rows = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::list_topic_messages(
             ctx.cx(),
             &pool,
             project.id.unwrap_or(0),
-            topic_name,
+            &topic_name,
             since_micros,
-            Some(viewer_id),
+            viewer_id,
             unread,
             msg_limit,
         )
@@ -3827,7 +3871,7 @@ pub async fn fetch_topic(
                 "ack_required": row.ack_required != 0,
                 "created_ts": micros_to_iso(row.created_ts),
                 "attachments": parse_attachment_metadata_json(&row.attachments),
-                "from": row.from.clone(),
+                "from": row.from,
             });
             if row.sender_project_id.is_some_and(|id| id != row.project_id) {
                 if let Some(human_key) = row.sender_project_human_key {
@@ -3845,8 +3889,9 @@ pub async fn fetch_topic(
             payload
         })
         .collect();
-    serde_json::to_string(&messages)
-        .map_err(|error| McpError::internal_error(format!("JSON serialization error: {error}")))
+    let response = serde_json::to_string(&messages)
+        .map_err(|error| McpError::internal_error(format!("JSON serialization error: {error}")))?;
+    render_topic_response(&response, format.as_deref(), &Config::get())
 }
 
 /// Retrieve recent messages for an agent and mark returned rows read.
@@ -4130,10 +4175,13 @@ pub async fn fetch_inbox(
 /// This is intentionally project-scoped under the supported Rust contract: it
 /// is the topic-search counterpart to recipient-scoped
 /// `fetch_inbox(topic=...)`.
+// Compile-elide the superseded pre-parity signature. The registered
+// Python-compatible contract is `fetch_topic` above.
+#[cfg(any())]
 #[tool(
     description = "Fetch all messages in a project with a given topic tag, regardless of recipient.\n\nParameters\n----------\nproject_key : str\n    Project identifier.\ntopic_name : str\n    The topic tag to filter by (case-insensitive).\nlimit : int\n    Max number of messages to return (default 50).\ninclude_bodies : bool\n    Include full Markdown bodies in the payloads (default true).\nsince_ts : Optional[str]\n    ISO-8601 timestamp; only messages newer than this are returned.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, importance, topic, [body_md] }"
 )]
-pub async fn fetch_topic(
+pub async fn fetch_topic_unscoped(
     ctx: &McpContext,
     project_key: String,
     topic_name: String,
@@ -6048,6 +6096,53 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_topic_reads_require_request_scoped_transport_authentication() {
+        let anonymous = McpContext::new(asupersync::Cx::for_testing(), 1);
+        assert!(!request_context_authorizes_anonymous_topic_read(&anonymous));
+
+        let authenticated = McpContext::new(asupersync::Cx::for_testing(), 2);
+        assert!(authenticated.set_auth(fastmcp::AuthContext::with_subject("outer-auth")));
+        assert!(request_context_authorizes_anonymous_topic_read(
+            &authenticated
+        ));
+    }
+
+    #[test]
+    fn fetch_topic_format_json_is_passthrough() {
+        let config = Config::default();
+        let json = r#"[{"id":1,"topic":"br-123"}]"#;
+        assert_eq!(
+            render_topic_response(json, Some("json"), &config).unwrap(),
+            json
+        );
+    }
+
+    #[test]
+    fn fetch_topic_format_rejects_invalid_value() {
+        let config = Config::default();
+        let error = render_topic_response("[]", Some("xml"), &config)
+            .expect_err("unsupported format must fail");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert!(error.message.contains("Expected 'json' or 'toon'"));
+    }
+
+    #[test]
+    fn fetch_topic_format_toon_falls_back_to_json_envelope() {
+        let config = Config {
+            toon_bin: Some("/definitely/missing/toon-encoder".to_string()),
+            ..Config::default()
+        };
+        let rendered = render_topic_response("[]", Some("toon"), &config)
+            .expect("TOON encoder failure should return fallback envelope");
+        let envelope: serde_json::Value =
+            serde_json::from_str(&rendered).expect("fallback envelope JSON");
+        assert_eq!(envelope["format"], "json");
+        assert_eq!(envelope["data"], serde_json::json!([]));
+        assert_eq!(envelope["meta"]["requested"], "toon");
+        assert!(envelope["meta"]["toon_error"].is_string());
+    }
+
+    #[test]
     fn normalize_topic_argument_rejects_unsafe_or_oversized_values() {
         for invalid in [
             ".",
@@ -6626,6 +6721,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: Some("thread-1".into()),
+            reply_to: Some(41),
             topic: Some("br-abc.1".into()),
             subject: "test".into(),
             importance: "normal".into(),
@@ -6817,6 +6913,7 @@ mod tests {
             project_id: 1,
             sender_id: 2,
             thread_id: Some("t-1".into()),
+            reply_to: None,
             topic: Some("br-abc.1".into()),
             subject: "Hello".into(),
             body_md: "# Content".into(),

@@ -2480,7 +2480,10 @@
           "normalize": {
             "ignore_json_pointers": [
               "/canonical_path",
-              "/git_common_dir"
+              "/git_common_dir",
+              "/human_key",
+              "/project_uid",
+              "/slug"
             ]
           }
         }

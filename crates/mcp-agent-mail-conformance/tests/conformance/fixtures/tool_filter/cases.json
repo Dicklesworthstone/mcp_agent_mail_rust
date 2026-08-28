@@ -19,6 +19,7 @@
         "fetch_inbox",
         "fetch_inbox_events",
         "fetch_inbox_product",
+        "fetch_summary",
         "fetch_topic",
         "file_reservation_paths",
         "force_release_file_reservation",
@@ -104,6 +105,7 @@
         "resolve_pane_identity",
         "retire_agent",
         "send_message",
+        "sweep_stale_agents",
         "unretire_agent",
         "whois"
       ]
@@ -138,6 +140,7 @@
         "search_messages",
         "send_message",
         "set_contact_policy",
+        "sweep_stale_agents",
         "unretire_agent",
         "whois"
       ]
@@ -181,6 +184,7 @@
         "fetch_inbox",
         "fetch_inbox_events",
         "fetch_inbox_product",
+        "fetch_summary",
         "fetch_topic",
         "get_message_delivery_receipt",
         "health_check",

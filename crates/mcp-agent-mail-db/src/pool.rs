@@ -10629,8 +10629,20 @@ fn preflight_bound_live_franken_family(stable_path: &Path, context: &str) -> Res
         )));
     }
 
+    // Recovery admission persists a provisional nonclean breaker before the
+    // operation starts.  A same-path salvage read is part of that admitted
+    // operation, so refusing its own marker would make every reconstruction
+    // self-block.  Pre-existing nonclean authority is still rejected before
+    // the depth guard can be entered.
+    let same_path_recovery_admitted =
+        RecoveryAdmissionDepthGuard::active_path().is_some_and(|active_path| {
+            active_path == normalize_sqlite_identity_path_lossless(stable_path)
+        });
     match crate::recovery_breaker::load(stable_path) {
-        Ok(Some(state)) if state.tripped || state.consecutive_failures > 0 => {
+        Ok(Some(state))
+            if (state.tripped || state.consecutive_failures > 0)
+                && !same_path_recovery_admitted =>
+        {
             return Err(SqlError::Custom(format!(
                 "{context}: refusing live read-only FrankenSQLite open for {} because durable recovery authority is nonclean and cannot be fingerprinted without opening the live main inode",
                 stable_path.display()
@@ -21600,7 +21612,7 @@ mod tests {
         let resolved = resolve_sqlite_path_with_absolute_fallback(&missing_relative);
         assert_eq!(resolved, missing_relative);
 
-        let database_url = format!("sqlite:///{missing_relative}");
+        let database_url = format!("sqlite:///./{missing_relative}");
         let mailbox_path =
             resolve_mailbox_sqlite_path(&database_url).expect("resolve shared mailbox authority");
         let pool = DbPool::new(&DbPoolConfig {

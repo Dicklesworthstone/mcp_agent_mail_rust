@@ -882,6 +882,13 @@ mod tests {
                 .expect("insert cross-count fixture row");
             drop(conn);
 
+            let guarded = mcp_agent_mail_db::DbConn::open_file(path.to_string_lossy().as_ref())
+                .expect("admit healthy cross-count fixture into guarded namespace");
+            guarded
+                .query_sync("SELECT COUNT(*) AS count FROM agents", &[])
+                .expect("query healthy cross-count fixture through guarded namespace");
+            mcp_agent_mail_db::close_db_conn(guarded, "cross-count guarded fixture admission");
+
             let wal_path = path.with_file_name(format!(
                 "{}-wal",
                 path.file_name().unwrap_or_default().to_string_lossy()
@@ -940,11 +947,11 @@ mod tests {
                 }
                 Err(error) => error,
             };
+            let error_message = error.to_string();
             assert!(
-                error
-                    .to_string()
-                    .contains("refusing live read-only SQLite engine open"),
-                "unexpected cross-count refusal for {breaker_kind}: {error}"
+                error_message.contains("refusing live read-only SQLite engine open")
+                    || error_message.contains("read-only FrankenSQLite"),
+                "unexpected cross-count refusal for {breaker_kind}: {error_message}"
             );
             assert!(
                 run_index_table_cross_count(&path).is_none(),

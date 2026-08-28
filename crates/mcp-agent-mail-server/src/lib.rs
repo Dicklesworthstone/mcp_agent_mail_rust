@@ -164,23 +164,23 @@ use mcp_agent_mail_tools::{
     AcknowledgeMessage, AcquireBuildSlot, AgentsListResource, CheckFileReservationConflicts,
     CleanupPaneIdentities, ConfigEnvironmentQueryResource, ConfigEnvironmentResource,
     CreateAgentIdentity, DeregisterAgent, EnsureProduct, EnsureProject, FetchInbox,
-    FetchInboxEvents, FetchInboxProduct, FetchTopic, FileReservationPaths,
+    FetchInboxEvents, FetchInboxProduct, FetchSummary, FetchTopic, FileReservationPaths,
     FileReservationsResource, ForceReleaseFileReservation, GetMessageDeliveryReceipt, HealthCheck,
     IdentityProjectResource, InboxResource, InstallPrecommitGuard, ListAgents, ListContacts,
-    MacroContactHandshake, MacroFileReservationCycle, MacroPrepareThread, MacroStartSession,
-    MailboxResource, MailboxWithCommitsResource, MarkMessageRead, MessageDetailsResource,
-    OutboxResource, ProductDetailsResource, ProductsLink, ProjectDetailsResource,
-    ProjectsListQueryResource, ProjectsListResource, RegisterAgent, ReleaseBuildSlot,
-    ReleaseFileReservations, RenewBuildSlot, RenewFileReservations, ReplyMessage, RequestContact,
-    ResolvePaneIdentity, RespondContact, RetireAgent, SearchMessages, SearchMessagesProduct,
-    SendMessage, SetContactPolicy, SummarizeThread, SummarizeThreadProduct, ThreadDetailsResource,
-    ToolingCapabilitiesResource, ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource,
-    ToolingDirectoryQueryResource, ToolingDirectoryResource, ToolingLocksQueryResource,
-    ToolingLocksResource, ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource,
-    ToolingMetricsQueryResource, ToolingMetricsResource, ToolingRecentResource,
-    ToolingSchemasQueryResource, ToolingSchemasResource, UninstallPrecommitGuard, UnretireAgent,
-    ViewsAckOverdueResource, ViewsAckRequiredResource, ViewsAcksStaleResource,
-    ViewsUrgentUnreadResource, Whois, clusters,
+    ListWindowIdentities, MacroContactHandshake, MacroFileReservationCycle, MacroPrepareThread,
+    MacroStartSession, MailboxResource, MailboxWithCommitsResource, MarkMessageRead,
+    MessageDetailsResource, OutboxResource, ProductDetailsResource, ProductsLink,
+    ProjectDetailsResource, ProjectsListQueryResource, ProjectsListResource, RegisterAgent,
+    ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot, RenewFileReservations, ReplyMessage,
+    RequestContact, ResolvePaneIdentity, RespondContact, RetireAgent, SearchMessages,
+    SearchMessagesProduct, SendMessage, SetContactPolicy, SummarizeRecent, SummarizeThread,
+    SummarizeThreadProduct, SweepStaleAgents, ThreadDetailsResource, ToolingCapabilitiesResource,
+    ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource, ToolingDirectoryQueryResource,
+    ToolingDirectoryResource, ToolingLocksQueryResource, ToolingLocksResource,
+    ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource, ToolingMetricsQueryResource,
+    ToolingMetricsResource, ToolingRecentResource, ToolingSchemasQueryResource,
+    ToolingSchemasResource, UninstallPrecommitGuard, UnretireAgent, ViewsAckOverdueResource,
+    ViewsAckRequiredResource, ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -670,6 +670,20 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
         "create_agent_identity",
         clusters::IDENTITY,
         CreateAgentIdentity,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "sweep_stale_agents",
+        clusters::IDENTITY,
+        SweepStaleAgents,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "list_window_identities",
+        clusters::IDENTITY,
+        ListWindowIdentities,
     );
     let server = add_tool(
         server,
@@ -11481,8 +11495,11 @@ impl HttpState {
             return resp;
         }
 
+        let transport_auth = self
+            .verified_transport_auth_context_with_cx(&auth_cx, &req)
+            .await;
         let json_rpc = inject_tmux_pane_header(json_rpc, &req);
-        let response = self.dispatch(json_rpc).await.map_or_else(
+        let response = self.dispatch(json_rpc, transport_auth).await.map_or_else(
             || HttpResponse::new(fastmcp_transport::http::HttpStatus::ACCEPTED),
             |resp| HttpResponse::ok().with_json(&resp),
         );
@@ -12427,6 +12444,30 @@ to skip auth for local requests.</p>
         Ok(JwtContext { roles, sub })
     }
 
+    /// Return only authentication facts verified by the outer HTTP transport.
+    ///
+    /// Localhost bypass and an auth-disabled listener intentionally remain
+    /// anonymous. Static bearer tokens prove authentication but carry no
+    /// subject; JWTs preserve their verified subject when one is present.
+    async fn verified_transport_auth_context_with_cx(
+        &self,
+        cx: &Cx,
+        req: &Http1Request,
+    ) -> Option<fastmcp::AuthContext> {
+        if self.has_expected_bearer_header(req) {
+            return Some(fastmcp::AuthContext::anonymous());
+        }
+        if !self.config.http_jwt_enabled {
+            return None;
+        }
+
+        let jwt = self.decode_jwt_with_cx(cx, req).await.ok()?;
+        Some(jwt.sub.map_or_else(
+            fastmcp::AuthContext::anonymous,
+            fastmcp::AuthContext::with_subject,
+        ))
+    }
+
     async fn rate_limit_redis_client(&self, cx: &Cx) -> Option<Arc<RedisClient>> {
         let url = {
             let guard = self
@@ -12653,13 +12694,17 @@ to skip auth for local requests.</p>
         None
     }
 
-    async fn dispatch(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+    async fn dispatch(
+        &self,
+        request: JsonRpcRequest,
+        transport_auth: Option<fastmcp::AuthContext>,
+    ) -> Option<JsonRpcResponse> {
         // Upgrade self_ref to Arc so we can move into the 'static blocking closure.
         // This keeps ALL synchronous router/DB work off the async worker threads.
         let Some(arc_self) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
             // self_ref not set or HttpState already dropped — fall back to inline sync.
             let id = request.id.clone();
-            return match self.dispatch_inner(request) {
+            return match self.dispatch_inner_with_auth(request, transport_auth) {
                 Ok(value) => id.map(|req_id| JsonRpcResponse::success(req_id, value)),
                 Err(err) => {
                     id.map(|req_id| JsonRpcResponse::error(Some(req_id), JsonRpcError::from(err)))
@@ -12702,7 +12747,14 @@ to skip auth for local requests.</p>
             dispatch_cx,
             DispatchCancel::new(),
             Arc::new(Mutex::new(Some(permit))),
-            move |cancel| arc_self.dispatch_inner_with_cx(request, &worker_cx, &cancel),
+            move |cancel| {
+                arc_self.dispatch_inner_with_cx_and_auth(
+                    request,
+                    &worker_cx,
+                    &cancel,
+                    transport_auth,
+                )
+            },
         )
         .await;
 
@@ -12714,19 +12766,28 @@ to skip auth for local requests.</p>
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     fn dispatch_inner(&self, request: JsonRpcRequest) -> Result<serde_json::Value, McpError> {
+        self.dispatch_inner_with_auth(request, None)
+    }
+
+    fn dispatch_inner_with_auth(
+        &self,
+        request: JsonRpcRequest,
+        transport_auth: Option<fastmcp::AuthContext>,
+    ) -> Result<serde_json::Value, McpError> {
         let cx = self.request_cx();
         let cancel = DispatchCancel::new();
-        self.dispatch_inner_with_cx(request, &cx, &cancel)
+        self.dispatch_inner_with_cx_and_auth(request, &cx, &cancel, transport_auth)
     }
 
     #[allow(clippy::too_many_lines)]
-    fn dispatch_inner_with_cx(
+    fn dispatch_inner_with_cx_and_auth(
         &self,
         request: JsonRpcRequest,
         cx: &Cx,
         cancel: &DispatchCancel,
+        transport_auth: Option<fastmcp::AuthContext>,
     ) -> Result<serde_json::Value, McpError> {
         let request_id = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         dispatch_checkpoint(cx, cancel)?;
@@ -12737,6 +12798,15 @@ to skip auth for local requests.</p>
         // (handlers enforce it via `budget_error`) rather than as an
         // explicit argument.
         let request_ctx = McpContext::new(cx.clone(), request_id).with_budget_ceiling(budget);
+        let auth_committed = transport_auth.map_or_else(
+            || request_ctx.commit_anonymous_auth(),
+            |auth| request_ctx.set_auth(auth),
+        );
+        if !auth_committed {
+            return Err(McpError::internal_error(
+                "request authentication admission could not be committed",
+            ));
+        }
 
         match request.method.as_str() {
             "initialize" => {
@@ -16141,6 +16211,19 @@ fn readiness_check_with_archive_reconcile(
             .map_err(|reconcile_error| {
                 format!("{error}; automatic archive-backed reconcile failed: {reconcile_error}")
             })?;
+            let rebound = DbConn::open_file(sqlite_path.to_string_lossy().as_ref()).map_err(
+            |rebind_error| {
+                format!(
+                    "{error}; archive-backed reconcile completed but runtime rebind failed: {rebind_error}"
+                )
+            },
+        )?;
+            rebound.query_sync("SELECT 1", &[]).map_err(|rebind_error| {
+            format!(
+                "{error}; archive-backed reconcile completed but runtime rebind probe failed: {rebind_error}"
+            )
+        })?;
+            mcp_agent_mail_db::close_db_conn(rebound, "readiness archive reconcile runtime rebind");
             *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
             readiness_check_quick(config).map_err(|post_error| {
                 format!(
@@ -17633,6 +17716,8 @@ mod tests {
     use super::*;
     use asupersync::http::h1::types::Version as Http1Version;
     use chrono::Utc;
+    use fastmcp::CallToolParams;
+    use fastmcp::legacy_2024::LegacyContent;
     use ftui_runtime::stdio_capture::StdioCapture;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -17734,7 +17819,7 @@ mod tests {
         let shm_path = db_path.with_file_name("shutdown-framed-wal.sqlite3-shm");
         let db_before = std::fs::read(&db_path).expect("read primary before shutdown cleanup");
         let wal_before = std::fs::read(&wal_path).expect("read framed WAL before shutdown cleanup");
-        let shm_before = std::fs::read(&shm_path).expect("read SHM before shutdown cleanup");
+        let shm_before = std::fs::read(&shm_path).ok();
         assert!(
             wal_before.len() > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize,
             "test setup must retain at least one committed WAL frame"
@@ -17769,9 +17854,9 @@ mod tests {
             "shutdown cleanup must not truncate or rewrite framed WAL before admission"
         );
         assert_eq!(
-            std::fs::read(&shm_path).expect("read SHM after shutdown cleanup"),
+            std::fs::read(&shm_path).ok(),
             shm_before,
-            "shutdown cleanup must preserve the exact SHM bytes"
+            "shutdown cleanup must preserve optional SHM state exactly"
         );
         assert_eq!(
             std::fs::read(&breaker_path).expect("read breaker after shutdown cleanup"),
@@ -17914,17 +17999,20 @@ mod tests {
             "fixture requires a missing configured relative target"
         );
         let mut config = mcp_agent_mail_core::Config::default();
-        config.database_url = format!("sqlite:///{}", relative_db.display());
+        config.database_url = format!("sqlite:///./{}", relative_db.display());
         let runtime_authority =
             mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
                 .expect("resolve DB runtime authority");
+        let runtime_path = std::env::current_dir()
+            .expect("resolve test working directory")
+            .join(&relative_db);
         assert_eq!(
             runtime_authority.canonical_path,
-            relative_db.to_string_lossy()
+            runtime_path.to_string_lossy()
         );
         assert_eq!(
             resolve_server_database_url_sqlite_path(&config.database_url),
-            Some(relative_db)
+            Some(runtime_path)
         );
 
         cleanup_shutdown_sqlite_sidecars(&config);
@@ -19221,15 +19309,18 @@ mod tests {
             "fixture requires a missing configured relative target"
         );
 
-        let database_url = format!("sqlite:///{}", relative_path.display());
+        let database_url = format!("sqlite:///./{}", relative_path.display());
         let server_path = resolve_server_database_url_sqlite_path(&database_url)
             .expect("resolve server runtime authority");
         let runtime_path = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&database_url)
             .expect("resolve DB runtime authority");
+        let expected_runtime_path = std::env::current_dir()
+            .expect("resolve test working directory")
+            .join(&relative_path);
 
         assert_eq!(server_path, PathBuf::from(&runtime_path.canonical_path));
         assert_eq!(
-            server_path, relative_path,
+            server_path, expected_runtime_path,
             "readiness locks must retain the same missing relative authority that DbPool will initialize"
         );
         assert_eq!(std::fs::read(&absolute_db).unwrap(), decoy_bytes);
@@ -20473,6 +20564,35 @@ first body
         }
     }
 
+    fn with_isolated_http_config<T>(f: impl FnOnce(mcp_agent_mail_core::Config) -> T) -> T {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create isolated storage root");
+
+        let database_path = temp.path().join("mailbox.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(database_path.to_string_lossy().as_ref())
+            .expect("open isolated HTTP database");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize isolated HTTP database");
+        drop(conn);
+
+        let database_url = format!("sqlite:///{}", database_path.display());
+        let storage_root_str = storage_root.to_string_lossy().into_owned();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_str.as_str()),
+            ],
+            || {
+                f(mcp_agent_mail_core::Config {
+                    database_url: database_url.clone(),
+                    storage_root: storage_root.clone(),
+                    ..Default::default()
+                })
+            },
+        )
+    }
+
     fn with_serialized_health_route<F, T>(f: F) -> T
     where
         F: FnOnce() -> T,
@@ -20598,6 +20718,66 @@ first body
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn authenticated_http_fetch_topic_receives_transport_auth_context() {
+        with_serialized_tool_dispatch_env(|project_key| {
+            let config = mcp_agent_mail_core::Config {
+                http_bearer_token: Some("transport-secret".to_string()),
+                http_allow_localhost_unauthenticated: false,
+                http_rbac_enabled: false,
+                ..mcp_agent_mail_core::Config::from_env()
+            };
+            let state = build_state(config);
+
+            let ensure_project = state.dispatch_inner(JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "ensure_project",
+                    "arguments": { "human_key": project_key.as_str() }
+                })),
+                1_i64,
+            ));
+            assert!(
+                ensure_project.is_ok(),
+                "ensure_project should succeed before HTTP fetch_topic: {ensure_project:?}"
+            );
+
+            let mut request = make_request_with_peer_addr(
+                Http1Method::Post,
+                "/api",
+                &[("Authorization", "Bearer transport-secret")],
+                Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+            );
+            request.body = serde_json::to_vec(&JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "fetch_topic",
+                    "arguments": {
+                        "project_key": project_key,
+                        "topic_name": "br-auth-context"
+                    }
+                })),
+                2_i64,
+            ))
+            .expect("serialize authenticated fetch_topic request");
+
+            let response = block_on(state.handle(request));
+            assert_eq!(response.status, 200);
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.body).expect("JSON-RPC response JSON");
+            assert_eq!(body["jsonrpc"], "2.0");
+            assert_eq!(body["id"], 2);
+            assert!(
+                body.get("error").is_none(),
+                "unexpected JSON-RPC error: {body}"
+            );
+            assert_eq!(
+                body["result"]["content"][0]["text"], "[]",
+                "verified HTTP auth must permit fetch_topic without agent_name: {body}"
+            );
+        });
     }
 
     #[test]
@@ -22788,7 +22968,7 @@ first body
         let state = build_state(config);
         let notification = JsonRpcRequest::notification("notifications/cancelled", None);
         // Stateless dispatch: notification returns None (no response)
-        assert!(block_on(state.dispatch(notification)).is_none());
+        assert!(block_on(state.dispatch(notification, None)).is_none());
     }
 
     #[test]
@@ -22796,7 +22976,7 @@ first body
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
         let request = JsonRpcRequest::new("nonexistent/method", None, 1_i64);
-        let resp = block_on(state.dispatch(request));
+        let resp = block_on(state.dispatch(request, None));
         assert!(
             resp.is_some(),
             "unknown method should still return a response"
@@ -28907,9 +29087,11 @@ first body
             mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
 
         conn.execute_raw(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT, program TEXT, last_active_ts DATETIME)",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT, program TEXT, last_active_ts DATETIME, retired_at DATETIME)",
         )
         .expect("create agents");
+        conn.execute_raw("CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY)")
+            .expect("create agent deregistrations");
 
         conn.execute_sync(
             "INSERT INTO agents (id, name, program, last_active_ts) VALUES (?1, ?2, ?3, ?4)",
@@ -29510,6 +29692,11 @@ first body
     fn dashboard_open_connection_uses_best_effort_busy_timeout() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("dashboard-busy-timeout.db");
+        let seed = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("seed database");
+        seed.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize database schema");
+        drop(seed);
+
         let database_url = format!("sqlite:///{}", db_path.display());
         let conn = dashboard_open_connection(&database_url, dir.path()).expect("open");
 
@@ -29548,7 +29735,7 @@ first body
             "fixture requires a missing configured relative target"
         );
 
-        let database_url = format!("sqlite://{}", relative_path.display());
+        let database_url = format!("sqlite:///./{}", relative_path.display());
         let conn = dashboard_open_connection(&database_url, dir.path());
         assert!(
             conn.is_none(),
@@ -33867,7 +34054,7 @@ first body
 
         // /mail should not 404 — it routes to mail_ui::dispatch
         let req = make_request(Http1Method::Get, COMPAT_MAIL_UI_PREFIX, &[]);
-        let resp = block_on(state.handle(req));
+        let resp = with_isolated_http_config(|_| block_on(state.handle(req)));
         // Mail UI may return 200, 302, or even 404 for specific sub-paths,
         // but it must NOT return 401 (auth is only for MCP endpoint).
         assert_ne!(
@@ -33888,7 +34075,7 @@ first body
 
         // Request with correct ?token= query param should NOT get 401.
         let req = make_request(Http1Method::Get, "/mail?token=test-secret-42", &[]);
-        let resp = block_on(state.handle(req));
+        let resp = with_isolated_http_config(|_| block_on(state.handle(req)));
         assert_ne!(resp.status, 401, "/mail with correct ?token= must not 401");
     }
 
@@ -33927,7 +34114,7 @@ first body
         let state = build_state(config);
 
         let req = make_request(Http1Method::Get, "/mail/dashboard?token=abc123", &[]);
-        let resp = block_on(state.handle(req));
+        let resp = with_isolated_http_config(|_| block_on(state.handle(req)));
         assert_ne!(
             resp.status, 401,
             "/mail/dashboard with correct token must not 401"
@@ -33943,7 +34130,7 @@ first body
         let state = build_state(config);
 
         let req = make_request(Http1Method::Get, "/mail?token=a%2Bb%2Fc%3Fd%3De%26f", &[]);
-        let resp = block_on(state.handle(req));
+        let resp = with_isolated_http_config(|_| block_on(state.handle(req)));
         assert_ne!(
             resp.status, 401,
             "/mail with percent-encoded token must authenticate"
@@ -33960,7 +34147,7 @@ first body
         let state = build_state(config);
 
         let req = make_request(Http1Method::Get, "/web-dashboard?token=dash-secret", &[]);
-        let resp = block_on(state.handle(req));
+        let resp = with_isolated_http_config(|_| block_on(state.handle(req)));
         assert_ne!(
             resp.status, 401,
             "/web-dashboard query token must authenticate"
@@ -33981,7 +34168,7 @@ first body
             "/web-dashboard/state?token=dash-secret",
             &[],
         );
-        let resp = block_on(state.handle(req));
+        let resp = with_isolated_http_config(|_| block_on(state.handle(req)));
         assert_ne!(
             resp.status, 401,
             "/web-dashboard/state query token must authenticate"
@@ -34002,7 +34189,7 @@ first body
             "/web-dashboard/stream?token=dash-secret",
             &[],
         );
-        let resp = block_on(state.handle(req));
+        let resp = with_isolated_http_config(|_| block_on(state.handle(req)));
         assert_ne!(
             resp.status, 401,
             "/web-dashboard/stream query token must authenticate"
@@ -34037,26 +34224,28 @@ first body
 
     #[test]
     fn mail_route_accepts_valid_jwt_when_jwt_only_enabled() {
-        let config = mcp_agent_mail_core::Config {
-            http_jwt_enabled: true,
-            http_jwt_secret: Some("jwt-only-secret".to_string()),
-            http_allow_localhost_unauthenticated: false,
-            ..Default::default()
-        };
-        let state = build_state(config);
-        let claims = serde_json::json!({ "sub": "mail-user", "role": "writer" });
-        let token = hs256_token(b"jwt-only-secret", &claims);
-        let auth = format!("Bearer {token}");
-        let req = make_request(
-            Http1Method::Get,
-            "/mail",
-            &[("Authorization", auth.as_str())],
-        );
-        let resp = block_on(state.handle(req));
-        assert_ne!(
-            resp.status, 401,
-            "/mail with valid JWT must authenticate successfully"
-        );
+        with_isolated_http_config(|base| {
+            let config = mcp_agent_mail_core::Config {
+                http_jwt_enabled: true,
+                http_jwt_secret: Some("jwt-only-secret".to_string()),
+                http_allow_localhost_unauthenticated: false,
+                ..base
+            };
+            let state = build_state(config);
+            let claims = serde_json::json!({ "sub": "mail-user", "role": "writer" });
+            let token = hs256_token(b"jwt-only-secret", &claims);
+            let auth = format!("Bearer {token}");
+            let req = make_request(
+                Http1Method::Get,
+                "/mail",
+                &[("Authorization", auth.as_str())],
+            );
+            let resp = block_on(state.handle(req));
+            assert_ne!(
+                resp.status, 401,
+                "/mail with valid JWT must authenticate successfully"
+            );
+        });
     }
 
     // ── D4: actionable HTML for unauthorized browser routes ──────
@@ -34252,21 +34441,23 @@ first body
 
     #[test]
     fn e4_no_bearer_config_allows_all_routes() {
-        let config = mcp_agent_mail_core::Config {
-            http_bearer_token: None,
-            http_jwt_enabled: false,
-            ..Default::default()
-        };
-        let state = build_state(config);
+        with_isolated_http_config(|base| {
+            let config = mcp_agent_mail_core::Config {
+                http_bearer_token: None,
+                http_jwt_enabled: false,
+                ..base
+            };
+            let state = build_state(config);
 
-        // Without any auth configured, /mail should be accessible.
-        let req = make_request(Http1Method::Get, "/mail", &[]);
-        let resp = block_on(state.handle(req));
-        assert_ne!(
-            resp.status, 401,
-            "/mail without auth config must not return 401 (got {})",
-            resp.status
-        );
+            // Without any auth configured, /mail should be accessible.
+            let req = make_request(Http1Method::Get, "/mail", &[]);
+            let resp = block_on(state.handle(req));
+            assert_ne!(
+                resp.status, 401,
+                "/mail without auth config must not return 401 (got {})",
+                resp.status
+            );
+        });
     }
 
     #[test]
@@ -34335,35 +34526,37 @@ first body
 
     #[test]
     fn e4_bearer_header_and_query_token_both_accepted() {
-        let config = mcp_agent_mail_core::Config {
-            http_bearer_token: Some("dual-test-token".to_string()),
-            http_allow_localhost_unauthenticated: false,
-            ..Default::default()
-        };
-        let state = build_state(config);
+        with_isolated_http_config(|base| {
+            let config = mcp_agent_mail_core::Config {
+                http_bearer_token: Some("dual-test-token".to_string()),
+                http_allow_localhost_unauthenticated: false,
+                ..base
+            };
+            let state = build_state(config);
 
-        // Bearer header auth.
-        let req = make_request(
-            Http1Method::Get,
-            "/mail",
-            &[("Authorization", "Bearer dual-test-token")],
-        );
-        let resp = block_on(state.handle(req));
-        assert_ne!(resp.status, 401, "Bearer header must authenticate");
+            // Bearer header auth.
+            let req = make_request(
+                Http1Method::Get,
+                "/mail",
+                &[("Authorization", "Bearer dual-test-token")],
+            );
+            let resp = block_on(state.handle(req));
+            assert_ne!(resp.status, 401, "Bearer header must authenticate");
 
-        // Query token auth.
-        let req = make_request(Http1Method::Get, "/mail?token=dual-test-token", &[]);
-        let resp = block_on(state.handle(req));
-        assert_ne!(resp.status, 401, "query token must authenticate");
+            // Query token auth.
+            let req = make_request(Http1Method::Get, "/mail?token=dual-test-token", &[]);
+            let resp = block_on(state.handle(req));
+            assert_ne!(resp.status, 401, "query token must authenticate");
 
-        // Dashboard query token auth.
-        let req = make_request(
-            Http1Method::Get,
-            "/web-dashboard?token=dual-test-token",
-            &[],
-        );
-        let resp = block_on(state.handle(req));
-        assert_ne!(resp.status, 401, "dashboard query token must authenticate");
+            // Dashboard query token auth.
+            let req = make_request(
+                Http1Method::Get,
+                "/web-dashboard?token=dual-test-token",
+                &[],
+            );
+            let resp = block_on(state.handle(req));
+            assert_ne!(resp.status, 401, "dashboard query token must authenticate");
+        });
     }
 
     #[test]

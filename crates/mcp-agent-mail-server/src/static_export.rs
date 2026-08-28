@@ -1407,16 +1407,16 @@ first body
 
     #[test]
     fn write_and_record_creates_file() {
-        let dir = PathBuf::from("/tmp/static_export_test_write");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let mut files = BTreeMap::new();
-        write_and_record(&dir, "test.txt", b"hello", "/test", &mut files).unwrap();
+        write_and_record(dir.path(), "test.txt", b"hello", "/test", &mut files).unwrap();
         assert!(files.contains_key("test.txt"));
         assert_eq!(files["test.txt"].size, 5);
         assert_eq!(files["test.txt"].route, "/test");
-        assert_eq!(fs::read_to_string(dir.join("test.txt")).unwrap(), "hello");
-        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("test.txt")).unwrap(),
+            "hello"
+        );
     }
 
     #[cfg(unix)]
@@ -1628,14 +1628,11 @@ first body
 
     #[test]
     fn hosting_files_are_emitted() {
-        let dir = PathBuf::from("/tmp/static_export_test_hosting");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let mut files = BTreeMap::new();
-        emit_hosting_files(&dir, &mut files).unwrap();
+        emit_hosting_files(dir.path(), &mut files).unwrap();
         assert!(files.contains_key(".nojekyll"));
         assert!(files.contains_key("_headers"));
         assert!(files.contains_key("index.html"));
-        let _ = fs::remove_dir_all(&dir);
     }
 }

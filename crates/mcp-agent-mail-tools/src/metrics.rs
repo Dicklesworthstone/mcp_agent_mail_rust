@@ -209,6 +209,20 @@ pub const TOOL_META_MAP: &[(&str, ToolMeta)] = &[
         },
     ),
     (
+        "list_window_identities",
+        ToolMeta {
+            capabilities: &["identity"],
+            complexity: "low",
+        },
+    ),
+    (
+        "sweep_stale_agents",
+        ToolMeta {
+            capabilities: &["identity", "file_reservations"],
+            complexity: "medium",
+        },
+    ),
+    (
         "retire_agent",
         ToolMeta {
             capabilities: &["identity", "write"],
@@ -397,6 +411,20 @@ pub const TOOL_META_MAP: &[(&str, ToolMeta)] = &[
         ToolMeta {
             capabilities: &["search", "summarization"],
             complexity: "medium",
+        },
+    ),
+    (
+        "summarize_recent",
+        ToolMeta {
+            capabilities: &["search", "summarization"],
+            complexity: "medium",
+        },
+    ),
+    (
+        "fetch_summary",
+        ToolMeta {
+            capabilities: &["read", "summarization"],
+            complexity: "low",
         },
     ),
     // Workflow macros

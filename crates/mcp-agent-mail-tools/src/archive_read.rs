@@ -646,7 +646,10 @@ fn live_probe(path: &Path) -> Result<mcp_agent_mail_db::DbConn, String> {
 }
 
 fn private_snapshot_probe(path: &Path) -> Result<mcp_agent_mail_db::DbConn, String> {
-    let conn = mcp_agent_mail_db::DbConn::open_file_read_only(path.to_string_lossy().into_owned())
+    // The reconstructed file is still private and unpublished here. Admit it
+    // once through FrankenSQLite's writable namespace path so the strict
+    // query-only pool can later bind to a complete pre-existing sidecar pair.
+    let conn = mcp_agent_mail_db::DbConn::open_file(path.to_string_lossy().into_owned())
         .map_err(|error| error.to_string())?;
     conn.execute_raw("PRAGMA query_only = ON;")
         .map_err(|error| error.to_string())?;

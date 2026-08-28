@@ -1345,6 +1345,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 2,
                 thread_id: Some("br-1".into()),
+                reply_to: None,
                 topic: Some("br-1".into()),
                 subject: "Hello".into(),
                 importance: "high".into(),

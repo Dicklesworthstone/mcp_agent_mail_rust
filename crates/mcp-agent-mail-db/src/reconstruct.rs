@@ -1470,7 +1470,12 @@ fn scan_archive_message_id(file_path: &Path) -> DbResult<Option<i64>> {
 /// fails. Individual archive files that fail to parse are skipped (counted
 /// in `parse_errors`).
 pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult<ReconstructStats> {
-    reconstruct_from_archive_impl(db_path, storage_root, false)
+    reconstruct_from_archive_impl(db_path, storage_root, false).map(|result| result.stats)
+}
+
+struct ArchiveRebuildResult {
+    stats: ReconstructStats,
+    message_id_map: HashMap<(i64, i64), i64>,
 }
 
 fn ensure_unoccupied_reconstruction_target_family(db_path: &Path) -> DbResult<()> {
@@ -1536,7 +1541,7 @@ fn reconstruct_from_archive_impl(
     db_path: &Path,
     storage_root: &Path,
     create_empty_target: bool,
-) -> DbResult<ReconstructStats> {
+) -> DbResult<ArchiveRebuildResult> {
     let mut stats = ReconstructStats::default();
     crate::pool::validate_sqlite_target_path(db_path, "reconstruct sqlite target")
         .map_err(|error| DbError::Sqlite(format!("reconstruct: {error}")))?;
@@ -1573,7 +1578,10 @@ fn reconstruct_from_archive_impl(
                 projects_dir.display()
             ));
             if !create_empty_target {
-                return Ok(stats);
+                return Ok(ArchiveRebuildResult {
+                    stats,
+                    message_id_map: HashMap::new(),
+                });
             }
         }
     } else {
@@ -1582,7 +1590,10 @@ fn reconstruct_from_archive_impl(
             storage_root.display()
         ));
         if !create_empty_target {
-            return Ok(stats);
+            return Ok(ArchiveRebuildResult {
+                stats,
+                message_id_map: HashMap::new(),
+            });
         }
     }
     project_dirs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1592,7 +1603,10 @@ fn reconstruct_from_archive_impl(
             projects_dir.display()
         ));
         if !create_empty_target {
-            return Ok(stats);
+            return Ok(ArchiveRebuildResult {
+                stats,
+                message_id_map: HashMap::new(),
+            });
         }
     }
 
@@ -1625,6 +1639,10 @@ fn reconstruct_from_archive_impl(
     conn.execute_raw("BEGIN IMMEDIATE;")
         .map_err(|e| DbError::Sqlite(format!("reconstruct: begin transaction: {e}")))?;
 
+    // Source archive ids are project-scoped. Keep this map after the archive
+    // transaction so the salvage merge can resolve parents absent from the
+    // salvage snapshot, including archive messages remapped after collisions.
+    let mut archived_message_id_map: HashMap<(i64, i64), i64> = HashMap::new();
     let rebuild_result = (|| -> DbResult<()> {
         // Lay down the latest base schema directly (base mode: no FTS5 virtual
         // tables, which FrankenConnection doesn't support). The base DDL already
@@ -1689,6 +1707,9 @@ fn reconstruct_from_archive_impl(
 
         // Maps for deduplication: ((project_id, name) → agent_id)
         let mut agent_ids: HashMap<(i64, String), i64> = HashMap::new();
+        // Reply edges are applied only after canonical and deferred collision
+        // messages have all settled.
+        let mut pending_archive_reply_edges: Vec<PendingReplyEdge> = Vec::new();
 
         // Canonical-id collision losers, GLOBAL across all projects: inserted
         // only after every project's canonical ids are settled (br-r6awv).
@@ -1761,6 +1782,8 @@ fn reconstruct_from_archive_impl(
                     pid,
                     slug,
                     &mut agent_ids,
+                    &mut archived_message_id_map,
+                    &mut pending_archive_reply_edges,
                     &mut stats,
                     &mut deferred_messages,
                 )?;
@@ -1779,6 +1802,8 @@ fn reconstruct_from_archive_impl(
                 item.project_id,
                 "",
                 &mut agent_ids,
+                &mut archived_message_id_map,
+                &mut pending_archive_reply_edges,
                 &mut stats,
                 None,
             ) {
@@ -1795,6 +1820,14 @@ fn reconstruct_from_archive_impl(
                 }
             }
         }
+
+        apply_pending_reply_edges(
+            &conn,
+            &archived_message_id_map,
+            &pending_archive_reply_edges,
+            "archive",
+            &mut stats,
+        )?;
 
         // ATC telemetry now lives in a dedicated sidecar DB (atc.sqlite3) that
         // is NOT part of the Git archive (br-bvq1x.11.7). Reconstruct rebuilds
@@ -1826,7 +1859,10 @@ fn reconstruct_from_archive_impl(
     stats.finalize_duplicate_warnings();
     stats.finalize_cross_project_canonical_collision_warnings();
     tracing::info!(%stats, "database reconstruction from archive complete");
-    Ok(stats)
+    Ok(ArchiveRebuildResult {
+        stats,
+        message_id_map: archived_message_id_map,
+    })
 }
 
 struct MaterializedLiveSalvage {
@@ -1841,11 +1877,11 @@ fn materialize_live_franken_salvage(path: &Path) -> DbResult<MaterializedLiveSal
                 "reconstruct live salvage: cannot allocate private snapshot directory: {error}"
             ))
         })?;
-    let snapshot_path = directory.path().join("salvage.sqlite3");
-    let snapshot_text = snapshot_path.to_str().ok_or_else(|| {
+    let franken_snapshot_path = directory.path().join("franken-salvage.sqlite3");
+    let snapshot_text = franken_snapshot_path.to_str().ok_or_else(|| {
         DbError::Sqlite(format!(
             "reconstruct live salvage: private snapshot path {} is not valid UTF-8",
-            snapshot_path.display()
+            franken_snapshot_path.display()
         ))
     })?;
     let conn = crate::pool::open_guarded_read_only_franken_existing_file(
@@ -1874,12 +1910,22 @@ fn materialize_live_franken_salvage(path: &Path) -> DbResult<MaterializedLiveSal
             DbError::Sqlite(format!(
                 "reconstruct live salvage: cannot materialize {} into private snapshot {}: {error}",
                 path.display(),
-                snapshot_path.display()
+                franken_snapshot_path.display()
             ))
         })?;
-    // The read-only source connection drops without a checkpoint. Keep the
-    // private directory alive across every subsequent canonical probe/merge.
+    // The read-only source connection drops without a checkpoint. VACUUM INTO
+    // admits its destination through FrankenSQLite and therefore leaves
+    // namespace sidecars beside it. Copy the completed export to a fresh
+    // private inode before canonical SQLite validates and merges it.
     drop(conn);
+    let snapshot_path = directory.path().join("canonical-salvage.sqlite3");
+    std::fs::copy(&franken_snapshot_path, &snapshot_path).map_err(|error| {
+        DbError::Sqlite(format!(
+            "reconstruct live salvage: cannot isolate private export {} as canonical snapshot {}: {error}",
+            franken_snapshot_path.display(),
+            snapshot_path.display()
+        ))
+    })?;
     Ok(MaterializedLiveSalvage {
         _directory: directory,
         path: snapshot_path,
@@ -1952,7 +1998,7 @@ pub fn reconstruct_from_archive_with_live_franken_salvage(
         Err(error) => {
             let message = error.to_string();
             if crate::pool::is_corruption_error_message(&message) {
-                let mut stats = reconstruct_from_archive_impl(db_path, storage_root, true)?;
+                let mut stats = reconstruct_from_archive_impl(db_path, storage_root, true)?.stats;
                 stats.push_warning(format!(
                     "live salvage source {} could not be materialized because it is corrupt ({message}); rebuilt archive-only candidate",
                     live_salvage_db_path.display()
@@ -2037,8 +2083,10 @@ fn reconstruct_from_archive_with_salvage(
         }
     }
 
-    let mut stats =
-        reconstruct_from_archive_impl(db_path, storage_root, salvage_db_path.is_some())?;
+    let ArchiveRebuildResult {
+        mut stats,
+        message_id_map: archived_message_id_map,
+    } = reconstruct_from_archive_impl(db_path, storage_root, salvage_db_path.is_some())?;
     if let Some(message) = unreadable_salvage {
         stats.push_warning(format!(
             "salvage source skipped ({message}); \
@@ -2046,7 +2094,12 @@ fn reconstruct_from_archive_with_salvage(
         ));
     }
     if let Some(salvage_db_path) = salvage_for_merge
-        && let Err(error) = merge_salvaged_database(db_path, salvage_db_path, &mut stats)
+        && let Err(error) = merge_salvaged_database(
+            db_path,
+            salvage_db_path,
+            &archived_message_id_map,
+            &mut stats,
+        )
     {
         let message = error.to_string();
         if crate::pool::is_corruption_error_message(&message) {
@@ -2281,6 +2334,8 @@ fn discover_messages(
     project_id: i64,
     project_slug: &str,
     agent_ids: &mut HashMap<(i64, String), i64>,
+    message_id_map: &mut HashMap<(i64, i64), i64>,
+    pending_reply_edges: &mut Vec<PendingReplyEdge>,
     stats: &mut ReconstructStats,
     deferred: &mut Vec<DeferredCollisionMessage>,
 ) -> DbResult<()> {
@@ -2340,6 +2395,8 @@ fn discover_messages(
             project_id,
             project_slug,
             agent_ids,
+            message_id_map,
+            pending_reply_edges,
             stats,
             Some(deferred),
         ) {
@@ -2371,6 +2428,119 @@ struct DeferredCollisionMessage {
     project_id: i64,
 }
 
+/// Reply edge whose source ids must be translated after all messages exist.
+///
+/// Archive replay and salvage can both remap numeric message ids. Keeping the
+/// source and target project identities explicit prevents a collision in one
+/// project from wiring a reply to a same-numbered message in another project.
+#[derive(Debug, Clone, Copy)]
+struct PendingReplyEdge {
+    source_project: i64,
+    source_child: i64,
+    source_parent: i64,
+    target_project: i64,
+    target_child: i64,
+}
+
+/// Positive message IDs are valid SQLite row IDs; zero marks a source ID that
+/// maps to multiple recovered generations and therefore cannot be linked safely.
+const AMBIGUOUS_REPLY_MESSAGE_ID: i64 = 0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingReplyTarget {
+    MissingChild,
+    Unset,
+    Set(i64),
+}
+
+fn apply_pending_reply_edges(
+    conn: &DbConn,
+    message_id_map: &HashMap<(i64, i64), i64>,
+    pending_reply_edges: &[PendingReplyEdge],
+    source_kind: &str,
+    stats: &mut ReconstructStats,
+) -> DbResult<()> {
+    let mut applied_edges: HashMap<i64, i64> = HashMap::new();
+
+    for edge in pending_reply_edges {
+        let Some(target_parent_id) = message_id_map
+            .get(&(edge.source_project, edge.source_parent))
+            .copied()
+        else {
+            stats.push_warning(format!(
+                "Skipped {source_kind} reply edge for source message {}: parent source id {} could not be mapped",
+                edge.source_child, edge.source_parent
+            ));
+            continue;
+        };
+
+        if target_parent_id == AMBIGUOUS_REPLY_MESSAGE_ID {
+            stats.push_warning(format!(
+                "Skipped {source_kind} reply edge for source message {}: parent source id {} is ambiguous across recovered message generations",
+                edge.source_child, edge.source_parent
+            ));
+            continue;
+        }
+
+        if message_project_id(conn, target_parent_id)? != Some(edge.target_project) {
+            stats.push_warning(format!(
+                "Skipped {source_kind} reply edge for source message {}: rebuilt parent {} is outside project {}",
+                edge.source_child, target_parent_id, edge.target_project
+            ));
+            continue;
+        }
+
+        if let Some(previous_parent_id) = applied_edges.get(&edge.target_child).copied() {
+            if previous_parent_id != target_parent_id {
+                stats.push_warning(format!(
+                    "Skipped conflicting {source_kind} reply edge for rebuilt message {}: already linked to {}, also referenced {}",
+                    edge.target_child, previous_parent_id, target_parent_id
+                ));
+            }
+            continue;
+        }
+
+        match message_reply_to(conn, edge.target_child, edge.target_project)? {
+            ExistingReplyTarget::MissingChild => {
+                stats.push_warning(format!(
+                    "Skipped {source_kind} reply edge for missing rebuilt message {} in project {}",
+                    edge.target_child, edge.target_project
+                ));
+                continue;
+            }
+            ExistingReplyTarget::Set(existing_parent_id) => {
+                if existing_parent_id != target_parent_id {
+                    stats.push_warning(format!(
+                        "Preserved existing reply edge for rebuilt message {} -> {}; conflicting {source_kind} edge referenced {}",
+                        edge.target_child, existing_parent_id, target_parent_id
+                    ));
+                }
+                applied_edges.insert(edge.target_child, existing_parent_id);
+                continue;
+            }
+            ExistingReplyTarget::Unset => {}
+        }
+
+        conn.execute_sync(
+            "UPDATE messages SET reply_to = ? WHERE id = ? AND project_id = ?",
+            &[
+                Value::BigInt(target_parent_id),
+                Value::BigInt(edge.target_child),
+                Value::BigInt(edge.target_project),
+            ],
+        )
+        .map_err(|error| {
+            DbError::Sqlite(format!(
+                "reconstruct {source_kind}: apply reply edge {} -> {}: {error}",
+                edge.target_child, target_parent_id
+            ))
+        })?;
+        applied_edges.insert(edge.target_child, target_parent_id);
+    }
+
+    Ok(())
+}
+
 /// Parse a single archive `.md` file and insert the message into the database.
 ///
 /// `deferred` carries the two insertion modes:
@@ -2386,6 +2556,8 @@ fn parse_and_insert_message(
     project_id: i64,
     _project_slug: &str,
     agent_ids: &mut HashMap<(i64, String), i64>,
+    message_id_map: &mut HashMap<(i64, i64), i64>,
+    pending_reply_edges: &mut Vec<PendingReplyEdge>,
     stats: &mut ReconstructStats,
     deferred: Option<&mut Vec<DeferredCollisionMessage>>,
 ) -> DbResult<()> {
@@ -2419,6 +2591,10 @@ fn parse_and_insert_message(
         .get("ack_required")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let source_reply_to = msg
+        .get("reply_to")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|reply_to| *reply_to > 0);
     // The fallback for a file without any parseable timestamp MUST be
     // deterministic across reconstruct runs: stamping `now_micros()` gave the
     // same artifact a new identity on every rebuild, so each recovery bred a
@@ -2447,7 +2623,7 @@ fn parse_and_insert_message(
     // DB primary key so that archive filenames (which embed `__{id}.md`)
     // remain consistent with DB row IDs.
     // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/9
-    let canonical_id = msg
+    let source_message_id = msg
         .get("id")
         .and_then(serde_json::Value::as_i64)
         .filter(|&id| id > 0);
@@ -2471,7 +2647,7 @@ fn parse_and_insert_message(
     //                            silently dropped as a "duplicate" (br-r6awv).
     //
     // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/104
-    let canonical_id = match (canonical_id, deferred) {
+    let canonical_id = match (source_message_id, deferred) {
         (Some(cid), Some(deferred)) => {
             if let Some((existing_project_id, existing_created_ts, existing_subject)) =
                 message_row_identity(conn, cid)?
@@ -2583,6 +2759,36 @@ fn parse_and_insert_message(
         // Retrieve the inserted row ID via last_insert_rowid() for reliability.
         query_last_insert_rowid(conn)?
     };
+
+    if let Some(source_message_id) = source_message_id {
+        let source_key = (project_id, source_message_id);
+        if let Some(existing_message_id) = message_id_map.get_mut(&source_key) {
+            if *existing_message_id != message_id
+                && *existing_message_id != AMBIGUOUS_REPLY_MESSAGE_ID
+            {
+                stats.push_warning(format!(
+                    "Source message id {source_message_id} in project {project_id} maps to multiple recovered generations ({existing_message_id} and {message_id}); reply references to that source id will be left unset"
+                ));
+                *existing_message_id = AMBIGUOUS_REPLY_MESSAGE_ID;
+            }
+        } else {
+            message_id_map.insert(source_key, message_id);
+        }
+        if let Some(source_parent_id) = source_reply_to {
+            pending_reply_edges.push(PendingReplyEdge {
+                source_project: project_id,
+                source_child: source_message_id,
+                source_parent: source_parent_id,
+                target_project: project_id,
+                target_child: message_id,
+            });
+        }
+    } else if let Some(source_parent_id) = source_reply_to {
+        stats.push_warning(format!(
+            "Skipped archive reply edge in {}: child message has no positive source id (parent source id {source_parent_id})",
+            file_path.display()
+        ));
+    }
 
     stats.messages += 1;
 
@@ -3337,6 +3543,33 @@ fn message_project_id(conn: &DbConn, message_id: i64) -> DbResult<Option<i64>> {
     }
 }
 
+/// Return the current reply target for `message_id`, preserving the distinction
+/// between a missing child row and a present child whose `reply_to` is NULL.
+fn message_reply_to(
+    conn: &DbConn,
+    message_id: i64,
+    project_id: i64,
+) -> DbResult<ExistingReplyTarget> {
+    let rows = conn
+        .query_sync(
+            "SELECT reply_to FROM messages WHERE id = ? AND project_id = ? LIMIT 1",
+            &[Value::BigInt(message_id), Value::BigInt(project_id)],
+        )
+        .map_err(|error| {
+            DbError::Sqlite(format!(
+                "check message {message_id} reply target in project {project_id}: {error}"
+            ))
+        })?;
+    let Some(row) = rows.first() else {
+        return Ok(ExistingReplyTarget::MissingChild);
+    };
+    Ok(row
+        .get_named::<i64>("reply_to")
+        .ok()
+        .filter(|reply_to| *reply_to > 0)
+        .map_or(ExistingReplyTarget::Unset, ExistingReplyTarget::Set))
+}
+
 fn agent_project_id(conn: &DbConn, agent_id: i64) -> DbResult<Option<i64>> {
     let rows = conn
         .query_sync(
@@ -3892,6 +4125,7 @@ fn enrich_existing_agent_from_salvage(
 fn merge_salvaged_database(
     target_db_path: &Path,
     salvage_db_path: &Path,
+    archived_message_id_map: &HashMap<(i64, i64), i64>,
     stats: &mut ReconstructStats,
 ) -> DbResult<()> {
     let target_path = target_db_path.to_str().ok_or_else(|| {
@@ -3948,6 +4182,8 @@ fn merge_salvaged_database(
         let mut project_id_map: HashMap<i64, i64> = HashMap::new();
         let mut agent_id_map: HashMap<i64, i64> = HashMap::new();
         let mut message_id_map: HashMap<i64, i64> = HashMap::new();
+        let mut salvage_reply_message_id_map: HashMap<(i64, i64), i64> = HashMap::new();
+        let mut pending_salvage_reply_edges: Vec<PendingReplyEdge> = Vec::new();
         let mut reservation_id_map: HashMap<i64, i64> = HashMap::new();
         let mut product_id_map: HashMap<i64, i64> = HashMap::new();
         // `None` means the source explicitly records a deregistration but its
@@ -5274,6 +5510,7 @@ fn merge_salvaged_database(
                 &[
                     "thread_id",
                     "topic",
+                    "reply_to",
                     "subject",
                     "body_md",
                     "importance",
@@ -5370,6 +5607,10 @@ fn merge_salvaged_database(
                     // reuse across generations). Treating that as "carried"
                     // silently discards the salvaged message (br-r6awv);
                     // identity mismatches fall through to the remap path.
+                    let source_reply_to = row
+                        .get_named::<i64>("reply_to")
+                        .ok()
+                        .filter(|reply_to| *reply_to > 0);
                     let source_subject = row.get_named::<String>("subject").unwrap_or_default();
                     // Must be deterministic: `now_micros()` here would give the
                     // same salvage row a new identity on every recovery and
@@ -5382,6 +5623,17 @@ fn merge_salvaged_database(
                         && existing_subject == source_subject
                     {
                         message_id_map.insert(source_message_id, source_message_id);
+                        salvage_reply_message_id_map
+                            .insert((source_project_id, source_message_id), source_message_id);
+                        if let Some(source_parent_id) = source_reply_to {
+                            pending_salvage_reply_edges.push(PendingReplyEdge {
+                                source_project: source_project_id,
+                                source_child: source_message_id,
+                                source_parent: source_parent_id,
+                                target_project: target_project_id,
+                                target_child: source_message_id,
+                            });
+                        }
                         continue;
                     }
                     // The same message can already be in the candidate under a
@@ -5397,6 +5649,17 @@ fn merge_salvaged_database(
                         &source_subject,
                     )? {
                         message_id_map.insert(source_message_id, existing_id);
+                        salvage_reply_message_id_map
+                            .insert((source_project_id, source_message_id), existing_id);
+                        if let Some(source_parent_id) = source_reply_to {
+                            pending_salvage_reply_edges.push(PendingReplyEdge {
+                                source_project: source_project_id,
+                                source_child: source_message_id,
+                                source_parent: source_parent_id,
+                                target_project: target_project_id,
+                                target_child: existing_id,
+                            });
+                        }
                         continue;
                     }
 
@@ -5515,6 +5778,17 @@ fn merge_salvaged_database(
                         source_message_id
                     };
                     message_id_map.insert(source_message_id, target_message_id);
+                    salvage_reply_message_id_map
+                        .insert((source_project_id, source_message_id), target_message_id);
+                    if let Some(source_parent_id) = source_reply_to {
+                        pending_salvage_reply_edges.push(PendingReplyEdge {
+                            source_project: source_project_id,
+                            source_child: source_message_id,
+                            source_parent: source_parent_id,
+                            target_project: target_project_id,
+                            target_child: target_message_id,
+                        });
+                    }
                     stats.salvaged_messages += 1;
 
                     for (names, kind) in [(&to_names, "to"), (&cc_names, "cc"), (&bcc_names, "bcc")]
@@ -5537,6 +5811,30 @@ fn merge_salvaged_database(
                 }
             }
         }
+
+        // A salvage snapshot can contain a child after its parent has already
+        // fallen out of that snapshot. Resolve such parents through the archive
+        // reconstruction map, which also carries collision-remapped IDs.
+        for edge in &pending_salvage_reply_edges {
+            let salvage_parent_key = (edge.source_project, edge.source_parent);
+            if salvage_reply_message_id_map.contains_key(&salvage_parent_key) {
+                continue;
+            }
+            if let Some(target_parent_id) = archived_message_id_map
+                .get(&(edge.target_project, edge.source_parent))
+                .copied()
+            {
+                salvage_reply_message_id_map.insert(salvage_parent_key, target_parent_id);
+            }
+        }
+
+        apply_pending_reply_edges(
+            &target_conn,
+            &salvage_reply_message_id_map,
+            &pending_salvage_reply_edges,
+            "salvage",
+            stats,
+        )?;
 
         if has_recipients {
             let recipient_columns = table_columns(&salvage_conn, "message_recipients")?;
@@ -7386,6 +7684,16 @@ body
         writer
             .execute_raw("INSERT INTO salvage_witness(value) VALUES (41);")
             .expect("commit WAL-only salvage witness");
+        // FrankenSQLite may keep its WAL index in-process rather than
+        // materializing a physical `-shm` file. Open a canonical SQLite
+        // reader so this fixture genuinely exercises preservation of all
+        // three live source-family files it asserts below.
+        let sqlite_reader =
+            SqliteDbConn::open_file(source_path.to_str().expect("source path UTF-8"))
+                .expect("open canonical reader for SHM fixture");
+        sqlite_reader
+            .query_sync("SELECT value FROM salvage_witness", &[])
+            .expect("prime canonical WAL reader");
         assert!(
             mcp_agent_mail_core::disk::sqlite_sidecar_path(&source_path, "-wal").is_file(),
             "fixture must retain a WAL sidecar"
@@ -8623,10 +8931,39 @@ body for {slug}
             .unwrap();
         }
 
+        // The reply sorts before its project-local parent. That parent also
+        // loses the global canonical-id collision and is rebuilt under a new
+        // id, so preserving this edge requires both deferred resolution and
+        // project-scoped id remapping.
+        let reply_messages_dir = storage_root
+            .join("projects")
+            .join("project-b")
+            .join("messages")
+            .join("2026")
+            .join("02");
+        std::fs::write(
+            reply_messages_dir.join("2026-02-22T11-00-00Z__reply__8.md"),
+            r#"---json
+{
+  "id": 8,
+  "from": "Alice",
+  "to": ["Carol"],
+  "subject": "Reply B",
+  "reply_to": 7,
+  "importance": "normal",
+  "created_ts": "2026-02-22T11:00:00Z"
+}
+---
+
+reply body
+"#,
+        )
+        .unwrap();
+
         let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
         assert_eq!(
-            stats.messages, 2,
-            "both messages must be preserved across projects"
+            stats.messages, 3,
+            "both parents and the reply must be preserved across projects"
         );
         assert_eq!(
             stats.duplicate_canonical_message_files, 0,
@@ -8646,18 +8983,50 @@ body for {slug}
         let subject_rows = conn
             .query_sync("SELECT subject FROM messages ORDER BY subject", &[])
             .unwrap();
-        assert_eq!(subject_rows.len(), 2, "both messages must exist in DB");
+        assert_eq!(subject_rows.len(), 3, "all messages must exist in DB");
         let subjects: Vec<String> = subject_rows
             .iter()
             .map(|r| r.get_named::<String>("subject").expect("subject"))
             .collect();
-        assert_eq!(subjects, vec!["Alice A".to_string(), "Alice B".to_string()]);
+        assert_eq!(
+            subjects,
+            vec![
+                "Alice A".to_string(),
+                "Alice B".to_string(),
+                "Reply B".to_string()
+            ]
+        );
 
         // Exactly one message keeps canonical id 7; the other is re-keyed.
         let canonical_rows = conn
             .query_sync("SELECT id FROM messages WHERE id = 7", &[])
             .unwrap();
         assert_eq!(canonical_rows.len(), 1);
+
+        let reply_rows = conn
+            .query_sync(
+                "SELECT child.reply_to AS reply_to, parent.id AS parent_id, pp.slug AS parent_project \
+                 FROM messages child \
+                 JOIN messages parent ON parent.id = child.reply_to \
+                 JOIN projects pp ON pp.id = parent.project_id \
+                 WHERE child.subject = 'Reply B'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(reply_rows.len(), 1);
+        assert_eq!(
+            reply_rows[0].get_named::<i64>("reply_to").unwrap(),
+            reply_rows[0].get_named::<i64>("parent_id").unwrap()
+        );
+        assert_ne!(
+            reply_rows[0].get_named::<i64>("parent_id").unwrap(),
+            7,
+            "project-b parent must have been remapped after the collision"
+        );
+        assert_eq!(
+            reply_rows[0].get_named::<String>("parent_project").unwrap(),
+            "project-b"
+        );
 
         // Both messages must keep their original project association — the
         // collision recovery must not collapse them into a single project.
@@ -8811,11 +9180,16 @@ body for {slug}
             "Gen two",
             "2026-03-09T00:00:00Z",
         );
+        std::fs::write(
+            messages_dir.join("2026-03-10T00-00-00Z__child-gen-two__6.md"),
+            "---json\n{\"id\":6,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"Child gen two\",\"reply_to\":5,\"importance\":\"normal\",\"created_ts\":\"2026-03-10T00:00:00Z\"}\n---\n\nchild body\n",
+        )
+        .unwrap();
 
         let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
         assert_eq!(
-            stats.messages, 2,
-            "distinct identities must both survive; warnings: {:?}",
+            stats.messages, 3,
+            "distinct identities and their child must survive; warnings: {:?}",
             stats.warnings
         );
         assert_eq!(stats.duplicate_canonical_message_files, 1);
@@ -8828,16 +9202,36 @@ body for {slug}
             "expected same-project reuse warning, got {:?}",
             stats.warnings
         );
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("ambiguous across recovered message generations")),
+            "expected ambiguous reply mapping warning, got {:?}",
+            stats.warnings
+        );
 
         let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
         let rows = conn
-            .query_sync("SELECT id, subject FROM messages ORDER BY id", &[])
+            .query_sync(
+                "SELECT id, subject, reply_to FROM messages ORDER BY id",
+                &[],
+            )
             .unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 5);
         assert_eq!(rows[0].get_named::<String>("subject").unwrap(), "Gen one");
-        assert!(rows[1].get_named::<i64>("id").unwrap() > 5);
-        assert_eq!(rows[1].get_named::<String>("subject").unwrap(), "Gen two");
+        assert_eq!(rows[1].get_named::<i64>("id").unwrap(), 6);
+        assert_eq!(
+            rows[1].get_named::<String>("subject").unwrap(),
+            "Child gen two"
+        );
+        assert!(
+            rows[1].get_named::<i64>("reply_to").is_err(),
+            "ambiguous parent source id must leave reply_to NULL"
+        );
+        assert!(rows[2].get_named::<i64>("id").unwrap() > 6);
+        assert_eq!(rows[2].get_named::<String>("subject").unwrap(), "Gen two");
     }
 
     #[test]
@@ -9751,6 +10145,152 @@ archive body
         );
     }
 
+    #[test]
+    fn salvage_preserves_conflicting_archive_reply_edge() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed.db");
+        let salvage_db_path = tmp.path().join("salvage.db");
+        let storage_root = tmp.path().join("storage");
+        let project_dir = storage_root.join("projects").join("reply-authority");
+        let messages_dir = project_dir.join("messages").join("2026").join("03");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"reply-authority","human_key":"/reply-authority","created_at":0}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-01T00:00:00Z","last_active_ts":"2026-03-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let archive_messages = [
+            (1_i64, "Parent A", "2026-03-01T00:00:00Z", None),
+            (2_i64, "Parent B", "2026-03-01T00:01:00Z", None),
+            (3_i64, "Child", "2026-03-01T00:02:00Z", Some(1_i64)),
+            (4_i64, "Salvage Child", "2026-03-01T00:03:00Z", None),
+        ];
+        for (id, subject, created_ts, reply_to) in archive_messages {
+            let reply_field = reply_to
+                .map(|parent| format!(",\"reply_to\":{parent}"))
+                .unwrap_or_default();
+            std::fs::write(
+                messages_dir.join(format!(
+                    "{}__message__{id}.md",
+                    created_ts.replace(':', "-")
+                )),
+                format!(
+                    "---json\n{{\"id\":{id},\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"{subject}\"{reply_field},\"importance\":\"normal\",\"created_ts\":\"{created_ts}\"}}\n---\n\n{subject} body\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    human_key TEXT,
+                    created_at INTEGER
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE agents (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    name TEXT NOT NULL
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    sender_id INTEGER NOT NULL,
+                    reply_to INTEGER,
+                    subject TEXT,
+                    created_ts INTEGER
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (100, 'reply-authority', '/reply-authority', 1)",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw("INSERT INTO agents (id, project_id, name) VALUES (10, 100, 'Alice')")
+            .unwrap();
+        for (id, subject, created_ts, archive_reply_to) in archive_messages {
+            if id == 2 {
+                continue;
+            }
+            let created_micros = chrono::DateTime::parse_from_rfc3339(created_ts)
+                .expect("fixture timestamp")
+                .timestamp_micros();
+            let salvage_reply_to = if id == 3 || id == 4 {
+                Some(2_i64)
+            } else {
+                archive_reply_to
+            };
+            salvage_conn
+                .execute_sync(
+                    "INSERT INTO messages
+                     (id, project_id, sender_id, reply_to, subject, created_ts)
+                     VALUES (?, 100, 10, ?, ?, ?)",
+                    &[
+                        Value::BigInt(id),
+                        salvage_reply_to.map_or(Value::Null, Value::BigInt),
+                        Value::Text(subject.to_string()),
+                        Value::BigInt(created_micros),
+                    ],
+                )
+                .unwrap();
+        }
+        drop(salvage_conn);
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("salvage merge should preserve archive authority");
+        assert!(
+            stats.warnings.iter().any(|warning| {
+                warning.contains("Preserved existing reply edge")
+                    && warning.contains("conflicting salvage edge")
+            }),
+            "expected archive-authority conflict warning, got {:?}",
+            stats.warnings
+        );
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT subject, reply_to FROM messages \
+                 WHERE subject IN ('Child', 'Salvage Child') ORDER BY subject",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].get_named::<i64>("reply_to").unwrap(),
+            1,
+            "archive reply edge must remain authoritative over salvage"
+        );
+        assert_eq!(
+            rows[1].get_named::<i64>("reply_to").unwrap(),
+            2,
+            "salvage child must resolve its archive-only parent"
+        );
+    }
+
     /// br-5mnkl: the salvage reads are keyset-paginated so the startup
     /// self-heal path can never materialize the whole `messages` /
     /// `message_recipients` tables at once. This exercises multiple batch
@@ -10044,10 +10584,12 @@ archive body
                     (600, 500, 'Bob', 'coder', 'test', '', 1, 2, 'auto', 'auto'),
                     (601, 500, 'Carol', 'coder', 'test', '', 1, 2, 'auto', 'auto');
                  INSERT INTO messages
-                    (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments)
+                    (id, project_id, sender_id, reply_to, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments)
                     VALUES
-                    (7, 500, 600, 'DB-only message', 'db body', 'urgent', 1, 3,
-                     '{\"to\":[\"Carol\"],\"cc\":[],\"bcc\":[]}', '[]');
+                    (7, 500, 600, NULL, 'DB-only message', 'db body', 'urgent', 1, 3,
+                     '{\"to\":[\"Carol\"],\"cc\":[],\"bcc\":[]}', '[]'),
+                    (6, 500, 600, 7, 'DB-only reply', 'reply body', 'normal', 0, 4,
+                     '{\"to\":[],\"cc\":[],\"bcc\":[]}', '[]');
                  INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
                     VALUES (7, 601, 'to', 4, 5);",
             )
@@ -10056,7 +10598,7 @@ archive body
         let stats =
             reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
                 .expect("cross-project numeric message collision should be remapped");
-        assert_eq!(stats.salvaged_messages, 1);
+        assert_eq!(stats.salvaged_messages, 2);
         assert_eq!(stats.salvaged_message_id_remaps, 1);
 
         let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
@@ -10070,16 +10612,45 @@ archive body
                 &[],
             )
             .expect("query reconstructed messages");
-        assert_eq!(message_rows.len(), 2);
+        assert_eq!(message_rows.len(), 3);
         let db_row = message_rows
             .iter()
-            .find(|row| row.get_named::<String>("slug").ok().as_deref() == Some("db-project"))
+            .find(|row| {
+                row.get_named::<String>("slug").ok().as_deref() == Some("db-project")
+                    && row.get_named::<String>("subject").ok().as_deref() == Some("DB-only message")
+            })
             .expect("DB-only message survived");
         assert_ne!(db_row.get_named::<i64>("id").unwrap(), 7);
         assert_eq!(db_row.get_named::<String>("sender").unwrap(), "Bob");
         assert_eq!(
             db_row.get_named::<String>("subject").unwrap(),
             "DB-only message"
+        );
+
+        let reply_rows = conn
+            .query_sync(
+                "SELECT child.id AS child_id, child.reply_to AS reply_to, parent.id AS parent_id, p.slug AS parent_project \
+                 FROM messages child \
+                 JOIN messages parent ON parent.id = child.reply_to \
+                 JOIN projects p ON p.id = parent.project_id \
+                 WHERE child.subject = 'DB-only reply'",
+                &[],
+            )
+            .expect("query remapped salvage reply edge");
+        assert_eq!(reply_rows.len(), 1);
+        assert_eq!(reply_rows[0].get_named::<i64>("child_id").unwrap(), 6);
+        assert_eq!(
+            reply_rows[0].get_named::<i64>("reply_to").unwrap(),
+            reply_rows[0].get_named::<i64>("parent_id").unwrap()
+        );
+        assert_ne!(
+            reply_rows[0].get_named::<i64>("parent_id").unwrap(),
+            7,
+            "salvage parent must have been remapped after the archive collision"
+        );
+        assert_eq!(
+            reply_rows[0].get_named::<String>("parent_project").unwrap(),
+            "db-project"
         );
 
         let recipient_rows = conn

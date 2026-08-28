@@ -257,7 +257,9 @@ mod dist_release_contract {
     const DOWNLOAD_ACTION: &str =
         "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093";
     const SETUP_ZIG_ACTION: &str = "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29";
-    const BEADS_RUST_COMMIT: &str = "a3f89e6624661259ffa73f876d105656c5b5246e";
+    const FRANKENSEARCH_COMMIT: &str = "e2d24118b06e4a1a4bbff16968f70767f35d5bb3";
+    const FAST_CMAES_COMMIT: &str = "3bf11b7601b54a08ffabb55821289ecb235a504d";
+    const BEADS_RUST_COMMIT: &str = "ba6ff75da25529c8cad8395352f5c5fc2162ee95";
     const RELEASE_TARGETS: [&str; 6] = [
         "x86_64-unknown-linux-gnu",
         "x86_64-unknown-linux-musl",
@@ -801,10 +803,15 @@ mod dist_release_contract {
             workflow,
             "'.id == $id and .tag_name == $tag and .name == $tag and .draft == $draft and .prerelease == $prerelease'",
         )?;
+        require_once(
+            workflow,
+            &format!("FRANKENSEARCH_COMMIT: {FRANKENSEARCH_COMMIT}"),
+        )?;
+        require_once(workflow, &format!("FAST_CMAES_COMMIT: {FAST_CMAES_COMMIT}"))?;
         require_once(workflow, &format!("BEADS_RUST_COMMIT: {BEADS_RUST_COMMIT}"))?;
         require_exactly(
             workflow,
-            "# Cargo.lock resolves beads_rust 0.5.2, so the workspace patch",
+            "# Cargo.lock resolves beads_rust 0.5.4, so the workspace patch",
             3,
         )?;
         require_exactly(
@@ -1008,6 +1015,16 @@ mod dist_release_contract {
                 &workflow,
                 "[ \"${#cosign_versions[@]}\" -ne 1 ] || [ \"${cosign_versions[0]}\" != \"$COSIGN_VERSION\" ]",
                 "[ \"${#cosign_versions[@]}\" -eq 0 ]",
+            ),
+            mutate(
+                &workflow,
+                FRANKENSEARCH_COMMIT,
+                "3bbfd8c664062f8304e7a790c51794671f9214dc",
+            ),
+            mutate(
+                &workflow,
+                FAST_CMAES_COMMIT,
+                "0000000000000000000000000000000000000000",
             ),
             mutate(
                 &workflow,

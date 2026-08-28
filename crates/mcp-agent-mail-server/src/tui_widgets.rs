@@ -6676,7 +6676,7 @@ mod tests {
     fn budget_timed_records_cost() {
         let mut budget = AnimationBudget::new(std::time::Duration::from_secs(1));
         let result = budget.timed(|| {
-            // A tiny computation.
+            std::thread::sleep(std::time::Duration::from_millis(1));
             42
         });
         assert_eq!(result, 42);

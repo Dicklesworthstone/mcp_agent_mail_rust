@@ -1929,7 +1929,17 @@ mod tests {
     #[test]
     fn b8_attachments_tick_retries_after_unavailable_without_data_change() {
         let broken = broken_db_state();
-        let healthy = test_state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("attachments-retry.sqlite3");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open healthy db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize healthy schema");
+        drop(conn);
+        let healthy = TuiSharedState::new(&Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: dir.path().join("storage"),
+            ..Config::default()
+        });
         let mut screen = AttachmentExplorerScreen::new();
 
         screen.tick(1, &broken);

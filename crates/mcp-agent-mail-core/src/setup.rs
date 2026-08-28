@@ -2462,7 +2462,7 @@ fn setup_directory_authority_path(path: &Path) -> PathBuf {
             (Path::new("/etc"), Path::new("/private/etc")),
         ] {
             if path.starts_with(alias) && crate::disk::is_trusted_system_directory_alias(alias) {
-                return canonical.join(path.strip_prefix(alias).unwrap_or(Path::new("")));
+                return canonical.join(path.strip_prefix(alias).unwrap_or_else(|_| Path::new("")));
             }
         }
     }
@@ -2767,6 +2767,11 @@ fn create_unique_setup_file_at(
 ) -> Result<(String, std::fs::File), SetupError> {
     use rustix::fs::{Mode, OFlags, fchmod, openat};
 
+    let permissions = u16::try_from(permissions).map_err(|_| {
+        SetupError::Other(format!(
+            "setup file permissions {permissions:#o} exceed the platform mode range"
+        ))
+    })?;
     let pid = std::process::id();
     let now = crate::timestamps::now_micros();
     for attempt in 0..1024 {

@@ -809,37 +809,29 @@ mod tests {
     // ── br-3h13: Additional tool_metrics.rs test coverage ──────────
 
     #[test]
-    fn open_metrics_connection_uses_absolute_candidate_for_missing_relative_database_url() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let absolute_db = dir.path().join("tool_metrics_fallback.sqlite3");
-        let absolute_db_str = absolute_db.to_string_lossy().into_owned();
-        let absolute_conn = DbConn::open_file(&absolute_db_str).expect("open absolute db");
-        absolute_conn
-            .execute_raw("CREATE TABLE seed(id INTEGER PRIMARY KEY)")
-            .expect("create seed table");
-        drop(absolute_conn);
+    fn open_metrics_connection_initializes_explicit_relative_database_url() {
+        let dir = tempfile::tempdir_in(".").expect("relative tempdir");
+        let current_dir = std::env::current_dir().expect("current directory");
+        let relative_dir = dir
+            .path()
+            .strip_prefix(&current_dir)
+            .expect("tempdir should be below current directory");
+        let relative_path = std::path::PathBuf::from(".")
+            .join(relative_dir)
+            .join("tool_metrics.sqlite3");
+        assert!(relative_path.is_relative());
+        assert!(!relative_path.exists());
 
-        let relative_path = std::path::PathBuf::from(absolute_db_str.trim_start_matches('/'));
-        if let Some(parent) = relative_path.parent() {
-            std::fs::create_dir_all(parent).expect("create relative parent");
-        }
-        assert!(
-            !relative_path.exists(),
-            "relative fallback fixture should be absent so metrics connection must resolve the absolute candidate"
-        );
-
-        let database_url = format!("sqlite://{}", relative_path.display());
-        let conn = open_metrics_connection(&database_url).expect("open metrics fallback db");
+        let database_url = format!("sqlite:///{}", relative_path.display());
+        let conn =
+            open_metrics_connection(&database_url).expect("open explicit relative metrics db");
         conn.execute_raw("CREATE TABLE marker(id INTEGER PRIMARY KEY)")
-            .expect("create marker table through fallback connection");
-        drop(conn);
+            .expect("create marker table");
+        mcp_agent_mail_db::close_db_conn(conn, "tool metrics explicit relative fixture");
 
-        assert!(
-            !relative_path.exists(),
-            "metrics fallback should not create a stray relative sqlite file"
-        );
-
-        let verify_conn = DbConn::open_file(&absolute_db_str).expect("reopen absolute db");
+        assert!(relative_path.exists());
+        let verify_conn = DbConn::open_file(relative_path.to_string_lossy().as_ref())
+            .expect("reopen explicit relative metrics db");
         let rows = verify_conn
             .query_sync(
                 "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'marker'",
@@ -847,6 +839,10 @@ mod tests {
             )
             .expect("query sqlite_master");
         assert_eq!(rows[0].get_named::<i64>("count").unwrap_or(0), 1);
+        mcp_agent_mail_db::close_db_conn(
+            verify_conn,
+            "verify tool metrics explicit relative fixture",
+        );
     }
 
     #[test]

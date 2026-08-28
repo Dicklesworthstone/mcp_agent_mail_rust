@@ -1909,6 +1909,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: Some("PRODUCT-LIMIT-1".to_string()),
+            reply_to: None,
             topic: None,
             subject: subject.to_string(),
             body_md: format!("- {subject} point"),

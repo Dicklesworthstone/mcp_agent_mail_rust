@@ -40,11 +40,11 @@ state is unavailable; native invariant tests are authoritative for those fields.
 
 ## Current coverage (as of 2026-08-27)
 
-- The live Rust router exposes 44 tools.
+- The live Rust router exposes 48 tools.
 - 37 tools have Python behavior fixtures in `tests/conformance/fixtures/python_reference.json`.
-- `fetch_topic` is the 38th supported compatibility tool. It retains the shared description/schema contract and has focused topic-bearing database and router coverage; mounted-transport proof remains a release gate. It is intentionally absent from the legacy sequential behavior fixture.
+- 5 additional Python-compatible tools retain inventory/input-schema compatibility, Rust-owned non-empty descriptions, and focused coverage: `fetch_topic`, `list_window_identities`, `sweep_stale_agents`, `summarize_recent`, and `fetch_summary`.
 - 6 tools are Rust-native extensions: `resolve_pane_identity`, `cleanup_pane_identities`, `list_agents`, `check_file_reservation_conflicts`, `fetch_inbox_events`, and `get_message_delivery_receipt`.
-- Those 6 Rust-native tools are covered by dedicated golden fixtures under `tests/conformance/fixtures/rust_native/`.
+- The 6 Rust-native tools are covered by dedicated golden fixtures under `tests/conformance/fixtures/rust_native/`.
 - The former tool fixture gap tracked by `br-a2k3h.3` is closed by the dedicated Rust-native fixture lane.
 - The live Rust router exposes 25 logical resource templates after collapsing `?{query}` variants.
 - 23 resource templates have Python behavior fixtures.
@@ -58,7 +58,7 @@ These classifications come from the live tool surface in `mcp_agent_mail_tools::
 the Python behavior fixture inventory in `tests/conformance/fixtures/python_reference.json`, and
 the audit record in [docs/CONFORMANCE_AUDIT_2026-04-18.md](../../docs/CONFORMANCE_AUDIT_2026-04-18.md).
 
-### Supported compatibility tools (38)
+### Supported Python compatibility tools (42)
 
 - `health_check` - Return the server readiness snapshot and infrastructure status.
 - `ensure_project` - Create or resolve the canonical project identity for a workspace path.
@@ -99,8 +99,13 @@ the audit record in [docs/CONFORMANCE_AUDIT_2026-04-18.md](../../docs/CONFORMANC
 - `renew_build_slot` - Extend an existing build slot lease.
 - `release_build_slot` - Release an existing build slot lease.
 
-### Rust-native extensions (6)
+- `fetch_topic` - Fetch project messages carrying one exact case-insensitive topic tag. Matching Python, `agent_name` may be omitted only when the current request carries FastMCP-verified transport authentication; otherwise callers authenticate an agent, and unread filtering always does. Focused router/persistence tests cover these boundaries.
+- `list_window_identities` - List active persistent window identities with focused active/expired filtering coverage.
+- `sweep_stale_agents` - Retire stale agents while protecting the caller and active reservation holders.
+- `summarize_recent` - Persist a bounded recent-project summary for later retrieval.
+- `fetch_summary` - Fetch persisted project summaries newest first.
 
+### Rust-native extensions (6)
 - `resolve_pane_identity` - Resolve the canonical agent name for a tmux pane from Rust-side identity files; there is no Python pane-identity analogue.
 - `cleanup_pane_identities` - Remove stale per-pane identity files for dead tmux panes; this is Rust-only operational cleanup tied to the pane identity model.
 - `list_agents` - List all registered agents in a project; this Rust-native identity surface is now covered by the dedicated `rust_native/` golden fixtures.

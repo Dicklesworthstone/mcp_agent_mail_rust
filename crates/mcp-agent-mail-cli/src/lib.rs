@@ -39662,6 +39662,7 @@ mod mail_server_cli_bridge_tests {
                 project_id: 7,
                 sender_id: 11,
                 thread_id: Some("br-42".to_string()),
+                reply_to: Some(41),
                 topic: Some("contract-parity".to_string()),
                 subject: "Plan".to_string(),
                 body_md: "Body".to_string(),

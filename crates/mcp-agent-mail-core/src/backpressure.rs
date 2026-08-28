@@ -480,15 +480,18 @@ pub fn set_shedding_enabled(enabled: bool) {
 /// may be rejected under Red-level backpressure when shedding is enabled.
 ///
 /// Criteria for inclusion:
-/// - The tool is **read-only** (no state mutation).
+/// - The tool is **read-only**, or only writes recreatable derived summaries.
 /// - Agents have an alternative path or can safely retry later.
 /// - The tool is not required for agent lifecycle or coordination.
 const SHEDABLE_TOOLS: &[&str] = &[
     // Search cluster — read-only, retryable
     "search_messages",
     "summarize_thread",
+    "summarize_recent",
+    "fetch_summary",
     // Identity cluster — read-only lookup
     "whois",
+    "list_window_identities",
     // Contacts cluster — read-only listing
     "list_contacts",
     // Product bus — cross-product reads (per-project fetch_inbox is unshed)
@@ -806,7 +809,10 @@ mod tests {
         // Shedable: read-only, deferrable tools
         assert!(is_shedable_tool("search_messages"));
         assert!(is_shedable_tool("summarize_thread"));
+        assert!(is_shedable_tool("summarize_recent"));
+        assert!(is_shedable_tool("fetch_summary"));
         assert!(is_shedable_tool("whois"));
+        assert!(is_shedable_tool("list_window_identities"));
         assert!(is_shedable_tool("list_contacts"));
         assert!(is_shedable_tool("search_messages_product"));
         assert!(is_shedable_tool("summarize_thread_product"));

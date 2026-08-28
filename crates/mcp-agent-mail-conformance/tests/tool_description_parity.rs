@@ -32,14 +32,8 @@ struct ToolDescriptionsFixture {
 }
 
 /// Python-only tools that exist in the Python server but not in Rust.
-/// These are window-management tools not yet ported.
-const PYTHON_ONLY_TOOLS: &[&str] = &[
-    "expire_window",
-    "fetch_summary",
-    "list_window_identities",
-    "rename_window",
-    "summarize_recent",
-];
+/// These window-management mutation tools have not been ported yet.
+const PYTHON_ONLY_TOOLS: &[&str] = &["expire_window", "rename_window"];
 
 /// Rust-native tools that do not have entries in the shared description fixture.
 const TOOLS_WITHOUT_SHARED_DESCRIPTION_FIXTURE: &[&str] = &[
@@ -124,23 +118,45 @@ fn normalized_property_type(prop: &Value) -> Option<String> {
     if let Some(kind) = prop.get("type").and_then(Value::as_str) {
         return Some(kind.to_string());
     }
+
     let mut non_null: Vec<String> = prop
-        .get("anyOf")
+        .get("type")
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
-                .filter_map(|branch| branch.get("type").and_then(Value::as_str))
+                .filter_map(Value::as_str)
                 .filter(|kind| *kind != "null")
                 .map(ToString::to_string)
                 .collect()
         })
         .unwrap_or_default();
+    non_null.extend(
+        prop.get("anyOf")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|branch| branch.get("type").and_then(Value::as_str))
+                    .filter(|kind| *kind != "null")
+                    .map(ToString::to_string)
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default(),
+    );
     if non_null.is_empty() {
         return None;
     }
     non_null.sort_unstable();
     non_null.dedup();
     Some(non_null.join("|"))
+}
+
+#[test]
+fn normalized_property_type_handles_nullable_type_arrays() {
+    let nullable = serde_json::json!({"type": ["string", "null"]});
+    assert_eq!(
+        normalized_property_type(&nullable).as_deref(),
+        Some("string")
+    );
 }
 
 /// Compare the supported input-schema contract.
@@ -492,6 +508,8 @@ fn cluster_identity_descriptions() {
     check_cluster_descriptions(&[
         "register_agent",
         "create_agent_identity",
+        "list_window_identities",
+        "sweep_stale_agents",
         "retire_agent",
         "unretire_agent",
         "deregister_agent",

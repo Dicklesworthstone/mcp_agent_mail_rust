@@ -2671,6 +2671,139 @@ Choose a different name (or omit the name to auto-generate one)."
     }
 }
 
+/// List active Python-compatible persistent window identities.
+fn render_window_identities_response(
+    json_result: &str,
+    format: Option<&str>,
+    config: &Config,
+) -> McpResult<String> {
+    mcp_agent_mail_core::apply_tool_format(json_result, format, config)
+        .map_err(|error| McpError::new(McpErrorCode::InvalidParams, error))
+}
+
+#[tool(
+    description = "List active window identities for a project.\n\nReturns all non-expired window identities with display names, last activity timestamps, and age.\n\nParameters\n----------\nproject_key : str\n    Project identifier.\n\nReturns\n-------\ndict\n    { identities: [{ id, window_uuid, display_name, created_ts, last_active_ts, expires_ts }] }"
+)]
+pub async fn list_window_identities(
+    ctx: &McpContext,
+    project_key: String,
+    format: Option<String>,
+) -> McpResult<String> {
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+    let pool = get_coalescer_bypass_read_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let now = mcp_agent_mail_db::now_micros();
+    let identities = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_active_window_identities(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            now,
+        )
+        .await,
+    )?;
+    let items: Vec<serde_json::Value> = identities
+        .into_iter()
+        .map(|identity| {
+            json!({
+                "id": identity.id,
+                "window_uuid": identity.window_uuid,
+                "display_name": identity.display_name,
+                "created_ts": micros_to_iso(identity.created_ts),
+                "last_active_ts": micros_to_iso(identity.last_active_ts),
+                "expires_ts": identity.expires_ts.map(micros_to_iso),
+                "age_days": now.saturating_sub(identity.created_ts) / MICROS_PER_DAY,
+            })
+        })
+        .collect();
+    let response = json!({ "identities": items, "count": items.len() }).to_string();
+    render_window_identities_response(&response, format.as_deref(), &Config::get())
+}
+
+/// Retire abandoned agents without requiring each target's token.
+#[tool(
+    description = "Retire abandoned agents in the caller's project using the server's conservative inactivity heuristic. The caller is never retired, the threshold has a 60-second floor, and active file reservations block retirement by default."
+)]
+pub async fn sweep_stale_agents(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    threshold_seconds: Option<i64>,
+    require_no_active_reservations: Option<bool>,
+    registration_token: Option<String>,
+    pane_id: Option<String>,
+) -> McpResult<String> {
+    let pool = get_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let actor = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            &agent_name,
+        )
+        .await,
+    )?;
+    authenticate_lifecycle_agent(
+        &project,
+        &actor,
+        registration_token.as_deref(),
+        pane_id.as_deref(),
+        "sweep_stale_agents",
+    )?;
+    reject_deregistered_lifecycle_transition(ctx, &pool, &actor, "swept").await?;
+
+    let actor_id = actor
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+    db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::touch_agent(ctx.cx(), &pool, actor_id).await,
+    )?;
+    db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::flush_deferred_touches(ctx.cx(), &pool).await,
+    )?;
+    let effective_threshold = threshold_seconds.unwrap_or(86_400).max(60);
+    let now = mcp_agent_mail_db::now_micros();
+    let cutoff = now.saturating_sub(effective_threshold.saturating_mul(1_000_000));
+    let protect_reservations = require_no_active_reservations.unwrap_or(true);
+    let retired = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::sweep_stale_agents(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            actor_id,
+            cutoff,
+            now,
+            protect_reservations,
+        )
+        .await,
+    )?;
+    let retired_names: Vec<String> = retired.iter().map(|agent| agent.name.clone()).collect();
+    let retired_agents: Vec<serde_json::Value> = retired
+        .into_iter()
+        .map(|agent| {
+            json!({
+                "agent_id": agent.id,
+                "agent_name": agent.name,
+                "project_id": project.id,
+                "project_key": project.human_key,
+                "last_active_ts": micros_to_iso(agent.last_active_ts),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "project_key": project.human_key,
+        "requested_by": actor.name,
+        "threshold_seconds": effective_threshold,
+        "require_no_active_reservations": protect_reservations,
+        "retired": retired_names,
+        "retired_agents": retired_agents,
+        "count": retired_names.len(),
+    })
+    .to_string())
+}
+
 /// Temporarily remove an agent from active routing while preserving history.
 #[tool(
     description = "Soft-delete an agent: mark it as retired so it stops accepting new messages while preserving message history. Retired agents are hidden from active agent lists but visible in 'all agents' views.\n\nRust authorization extension: authorization requires either the agent registration_token or a pane bound to the agent."
@@ -3184,6 +3317,48 @@ mod tests {
     use fastmcp::McpContext;
     use mcp_agent_mail_core::config::with_process_env_overrides_for_test;
     use std::path::PathBuf;
+
+    #[test]
+    fn window_identities_format_json_is_passthrough() {
+        let config = Config::default();
+        let json = r#"{"identities":[],"count":0}"#;
+
+        assert_eq!(
+            render_window_identities_response(json, Some("json"), &config).unwrap(),
+            json
+        );
+    }
+
+    #[test]
+    fn window_identities_format_rejects_invalid_value() {
+        let config = Config::default();
+        let error = render_window_identities_response("{}", Some("xml"), &config)
+            .expect_err("unsupported format must fail");
+
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert!(error.message.contains("Expected 'json' or 'toon'"));
+    }
+
+    #[test]
+    fn window_identities_format_toon_falls_back_to_json_envelope() {
+        let config = Config {
+            toon_bin: Some("/definitely/missing/toon-encoder".to_string()),
+            ..Config::default()
+        };
+        let rendered = render_window_identities_response(
+            r#"{"identities":[],"count":0}"#,
+            Some("toon"),
+            &config,
+        )
+        .expect("TOON encoder failure should return fallback envelope");
+        let envelope: serde_json::Value =
+            serde_json::from_str(&rendered).expect("fallback envelope JSON");
+
+        assert_eq!(envelope["format"], "json");
+        assert_eq!(envelope["data"]["count"], 0);
+        assert_eq!(envelope["meta"]["requested"], "toon");
+        assert!(envelope["meta"]["toon_error"].is_string());
+    }
 
     /// All-green decomposed verdicts, for response-serialization tests that
     /// don't exercise the rollup logic.
@@ -4709,6 +4884,11 @@ body
     fn health_check_direct_sqlite_probe_uses_mailbox_runtime_engine() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("health-check-engine.sqlite3");
+        let seed = DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("initialize health-check engine fixture");
+        seed.execute_raw("CREATE TABLE health_probe_fixture (id INTEGER PRIMARY KEY)")
+            .expect("initialize health-check engine schema");
+        drop(seed);
 
         let conn = open_health_check_sync_db_connection(&db_path)
             .expect("health_check direct probe should open sqlite");

@@ -9,9 +9,23 @@ const README_RELATIVE: &str = "README.md";
 const PYTHON_FIXTURE_RELATIVE: &str = "tests/conformance/fixtures/python_reference.json";
 const TOOL_FILTER_FIXTURE_RELATIVE: &str = "tests/conformance/fixtures/tool_filter/cases.json";
 const RUST_NATIVE_FIXTURE_DIR_RELATIVE: &str = "tests/conformance/fixtures/rust_native";
-const SUPPLEMENTAL_COMPATIBILITY_FIXTURE: &str =
-    "crates/mcp-agent-mail-conformance/tests/conformance.rs";
-const SUPPLEMENTAL_COMPATIBILITY_TOOLS: &[&str] = &["fetch_topic"];
+const SUPPLEMENTAL_PYTHON_PARITY_TOOLS: &[&str] = &[
+    "fetch_topic",
+    "fetch_summary",
+    "list_window_identities",
+    "summarize_recent",
+    "sweep_stale_agents",
+];
+
+fn supplemental_python_parity_fixture(tool: &str) -> Option<&'static str> {
+    if tool == "fetch_topic" {
+        Some("crates/mcp-agent-mail-conformance/tests/conformance.rs")
+    } else if SUPPLEMENTAL_PYTHON_PARITY_TOOLS.contains(&tool) {
+        Some("tests/conformance/fixtures/tool_descriptions.json")
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct ToolFilterFixtures {
@@ -263,7 +277,7 @@ fn audit_doc_matches_live_inventory() {
         .collect();
     assert_eq!(
         runtime_tools.len(),
-        44,
+        48,
         "tool count drifted from audit baseline"
     );
 
@@ -276,12 +290,12 @@ fn audit_doc_matches_live_inventory() {
                 classification: "python-parity".to_string(),
                 fixture_file: "crates/mcp-agent-mail-conformance/tests/conformance/fixtures/python_reference.json".to_string(),
             }
-        } else if SUPPLEMENTAL_COMPATIBILITY_TOOLS.contains(&tool.as_str()) {
+        } else if let Some(fixture_file) = supplemental_python_parity_fixture(tool) {
             AuditRow {
                 name: tool.clone(),
                 has_fixture: "yes".to_string(),
-                classification: "supported-compatibility".to_string(),
-                fixture_file: SUPPLEMENTAL_COMPATIBILITY_FIXTURE.to_string(),
+                classification: "python-parity".to_string(),
+                fixture_file: fixture_file.to_string(),
             }
         } else if rust_native_tools.contains(tool) {
             AuditRow {
@@ -422,10 +436,12 @@ fn crate_readme_current_coverage_matches_audit_summary() {
     for needle in [
         "# mcp-agent-mail-conformance",
         "## Current coverage (as of 2026-08-27)",
-        "44 tools",
+        "48 tools",
         "37 tools have Python behavior fixtures",
         "5 additional Python-compatible tools",
         "fetch_topic",
+        "list_window_identities",
+        "sweep_stale_agents",
         "summarize_recent",
         "fetch_summary",
         "resolve_pane_identity",

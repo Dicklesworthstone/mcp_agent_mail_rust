@@ -32,7 +32,13 @@ const AUTO_INCREMENT_ID_KEYS: &[&str] = &["id", "message_id", "reply_to", "sende
 const TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS: &str = "3600";
 const TEST_SEARCH_ENGINE: &str = "legacy";
 const RUST_NATIVE_FIXTURE_DIR: &str = "tests/conformance/fixtures/rust_native";
-const SUPPLEMENTAL_COMPATIBILITY_TOOLS: &[&str] = &["fetch_topic"];
+const FOCUSED_COMPATIBILITY_TOOLS: &[&str] = &[
+    "fetch_topic",
+    "list_window_identities",
+    "sweep_stale_agents",
+    "summarize_recent",
+    "fetch_summary",
+];
 const LEGACY_FIXTURE_REPO_INSTALL_PATH: &str = "/tmp/agent-mail-fixtures/repo_install";
 const LEGACY_FIXTURE_REPO_UNINSTALL_PATH: &str = "/tmp/agent-mail-fixtures/repo_uninstall";
 
@@ -693,6 +699,42 @@ fn expected_error_containing(needle: &str) -> ExpectedError {
 fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
     vec![
         HandwrittenToolFailureCase {
+            tool_name: "fetch_topic",
+            case_name: "project_not_found_error",
+            input: serde_json::json!({
+                "project_key": "missing-project",
+                "topic_name": "release.v31"
+            }),
+            expected_err: expected_error_containing("not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "list_window_identities",
+            case_name: "project_not_found_error",
+            input: serde_json::json!({ "project_key": "missing-project" }),
+            expected_err: expected_error_containing("not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "sweep_stale_agents",
+            case_name: "project_not_found_error",
+            input: serde_json::json!({
+                "project_key": "missing-project",
+                "agent_name": "BlueLake"
+            }),
+            expected_err: expected_error_containing("not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "summarize_recent",
+            case_name: "project_not_found_error",
+            input: serde_json::json!({ "project_key": "missing-project" }),
+            expected_err: expected_error_containing("not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "fetch_summary",
+            case_name: "project_not_found_error",
+            input: serde_json::json!({ "project_key": "missing-project" }),
+            expected_err: expected_error_containing("not found"),
+        },
+        HandwrittenToolFailureCase {
             tool_name: "health_check",
             case_name: "malformed_non_object_arguments",
             input: serde_json::json!([]),
@@ -960,11 +1002,15 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
 
 fn handwritten_tool_happy_case_tools() -> BTreeSet<&'static str> {
     BTreeSet::from([
-        "deregister_agent",
-        "fetch_topic",
         "force_release_file_reservation",
+        "fetch_topic",
+        "list_window_identities",
+        "sweep_stale_agents",
+        "summarize_recent",
+        "fetch_summary",
         "retire_agent",
         "unretire_agent",
+        "deregister_agent",
     ])
 }
 
@@ -1179,6 +1225,20 @@ fn init_fixture_repo(repo_dir: &Path) {
     assert!(
         status.success(),
         "git init failed for {} with status {status}",
+        repo_dir.display()
+    );
+
+    // Keep guard fixtures hermetic when the developer has a global
+    // core.hooksPath: guard installation intentionally rejects shared hook
+    // directories unless explicitly opted in.
+    let status = std::process::Command::new("git")
+        .args(["config", "--local", "core.hooksPath", ".git/hooks"])
+        .current_dir(repo_dir)
+        .status()
+        .unwrap_or_else(|e| panic!("git config {}: {e}", repo_dir.display()));
+    assert!(
+        status.success(),
+        "git config failed for {} with status {status}",
         repo_dir.display()
     );
 }
@@ -1592,7 +1652,7 @@ fn run_fixtures_against_rust_server_router() {
                 (Some(expected_ok), None) => {
                     let call_result = result.unwrap_or_else(|e| {
                         panic!(
-                            "tool {tool_name} case {}: unexpected router error: {e}",
+                            "tool {tool_name} case {}: unexpected router error: {e:?}",
                             case.name
                         )
                     });
@@ -2181,10 +2241,14 @@ fn run_fixtures_against_rust_server_router() {
 
     // --- Notification signal assertions (tool flow) ---
     let notif_tmp = tempfile::TempDir::new().expect("failed to create notifications tempdir");
-    let notif_db_path = notif_tmp.path().join("db.sqlite3");
+    let notif_root = notif_tmp
+        .path()
+        .canonicalize()
+        .expect("canonicalize notifications tempdir");
+    let notif_db_path = notif_root.join("db.sqlite3");
     let notif_db_url = format!("sqlite://{}", notif_db_path.display());
-    let notif_storage_root = notif_tmp.path().join("archive");
-    let notif_signals_dir = notif_tmp.path().join("signals");
+    let notif_storage_root = notif_root.join("archive");
+    let notif_signals_dir = notif_root.join("signals");
     let _env_guard = EnvVarGuard::set(&[
         ("DATABASE_URL", notif_db_url.as_str()),
         (
@@ -2207,7 +2271,7 @@ fn run_fixtures_against_rust_server_router() {
     let config = mcp_agent_mail_core::Config::from_env();
     let router = mcp_agent_mail_server::build_server(&config).into_router();
 
-    let project_dir = notif_tmp.path().join("project");
+    let project_dir = notif_root.join("project");
     std::fs::create_dir_all(&project_dir).expect("create notification project dir");
     let project_key = project_dir.to_string_lossy().to_string();
     let project_slug = mcp_agent_mail_core::compute_project_slug(&project_key);
@@ -2779,9 +2843,154 @@ fn lifecycle_tools_preserve_authorization_roster_and_permanent_deregistration_co
     )
     .expect_err("deregistered identity cannot be unretired");
     assert!(
-        unretire_error.contains("AGENT_DEREGISTERED"),
-        "expected typed permanent-lifecycle error, got: {unretire_error}"
+        unretire_error.contains("deregistered and cannot be unretired"),
+        "expected permanent-lifecycle refusal, got: {unretire_error}"
     );
+}
+
+#[test]
+fn window_identity_listing_and_stale_sweep_work_through_the_router() {
+    let _lock = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+    let env = setup_fixture_env();
+    let project_path = env.tmp.path().join("identity-maintenance-project");
+    std::fs::create_dir_all(&project_path).expect("create identity fixture project");
+    let project_key = project_path.to_string_lossy().into_owned();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id = 19_000;
+    let invoke = |tool: &str, input: Value, req_id: &mut u64| {
+        execute_tool(
+            &env.router,
+            &cx,
+            &budget,
+            req_id,
+            tool,
+            args_from_value(&input),
+        )
+        .unwrap_or_else(|error| panic!("{tool} router failure: {error}"))
+    };
+
+    invoke(
+        "ensure_project",
+        serde_json::json!({ "human_key": &project_key }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("ensure_project failed: {error}"));
+    let caller = invoke(
+        "register_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "program": "codex-cli",
+            "model": "gpt-5",
+            "name": "AmberStone"
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("register caller failed: {error}"));
+    let caller_token = caller["registration_token"]
+        .as_str()
+        .expect("caller registration token")
+        .to_string();
+    let project_id = caller["project_id"].as_i64().expect("caller project id");
+    invoke(
+        "register_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "program": "codex-cli",
+            "model": "gpt-5",
+            "name": "GrayWolf"
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("register stale agent failed: {error}"));
+    invoke(
+        "register_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "program": "codex-cli",
+            "model": "gpt-5",
+            "name": "BlueDog"
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("register reservation-protected agent failed: {error}"));
+    invoke(
+        "file_reservation_paths",
+        serde_json::json!({
+            "project_key": &project_key,
+            "agent_name": "BlueDog",
+            "paths": ["src/protected.rs"],
+            "ttl_seconds": 600,
+            "exclusive": true,
+            "reason": "stale-sweep protection witness"
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("reserve protected path failed: {error}"));
+
+    let db_path = env.tmp.path().join("db.sqlite3");
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+        db_path.to_str().expect("fixture DB path UTF-8"),
+    )
+    .expect("open fixture DB");
+    let now = mcp_agent_mail_db::now_micros();
+    conn.execute_sync(
+        "UPDATE agents SET last_active_ts = 1 \
+         WHERE project_id = ? AND name IN ('AmberStone', 'GrayWolf', 'BlueDog')",
+        &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(project_id)],
+    )
+    .expect("age stale agent");
+    for (uuid, display_name, expires_ts) in [
+        ("window-active", "Active Window", None),
+        (
+            "window-expired",
+            "Expired Window",
+            Some(now.saturating_sub(1)),
+        ),
+    ] {
+        conn.execute_sync(
+            "INSERT INTO window_identities \
+                 (project_id, window_uuid, display_name, created_ts, last_active_ts, expires_ts) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(project_id),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(uuid.to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(display_name.to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now.saturating_sub(1_000_000)),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now),
+                expires_ts.map_or(
+                    mcp_agent_mail_db::sqlmodel_core::Value::Null,
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt,
+                ),
+            ],
+        )
+        .expect("seed window identity");
+    }
+    drop(conn);
+
+    let windows = invoke(
+        "list_window_identities",
+        serde_json::json!({ "project_key": &project_key }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("list_window_identities failed: {error}"));
+    assert_eq!(windows["count"].as_u64(), Some(1));
+    assert_eq!(windows["identities"][0]["window_uuid"], "window-active");
+
+    let swept = invoke(
+        "sweep_stale_agents",
+        serde_json::json!({
+            "project_key": &project_key,
+            "agent_name": "AmberStone",
+            "threshold_seconds": 60,
+            "registration_token": &caller_token
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("sweep_stale_agents failed: {error}"));
+    assert_eq!(swept["count"].as_u64(), Some(1));
+    assert_eq!(swept["retired"], serde_json::json!(["GrayWolf"]));
+    assert_eq!(swept["requested_by"], "AmberStone");
 }
 
 #[test]
@@ -2894,12 +3103,47 @@ fn topic_tools_persist_filter_and_inherit_topics_through_the_router() {
     )
     .unwrap_or_else(|error| panic!("reply_message failed: {error}"));
     assert_eq!(reply["topic"], "release.v31");
+    let reply_id = reply["id"].as_i64().expect("reply message id");
+    assert_eq!(reply["reply_to"].as_i64(), Some(message_id));
+    assert_eq!(
+        reply["deliveries"][0]["payload"]["reply_to"].as_i64(),
+        Some(message_id)
+    );
+
+    let idempotent_reply_args = serde_json::json!({
+        "project_key": &project_key,
+        "message_id": message_id,
+        "sender_name": "BlueLake",
+        "sender_token": &recipient_token,
+        "body_md": "idempotent topic reply",
+        "idempotency_key": "topic-reply-parent-edge"
+    });
+    let idempotent_reply = invoke("reply_message", idempotent_reply_args.clone(), &mut req_id)
+        .unwrap_or_else(|error| panic!("idempotent reply_message failed: {error}"));
+    let idempotent_reply_id = idempotent_reply["id"]
+        .as_i64()
+        .expect("idempotent reply message id");
+    assert_eq!(idempotent_reply["reply_to"].as_i64(), Some(message_id));
+    assert_eq!(
+        idempotent_reply["deliveries"][0]["payload"]["reply_to"].as_i64(),
+        Some(message_id)
+    );
+    let replayed_reply = invoke("reply_message", idempotent_reply_args, &mut req_id)
+        .unwrap_or_else(|error| panic!("replayed reply_message failed: {error}"));
+    assert_eq!(replayed_reply["id"].as_i64(), Some(idempotent_reply_id));
+    assert_eq!(replayed_reply["reply_to"].as_i64(), Some(message_id));
+    assert_eq!(
+        replayed_reply["deliveries"][0]["payload"]["reply_to"].as_i64(),
+        Some(message_id)
+    );
 
     let topic_messages = invoke(
         "fetch_topic",
         serde_json::json!({
             "project_key": &project_key,
             "topic_name": "Release.V31",
+            "agent_name": "BlueLake",
+            "registration_token": &recipient_token,
             "include_bodies": true,
             "limit": 10
         }),
@@ -2907,7 +3151,7 @@ fn topic_tools_persist_filter_and_inherit_topics_through_the_router() {
     )
     .unwrap_or_else(|error| panic!("fetch_topic failed: {error}"));
     let topic_messages = topic_messages.as_array().expect("fetch_topic array");
-    assert_eq!(topic_messages.len(), 2);
+    assert_eq!(topic_messages.len(), 3);
     assert!(
         topic_messages
             .iter()
@@ -2917,6 +3161,188 @@ fn topic_tools_persist_filter_and_inherit_topics_through_the_router() {
         topic_messages
             .iter()
             .any(|message| message["body_md"] == "topic reply")
+    );
+    let explicit_auth_error = invoke(
+        "fetch_topic",
+        serde_json::json!({
+            "project_key": &project_key,
+            "topic_name": "release.v31",
+            "agent_name": "BlueLake",
+            "registration_token": "wrong-token"
+        }),
+        &mut req_id,
+    )
+    .expect_err("explicit fetch_topic identity must authenticate even without unread_only");
+    assert!(
+        explicit_auth_error.to_string().contains("token")
+            || explicit_auth_error.to_string().contains("AUTHENTICATION"),
+        "unexpected explicit fetch_topic auth error: {explicit_auth_error}"
+    );
+    let whitespace_agent_error = invoke(
+        "fetch_topic",
+        serde_json::json!({
+            "project_key": &project_key,
+            "topic_name": "release.v31",
+            "agent_name": "   "
+        }),
+        &mut req_id,
+    )
+    .expect_err("whitespace fetch_topic identity must not fall back to anonymous access");
+    assert!(
+        whitespace_agent_error.to_string().contains("not found")
+            || whitespace_agent_error.to_string().contains("INVALID"),
+        "unexpected whitespace fetch_topic identity error: {whitespace_agent_error}"
+    );
+    for (stored_reply_id, expected_body) in [
+        (reply_id, "topic reply"),
+        (idempotent_reply_id, "idempotent topic reply"),
+    ] {
+        let stored_reply = topic_messages
+            .iter()
+            .find(|message| message["id"].as_i64() == Some(stored_reply_id))
+            .unwrap_or_else(|| panic!("missing stored reply body {expected_body}"));
+        assert_eq!(stored_reply["body_md"], expected_body);
+        assert_eq!(stored_reply["reply_to"].as_i64(), Some(message_id));
+    }
+
+    let witness_db_path = env.tmp.path().join("db.sqlite3");
+    let witness_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+        witness_db_path.to_str().expect("fixture DB path UTF-8"),
+    )
+    .expect("open fixture DB for activity witness");
+    witness_conn
+        .execute_raw("UPDATE agents SET last_active_ts = 1 WHERE name = 'BlueLake'")
+        .expect("age recipient activity witness");
+    drop(witness_conn);
+
+    let authenticated_topic_messages = invoke(
+        "fetch_topic",
+        serde_json::json!({
+            "project_key": &project_key,
+            "topic_name": "release.v31",
+            "agent_name": "BlueLake",
+            "registration_token": &recipient_token,
+            "include_bodies": false
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("authenticated fetch_topic failed: {error}"));
+    assert_eq!(
+        authenticated_topic_messages.as_array().map(Vec::len),
+        Some(3)
+    );
+    let witness_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+        witness_db_path.to_str().expect("fixture DB path UTF-8"),
+    )
+    .expect("reopen fixture DB explicit-auth activity witness");
+    let activity_rows = witness_conn
+        .query_sync(
+            "SELECT last_active_ts FROM agents WHERE name = 'BlueLake'",
+            &[],
+        )
+        .expect("query explicit-auth recipient activity");
+    assert!(
+        activity_rows[0]
+            .get_named::<i64>("last_active_ts")
+            .expect("last_active_ts")
+            > 1,
+        "authenticated fetch_topic must refresh caller activity without unread_only"
+    );
+    witness_conn
+        .execute_raw("UPDATE agents SET last_active_ts = 1 WHERE name = 'BlueLake'")
+        .expect("reset recipient activity before unread witness");
+    drop(witness_conn);
+
+    let unread_topic_messages = invoke(
+        "fetch_topic",
+        serde_json::json!({
+            "project_key": &project_key,
+            "topic_name": "release.v31",
+            "agent_name": "BlueLake",
+            "registration_token": &recipient_token,
+            "unread_only": true,
+            "include_bodies": false
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("authenticated unread fetch_topic failed: {error}"));
+    assert_eq!(unread_topic_messages.as_array().map(Vec::len), Some(1));
+    assert_eq!(unread_topic_messages[0]["id"].as_i64(), Some(message_id));
+    let witness_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+        witness_db_path.to_str().expect("fixture DB path UTF-8"),
+    )
+    .expect("reopen fixture DB for activity witness");
+    let activity_rows = witness_conn
+        .query_sync(
+            "SELECT last_active_ts FROM agents WHERE name = 'BlueLake'",
+            &[],
+        )
+        .expect("query refreshed recipient activity");
+    assert_eq!(activity_rows.len(), 1);
+    assert!(
+        activity_rows[0]
+            .get_named::<i64>("last_active_ts")
+            .expect("last_active_ts")
+            > 1,
+        "authenticated unread fetch_topic must refresh caller activity"
+    );
+
+    let summary = invoke(
+        "summarize_recent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "since_hours": 1.0,
+            "llm_mode": false,
+            "max_messages": 10
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("summarize_recent failed: {error}"));
+    let summary_id = summary["id"].as_i64().expect("persisted summary id");
+    let summary_message_count = summary["source_message_count"]
+        .as_i64()
+        .expect("summary source_message_count");
+    assert!(
+        summary_message_count >= 3,
+        "summary must include the topic parent and both stored replies"
+    );
+
+    let newer_summary = invoke(
+        "summarize_recent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "since_hours": 0.5,
+            "llm_mode": false,
+            "max_messages": 10
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("second summarize_recent failed: {error}"));
+    let newer_summary_id = newer_summary["id"]
+        .as_i64()
+        .expect("second persisted summary id");
+    assert_ne!(
+        newer_summary_id, summary_id,
+        "distinct windows must persist distinct summaries"
+    );
+
+    let summaries = invoke(
+        "fetch_summary",
+        serde_json::json!({
+            "project_key": &project_key,
+            "since_hours": 1.0,
+            "limit": 5
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("fetch_summary failed: {error}"));
+    let summaries = summaries.as_array().expect("fetch_summary array");
+    assert_eq!(summaries.len(), 2);
+    assert_eq!(summaries[0]["id"].as_i64(), Some(newer_summary_id));
+    assert_eq!(summaries[1]["id"].as_i64(), Some(summary_id));
+    assert_eq!(
+        summaries[0]["source_message_count"].as_i64(),
+        Some(summary_message_count)
     );
 
     let invalid_topic = invoke(
@@ -2929,8 +3355,8 @@ fn topic_tools_persist_filter_and_inherit_topics_through_the_router() {
     )
     .expect_err("invalid topic lookup must fail before querying");
     assert!(
-        invalid_topic.contains("INVALID_TOPIC"),
-        "expected typed invalid-topic error, got: {invalid_topic}"
+        invalid_topic.contains("Topic must be 1-64 characters"),
+        "expected invalid-topic validation error, got: {invalid_topic}"
     );
 
     let blank_topic = invoke(
@@ -2943,8 +3369,8 @@ fn topic_tools_persist_filter_and_inherit_topics_through_the_router() {
     )
     .expect_err("blank required topic lookup must fail");
     assert!(
-        blank_topic.contains("INVALID_ARGUMENT"),
-        "expected typed blank-topic error, got: {blank_topic}"
+        blank_topic.contains("topic_name must be a non-empty string"),
+        "expected blank-topic validation error, got: {blank_topic}"
     );
 }
 
@@ -3088,6 +3514,11 @@ fn product_bus_tools_end_to_end_across_linked_projects() {
 
     let config = mcp_agent_mail_core::Config::from_env();
     let router = mcp_agent_mail_server::build_server(&config).into_router();
+    mcp_agent_mail_core::Config::reset_cached();
+    assert!(
+        mcp_agent_mail_core::Config::get().worktrees_enabled,
+        "product-bus fixture requires WORKTREES_ENABLED"
+    );
     let cx = Cx::for_testing();
     let mut req_id: u64 = 1;
 
@@ -3367,6 +3798,8 @@ fn collect_files_recursive(base: &std::path::Path, dir: &std::path::Path, out: &
 fn fixture_schema_drift_guard() {
     let fixtures = Fixtures::load_default().expect("failed to load fixtures");
     let rust_native_tools = rust_native_tool_names();
+    let focused_compatibility_tools: BTreeSet<&str> =
+        FOCUSED_COMPATIBILITY_TOOLS.iter().copied().collect();
 
     // Every registered tool must be covered by the captured Python fixture, a
     // focused supplemental compatibility test, or an exact Rust-native golden.
@@ -3376,11 +3809,11 @@ fn fixture_schema_drift_guard() {
         .collect();
     for tool_name in &tool_names {
         let python_fixture = fixtures.tools.get(*tool_name);
-        let supplemental_fixture = SUPPLEMENTAL_COMPATIBILITY_TOOLS.contains(tool_name);
         let rust_native_fixture = rust_native_tools.contains(*tool_name);
+        let focused_compatibility_coverage = focused_compatibility_tools.contains(tool_name);
         assert!(
-            python_fixture.is_some() || supplemental_fixture || rust_native_fixture,
-            "tool {tool_name} is registered in TOOL_CLUSTER_MAP but has no captured, supplemental-compatibility, or Rust-native fixture"
+            python_fixture.is_some() || rust_native_fixture || focused_compatibility_coverage,
+            "tool {tool_name} is registered in TOOL_CLUSTER_MAP but has no Python-parity, focused-compatibility, or rust-native coverage"
         );
         if let Some(fixture) = python_fixture {
             assert!(
@@ -3403,14 +3836,14 @@ fn fixture_schema_drift_guard() {
             "rust-native fixture tool {tool_name} is not in TOOL_CLUSTER_MAP (stale fixture?)"
         );
     }
-    for tool_name in SUPPLEMENTAL_COMPATIBILITY_TOOLS {
+    for tool_name in FOCUSED_COMPATIBILITY_TOOLS {
         assert!(
             tool_names.contains(tool_name),
-            "supplemental compatibility tool {tool_name} is not in TOOL_CLUSTER_MAP (stale classification?)"
+            "focused compatibility tool {tool_name} is not in TOOL_CLUSTER_MAP (stale classification?)"
         );
         assert!(
             !fixtures.tools.contains_key(*tool_name) && !rust_native_tools.contains(*tool_name),
-            "supplemental compatibility tool {tool_name} must have exactly one conformance classification"
+            "focused compatibility tool {tool_name} must have exactly one conformance classification"
         );
     }
 

@@ -1451,6 +1451,15 @@ fn message_summary_response(
     })
 }
 
+fn render_summary_response(
+    json_result: &str,
+    format: Option<&str>,
+    config: &mcp_agent_mail_core::Config,
+) -> McpResult<String> {
+    mcp_agent_mail_core::apply_tool_format(json_result, format, config)
+        .map_err(|error| McpError::new(McpErrorCode::InvalidParams, error))
+}
+
 fn retain_latest_window<T>(mut rows: Vec<T>, limit: usize) -> (Vec<T>, bool) {
     let truncated = rows.len() > limit;
     if truncated {
@@ -1460,10 +1469,40 @@ fn retain_latest_window<T>(mut rows: Vec<T>, limit: usize) -> (Vec<T>, bool) {
     (rows, truncated)
 }
 
+fn cached_message_summary_matches_request(
+    summary: &mcp_agent_mail_db::MessageSummaryRow,
+    max_messages: usize,
+    llm_requested: bool,
+) -> bool {
+    // LLM output depends on the requested model and mutable provider settings.
+    // Without a persisted request fingerprint, recomputing is the only exact
+    // cache policy. Deterministic requests must likewise reject LLM output.
+    if llm_requested || summary.llm_model.is_some() {
+        return false;
+    }
+
+    let Ok(source_message_count) = usize::try_from(summary.source_message_count) else {
+        return false;
+    };
+    let Ok(summary_json) = serde_json::from_str::<serde_json::Value>(&summary.summary_text) else {
+        return false;
+    };
+    let truncated = summary_json
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    if truncated {
+        source_message_count == max_messages
+    } else {
+        source_message_count <= max_messages
+    }
+}
+
 /// Summarize and persist recent project-wide activity.
 #[allow(clippy::too_many_lines)]
 #[tool(
-    description = "Summarize all recent project messages within a time window.\n\nFetches messages from the last ``since_hours`` hours, groups them by\nthread, and produces a combined project-wide summary.  Results are\nstored in the ``message_summaries`` table for fast retrieval via\n``fetch_summary``.\n\nIdempotent: if a summary already exists for the same time window\n(within 5-minute tolerance) it is returned from cache.\n\nParameters\n----------\nproject_key : str\n    Project identifier (slug or human key).\nsince_hours : float\n    How far back to look (default 1 hour).\nllm_mode : bool\n    Use LLM to refine the summary (default True).\nllm_model : str, optional\n    Override LLM model name.\nmax_messages : int\n    Maximum messages to include (default 500, capped at 500).\nformat : str, optional\n    Output format (json or toon)."
+    description = "Summarize all recent project messages within a time window.\n\nFetches messages from the last ``since_hours`` hours, groups them by\nthread, and produces a combined project-wide summary.  Results are\nstored in the ``message_summaries`` table for fast retrieval via\n``fetch_summary``.\n\nCompatible deterministic summaries within a 5-minute window may be\nreturned from cache. LLM-refined requests are recomputed because the\ncache does not persist a complete model/provider request fingerprint.\n\nParameters\n----------\nproject_key : str\n    Project identifier (slug or human key).\nsince_hours : float\n    How far back to look (default 1 hour).\nllm_mode : bool\n    Use LLM to refine the summary (default True).\nllm_model : str, optional\n    Override LLM model name.\nmax_messages : int\n    Maximum messages to include (default 500, capped at 500).\nformat : str, optional\n    Output format (json or toon)."
 )]
 pub async fn summarize_recent(
     ctx: &McpContext,
@@ -1476,7 +1515,6 @@ pub async fn summarize_recent(
 ) -> McpResult<String> {
     const CACHE_TOLERANCE_US: i64 = 5 * 60 * 1_000_000;
 
-    let _ = format;
     let hours = validated_since_hours(since_hours, 1.0)?;
     let window_us = hours_to_micros(hours)?;
     let max_messages = usize::try_from(max_messages.unwrap_or(500).clamp(1, 500)).unwrap_or(500);
@@ -1485,6 +1523,8 @@ pub async fn summarize_recent(
     let project_id = project.id.unwrap_or(0);
     let now = mcp_agent_mail_db::now_micros();
     let window_start = now.saturating_sub(window_us);
+    let config = &mcp_agent_mail_core::Config::get();
+    let llm_requested = llm_mode.unwrap_or(true) && config.llm_enabled;
 
     let cached = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::find_cached_message_summary(
@@ -1498,8 +1538,11 @@ pub async fn summarize_recent(
         )
         .await,
     )?;
-    if let Some(summary) = cached {
-        return Ok(message_summary_response(&summary, true).to_string());
+    if let Some(summary) = cached.filter(|summary| {
+        cached_message_summary_matches_request(summary, max_messages, llm_requested)
+    }) {
+        let response = message_summary_response(&summary, true).to_string();
+        return render_summary_response(&response, format.as_deref(), config);
     }
 
     let rows = db_outcome_to_mcp_result(
@@ -1513,7 +1556,7 @@ pub async fn summarize_recent(
         .await,
     )?;
     if rows.is_empty() {
-        return Ok(json!({
+        let response = json!({
             "id": serde_json::Value::Null,
             "cached": false,
             "summary_text": format!("No activity in last {hours:?} hours."),
@@ -1525,7 +1568,8 @@ pub async fn summarize_recent(
             "cost_usd": serde_json::Value::Null,
             "created_ts": micros_to_iso(now),
         })
-        .to_string());
+        .to_string();
+        return render_summary_response(&response, format.as_deref(), config);
     }
 
     let (rows, truncated) = retain_latest_window(rows, max_messages);
@@ -1598,8 +1642,7 @@ pub async fn summarize_recent(
 
     let mut used_model = None;
     let mut cost_usd = None;
-    let config = &mcp_agent_mail_core::Config::get();
-    if llm_mode.unwrap_or(true) && config.llm_enabled {
+    if llm_requested {
         let system = "You are a senior engineering lead. Summarize the project messages from this time window into concise JSON with keys: key_decisions[], blockers_resolved[], work_completed[], open_questions[], participants[], total_messages (int), total_threads (int). Be specific and actionable.";
         let user = format!(
             "Time window: last {hours:?}h\n\n{}",
@@ -1650,7 +1693,8 @@ pub async fn summarize_recent(
     let stored = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::create_message_summary(ctx.cx(), &pool, &summary).await,
     )?;
-    Ok(message_summary_response(&stored, false).to_string())
+    let response = message_summary_response(&stored, false).to_string();
+    render_summary_response(&response, format.as_deref(), config)
 }
 
 /// Retrieve persisted project-wide summaries.
@@ -1664,11 +1708,10 @@ pub async fn fetch_summary(
     limit: Option<i32>,
     format: Option<String>,
 ) -> McpResult<String> {
-    let _ = format;
     let hours = validated_since_hours(since_hours, 24.0)?;
     let window_us = hours_to_micros(hours)?;
     let limit = usize::try_from(limit.unwrap_or(5).clamp(1, 1000)).unwrap_or(5);
-    let pool = get_read_db_pool(ctx.cx()).await?;
+    let pool = get_coalescer_bypass_read_db_pool()?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let cutoff = mcp_agent_mail_db::now_micros().saturating_sub(window_us);
     let summaries = db_outcome_to_mcp_result(
@@ -1691,8 +1734,13 @@ pub async fn fetch_summary(
             value
         })
         .collect();
-    serde_json::to_string(&response)
-        .map_err(|error| McpError::internal_error(format!("JSON error: {error}")))
+    let response = serde_json::to_string(&response)
+        .map_err(|error| McpError::internal_error(format!("JSON error: {error}")))?;
+    render_summary_response(
+        &response,
+        format.as_deref(),
+        &mcp_agent_mail_core::Config::get(),
+    )
 }
 
 #[cfg(test)]
@@ -1718,6 +1766,34 @@ mod tests {
         let (rows, truncated) = retain_latest_window(vec![2, 3], 2);
         assert_eq!(rows, vec![2, 3]);
         assert!(!truncated, "an exact-size window is not truncated");
+    }
+
+    #[test]
+    fn recent_summary_cache_matches_result_shaping_parameters() {
+        let mut summary = mcp_agent_mail_db::MessageSummaryRow {
+            id: Some(7),
+            project_id: 3,
+            summary_text: serde_json::json!({"total_messages": 4}).to_string(),
+            start_ts: 1_700_000_000_000_000,
+            end_ts: 1_700_003_600_000_000,
+            source_message_count: 4,
+            source_thread_ids: "[]".to_string(),
+            llm_model: None,
+            cost_usd: None,
+            created_ts: 1_700_003_600_000_000,
+        };
+
+        assert!(cached_message_summary_matches_request(&summary, 4, false));
+        assert!(cached_message_summary_matches_request(&summary, 10, false));
+        assert!(!cached_message_summary_matches_request(&summary, 3, false));
+        assert!(!cached_message_summary_matches_request(&summary, 10, true));
+
+        summary.summary_text = serde_json::json!({"truncated": true}).to_string();
+        assert!(cached_message_summary_matches_request(&summary, 4, false));
+        assert!(!cached_message_summary_matches_request(&summary, 10, false));
+
+        summary.llm_model = Some("test-model".to_string());
+        assert!(!cached_message_summary_matches_request(&summary, 4, false));
     }
 
     #[test]
@@ -1749,6 +1825,44 @@ mod tests {
         assert!(response["start_ts"].as_str().is_some());
         assert!(response["end_ts"].as_str().is_some());
         assert!(response["created_ts"].as_str().is_some());
+    }
+
+    #[test]
+    fn summary_response_format_json_is_passthrough() {
+        let config = mcp_agent_mail_core::Config::default();
+        let json = r#"{"id":7,"cached":false}"#;
+
+        assert_eq!(
+            render_summary_response(json, Some("json"), &config).unwrap(),
+            json
+        );
+    }
+
+    #[test]
+    fn summary_response_format_rejects_invalid_value() {
+        let config = mcp_agent_mail_core::Config::default();
+        let error = render_summary_response("[]", Some("xml"), &config)
+            .expect_err("unsupported format must fail");
+
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert!(error.message.contains("Expected 'json' or 'toon'"));
+    }
+
+    #[test]
+    fn summary_response_format_toon_falls_back_to_json_envelope() {
+        let config = mcp_agent_mail_core::Config {
+            toon_bin: Some("/definitely/missing/toon-encoder".to_string()),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let rendered = render_summary_response(r#"{"id":7}"#, Some("toon"), &config)
+            .expect("TOON encoder failure should return fallback envelope");
+        let envelope: serde_json::Value =
+            serde_json::from_str(&rendered).expect("fallback envelope JSON");
+
+        assert_eq!(envelope["format"], "json");
+        assert_eq!(envelope["data"]["id"], 7);
+        assert_eq!(envelope["meta"]["requested"], "toon");
+        assert!(envelope["meta"]["toon_error"].is_string());
     }
 
     #[test]
@@ -1853,6 +1967,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: None,
+            reply_to: None,
             topic: None,
             subject: "test".to_string(),
             body_md: body.to_string(),
