@@ -375,56 +375,34 @@ pub fn fetch_inbox_ack_overdue_metadata_rows_from_conn(
     )
 }
 
+/// Whether inbox rows materialize `body_md` or metadata only.
 #[derive(Clone, Copy)]
-enum InboxBodyPolicy {
+pub enum InboxBodyPolicy {
     Full,
     MetadataOnly,
 }
 
+/// Filter set for [`fetch_inbox_filtered_rows_from_conn`].
 #[derive(Clone, Copy)]
-struct InboxFetchOptions<'a> {
-    urgent_only: bool,
-    unread_only: bool,
-    ack_required_only: bool,
-    ack_overdue_before: Option<i64>,
-    topic: Option<&'a str>,
-    body_policy: InboxBodyPolicy,
+pub struct InboxFetchOptions<'a> {
+    pub urgent_only: bool,
+    pub unread_only: bool,
+    pub ack_required_only: bool,
+    pub ack_overdue_before: Option<i64>,
+    pub topic: Option<&'a str>,
+    pub body_policy: InboxBodyPolicy,
 }
 
 /// Fetch inbox rows with the complete filter set used by the MCP tool.
-#[allow(clippy::too_many_arguments)]
 pub fn fetch_inbox_filtered_rows_from_conn(
     conn: &DbConn,
     project_id: i64,
     agent_id: i64,
-    urgent_only: bool,
-    unread_only: bool,
-    ack_required_only: bool,
     since_ts: Option<i64>,
     limit: usize,
-    ack_overdue_before: Option<i64>,
-    topic: Option<&str>,
-    include_bodies: bool,
+    options: InboxFetchOptions<'_>,
 ) -> Result<Vec<InboxRow>, DbError> {
-    fetch_inbox_rows_from_conn_impl(
-        conn,
-        project_id,
-        agent_id,
-        since_ts,
-        limit,
-        InboxFetchOptions {
-            urgent_only,
-            unread_only,
-            ack_required_only,
-            ack_overdue_before,
-            topic,
-            body_policy: if include_bodies {
-                InboxBodyPolicy::Full
-            } else {
-                InboxBodyPolicy::MetadataOnly
-            },
-        },
-    )
+    fetch_inbox_rows_from_conn_impl(conn, project_id, agent_id, since_ts, limit, options)
 }
 
 fn fetch_inbox_rows_from_conn_impl(

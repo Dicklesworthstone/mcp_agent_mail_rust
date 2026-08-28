@@ -3957,12 +3957,7 @@ fn merge_salvaged_database(
         let mut source_deregistered_agents: HashMap<i64, Option<i64>> = HashMap::new();
         if has_agent_deregistrations {
             let columns = table_columns(&salvage_conn, "agent_deregistrations")?;
-            if !columns.contains("agent_id") {
-                stats.push_warning(format!(
-                    "Salvage database {} table agent_deregistrations is missing required column agent_id",
-                    salvage_db_path.display()
-                ));
-            } else {
+            if columns.contains("agent_id") {
                 let select = if columns.contains("deregistered_at") {
                     "agent_id, deregistered_at"
                 } else {
@@ -4003,6 +3998,11 @@ fn merge_salvaged_database(
                     };
                     source_deregistered_agents.insert(source_agent_id, deregistered_at);
                 }
+            } else {
+                stats.push_warning(format!(
+                    "Salvage database {} table agent_deregistrations is missing required column agent_id",
+                    salvage_db_path.display()
+                ));
             }
         }
         if has_projects {

@@ -10019,14 +10019,20 @@ async fn fetch_inbox_impl(
             &conn,
             project_id,
             agent_id,
-            options.urgent_only,
-            options.unread_only,
-            options.ack_required_only,
             since_ts,
             limit,
-            options.ack_overdue_before,
-            options.topic,
-            matches!(options.body_policy, InboxBodyPolicy::Full),
+            crate::sync::InboxFetchOptions {
+                urgent_only: options.urgent_only,
+                unread_only: options.unread_only,
+                ack_required_only: options.ack_required_only,
+                ack_overdue_before: options.ack_overdue_before,
+                topic: options.topic,
+                body_policy: if matches!(options.body_policy, InboxBodyPolicy::Full) {
+                    crate::sync::InboxBodyPolicy::Full
+                } else {
+                    crate::sync::InboxBodyPolicy::MetadataOnly
+                },
+            },
         )
     };
 
