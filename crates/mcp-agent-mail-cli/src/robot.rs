@@ -13308,6 +13308,14 @@ fn emit_robot_output(out: &str) {
     ftui_runtime::ftui_println!("{out}");
 }
 
+fn aggregate_robot_health_level(overall: &str, capacity_health_level: &str) -> String {
+    match overall {
+        "unhealthy" => "red".to_string(),
+        "degraded" if capacity_health_level == "green" => "yellow".to_string(),
+        _ => capacity_health_level.to_string(),
+    }
+}
+
 fn build_navigate_config_environment() -> (NavigateResult, Option<String>) {
     let config = mcp_agent_mail_core::Config::get();
     (
@@ -15011,7 +15019,13 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             #[derive(Serialize)]
             struct HealthData {
                 overall: String,
+                /// Aggregate robot-health level. This must agree with
+                /// `overall`, even when the capacity counters in this CLI
+                /// process are green but live server/database probes fail.
                 health_level: String,
+                /// Capacity/backpressure-only level retained as a distinct
+                /// signal for consumers that need the former field's detail.
+                capacity_health_level: String,
                 runtime_identity: serde_json::Value,
                 probes: Vec<HealthProbe>,
                 circuits: Vec<CircuitEntry>,
@@ -15039,6 +15053,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 config.http_port,
                 db_file.as_deref(),
             );
+            let aggregate_health_level = aggregate_robot_health_level(overall, &health_str);
 
             #[derive(Serialize)]
             struct CircuitEntry {
@@ -15103,7 +15118,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 format,
                 HealthData {
                     overall: overall.into(),
-                    health_level: health_str,
+                    health_level: aggregate_health_level,
+                    capacity_health_level: health_str,
                     runtime_identity,
                     probes,
                     circuits: circuit_entries,
@@ -18605,6 +18621,15 @@ mod tests {
         assert_eq!(v["overall"], "healthy");
         assert_eq!(v["health_level"], "green");
         assert_eq!(v["probes"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn aggregate_robot_health_level_never_contradicts_overall_verdict() {
+        assert_eq!(aggregate_robot_health_level("healthy", "green"), "green");
+        assert_eq!(aggregate_robot_health_level("degraded", "green"), "yellow");
+        assert_eq!(aggregate_robot_health_level("degraded", "yellow"), "yellow");
+        assert_eq!(aggregate_robot_health_level("unhealthy", "green"), "red");
+        assert_eq!(aggregate_robot_health_level("unhealthy", "red"), "red");
     }
 
     #[test]
@@ -23732,6 +23757,14 @@ mod tests {
         );
 
         assert_eq!(value["overall"], "unhealthy");
+        assert_eq!(
+            value["health_level"], "red",
+            "aggregate health level must not stay green when a decisive probe failed"
+        );
+        assert!(
+            value["capacity_health_level"].is_string(),
+            "capacity-only telemetry remains separately available"
+        );
         let schema_probe = value["probes"]
             .as_array()
             .expect("probes array")
