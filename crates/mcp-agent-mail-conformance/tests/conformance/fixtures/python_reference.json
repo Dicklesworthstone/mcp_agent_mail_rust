@@ -5623,7 +5623,7 @@
         }
       ]
     },
-    "resource://views/acks-stale/GreenCastle?project=abs-path-backend&ttl_seconds=60&limit=10": {
+    "resource://views/acks-stale/GreenCastle?project=abs-path-backend&ttl_seconds=86400&limit=10": {
       "cases": [
         {
           "name": "acks_stale",
@@ -5632,7 +5632,7 @@
             "ok": {
               "project": "/abs/path/backend",
               "agent": "GreenCastle",
-              "ttl_seconds": 60,
+              "ttl_seconds": 86400,
               "count": 0,
               "messages": []
             }
@@ -5640,7 +5640,7 @@
         }
       ]
     },
-    "resource://views/ack-overdue/GreenCastle?project=abs-path-backend&ttl_minutes=1&limit=10": {
+    "resource://views/ack-overdue/GreenCastle?project=abs-path-backend&ttl_minutes=1440&limit=10": {
       "cases": [
         {
           "name": "ack_overdue",

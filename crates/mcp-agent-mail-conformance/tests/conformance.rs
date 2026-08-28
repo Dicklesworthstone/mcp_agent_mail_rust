@@ -781,6 +781,15 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
             expected_err: expected_error_containing("limit must be at least 1"),
         },
         HandwrittenToolFailureCase {
+            tool_name: "fetch_topic",
+            case_name: "invalid_topic_error",
+            input: serde_json::json!({
+                "project_key": "missing-project",
+                "topic_name": "../never-stored"
+            }),
+            expected_err: expected_error_containing("INVALID_TOPIC"),
+        },
+        HandwrittenToolFailureCase {
             tool_name: "mark_message_read",
             case_name: "project_not_found_error",
             input: serde_json::json!({
@@ -950,7 +959,13 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
 }
 
 fn handwritten_tool_happy_case_tools() -> BTreeSet<&'static str> {
-    BTreeSet::from(["force_release_file_reservation"])
+    BTreeSet::from([
+        "deregister_agent",
+        "fetch_topic",
+        "force_release_file_reservation",
+        "retire_agent",
+        "unretire_agent",
+    ])
 }
 
 fn rust_native_tool_case_shapes() -> BTreeMap<String, (bool, bool)> {
