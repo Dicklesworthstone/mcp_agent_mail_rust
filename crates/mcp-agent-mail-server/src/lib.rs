@@ -6339,17 +6339,21 @@ fn atc_durable_experience_store_writable(pool: &mcp_agent_mail_db::DbPool) -> bo
 /// Whether the ATC operator may persist durable experience rows this run.
 ///
 /// Requires BOTH (a) an executing executor mode (Live/Canary — Shadow/DryRun
-/// suppress real actions and durable rows) AND (b) a non-Off write mode. Write
-/// mode Off — the default, or via `AM_ATC_WRITE_MODE=off`, `ATC_LEARNING_DISABLED`,
-/// or the runtime kill switch — means the learning ledger is NOT written,
-/// regardless of executor mode. The executor independently defaults to Shadow;
-/// Live/Canary execution and experience writes both require explicit opt-in.
+/// suppress real actions and durable rows) AND (b) Live write mode. Shadow write
+/// mode is trace-only; Off — the default, or via `AM_ATC_WRITE_MODE=off` —
+/// suppresses experience-ledger activity. `ATC_LEARNING_DISABLED` also disables
+/// the operator runtime entirely. The executor independently defaults to Shadow,
+/// so effect execution and experience persistence each require explicit opt-in.
+/// The file-backed runtime kill switch overrides an otherwise-live combination.
 fn atc_durable_writes_enabled(
     write_mode: mcp_agent_mail_core::AtcWriteMode,
     executor_mode: AtcExecutorMode,
     atc_db_pool: Option<&mcp_agent_mail_db::DbPool>,
+    kill_switch_active: bool,
 ) -> bool {
-    write_mode.is_live() && atc_durable_experience_store_enabled(executor_mode, atc_db_pool)
+    !kill_switch_active
+        && write_mode.is_live()
+        && atc_durable_experience_store_enabled(executor_mode, atc_db_pool)
 }
 
 fn atc_durable_experience_store_enabled(
@@ -8312,8 +8316,6 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     if atc_db_pool.is_none() {
         tracing::warn!("ATC durable experience append disabled: failed to acquire DB pool");
     }
-    let durable_writes_enabled =
-        atc_durable_writes_enabled(config.atc_write_mode, executor_mode, atc_db_pool.as_ref());
     let mut recent_actions = VecDeque::with_capacity(ATC_OPERATOR_ACTION_CAPACITY);
     let mut recent_executions = VecDeque::with_capacity(ATC_OPERATOR_EXECUTION_CAPACITY);
     let mut last_action_by_key: HashMap<String, i64> = HashMap::new();
@@ -8339,6 +8341,12 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
 
     while !stop.load(Ordering::Relaxed) {
         atc::refresh_kill_switch();
+        let durable_writes_enabled = atc_durable_writes_enabled(
+            config.atc_write_mode,
+            executor_mode,
+            atc_db_pool.as_ref(),
+            atc::atc_kill_switch_active(),
+        );
         let started_at = Instant::now();
         let sync_check_micros = mcp_agent_mail_core::timestamps::now_micros();
         if let Some(pool) = atc_db_pool.as_ref()
@@ -21361,7 +21369,7 @@ first body
     }
 
     #[test]
-    fn atc_durable_writes_require_non_off_write_mode_and_executing_executor() {
+    fn atc_durable_writes_require_live_write_mode_and_executing_executor() {
         use mcp_agent_mail_core::AtcWriteMode;
         let pool = create_pool(&DbPoolConfig {
             database_url: "sqlite:///:memory:".to_string(),
@@ -21378,37 +21386,51 @@ first body
         assert!(!atc_durable_writes_enabled(
             AtcWriteMode::Off,
             AtcExecutorMode::Live,
-            Some(&pool)
+            Some(&pool),
+            false
         ));
         assert!(!atc_durable_writes_enabled(
             AtcWriteMode::Off,
             AtcExecutorMode::Canary,
-            Some(&pool)
+            Some(&pool),
+            false
         ));
         // Shadow write mode is trace-only even with an executing executor.
         assert!(!atc_durable_writes_enabled(
             AtcWriteMode::Shadow,
             AtcExecutorMode::Live,
-            Some(&pool)
+            Some(&pool),
+            false
         ));
         // Live write mode + an executing executor allows durable writes.
         assert!(atc_durable_writes_enabled(
             AtcWriteMode::Live,
             AtcExecutorMode::Live,
-            Some(&pool)
+            Some(&pool),
+            false
         ));
         // A non-executing executor (Shadow/DryRun) still suppresses durable rows
         // even with a writing write mode.
         assert!(!atc_durable_writes_enabled(
             AtcWriteMode::Live,
             AtcExecutorMode::Shadow,
-            Some(&pool)
+            Some(&pool),
+            false
         ));
         // No pool → never writable.
         assert!(!atc_durable_writes_enabled(
             AtcWriteMode::Live,
             AtcExecutorMode::Live,
-            None
+            None,
+            false
+        ));
+        // The file-backed runtime kill switch is re-read every operator tick
+        // and overrides an otherwise fully-live configuration immediately.
+        assert!(!atc_durable_writes_enabled(
+            AtcWriteMode::Live,
+            AtcExecutorMode::Live,
+            Some(&pool),
+            true
         ));
     }
 
