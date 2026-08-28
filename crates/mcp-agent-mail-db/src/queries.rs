@@ -8197,6 +8197,10 @@ async fn ensure_message_participants_active_in_tx(
     Outcome::Ok(())
 }
 
+const INSERT_MESSAGE_RECIPIENT_SQL: &str = "INSERT INTO message_recipients \
+    (message_id, agent_id, kind, read_ts, ack_ts) \
+    VALUES (?, ?, ?, NULL, NULL) ON CONFLICT DO NOTHING";
+
 /// Inner transaction body for [`create_message_with_recipients`].
 ///
 /// Runs BEGIN CONCURRENT → INSERT message → INSERT recipients → COMMIT.
@@ -8359,22 +8363,23 @@ async fn create_message_with_recipients_tx(
     // This avoids a known multi-row INSERT + trigger path that can surface
     // spurious PRIMARY KEY conflicts in the franken sqlite engine.
     //
-    // `ON CONFLICT(message_id, agent_id) DO NOTHING` makes a re-driven insert
-    // idempotent (see #243 Bug 2): under busy/MVCC retry a partial re-drive of
-    // the recipient loop must not fail with a UNIQUE-constraint error that gets
-    // surfaced as a false `isError` after the message + all distinct recipients
-    // were already persisted. The caller de-duplicates recipient ids before this
-    // runs, so a genuinely-distinct recipient is never silently dropped; the
-    // post-commit visibility probe still verifies every distinct recipient is
-    // present, so a swallowed engine quirk cannot hide a missing row.
-    let insert_recipient_sql = "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (?, ?, ?, NULL, NULL) ON CONFLICT(message_id, agent_id) DO NOTHING";
+    // Targetless `ON CONFLICT DO NOTHING` makes a re-driven insert idempotent
+    // under both admitted primary-key shapes: current databases key on
+    // (message_id, agent_id), while legacy Python databases may also include
+    // kind. Naming only the current key makes SQLite reject the statement
+    // before insertion on those legacy databases. The caller de-duplicates
+    // recipient ids before this runs, so a genuinely distinct recipient is
+    // never silently dropped; the post-commit visibility probe still verifies
+    // every distinct recipient is present.
     for (agent_id, kind) in recipients {
         let params = [
             Value::BigInt(message_id),
             Value::BigInt(*agent_id),
             Value::Text((*kind).to_string()),
         ];
-        match map_sql_outcome(traw_execute(cx, tracked, insert_recipient_sql, &params).await) {
+        match map_sql_outcome(
+            traw_execute(cx, tracked, INSERT_MESSAGE_RECIPIENT_SQL, &params).await,
+        ) {
             Outcome::Ok(_) => {}
             Outcome::Err(error) => {
                 let existing_rows = match map_sql_outcome(
@@ -23472,6 +23477,59 @@ mod tests {
                 "both distinct recipients persisted exactly once"
             );
         });
+    }
+
+    #[test]
+    fn message_recipient_retry_insert_supports_current_and_legacy_primary_keys() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        for (schema_name, primary_key) in [
+            ("current", "PRIMARY KEY(message_id, agent_id)"),
+            ("legacy", "PRIMARY KEY(message_id, agent_id, kind)"),
+        ] {
+            let db_path = dir.path().join(format!("recipient_retry_{schema_name}.db"));
+            let conn = crate::DbConn::open_file(db_path.display().to_string())
+                .expect("open recipient retry fixture");
+            conn.execute_raw(&format!(
+                "CREATE TABLE message_recipients (\
+                    message_id INTEGER NOT NULL, \
+                    agent_id INTEGER NOT NULL, \
+                    kind TEXT NOT NULL, \
+                    read_ts INTEGER, \
+                    ack_ts INTEGER, \
+                    {primary_key}\
+                )"
+            ))
+            .unwrap_or_else(|error| panic!("create {schema_name} fixture: {error}"));
+
+            let params = [
+                Value::BigInt(8172),
+                Value::BigInt(193),
+                Value::Text("to".to_string()),
+            ];
+            conn.execute_sync(INSERT_MESSAGE_RECIPIENT_SQL, &params)
+                .unwrap_or_else(|error| panic!("insert into {schema_name} fixture: {error}"));
+            conn.execute_sync(INSERT_MESSAGE_RECIPIENT_SQL, &params)
+                .unwrap_or_else(|error| panic!("retry {schema_name} insert: {error}"));
+
+            let rows = conn
+                .query_sync(
+                    "SELECT COUNT(*) AS count, MIN(kind) AS kind FROM message_recipients",
+                    &[],
+                )
+                .unwrap_or_else(|error| panic!("query {schema_name} fixture: {error}"));
+            assert_eq!(
+                rows[0].get_named::<i64>("count").unwrap_or(-1),
+                1,
+                "{schema_name} retry must leave exactly one recipient row"
+            );
+            assert_eq!(
+                rows[0].get_named::<String>("kind").expect("recipient kind"),
+                "to",
+                "{schema_name} retry must preserve recipient kind"
+            );
+        }
     }
 
     #[test]
