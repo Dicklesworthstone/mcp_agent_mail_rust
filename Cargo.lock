@@ -2073,7 +2073,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "asupersync",
  "compact_str 0.10.0",
@@ -2088,7 +2088,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-embed"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -2104,7 +2104,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-fusion"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "ahash",
  "asupersync",
@@ -2123,7 +2123,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-index"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -2144,7 +2144,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-lexical"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -2183,7 +2183,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-rerank"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "asupersync",
  "frankensearch-core",
