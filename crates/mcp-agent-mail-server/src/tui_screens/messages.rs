@@ -9119,6 +9119,7 @@ first body
             vec![RawMessageRow {
                 id: 42,
                 subject: "Subject".to_string(),
+                topic: None,
                 body_md: "Body".to_string(),
                 thread_id: "thread-42".to_string(),
                 importance: "normal".to_string(),

@@ -4658,19 +4658,22 @@ mod tests {
         )
         .expect("insert contaminated reservation");
 
-        // Reproduce the read bug: under numeric comparison the TEXT value
-        // coerces to its leading digits (2027), so an un-expired reservation
-        // is invisible to `expires_ts > now_micros`.
-        let hidden = conn
+        // The row is stored as TEXT — the contamination GH#265 reports.
+        // Engines differ on how an INTEGER-affinity comparison treats a
+        // non-numeric TEXT value (canonical SQLite orders TEXT above every
+        // INTEGER, while numeric coercion hides the row), and typed i64
+        // decodes of the row are broken either way — so the repaired
+        // invariant, not any one comparison outcome, is the contract here.
+        let contaminated = conn
             .query_sync(
-                "SELECT COUNT(*) AS c FROM file_reservations WHERE expires_ts > ?",
-                &[Value::BigInt(1_700_000_000_000_000)],
+                "SELECT COUNT(*) AS c FROM file_reservations WHERE typeof(expires_ts) = 'text'",
+                &[],
             )
-            .expect("probe hidden reservation");
+            .expect("probe contaminated reservation");
         assert_eq!(
-            hidden[0].get_named::<i64>("c").unwrap_or(-1),
-            0,
-            "TEXT expires_ts must reproduce the hidden-reservation read bug before repair"
+            contaminated[0].get_named::<i64>("c").unwrap_or(-1),
+            1,
+            "fixture must store a TEXT expires_ts before repair"
         );
 
         // Second boot: the migration set is already complete, but the per-boot
