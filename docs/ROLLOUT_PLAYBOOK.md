@@ -76,7 +76,7 @@ cargo clippy --workspace --all-targets
 
 ```bash
 cargo test -p mcp-agent-mail-conformance
-# Expected: the conformance output matches the current 37-tool / 25-resource surface
+# Expected: the conformance output matches the current 48-tool / 25-resource surface
 ```
 
 ### 2.4 Dual-Mode E2E Suite

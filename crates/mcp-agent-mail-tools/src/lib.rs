@@ -2935,6 +2935,8 @@ pub const TOOL_CLUSTER_MAP: &[(&str, &str)] = &[
     // Search
     ("search_messages", clusters::SEARCH),
     ("summarize_thread", clusters::SEARCH),
+    ("summarize_recent", clusters::SEARCH),
+    ("fetch_summary", clusters::SEARCH),
     // Workflow macros
     ("macro_start_session", clusters::WORKFLOW_MACROS),
     ("macro_prepare_thread", clusters::WORKFLOW_MACROS),

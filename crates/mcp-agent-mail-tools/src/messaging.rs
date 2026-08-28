@@ -1525,6 +1525,7 @@ pub struct MessagePayload {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub reply_to: Option<i64>,
     pub topic: Option<String>,
     pub subject: String,
     pub body_md: String,
@@ -1690,6 +1691,7 @@ pub struct InboxMessage {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub reply_to: Option<i64>,
     pub topic: Option<String>,
     pub subject: String,
     pub importance: String,
@@ -2692,6 +2694,7 @@ effective_free_bytes={free}"
             project_id,
             sender_id,
             thread_id: message.thread_id,
+            reply_to: message.reply_to,
             topic: message.topic,
             subject: message.subject,
             body_md: message.body_md,
@@ -3649,6 +3652,7 @@ effective_free_bytes={free}"
             project_id,
             sender_id,
             thread_id: Some(thread_id.clone()),
+            reply_to: reply.reply_to,
             topic: reply.topic.clone(),
             subject: reply.subject.clone(),
             body_md: reply.body_md.clone(),
@@ -3699,6 +3703,150 @@ effective_free_bytes={free}"
     response
         .map(|json| crate::idempotency::with_replay_marker(json, idempotent_replay))
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+/// Fetch every message carrying a project-scoped topic tag.
+#[allow(clippy::too_many_arguments)]
+#[tool(
+    description = "Fetch all messages in a project with a given topic tag, regardless of recipient.\n\nParameters\n----------\nproject_key : str\n    Project identifier.\ntopic_name : str\n    The topic tag to filter by (case-insensitive).\nlimit : int\n    Max number of messages to return (default 50).\ninclude_bodies : bool\n    Include full Markdown bodies in the payloads (default true).\nsince_ts : Optional[str]\n    ISO-8601 timestamp; only messages newer than this are returned.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, importance, topic, [body_md] }\n\nRequires an authenticated identity via agent_name plus registration_token or a bound pane identity. unread_only additionally restricts results to unread recipient rows and never marks them read."
+)]
+pub async fn fetch_topic(
+    ctx: &McpContext,
+    project_key: String,
+    topic_name: String,
+    limit: Option<i32>,
+    include_bodies: Option<bool>,
+    since_ts: Option<String>,
+    agent_name: Option<String>,
+    unread_only: Option<bool>,
+    registration_token: Option<String>,
+    pane_id: Option<String>,
+    format: Option<String>,
+) -> McpResult<String> {
+    let _ = format;
+    let topic_name = topic_name.trim();
+    if topic_name.is_empty() {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "topic_name must be a non-empty string.",
+            true,
+            json!({ "argument": "topic_name" }),
+        ));
+    }
+    let msg_limit = limit.unwrap_or(50).clamp(1, 1000);
+    let msg_limit = usize::try_from(msg_limit).map_err(|_| {
+        legacy_tool_error(
+            "INVALID_LIMIT",
+            "limit exceeds the supported range",
+            true,
+            json!({ "provided": msg_limit, "min": 1, "max": 1000 }),
+        )
+    })?;
+    let include_body = include_bodies.unwrap_or(true);
+    let unread = unread_only.unwrap_or(false);
+    let since_micros = match &since_ts {
+        Some(timestamp) => Some(mcp_agent_mail_db::iso_to_micros(timestamp).ok_or_else(|| {
+            legacy_tool_error(
+                "INVALID_TIMESTAMP",
+                format!("Invalid since_ts format: '{timestamp}'. Expected ISO-8601."),
+                true,
+                json!({
+                    "provided": timestamp,
+                    "expected_format": "YYYY-MM-DDTHH:MM:SS+HH:MM",
+                }),
+            )
+        })?),
+        None => None,
+    };
+
+    let pool = get_coalescer_bypass_read_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let viewer_name = agent_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            mcp_agent_mail_core::pane_identity::resolve_identity_with_optional_pane(
+                &project.human_key,
+                pane_id.as_deref(),
+            )
+        })
+        .ok_or_else(|| {
+            legacy_tool_error(
+                "AUTHENTICATION_REQUIRED",
+                "fetch_topic requires agent_name plus registration_token, or a bound pane identity.",
+                true,
+                json!({ "token_param": "registration_token" }),
+            )
+        })?;
+    let viewer = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            &viewer_name,
+        )
+        .await,
+    )?;
+    crate::identity::authenticate_lifecycle_agent(
+        &project,
+        &viewer,
+        registration_token.as_deref(),
+        pane_id.as_deref(),
+        "fetch_topic",
+    )?;
+    let viewer_id = viewer
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+
+    let rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_topic_messages(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            topic_name,
+            since_micros,
+            Some(viewer_id),
+            unread,
+            msg_limit,
+        )
+        .await,
+    )?;
+    let messages: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            let mut payload = json!({
+                "id": row.id,
+                "project_id": row.project_id,
+                "sender_id": row.sender_id,
+                "thread_id": row.thread_id,
+                "reply_to": row.reply_to,
+                "topic": row.topic,
+                "subject": row.subject,
+                "importance": row.importance,
+                "ack_required": row.ack_required != 0,
+                "created_ts": micros_to_iso(row.created_ts),
+                "attachments": parse_attachment_metadata_json(&row.attachments),
+                "from": row.from.clone(),
+            });
+            if row.sender_project_id.is_some_and(|id| id != row.project_id) {
+                if let Some(human_key) = row.sender_project_human_key {
+                    payload["from_project"] = serde_json::Value::String(human_key);
+                }
+                if let Some(slug) = row.sender_project_slug {
+                    payload["from_project_slug"] = serde_json::Value::String(slug.clone());
+                    payload["from_address"] =
+                        serde_json::Value::String(format!("project:{slug}#{}", row.from));
+                }
+            }
+            if include_body {
+                payload["body_md"] = serde_json::Value::String(row.body_md);
+            }
+            payload
+        })
+        .collect();
+    serde_json::to_string(&messages)
+        .map_err(|error| McpError::internal_error(format!("JSON serialization error: {error}")))
 }
 
 /// Retrieve recent messages for an agent and mark returned rows read.
@@ -3859,6 +4007,7 @@ pub async fn fetch_inbox(
                 project_id: row.message.project_id,
                 sender_id: row.message.sender_id,
                 thread_id: row.message.thread_id,
+                reply_to: row.message.reply_to,
                 topic: row.message.topic,
                 subject: row.message.subject,
                 importance: row.message.importance,
@@ -6450,6 +6599,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: None,
+            reply_to: None,
             topic: None,
             subject: "test".into(),
             importance: "normal".into(),
@@ -6496,6 +6646,7 @@ mod tests {
         assert_eq!(json["body_md"], "Hello world");
         assert_eq!(json["ack_required"], true);
         assert_eq!(json["thread_id"], "thread-1");
+        assert_eq!(json["reply_to"], 41);
         assert_eq!(json["attachments"][0]["path"], "img.webp");
     }
 
@@ -6528,6 +6679,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: Some("thread-1".into()),
+            reply_to: None,
             topic: None,
             subject: "test".into(),
             importance: "normal".into(),
@@ -6560,6 +6712,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 1,
                 thread_id: None,
+                reply_to: None,
                 topic: None,
                 subject: "new".into(),
                 importance: "normal".into(),
@@ -6580,6 +6733,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 1,
                 thread_id: None,
+                reply_to: None,
                 topic: None,
                 subject: "already-read".into(),
                 importance: "normal".into(),
@@ -6600,6 +6754,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 1,
                 thread_id: None,
+                reply_to: None,
                 topic: None,
                 subject: "not-updated".into(),
                 importance: "normal".into(),
@@ -7571,6 +7726,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 1,
                 thread_id: None,
+                reply_to: None,
                 topic: None,
                 subject: "test".into(),
                 body_md: "body".into(),
@@ -7597,6 +7753,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: None,
+            reply_to: None,
             topic: None,
             subject: "s".into(),
             body_md: "b".into(),

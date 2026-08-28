@@ -1620,7 +1620,7 @@ pub struct AgentResponse {
     pub deregistered_at: Option<String>,
 }
 
-fn authenticate_lifecycle_agent(
+pub(crate) fn authenticate_lifecycle_agent(
     project: &mcp_agent_mail_db::ProjectRow,
     agent: &mcp_agent_mail_db::AgentRow,
     registration_token: Option<&str>,

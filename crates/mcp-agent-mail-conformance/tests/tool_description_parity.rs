@@ -508,6 +508,7 @@ fn cluster_messaging_descriptions() {
         "send_message",
         "reply_message",
         "fetch_inbox",
+        "fetch_topic",
         "fetch_inbox_events",
         "get_message_delivery_receipt",
         "mark_message_read",
@@ -539,11 +540,16 @@ fn cluster_file_reservations_descriptions() {
     ]);
 }
 
-/// Search cluster: search_messages, summarize_thread
+/// Search cluster descriptions.
 #[test]
 fn cluster_search_descriptions() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
-    check_cluster_descriptions(&["search_messages", "summarize_thread"]);
+    check_cluster_descriptions(&[
+        "search_messages",
+        "summarize_thread",
+        "summarize_recent",
+        "fetch_summary",
+    ]);
 }
 
 /// Macros cluster: macro_start_session, macro_prepare_thread, macro_file_reservation_cycle, macro_contact_handshake

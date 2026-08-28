@@ -418,9 +418,30 @@ fn fetch_inbox_rows_from_conn_impl(
         InboxBodyPolicy::Full => "m.body_md",
         InboxBodyPolicy::MetadataOnly => "'' AS body_md",
     };
+    let message_columns = conn
+        .query_sync("PRAGMA table_info(messages)", &[])
+        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+    let has_topic = message_columns.iter().any(|row| {
+        row.get_named::<String>("name")
+            .is_ok_and(|name| name.eq_ignore_ascii_case("topic"))
+    });
+    let has_reply_to = message_columns.iter().any(|row| {
+        row.get_named::<String>("name")
+            .is_ok_and(|name| name.eq_ignore_ascii_case("reply_to"))
+    });
+    let topic_select = if has_topic {
+        "m.topic"
+    } else {
+        "NULL AS topic"
+    };
+    let reply_to_select = if has_reply_to {
+        "m.reply_to"
+    } else {
+        "NULL AS reply_to"
+    };
 
     let mut sql = format!(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, {body_select}, \
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, {topic_select}, {reply_to_select}, m.subject, {body_select}, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
                 r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts, r.ack_ts \
          FROM message_recipients r \
@@ -478,6 +499,9 @@ fn fetch_inbox_rows_from_conn_impl(
         let topic: Option<String> = row
             .get_named("topic")
             .map_err(|e| DbError::Sqlite(e.to_string()))?;
+        let reply_to: Option<i64> = row
+            .get_named("reply_to")
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
         let subject: String = row
             .get_named("subject")
             .map_err(|e| DbError::Sqlite(e.to_string()))?;
@@ -519,6 +543,7 @@ fn fetch_inbox_rows_from_conn_impl(
                 sender_id,
                 thread_id,
                 topic,
+                reply_to,
                 subject,
                 body_md,
                 importance,

@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::llm;
 use crate::tool_util::{
-    db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_read_db_pool,
+    db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_db_pool, get_read_db_pool,
     legacy_tool_error, resolve_existing_project, resolve_project,
 };
 
@@ -1405,10 +1405,351 @@ pub async fn summarize_thread(
     }
 }
 
+fn validated_since_hours(value: Option<f64>, default: f64) -> McpResult<f64> {
+    const MAX_SINCE_HOURS: f64 = 24.0 * 365.0 * 100.0;
+    let hours = value.unwrap_or(default);
+    if !hours.is_finite() || hours <= 0.0 || hours > MAX_SINCE_HOURS {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!("since_hours must be finite and in (0, {MAX_SINCE_HOURS}], got {hours}"),
+            true,
+            json!({ "field": "since_hours", "provided": hours }),
+        ));
+    }
+    Ok(hours)
+}
+
+fn hours_to_micros(hours: f64) -> McpResult<i64> {
+    let duration = std::time::Duration::from_secs_f64(hours * 3_600.0);
+    i64::try_from(duration.as_micros()).map_err(|_| {
+        legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "since_hours exceeds the supported timestamp range",
+            true,
+            json!({ "field": "since_hours", "provided": hours }),
+        )
+    })
+}
+
+fn message_summary_response(
+    summary: &mcp_agent_mail_db::MessageSummaryRow,
+    cached: bool,
+) -> serde_json::Value {
+    let source_thread_ids = serde_json::from_str::<serde_json::Value>(&summary.source_thread_ids)
+        .unwrap_or_else(|_| json!([]));
+    json!({
+        "id": summary.id,
+        "cached": cached,
+        "summary_text": summary.summary_text,
+        "start_ts": micros_to_iso(summary.start_ts),
+        "end_ts": micros_to_iso(summary.end_ts),
+        "source_message_count": summary.source_message_count,
+        "source_thread_ids": source_thread_ids,
+        "llm_model": summary.llm_model,
+        "cost_usd": summary.cost_usd,
+        "created_ts": micros_to_iso(summary.created_ts),
+    })
+}
+
+fn retain_latest_window<T>(mut rows: Vec<T>, limit: usize) -> (Vec<T>, bool) {
+    let truncated = rows.len() > limit;
+    if truncated {
+        let excess = rows.len() - limit;
+        rows.drain(..excess);
+    }
+    (rows, truncated)
+}
+
+/// Summarize and persist recent project-wide activity.
+#[allow(clippy::too_many_lines)]
+#[tool(
+    description = "Summarize all recent project messages within a time window.\n\nFetches messages from the last ``since_hours`` hours, groups them by\nthread, and produces a combined project-wide summary.  Results are\nstored in the ``message_summaries`` table for fast retrieval via\n``fetch_summary``.\n\nIdempotent: if a summary already exists for the same time window\n(within 5-minute tolerance) it is returned from cache.\n\nParameters\n----------\nproject_key : str\n    Project identifier (slug or human key).\nsince_hours : float\n    How far back to look (default 1 hour).\nllm_mode : bool\n    Use LLM to refine the summary (default True).\nllm_model : str, optional\n    Override LLM model name.\nmax_messages : int\n    Maximum messages to include (default 500, capped at 500).\nformat : str, optional\n    Output format (json or toon)."
+)]
+pub async fn summarize_recent(
+    ctx: &McpContext,
+    project_key: String,
+    since_hours: Option<f64>,
+    llm_mode: Option<bool>,
+    llm_model: Option<String>,
+    max_messages: Option<i32>,
+    format: Option<String>,
+) -> McpResult<String> {
+    const CACHE_TOLERANCE_US: i64 = 5 * 60 * 1_000_000;
+
+    let _ = format;
+    let hours = validated_since_hours(since_hours, 1.0)?;
+    let window_us = hours_to_micros(hours)?;
+    let max_messages = usize::try_from(max_messages.unwrap_or(500).clamp(1, 500)).unwrap_or(500);
+    let pool = get_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let project_id = project.id.unwrap_or(0);
+    let now = mcp_agent_mail_db::now_micros();
+    let window_start = now.saturating_sub(window_us);
+
+    let cached = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::find_cached_message_summary(
+            ctx.cx(),
+            &pool,
+            project_id,
+            window_start.saturating_sub(CACHE_TOLERANCE_US),
+            window_start.saturating_add(CACHE_TOLERANCE_US),
+            now.saturating_sub(CACHE_TOLERANCE_US),
+            now.saturating_add(CACHE_TOLERANCE_US),
+        )
+        .await,
+    )?;
+    if let Some(summary) = cached {
+        return Ok(message_summary_response(&summary, true).to_string());
+    }
+
+    let rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_recent_project_messages(
+            ctx.cx(),
+            &pool,
+            project_id,
+            window_start,
+            max_messages.saturating_add(1),
+        )
+        .await,
+    )?;
+    if rows.is_empty() {
+        return Ok(json!({
+            "id": serde_json::Value::Null,
+            "cached": false,
+            "summary_text": format!("No activity in last {hours:?} hours."),
+            "start_ts": micros_to_iso(window_start),
+            "end_ts": micros_to_iso(now),
+            "source_message_count": 0,
+            "source_thread_ids": [],
+            "llm_model": serde_json::Value::Null,
+            "cost_usd": serde_json::Value::Null,
+            "created_ts": micros_to_iso(now),
+        })
+        .to_string());
+    }
+
+    let (rows, truncated) = retain_latest_window(rows, max_messages);
+    let source_message_count = rows.len();
+    let llm_excerpts: Vec<String> = rows
+        .iter()
+        .take(30)
+        .map(|message| {
+            let thread_id = message
+                .thread_id
+                .clone()
+                .unwrap_or_else(|| format!("msg-{}", message.id));
+            let body: String = message.body_md.chars().take(400).collect();
+            format!(
+                "[{thread_id}] {}: {}\n{body}",
+                message.from, message.subject
+            )
+        })
+        .collect();
+
+    let mut thread_order = Vec::new();
+    let mut threads: HashMap<String, Vec<mcp_agent_mail_db::queries::ThreadMessageRow>> =
+        HashMap::new();
+    for message in rows {
+        let thread_id = message
+            .thread_id
+            .clone()
+            .unwrap_or_else(|| format!("msg-{}", message.id));
+        if !threads.contains_key(&thread_id) {
+            thread_order.push(thread_id.clone());
+        }
+        threads.entry(thread_id).or_default().push(message);
+    }
+    let mut thread_ids = thread_order.clone();
+    thread_ids.sort();
+
+    let mut participants = HashSet::new();
+    let mut key_points = Vec::new();
+    let mut action_items = Vec::new();
+    let mut open_actions = 0_i64;
+    let mut done_actions = 0_i64;
+    for thread_id in &thread_order {
+        if let Some(messages) = threads.get(thread_id) {
+            let summary = summarize_messages(messages);
+            participants.extend(summary.participants);
+            key_points.extend(summary.key_points);
+            action_items.extend(summary.action_items);
+            open_actions = open_actions.saturating_add(summary.open_actions);
+            done_actions = done_actions.saturating_add(summary.done_actions);
+        }
+    }
+    let mut participants: Vec<String> = participants.into_iter().collect();
+    participants.sort();
+    key_points.truncate(20);
+    action_items.truncate(20);
+    let mut combined = json!({
+        "participants": participants,
+        "key_points": key_points,
+        "action_items": action_items,
+        "total_messages": source_message_count,
+        "total_threads": threads.len(),
+        "open_actions": open_actions,
+        "done_actions": done_actions,
+    });
+    if truncated {
+        combined["truncated"] = serde_json::Value::Bool(true);
+        combined["truncation_note"] =
+            serde_json::Value::String(format!("Limited to {max_messages} most recent messages."));
+    }
+
+    let mut used_model = None;
+    let mut cost_usd = None;
+    let config = &mcp_agent_mail_core::Config::get();
+    if llm_mode.unwrap_or(true) && config.llm_enabled {
+        let system = "You are a senior engineering lead. Summarize the project messages from this time window into concise JSON with keys: key_decisions[], blockers_resolved[], work_completed[], open_questions[], participants[], total_messages (int), total_threads (int). Be specific and actionable.";
+        let user = format!(
+            "Time window: last {hours:?}h\n\n{}",
+            llm_excerpts.join("\n\n")
+        );
+        match llm::complete_system_user(
+            ctx.cx(),
+            system,
+            &user,
+            llm_model.as_deref(),
+            Some(config.llm_temperature),
+            Some(config.llm_max_tokens),
+        )
+        .await
+        {
+            Ok(output) => {
+                let parsed = llm::parse_json_safely(&output.content);
+                used_model = Some(output.model);
+                cost_usd = output.estimated_cost_usd;
+                if let Some(mut parsed) = parsed
+                    && parsed.as_object().is_some_and(|object| !object.is_empty())
+                {
+                    parsed["total_messages"] = json!(source_message_count);
+                    parsed["total_threads"] = json!(threads.len());
+                    if truncated {
+                        parsed["truncated"] = serde_json::Value::Bool(true);
+                    }
+                    combined = parsed;
+                }
+            }
+            Err(error) => tracing::debug!("summarize_recent.llm_skipped: {error}"),
+        }
+    }
+
+    let summary = mcp_agent_mail_db::MessageSummaryRow {
+        id: None,
+        project_id,
+        summary_text: combined.to_string(),
+        start_ts: window_start,
+        end_ts: now,
+        source_message_count: i64::try_from(source_message_count).unwrap_or(i64::MAX),
+        source_thread_ids: serde_json::to_string(&thread_ids)
+            .map_err(|error| McpError::internal_error(format!("JSON error: {error}")))?,
+        llm_model: used_model,
+        cost_usd,
+        created_ts: mcp_agent_mail_db::now_micros(),
+    };
+    let stored = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::create_message_summary(ctx.cx(), &pool, &summary).await,
+    )?;
+    Ok(message_summary_response(&stored, false).to_string())
+}
+
+/// Retrieve persisted project-wide summaries.
+#[tool(
+    description = "Retrieve stored project-wide summaries.\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nsince_hours : float\n    Return summaries whose end_ts is within this window (default 24h).\nlimit : int\n    Maximum summaries to return (default 5).\nformat : str, optional\n    Output format."
+)]
+pub async fn fetch_summary(
+    ctx: &McpContext,
+    project_key: String,
+    since_hours: Option<f64>,
+    limit: Option<i32>,
+    format: Option<String>,
+) -> McpResult<String> {
+    let _ = format;
+    let hours = validated_since_hours(since_hours, 24.0)?;
+    let window_us = hours_to_micros(hours)?;
+    let limit = usize::try_from(limit.unwrap_or(5).clamp(1, 1000)).unwrap_or(5);
+    let pool = get_read_db_pool(ctx.cx()).await?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let cutoff = mcp_agent_mail_db::now_micros().saturating_sub(window_us);
+    let summaries = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_message_summaries(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            cutoff,
+            limit,
+        )
+        .await,
+    )?;
+    let response: Vec<serde_json::Value> = summaries
+        .iter()
+        .map(|summary| {
+            let mut value = message_summary_response(summary, false);
+            if let Some(object) = value.as_object_mut() {
+                object.remove("cached");
+            }
+            value
+        })
+        .collect();
+    serde_json::to_string(&response)
+        .map_err(|error| McpError::internal_error(format!("JSON error: {error}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mcp_agent_mail_db::queries::ThreadMessageRow;
+
+    #[test]
+    fn recent_summary_window_validation_rejects_invalid_values() {
+        assert_eq!(validated_since_hours(None, 1.0).unwrap(), 1.0);
+        assert_eq!(validated_since_hours(Some(1.5), 1.0).unwrap(), 1.5);
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY, 1_000_000.0] {
+            assert!(validated_since_hours(Some(value), 1.0).is_err());
+        }
+    }
+
+    #[test]
+    fn recent_summary_retains_latest_window_and_uses_sentinel_for_truncation() {
+        let (rows, truncated) = retain_latest_window(vec![1, 2, 3], 2);
+        assert_eq!(rows, vec![2, 3]);
+        assert!(truncated);
+
+        let (rows, truncated) = retain_latest_window(vec![2, 3], 2);
+        assert_eq!(rows, vec![2, 3]);
+        assert!(!truncated, "an exact-size window is not truncated");
+    }
+
+    #[test]
+    fn message_summary_response_matches_python_shape() {
+        let summary = mcp_agent_mail_db::MessageSummaryRow {
+            id: Some(7),
+            project_id: 3,
+            summary_text: "summary".to_string(),
+            start_ts: 1_700_000_000_000_000,
+            end_ts: 1_700_003_600_000_000,
+            source_message_count: 4,
+            source_thread_ids: "[\"thread-a\",\"thread-b\"]".to_string(),
+            llm_model: Some("test-model".to_string()),
+            cost_usd: Some(0.25),
+            created_ts: 1_700_003_601_000_000,
+        };
+
+        let response = message_summary_response(&summary, true);
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["cached"], true);
+        assert_eq!(response["summary_text"], "summary");
+        assert_eq!(response["source_message_count"], 4);
+        assert_eq!(
+            response["source_thread_ids"],
+            json!(["thread-a", "thread-b"])
+        );
+        assert_eq!(response["llm_model"], "test-model");
+        assert_eq!(response["cost_usd"], 0.25);
+        assert!(response["start_ts"].as_str().is_some());
+        assert!(response["end_ts"].as_str().is_some());
+        assert!(response["created_ts"].as_str().is_some());
+    }
 
     #[test]
     fn parse_thread_ids_trims_and_drops_empty_values() {

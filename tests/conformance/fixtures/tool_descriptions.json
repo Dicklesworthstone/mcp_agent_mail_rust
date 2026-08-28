@@ -2093,6 +2093,44 @@
       }
     },
     {
+      "name": "sweep_stale_agents",
+      "description": "Retire abandoned agents in the caller's project using the server's conservative inactivity heuristic. The caller is never retired, the threshold has a 60-second floor, and active file reservations block retirement by default.",
+      "inputSchema": {
+        "properties": {
+          "project_key": {
+            "type": "string"
+          },
+          "agent_name": {
+            "type": "string"
+          },
+          "threshold_seconds": {
+            "default": 86400,
+            "type": "integer"
+          },
+          "require_no_active_reservations": {
+            "default": true,
+            "type": "boolean"
+          },
+          "registration_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name"
+        ],
+        "type": "object"
+      }
+    },
+    {
       "name": "uninstall_precommit_guard",
       "description": "",
       "inputSchema": {
@@ -2157,5 +2195,5 @@
       }
     }
   ],
-  "tool_count": 43
+  "tool_count": 44
 }

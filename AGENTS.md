@@ -565,7 +565,7 @@ mcp_agent_mail_rust/
 | Messaging | 8 | send_message, reply_message, fetch_inbox, fetch_topic, fetch_inbox_events, get_message_delivery_receipt, acknowledge_message, mark_message_read |
 | Contacts | 4 | request_contact, respond_contact, list_contacts, set_contact_policy |
 | File Reservations | 5 | check_file_reservation_conflicts, file_reservation_paths, renew_file_reservations, release_file_reservations, force_release_file_reservation |
-| Search | 2 | search_messages, summarize_thread |
+| Search | 4 | search_messages, summarize_thread, summarize_recent, fetch_summary |
 | Macros | 4 | macro_start_session, macro_prepare_thread, macro_contact_handshake, macro_file_reservation_cycle |
 | Product Bus | 5 | ensure_product, products_link, search_messages_product, fetch_inbox_product, summarize_thread_product |
 | Build Slots | 3 | acquire_build_slot, renew_build_slot, release_build_slot |

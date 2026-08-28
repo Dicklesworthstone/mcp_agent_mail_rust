@@ -864,6 +864,20 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
     let server = add_tool(
         server,
         config,
+        "summarize_recent",
+        clusters::SEARCH,
+        SummarizeRecent,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "fetch_summary",
+        clusters::SEARCH,
+        FetchSummary,
+    );
+    let server = add_tool(
+        server,
+        config,
         "macro_start_session",
         clusters::WORKFLOW_MACROS,
         MacroStartSession,

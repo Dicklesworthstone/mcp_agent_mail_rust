@@ -38408,6 +38408,7 @@ fn inbox_row_to_json(
         "kind": r.kind,
         "thread_id": r.message.thread_id,
         "topic": r.message.topic,
+        "reply_to": r.message.reply_to,
     });
     if include_body && let Some(obj) = v.as_object_mut() {
         obj.insert(
@@ -38429,6 +38430,7 @@ fn product_inbox_row_to_json(
         "sender_id": r.message.sender_id,
         "thread_id": r.message.thread_id,
         "topic": r.message.topic,
+        "reply_to": r.message.reply_to,
         "subject": r.message.subject,
         "importance": r.message.importance,
         "ack_required": r.message.ack_required != 0,
@@ -39683,6 +39685,10 @@ mod mail_server_cli_bridge_tests {
             Some(7)
         );
         assert_eq!(
+            json.get("reply_to").and_then(serde_json::Value::as_i64),
+            Some(41)
+        );
+        assert_eq!(
             json.get("sender_id").and_then(serde_json::Value::as_i64),
             Some(11)
         );
@@ -39715,6 +39721,7 @@ mod mail_server_cli_bridge_tests {
                 sender_id: 11,
                 thread_id: Some("br-43".to_string()),
                 topic: None,
+                reply_to: None,
                 subject: "Broken attachments".to_string(),
                 body_md: "Body".to_string(),
                 importance: "high".to_string(),

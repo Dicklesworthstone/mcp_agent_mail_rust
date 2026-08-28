@@ -89,7 +89,6 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_project_created ON messages(project_id, created_ts);
 CREATE INDEX IF NOT EXISTS idx_messages_project_sender_created ON messages(project_id, sender_id, created_ts);
 CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id);
-CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages(project_id, topic);
 CREATE INDEX IF NOT EXISTS idx_messages_importance ON messages(importance);
 CREATE INDEX IF NOT EXISTS idx_messages_created_ts ON messages(created_ts);
 CREATE INDEX IF NOT EXISTS idx_msg_thread_created ON messages(thread_id, created_ts);
@@ -154,6 +153,37 @@ CREATE INDEX IF NOT EXISTS idx_agent_links_status ON agent_links(status);
 CREATE INDEX IF NOT EXISTS idx_al_a_agent_status ON agent_links(a_project_id, a_agent_id, status);
 CREATE INDEX IF NOT EXISTS idx_al_b_agent_status ON agent_links(b_project_id, b_agent_id, status);
 CREATE INDEX IF NOT EXISTS idx_agent_links_updated_id_desc ON agent_links(updated_ts DESC, id DESC);
+
+-- Persistent terminal-window identities
+CREATE TABLE IF NOT EXISTS window_identities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    window_uuid TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    created_ts INTEGER NOT NULL,
+    last_active_ts INTEGER NOT NULL,
+    expires_ts INTEGER,
+    UNIQUE(project_id, window_uuid)
+);
+CREATE INDEX IF NOT EXISTS idx_window_identities_project ON window_identities(project_id);
+CREATE INDEX IF NOT EXISTS idx_window_identities_uuid ON window_identities(window_uuid);
+CREATE INDEX IF NOT EXISTS idx_window_identities_project_active ON window_identities(project_id, expires_ts);
+
+-- On-demand project-wide summaries
+CREATE TABLE IF NOT EXISTS message_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    summary_text TEXT NOT NULL,
+    start_ts INTEGER NOT NULL,
+    end_ts INTEGER NOT NULL,
+    source_message_count INTEGER NOT NULL DEFAULT 0,
+    source_thread_ids TEXT NOT NULL DEFAULT '[]',
+    llm_model TEXT,
+    cost_usd REAL,
+    created_ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_summaries_project ON message_summaries(project_id);
+CREATE INDEX IF NOT EXISTS idx_summaries_project_end ON message_summaries(project_id, end_ts);
 
 -- Project sibling suggestions
 CREATE TABLE IF NOT EXISTS project_sibling_suggestions (
@@ -2343,6 +2373,61 @@ pub fn schema_migrations() -> Vec<Migration> {
          SELECT id, last_active_ts FROM agents \
          WHERE task_description LIKE '[DEREGISTERED %'"
             .to_string(),
+        String::new(),
+    ));
+
+    // Python persists the explicit parent edge separately from thread_id. The
+    // preflight probe skips this ALTER on imported databases where the column
+    // already exists.
+    migrations.push(Migration::new(
+        "v29_messages_reply_to".to_string(),
+        "preserve Python parent-to-child reply edges".to_string(),
+        "ALTER TABLE messages ADD COLUMN reply_to INTEGER DEFAULT NULL".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v29_idx_messages_reply_to".to_string(),
+        "index persisted parent-to-child reply edges".to_string(),
+        "CREATE INDEX IF NOT EXISTS ix_messages_reply_to ON messages(reply_to)".to_string(),
+        String::new(),
+    ));
+
+    // ── v29: Python compatibility state ────────────────────────────
+    //
+    // Generated v1 migrations create these tables for Rust-native
+    // databases. Imported Python databases already have them with
+    // SQLAlchemy DATETIME/TEXT values, so normalize those timestamps to the
+    // integer-microsecond convention used by every Rust query.
+    migrations.push(Migration::new(
+        "v29_fix_window_identities_text_timestamps".to_string(),
+        "convert imported window identity timestamps to integer microseconds".to_string(),
+        format!(
+            "UPDATE window_identities SET \
+             created_ts = CASE WHEN typeof(created_ts) = 'text' THEN ({}) ELSE created_ts END, \
+             last_active_ts = CASE WHEN typeof(last_active_ts) = 'text' THEN ({}) ELSE last_active_ts END, \
+             expires_ts = CASE WHEN typeof(expires_ts) = 'text' THEN ({}) ELSE expires_ts END \
+             WHERE typeof(created_ts) = 'text' OR typeof(last_active_ts) = 'text' \
+             OR typeof(expires_ts) = 'text'",
+            ts_conversion("created_ts"),
+            ts_conversion("last_active_ts"),
+            ts_conversion("expires_ts")
+        ),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v29_fix_message_summaries_text_timestamps".to_string(),
+        "convert imported message summary timestamps to integer microseconds".to_string(),
+        format!(
+            "UPDATE message_summaries SET \
+             start_ts = CASE WHEN typeof(start_ts) = 'text' THEN ({}) ELSE start_ts END, \
+             end_ts = CASE WHEN typeof(end_ts) = 'text' THEN ({}) ELSE end_ts END, \
+             created_ts = CASE WHEN typeof(created_ts) = 'text' THEN ({}) ELSE created_ts END \
+             WHERE typeof(start_ts) = 'text' OR typeof(end_ts) = 'text' \
+             OR typeof(created_ts) = 'text'",
+            ts_conversion("start_ts"),
+            ts_conversion("end_ts"),
+            ts_conversion("created_ts")
+        ),
         String::new(),
     ));
 
@@ -6178,6 +6263,43 @@ mod tests {
             ],
         ).expect("insert legacy product_project_link");
 
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS window_identities (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, window_uuid TEXT NOT NULL, display_name TEXT NOT NULL, created_ts DATETIME NOT NULL, last_active_ts DATETIME NOT NULL, expires_ts DATETIME, UNIQUE(project_id, window_uuid))",
+            &[],
+        )
+        .expect("create legacy window_identities table");
+        conn.execute_sync(
+            "INSERT INTO window_identities (project_id, window_uuid, display_name, created_ts, last_active_ts, expires_ts) VALUES (?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::Text("window-legacy".to_string()),
+                Value::Text("BlueLake".to_string()),
+                Value::Text("2026-02-04 22:40:00.100000".to_string()),
+                Value::Text("2026-02-04 22:45:00.200000".to_string()),
+                Value::Text("2026-02-05 22:45:00.300000".to_string()),
+            ],
+        )
+        .expect("insert legacy window identity");
+
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS message_summaries (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, summary_text TEXT NOT NULL, start_ts DATETIME NOT NULL, end_ts DATETIME NOT NULL, source_message_count INTEGER NOT NULL DEFAULT 0, source_thread_ids TEXT NOT NULL DEFAULT '[]', llm_model TEXT, cost_usd REAL, created_ts DATETIME NOT NULL)",
+            &[],
+        )
+        .expect("create legacy message_summaries table");
+        conn.execute_sync(
+            "INSERT INTO message_summaries (project_id, summary_text, start_ts, end_ts, source_message_count, source_thread_ids, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::Text("legacy summary".to_string()),
+                Value::Text("2026-02-04 21:45:00.400000".to_string()),
+                Value::Text("2026-02-04 22:45:00.500000".to_string()),
+                Value::BigInt(3),
+                Value::Text("[\"thread-1\"]".to_string()),
+                Value::Text("2026-02-04 22:46:00.600000".to_string()),
+            ],
+        )
+        .expect("insert legacy message summary");
+
         // Run migrations (v3 should convert TEXT timestamps).
         block_on({
             let conn = &conn;
@@ -6257,6 +6379,51 @@ mod tests {
             link_created > 1_700_000_000_000_000,
             "product_project_links.created_at should be microseconds: {link_created}"
         );
+
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(created_ts) AS created_type, typeof(last_active_ts) AS active_type, typeof(expires_ts) AS expires_type FROM window_identities",
+                &[],
+            )
+            .expect("query migrated window identity timestamps");
+        assert_eq!(
+            rows[0].get_named::<String>("created_type").unwrap(),
+            "integer"
+        );
+        assert_eq!(
+            rows[0].get_named::<String>("active_type").unwrap(),
+            "integer"
+        );
+        assert_eq!(
+            rows[0].get_named::<String>("expires_type").unwrap(),
+            "integer"
+        );
+
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(start_ts) AS start_type, typeof(end_ts) AS end_type, typeof(created_ts) AS created_type FROM message_summaries",
+                &[],
+            )
+            .expect("query migrated message summary timestamps");
+        assert_eq!(
+            rows[0].get_named::<String>("start_type").unwrap(),
+            "integer"
+        );
+        assert_eq!(rows[0].get_named::<String>("end_type").unwrap(), "integer");
+        assert_eq!(
+            rows[0].get_named::<String>("created_type").unwrap(),
+            "integer"
+        );
+
+        conn.execute_sync(
+            "UPDATE messages SET reply_to = ? WHERE id = 1",
+            &[Value::BigInt(99)],
+        )
+        .expect("write migrated reply_to column");
+        let rows = conn
+            .query_sync("SELECT reply_to FROM messages WHERE id = 1", &[])
+            .expect("query migrated reply_to column");
+        assert_eq!(rows[0].get_named::<i64>("reply_to").unwrap(), 99);
     }
 
     #[test]

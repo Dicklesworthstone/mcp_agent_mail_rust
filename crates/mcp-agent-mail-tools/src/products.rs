@@ -812,6 +812,7 @@ pub async fn fetch_inbox_product(
                 project_id: msg.project_id,
                 sender_id: msg.sender_id,
                 thread_id: msg.thread_id,
+                reply_to: msg.reply_to,
                 topic: msg.topic,
                 subject: msg.subject,
                 importance: msg.importance,

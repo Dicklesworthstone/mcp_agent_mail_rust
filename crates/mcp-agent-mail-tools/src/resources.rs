@@ -6064,6 +6064,7 @@ mod resource_shape_tests {
                     .expect("reply should be visible via inbox resource");
                 assert_eq!(sender_resource_message["subject"], "Re: Durability Subject");
                 assert_eq!(sender_resource_message["body_md"], "Reply body");
+                assert_eq!(sender_resource_message["reply_to"], sent_id);
             });
         });
     }
