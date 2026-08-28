@@ -6953,22 +6953,29 @@ pub async fn set_agent_retired_at(
             ));
         }
 
-        let params = [
-            retired_at.map_or(Value::Null, Value::BigInt),
-            Value::BigInt(agent_id),
-        ];
+        // Retiring is idempotent at the mutation boundary, not merely in the
+        // caller's preceding read. Two concurrent retire requests can both
+        // observe an active row; COALESCE ensures whichever transaction wins
+        // first owns the durable retirement timestamp. Clearing retirement is
+        // an explicit transition and therefore writes NULL unconditionally.
+        let (sql, params) = retired_at.map_or_else(
+            || {
+                (
+                    "UPDATE agents SET retired_at = NULL WHERE id = ?",
+                    vec![Value::BigInt(agent_id)],
+                )
+            },
+            |timestamp| {
+                (
+                    "UPDATE agents SET retired_at = COALESCE(retired_at, ?) WHERE id = ?",
+                    vec![Value::BigInt(timestamp), Value::BigInt(agent_id)],
+                )
+            },
+        );
         let affected = try_in_tx!(
             cx,
             &tracked,
-            map_sql_outcome(
-                traw_execute(
-                    cx,
-                    &tracked,
-                    "UPDATE agents SET retired_at = ? WHERE id = ?",
-                    &params,
-                )
-                .await
-            )
+            map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
         );
         if affected == 0 {
             rollback_tx(cx, &tracked).await;
@@ -19270,6 +19277,66 @@ mod tests {
             Outcome::Panicked(payload) => std::panic::resume_unwind(Box::new(payload)),
         }
         (cx, pool, dir)
+    }
+
+    #[test]
+    fn set_agent_retired_at_preserves_first_timestamp_until_explicit_unretire() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build retirement idempotency runtime");
+        let (cx, pool, _dir) = setup_test_pool("retirement_timestamp_idempotency.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/retirement-timestamp-idempotency")
+                .await
+                .into_result()
+                .expect("create retirement test project");
+            let agent = register_agent(
+                &cx,
+                &pool,
+                project.id.expect("project id"),
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("retirement idempotency test"),
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register retirement test agent");
+            let agent_id = agent.id.expect("agent id");
+
+            let first = set_agent_retired_at(&cx, &pool, agent_id, Some(111))
+                .await
+                .into_result()
+                .expect("retire agent first time");
+            assert_eq!(first.retired_at, Some(111));
+
+            let retry = set_agent_retired_at(&cx, &pool, agent_id, Some(222))
+                .await
+                .into_result()
+                .expect("retry retirement");
+            assert_eq!(
+                retry.retired_at,
+                Some(111),
+                "a later retry must not replace the first durable retirement timestamp"
+            );
+
+            let active = set_agent_retired_at(&cx, &pool, agent_id, None)
+                .await
+                .into_result()
+                .expect("explicitly unretire agent");
+            assert_eq!(active.retired_at, None);
+
+            let second_retirement = set_agent_retired_at(&cx, &pool, agent_id, Some(333))
+                .await
+                .into_result()
+                .expect("retire agent after explicit reactivation");
+            assert_eq!(second_retirement.retired_at, Some(333));
+        });
     }
 
     fn open_direct_repair_connection(db_path: &std::path::Path) -> crate::DbConn {
