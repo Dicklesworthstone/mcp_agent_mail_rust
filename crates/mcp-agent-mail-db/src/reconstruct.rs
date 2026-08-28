@@ -9229,8 +9229,11 @@ body
         );
         std::fs::write(reservations_dir.join("id-174-g2c9ef981.json"), &active)
             .expect("active artifact");
-        std::fs::write(reservations_dir.join("id-174-g90bc42e0.json"), &released_artifact)
-            .expect("released artifact");
+        std::fs::write(
+            reservations_dir.join("id-174-g90bc42e0.json"),
+            &released_artifact,
+        )
+        .expect("released artifact");
 
         let created_us = chrono::DateTime::parse_from_rfc3339(created)
             .unwrap()
@@ -9243,7 +9246,9 @@ body
             .timestamp_micros();
 
         // The unhealthy live DB still carries the same lease under its own local
-        // ids. Recovery must recognise it as the lease the archive already has.
+        // id. Deliberately make that id differ from the archive's 174: numeric ids
+        // are database-local, so using 174 here would let an accidental id-based
+        // merge pass without proving the stable reservation identity is honored.
         let salvage_conn =
             SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).expect("salvage db");
         salvage_conn
@@ -9278,7 +9283,7 @@ body
                 "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
                  VALUES (?, 20, 5, 'scripts/release-build.sh', 1, 'release lane', ?, ?, ?)",
                 &[
-                    Value::BigInt(174),
+                    Value::BigInt(9_174),
                     Value::BigInt(created_us),
                     Value::BigInt(expires_us),
                     Value::BigInt(released_us),
@@ -9310,6 +9315,12 @@ body
             rows.iter()
                 .map(|row| row.get_named::<i64>("id").unwrap_or(-1))
                 .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rows[0].get_named::<i64>("id").unwrap(),
+            174,
+            "the archive's canonical reservation id must remain authoritative over the \
+             salvage database's unrelated local id"
         );
         assert_eq!(
             rows[0].get_named::<Option<i64>>("released_ts").unwrap(),
