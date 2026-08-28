@@ -4920,7 +4920,7 @@ mod tests {
         assert_eq!(ledger.len(), 1);
         assert_eq!(
             ledger[0].get_named::<i64>("deregistered_at").unwrap(),
-            424242
+            424_242
         );
         let indexes = conn
             .query_sync("PRAGMA index_list(agents)", &[])
