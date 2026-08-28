@@ -6349,7 +6349,7 @@ fn atc_durable_writes_enabled(
     executor_mode: AtcExecutorMode,
     atc_db_pool: Option<&mcp_agent_mail_db::DbPool>,
 ) -> bool {
-    !write_mode.is_off() && atc_durable_experience_store_enabled(executor_mode, atc_db_pool)
+    write_mode.is_live() && atc_durable_experience_store_enabled(executor_mode, atc_db_pool)
 }
 
 fn atc_durable_experience_store_enabled(
@@ -8423,7 +8423,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                     if let Some(dropped) = pending_effects.pop_front() {
                         let dropped_key = atc_effect_semantic_key(&dropped);
                         pending_effect_keys.remove(&dropped_key);
-                        if let Some(pool) = atc_db_pool.as_ref() {
+                        if durable_writes_enabled && let Some(pool) = atc_db_pool.as_ref() {
                             capture_atc_execution_result(
                                 pool,
                                 dropped.experience_id,
@@ -8475,7 +8475,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 };
                 pending_effect_keys.remove(&cooldown_key);
                 let status = format!("throttled:{}", effect.semantics.family);
-                if let Some(pool) = atc_db_pool.as_ref() {
+                if durable_writes_enabled && let Some(pool) = atc_db_pool.as_ref() {
                     capture_atc_execution_result(
                         pool,
                         effect.experience_id,
@@ -8511,7 +8511,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 last_action_by_key.insert(cooldown_key, now_micros);
             }
             // Capture execution result into durable experience store (br-0qt6e.2.2).
-            if let Some(pool) = atc_db_pool.as_ref() {
+            if durable_writes_enabled && let Some(pool) = atc_db_pool.as_ref() {
                 capture_atc_execution_result(
                     pool,
                     effect.experience_id,
@@ -8540,7 +8540,8 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 sweep_open_experiences_for_resolution(pool, now_micros, 600_000_000);
             }
         }
-        if let Some(pool) = atc_db_pool.as_ref()
+        if durable_writes_enabled
+            && let Some(pool) = atc_db_pool.as_ref()
             && now_micros >= next_rollup_refresh_micros
         {
             let cx = Cx::for_request_with_budget(Budget::INFINITE);
@@ -21384,12 +21385,13 @@ first body
             AtcExecutorMode::Canary,
             Some(&pool)
         ));
-        // Shadow/Live write mode + an executing executor allows durable writes.
-        assert!(atc_durable_writes_enabled(
+        // Shadow write mode is trace-only even with an executing executor.
+        assert!(!atc_durable_writes_enabled(
             AtcWriteMode::Shadow,
             AtcExecutorMode::Live,
             Some(&pool)
         ));
+        // Live write mode + an executing executor allows durable writes.
         assert!(atc_durable_writes_enabled(
             AtcWriteMode::Live,
             AtcExecutorMode::Live,
