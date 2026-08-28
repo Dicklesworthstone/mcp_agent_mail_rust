@@ -158,7 +158,9 @@ fn compare_input_schemas(tool_name: &str, expected: &Value, actual: &Value) -> V
             "[{tool_name}] new required inputs break existing clients: {newly_required:?}"
         ));
     } else if !relaxed.is_empty() {
-        eprintln!("[{tool_name}] note: formerly required inputs are now optional (ok): {relaxed:?}");
+        eprintln!(
+            "[{tool_name}] note: formerly required inputs are now optional (ok): {relaxed:?}"
+        );
     }
 
     // Compare property names
@@ -196,7 +198,6 @@ fn compare_input_schemas(tool_name: &str, expected: &Value, actual: &Value) -> V
                         exp_type, act_type
                     ));
                 }
-
             }
         }
     }

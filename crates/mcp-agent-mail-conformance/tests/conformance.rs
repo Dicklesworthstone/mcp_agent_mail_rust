@@ -284,9 +284,7 @@ fn supported_compatibility_mismatch(
                     expected.len()
                 ));
             }
-            for (index, (actual_value, expected_value)) in
-                actual.iter().zip(expected).enumerate()
-            {
+            for (index, (actual_value, expected_value)) in actual.iter().zip(expected).enumerate() {
                 let item_path = format!("{path}[{index}]");
                 if let Some(mismatch) =
                     supported_compatibility_mismatch(actual_value, expected_value, &item_path)
