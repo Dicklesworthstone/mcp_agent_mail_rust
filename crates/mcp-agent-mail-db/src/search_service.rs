@@ -4581,7 +4581,6 @@ fn map_planned_rows(rows: Vec<sqlmodel_core::Row>, doc_kind: DocKind) -> Vec<Sea
                         .unwrap_or(0),
                 ),
                 thread_id: row.get_as::<Option<String>>(5).unwrap_or_default(),
-                topic: None,
                 from_agent: Some(
                     row.get_as::<String>(6)
                         .unwrap_or_default()
@@ -4598,6 +4597,7 @@ fn map_planned_rows(rows: Vec<sqlmodel_core::Row>, doc_kind: DocKind) -> Vec<Sea
                         .unwrap_or(0),
                 ),
                 score: Some(row.get_as::<f64>(10).unwrap_or(0.0)),
+                topic: row.get_as::<Option<String>>(11).unwrap_or_default(),
                 ..SearchResult::default()
             })
             .collect(),
@@ -5859,6 +5859,7 @@ mod tests {
                 "body_md".to_string(),
                 "project_id".to_string(),
                 "score".to_string(),
+                "topic".to_string(),
             ],
             vec![
                 Value::BigInt(7),
@@ -5872,6 +5873,7 @@ mod tests {
                 Value::Text("Thread preview".to_string()),
                 Value::BigInt(3),
                 Value::Double(0.0),
+                Value::Text("br-thread.7".to_string()),
             ],
         );
 
@@ -5880,6 +5882,7 @@ mod tests {
         assert_eq!(results[0].from_agent.as_deref(), Some("BlueLake"));
         assert_eq!(results[0].from_agent_id, Some(42));
         assert_eq!(results[0].thread_id.as_deref(), Some("thread-7"));
+        assert_eq!(results[0].topic.as_deref(), Some("br-thread.7"));
     }
 
     #[test]
@@ -5897,6 +5900,7 @@ mod tests {
                 "body_md".to_string(),
                 "project_id".to_string(),
                 "score".to_string(),
+                "topic".to_string(),
             ],
             vec![
                 Value::BigInt(8),
@@ -5910,6 +5914,7 @@ mod tests {
                 Value::Text("Thread preview".to_string()),
                 Value::BigInt(4),
                 Value::Double(0.0),
+                Value::Null,
             ],
         );
 
@@ -5920,6 +5925,7 @@ mod tests {
             Some(UNKNOWN_SENDER_DISPLAY)
         );
         assert_eq!(results[0].from_agent_id, None);
+        assert_eq!(results[0].topic, None);
     }
 
     #[test]

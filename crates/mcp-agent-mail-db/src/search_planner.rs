@@ -725,7 +725,8 @@ const fn empty_plan_sql(kind: DocKind) -> &'static str {
                 0 AS from_agent_id, \
                 '' AS body_md, \
                 0 AS project_id, \
-                0.0 AS score \
+                0.0 AS score, \
+                NULL AS topic \
              WHERE 0"
         }
         DocKind::Agent => {
@@ -807,7 +808,7 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
                 format!(
                     "m.id, m.subject, m.importance, m.ack_required, m.created_ts, \
                      m.thread_id, COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS from_name, \
-                     a.id AS from_agent_id, m.body_md, m.project_id, 0.0 AS score"
+                     a.id AS from_agent_id, m.body_md, m.project_id, 0.0 AS score, m.topic"
                 ),
                 "messages m LEFT JOIN agents a ON a.id = m.sender_id".to_string(),
                 message_order_clause.to_string(),
@@ -817,7 +818,7 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
             format!(
                 "m.id, m.subject, m.importance, m.ack_required, m.created_ts, \
                  m.thread_id, COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS from_name, \
-                 a.id AS from_agent_id, m.body_md, m.project_id, 0.0 AS score"
+                 a.id AS from_agent_id, m.body_md, m.project_id, 0.0 AS score, m.topic"
             ),
             "messages m LEFT JOIN agents a ON a.id = m.sender_id".to_string(),
             message_order_clause.to_string(),
@@ -1689,6 +1690,10 @@ mod tests {
         let plan = plan_search(&q);
         // The last param should be the limit
         assert!(plan.sql.contains("LIMIT ?"));
+        assert!(
+            plan.sql.contains("m.topic"),
+            "message search plans must project topic metadata"
+        );
         if let Some(PlanParam::Int(v)) = plan.params.last() {
             assert_eq!(*v, 25);
         } else {
@@ -1730,6 +1735,7 @@ mod tests {
             ack_required: Some(true),
             created_ts: Some(1000),
             thread_id: Some("t1".to_string()),
+            topic: Some("br-abc.1".to_string()),
             from_agent: Some("Blue".to_string()),
             from_agent_id: None,
             to: None,
@@ -1744,6 +1750,7 @@ mod tests {
         let r2: SearchResult = serde_json::from_str(&json).unwrap();
         assert_eq!(r2.id, 1);
         assert_eq!(r2.score, Some(-1.5));
+        assert_eq!(r2.topic.as_deref(), Some("br-abc.1"));
         assert!(!r2.redacted);
     }
 
@@ -1916,6 +1923,7 @@ mod tests {
             ack_required: None,
             created_ts: Some(1000),
             thread_id: Some("t1".to_string()),
+            topic: None,
             from_agent: Some("BlueLake".to_string()),
             from_agent_id: None,
             to: None,

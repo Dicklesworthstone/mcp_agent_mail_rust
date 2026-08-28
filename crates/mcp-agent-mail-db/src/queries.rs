@@ -10830,6 +10830,8 @@ pub struct GlobalInboxRow {
     pub ack_ts: Option<i64>,
     pub project_id: i64,
     pub project_slug: String,
+    /// Project message topic, duplicated from `message.topic` for global-view
+    /// consumers that operate on the outer project-context row.
     pub topic: Option<String>,
 }
 
@@ -10913,7 +10915,7 @@ pub async fn fetch_inbox_global(
                         project_id,
                         sender_id,
                         thread_id,
-                        topic,
+                        topic: topic.clone(),
                         subject,
                         body_md,
                         importance,
@@ -10927,6 +10929,7 @@ pub async fn fetch_inbox_global(
                     ack_ts,
                     project_id,
                     project_slug,
+                    topic,
                 });
             }
             Outcome::Ok(out)
@@ -11012,6 +11015,8 @@ pub struct GlobalSearchRow {
     pub body_md: String,
     pub project_id: i64,
     pub project_slug: String,
+    /// Project message topic carried through cross-project search results.
+    pub topic: Option<String>,
 }
 
 /// Full-text search across ALL projects.
@@ -29225,11 +29230,13 @@ mod tests {
             ack_ts: None,
             project_id: 10,
             project_slug: "my-project".to_string(),
+            topic: Some("br-abc.1".to_string()),
         };
 
         assert_eq!(row.project_id, 10);
         assert_eq!(row.project_slug, "my-project");
         assert_eq!(row.message.subject, "Test");
+        assert_eq!(row.topic, row.message.topic);
     }
 
     #[test]
