@@ -551,6 +551,7 @@ const TRG_INBOX_DELIVERY_EVENTS_RECIPIENT_INSERT_SQL: &str = "CREATE TRIGGER IF 
 #[allow(clippy::too_many_lines)]
 pub fn schema_migrations() -> Vec<Migration> {
     let mut migrations: Vec<Migration> = Vec::new();
+    let mut deferred_column_dependent_indexes: Vec<Migration> = Vec::new();
 
     for chunk in CREATE_TABLES_SQL.split(';') {
         let stmt = chunk.trim();
@@ -562,7 +563,16 @@ pub fn schema_migrations() -> Vec<Migration> {
             continue;
         };
 
-        migrations.push(Migration::new(id, desc, stmt.to_string(), String::new()));
+        let migration = Migration::new(id, desc, stmt.to_string(), String::new());
+        if matches!(
+            migration.id.as_str(),
+            "v1_create_index_idx_agents_project_active"
+                | "v1_create_index_idx_messages_project_topic"
+        ) {
+            deferred_column_dependent_indexes.push(migration);
+        } else {
+            migrations.push(migration);
+        }
     }
 
     // Drop legacy Python FTS triggers that conflict with the Rust triggers below.
@@ -2335,6 +2345,13 @@ pub fn schema_migrations() -> Vec<Migration> {
             .to_string(),
         String::new(),
     ));
+
+    // These indexes are also present in the latest static DDL, which gives
+    // them generated v1 migration IDs. On an existing pre-v27/v28 database,
+    // however, their columns do not exist until the explicit evolution
+    // migrations above run. Keep the generated IDs, but record them only after
+    // the column migrations and their canonical indexes are satisfied.
+    migrations.extend(deferred_column_dependent_indexes);
 
     migrations
 }
@@ -4863,6 +4880,46 @@ mod tests {
     }
 
     #[test]
+    fn column_dependent_generated_indexes_follow_column_migrations() {
+        let ordered_ids: Vec<String> = schema_migrations()
+            .into_iter()
+            .map(|migration| migration.id)
+            .collect();
+
+        for (column_migration_id, index_migration_id) in [
+            (
+                "v27_add_topic_to_messages",
+                "v27_idx_messages_project_topic",
+            ),
+            (
+                "v27_add_topic_to_messages",
+                "v1_create_index_idx_messages_project_topic",
+            ),
+            (
+                "v28_add_retired_at_to_agents",
+                "v28_idx_agents_project_active",
+            ),
+            (
+                "v28_add_retired_at_to_agents",
+                "v1_create_index_idx_agents_project_active",
+            ),
+        ] {
+            let column_position = ordered_ids
+                .iter()
+                .position(|id| id == column_migration_id)
+                .unwrap_or_else(|| panic!("missing column migration {column_migration_id}"));
+            let index_position = ordered_ids
+                .iter()
+                .position(|id| id == index_migration_id)
+                .unwrap_or_else(|| panic!("missing index migration {index_migration_id}"));
+            assert!(
+                column_position < index_position,
+                "{column_migration_id} must precede {index_migration_id}"
+            );
+        }
+    }
+
+    #[test]
     fn lifecycle_migrations_preserve_legacy_tombstones_and_add_active_index() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("lifecycle_migration.db");
@@ -6317,6 +6374,98 @@ VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00'
                 .expect("projects.created_at type"),
             "integer"
         );
+
+        for (table, column) in [("messages", "topic"), ("agents", "retired_at")] {
+            let columns = conn
+                .query_sync(&format!("PRAGMA table_info({table})"), &[])
+                .unwrap_or_else(|error| panic!("inspect {table} columns: {error}"));
+            assert!(
+                columns
+                    .iter()
+                    .any(|row| { row.get_named::<String>("name").ok().as_deref() == Some(column) }),
+                "{table}.{column} must exist after the full legacy upgrade"
+            );
+        }
+
+        for (table, index) in [
+            ("messages", "idx_messages_project_topic"),
+            ("agents", "idx_agents_project_active"),
+            ("agent_deregistrations", "idx_agent_deregistrations_ts"),
+        ] {
+            let indexes = conn
+                .query_sync(&format!("PRAGMA index_list({table})"), &[])
+                .unwrap_or_else(|error| panic!("inspect {table} indexes: {error}"));
+            assert!(
+                indexes
+                    .iter()
+                    .any(|row| { row.get_named::<String>("name").ok().as_deref() == Some(index) }),
+                "{index} must exist after the full legacy upgrade"
+            );
+        }
+
+        let lifecycle_table = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'agent_deregistrations'",
+                &[],
+            )
+            .expect("inspect lifecycle table");
+        assert_eq!(
+            lifecycle_table.len(),
+            1,
+            "agent_deregistrations must exist after the full legacy upgrade"
+        );
+
+        let ledger_rows = conn
+            .query_sync(&format!("SELECT id FROM {MIGRATIONS_TABLE_NAME}"), &[])
+            .expect("read migration ledger");
+        let ledger_ids: std::collections::HashSet<String> = ledger_rows
+            .iter()
+            .filter_map(|row| row.get_named::<String>("id").ok())
+            .collect();
+        for required_id in [
+            "v1_create_index_idx_agents_project_active",
+            "v1_create_table_agent_deregistrations",
+            "v1_create_index_idx_agent_deregistrations_ts",
+            "v1_create_index_idx_messages_project_topic",
+            "v27_add_topic_to_messages",
+            "v27_idx_messages_project_topic",
+            "v28_add_retired_at_to_agents",
+            "v28_create_agent_deregistrations",
+            "v28_idx_agents_project_active",
+            "v28_idx_agent_deregistrations_ts",
+            "v28_backfill_agent_deregistrations",
+        ] {
+            assert!(
+                ledger_ids.contains(required_id),
+                "migration ledger must contain {required_id}"
+            );
+        }
+
+        for (table, expected_count) in [
+            ("agents", 2_i64),
+            ("messages", 1_i64),
+            ("message_recipients", 1_i64),
+            ("file_reservations", 1_i64),
+        ] {
+            let rows = conn
+                .query_sync(&format!("SELECT COUNT(*) AS n FROM {table}"), &[])
+                .unwrap_or_else(|error| panic!("count {table}: {error}"));
+            assert_eq!(
+                rows[0].get_named::<i64>("n").expect("row count"),
+                expected_count,
+                "legacy rows in {table} must survive the upgrade"
+            );
+        }
+
+        let integrity = conn
+            .query_sync("PRAGMA integrity_check", &[])
+            .expect("integrity_check");
+        let verdicts: Vec<String> = integrity
+            .iter()
+            .filter_map(|row| row.get_as::<String>(0).ok())
+            .collect();
+        assert_eq!(verdicts, vec!["ok".to_string()]);
     }
 
     #[test]
