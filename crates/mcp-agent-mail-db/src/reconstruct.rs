@@ -9174,6 +9174,151 @@ body
     }
 
     #[test]
+    fn salvage_does_not_duplicate_a_lease_the_archive_already_merged_across_generations() {
+        // Live outage 2026-08-28 (hfdt-agent-mail-reservation-parity-drift-o3902):
+        // `am doctor reconstruct` rebuilt 44 agents / 3131 messages and then
+        // REFUSED promotion with "reservations produced 881 rows but only 873
+        // unique stable keys; refusing ambiguous recovery".
+        //
+        // Measured on the real failed candidate: all 8 collisions were 2 rows with
+        // the SAME project_id, SAME agent_id, and identical path / exclusive /
+        // reason / created_ts / expires_ts / released_ts, differing only in `id`.
+        // In the archive each was ONE reservation id present under BOTH database
+        // generations, active in the older and released in the newer:
+        //   id-174-g2c9ef98....json  released_ts = null
+        //   id-174-g90bc42e0....json released_ts = 2026-08-28T03:02:27.101444Z
+        //
+        // The archive-only path already collapses that pair (proved by
+        // `reconstruct_merges_reservation_lifecycle_artifacts_across_generations`).
+        // The production path also merges the unhealthy live DB, and THAT is the
+        // uncovered combination: the salvaged row must land on the row the archive
+        // replay already merged, not become a phantom fresh-id duplicate.
+        //
+        // This is the negative control for the stable-key collision: two rows here
+        // is exactly what makes `require_unique_receipt_keys` refuse recovery.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed.sqlite3");
+        let salvage_db_path = tmp.path().join("salvage.sqlite3");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("outage-project");
+        let agents_dir = project_dir.join("agents").join("TanMink");
+        let reservations_dir = project_dir.join("file_reservations");
+        std::fs::create_dir_all(&agents_dir).expect("agents dir");
+        std::fs::create_dir_all(&reservations_dir).expect("reservations dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"outage-project","human_key":"/outage-project","created_at":0}"#,
+        )
+        .expect("project meta");
+        std::fs::write(
+            agents_dir.join("profile.json"),
+            r#"{"name":"TanMink","program":"codex-cli","model":"gpt-5","task_description":"","inception_ts":"2026-08-27T05:00:00Z","last_active_ts":"2026-08-27T05:00:00Z"}"#,
+        )
+        .expect("agent profile");
+
+        // The real archive shape: one id, two generations, active then released.
+        let created = "2026-08-27T06:22:00.659794Z";
+        let expires = "2026-08-27T07:52:00.659794Z";
+        let released = "2026-08-28T03:02:27.101444Z";
+        let active = format!(
+            r#"{{"id":174,"db_generation":"2c9ef981","project":"/outage-project","agent":"TanMink","path_pattern":"scripts/release-build.sh","exclusive":true,"reason":"release lane","created_ts":"{created}","expires_ts":"{expires}","released_ts":null}}"#
+        );
+        let released_artifact = format!(
+            r#"{{"id":174,"db_generation":"90bc42e0","project":"/outage-project","agent":"TanMink","path_pattern":"scripts/release-build.sh","exclusive":true,"reason":"release lane","created_ts":"{created}","expires_ts":"{expires}","released_ts":"{released}"}}"#
+        );
+        std::fs::write(reservations_dir.join("id-174-g2c9ef981.json"), &active)
+            .expect("active artifact");
+        std::fs::write(reservations_dir.join("id-174-g90bc42e0.json"), &released_artifact)
+            .expect("released artifact");
+
+        let created_us = chrono::DateTime::parse_from_rfc3339(created)
+            .unwrap()
+            .timestamp_micros();
+        let expires_us = chrono::DateTime::parse_from_rfc3339(expires)
+            .unwrap()
+            .timestamp_micros();
+        let released_us = chrono::DateTime::parse_from_rfc3339(released)
+            .unwrap()
+            .timestamp_micros();
+
+        // The unhealthy live DB still carries the same lease under its own local
+        // ids. Recovery must recognise it as the lease the archive already has.
+        let salvage_conn =
+            SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).expect("salvage db");
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT, created_at INTEGER)",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT, model TEXT, task_description TEXT, inception_ts INTEGER, last_active_ts INTEGER)",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL, reason TEXT NOT NULL, created_ts INTEGER NOT NULL, expires_ts INTEGER NOT NULL, released_ts INTEGER)",
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (20, 'outage-project', '/outage-project', 1)",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts) VALUES (5, 20, 'TanMink', 'codex-cli', 'gpt-5', '', 10, 10)",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+                 VALUES (?, 20, 5, 'scripts/release-build.sh', 1, 'release lane', ?, ?, ?)",
+                &[
+                    Value::BigInt(174),
+                    Value::BigInt(created_us),
+                    Value::BigInt(expires_us),
+                    Value::BigInt(released_us),
+                ],
+            )
+            .unwrap();
+        drop(salvage_conn);
+
+        reconstruct_from_archive_with_private_salvage(
+            &db_path,
+            storage_root.as_path(),
+            &salvage_db_path,
+        )
+        .expect("reconstruct with salvage");
+
+        let conn = SqliteDbConn::open_file(db_path.display().to_string()).expect("open db");
+        let rows = conn
+            .query_sync(
+                "SELECT id, path_pattern, created_ts, released_ts FROM file_reservations ORDER BY id ASC",
+                &[],
+            )
+            .expect("query reservations");
+        assert_eq!(
+            rows.len(),
+            1,
+            "one lease across two archive generations plus the live salvage row must \
+             import exactly once; duplicates collide on the promotion receipt's stable \
+             key and refuse recovery (got ids {:?})",
+            rows.iter()
+                .map(|row| row.get_named::<i64>("id").unwrap_or(-1))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rows[0].get_named::<Option<i64>>("released_ts").unwrap(),
+            Some(released_us),
+            "the released generation must win over the active one"
+        );
+    }
+
+    #[test]
     fn reconstruct_preserves_cross_generation_reservations_with_reused_id() {
         // br-n8qh6: two DB generations wrote a reservation with the SAME global id
         // 1 to the same archive. The generation-stamped filenames keep both
