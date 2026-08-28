@@ -32,6 +32,7 @@ const AUTO_INCREMENT_ID_KEYS: &[&str] = &["id", "message_id", "reply_to", "sende
 const TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS: &str = "3600";
 const TEST_SEARCH_ENGINE: &str = "legacy";
 const RUST_NATIVE_FIXTURE_DIR: &str = "tests/conformance/fixtures/rust_native";
+const SUPPLEMENTAL_COMPATIBILITY_TOOLS: &[&str] = &["fetch_topic"];
 const LEGACY_FIXTURE_REPO_INSTALL_PATH: &str = "/tmp/agent-mail-fixtures/repo_install";
 const LEGACY_FIXTURE_REPO_UNINSTALL_PATH: &str = "/tmp/agent-mail-fixtures/repo_uninstall";
 
@@ -3352,18 +3353,19 @@ fn fixture_schema_drift_guard() {
     let fixtures = Fixtures::load_default().expect("failed to load fixtures");
     let rust_native_tools = rust_native_tool_names();
 
-    // Every registered tool must be covered by either Python-parity fixtures or
-    // a rust-native fixture file when parity is intentionally deferred.
+    // Every registered tool must be covered by the captured Python fixture, a
+    // focused supplemental compatibility test, or an exact Rust-native golden.
     let tool_names: BTreeSet<&str> = mcp_agent_mail_tools::TOOL_CLUSTER_MAP
         .iter()
         .map(|(name, _)| *name)
         .collect();
     for tool_name in &tool_names {
         let python_fixture = fixtures.tools.get(*tool_name);
+        let supplemental_fixture = SUPPLEMENTAL_COMPATIBILITY_TOOLS.contains(tool_name);
         let rust_native_fixture = rust_native_tools.contains(*tool_name);
         assert!(
-            python_fixture.is_some() || rust_native_fixture,
-            "tool {tool_name} is registered in TOOL_CLUSTER_MAP but has no Python-parity or rust-native fixture"
+            python_fixture.is_some() || supplemental_fixture || rust_native_fixture,
+            "tool {tool_name} is registered in TOOL_CLUSTER_MAP but has no captured, supplemental-compatibility, or Rust-native fixture"
         );
         if let Some(fixture) = python_fixture {
             assert!(
@@ -3384,6 +3386,16 @@ fn fixture_schema_drift_guard() {
         assert!(
             tool_names.contains(tool_name.as_str()),
             "rust-native fixture tool {tool_name} is not in TOOL_CLUSTER_MAP (stale fixture?)"
+        );
+    }
+    for tool_name in SUPPLEMENTAL_COMPATIBILITY_TOOLS {
+        assert!(
+            tool_names.contains(tool_name),
+            "supplemental compatibility tool {tool_name} is not in TOOL_CLUSTER_MAP (stale classification?)"
+        );
+        assert!(
+            !fixtures.tools.contains_key(*tool_name) && !rust_native_tools.contains(*tool_name),
+            "supplemental compatibility tool {tool_name} must have exactly one conformance classification"
         );
     }
 

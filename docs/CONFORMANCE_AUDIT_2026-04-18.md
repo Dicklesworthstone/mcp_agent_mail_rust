@@ -12,13 +12,13 @@ Scope:
 - Direct source inspection in `crates/mcp-agent-mail-tools/src/resources.rs`
 
 Headline counts:
-- Tools: 44 total = 37 supported-compatibility + 7 Rust-native (`fetch_topic` added 2026-08-27 for GH#259; lifecycle compatibility tools added for GH#255; `get_message_delivery_receipt` registered 2026-08-13 for GH#218). The sequential captured behavior fixture covers all 37 compatibility tools; `fetch_topic` has a retained schema/description contract and topic-bearing router coverage. The Rust implementation is authoritative over legacy fixtures.
+- Tools: 44 total = 38 supported-compatibility + 6 Rust-native (`fetch_topic` added as the supplemental compatibility tool on 2026-08-27 for GH#259; lifecycle compatibility tools added for GH#255; `get_message_delivery_receipt` registered 2026-08-13 for GH#218). The sequential captured behavior fixture covers 37 compatibility tools; `fetch_topic` has a retained schema/description contract and topic-bearing router coverage. The Rust implementation is authoritative over legacy fixtures.
 - Resources: 25 logical templates = 23 python-parity + 2 rust-native uncovered (`resource://tooling/metrics_core`, `resource://tooling/diagnostics`)
 - Current suite state: the pre-`3813da8f` full-suite audit still records failures in `tests/conformance.rs`, and the dedicated Rust-native fixture lane now exists. A targeted `rch` verification attempt on 2026-04-18T09:59Z did not reach assertions because the remote worker ran out of disk space while compiling (`No space left on device`).
 
 ## Tool coverage table
 
-| tool_name | has_fixture | passes | classification (python-parity / rust-native / unknown) | fixture_file | notes |
+| tool_name | has_fixture | passes | classification (python-parity / supported-compatibility / rust-native / unknown) | fixture_file | notes |
 | --- | --- | --- | --- | --- | --- |
 | health_check | yes | no | python-parity | crates/mcp-agent-mail-conformance/tests/conformance/fixtures/python_reference.json | 1 case in the Python behavior fixture, but the current run fails because `health_check` now returns `status=error` plus semantic-readiness/recovery fields when the DB is absent. |
 | ensure_project | yes | yes | python-parity | crates/mcp-agent-mail-conformance/tests/conformance/fixtures/python_reference.json | 2 case(s) in the Python behavior fixture; exercised by `run_fixtures_against_rust_server_router`. |
@@ -36,7 +36,7 @@ Headline counts:
 | send_message | yes | yes | python-parity | crates/mcp-agent-mail-conformance/tests/conformance/fixtures/python_reference.json | 4 case(s) in the Python behavior fixture; exercised by `run_fixtures_against_rust_server_router`. |
 | reply_message | yes | yes | python-parity | crates/mcp-agent-mail-conformance/tests/conformance/fixtures/python_reference.json | 3 case(s) in the Python behavior fixture; exercised by `run_fixtures_against_rust_server_router`. |
 | fetch_inbox | yes | yes | python-parity | crates/mcp-agent-mail-conformance/tests/conformance/fixtures/python_reference.json | 1 case(s) in the Python behavior fixture; exercised by `run_fixtures_against_rust_server_router`. |
-| fetch_topic | yes | yes | rust-native | crates/mcp-agent-mail-conformance/tests/conformance.rs | Focused router fixture proves exact case-insensitive project-topic lookup, body hydration, inbox filtering, and reply-topic inheritance; there is no legacy Python behavior fixture. |
+| fetch_topic | yes | yes | supported-compatibility | crates/mcp-agent-mail-conformance/tests/conformance.rs | Retained schema/description plus a focused router fixture prove exact case-insensitive project-topic lookup, body hydration, inbox filtering, and reply-topic inheritance; there is no captured legacy sequential behavior case. |
 | fetch_inbox_events | yes | pending | rust-native | crates/mcp-agent-mail-conformance/tests/conformance/fixtures/rust_native/fetch_inbox_events.json | Durable per-recipient cursor surface for GH#238; covered by empty-tail and invalid-argument native cases, with append-only pagination and retention behavior covered in DB unit tests. |
 | get_message_delivery_receipt | yes | pending | rust-native | crates/mcp-agent-mail-conformance/tests/conformance/fixtures/rust_native/get_message_delivery_receipt.json | Message-ID-bound delivery facts (persisted/signaled/acknowledged per recipient) for GH#218; registered 2026-08-13 after shipping as dead code; native cases cover the persisted-recipient facts and unknown-message NOT_FOUND. |
 | mark_message_read | yes | yes | python-parity | crates/mcp-agent-mail-conformance/tests/conformance/fixtures/python_reference.json | 1 case(s) in the Python behavior fixture; exercised by `run_fixtures_against_rust_server_router`. |

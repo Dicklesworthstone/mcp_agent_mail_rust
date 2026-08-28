@@ -36,7 +36,7 @@ v0.3.13 and amd64-only since June (GH#256).
   and topic metadata survives SQLite migration, archive writes, reconstruction,
   snapshots, CLI/robot output, and TUI rendering. `fetch_inbox(topic=...)`
   performs exact case-insensitive recipient filtering, while the newly registered
-  Rust-native `fetch_topic` tool searches the whole project without allowing
+  `fetch_topic` compatibility tool searches the whole project without allowing
   unrelated newer mail to displace matching rows before the result limit.
 
 - **First-class Oh My Pi (OMP) support.** Agent detection now recognizes the
