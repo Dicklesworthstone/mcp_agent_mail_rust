@@ -19128,6 +19128,54 @@ mod tests {
     }
 
     #[test]
+    fn readiness_check_integrity_opt_out_skips_pool_archive_recovery() {
+        let _env_lock = lock_mutex(&TOOL_DISPATCH_ENV_TEST_LOCK);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("integrity-opt-out.sqlite3");
+        let storage_root = temp.path().join("storage");
+        let archive_project = storage_root.join("projects").join("archive-only");
+        std::fs::create_dir_all(&archive_project).expect("create archive project");
+        std::fs::write(
+            archive_project.join("project.json"),
+            r#"{"slug":"archive-only","human_key":"/archive-only","created_at":0}"#,
+        )
+        .expect("write archive project metadata");
+
+        let seed =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open seed database");
+        seed.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize seed schema");
+        drop(seed);
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("INTEGRITY_CHECK_ON_STARTUP", "false"),
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || {
+                let config = mcp_agent_mail_core::Config::from_env();
+                assert!(!config.integrity_check_on_startup);
+                readiness_check(&config).expect("readiness should skip automatic recovery");
+            },
+        );
+
+        let verify = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open verified database");
+        let rows = verify
+            .query_sync("SELECT COUNT(*) AS c FROM projects", &[])
+            .expect("count projects");
+        assert_eq!(
+            rows[0].get_named::<i64>("c").unwrap_or(-1),
+            0,
+            "readiness opt-out must not reconcile archive-only state into SQLite"
+        );
+    }
+
+    #[test]
     fn readiness_check_recovers_missing_sqlite_before_startup_integrity_check() {
         let temp = tempfile::tempdir().expect("tempdir");
         let storage_root = temp.path().join("storage");

@@ -213,7 +213,11 @@ pub struct Config {
     /// Override via `AM_READ_CACHE_ENTRIES_PER_CATEGORY`. Default:
     /// profile-derived `16_384`.
     pub read_cache_entries_per_category: usize,
-    /// Run `PRAGMA quick_check` on pool initialization (default: true).
+    /// Run startup integrity probes and automatic pool-open recovery
+    /// (default: true).
+    ///
+    /// When disabled, migrations and direct read/write opens still run, but
+    /// startup self-heal, archive reconciliation, and pool-open recovery do not.
     pub integrity_check_on_startup: bool,
     /// Hours between periodic full `PRAGMA integrity_check` runs
     /// (default: 1, 0 = disabled).

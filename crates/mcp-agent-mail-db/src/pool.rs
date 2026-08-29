@@ -2884,7 +2884,16 @@ struct DbPoolAuthority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DbPoolOpenMode {
     Recovering,
+    ReadWriteNoRecovery,
     QueryOnlyStrict,
+}
+
+fn configured_read_write_open_mode(config: &mcp_agent_mail_core::Config) -> DbPoolOpenMode {
+    if config.integrity_check_on_startup {
+        DbPoolOpenMode::Recovering
+    } else {
+        DbPoolOpenMode::ReadWriteNoRecovery
+    }
 }
 
 /// Registry of pool generations and their resolved message-id allocators,
@@ -3168,7 +3177,7 @@ impl DbPool {
             journal_size_limit_state,
             run_migrations: config.run_migrations,
             skip_startup_init,
-            open_mode: DbPoolOpenMode::Recovering,
+            open_mode: configured_read_write_open_mode(&core_config),
             stats_sampler,
             message_id_allocator,
         })
@@ -3227,7 +3236,7 @@ impl DbPool {
             open_mode: if query_only {
                 DbPoolOpenMode::QueryOnlyStrict
             } else {
-                DbPoolOpenMode::Recovering
+                configured_read_write_open_mode(&core_config)
             },
             stats_sampler,
             message_id_allocator,
@@ -3482,9 +3491,9 @@ impl DbPool {
                         return Outcome::Err(error);
                     }
                     // Ensure parent directory exists for file-backed DBs.
-                    if sqlite_path != ":memory:"
-                        && open_mode == DbPoolOpenMode::Recovering
-                        && let Err(e) = ensure_sqlite_parent_dir_exists(&sqlite_path)
+                if sqlite_path != ":memory:"
+                    && open_mode != DbPoolOpenMode::QueryOnlyStrict
+                    && let Err(e) = ensure_sqlite_parent_dir_exists(&sqlite_path)
                     {
                         return Outcome::Err(e);
                     }
@@ -3523,6 +3532,7 @@ impl DbPool {
                                     &sqlite_path,
                                     run_migrations,
                                     &storage_root,
+                                    open_mode,
                                 )
                                 .await;
                                 match init_out {
@@ -3556,15 +3566,20 @@ impl DbPool {
                             Ok(c) => c,
                             Err(e) => return Outcome::Err(e),
                         }
-                    } else if open_mode == DbPoolOpenMode::QueryOnlyStrict {
-                        match open_guarded_read_only_franken_existing_file(
-                            Path::new(&sqlite_path),
-                            "strict query-only pool connection",
-                        ) {
-                            Ok(c) => c,
-                            Err(e) => return Outcome::Err(e),
-                        }
-                    } else {
+                } else if open_mode == DbPoolOpenMode::QueryOnlyStrict {
+                    match open_guarded_read_only_franken_existing_file(
+                        Path::new(&sqlite_path),
+                        "strict query-only pool connection",
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => return Outcome::Err(e),
+                    }
+                } else if open_mode == DbPoolOpenMode::ReadWriteNoRecovery {
+                    match open_sqlite_file_with_lock_retry(&sqlite_path) {
+                        Ok(c) => c,
+                        Err(e) => return Outcome::Err(e),
+                    }
+                } else {
                         match open_sqlite_file_with_recovery_and_storage_root(
                             &sqlite_path,
                             &storage_root_for_recovery,
@@ -3602,9 +3617,9 @@ impl DbPool {
                         &init_sql,
                         "pool connection init pragmas",
                     ) {
-                        if sqlite_path == ":memory:"
-                            || open_mode == DbPoolOpenMode::QueryOnlyStrict
-                            || !is_sqlite_recovery_error_message(&first_init_err.to_string())
+                    if sqlite_path == ":memory:"
+                        || open_mode != DbPoolOpenMode::Recovering
+                        || !is_sqlite_recovery_error_message(&first_init_err.to_string())
                         {
                             if open_mode == DbPoolOpenMode::QueryOnlyStrict {
                                 // `close_db_conn` checkpoints. A genuinely
@@ -6780,15 +6795,18 @@ async fn initialize_sqlite_file_once(
     sqlite_path: &str,
     run_migrations: bool,
     storage_root: &Path,
+    open_mode: DbPoolOpenMode,
 ) -> Outcome<(), SqlError> {
     let path = Path::new(sqlite_path);
+    let allow_recovery = open_mode == DbPoolOpenMode::Recovering;
     // A missing primary is normally fresh-start authority, but an adjacent
     // breaker sidecar remains durable authority for that exact pathname.
     // Consult it before archive inventory, fresh creation, or any engine open.
     // Existing namespace entries retain the established cleanup/private-health
     // decision path, which allows a directly healthy exact family to serve
     // without rewriting historical breaker state.
-    if sqlite_path != ":memory:"
+    if allow_recovery
+        && sqlite_path != ":memory:"
         && !path_is_occupied(path)
         && let Err(error) = preflight_missing_primary_pool_breaker_authority(path)
     {
@@ -6799,7 +6817,8 @@ async fn initialize_sqlite_file_once(
     // require mutation, then reclassifies before moving them. A malformed or
     // tripped breaker therefore refuses pool initialization without changing
     // the live family.
-    if sqlite_path != ":memory:"
+    if allow_recovery
+        && sqlite_path != ":memory:"
         && let Err(error) = cleanup_truncated_wal_sidecar(path)
     {
         return Outcome::Err(error);
@@ -6807,7 +6826,8 @@ async fn initialize_sqlite_file_once(
     // Reconcile archive-backed state before first init so every entrypoint,
     // not just the server startup probe, preserves durable message IDs when a
     // DB is missing or stale relative to the archive.
-    if sqlite_path != ":memory:"
+    if allow_recovery
+        && sqlite_path != ":memory:"
         && let Err(err) = reconcile_archive_state_before_init(path, storage_root)
     {
         return Outcome::Err(err);
@@ -6820,7 +6840,7 @@ async fn initialize_sqlite_file_once(
     // is unhealthy, complete the admission-controlled recovery before either
     // migrations or pooled connections open the live path. Missing files are
     // normal fresh-start authority and remain the init path's responsibility.
-    if sqlite_path != ":memory:" && path.exists() {
+    if allow_recovery && sqlite_path != ":memory:" && path.exists() {
         match sqlite_file_is_healthy_without_family_cleanup(path) {
             Ok(true) => {}
             Ok(false) => {
@@ -6838,6 +6858,15 @@ async fn initialize_sqlite_file_once(
         Outcome::Err(first_err) => {
             if !should_retry_sqlite_init_error(&first_err) {
                 return Outcome::Err(first_err);
+            }
+
+            if !allow_recovery {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %first_err,
+                    "sqlite init failed with retryable error; automatic recovery disabled; retrying initialization once"
+                );
+                return run_sqlite_init_once(cx, sqlite_path, run_migrations).await;
             }
 
             if is_sqlite_recovery_error_message(&first_err.to_string()) {
@@ -19299,6 +19328,69 @@ mod tests {
             .expect("successful admitted recovery persists cleared authority");
         assert_eq!(breaker.consecutive_failures, 0);
         assert!(!breaker.tripped);
+    }
+
+    #[test]
+    fn pool_init_integrity_opt_out_skips_archive_recovery() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("integrity-opt-out.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let archive_project = storage_root.join("projects").join("archive-only");
+        std::fs::create_dir_all(&archive_project).expect("create archive project");
+        std::fs::write(
+            archive_project.join("project.json"),
+            r#"{"slug":"archive-only","human_key":"/archive-only","created_at":0}"#,
+        )
+        .expect("write archive project metadata");
+
+        let seed = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open seed database");
+        seed.execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("initialize seed schema");
+        drop(seed);
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("INTEGRITY_CHECK_ON_STARTUP", "false"),
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || {
+                let pool = DbPool::new(&DbPoolConfig {
+                    database_url: database_url.clone(),
+                    storage_root: Some(storage_root.clone()),
+                    min_connections: 1,
+                    max_connections: 1,
+                    warmup_connections: 0,
+                    ..Default::default()
+                })
+                .expect("create pool");
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                let cx = Cx::for_testing();
+
+                runtime.block_on(async {
+                    let conn = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("acquire without automatic recovery");
+                    let rows = conn
+                        .query_sync("SELECT COUNT(*) AS c FROM projects", &[])
+                        .expect("count projects");
+                    assert_eq!(
+                        rows[0].get_named::<i64>("c").unwrap_or(-1),
+                        0,
+                        "integrity opt-out must not reconcile archive-only state into SQLite"
+                    );
+                });
+            },
+        );
     }
 
     #[test]
