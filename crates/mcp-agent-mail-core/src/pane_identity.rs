@@ -52,6 +52,11 @@ const IDENTITY_DIR_NAME: &str = "agent-mail/identity";
 /// How many hex chars of the project hash to use in the directory name.
 const PROJECT_HASH_LEN: usize = 12;
 
+/// Schema marker for rows carrying tmux server-generation evidence.
+/// `parse_binding_generation` requires it, so only rows that captured a
+/// complete, unambiguous generation may carry it (agent-factory-3tf).
+const BINDING_SCHEMA_V1: &str = "am.pane-binding.v1";
+
 /// tmux format used to probe a recorded binding's liveness on its own server.
 const LIVENESS_PROBE_FORMAT: &str = "#{session_name}\t#{pane_pid}\t#{pane_current_command}";
 
@@ -118,6 +123,27 @@ pub struct PaneIdentityRecord {
     /// RFC 3339 timestamp of the write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub written_at: Option<String>,
+    /// `am.pane-binding.v1` marker when the row carries generation evidence
+    /// (agent-factory-3tf). Absent on rows written by the GH#252-only writer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
+    /// Identity key the row was written under (bare `%25` or composite
+    /// `session:window:pane`). Distinct from `pane_id`, whose meaning is
+    /// version-dependent; never probe tmux with this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_key: Option<String>,
+    /// Authoritative bare tmux pane id (`%25`) for this binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_pane_id: Option<String>,
+    /// `st_dev` of the tmux server socket, pinning the server generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_device: Option<u64>,
+    /// `st_ino` of the tmux server socket, pinning the server generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_inode: Option<u64>,
+    /// tmux server pid, pinning the server generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_pid: Option<u32>,
 }
 
 impl PaneIdentityRecord {
@@ -131,14 +157,35 @@ impl PaneIdentityRecord {
             pane_pid: None,
             socket_path: None,
             written_at: None,
+            schema_version: None,
+            identity_key: None,
+            tmux_pane_id: None,
+            socket_device: None,
+            socket_inode: None,
+            server_pid: None,
         }
+    }
+
+    /// Bare tmux pane id to probe tmux with.
+    ///
+    /// `tmux_pane_id` is authoritative when present. Rows written by the
+    /// GH#252-only writer put the bare id in `pane_id`, so that is the
+    /// fallback. A composite `pane_id` is NOT a valid tmux target and is
+    /// deliberately not returned here (agent-factory-3tf).
+    #[must_use]
+    pub fn probe_pane_id(&self) -> Option<&str> {
+        if let Some(bare) = self.tmux_pane_id.as_deref() {
+            return Some(bare);
+        }
+        let pane = self.pane_id.as_deref()?;
+        (!pane.contains(':')).then_some(pane)
     }
 
     /// Whether the record carries every fact the liveness predicate needs.
     #[must_use]
-    pub const fn is_verifiable(&self) -> bool {
+    pub fn is_verifiable(&self) -> bool {
         self.session_name.is_some()
-            && self.pane_id.is_some()
+            && self.probe_pane_id().is_some()
             && self.pane_pid.is_some()
             && self.socket_path.is_some()
     }
@@ -270,7 +317,7 @@ where
 {
     let (Some(session_name), Some(recorded_pane), Some(recorded_pid), Some(socket_path)) = (
         record.session_name.as_deref(),
-        record.pane_id.as_deref(),
+        record.probe_pane_id(),
         record.pane_pid,
         record.socket_path.as_deref(),
     ) else {
@@ -398,7 +445,7 @@ pub fn write_identity(
         && binding_liveness(&existing) == PaneBindingLiveness::Live
     {
         let same_holder = facts.as_ref().is_some_and(|f| {
-            existing.pane_id.as_deref() == Some(f.pane_id.as_str())
+            existing.probe_pane_id() == Some(f.pane_id.as_str())
                 && existing.socket_path.as_deref() == Some(f.socket_path.as_str())
         });
         if !same_holder {
@@ -414,7 +461,7 @@ pub fn write_identity(
         }
     }
 
-    let record = record_from_facts(agent_name, facts.as_ref());
+    let record = record_from_facts(agent_name, pane_id, facts.as_ref());
     write_record_content_no_follow(&path, &record)?;
     Ok(path)
 }
@@ -1063,6 +1110,19 @@ pub fn resolve_identity_with_binding(
         return Some(hit);
     }
 
+    // 1a. A release that was quarantined but not completed (the process died
+    //     inside the rename window) leaves the binding in a `.NAME.release-*`
+    //     sibling. That row still holds the binding, so it must stay
+    //     resolvable until a retry completes or restores it — otherwise a
+    //     crash mid-release silently orphans a live agent's identity.
+    //     Restored in agent-factory-3tf: the GH#252 merge dropped this step,
+    //     so every pending row resolved as NotFound.
+    for pending in pending_release_paths(&canonical_identity_path(project_key, pane_id)) {
+        if let Some(hit) = resolver.consider(pending) {
+            return Some(hit);
+        }
+    }
+
     // 1b. If pane_id is a composite key, try legacy bare $TMUX_PANE canonical path.
     //     A composite key contains `:`, e.g., `main:0:2`. The bare pane env var
     //     is something like `%3`. We check the env so we can find files written
@@ -1312,6 +1372,7 @@ fn cleanup_identity_directory(project_dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(project_dir) else {
         return Vec::new();
     };
+    let live_panes = list_live_tmux_panes();
     let mut bindings = std::collections::BTreeMap::new();
     for entry in entries.flatten() {
         if !dir_entry_is_real_file(&entry) {
@@ -1321,12 +1382,28 @@ fn cleanup_identity_directory(project_dir: &Path) -> Vec<PathBuf> {
         if is_released_name(&raw_name) {
             continue;
         }
+        // agent-factory-3tf: upstream decides WHICH rows are stale (liveness
+        // predicate, socket-gone rule, and the "retain everything when this
+        // host has no live panes" guard); 7x5 decides WHAT HAPPENS to a stale
+        // row (durable release receipt, never an unlink). Before this, the
+        // 7x5 merge released every row and delegated the decision entirely to
+        // the release gate, which tombstoned rows that were merely
+        // unverifiable and left `identity_entry_is_stale` with no callers.
+        if !identity_entry_is_stale(&entry, &live_panes) {
+            continue;
+        }
         let pending = pending_original_name(&raw_name);
         let filename_pane_id = pending
             .map(str::to_owned)
             .unwrap_or_else(|| raw_name.to_string_lossy().into_owned());
         let path = entry.path();
-        let pane_id = binding_pane_id(&path).unwrap_or(filename_pane_id);
+        // agent-factory-3tf: report/act on the pane id a caller can hand back
+        // to resolve-pane and release (`%99`), not the sanitized on-disk file
+        // name (`99`). The recorded identity key is authoritative; a v1 row's
+        // stored pane is next; the file name is the last resort.
+        let pane_id = recorded_identity_key(&path)
+            .or_else(|| binding_pane_id(&path))
+            .unwrap_or(filename_pane_id);
         if let Some(agent_name) = read_identity_file(&path) {
             let replace = bindings
                 .get(&pane_id)
@@ -1386,12 +1463,24 @@ pub fn list_identities_with_paths(project_key: &str) -> Vec<(String, String, Pat
         if is_released_name(&raw_name) {
             continue;
         }
+        // agent-factory-3tf: upstream skips every dotfile as an internal
+        // atomic-write artifact, but 7x5's pending-release rows are dotfiles
+        // that still hold a real binding. Skip artifacts, keep pending rows.
+        if pending_original_name(&raw_name).is_none() && identity_entry_is_internal(&entry) {
+            continue;
+        }
         let pending = pending_original_name(&raw_name);
         let filename_pane_id = pending
             .map(str::to_owned)
             .unwrap_or_else(|| raw_name.to_string_lossy().into_owned());
         let path = entry.path();
-        let pane_id = binding_pane_id(&path).unwrap_or(filename_pane_id);
+        // agent-factory-3tf: report/act on the pane id a caller can hand back
+        // to resolve-pane and release (`%99`), not the sanitized on-disk file
+        // name (`99`). The recorded identity key is authoritative; a v1 row's
+        // stored pane is next; the file name is the last resort.
+        let pane_id = recorded_identity_key(&path)
+            .or_else(|| binding_pane_id(&path))
+            .unwrap_or(filename_pane_id);
         if let Some(name) = read_identity_file(&path) {
             let replace = result
                 .get(&pane_id)
@@ -1492,7 +1581,7 @@ fn parse_identity(content: String) -> Option<String> {
 
 fn parse_binding_generation(content: &str) -> Option<BindingGeneration> {
     let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    if value.get("schema_version")?.as_str()? != "am.pane-binding.v1" {
+    if value.get("schema_version")?.as_str()? != BINDING_SCHEMA_V1 {
         return None;
     }
     let tmux_pane_id = value.get("tmux_pane_id")?.as_str()?.trim();
@@ -1512,16 +1601,76 @@ fn parse_binding_generation(content: &str) -> Option<BindingGeneration> {
 
 fn parse_binding_pane_id(content: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    if value.get("schema_version")?.as_str()? != "am.pane-binding.v1" {
+    if value.get("schema_version")?.as_str()? != BINDING_SCHEMA_V1 {
         return None;
     }
     let pane_id = value.get("pane_id")?.as_str()?.trim();
     (!pane_id.is_empty()).then(|| pane_id.to_string())
 }
 
+/// Query tmux for all live pane IDs (sanitized).
+///
+/// Returns composite keys (`session_name:window_index:pane_index`) for each
+/// live pane, plus the legacy bare pane ID (e.g., `%3` -> `3`) for backwards
+/// compatibility during cleanup. Returns an empty vec if tmux is not running
+/// or the command fails.
+///
+/// Restored in agent-factory-3tf: the 7x5 merge dropped this along with the
+/// staleness rule that consumes it.
+fn list_live_tmux_panes() -> Vec<String> {
+    #[cfg(test)]
+    if let Some(panes) = test_live_tmux_panes() {
+        return panes;
+    }
+
+    let output = tmux_command()
+        .args([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}:#{window_index}:#{pane_index}:#{pane_id}",
+        ])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut ids = Vec::new();
+            for line in text.lines().filter(|l| !l.is_empty()) {
+                let line = line.trim();
+                // Parse "session:window:pane_idx:pane_id" format.
+                // The composite key is the first three fields joined by `:`.
+                // We also include the bare pane_id for backwards compat.
+                if let Some((composite, bare_id)) = line.rsplit_once(':') {
+                    ids.push(sanitize_pane_id(composite));
+                    ids.push(sanitize_pane_id(bare_id));
+                } else {
+                    // Fallback: treat the entire line as a bare pane ID
+                    ids.push(sanitize_pane_id(line));
+                }
+            }
+            ids.sort();
+            ids.dedup();
+            ids
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn binding_pane_id(path: &Path) -> Option<String> {
     let content = read_identity_file_no_follow(path).ok()?;
     parse_binding_pane_id(&content)
+}
+
+/// Identity key a record was written under, when it recorded one.
+///
+/// Lets listings and cleanup report/act on the caller-facing pane id even
+/// when the file name had to be sanitized (agent-factory-3tf).
+fn recorded_identity_key(path: &Path) -> Option<String> {
+    let content = read_identity_file_no_follow(path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+    let key = value.get("identity_key")?.as_str()?.trim();
+    (!key.is_empty()).then(|| key.to_string())
 }
 
 fn resolve_unique_v1_by_bare_pane(
@@ -1998,36 +2147,77 @@ fn tmux_env_socket_path() -> Option<String> {
 }
 
 /// Build a structured record for `name` from optional target-pane facts.
-fn record_from_facts(name: &str, facts: Option<&TargetPaneFacts>) -> PaneIdentityRecord {
-    facts.map_or_else(
-        || PaneIdentityRecord::bare(name),
-        |f| PaneIdentityRecord {
-            name: name.trim().to_string(),
-            session_name: Some(f.session_name.clone()),
-            pane_id: Some(f.pane_id.clone()),
-            pane_pid: Some(f.pane_pid),
-            socket_path: if f.socket_path.is_empty() {
-                None
-            } else {
-                Some(f.socket_path.clone())
-            },
-            written_at: Some(chrono::Utc::now().to_rfc3339()),
+fn record_from_facts(
+    name: &str,
+    identity_key: &str,
+    facts: Option<&TargetPaneFacts>,
+) -> PaneIdentityRecord {
+    let Some(f) = facts else {
+        let mut record = PaneIdentityRecord::bare(name);
+        record.identity_key = Some(identity_key.trim().to_string());
+        return record;
+    };
+
+    // agent-factory-3tf: the GH#252 writer recorded only the "is an agent
+    // running here" facts, which left `parse_binding_generation` returning
+    // None for every row production wrote. That silently downgraded the
+    // destructive release gate to the `tmux_pane_is_live` fallback — the
+    // exact path that was proven to grant release of LIVE panes. The write
+    // path therefore captures the server generation too, and a row that
+    // cannot capture one unambiguously stays deliberately non-authoritative
+    // (schema_version absent -> live-unverified, never verified-live).
+    let generation = capture_binding_generation(identity_key)
+        .ok()
+        .flatten()
+        .filter(|generation| binding_authorizes_pane(generation, identity_key));
+
+    let mut record = PaneIdentityRecord {
+        name: name.trim().to_string(),
+        session_name: Some(f.session_name.clone()),
+        pane_id: Some(f.pane_id.clone()),
+        pane_pid: Some(f.pane_pid),
+        socket_path: if f.socket_path.is_empty() {
+            None
+        } else {
+            Some(f.socket_path.clone())
         },
-    )
+        written_at: Some(chrono::Utc::now().to_rfc3339()),
+        schema_version: None,
+        identity_key: Some(identity_key.trim().to_string()),
+        tmux_pane_id: Some(f.pane_id.clone()),
+        socket_device: None,
+        socket_inode: None,
+        server_pid: None,
+    };
+
+    if let Some(generation) = generation {
+        // v1 contract: `pane_id` is the composite tmux address that
+        // `binding_authorizes_pane` compares against, and `tmux_pane_id` is
+        // the bare id. `probe_pane_id()` keeps GH#252's liveness probe on the
+        // bare id, so both readers stay correct on one row.
+        record.schema_version = Some(BINDING_SCHEMA_V1.to_string());
+        record.pane_id = Some(generation.pane_id.clone());
+        record.socket_path = Some(generation.socket_path.to_string_lossy().into_owned());
+        record.socket_device = Some(generation.socket_device);
+        record.socket_inode = Some(generation.socket_inode);
+        record.server_pid = Some(generation.server_pid);
+        record.tmux_pane_id = Some(generation.tmux_pane_id.clone());
+    }
+    record
 }
 
 /// Best-effort adoption rewrite: bind `name` to the adopter's pane facts at
 /// the identity file that produced the candidate (upgrading legacy files to
 /// structured records in place). IO failures are ignored — adoption must not
 /// break resolution.
-fn adopt_record_at(path: &Path, name: &str, facts: &TargetPaneFacts) {
+fn adopt_record_at(path: &Path, name: &str, identity_key: &str, facts: &TargetPaneFacts) {
     if path_has_symlinked_parent(path).unwrap_or(true) {
         return;
     }
     if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return;
     }
-    let record = record_from_facts(name, Some(facts));
+    let record = record_from_facts(name, identity_key, Some(facts));
     let _ = write_record_content_no_follow(path, &record);
 }
 
@@ -2069,7 +2259,7 @@ impl PaneBindingResolver {
         match binding_liveness(&record) {
             PaneBindingLiveness::Live => {
                 let holder_matches = self.target_facts().is_some_and(|f| {
-                    record.pane_id.as_deref() == Some(f.pane_id.as_str())
+                    record.probe_pane_id() == Some(f.pane_id.as_str())
                         && record.socket_path.as_deref() == Some(f.socket_path.as_str())
                 });
                 if holder_matches {
@@ -2080,7 +2270,7 @@ impl PaneBindingResolver {
             }
             PaneBindingLiveness::Dead => {
                 if let Some(facts) = self.target_facts().cloned() {
-                    adopt_record_at(&path, &record.name, &facts);
+                    adopt_record_at(&path, &record.name, &self.pane_arg.clone(), &facts);
                 }
                 Some((record.name, path, PaneBindingStatus::AdoptedDead))
             }
@@ -2099,7 +2289,7 @@ impl PaneBindingResolver {
                         Some((record.name, path, PaneBindingStatus::LegacyUnverified))
                     }
                     Some(facts) => {
-                        adopt_record_at(&path, &record.name, &facts);
+                        adopt_record_at(&path, &record.name, &self.pane_arg.clone(), &facts);
                         Some((record.name, path, PaneBindingStatus::AdoptedDead))
                     }
                     None => Some((record.name, path, PaneBindingStatus::LegacyUnverified)),
@@ -2126,6 +2316,24 @@ impl PaneBindingResolver {
 /// harmless to keep and become adoptable/purgeable once a local server runs.
 fn identity_entry_is_stale(entry: &std::fs::DirEntry, live_panes: &[String]) -> bool {
     let path = entry.path();
+
+    // agent-factory-3tf: a row carrying tmux server-generation evidence is
+    // judgeable on its own terms, so it does not need the legacy live-pane
+    // inventory. Upstream's "retain everything when this host reports no
+    // live panes" guard exists because an unverifiable row cannot be judged;
+    // a v1 row can. A failed tmux query stays fail-closed (retained), never
+    // read as evidence of absence.
+    if let Some(generation) = read_identity_file_no_follow(&path)
+        .ok()
+        .as_deref()
+        .and_then(parse_binding_generation)
+    {
+        return match binding_generation_is_live(&generation.tmux_pane_id, Some(&generation)) {
+            Ok(live) => !live,
+            Err(_) => false,
+        };
+    }
+
     let record = read_identity_record(&path);
     match record.as_ref().map(binding_liveness) {
         Some(PaneBindingLiveness::Live) => false,
@@ -3484,9 +3692,13 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["99"]);
+        // agent-factory-3tf: the on-disk FILE name stays sanitized ("99"),
+        // but the listing reports the pane id a caller can hand back to
+        // resolve-pane/release ("%99") under 7x5's semantics. The test's
+        // intent — exactly one complete visible record — is unchanged.
         assert_eq!(
             list_identities(&unique_key),
-            vec![("99".into(), "BlueLake".into())]
+            vec![("%99".into(), "BlueLake".into())]
         );
         drop(config);
     }
@@ -3508,7 +3720,7 @@ mod tests {
 
         assert_eq!(
             list_identities(&unique_key),
-            vec![("4".into(), "RedFox".into())]
+            vec![("%4".into(), "RedFox".into())]
         );
         drop(config);
     }
@@ -3865,6 +4077,7 @@ mod tests {
             pane_pid: Some(root_pid),
             socket_path: Some(socket.to_string()),
             written_at: Some("2026-08-20T09:00:00Z".to_string()),
+            ..PaneIdentityRecord::bare(name)
         })
         .expect("serialize record")
     }
@@ -3942,6 +4155,7 @@ mod tests {
             pane_pid: Some(3_452_123),
             socket_path: Some("/tmp/tmux-1000/default".to_string()),
             written_at: None,
+            ..PaneIdentityRecord::bare("AmberRabbit")
         }
     }
 
