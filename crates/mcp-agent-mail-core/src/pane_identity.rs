@@ -611,11 +611,59 @@ fn tmux_server_has_pane(pane_id: &str, socket: Option<&Path>) -> std::io::Result
     }))
 }
 
+/// Test-only stand-in for a real tmux server generation.
+///
+/// agent-factory-3tf: before steer 1 the unit suite could only ever produce
+/// *unevidenced* rows, because liveness was injected at `tmux_pane_is_live` while
+/// generation capture went to a deliberately-absent tmux binary. Every release
+/// test therefore exercised the legacy fall-through and none of them exercised
+/// the path production actually uses. Synthesising one stable generation here,
+/// and honouring the injected inventory in `tmux_server_binding_generation`,
+/// moves the whole suite onto the evidenced path. Rows that must stay legacy are
+/// written directly by `write_legacy_fixture`, not through this.
+#[cfg(test)]
+fn test_generation_socket() -> &'static Path {
+    static SOCKET: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    SOCKET.get_or_init(|| {
+        let path = std::env::temp_dir().join(format!(
+            "am-test-generation-socket-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::write(&path, b"");
+        path
+    })
+}
+
+#[cfg(test)]
+fn test_binding_generation(pane_id: &str) -> Option<BindingGeneration> {
+    use std::os::unix::fs::MetadataExt as _;
+    let socket = test_generation_socket();
+    let metadata = std::fs::metadata(socket).ok()?;
+    let requested = pane_id.trim();
+    if requested.is_empty() {
+        return None;
+    }
+    Some(BindingGeneration {
+        pane_id: requested.to_string(),
+        socket_path: socket.to_path_buf(),
+        socket_device: metadata.dev(),
+        socket_inode: metadata.ino(),
+        server_pid: 424_242,
+        // Keep the injected inventory the single source of liveness truth:
+        // `tmux_pane_ids_match` already understands composite/bare aliasing, so
+        // carrying the requested key here preserves the existing match
+        // semantics exactly.
+        tmux_pane_id: requested.to_string(),
+    })
+}
+
 fn capture_binding_generation(pane_id: &str) -> std::io::Result<Option<BindingGeneration>> {
     #[cfg(test)]
-    if test_live_tmux_panes().is_some() {
-        // Unit tests inject liveness independently of a real tmux server.
-        return Ok(None);
+    if crate::config::process_env_value("AM_TEST_TMUX_BIN")
+        .is_none_or(|value| value.trim().is_empty()) {
+        // Unit tests have no tmux server. Record the same evidence a real
+        // registration would, so the suite exercises the evidenced path.
+        return Ok(test_binding_generation(pane_id));
     }
 
     // A registration request carries only a pane id, not a trusted tmux
@@ -680,7 +728,66 @@ fn binding_generation_is_live(
             }
             tmux_binding_generation_matches(expected)
         }
-        None => tmux_pane_is_live(pane_id),
+        // agent-factory-3tf, binding steer 1: an unevidenced row is REFUSED,
+        // never grandfathered.
+        //
+        // This arm used to fall through to `tmux_pane_is_live(pane_id)`, which
+        // asks "is SOME pane with this bare id alive on the default socket?".
+        // That is not the question the release gate needs answered. Pane ids
+        // are global per tmux server and are reissued across sockets, so the
+        // fall-through happily reported a DIFFERENT server's live pane as this
+        // binding's liveness -- and, worse, reported dead whenever the id had
+        // been recycled away, which is how a decorrelated review (StormyOsprey,
+        // FAIL, 191253a) reproduced release of LIVE panes 6 times.
+        //
+        // The legacy population this arm served is the 70-of-81 rows written
+        // before `am.pane-binding.v1`. They are not grandfathered: a row that
+        // cannot prove which tmux server generation it belongs to cannot be
+        // proven dead, and a destructive gate that cannot prove death must not
+        // fire. Unknown is an error here, exactly as a failed tmux query is.
+        // Re-registration rewrites such a row with evidence; that is the
+        // recovery path, not a silent release.
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to release pane {pane_id}: binding carries no \
+                 {BINDING_SCHEMA_V1} generation evidence, so it cannot be \
+                 proven dead"
+            ),
+        )),
+    }
+}
+
+/// Release-time liveness, decided on whatever evidence the row actually carries.
+///
+/// agent-factory-3tf, binding steer 1. A destructive release must never fire on
+/// an absence of information, so this returns three outcomes, not two:
+///
+/// * `Ok(true)`  -- proven LIVE. Refuse.
+/// * `Ok(false)` -- proven DEAD. Release may proceed.
+/// * `Err(..)`   -- UNPROVABLE. Refuse, fail closed.
+///
+/// The tiers, strongest evidence first:
+///
+/// 1. An `am.pane-binding.v1` generation. This is the only evidence that
+///    identifies the tmux *server* the binding belongs to, so it is the only
+///    one immune to a pane id being reissued on a different socket.
+/// 2. A GH#252 structured record. Its own `binding_liveness` predicate is real
+///    evidence -- recorded socket gone, or session/pid/command checked against
+///    the recorded socket -- and is reused verbatim rather than reimplemented.
+///    Its `Unverifiable` verdict is deliberately NOT read as dead.
+/// 3. Anything else -- the bare `Name\n` legacy file, which is the 70-of-81
+///    population. It carries no evidence at all and is REFUSED, never
+///    grandfathered. Its heal path is re-registration, which overwrites an
+///    unverifiable row (see `write_identity`) and now records evidence.
+fn binding_release_liveness(pane_id: &str, content: Option<&str>) -> std::io::Result<bool> {
+    if let Some(generation) = content.and_then(parse_binding_generation) {
+        return binding_generation_is_live(pane_id, Some(&generation));
+    }
+    match content.and_then(parse_identity_record).as_ref().map(binding_liveness) {
+        Some(PaneBindingLiveness::Live) => Ok(true),
+        Some(PaneBindingLiveness::Dead) => Ok(false),
+        _ => binding_generation_is_live(pane_id, None),
     }
 }
 
@@ -688,6 +795,30 @@ fn tmux_server_binding_generation(
     pane_id: &str,
     socket: Option<&Path>,
 ) -> std::io::Result<Option<BindingGeneration>> {
+    #[cfg(test)]
+    if let Some(panes) = test_live_tmux_panes() {
+        let call = TEST_TMUX_QUERY_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if panes.iter().any(|candidate| candidate == "__QUERY_ERROR__") {
+            return Err(std::io::Error::other("injected tmux liveness failure"));
+        }
+        if call >= 1
+            && panes
+                .iter()
+                .any(|candidate| candidate == "__QUERY_ERROR_AFTER_1__")
+        {
+            return Err(std::io::Error::other("injected late tmux liveness failure"));
+        }
+        let live = panes.iter().any(|candidate| {
+            candidate
+                .strip_prefix("__LIVE_AFTER_1__:")
+                .map_or_else(
+                    || tmux_pane_ids_match(pane_id, candidate.trim()),
+                    |candidate| call >= 1 && tmux_pane_ids_match(pane_id, candidate),
+                )
+        });
+        return Ok(live.then(|| test_binding_generation(pane_id)).flatten());
+    }
+
     let mut command = tmux_command();
     if let Some(socket) = socket {
         command.arg("-S").arg(socket);
@@ -980,17 +1111,8 @@ fn release_resolved_identity(
         .into_iter()
         .filter_map(|pending| pending.file_name().map(OsStr::to_os_string))
         .collect();
-    let recorded_generation = read_identity_file_no_follow(path)
-        .ok()
-        .and_then(|content| parse_binding_generation(&content));
-    #[cfg(not(target_os = "linux"))]
-    if recorded_generation.is_none() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "refusing to release an unnamespaced legacy pane binding on this platform",
-        ));
-    }
-    if binding_generation_is_live(pane_id, recorded_generation.as_ref())? {
+    let recorded_content = read_identity_file_no_follow(path).ok();
+    if binding_release_liveness(pane_id, recorded_content.as_deref())? {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("refusing to release recycled live tmux pane {pane_id}"),
@@ -1025,11 +1147,8 @@ fn release_resolved_identity(
 
     let quarantined_content = anchored.read(&quarantine_name).ok();
     let quarantined_agent = quarantined_content.clone().and_then(parse_identity);
-    let quarantined_generation = quarantined_content
-        .as_deref()
-        .and_then(parse_binding_generation);
     let live_after_quarantine =
-        match binding_generation_is_live(pane_id, quarantined_generation.as_ref()) {
+        match binding_release_liveness(pane_id, quarantined_content.as_deref()) {
             Ok(live) => live,
             Err(error) => {
                 if !already_pending {
@@ -2253,24 +2372,41 @@ fn record_from_facts(
     identity_key: &str,
     facts: Option<&TargetPaneFacts>,
 ) -> PaneIdentityRecord {
-    let Some(f) = facts else {
-        let mut record = PaneIdentityRecord::bare(name);
-        record.identity_key = Some(identity_key.trim().to_string());
-        return record;
-    };
-
     // agent-factory-3tf: the GH#252 writer recorded only the "is an agent
     // running here" facts, which left `parse_binding_generation` returning
     // None for every row production wrote. That silently downgraded the
-    // destructive release gate to the `tmux_pane_is_live` fallback — the
+    // destructive release gate to the `tmux_pane_is_live` fallback -- the
     // exact path that was proven to grant release of LIVE panes. The write
     // path therefore captures the server generation too, and a row that
     // cannot capture one unambiguously stays deliberately non-authoritative
     // (schema_version absent -> live-unverified, never verified-live).
+    //
+    // The two evidence sets are INDEPENDENT and neither gates the other.
+    // GH#252's facts come from `display-message -t <pane>` ("is an agent
+    // running in this pane"); the generation comes from `list-panes -a`
+    // ("which tmux server does this pane belong to"). Either query can fail
+    // while the other succeeds, so capturing the generation must not sit
+    // behind the facts. It did, and that is why a row with no facts was
+    // written unevidenced and then became unreleasable under steer 1.
     let generation = capture_binding_generation(identity_key)
         .ok()
         .flatten()
         .filter(|generation| binding_authorizes_pane(generation, identity_key));
+
+    let Some(f) = facts else {
+        let mut record = PaneIdentityRecord::bare(name);
+        record.identity_key = Some(identity_key.trim().to_string());
+        if let Some(generation) = generation {
+            record.schema_version = Some(BINDING_SCHEMA_V1.to_string());
+            record.pane_id = Some(generation.pane_id.clone());
+            record.socket_path = Some(generation.socket_path.to_string_lossy().into_owned());
+            record.socket_device = Some(generation.socket_device);
+            record.socket_inode = Some(generation.socket_inode);
+            record.server_pid = Some(generation.server_pid);
+            record.tmux_pane_id = Some(generation.tmux_pane_id);
+        }
+        return record;
+    };
 
     let mut record = PaneIdentityRecord {
         name: name.trim().to_string(),
@@ -2902,6 +3038,20 @@ mod tests {
         }
     }
 
+    /// A pre-`am.pane-binding.v1` row: a bare agent name and nothing else.
+    ///
+    /// agent-factory-3tf: `write_identity` now records generation evidence, so a
+    /// test that needs the LEGACY population must write it directly. Going
+    /// through the production path would quietly produce an evidenced row and
+    /// the test would stop testing what it names.
+    fn write_legacy_fixture(project: &str, pane_id: &str, agent: &str) -> PathBuf {
+        let path = canonical_identity_path(project, pane_id);
+        std::fs::create_dir_all(path.parent().expect("identity parent"))
+            .expect("create identity parent");
+        std::fs::write(&path, format!("{agent}\n")).expect("write legacy fixture");
+        path
+    }
+
     fn write_v1_fixture(project: &str, composite: &str, bare: &str, agent: &str) -> PathBuf {
         let path = canonical_identity_path(project, composite);
         std::fs::create_dir_all(path.parent().expect("identity parent"))
@@ -3270,7 +3420,7 @@ mod tests {
         let config = IsolatedConfigBaseDir::new();
         let project = config.project_key("legacy-live-state");
         let tmux = LiveTmuxPanesGuard::new(vec!["%42".into()]);
-        let path = write_identity(&project, "%42", "BlueLake").expect("write legacy binding");
+        let path = write_legacy_fixture(&project, "%42", "BlueLake");
 
         assert_eq!(
             identity_binding_state("%42", &path).expect("classify binding"),
@@ -4896,13 +5046,21 @@ mod tests {
                     "dead structured record must be released with a receipt: {removed:?}"
                 );
                 assert!(!dead_path.exists(), "dead binding must no longer resolve");
+                // agent-factory-3tf, binding steer 1: this file used to be
+                // swept here. It carries no evidence at all, so the only thing
+                // that ever condemned it was "the host's live-pane inventory
+                // does not list this key" -- and that inventory does not cover
+                // the server the row belongs to. Sweeping on it is the
+                // grandfathering the steer removes. Retention is non-
+                // destructive and the row heals on re-registration.
                 assert!(
-                    contains_release_receipt_for(&removed, &legacy_stale_path),
-                    "stale legacy file must be released with a receipt: {removed:?}"
+                    !contains_release_receipt_for(&removed, &legacy_stale_path),
+                    "an unevidenced legacy row must never be swept on inventory \
+                     evidence alone: {removed:?}"
                 );
                 assert!(
-                    !legacy_stale_path.exists(),
-                    "stale legacy binding must no longer resolve"
+                    legacy_stale_path.exists(),
+                    "an unevidenced legacy row must be retained, not destroyed"
                 );
                 assert!(
                     live_path.exists(),
@@ -5017,8 +5175,14 @@ mod tests {
     }
 
     /// A record with a present socket that tmux cannot check (not executable)
-    /// is treated like a legacy file even when local panes exist: kept when
-    /// its file name matches a live pane key, purged otherwise.
+    /// is RETAINED whether or not its file name matches a live pane key.
+    ///
+    /// agent-factory-3tf, binding steer 1: upstream purged the non-matching one
+    /// on the strength of the host's live-pane inventory. "tmux could not be
+    /// executed" is the textbook unprovable case -- the process learned nothing
+    /// about this binding -- so a destructive sweep must not fire on it. Note
+    /// this is the same verdict `binding_liveness` already reaches on its own
+    /// (`Unverifiable`, explicitly not `Dead`); only the sweep disagreed.
     #[test]
     fn cleanup_applies_legacy_rule_to_uncheckable_structured_records() {
         let config = IsolatedConfigBaseDir::new();
@@ -5042,13 +5206,13 @@ mod tests {
         crate::config::with_process_env_overrides_for_test(&[("AM_TEST_TMUX_BIN", "")], || {
             let removed = cleanup_stale_identities(&project);
             assert!(
-                contains_release_receipt_for(&removed, &stale_path),
-                "uncheckable record not matching a live pane key must be released \
-                 with a receipt: {removed:?}"
+                removed.is_empty(),
+                "a sweep that cannot execute tmux must destroy nothing: {removed:?}"
             );
             assert!(
-                !stale_path.exists(),
-                "uncheckable stale binding must no longer resolve"
+                stale_path.exists(),
+                "an uncheckable record must be retained, not swept on inventory \
+                 evidence alone"
             );
             assert!(
                 kept_path.exists(),
@@ -5136,6 +5300,103 @@ mod tests {
                 assert!(record.is_verifiable());
             },
         );
+        drop(config);
+    }
+    /// agent-factory-3tf, binding steer 1: an unevidenced legacy binding is
+    /// REFUSED, not grandfathered.
+    ///
+    /// The old `None` arm answered "is SOME pane with this bare id alive on the
+    /// default socket?". That is not this binding's liveness: pane ids are
+    /// global per tmux server and get reissued across sockets, so the answer
+    /// was about a different server as often as not. A decorrelated review
+    /// (StormyOsprey, FAIL, 191253a) rode that arm to release LIVE panes six
+    /// times. The 70-of-81 legacy population is exactly the input that reached
+    /// it, so the refusal is asserted here directly rather than left implied by
+    /// the tests that happen to route around it.
+    #[test]
+    fn legacy_binding_without_generation_evidence_refuses_release() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("legacy-refusal-project");
+        let pane = "%42";
+        let path = write_legacy_fixture(&project, pane, "BlueLake");
+        // The inventory reports the pane as absent -- which under the old arm
+        // was read as "dead, go ahead and release".
+        let _tmux = LiveTmuxPanesGuard::new(Vec::new());
+
+        let error = release_identity(&project, pane, "BlueLake")
+            .expect_err("an unevidenced legacy binding must never be released");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains(BINDING_SCHEMA_V1),
+            "the refusal must name the missing evidence: {error}"
+        );
+        assert!(path.exists(), "a refused release must leave the row intact");
+        assert_eq!(resolve_identity(&project, pane).as_deref(), Some("BlueLake"));
+
+        // The heal path: re-registration overwrites the unverifiable row and
+        // records evidence, after which the row is releasable on its own terms.
+        write_identity(&project, pane, "BlueLake").expect("re-registration must heal the row");
+        let (agent, receipt) =
+            release_identity(&project, pane, "BlueLake").expect("healed row releases");
+        assert_eq!(agent, "BlueLake");
+        assert!(receipt.exists(), "release must leave a durable receipt");
+        drop(config);
+    }
+
+    /// agent-factory-3tf: a release is keyed on (project, pane), and a pane id
+    /// alone never reaches across projects.
+    ///
+    /// Pane ids are global per tmux server while Agent Mail scopes identity per
+    /// project, so the same `%N` legitimately names a different agent in each
+    /// project on this machine. Releasing one must leave the others untouched.
+    #[test]
+    fn release_is_scoped_to_its_project() {
+        let config = IsolatedConfigBaseDir::new();
+        let project_a = config.project_key("scope-project-a");
+        let project_b = config.project_key("scope-project-b");
+        let pane = "%42";
+        write_identity(&project_a, pane, "AgentA").expect("bind in project A");
+        let path_b = write_identity(&project_b, pane, "AgentB").expect("bind in project B");
+        assert_ne!(
+            canonical_identity_path(&project_a, pane),
+            canonical_identity_path(&project_b, pane),
+            "two projects must not share one identity file"
+        );
+        let _tmux = LiveTmuxPanesGuard::new(Vec::new());
+
+        release_identity(&project_a, pane, "AgentA").expect("release project A binding");
+
+        assert!(
+            resolve_identity(&project_a, pane).is_none(),
+            "project A binding must be gone"
+        );
+        assert!(path_b.exists(), "project B binding must survive untouched");
+        assert_eq!(
+            resolve_identity(&project_b, pane).as_deref(),
+            Some("AgentB"),
+            "a release in one project must never reach into another"
+        );
+        drop(config);
+    }
+
+    /// agent-factory-3tf: compare-and-release refuses when the caller names an
+    /// agent that does not hold the binding, so one agent cannot release
+    /// another's pane by guessing the id.
+    #[test]
+    fn release_refuses_when_named_agent_does_not_hold_the_binding() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("wrong-agent-project");
+        let pane = "%42";
+        let path = write_identity(&project, pane, "BlueLake").expect("write identity");
+        let _tmux = LiveTmuxPanesGuard::new(Vec::new());
+
+        let error = release_identity(&project, pane, "GreenHarbor")
+            .expect_err("a release naming the wrong agent must refuse");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(path.exists(), "the binding must survive a refused release");
+        assert_eq!(resolve_identity(&project, pane).as_deref(), Some("BlueLake"));
         drop(config);
     }
 }
