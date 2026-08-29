@@ -3034,33 +3034,37 @@ pub async fn resolve_pane_identity(
         &effective_pane,
     );
 
-    resolve_identity_from_project_keys(&project_keys, &effective_pane).map_or_else(
-        || {
-            Err(legacy_tool_error(
-                "IDENTITY_NOT_FOUND",
-                format!(
-                    "No identity file found for pane '{effective_pane}' in project '{project_key}'. \
-                     Register an agent first with register_agent or macro_start_session."
-                ),
-                false,
-                json!({
-                    "pane_id": effective_pane,
-                    "project_key": project_key,
-                    "checked_path": checked_path.to_string_lossy(),
-                }),
-            ))
-        },
-        |(agent_name, resolved_path, binding)| {
-            let response = json!({
-                "agent_name": agent_name,
+    let resolved = resolve_identity_from_project_keys(&project_keys, &effective_pane)
+        .map(|(name, path, binding)| (name, path, binding.as_str().to_string()))
+        .or_else(|| {
+            project_keys.iter().find_map(|key| {
+                mcp_agent_mail_core::resolve_released_identity(key, &effective_pane)
+                    .map(|(name, path)| (name, path, "released".to_string()))
+            })
+        });
+    let Some((agent_name, resolved_path, binding)) = resolved else {
+        return Err(legacy_tool_error(
+            "IDENTITY_NOT_FOUND",
+            format!(
+                "No identity file found for pane '{effective_pane}' in project '{project_key}'. \
+                 Register an agent first with register_agent or macro_start_session."
+            ),
+            false,
+            json!({
                 "pane_id": effective_pane,
-                "identity_path": resolved_path.to_string_lossy(),
-                "binding": binding.as_str(),
-            });
-            serde_json::to_string(&response)
-                .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
-        },
-    )
+                "project_key": project_key,
+                "checked_path": checked_path.to_string_lossy(),
+            }),
+        ));
+    };
+    let response = json!({
+        "agent_name": agent_name,
+        "pane_id": effective_pane,
+        "identity_path": resolved_path.to_string_lossy(),
+        "binding": binding,
+    });
+    serde_json::to_string(&response)
+        .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
 }
 
 /// Clean up stale per-pane identity files for dead tmux panes.
@@ -3074,7 +3078,7 @@ pub async fn resolve_pane_identity(
 /// # Conformance
 /// Rust-native.
 #[tool(
-    description = "Remove stale per-pane identity files for tmux panes that no longer exist.\n\nQueries tmux for live panes and removes identity files that reference dead panes.\nSafety: does nothing if tmux is not running (to avoid accidentally removing everything).\n\nParameters\n----------\nproject_key : Optional[str]\n    If provided, only clean up identity files for this project.\n    If omitted, clean up across all projects.\n\nReturns\n-------\ndict\n    { removed_count, removed_paths }"
+    description = "Release stale per-pane identity bindings for tmux panes that no longer exist.\n\nEvery row is compare-and-released through repeated direct tmux probes. A live pane or failed liveness query is refused; an absent tmux server means there are no live panes.\n\nParameters\n----------\nproject_key : Optional[str]\n    If provided, only clean up identity files for this project.\n    If omitted, clean up across all projects.\n\nReturns\n-------\ndict\n    { schema_version, released_count, released_paths }"
 )]
 pub fn cleanup_pane_identities(
     _ctx: &McpContext,
@@ -3091,8 +3095,9 @@ pub fn cleanup_pane_identities(
         .collect();
 
     let response = json!({
-        "removed_count": removed.len(),
-        "removed_paths": paths,
+        "schema_version": "am.agents.sweep.v1",
+        "released_count": removed.len(),
+        "released_paths": paths,
     });
 
     serde_json::to_string(&response)

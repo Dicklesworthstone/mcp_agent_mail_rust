@@ -28,7 +28,19 @@
 
 use sha1::{Digest, Sha1};
 use std::ffi::OsStr;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct BindingGeneration {
+    pane_id: String,
+    socket_path: PathBuf,
+    socket_device: u64,
+    socket_inode: u64,
+    server_pid: u32,
+    tmux_pane_id: String,
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -65,6 +77,9 @@ static TEST_CONFIG_BASE_DIR: std::sync::LazyLock<std::sync::Mutex<Option<PathBuf
 #[cfg(test)]
 static TEST_LIVE_TMUX_PANES: std::sync::LazyLock<std::sync::Mutex<Option<Vec<String>>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+#[cfg(test)]
+static TEST_TMUX_QUERY_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -325,8 +340,9 @@ pub fn read_identity_record(path: &Path) -> Option<PaneIdentityRecord> {
 pub fn canonical_identity_path(project_key: &str, pane_id: &str) -> PathBuf {
     let base = config_base_dir();
     let hash = project_hash(project_key);
-    let sanitized_pane = sanitize_pane_id(pane_id);
-    base.join(IDENTITY_DIR_NAME).join(hash).join(sanitized_pane)
+    base.join(IDENTITY_DIR_NAME)
+        .join(hash)
+        .join(sanitize_pane_id(pane_id))
 }
 
 /// Write an agent name to the canonical identity file for a pane.
@@ -401,6 +417,580 @@ pub fn write_identity(
     let record = record_from_facts(agent_name, facts.as_ref());
     write_record_content_no_follow(&path, &record)?;
     Ok(path)
+}
+
+/// Classify whether an identity belongs to the current tmux pane generation.
+///
+/// Pane existence alone is insufficient because tmux may recycle a pane id
+/// after its server restarts or a composite target is recreated. Only a v1
+/// binding whose socket inode, server PID, and stable bare tmux pane id match is
+/// authoritative. Legacy rows remain explicitly unverified while a pane with
+/// the same id exists.
+pub fn identity_binding_state(pane_id: &str, path: &Path) -> std::io::Result<&'static str> {
+    let content = read_identity_file_no_follow(path)?;
+    if let Some(expected) = parse_binding_generation(&content) {
+        if !binding_authorizes_pane(&expected, pane_id) {
+            return Ok("abandoned");
+        }
+        return if tmux_binding_generation_matches(&expected)? {
+            Ok("verified-live")
+        } else {
+            Ok("abandoned")
+        };
+    }
+    if let Some(stored_pane_id) = parse_binding_pane_id(&content)
+        && !pane_ids_are_authoritatively_compatible(pane_id, &stored_pane_id)
+    {
+        return Ok("abandoned");
+    }
+    if tmux_pane_is_live(pane_id)? {
+        Ok("live-unverified")
+    } else {
+        Ok("abandoned")
+    }
+}
+
+/// Return whether an explicitly named tmux pane is live.
+///
+/// Unlike the best-effort stale-identity cleanup, this is a safety gate for
+/// destructive release. A failed tmux query is an error, never evidence that
+/// the pane is absent.
+pub fn tmux_pane_is_live(pane_id: &str) -> std::io::Result<bool> {
+    tmux_pane_is_live_with_socket(pane_id, None)
+}
+
+fn tmux_pane_is_live_with_socket(
+    pane_id: &str,
+    recorded_socket: Option<&Path>,
+) -> std::io::Result<bool> {
+    let pane = pane_id.trim();
+    if pane.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "pane id must not be empty",
+        ));
+    }
+    #[cfg(test)]
+    if let Some(panes) = test_live_tmux_panes() {
+        let call = TEST_TMUX_QUERY_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if panes.iter().any(|candidate| candidate == "__QUERY_ERROR__") {
+            return Err(std::io::Error::other("injected tmux liveness failure"));
+        }
+        if call >= 1
+            && panes
+                .iter()
+                .any(|candidate| candidate == "__QUERY_ERROR_AFTER_1__")
+        {
+            return Err(std::io::Error::other("injected late tmux liveness failure"));
+        }
+        if call >= 1
+            && panes.iter().any(|candidate| {
+                candidate
+                    .strip_prefix("__LIVE_AFTER_1__:")
+                    .is_some_and(|candidate| tmux_pane_ids_match(pane, candidate))
+            })
+        {
+            return Ok(true);
+        }
+        return Ok(panes
+            .iter()
+            .any(|candidate| tmux_pane_ids_match(pane, candidate.trim())));
+    }
+
+    if tmux_server_has_pane(pane, None)? {
+        return Ok(true);
+    }
+    let mut sockets: std::collections::BTreeSet<PathBuf> =
+        tmux_socket_paths()?.into_iter().collect();
+    if let Some(socket) = recorded_socket {
+        sockets.insert(socket.to_path_buf());
+    }
+    for socket in sockets {
+        if tmux_server_has_pane(pane, Some(&socket))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn tmux_server_has_pane(pane_id: &str, socket: Option<&Path>) -> std::io::Result<bool> {
+    let mut command = tmux_command();
+    if let Some(socket) = socket {
+        command.arg("-S").arg(socket);
+    }
+    let output = command
+        .args([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}:#{window_index}:#{pane_index}\t#{pane_id}",
+        ])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if tmux_output_means_no_server(&stderr) {
+            return Ok(false);
+        }
+        return Err(std::io::Error::other(format!(
+            "tmux liveness query failed{}: {}",
+            socket.map_or_else(String::new, |path| format!(" on {}", path.display())),
+            stderr.trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let (composite, bare) = line.split_once('\t').unwrap_or((line, line));
+        tmux_pane_ids_match(pane_id, composite.trim()) || tmux_pane_ids_match(pane_id, bare.trim())
+    }))
+}
+
+fn capture_binding_generation(pane_id: &str) -> std::io::Result<Option<BindingGeneration>> {
+    #[cfg(test)]
+    if test_live_tmux_panes().is_some() {
+        // Unit tests inject liveness independently of a real tmux server.
+        return Ok(None);
+    }
+
+    // A registration request carries only a pane id, not a trusted tmux
+    // socket namespace. Neither the daemon's inherited TMUX value nor the
+    // default server is therefore authoritative: an unrelated server can
+    // reuse the same bare pane id. Collect every discoverable match and only
+    // persist a generation when the result is unique.
+    let mut generations = std::collections::BTreeSet::new();
+    if let Some(generation) = tmux_server_binding_generation(pane_id, None)? {
+        generations.insert(generation);
+    }
+    for socket in tmux_socket_paths()? {
+        if let Some(generation) = tmux_server_binding_generation(pane_id, Some(&socket))? {
+            generations.insert(generation);
+        }
+    }
+    // A bare pane id shared by multiple servers is ambiguous. Persisting no
+    // generation keeps the row live-unverified and therefore non-authoritative.
+    if generations.len() == 1 {
+        Ok(generations.into_iter().next())
+    } else {
+        Ok(None)
+    }
+}
+
+fn tmux_binding_generation_matches(expected: &BindingGeneration) -> std::io::Result<bool> {
+    let Some(observed) =
+        tmux_server_binding_generation(&expected.tmux_pane_id, Some(&expected.socket_path))?
+    else {
+        return Ok(false);
+    };
+    Ok(binding_generations_are_same(expected, &observed))
+}
+
+fn binding_generations_are_same(left: &BindingGeneration, right: &BindingGeneration) -> bool {
+    left.socket_path == right.socket_path
+        && left.socket_device == right.socket_device
+        && left.socket_inode == right.socket_inode
+        && left.server_pid == right.server_pid
+        && left.tmux_pane_id == right.tmux_pane_id
+}
+
+fn binding_generation_is_live(
+    pane_id: &str,
+    generation: Option<&BindingGeneration>,
+) -> std::io::Result<bool> {
+    match generation {
+        Some(expected) => tmux_binding_generation_matches(expected),
+        None => tmux_pane_is_live(pane_id),
+    }
+}
+
+fn tmux_server_binding_generation(
+    pane_id: &str,
+    socket: Option<&Path>,
+) -> std::io::Result<Option<BindingGeneration>> {
+    let mut command = tmux_command();
+    if let Some(socket) = socket {
+        command.arg("-S").arg(socket);
+    }
+    let output = command
+        .args([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{socket_path}\t#{pid}\t#{session_name}:#{window_index}:#{pane_index}\t#{pane_id}",
+        ])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if tmux_output_means_no_server(&stderr) {
+            return Ok(None);
+        }
+        return Err(std::io::Error::other(format!(
+            "tmux binding-generation query failed{}: {}",
+            socket.map_or_else(String::new, |path| format!(" on {}", path.display())),
+            stderr.trim()
+        )));
+    }
+    let requested = pane_id.trim();
+    let mut exact = std::collections::BTreeSet::new();
+    let mut aliases = std::collections::BTreeSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split('\t');
+        let Some(socket_path) = fields.next().filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        let Some(server_pid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let composite = fields.next().unwrap_or_default();
+        let bare = fields.next().unwrap_or_default();
+        if !tmux_pane_ids_match(requested, composite) && !tmux_pane_ids_match(requested, bare) {
+            continue;
+        }
+        let socket_path = PathBuf::from(socket_path);
+        let (socket_device, socket_inode) = socket_identity(&socket_path)?;
+        let generation = BindingGeneration {
+            pane_id: requested.to_string(),
+            socket_path,
+            socket_device,
+            socket_inode,
+            server_pid,
+            tmux_pane_id: bare.trim().to_string(),
+        };
+        if tmux_pane_id_is_exact_match(requested, composite, bare) {
+            exact.insert(generation);
+        } else {
+            aliases.insert(generation);
+        }
+    }
+    if exact.len() == 1 {
+        return Ok(exact.into_iter().next());
+    }
+    if exact.is_empty() && aliases.len() == 1 {
+        return Ok(aliases.into_iter().next());
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn socket_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn socket_identity(_path: &Path) -> std::io::Result<(u64, u64)> {
+    Err(std::io::Error::other(
+        "tmux binding generations require Unix socket metadata",
+    ))
+}
+
+fn tmux_socket_paths() -> std::io::Result<Vec<PathBuf>> {
+    let mut sockets = std::collections::BTreeSet::new();
+    if let Some(tmux) = crate::config::process_env_value("TMUX")
+        && let Some(socket) = tmux.split(',').next().map(str::trim)
+        && !socket.is_empty()
+    {
+        sockets.insert(PathBuf::from(socket));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        // `/proc` is not available on macOS. The configured home directory is
+        // already required for identity storage and gives us a same-user UID
+        // without relying on a Linux-only pseudo-filesystem.
+        let own_uid = home_dir()
+            .ok_or_else(|| std::io::Error::other("cannot determine home directory"))
+            .and_then(std::fs::metadata)?
+            .uid();
+        let mut roots =
+            std::collections::BTreeSet::from([std::env::temp_dir(), PathBuf::from("/tmp")]);
+        if let Some(root) =
+            crate::config::process_env_value("TMUX_TMPDIR").filter(|value| !value.trim().is_empty())
+        {
+            roots.insert(PathBuf::from(root));
+        }
+        for root in roots {
+            let entries = match std::fs::read_dir(&root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            for directory in entries {
+                let directory = directory?;
+                if !directory.file_name().to_string_lossy().starts_with("tmux-") {
+                    continue;
+                }
+                let metadata = directory.metadata()?;
+                if !metadata.is_dir() || metadata.uid() != own_uid {
+                    continue;
+                }
+                for entry in std::fs::read_dir(directory.path())? {
+                    let entry = entry?;
+                    let metadata = entry.metadata()?;
+                    if metadata.uid() == own_uid && metadata.file_type().is_socket() {
+                        sockets.insert(entry.path());
+                    }
+                }
+            }
+        }
+
+        // `TMUX_TMPDIR` may point anywhere, and the releasing process does not
+        // necessarily inherit the value used by the tmux server. Linux exposes
+        // bound Unix socket paths in `/proc/net/unix`; tmux still creates its
+        // `tmux-<uid>` namespace below a custom root, so include every
+        // same-user socket in that namespace. This prevents a live pane on a
+        // custom tmux server from becoming invisible to release.
+        #[cfg(target_os = "linux")]
+        {
+            let namespace = format!("tmux-{own_uid}");
+            let unix_sockets = std::fs::read_to_string("/proc/net/unix")?;
+            for line in unix_sockets.lines().skip(1) {
+                let fields: Vec<&str> = line.split_ascii_whitespace().collect();
+                if fields.len() < 8 {
+                    continue;
+                }
+                let socket = PathBuf::from(fields[7..].join(" "));
+                if !socket
+                    .components()
+                    .any(|component| component.as_os_str() == OsStr::new(&namespace))
+                {
+                    continue;
+                }
+                let metadata = std::fs::metadata(&socket)?;
+                if metadata.uid() == own_uid && metadata.file_type().is_socket() {
+                    sockets.insert(socket);
+                }
+            }
+        }
+    }
+
+    Ok(sockets.into_iter().collect())
+}
+
+fn tmux_output_means_no_server(stderr: &str) -> bool {
+    let message = stderr.to_ascii_lowercase();
+    message.contains("no server running on")
+        || (message.contains("failed to connect to server")
+            && (message.contains("no such file or directory")
+                || message.contains("connection refused")))
+        || (message.contains("error connecting to")
+            && (message.contains("no such file or directory")
+                || message.contains("connection refused")))
+}
+
+fn tmux_pane_ids_match(requested: &str, observed: &str) -> bool {
+    let requested = requested.trim();
+    let observed = observed.trim();
+    if requested.contains(':') || observed.contains(':') {
+        return requested == observed || sanitize_pane_id(requested) == sanitize_pane_id(observed);
+    }
+    match (numeric_bare_pane(requested), numeric_bare_pane(observed)) {
+        (Some(left), Some(right)) => left == right,
+        _ => requested == observed,
+    }
+}
+
+fn tmux_pane_id_is_exact_match(requested: &str, composite: &str, bare: &str) -> bool {
+    let requested = requested.trim();
+    let composite = composite.trim();
+    let bare = bare.trim();
+    if requested == composite || requested == bare {
+        return true;
+    }
+    if requested.contains(':') {
+        return false;
+    }
+    matches!(
+        (numeric_bare_pane(requested), numeric_bare_pane(bare)),
+        (Some(left), Some(right)) if left == right
+    )
+}
+
+fn pane_ids_are_authoritatively_compatible(requested: &str, stored: &str) -> bool {
+    let requested = requested.trim();
+    let stored = stored.trim();
+    if requested.contains(':') || stored.contains(':') {
+        return requested == stored;
+    }
+    matches!(
+        (numeric_bare_pane(requested), numeric_bare_pane(stored)),
+        (Some(left), Some(right)) if left == right
+    ) || requested == stored
+}
+
+fn binding_authorizes_pane(binding: &BindingGeneration, requested: &str) -> bool {
+    pane_ids_are_authoritatively_compatible(requested, &binding.pane_id)
+        || pane_ids_are_authoritatively_compatible(requested, &binding.tmux_pane_id)
+}
+
+fn numeric_bare_pane(pane: &str) -> Option<&str> {
+    let numeric = pane.strip_prefix('%').unwrap_or(pane);
+    numeric
+        .chars()
+        .all(|ch| ch.is_ascii_digit())
+        .then_some(numeric)
+}
+
+/// Release one pane identity after proving the pane is absent from tmux.
+///
+/// `expected_agent` is a compare-and-release guard: a caller may only remove
+/// the exact binding it observed before teardown. Generation-aware liveness is
+/// checked before and after quarantine so a recycled pane ID does not keep an
+/// abandoned binding alive or let a live binding disappear.
+pub fn release_identity(
+    project_key: &str,
+    pane_id: &str,
+    expected_agent: &str,
+) -> std::io::Result<(String, PathBuf)> {
+    let Some((agent_name, path)) = resolve_identity_with_path(project_key, pane_id) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no identity registered for pane {pane_id}"),
+        ));
+    };
+    if agent_name != expected_agent.trim() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "pane {pane_id} is bound to {agent_name}, not expected agent {}",
+                expected_agent.trim()
+            ),
+        ));
+    }
+    release_resolved_identity(pane_id, &agent_name, &path)
+        .map(|released_path| (agent_name, released_path))
+}
+
+/// Release a binding that was already resolved from an identity inventory.
+///
+/// Sweep callers use this path so every row gets the same repeated direct-tmux,
+/// compare-and-release, quarantine, and race checks as a one-row release.
+fn release_resolved_identity(
+    pane_id: &str,
+    agent_name: &str,
+    path: &Path,
+) -> std::io::Result<PathBuf> {
+    let canonical_release_path = path
+        .file_name()
+        .and_then(pending_original_name)
+        .map_or_else(
+            || path.to_path_buf(),
+            |original| path.with_file_name(original),
+        );
+    let pending_siblings: Vec<std::ffi::OsString> = pending_release_paths(&canonical_release_path)
+        .into_iter()
+        .filter_map(|pending| pending.file_name().map(OsStr::to_os_string))
+        .collect();
+    let recorded_generation = read_identity_file_no_follow(path)
+        .ok()
+        .and_then(|content| parse_binding_generation(&content));
+    #[cfg(not(target_os = "linux"))]
+    if recorded_generation.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to release an unnamespaced legacy pane binding on this platform",
+        ));
+    }
+    if binding_generation_is_live(pane_id, recorded_generation.as_ref())? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing to release recycled live tmux pane {pane_id}"),
+        ));
+    }
+    // Quarantine with one atomic, directory-fd-anchored rename before the
+    // final liveness decision.
+    // If tmux recycles the id between the check above and this rename, the
+    // subsequent live check restores the exact inode we moved (or leaves a
+    // concurrently written replacement in place). This closes the
+    // check-then-unlink race that could otherwise delete a new live binding.
+    let anchored = AnchoredIdentity::open(&path)?;
+    let source_name = anchored.file_name.clone();
+    let already_pending = is_release_pending_name(&source_name);
+    let quarantine_name = if already_pending {
+        source_name.clone()
+    } else {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random)
+            .map_err(|error| std::io::Error::other(format!("randomness failed: {error}")))?;
+        let nonce: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let file_name = source_name.to_string_lossy();
+        std::ffi::OsString::from(format!(
+            ".{file_name}.release-{}-{nonce}",
+            std::process::id()
+        ))
+    };
+    if !already_pending {
+        anchored.rename_no_replace(&source_name, &quarantine_name)?;
+        anchored.sync()?;
+    }
+
+    let quarantined_content = anchored.read(&quarantine_name).ok();
+    let quarantined_agent = quarantined_content.clone().and_then(parse_identity);
+    let quarantined_generation = quarantined_content
+        .as_deref()
+        .and_then(parse_binding_generation);
+    let live_after_quarantine =
+        match binding_generation_is_live(pane_id, quarantined_generation.as_ref()) {
+            Ok(live) => live,
+            Err(error) => {
+                if !already_pending {
+                    match anchored.rename_no_replace(&quarantine_name, &source_name) {
+                        Ok(()) => {}
+                        // A concurrent registration won the canonical name. Keep
+                        // both it and the pending row while liveness is unknown;
+                        // a later release can reconcile them safely.
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(restore_error) => return Err(restore_error),
+                    }
+                }
+                anchored.sync()?;
+                return Err(error);
+            }
+        };
+    if live_after_quarantine || quarantined_agent.as_deref() != Some(agent_name) {
+        if !already_pending {
+            match anchored.rename_no_replace(&quarantine_name, &source_name) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // A concurrent registration already installed a new
+                    // binding. Discard only the quarantined old row without
+                    // touching that canonical replacement.
+                    anchored.unlink(&quarantine_name)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        anchored.sync()?;
+        let reason = if live_after_quarantine {
+            format!("refusing to release recycled live tmux pane {pane_id}")
+        } else {
+            format!("pane {pane_id} binding changed during release")
+        };
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            reason,
+        ));
+    }
+    let released_name = released_name_for_pending(&quarantine_name).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "release quarantine has no durable receipt name",
+        )
+    })?;
+    anchored.rename_no_replace(&quarantine_name, &released_name)?;
+    for sibling in pending_siblings {
+        if sibling == quarantine_name {
+            continue;
+        }
+        match anchored.unlink(&sibling) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    anchored.sync()?;
+    Ok(canonical_release_path.with_file_name(released_name))
 }
 
 /// Resolve the agent name for a given project and tmux pane.
@@ -503,6 +1093,16 @@ pub fn resolve_identity_with_binding(
         if let Some(hit) = resolver.consider(composite_canonical) {
             return Some(hit);
         }
+    }
+
+    // After a pane dies tmux can no longer translate its stable bare id to
+    // the composite key used as the canonical filename. Recover a unique v1
+    // row by the bare id stored in its generation receipt. Ambiguity fails
+    // closed because a recycled id may have multiple abandoned generations.
+    if !pane_id.contains(':')
+        && let Some(identity) = resolve_unique_v1_by_bare_pane(project_key, pane_id)
+    {
+        return Some(identity);
     }
 
     // 2. Legacy Claude Code path: ~/.claude/agent-mail/identity.$TMUX_PANE
@@ -669,34 +1269,10 @@ pub fn write_identity_with_optional_pane(
 /// Returns the list of removed file paths.
 #[must_use]
 pub fn cleanup_stale_identities(project_key: &str) -> Vec<PathBuf> {
-    let mut removed = Vec::new();
     let base = config_base_dir();
     let hash = project_hash(project_key);
     let project_dir = base.join(IDENTITY_DIR_NAME).join(&hash);
-
-    if !path_is_real_directory(&project_dir) {
-        return removed;
-    }
-
-    let live_panes = list_live_tmux_panes();
-
-    let Ok(entries) = std::fs::read_dir(&project_dir) else {
-        return removed;
-    };
-
-    for entry in entries.flatten() {
-        if identity_entry_is_internal(&entry) {
-            continue;
-        }
-        if identity_entry_is_stale(&entry, &live_panes) {
-            let path = entry.path();
-            if dir_entry_is_real_file(&entry) && std::fs::remove_file(&path).is_ok() {
-                removed.push(path);
-            }
-        }
-    }
-
-    removed
+    cleanup_identity_directory(&project_dir)
 }
 
 /// Clean up stale identities across all project hash directories.
@@ -714,8 +1290,6 @@ pub fn cleanup_all_stale_identities() -> Vec<PathBuf> {
         return removed;
     }
 
-    let live_panes = list_live_tmux_panes();
-
     let Ok(entries) = std::fs::read_dir(&identity_root) else {
         return removed;
     };
@@ -725,23 +1299,49 @@ pub fn cleanup_all_stale_identities() -> Vec<PathBuf> {
         if !dir_entry_is_real_directory(&dir_entry) {
             continue;
         }
-        let Ok(files) = std::fs::read_dir(&project_dir) else {
-            continue;
-        };
-        for file_entry in files.flatten() {
-            if identity_entry_is_internal(&file_entry) {
-                continue;
-            }
-            if identity_entry_is_stale(&file_entry, &live_panes) {
-                let path = file_entry.path();
-                if dir_entry_is_real_file(&file_entry) && std::fs::remove_file(&path).is_ok() {
-                    removed.push(path);
-                }
-            }
-        }
+        removed.extend(cleanup_identity_directory(&project_dir));
     }
 
     removed
+}
+
+fn cleanup_identity_directory(project_dir: &Path) -> Vec<PathBuf> {
+    if !path_is_real_directory(project_dir) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(project_dir) else {
+        return Vec::new();
+    };
+    let mut bindings = std::collections::BTreeMap::new();
+    for entry in entries.flatten() {
+        if !dir_entry_is_real_file(&entry) {
+            continue;
+        }
+        let raw_name = entry.file_name();
+        if is_released_name(&raw_name) {
+            continue;
+        }
+        let pending = pending_original_name(&raw_name);
+        let filename_pane_id = pending
+            .map(str::to_owned)
+            .unwrap_or_else(|| raw_name.to_string_lossy().into_owned());
+        let path = entry.path();
+        let pane_id = binding_pane_id(&path).unwrap_or(filename_pane_id);
+        if let Some(agent_name) = read_identity_file(&path) {
+            let replace = bindings
+                .get(&pane_id)
+                .is_none_or(|(_, _, was_pending)| *was_pending && pending.is_none());
+            if replace {
+                bindings.insert(pane_id, (agent_name, path, pending.is_some()));
+            }
+        }
+    }
+    bindings
+        .into_iter()
+        .filter_map(|(pane_id, (agent_name, path, _pending))| {
+            release_resolved_identity(&pane_id, &agent_name, &path).ok()
+        })
+        .collect()
 }
 
 /// List all identity entries for a project (for diagnostic/debug use).
@@ -773,24 +1373,38 @@ pub fn list_identities_with_paths(project_key: &str) -> Vec<(String, String, Pat
         return Vec::new();
     }
 
-    let mut result = Vec::new();
+    let mut result = std::collections::BTreeMap::new();
     let Ok(entries) = std::fs::read_dir(&project_dir) else {
-        return result;
+        return Vec::new();
     };
 
     for entry in entries.flatten() {
-        if identity_entry_is_internal(&entry) {
+        if !dir_entry_is_real_file(&entry) {
             continue;
         }
-        let pane_id = entry.file_name().to_string_lossy().to_string();
+        let raw_name = entry.file_name();
+        if is_released_name(&raw_name) {
+            continue;
+        }
+        let pending = pending_original_name(&raw_name);
+        let filename_pane_id = pending
+            .map(str::to_owned)
+            .unwrap_or_else(|| raw_name.to_string_lossy().into_owned());
         let path = entry.path();
+        let pane_id = binding_pane_id(&path).unwrap_or(filename_pane_id);
         if let Some(name) = read_identity_file(&path) {
-            result.push((pane_id, name, path));
+            let replace = result
+                .get(&pane_id)
+                .is_none_or(|(_, _, was_pending)| *was_pending && pending.is_none());
+            if replace {
+                result.insert(pane_id, (name, path, pending.is_some()));
+            }
         }
     }
-
-    result.sort_by(|a, b| a.0.cmp(&b.0));
     result
+        .into_iter()
+        .map(|(pane, (name, path, _pending))| (pane, name, path))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -862,6 +1476,263 @@ fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn parse_identity(content: String) -> Option<String> {
+    let trimmed = content.trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&trimmed)
+        && let Some(name) = value.get("name").and_then(serde_json::Value::as_str)
+        && !name.trim().is_empty()
+    {
+        return Some(name.trim().to_string());
+    }
+    Some(trimmed)
+}
+
+fn parse_binding_generation(content: &str) -> Option<BindingGeneration> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    if value.get("schema_version")?.as_str()? != "am.pane-binding.v1" {
+        return None;
+    }
+    let tmux_pane_id = value.get("tmux_pane_id")?.as_str()?.trim();
+    let pane_id = value.get("pane_id")?.as_str()?.trim();
+    if tmux_pane_id.is_empty() || pane_id.is_empty() {
+        return None;
+    }
+    Some(BindingGeneration {
+        pane_id: pane_id.to_string(),
+        socket_path: PathBuf::from(value.get("socket_path")?.as_str()?),
+        socket_device: value.get("socket_device")?.as_u64()?,
+        socket_inode: value.get("socket_inode")?.as_u64()?,
+        server_pid: u32::try_from(value.get("server_pid")?.as_u64()?).ok()?,
+        tmux_pane_id: tmux_pane_id.to_string(),
+    })
+}
+
+fn parse_binding_pane_id(content: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    if value.get("schema_version")?.as_str()? != "am.pane-binding.v1" {
+        return None;
+    }
+    let pane_id = value.get("pane_id")?.as_str()?.trim();
+    (!pane_id.is_empty()).then(|| pane_id.to_string())
+}
+
+fn binding_pane_id(path: &Path) -> Option<String> {
+    let content = read_identity_file_no_follow(path).ok()?;
+    parse_binding_pane_id(&content)
+}
+
+fn resolve_unique_v1_by_bare_pane(
+    project_key: &str,
+    pane_id: &str,
+) -> Option<(String, PathBuf, PaneBindingStatus)> {
+    let project_dir = config_base_dir()
+        .join(IDENTITY_DIR_NAME)
+        .join(project_hash(project_key));
+    if !path_is_real_directory(&project_dir) {
+        return None;
+    }
+    let entries = std::fs::read_dir(project_dir).ok()?;
+    let mut match_found: Option<(String, PathBuf, PaneBindingStatus)> = None;
+    for entry in entries.flatten() {
+        if !dir_entry_is_real_file(&entry) || is_released_name(&entry.file_name()) {
+            continue;
+        }
+        let path = entry.path();
+        let content = read_identity_file_no_follow(&path).ok()?;
+        let Some(binding) = parse_binding_generation(&content) else {
+            continue;
+        };
+        if !pane_ids_are_authoritatively_compatible(pane_id, &binding.tmux_pane_id) {
+            continue;
+        }
+        let name = parse_identity(content)?;
+        if match_found.is_some() {
+            return None;
+        }
+        match_found = Some((name, path, PaneBindingStatus::AdoptedDead));
+    }
+    match_found
+}
+
+fn is_release_pending_name(name: &OsStr) -> bool {
+    name.to_string_lossy().contains(".release-")
+}
+
+/// Directory-fd anchor for destructive identity operations. Once opened, a
+/// concurrent parent-directory rename or symlink swap cannot redirect any
+/// rename/unlink below it.
+#[cfg(unix)]
+struct AnchoredIdentity {
+    parent: File,
+    file_name: std::ffi::OsString,
+}
+
+#[cfg(unix)]
+impl AnchoredIdentity {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        let parent_path = path.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "identity has no parent")
+        })?;
+        if path_has_symlinked_parent(path)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing symlinked identity parent {}",
+                    parent_path.display()
+                ),
+            ));
+        }
+
+        #[cfg(target_os = "linux")]
+        let parent = {
+            use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
+            let root = File::open("/")?;
+            let relative = parent_path.strip_prefix("/").map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "identity parent must be absolute",
+                )
+            })?;
+            let fd = openat2(
+                &root,
+                relative,
+                OpenHow::new()
+                    .flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
+                    .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
+            )
+            .map_err(nix_to_io)?;
+            File::from(fd)
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let parent = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+                .open(parent_path)?
+        };
+
+        let file_name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "identity has no filename")
+        })?;
+        Ok(Self {
+            parent,
+            file_name: file_name.to_os_string(),
+        })
+    }
+
+    fn read(&self, name: &OsStr) -> std::io::Result<String> {
+        let fd = nix::fcntl::openat(
+            &self.parent,
+            name,
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_CLOEXEC
+                | nix::fcntl::OFlag::O_NOFOLLOW,
+            nix::sys::stat::Mode::empty(),
+        )
+        .map_err(nix_to_io)?;
+        let mut file = File::from(fd);
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        Ok(content)
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn rename_no_replace(&self, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
+        nix::fcntl::renameat2(
+            &self.parent,
+            from,
+            &self.parent,
+            to,
+            nix::fcntl::RenameFlags::RENAME_NOREPLACE,
+        )
+        .map_err(nix_to_io)
+    }
+
+    #[cfg(all(
+        not(all(target_os = "linux", target_env = "gnu")),
+        not(target_os = "redox")
+    ))]
+    fn rename_no_replace(&self, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
+        // POSIX linkat is an atomic no-replace claim on `to`. Removing the old
+        // link afterward gives rename semantics without the check-then-rename
+        // overwrite race present in plain renameat on macOS.
+        nix::unistd::linkat(
+            &self.parent,
+            from,
+            &self.parent,
+            to,
+            nix::fcntl::AtFlags::empty(),
+        )
+        .map_err(nix_to_io)?;
+        self.unlink(from)
+    }
+
+    #[cfg(target_os = "redox")]
+    fn rename_no_replace(&self, _from: &OsStr, _to: &OsStr) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic no-replace identity release is unavailable on this platform",
+        ))
+    }
+
+    fn unlink(&self, name: &OsStr) -> std::io::Result<()> {
+        nix::unistd::unlinkat(&self.parent, name, nix::unistd::UnlinkatFlags::NoRemoveDir)
+            .map_err(nix_to_io)
+    }
+
+    fn sync(&self) -> std::io::Result<()> {
+        self.parent.sync_all()
+    }
+}
+
+#[cfg(unix)]
+fn nix_to_io(error: nix::errno::Errno) -> std::io::Error {
+    std::io::Error::from_raw_os_error(error as i32)
+}
+
+#[cfg(not(unix))]
+struct AnchoredIdentity {
+    parent: PathBuf,
+    file_name: std::ffi::OsString,
+}
+
+#[cfg(not(unix))]
+impl AnchoredIdentity {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            parent: path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+            file_name: path
+                .file_name()
+                .unwrap_or_else(|| OsStr::new("identity"))
+                .to_os_string(),
+        })
+    }
+    fn full_path(&self, name: &OsStr) -> PathBuf {
+        self.parent.join(name)
+    }
+    fn read(&self, name: &OsStr) -> std::io::Result<String> {
+        std::fs::read_to_string(self.full_path(name))
+    }
+    fn rename_no_replace(&self, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
+        std::fs::hard_link(self.full_path(from), self.full_path(to))?;
+        self.unlink(from)
+    }
+    fn unlink(&self, name: &OsStr) -> std::io::Result<()> {
+        std::fs::remove_file(self.full_path(name))
+    }
+    fn sync(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn path_has_symlinked_parent(path: &Path) -> std::io::Result<bool> {
     let Some(parent) = path.parent() else {
         return Ok(false);
@@ -893,9 +1764,76 @@ fn path_has_symlinked_parent(path: &Path) -> std::io::Result<bool> {
     Ok(false)
 }
 
-fn file_name_matches_live_pane(file_name: &OsStr, live_panes: &[String]) -> bool {
-    let name = file_name.to_string_lossy();
-    live_panes.iter().any(|pane| pane.as_str() == name.as_ref())
+fn pending_original_name(file_name: &OsStr) -> Option<&str> {
+    let name = file_name.to_str()?.strip_prefix('.')?;
+    let (original, suffix) = name.split_once(".release-")?;
+    (!original.is_empty() && !suffix.is_empty()).then_some(original)
+}
+
+fn pending_release_paths(path: &Path) -> Vec<PathBuf> {
+    identity_sibling_paths(path, ".release-")
+}
+
+fn released_identity_paths(path: &Path) -> Vec<PathBuf> {
+    identity_sibling_paths(path, ".released-")
+}
+
+fn identity_sibling_paths(path: &Path, marker: &str) -> Vec<PathBuf> {
+    let Some(parent) = path.parent() else {
+        return Vec::new();
+    };
+    if path_has_symlinked_parent(path).unwrap_or(true) {
+        return Vec::new();
+    }
+    let Some(file_name) = path.file_name() else {
+        return Vec::new();
+    };
+    let prefix = format!(".{}{marker}", file_name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(prefix.as_str())
+                && entry.file_type().is_ok_and(|file_type| file_type.is_file())
+        })
+        .map(|entry| entry.path())
+        .collect();
+    candidates.sort_by(|left, right| {
+        let left_modified = std::fs::metadata(left)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        let right_modified = std::fs::metadata(right)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        left_modified
+            .cmp(&right_modified)
+            .then_with(|| left.cmp(right))
+    });
+    candidates
+}
+
+/// Resolve the newest durable release receipt for a pane.
+#[must_use]
+pub fn resolve_released_identity(project_key: &str, pane_id: &str) -> Option<(String, PathBuf)> {
+    released_identity_paths(&canonical_identity_path(project_key, pane_id))
+        .into_iter()
+        .rev()
+        .find_map(|path| read_identity_record(&path).map(|record| (record.name, path)))
+}
+
+fn is_released_name(file_name: &OsStr) -> bool {
+    file_name.to_string_lossy().contains(".released-")
+}
+
+fn released_name_for_pending(file_name: &OsStr) -> Option<std::ffi::OsString> {
+    let name = file_name.to_str()?;
+    name.contains(".release-")
+        .then(|| std::ffi::OsString::from(name.replacen(".release-", ".released-", 1)))
 }
 
 /// Compute a truncated SHA-1 hex hash of the project key.
@@ -1209,6 +2147,15 @@ fn identity_entry_is_stale(entry: &std::fs::DirEntry, live_panes: &[String]) -> 
     }
 }
 
+fn file_name_matches_live_pane(file_name: &OsStr, live_panes: &[String]) -> bool {
+    let key = pending_original_name(file_name)
+        .map(str::to_owned)
+        .unwrap_or_else(|| file_name.to_string_lossy().into_owned());
+    live_panes
+        .iter()
+        .any(|pane| sanitize_pane_id(pane) == key || pane.trim() == key)
+}
+
 /// Run tmux with `args`.
 ///
 /// `Err` means tmux could not be executed at all (binary missing, not
@@ -1476,55 +2423,10 @@ fn test_live_tmux_panes() -> Option<Vec<String>> {
 
 #[cfg(test)]
 fn set_test_live_tmux_panes(panes: Option<Vec<String>>) {
+    TEST_TMUX_QUERY_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
     *TEST_LIVE_TMUX_PANES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = panes;
-}
-
-/// Query tmux for all live pane IDs (sanitized).
-///
-/// Returns composite keys (`session_name:window_index:pane_index`) for each
-/// live pane, plus the legacy bare pane ID (e.g., `%3` -> `3`) for backwards
-/// compatibility during cleanup. Returns an empty vec if tmux is not running
-/// or the command fails.
-fn list_live_tmux_panes() -> Vec<String> {
-    #[cfg(test)]
-    if let Some(panes) = test_live_tmux_panes() {
-        return panes;
-    }
-
-    let output = tmux_command()
-        .args([
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}:#{window_index}:#{pane_index}:#{pane_id}",
-        ])
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            let mut ids = Vec::new();
-            for line in text.lines().filter(|l| !l.is_empty()) {
-                let line = line.trim();
-                // Parse "session:window:pane_idx:pane_id" format.
-                // The composite key is the first three fields joined by `:`.
-                // We also include the bare pane_id for backwards compat.
-                if let Some((composite, bare_id)) = line.rsplit_once(':') {
-                    ids.push(sanitize_pane_id(composite));
-                    ids.push(sanitize_pane_id(bare_id));
-                } else {
-                    // Fallback: treat the entire line as a bare pane ID
-                    ids.push(sanitize_pane_id(line));
-                }
-            }
-            ids.sort();
-            ids.dedup();
-            ids
-        }
-        _ => Vec::new(),
-    }
 }
 
 /// Get a composite tmux pane identifier for the **caller's own** pane.
@@ -1680,6 +2582,24 @@ mod tests {
         }
     }
 
+    fn write_v1_fixture(project: &str, composite: &str, bare: &str, agent: &str) -> PathBuf {
+        let path = canonical_identity_path(project, composite);
+        std::fs::create_dir_all(path.parent().expect("identity parent"))
+            .expect("create identity parent");
+        let content = serde_json::json!({
+            "schema_version": "am.pane-binding.v1",
+            "name": agent,
+            "pane_id": composite,
+            "socket_path": "/tmp/agent-mail-test-no-server",
+            "socket_device": 7,
+            "socket_inode": 11,
+            "server_pid": 13,
+            "tmux_pane_id": bare,
+        });
+        std::fs::write(&path, format!("{content}\n")).expect("write v1 fixture");
+        path
+    }
+
     // -- identity_source_category -------------------------------------------
 
     #[test]
@@ -1822,6 +2742,26 @@ mod tests {
     }
 
     #[test]
+    fn registration_refuses_lossy_session_alias_collision() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("alias-collision-project");
+        let _tmux = LiveTmuxPanesGuard::new(Vec::new());
+        let spaced = canonical_identity_path(&project, "foo bar:1:1");
+        let punctuated = canonical_identity_path(&project, "foo@bar:1:1");
+        assert_eq!(spaced, punctuated);
+
+        write_identity(&project, "foo bar:1:1", "BlueLake").expect("first binding");
+        let error = write_identity(&project, "foo@bar:1:1", "GreenHarbor")
+            .expect_err("colliding target must not overwrite the first identity");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            resolve_identity(&project, "foo bar:1:1").as_deref(),
+            Some("BlueLake")
+        );
+        assert!(resolve_identity(&project, "foo@bar:1:1").is_none());
+    }
+
+    #[test]
     fn canonical_path_honors_virtual_xdg_config_home() {
         let _guard = TEST_CONFIG_BASE_DIR_SERIAL
             .lock()
@@ -1912,6 +2852,22 @@ mod tests {
     }
 
     #[test]
+    fn read_identity_file_extracts_name_from_ntm_receipt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file_path = tmp.path().join("identity");
+        std::fs::write(
+            &file_path,
+            r#"{"name":"BronzeCardinal","pane_id":"%42","pane_pid":1234}"#,
+        )
+        .expect("write receipt");
+
+        assert_eq!(
+            read_identity_file(&file_path).as_deref(),
+            Some("BronzeCardinal")
+        );
+    }
+
+    #[test]
     fn read_identity_file_missing_returns_none() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("nonexistent");
@@ -1954,6 +2910,366 @@ mod tests {
 
         let resolved = resolve_identity(&unique_key, composite_pane);
         assert_eq!(resolved.as_deref(), Some("GreenOwl"));
+        drop(config);
+    }
+
+    #[test]
+    fn release_identity_removes_only_expected_dead_binding() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("release-dead-project");
+        let pane = "%42";
+        let path = write_identity(&project, pane, "BlueLake").expect("write identity");
+        let _tmux = LiveTmuxPanesGuard::new(Vec::new());
+
+        let (agent, released_path) =
+            release_identity(&project, pane, "BlueLake").expect("release dead pane");
+
+        assert_eq!(agent, "BlueLake");
+        assert_ne!(released_path, path);
+        assert!(!path.exists());
+        assert!(released_path.exists());
+        assert_eq!(
+            resolve_released_identity(&project, pane)
+                .as_ref()
+                .map(|(name, _)| name.as_str()),
+            Some("BlueLake")
+        );
+        let second = release_identity(&project, pane, "BlueLake")
+            .expect_err("double release must report no binding");
+        assert_eq!(second.kind(), std::io::ErrorKind::NotFound);
+        write_identity(&project, pane, "NewHarbor").expect("claim after release");
+        assert_eq!(
+            resolve_identity(&project, pane).as_deref(),
+            Some("NewHarbor")
+        );
+        drop(config);
+    }
+
+    #[test]
+    fn legacy_live_binding_is_never_generation_verified() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("legacy-live-state");
+        let tmux = LiveTmuxPanesGuard::new(vec!["%42".into()]);
+        let path = write_identity(&project, "%42", "BlueLake").expect("write legacy binding");
+
+        assert_eq!(
+            identity_binding_state("%42", &path).expect("classify binding"),
+            "live-unverified"
+        );
+        drop(tmux);
+        drop(config);
+    }
+
+    #[test]
+    fn binding_generation_parser_requires_the_complete_v1_marker() {
+        let complete = serde_json::json!({
+            "schema_version": "am.pane-binding.v1",
+            "name": "BlueLake",
+            "pane_id": "main:0:1",
+            "socket_path": "/tmp/tmux-1000/default",
+            "socket_device": 7,
+            "socket_inode": 11,
+            "server_pid": 13,
+            "tmux_pane_id": "%17",
+        });
+        let parsed = parse_binding_generation(&complete.to_string()).expect("parse generation");
+        assert_eq!(parsed.pane_id, "main:0:1");
+        assert_eq!(parsed.socket_device, 7);
+        assert_eq!(parsed.socket_inode, 11);
+        assert_eq!(parsed.server_pid, 13);
+        assert_eq!(parsed.tmux_pane_id, "%17");
+
+        let mut incomplete = complete;
+        incomplete
+            .as_object_mut()
+            .expect("binding object")
+            .remove("socket_inode");
+        assert!(parse_binding_generation(&incomplete.to_string()).is_none());
+    }
+
+    #[test]
+    fn generation_match_ignores_renamed_composite_but_not_stable_tmux_fields() {
+        let original = BindingGeneration {
+            pane_id: "former:1:2".into(),
+            socket_path: "/tmp/tmux-1000/default".into(),
+            socket_device: 7,
+            socket_inode: 11,
+            server_pid: 13,
+            tmux_pane_id: "%42".into(),
+        };
+        let mut renamed = original.clone();
+        renamed.pane_id = "current:1:2".into();
+        assert!(binding_generations_are_same(&original, &renamed));
+
+        renamed.server_pid = 14;
+        assert!(!binding_generations_are_same(&original, &renamed));
+    }
+
+    #[test]
+    fn dead_composite_v1_binding_resolves_and_releases_by_bare_pane() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("dead-composite-v1-project");
+        let path = write_v1_fixture(&project, "former:1:2", "%42", "BlueLake");
+
+        assert_eq!(
+            resolve_identity(&project, "%42").as_deref(),
+            Some("BlueLake")
+        );
+        let (_, released) =
+            release_identity(&project, "%42", "BlueLake").expect("release dead v1 row");
+
+        assert!(!path.exists());
+        assert!(released.exists());
+        assert_eq!(
+            resolve_released_identity(&project, "%42")
+                .as_ref()
+                .map(|(name, path)| (name.as_str(), path)),
+            Some(("BlueLake", &released))
+        );
+        drop(config);
+    }
+
+    #[test]
+    fn ambiguous_dead_v1_generations_for_bare_pane_fail_closed() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("ambiguous-v1-project");
+        write_v1_fixture(&project, "former-a:1:2", "%42", "BlueLake");
+        write_v1_fixture(&project, "former-b:1:2", "%42", "RedStone");
+
+        assert!(resolve_identity(&project, "%42").is_none());
+        let error = release_identity(&project, "%42", "BlueLake")
+            .expect_err("ambiguous generations must not be guessed");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        drop(config);
+    }
+
+    #[test]
+    fn composite_v1_inventory_uses_stored_pane_and_cleanup_releases_it() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("composite-v1-inventory-project");
+        let composite = "former:1:2";
+        let path = write_v1_fixture(&project, composite, "%42", "BlueLake");
+
+        let listed = list_identities_with_paths(&project);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, composite);
+        assert_eq!(listed[0].1, "BlueLake");
+        assert_eq!(listed[0].2, path);
+
+        let released = cleanup_stale_identities(&project);
+        assert_eq!(released.len(), 1);
+        assert!(!path.exists());
+        assert!(released[0].exists());
+        drop(config);
+    }
+
+    #[test]
+    fn exact_composite_match_beats_lossy_sanitized_alias() {
+        assert!(!tmux_pane_id_is_exact_match(
+            "foo@bar:1:1",
+            "foo bar:1:1",
+            "%0"
+        ));
+        assert!(tmux_pane_ids_match("foo@bar:1:1", "foo bar:1:1"));
+        assert!(tmux_pane_id_is_exact_match(
+            "foo@bar:1:1",
+            "foo@bar:1:1",
+            "%1"
+        ));
+    }
+
+    #[test]
+    fn successful_release_removes_older_pending_sibling() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("release-pending-sibling-project");
+        let pane = "%42";
+        let canonical = write_identity(&project, pane, "NewAgent").expect("write identity");
+        let pending = canonical.with_file_name(".42.release-old-fixture");
+        std::fs::write(&pending, "OldAgent\n").expect("write old pending identity");
+        let _tmux = LiveTmuxPanesGuard::new(Vec::new());
+
+        release_identity(&project, pane, "NewAgent").expect("release dead pane state");
+
+        assert!(resolve_identity(&project, pane).is_none());
+        assert!(!canonical.exists());
+        assert!(!pending.exists());
+        drop(config);
+    }
+
+    #[test]
+    fn tmux_no_server_errors_mean_no_live_panes() {
+        assert!(tmux_output_means_no_server(
+            "no server running on /tmp/tmux-1/default"
+        ));
+        assert!(tmux_output_means_no_server(
+            "error connecting to /tmp/tmux-1/test (No such file or directory)"
+        ));
+        assert!(!tmux_output_means_no_server("permission denied"));
+        assert!(!tmux_output_means_no_server(
+            "failed to connect to server: Permission denied"
+        ));
+    }
+
+    #[test]
+    fn release_identity_refuses_live_pane_and_preserves_binding() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("release-live-project");
+        let pane = "%42";
+        let path = write_identity(&project, pane, "BlueLake").expect("write identity");
+        let _tmux = LiveTmuxPanesGuard::new(vec![pane.to_string()]);
+
+        let error = release_identity(&project, pane, "BlueLake")
+            .expect_err("live pane release must refuse");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(path.exists());
+        drop(config);
+    }
+
+    #[test]
+    fn release_identity_refuses_live_unprefixed_numeric_pane() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("release-live-unprefixed-project");
+        let path = write_identity(&project, "42", "BlueLake").expect("write identity");
+        let _tmux = LiveTmuxPanesGuard::new(vec!["%42".to_string()]);
+
+        let error = release_identity(&project, "42", "BlueLake")
+            .expect_err("unprefixed alias of live pane must refuse");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(path.exists());
+        drop(config);
+    }
+
+    #[test]
+    fn release_identity_preserves_binding_when_tmux_query_fails() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("release-query-failure-project");
+        let path = write_identity(&project, "%42", "BlueLake").expect("write identity");
+        let _tmux = LiveTmuxPanesGuard::new(vec!["__QUERY_ERROR__".to_string()]);
+
+        let error = release_identity(&project, "%42", "BlueLake")
+            .expect_err("tmux query failure must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(path.exists());
+        drop(config);
+    }
+
+    #[test]
+    fn pending_release_remains_resolvable_after_crash_window() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("release-crash-project");
+        let pane = "%42";
+        let path = write_identity(&project, pane, "BlueLake").expect("write identity");
+        let pending = path.with_file_name(".42.release-crash-fixture");
+        std::fs::rename(&path, &pending).expect("simulate crash after quarantine rename");
+
+        let (agent, resolved_path) =
+            resolve_identity_with_path(&project, pane).expect("pending identity must resolve");
+
+        assert_eq!(agent, "BlueLake");
+        assert_eq!(resolved_path, pending);
+        let _tmux = LiveTmuxPanesGuard::new(Vec::new());
+        release_identity(&project, pane, "BlueLake").expect("retry pending release");
+        assert!(resolve_identity(&project, pane).is_none());
+        drop(config);
+    }
+
+    #[test]
+    fn pending_release_survives_late_tmux_query_failure() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("release-pending-query-failure-project");
+        let pane = "%42";
+        let path = write_identity(&project, pane, "BlueLake").expect("write identity");
+        let pending = path.with_file_name(".42.release-crash-fixture");
+        std::fs::rename(&path, &pending).expect("simulate pending release");
+        let _tmux = LiveTmuxPanesGuard::new(vec!["__QUERY_ERROR_AFTER_1__".to_string()]);
+
+        let error = release_identity(&project, pane, "BlueLake")
+            .expect_err("late tmux query failure must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            resolve_identity(&project, pane).as_deref(),
+            Some("BlueLake")
+        );
+        assert!(pending.exists());
+        drop(config);
+    }
+
+    #[test]
+    fn recycled_pane_becoming_live_after_quarantine_is_restored() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("release-late-live-project");
+        let pane = "%42";
+        let path = write_identity(&project, pane, "BlueLake").expect("write identity");
+        let _tmux = LiveTmuxPanesGuard::new(vec!["__LIVE_AFTER_1__:%42".to_string()]);
+
+        let error = release_identity(&project, pane, "BlueLake")
+            .expect_err("pane recycled after quarantine must refuse");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            resolve_identity(&project, pane).as_deref(),
+            Some("BlueLake")
+        );
+        assert!(path.exists());
+        drop(config);
+    }
+
+    #[test]
+    fn anchored_restore_never_overwrites_concurrent_canonical_binding() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("release-no-overwrite-project");
+        let pane = "%42";
+        let path = write_identity(&project, pane, "NewAgent").expect("write canonical");
+        let pending = path.with_file_name(".42.release-race-fixture");
+        std::fs::write(&pending, "OldAgent\n").expect("write pending identity");
+        let anchored = AnchoredIdentity::open(&path).expect("open identity parent");
+
+        let error = anchored
+            .rename_no_replace(
+                pending.file_name().expect("pending name"),
+                path.file_name().expect("canonical name"),
+            )
+            .expect_err("restore must not replace a concurrent canonical binding");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(read_identity_file(&path).as_deref(), Some("NewAgent"));
+        assert_eq!(read_identity_file(&pending).as_deref(), Some("OldAgent"));
+        drop(config);
+    }
+
+    #[test]
+    fn release_identity_refuses_live_composite_pane_and_preserves_binding() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("release-live-composite-project");
+        let pane = "session-a:1:2";
+        let path = write_identity(&project, pane, "BlueLake").expect("write identity");
+        let _tmux = LiveTmuxPanesGuard::new(vec![pane.to_string()]);
+
+        let error = release_identity(&project, pane, "BlueLake")
+            .expect_err("live composite pane release must refuse");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(path.exists());
+        drop(config);
+    }
+
+    #[test]
+    fn release_identity_refuses_wrong_agent_and_preserves_binding() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("release-wrong-agent-project");
+        let pane = "%42";
+        let path = write_identity(&project, pane, "BlueLake").expect("write identity");
+        let _tmux = LiveTmuxPanesGuard::new(Vec::new());
+
+        let error = release_identity(&project, pane, "RedStone")
+            .expect_err("wrong-agent release must refuse");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(path.exists());
         drop(config);
     }
 
@@ -2032,6 +3348,7 @@ mod tests {
     #[test]
     fn composite_resolution_honors_virtual_bare_tmux_pane_fallback() {
         let config = IsolatedConfigBaseDir::new();
+        let _tmux = LiveTmuxPanesGuard::new(Vec::new());
         let unique_key = config.project_key("bare-fallback-project");
         let bare_pane = "%23";
         let written_path =
@@ -2050,15 +3367,102 @@ mod tests {
     #[test]
     fn list_identities_returns_entries() {
         let config = IsolatedConfigBaseDir::new();
+        let _tmux = LiveTmuxPanesGuard::new(Vec::new());
         let unique_key = config.project_key("list-project");
         let pane = "%99";
         write_identity(&unique_key, pane, "RedFox").expect("write identity");
 
         let entries = list_identities(&unique_key);
         assert!(
-            entries.iter().any(|(p, n)| p == "99" && n == "RedFox"),
+            entries.iter().any(|(p, n)| p == "%99" && n == "RedFox"),
             "expected RedFox entry: {entries:?}"
         );
+        drop(config);
+    }
+
+    #[test]
+    fn cleanup_and_listing_preserve_live_pending_release_identity() {
+        let config = IsolatedConfigBaseDir::new();
+        let _tmux = LiveTmuxPanesGuard::new(Vec::new());
+        let scoped_project = config.project_key("pending-scoped-cleanup-project");
+        let global_project = config.project_key("pending-global-cleanup-project");
+        let scoped =
+            write_identity(&scoped_project, "%42", "BlueLake").expect("write scoped identity");
+        let global =
+            write_identity(&global_project, "%42", "RedStone").expect("write global identity");
+        let scoped_pending = scoped.with_file_name(".42.release-scoped-fixture");
+        let global_pending = global.with_file_name(".42.release-global-fixture");
+        std::fs::rename(&scoped, &scoped_pending).expect("quarantine scoped identity");
+        std::fs::rename(&global, &global_pending).expect("quarantine global identity");
+        set_test_live_tmux_panes(Some(vec!["42".to_string()]));
+
+        assert!(cleanup_stale_identities(&scoped_project).is_empty());
+        assert!(scoped_pending.exists());
+        assert_eq!(
+            list_identities(&scoped_project),
+            vec![("%42".to_string(), "BlueLake".to_string())]
+        );
+
+        assert!(cleanup_all_stale_identities().is_empty());
+        assert!(scoped_pending.exists());
+        assert!(global_pending.exists());
+        drop(config);
+    }
+
+    #[test]
+    fn cleanup_releases_dead_binding_but_preserves_live_binding() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("safe-cleanup-project");
+        let dead = write_identity(&project, "%41", "OldHarbor").expect("write dead binding");
+        let live = write_identity(&project, "%42", "BlueLake").expect("write live binding");
+        let _tmux = LiveTmuxPanesGuard::new(vec!["%42".to_string()]);
+
+        let released = cleanup_stale_identities(&project);
+
+        assert_eq!(released.len(), 1);
+        assert!(released[0].exists());
+        assert!(!dead.exists());
+        assert!(live.exists());
+        assert_eq!(
+            resolve_identity(&project, "%42").as_deref(),
+            Some("BlueLake")
+        );
+        write_identity(&project, "%41", "NewHarbor").expect("claim released pane");
+        assert_eq!(
+            resolve_identity(&project, "%41").as_deref(),
+            Some("NewHarbor")
+        );
+        drop(config);
+    }
+
+    #[test]
+    fn cleanup_fails_closed_when_tmux_query_fails() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("cleanup-query-failure-project");
+        let binding = write_identity(&project, "%42", "BlueLake").expect("write identity binding");
+        let _tmux = LiveTmuxPanesGuard::new(vec!["__QUERY_ERROR__".to_string()]);
+
+        assert!(cleanup_stale_identities(&project).is_empty());
+        assert!(binding.exists());
+        drop(config);
+    }
+
+    #[test]
+    fn cleanup_preserves_live_composite_binding_from_sanitized_filename() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("cleanup-live-composite-project");
+        let pane = "session-a:1:2";
+        let binding = write_identity(&project, pane, "BlueLake").expect("write binding");
+        assert!(
+            binding
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name == "session-a-1-2")
+        );
+        let _tmux = LiveTmuxPanesGuard::new(vec![pane.to_string()]);
+
+        assert!(cleanup_stale_identities(&project).is_empty());
+        assert!(binding.exists());
         drop(config);
     }
 
@@ -2326,6 +3730,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let config = IsolatedConfigBaseDir::new();
+        let _tmux = LiveTmuxPanesGuard::new(Vec::new());
         let project = config.project_key("backend");
 
         // The caller's pane %97 has composite key main:14:1, which owns the

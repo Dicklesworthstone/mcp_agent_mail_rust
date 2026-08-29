@@ -2884,6 +2884,39 @@ pub enum AgentsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Release a dead pane's identity binding (refuses live tmux panes).
+    Release {
+        /// Project key (slug or human_key / absolute path).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Pane id to release (for example `%42`).
+        #[arg(long)]
+        pane: String,
+        /// Expected agent currently bound to the pane.
+        #[arg(long)]
+        agent: String,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Find stale pane bindings and release them only after direct tmux checks.
+    Sweep {
+        /// Project key (slug or human_key / absolute path).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Apply releases. Without this flag, report live and abandoned rows only.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Create a new, unique agent identity (never updates existing).
     Create {
         /// Project key (slug or human_key / absolute path).
@@ -3484,6 +3517,7 @@ fn agents_command_is_read_only(action: &AgentsCommand) -> bool {
             | AgentsCommand::Show { .. }
             | AgentsCommand::Detect { .. }
             | AgentsCommand::ResolvePane { .. }
+            | AgentsCommand::Sweep { yes: false, .. }
     )
 }
 
@@ -37349,6 +37383,14 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
 
             let resolved = candidate_keys.iter().find_map(|key| {
                 mcp_agent_mail_core::resolve_identity_with_binding(key, &effective_pane)
+                    .map(|(name, path, binding)| (name, path, binding.as_str().to_string()))
+            });
+
+            let resolved = resolved.or_else(|| {
+                candidate_keys.iter().find_map(|key| {
+                    mcp_agent_mail_core::resolve_released_identity(key, &effective_pane)
+                        .map(|(name, path)| (name, path, "released".to_string()))
+                })
             });
 
             let Some((agent_name, resolved_path, binding)) = resolved else {
@@ -37363,22 +37405,211 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             // file path or contents. GH#252 adds the binding status
             // (verified-live / adopted-dead / legacy-unverified) alongside it.
             let source = mcp_agent_mail_core::identity_source_category(&resolved_path);
-            let binding = binding.as_str();
             let data = serde_json::json!({
                 "schema_version": "am.agents.resolve-pane.v1",
                 "agent_name": agent_name,
+                "binding": &binding,
                 "pane_id": effective_pane,
                 "project_key": project_key,
                 "source": source,
-                "binding": binding,
             });
             output::emit_output(&data, fmt, || {
                 output::section("Pane Identity");
                 output::kv("Agent", &agent_name);
+                output::kv("Binding", &binding);
                 output::kv("Pane", &effective_pane);
                 output::kv("Project", &project_key);
                 output::kv("Source", source);
-                output::kv("Binding", binding);
+            });
+            Ok(())
+        }
+
+        AgentsCommand::Release {
+            project_key,
+            pane,
+            agent,
+            format,
+            json,
+        } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
+            let pane = pane.trim().to_string();
+            let agent = agent.trim().to_string();
+            if pane.is_empty() || agent.is_empty() {
+                return Err(CliError::InvalidArgument(
+                    "--pane and --agent must not be empty".into(),
+                ));
+            }
+
+            let mut candidate_keys = vec![project_key.clone()];
+            if !std::path::Path::new(&project_key).is_absolute()
+                && let Ok(ctx) = context::AsyncCliContext::open()
+            {
+                let cx = asupersync::Cx::for_request();
+                if let Ok(proj) = resolve_project_async(&cx, &ctx.pool, &project_key).await
+                    && proj.human_key != project_key
+                {
+                    candidate_keys.push(proj.human_key);
+                }
+            }
+            let release_key = candidate_keys
+                .iter()
+                .find(|key| mcp_agent_mail_core::resolve_identity(key, &pane).is_some())
+                .ok_or_else(|| {
+                    CliError::InvalidArgument(format!(
+                        "no identity registered for pane '{pane}' in project '{project_key}'"
+                    ))
+                })?;
+            let (released_agent, released_path) =
+                mcp_agent_mail_core::release_identity(release_key, &pane, &agent)
+                    .map_err(|error| CliError::InvalidArgument(error.to_string()))?;
+            let source = mcp_agent_mail_core::identity_source_category(&released_path);
+            let data = serde_json::json!({
+                "schema_version": "am.agents.release.v1",
+                "released": true,
+                "released_at": Utc::now().to_rfc3339(),
+                "agent_name": released_agent,
+                "pane_id": pane,
+                "state": "released",
+                "project_key": project_key,
+                "source": source,
+            });
+            output::emit_output(&data, fmt, || {
+                output::section("Pane Identity Released");
+                output::kv("Agent", &released_agent);
+                output::kv("Pane", &pane);
+                output::kv("Project", &project_key);
+                output::kv("Source", source);
+            });
+            Ok(())
+        }
+
+        AgentsCommand::Sweep {
+            project_key,
+            yes,
+            format,
+            json,
+        } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
+            let mut candidate_keys = vec![project_key.clone()];
+            if !std::path::Path::new(&project_key).is_absolute()
+                && let Ok(ctx) = context::AsyncCliContext::open()
+            {
+                let cx = asupersync::Cx::for_request();
+                if let Ok(proj) = resolve_project_async(&cx, &ctx.pool, &project_key).await
+                    && proj.human_key != project_key
+                {
+                    candidate_keys.push(proj.human_key);
+                }
+            }
+
+            let (release_key, bindings) = candidate_keys
+                .iter()
+                .find_map(|key| {
+                    let bindings = mcp_agent_mail_core::list_identities_with_paths(key);
+                    (!bindings.is_empty()).then_some((key.as_str(), bindings))
+                })
+                .unwrap_or((project_key.as_str(), Vec::new()));
+            let mut rows = Vec::with_capacity(bindings.len());
+            let mut live = 0_usize;
+            let mut abandoned = 0_usize;
+            let mut released = 0_usize;
+            let mut refused = 0_usize;
+
+            for (pane_id, agent_name, path) in bindings {
+                let source = mcp_agent_mail_core::identity_source_category(&path);
+                match mcp_agent_mail_core::identity_binding_state(&pane_id, &path) {
+                    Ok("verified-live" | "live-unverified") => {
+                        live += 1;
+                        rows.push(serde_json::json!({
+                            "agent_name": agent_name,
+                            "pane_id": pane_id,
+                            "state": "live",
+                            "source": source,
+                        }));
+                    }
+                    Ok("abandoned") if !yes => {
+                        abandoned += 1;
+                        rows.push(serde_json::json!({
+                            "agent_name": agent_name,
+                            "pane_id": pane_id,
+                            "state": "abandoned",
+                            "source": source,
+                        }));
+                    }
+                    Ok("abandoned") => match mcp_agent_mail_core::release_identity(
+                        release_key,
+                        &pane_id,
+                        &agent_name,
+                    ) {
+                        Ok((released_agent, released_path)) => {
+                            released += 1;
+                            rows.push(serde_json::json!({
+                                "schema_version": "am.agents.release.v1",
+                                "released": true,
+                                "released_at": Utc::now().to_rfc3339(),
+                                "agent_name": released_agent,
+                                "pane_id": pane_id,
+                                "state": "released",
+                                "project_key": project_key,
+                                "source": mcp_agent_mail_core::identity_source_category(
+                                    &released_path
+                                ),
+                            }));
+                        }
+                        Err(error) => {
+                            refused += 1;
+                            rows.push(serde_json::json!({
+                                "agent_name": agent_name,
+                                "pane_id": pane_id,
+                                "state": "refused",
+                                "source": source,
+                                "error": error.to_string(),
+                            }));
+                        }
+                    },
+                    Ok(state) => {
+                        refused += 1;
+                        rows.push(serde_json::json!({
+                            "agent_name": agent_name,
+                            "pane_id": pane_id,
+                            "state": "refused",
+                            "source": source,
+                            "error": format!("unknown binding state {state}"),
+                        }));
+                    }
+                    Err(error) => {
+                        refused += 1;
+                        rows.push(serde_json::json!({
+                            "agent_name": agent_name,
+                            "pane_id": pane_id,
+                            "state": "refused",
+                            "source": source,
+                            "error": error.to_string(),
+                        }));
+                    }
+                }
+            }
+
+            let data = serde_json::json!({
+                "schema_version": "am.agents.sweep.v1",
+                "applied": yes,
+                "project_key": project_key,
+                "counts": {
+                    "live": live,
+                    "abandoned": abandoned,
+                    "released": released,
+                    "refused": refused,
+                },
+                "bindings": rows,
+            });
+            output::emit_output(&data, fmt, || {
+                output::section("Pane Binding Sweep");
+                output::kv("Project", &project_key);
+                output::kv("Applied", if yes { "yes" } else { "no (preview)" });
+                output::kv("Live", &live.to_string());
+                output::kv("Abandoned", &abandoned.to_string());
+                output::kv("Released", &released.to_string());
+                output::kv("Refused", &refused.to_string());
             });
             Ok(())
         }
@@ -63050,6 +63281,93 @@ startup_timeout_sec = 42
             Commands::Agents {
                 action: AgentsCommand::ResolvePane { pane, .. },
             } => assert_eq!(pane, None),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agents_release_requires_expected_agent_and_is_write_classified() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "agents",
+            "release",
+            "--project",
+            "/home/me/projects/foo",
+            "--pane",
+            "%42",
+            "--agent",
+            "BlueLake",
+            "--json",
+        ])
+        .expect("agents release must parse");
+        match cli.command.expect("expected command") {
+            Commands::Agents { action } => {
+                assert!(!agents_command_is_read_only(&action));
+                match action {
+                    AgentsCommand::Release {
+                        project_key,
+                        pane,
+                        agent,
+                        json,
+                        ..
+                    } => {
+                        assert_eq!(project_key, "/home/me/projects/foo");
+                        assert_eq!(pane, "%42");
+                        assert_eq!(agent, "BlueLake");
+                        assert!(json);
+                    }
+                    other => panic!("unexpected agents action: {other:?}"),
+                }
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agents_sweep_preview_is_read_only_and_yes_is_write_classified() {
+        let preview = Cli::try_parse_from([
+            "am",
+            "agents",
+            "sweep",
+            "--project",
+            "/home/me/projects/foo",
+            "--json",
+        ])
+        .expect("agents sweep preview must parse");
+        match preview.command.expect("expected preview command") {
+            Commands::Agents { action } => {
+                assert!(agents_command_is_read_only(&action));
+                match action {
+                    AgentsCommand::Sweep {
+                        project_key,
+                        yes,
+                        json,
+                        ..
+                    } => {
+                        assert_eq!(project_key, "/home/me/projects/foo");
+                        assert!(!yes);
+                        assert!(json);
+                    }
+                    other => panic!("unexpected agents action: {other:?}"),
+                }
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let apply = Cli::try_parse_from([
+            "am",
+            "agents",
+            "sweep",
+            "--project",
+            "/home/me/projects/foo",
+            "--yes",
+        ])
+        .expect("agents sweep apply must parse");
+        match apply.command.expect("expected apply command") {
+            Commands::Agents { action } => {
+                assert!(!agents_command_is_read_only(&action));
+                assert!(matches!(action, AgentsCommand::Sweep { yes: true, .. }));
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }
