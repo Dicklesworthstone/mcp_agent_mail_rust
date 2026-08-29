@@ -439,6 +439,27 @@ pub fn write_identity(
 
     let facts = query_target_pane_facts(pane_id);
 
+    // agent-factory-3tf: refuse a lossy-sanitization collision BEFORE the
+    // liveness rule. Two different composite keys can sanitize to one file
+    // name, and the GH#252 rule only refuses a *verifiably live* holder --
+    // so without this an unverifiable row belonging to a different pane is
+    // silently overwritten and two panes share one identity file.
+    if let Some(existing_key) = read_identity_record(&path)
+        .as_ref()
+        .and_then(|record| record.identity_key.as_deref())
+        && identity_keys_collide_lossily(existing_key, pane_id)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to overwrite pane identity at {}: it is bound to key \
+                 '{existing_key}', which sanitizes to the same file name as \
+                 '{pane_id}' but is a different pane",
+                path.display()
+            ),
+        ));
+    }
+
     // GH#252: never overwrite a verifiably live binding held by another pane.
     if let Some(existing) = read_identity_record(&path)
         && existing.is_verifiable()
@@ -642,7 +663,23 @@ fn binding_generation_is_live(
     generation: Option<&BindingGeneration>,
 ) -> std::io::Result<bool> {
     match generation {
-        Some(expected) => tmux_binding_generation_matches(expected),
+        Some(expected) => {
+            // agent-factory-3tf: a tmux server's socket exists for as long as
+            // the server does, so its absence is positive evidence that this
+            // generation is gone -- the same rule GH#252's binding_liveness
+            // already applies to a recorded socket_path. Concluding DEAD here
+            // is what lets a genuinely dead binding be released on a host
+            // where tmux cannot be executed at all; without it the row stays
+            // poisoned forever, which is the bug this line exists to fix.
+            //
+            // This stays a DEAD-only shortcut. A tmux query that FAILS is
+            // still an error and never evidence of absence, so the release
+            // gate remains fail-closed everywhere else.
+            if !expected.socket_path.exists() {
+                return Ok(false);
+            }
+            tmux_binding_generation_matches(expected)
+        }
         None => tmux_pane_is_live(pane_id),
     }
 }
@@ -852,6 +889,20 @@ fn tmux_pane_id_is_exact_match(requested: &str, composite: &str, bare: &str) -> 
         (numeric_bare_pane(requested), numeric_bare_pane(bare)),
         (Some(left), Some(right)) if left == right
     )
+}
+
+/// Whether a stored identity key and a requested key are a lossy-sanitization
+/// collision: both composite, and different.
+///
+/// `foo bar:1:1` and `foo@bar:1:1` both sanitize to `foo_bar-1-1`, so the file
+/// name cannot tell them apart. The recorded `identity_key` can
+/// (agent-factory-3tf). Deliberately scoped to composite-vs-composite: a bare
+/// id resolving to its own composite key is normal recovery (GH#177 Defect 2),
+/// not a collision.
+fn identity_keys_collide_lossily(stored: &str, requested: &str) -> bool {
+    let stored = stored.trim();
+    let requested = requested.trim();
+    stored.contains(':') && requested.contains(':') && stored != requested
 }
 
 fn pane_ids_are_authoritatively_compatible(requested: &str, stored: &str) -> bool {
@@ -1969,10 +2020,60 @@ fn identity_sibling_paths(path: &Path, marker: &str) -> Vec<PathBuf> {
 /// Resolve the newest durable release receipt for a pane.
 #[must_use]
 pub fn resolve_released_identity(project_key: &str, pane_id: &str) -> Option<(String, PathBuf)> {
-    released_identity_paths(&canonical_identity_path(project_key, pane_id))
+    if let Some(hit) = released_identity_paths(&canonical_identity_path(project_key, pane_id))
         .into_iter()
         .rev()
         .find_map(|path| read_identity_record(&path).map(|record| (record.name, path)))
+    {
+        return Some(hit);
+    }
+
+    // agent-factory-3tf: a tombstone for a COMPOSITE-keyed row is a sibling of
+    // that composite file name, so a lookup by the bare id misses it entirely
+    // -- the same gap resolve_unique_v1_by_bare_pane already closes for live
+    // rows. Recover it by the bare id recorded in the receipt's own
+    // generation. Newest wins, matching the canonical path above: a tombstone
+    // records who WAS released, it never grants authority to bind.
+    if pane_id.contains(':') {
+        return None;
+    }
+    resolve_released_by_bare_pane(project_key, pane_id)
+}
+
+/// Newest release receipt whose recorded generation names `pane_id`.
+fn resolve_released_by_bare_pane(project_key: &str, pane_id: &str) -> Option<(String, PathBuf)> {
+    let project_dir = config_base_dir()
+        .join(IDENTITY_DIR_NAME)
+        .join(project_hash(project_key));
+    if !path_is_real_directory(&project_dir) {
+        return None;
+    }
+    let mut matches: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(project_dir).ok()?.flatten() {
+        if !dir_entry_is_real_file(&entry) || !is_released_name(&entry.file_name()) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(content) = read_identity_file_no_follow(&path) else {
+            continue;
+        };
+        let Some(generation) = parse_binding_generation(&content) else {
+            continue;
+        };
+        if !pane_ids_are_authoritatively_compatible(pane_id, &generation.tmux_pane_id) {
+            continue;
+        }
+        let Some(name) = parse_identity(content) else {
+            continue;
+        };
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        matches.push((modified, name, path));
+    }
+    matches.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.2.cmp(&right.2)));
+    matches.pop().map(|(_, name, path)| (name, path))
 }
 
 fn is_released_name(file_name: &OsStr) -> bool {
@@ -2191,10 +2292,13 @@ fn record_from_facts(
     };
 
     if let Some(generation) = generation {
-        // v1 contract: `pane_id` is the composite tmux address that
-        // `binding_authorizes_pane` compares against, and `tmux_pane_id` is
-        // the bare id. `probe_pane_id()` keeps GH#252's liveness probe on the
-        // bare id, so both readers stay correct on one row.
+        // v1 contract: `pane_id` is the REQUESTED identity key (composite
+        // when registration used a composite key, bare when it used a bare
+        // one) -- see tmux_server_binding_generation, which sets it from
+        // `requested`. `binding_authorizes_pane` compares an incoming key
+        // against it OR against `tmux_pane_id`, the authoritative bare id.
+        // `probe_pane_id()` keeps GH#252's liveness probe on the bare id, so
+        // both readers stay correct on one row.
         record.schema_version = Some(BINDING_SCHEMA_V1.to_string());
         record.pane_id = Some(generation.pane_id.clone());
         record.socket_path = Some(generation.socket_path.to_string_lossy().into_owned());
@@ -2256,6 +2360,14 @@ impl PaneBindingResolver {
     /// lookup continues and ultimately mints a fresh identity.
     fn consider(&mut self, path: PathBuf) -> Option<(String, PathBuf, PaneBindingStatus)> {
         let record = read_identity_record(&path)?;
+        // agent-factory-3tf: the file name cannot distinguish two composite
+        // keys that sanitize to it, so never return a record whose recorded
+        // key names a different pane.
+        if let Some(stored_key) = record.identity_key.as_deref()
+            && identity_keys_collide_lossily(stored_key, &self.pane_arg)
+        {
+            return None;
+        }
         match binding_liveness(&record) {
             PaneBindingLiveness::Live => {
                 let holder_matches = self.target_facts().is_some_and(|f| {
@@ -4082,6 +4194,28 @@ mod tests {
         .expect("serialize record")
     }
 
+    /// Whether `removed` carries the durable release receipt for `original`.
+    ///
+    /// agent-factory-3tf: upstream's cleanup UNLINKED a stale row and returned
+    /// the path it deleted; 7x5's releases it and returns the `.released-`
+    /// tombstone, which is the whole point of the 7x5 line -- a released
+    /// binding must stay distinguishable from an abandoned one across a
+    /// restart. 7x5 wins on the action, so these assertions check that the
+    /// binding is gone AND that a receipt for it was returned.
+    fn contains_release_receipt_for(removed: &[PathBuf], original: &Path) -> bool {
+        let Some(name) = original.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            return false;
+        };
+        let prefix = format!(".{name}.released-");
+        removed.iter().any(|path| {
+            path.parent() == original.parent()
+                && path
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(prefix.as_str()))
+                && path.exists()
+        })
+    }
+
     fn write_record_fixture(path: &Path, json: &str) {
         std::fs::create_dir_all(path.parent().expect("record parent")).expect("create parent");
         std::fs::write(path, format!("{json}\n")).expect("write record fixture");
@@ -4758,12 +4892,17 @@ mod tests {
             || {
                 let removed = cleanup_stale_identities(&project);
                 assert!(
-                    removed.contains(&dead_path),
-                    "dead structured record must be purged: {removed:?}"
+                    contains_release_receipt_for(&removed, &dead_path),
+                    "dead structured record must be released with a receipt: {removed:?}"
+                );
+                assert!(!dead_path.exists(), "dead binding must no longer resolve");
+                assert!(
+                    contains_release_receipt_for(&removed, &legacy_stale_path),
+                    "stale legacy file must be released with a receipt: {removed:?}"
                 );
                 assert!(
-                    removed.contains(&legacy_stale_path),
-                    "stale legacy file must be purged: {removed:?}"
+                    !legacy_stale_path.exists(),
+                    "stale legacy binding must no longer resolve"
                 );
                 assert!(
                     live_path.exists(),
@@ -4806,8 +4945,12 @@ mod tests {
         crate::config::with_process_env_overrides_for_test(&[("AM_TEST_TMUX_BIN", "")], || {
             let removed = cleanup_stale_identities(&project);
             assert!(
-                removed.contains(&dead_path),
-                "record with a gone socket must be purged: {removed:?}"
+                contains_release_receipt_for(&removed, &dead_path),
+                "record with a gone socket must be released with a receipt: {removed:?}"
+            );
+            assert!(
+                !dead_path.exists(),
+                "socket-gone binding must no longer resolve"
             );
             assert!(
                 legacy_path.exists(),
@@ -4899,8 +5042,13 @@ mod tests {
         crate::config::with_process_env_overrides_for_test(&[("AM_TEST_TMUX_BIN", "")], || {
             let removed = cleanup_stale_identities(&project);
             assert!(
-                removed.contains(&stale_path),
-                "uncheckable record not matching a live pane key must be purged: {removed:?}"
+                contains_release_receipt_for(&removed, &stale_path),
+                "uncheckable record not matching a live pane key must be released \
+                 with a receipt: {removed:?}"
+            );
+            assert!(
+                !stale_path.exists(),
+                "uncheckable stale binding must no longer resolve"
             );
             assert!(
                 kept_path.exists(),
@@ -4908,6 +5056,86 @@ mod tests {
             );
         });
         drop(tmux);
+        drop(config);
+    }
+    /// agent-factory-3tf regression: the PRODUCTION write path must record
+    /// tmux server-generation evidence.
+    ///
+    /// The GH#252 merge left `capture_binding_generation` with zero callers,
+    /// so every row production wrote carried no generation. Nothing failed:
+    /// `parse_binding_generation` simply returned None, and the destructive
+    /// release gate quietly fell back to `tmux_pane_is_live` -- the path a
+    /// decorrelated review had already proven grants release of LIVE panes.
+    /// The whole pane suite stayed green through it, because every other test
+    /// injects its record as a fixture instead of writing one.
+    ///
+    /// This test writes through the real path and asserts the evidence is on
+    /// disk, so that regression cannot reappear silently.
+    #[cfg(unix)]
+    #[test]
+    fn write_identity_records_generation_evidence_through_production_path() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("generation-evidence-project");
+
+        // A real file so the generation can stat a device and inode.
+        let sock = config.tempdir.path().join("tmux-generation-sock");
+        std::fs::write(&sock, b"").expect("create socket placeholder");
+        let sock_text = sock.to_string_lossy().into_owned();
+
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let script = format!(
+            "#!/bin/sh\n\
+             cmd=\"\"\n\
+             for a in \"$@\"; do\n\
+             case \"$a\" in\n\
+             list-panes) cmd=lp ;;\n\
+             display-message) cmd=dm ;;\n\
+             esac\n\
+             done\n\
+             if [ \"$cmd\" = lp ]; then\n\
+             printf '%s\\t%s\\t%s\\t%s\\n' '{sock_text}' '4242' 'alpha:0:1' '%77'\n\
+             exit 0\n\
+             fi\n\
+             if [ \"$cmd\" = dm ]; then\n\
+             printf '%s\\t%s\\t%s\\t%s\\t%s\\n' 'alpha' '%77' '999' 'claude' '{sock_text}'\n\
+             exit 0\n\
+             fi\n\
+             exit 1\n"
+        );
+        let tmux_bin = write_tmux_stub(stub_dir.path(), &script);
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", tmux_bin.as_str())],
+            || {
+                let path = write_identity(&project, "%77", "GenAgent").expect("write identity");
+                let content = read_identity_file_no_follow(&path).expect("read written record");
+
+                // The claim that actually matters: the destructive release
+                // gate can parse a generation out of what production wrote.
+                let generation = parse_binding_generation(&content).expect(
+                    "production write path must record generation evidence the \
+                     release gate can parse",
+                );
+                assert_eq!(generation.tmux_pane_id, "%77");
+                assert_eq!(generation.server_pid, 4242);
+                assert_eq!(generation.socket_path, sock);
+
+                let record = read_identity_record(&path).expect("parse written record");
+                assert_eq!(record.name, "GenAgent");
+                assert_eq!(record.schema_version.as_deref(), Some(BINDING_SCHEMA_V1));
+                assert_eq!(record.identity_key.as_deref(), Some("%77"));
+                // The v1 contract: `pane_id` is the requested identity key
+                // (bare here, composite when registration used a composite
+                // key), `tmux_pane_id` is the authoritative bare id, and the
+                // GH#252 liveness probe uses the bare id via probe_pane_id().
+                assert_eq!(record.pane_id.as_deref(), Some("%77"));
+                assert_eq!(record.tmux_pane_id.as_deref(), Some("%77"));
+                assert_eq!(record.probe_pane_id(), Some("%77"));
+                assert!(record.socket_device.is_some());
+                assert!(record.socket_inode.is_some());
+                assert!(record.is_verifiable());
+            },
+        );
         drop(config);
     }
 }
