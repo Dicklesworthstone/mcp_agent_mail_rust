@@ -35259,6 +35259,7 @@ async fn send_mail_envelope_via_server_or_local(
     bearer: Option<&str>,
     envelope: &PendingMailSendEnvelope,
     sender_token: Option<&str>,
+    idempotency_key: Option<&str>,
 ) -> CliResult<serde_json::Value> {
     let cc_names = if envelope.cc.is_empty() {
         None
@@ -35281,6 +35282,7 @@ async fn send_mail_envelope_via_server_or_local(
             envelope.thread_id.as_deref(),
             envelope.topic.as_deref(),
             sender_token,
+            idempotency_key,
         ),
     )
     .await
@@ -35337,6 +35339,7 @@ async fn send_mail_envelope_via_server_or_local(
         envelope.thread_id.as_deref(),
         envelope.topic.as_deref(),
         sender_token,
+        idempotency_key,
     ));
     let payload = match asupersync::time::timeout(
         asupersync::time::wall_now(),
@@ -35362,6 +35365,25 @@ fn pending_send_content_hash(envelope: &PendingMailSendEnvelope) -> CliResult<St
     let bytes = serde_json::to_vec(envelope)
         .map_err(|error| CliError::Format(format!("serialize pending-send envelope: {error}")))?;
     Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+/// Stable server-side de-duplication key for one durable replay artifact.
+///
+/// The envelope hash alone is insufficient: a later, intentional send with
+/// byte-identical content is stored in a fresh `.N.json` artifact and must
+/// remain a distinct message. Hashing the immutable artifact gives every
+/// queued occurrence its own key while preserving that key across retries,
+/// concurrent replay processes, receipt-write failures, and a missing receipt
+/// sibling.
+fn pending_send_replay_idempotency_key(artifact: &PendingSendArtifact) -> CliResult<String> {
+    use sha2::{Digest as _, Sha256};
+
+    let bytes = serde_json::to_vec(artifact)
+        .map_err(|error| CliError::Format(format!("serialize pending-send artifact: {error}")))?;
+    Ok(format!(
+        "{PENDING_SEND_SCHEMA_VERSION}:{}",
+        hex::encode(Sha256::digest(bytes))
+    ))
 }
 
 fn shell_quote(value: &str) -> String {
@@ -35790,6 +35812,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 bearer.as_deref(),
                 &envelope,
                 resolved_sender_token.as_deref(),
+                None,
             )
             .await
             .map_err(|error| {
@@ -35842,6 +35865,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 None,
                 None,
             )?;
+            let replay_idempotency_key = pending_send_replay_idempotency_key(&queued)?;
             let mut data = send_mail_envelope_via_server_or_local(
                 &server_config,
                 &database_url,
@@ -35849,6 +35873,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 bearer.as_deref(),
                 &queued.envelope,
                 resolved_sender_token.as_deref(),
+                Some(&replay_idempotency_key),
             )
             .await?;
             let receipt_path = write_pending_send_receipt(&artifact, &queued, &data)?;
@@ -36566,6 +36591,7 @@ fn build_server_send_message_arguments(
     thread_id: Option<&str>,
     topic: Option<&str>,
     sender_token: Option<&str>,
+    idempotency_key: Option<&str>,
 ) -> serde_json::Value {
     let mut arguments = serde_json::Map::from_iter([
         ("project_key".to_string(), serde_json::json!(project_key)),
@@ -36587,6 +36613,12 @@ fn build_server_send_message_arguments(
     }
     if let Some(sender_token) = sender_token.filter(|t| !t.is_empty()) {
         arguments.insert("sender_token".to_string(), serde_json::json!(sender_token));
+    }
+    if let Some(idempotency_key) = idempotency_key.filter(|key| !key.is_empty()) {
+        arguments.insert(
+            "idempotency_key".to_string(),
+            serde_json::json!(idempotency_key),
+        );
     }
     serde_json::Value::Object(arguments)
 }
@@ -38806,11 +38838,11 @@ mod mail_server_cli_bridge_tests {
         mailbox_activity_lock_cli_error, normalize_cli_product_inbox_agent_name,
         parse_blocking_http_url, parse_cli_fetch_inbox_product_limit, parse_cli_search_limit,
         pending_send_content_hash, pending_send_failure_from_error, pending_send_receipt_path,
-        persist_sender_identity_token, persist_sender_identity_token_from_agent_payload,
-        post_jsonrpc_request_blocking_http, product_inbox_row_to_json,
-        reject_local_fallback_with_ownership_probe, reject_local_registration_when_gate,
-        resolve_mailbox_activity_sqlite_path, resolve_sender_token,
-        server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
+        pending_send_replay_idempotency_key, persist_sender_identity_token,
+        persist_sender_identity_token_from_agent_payload, post_jsonrpc_request_blocking_http,
+        product_inbox_row_to_json, reject_local_fallback_with_ownership_probe,
+        reject_local_registration_when_gate, resolve_mailbox_activity_sqlite_path,
+        resolve_sender_token, server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
         sort_product_inbox_items_desc, sqlite_doctor_sanity_with_health_probe,
         validate_pending_send_artifact, validate_pending_send_receipt, write_pending_send_receipt,
     };
@@ -38829,6 +38861,7 @@ mod mail_server_cli_bridge_tests {
             None,
             "high",
             true,
+            None,
             None,
             None,
             None,
@@ -38856,6 +38889,7 @@ mod mail_server_cli_bridge_tests {
             None,
             None,
             Some("secret-tok"),
+            Some("replay-key"),
         );
         let object = args.as_object().expect("object arguments");
         assert_eq!(
@@ -38863,6 +38897,12 @@ mod mail_server_cli_bridge_tests {
                 .get("sender_token")
                 .and_then(serde_json::Value::as_str),
             Some("secret-tok")
+        );
+        assert_eq!(
+            object
+                .get("idempotency_key")
+                .and_then(serde_json::Value::as_str),
+            Some("replay-key")
         );
         // An empty token must be omitted (never serialize a blank credential).
         let args_empty = build_server_send_message_arguments(
@@ -38877,8 +38917,15 @@ mod mail_server_cli_bridge_tests {
             None,
             None,
             Some(""),
+            Some(""),
         );
         assert!(!args_empty.as_object().unwrap().contains_key("sender_token"));
+        assert!(
+            !args_empty
+                .as_object()
+                .unwrap()
+                .contains_key("idempotency_key")
+        );
     }
 
     // ---- #147: mail send sender-token UX ----
@@ -39028,6 +39075,43 @@ mod mail_server_cli_bridge_tests {
             validate_pending_send_receipt(&mismatched_receipt_path, &artifact, &mismatched_receipt)
                 .expect_err("mismatched receipt hash should be rejected");
         assert!(mismatch.to_string().contains("content_hash mismatch"));
+    }
+
+    #[test]
+    fn queued_send_replay_key_survives_receipt_loss_and_distinguishes_later_send() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = config_with_storage_root(temp.path());
+        let envelope = pending_send_test_envelope();
+        let failure =
+            pending_send_failure_from_error(&CliError::Other("database is locked".to_string()))
+                .expect("lock failure should be queueable");
+        let (first_path, first_artifact) =
+            create_pending_send_artifact(&config, &envelope, failure.clone(), false)
+                .expect("create first artifact");
+        let first_key = pending_send_replay_idempotency_key(&first_artifact).expect("first key");
+
+        let response = serde_json::json!({"id": 7, "to": ["WindyGate"]});
+        let receipt = write_pending_send_receipt(&first_path, &first_artifact, &response)
+            .expect("write first receipt");
+        let (second_path, second_artifact) =
+            create_pending_send_artifact(&config, &envelope, failure, false)
+                .expect("create later byte-identical send");
+        let second_key = pending_send_replay_idempotency_key(&second_artifact).expect("second key");
+        assert_ne!(first_path, second_path);
+        assert_ne!(first_key, second_key);
+
+        // Model a git-sibling receipt disappearing without deleting test data.
+        // Replaying the original artifact still presents the exact same key to
+        // the daemon, whose transactionally stored idempotency record wins the
+        // race before either process can send a duplicate.
+        let quarantined_receipt = receipt.with_extension("json.quarantined");
+        std::fs::rename(&receipt, &quarantined_receipt).expect("quarantine receipt");
+        assert!(!receipt.exists());
+        let reloaded = load_pending_send_artifact(&first_path).expect("reload first artifact");
+        assert_eq!(
+            pending_send_replay_idempotency_key(&reloaded).expect("reloaded key"),
+            first_key
+        );
     }
 
     #[test]
@@ -39212,6 +39296,7 @@ mod mail_server_cli_bridge_tests {
             false,
             Some("br-123"),
             Some("br-123.1"),
+            None,
             None,
         );
 
@@ -82694,6 +82779,7 @@ async fn call_send_message_tool_locally(
     thread_id: Option<&str>,
     topic: Option<&str>,
     sender_token: Option<&str>,
+    idempotency_key: Option<&str>,
 ) -> CliResult<serde_json::Value> {
     let ctx = McpContext::new(asupersync::Cx::for_request(), 1);
     let payload = mcp_agent_mail_tools::messaging::send_message(
@@ -82714,7 +82800,9 @@ async fn call_send_message_tool_locally(
         None,
         None,
         sender_token.filter(|t| !t.is_empty()).map(str::to_string),
-        None, // idempotency_key
+        idempotency_key
+            .filter(|key| !key.is_empty())
+            .map(str::to_string),
     )
     .await
     .map_err(mcp_error_to_cli_error)?;
