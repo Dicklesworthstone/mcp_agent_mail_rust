@@ -1558,7 +1558,8 @@ fn collect_recovery_continuity_sets_with_overrides(
             .query_sync(
                 "SELECT m.id AS message_id, \
                         p.slug AS project_slug, p.human_key AS project_human_key, \
-                        sender.name AS sender_name, m.thread_id AS thread_id, \
+                        sender.name AS sender_name, \
+                        CAST(m.thread_id AS TEXT) AS thread_id, \
                         m.subject AS subject, m.body_md AS body_md, \
                         m.importance AS importance, \
                         CAST(m.ack_required AS INTEGER) AS ack_required, \
@@ -4367,6 +4368,24 @@ mod tests {
             .expect("seed receipt fixture proof-gate nonce");
         }
         drop(conn);
+    }
+
+    #[test]
+    fn recovery_receipt_preserves_numeric_text_thread_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("numeric-thread.sqlite3");
+        seed_recovery_receipt_db(&db_path, true);
+
+        let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open receipt fixture database");
+        conn.execute_raw("UPDATE messages SET thread_id = '17039' WHERE id = 73")
+            .expect("store numeric-looking thread id as text");
+        drop(conn);
+
+        let sets = collect_recovery_continuity_sets(&db_path)
+            .expect("numeric-looking text thread id must remain valid receipt evidence");
+        assert_eq!(sets.messages.values().sum::<usize>(), 1);
+        assert_eq!(sets.message_identities.values().sum::<usize>(), 1);
     }
 
     #[test]
