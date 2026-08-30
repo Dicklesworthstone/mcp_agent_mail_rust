@@ -581,6 +581,7 @@ fn tmux_pane_is_live_with_socket(
     Ok(false)
 }
 
+#[allow(clippy::literal_string_with_formatting_args)] // tmux interpolation syntax, not Rust format syntax
 fn tmux_server_has_pane(pane_id: &str, socket: Option<&Path>) -> std::io::Result<bool> {
     let mut command = tmux_command();
     if let Some(socket) = socket {
@@ -794,6 +795,7 @@ fn binding_release_liveness(pane_id: &str, content: Option<&str>) -> std::io::Re
     }
 }
 
+#[allow(clippy::literal_string_with_formatting_args)] // tmux interpolation syntax, not Rust format syntax
 fn tmux_server_binding_generation(
     pane_id: &str,
     socket: Option<&Path>,
@@ -1125,7 +1127,7 @@ fn release_resolved_identity(
     // subsequent live check restores the exact inode we moved (or leaves a
     // concurrently written replacement in place). This closes the
     // check-then-unlink race that could otherwise delete a new live binding.
-    let anchored = AnchoredIdentity::open(&path)?;
+    let anchored = AnchoredIdentity::open(path)?;
     let source_name = anchored.file_name.clone();
     let already_pending = is_release_pending_name(&source_name);
     let quarantine_name = if already_pending {
@@ -1134,7 +1136,7 @@ fn release_resolved_identity(
         let mut random = [0_u8; 16];
         getrandom::fill(&mut random)
             .map_err(|error| std::io::Error::other(format!("randomness failed: {error}")))?;
-        let nonce: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let nonce = hex::encode(random);
         let file_name = source_name.to_string_lossy();
         std::ffi::OsString::from(format!(
             ".{file_name}.release-{}-{nonce}",
@@ -1147,7 +1149,7 @@ fn release_resolved_identity(
     }
 
     let quarantined_content = anchored.read(&quarantine_name).ok();
-    let quarantined_agent = quarantined_content.clone().and_then(parse_identity);
+    let quarantined_agent = quarantined_content.as_deref().and_then(parse_identity);
     let live_after_quarantine =
         match binding_release_liveness(pane_id, quarantined_content.as_deref()) {
             Ok(live) => live,
@@ -1564,9 +1566,8 @@ fn cleanup_identity_directory(project_dir: &Path) -> Vec<PathBuf> {
             continue;
         }
         let pending = pending_original_name(&raw_name);
-        let filename_pane_id = pending
-            .map(str::to_owned)
-            .unwrap_or_else(|| raw_name.to_string_lossy().into_owned());
+        let filename_pane_id =
+            pending.map_or_else(|| raw_name.to_string_lossy().into_owned(), str::to_owned);
         let path = entry.path();
         // agent-factory-3tf: report/act on the pane id a caller can hand back
         // to resolve-pane and release (`%99`), not the sanitized on-disk file
@@ -1641,9 +1642,8 @@ pub fn list_identities_with_paths(project_key: &str) -> Vec<(String, String, Pat
             continue;
         }
         let pending = pending_original_name(&raw_name);
-        let filename_pane_id = pending
-            .map(str::to_owned)
-            .unwrap_or_else(|| raw_name.to_string_lossy().into_owned());
+        let filename_pane_id =
+            pending.map_or_else(|| raw_name.to_string_lossy().into_owned(), str::to_owned);
         let path = entry.path();
         // agent-factory-3tf: report/act on the pane id a caller can hand back
         // to resolve-pane and release (`%99`), not the sanitized on-disk file
@@ -1736,7 +1736,7 @@ fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn parse_identity(content: String) -> Option<String> {
+fn parse_identity(content: &str) -> Option<String> {
     let trimmed = content.trim().to_string();
     if trimmed.is_empty() {
         return None;
@@ -1868,7 +1868,7 @@ fn resolve_unique_v1_by_bare_pane(
         if !pane_ids_are_authoritatively_compatible(pane_id, &binding.tmux_pane_id) {
             continue;
         }
-        let name = parse_identity(content)?;
+        let name = parse_identity(&content)?;
         if match_found.is_some() {
             return None;
         }
@@ -2183,7 +2183,7 @@ fn resolve_released_by_bare_pane(project_key: &str, pane_id: &str) -> Option<(St
         if !pane_ids_are_authoritatively_compatible(pane_id, &generation.tmux_pane_id) {
             continue;
         }
-        let Some(name) = parse_identity(content) else {
+        let Some(name) = parse_identity(&content) else {
             continue;
         };
         let modified = entry
@@ -2442,7 +2442,7 @@ fn record_from_facts(
         record.socket_device = Some(generation.socket_device);
         record.socket_inode = Some(generation.socket_inode);
         record.server_pid = Some(generation.server_pid);
-        record.tmux_pane_id = Some(generation.tmux_pane_id.clone());
+        record.tmux_pane_id = Some(generation.tmux_pane_id);
     }
     record
 }
@@ -2577,10 +2577,8 @@ fn identity_entry_is_stale(entry: &std::fs::DirEntry, live_panes: &[String]) -> 
         .as_deref()
         .and_then(parse_binding_generation)
     {
-        return match binding_generation_is_live(&generation.tmux_pane_id, Some(&generation)) {
-            Ok(live) => !live,
-            Err(_) => false,
-        };
+        return binding_generation_is_live(&generation.tmux_pane_id, Some(&generation))
+            .is_ok_and(|live| !live);
     }
 
     let record = read_identity_record(&path);
@@ -2606,8 +2604,7 @@ fn identity_entry_is_stale(entry: &std::fs::DirEntry, live_panes: &[String]) -> 
 
 fn file_name_matches_live_pane(file_name: &OsStr, live_panes: &[String]) -> bool {
     let key = pending_original_name(file_name)
-        .map(str::to_owned)
-        .unwrap_or_else(|| file_name.to_string_lossy().into_owned());
+        .map_or_else(|| file_name.to_string_lossy().into_owned(), str::to_owned);
     live_panes
         .iter()
         .any(|pane| sanitize_pane_id(pane) == key || pane.trim() == key)
@@ -3230,6 +3227,7 @@ mod tests {
             Some("BlueLake")
         );
         assert!(resolve_identity(&project, "foo@bar:1:1").is_none());
+        drop(config);
     }
 
     #[test]
@@ -3867,14 +3865,17 @@ mod tests {
         std::fs::rename(&global, &global_pending).expect("quarantine global identity");
         set_test_live_tmux_panes(Some(vec!["42".to_string()]));
 
-        assert!(cleanup_stale_identities(&scoped_project).is_empty());
+        assert_eq!(
+            cleanup_stale_identities(&scoped_project),
+            Vec::<PathBuf>::new()
+        );
         assert!(scoped_pending.exists());
         assert_eq!(
             list_identities(&scoped_project),
             vec![("%42".to_string(), "BlueLake".to_string())]
         );
 
-        assert!(cleanup_all_stale_identities().is_empty());
+        assert_eq!(cleanup_all_stale_identities(), Vec::<PathBuf>::new());
         assert!(scoped_pending.exists());
         assert!(global_pending.exists());
         drop(config);
@@ -3913,7 +3914,7 @@ mod tests {
         let binding = write_identity(&project, "%42", "BlueLake").expect("write identity binding");
         let _tmux = LiveTmuxPanesGuard::new(vec!["__QUERY_ERROR__".to_string()]);
 
-        assert!(cleanup_stale_identities(&project).is_empty());
+        assert_eq!(cleanup_stale_identities(&project), Vec::<PathBuf>::new());
         assert!(binding.exists());
         drop(config);
     }
@@ -3932,7 +3933,7 @@ mod tests {
         );
         let _tmux = LiveTmuxPanesGuard::new(vec![pane.to_string()]);
 
-        assert!(cleanup_stale_identities(&project).is_empty());
+        assert_eq!(cleanup_stale_identities(&project), Vec::<PathBuf>::new());
         assert!(binding.exists());
         drop(config);
     }
@@ -5313,7 +5314,7 @@ mod tests {
     /// default socket?". That is not this binding's liveness: pane ids are
     /// global per tmux server and get reissued across sockets, so the answer
     /// was about a different server as often as not. A decorrelated review
-    /// (StormyOsprey, FAIL, 191253a) rode that arm to release LIVE panes six
+    /// (`StormyOsprey`, FAIL, 191253a) rode that arm to release LIVE panes six
     /// times. The 70-of-81 legacy population is exactly the input that reached
     /// it, so the refusal is asserted here directly rather than left implied by
     /// the tests that happen to route around it.
