@@ -35306,6 +35306,18 @@ async fn send_mail_envelope_via_server_or_local(
                     "send_message via server failed: {message}"
                 )));
             }
+            // A scope-missing rejection is eligible for the legacy local path
+            // only when no daemon owns the mailbox.  Falling through while the
+            // daemon is live merely turns the actionable server rejection
+            // (for example, "agent not found") into a misleading SQLite lock
+            // error and queues an artifact that replay cannot repair.
+            reject_local_fallback_if_mailbox_owned(
+                "mail send",
+                server_url,
+                &message,
+                database_url,
+                server_config.storage_root.as_path(),
+            )?;
             tracing::debug!(
                 message = %message,
                 "mail send fell back to local tool after server scope mismatch"
@@ -40217,6 +40229,62 @@ mod mail_server_cli_bridge_tests {
         assert!(message.contains("mail send could not be proxied"));
         assert!(message.contains("Refusing local SQLite fallback"));
         assert!(message.contains("another Agent Mail server owns the mailbox database"));
+    }
+
+    #[test]
+    fn scope_rejection_fallback_refuses_owned_mailbox_without_queueing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mailbox.sqlite3");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("archive");
+        let server_rejection = "agent not found: MissingSender";
+
+        assert!(mail_server_rejection_allows_local_fallback(
+            server_rejection
+        ));
+        let error = reject_local_fallback_with_ownership_probe(
+            "mail send",
+            "http://127.0.0.1:8765/mcp/",
+            server_rejection,
+            &database_url,
+            &storage_root,
+            |sqlite_path, root| mcp_agent_mail_db::pool::MailboxOwnershipState {
+                disposition: mcp_agent_mail_db::pool::MailboxOwnershipDisposition::ActiveOtherOwner,
+                storage_lock_path: root.join(".mailbox.activity.lock").display().to_string(),
+                sqlite_lock_path: format!("{}.activity.lock", sqlite_path.display()),
+                processes: Vec::new(),
+                competing_pids: vec![42],
+                supervised_restart_required: false,
+                detail: "the running Agent Mail daemon owns this mailbox".to_string(),
+            },
+        )
+        .expect_err("scope rejection must not fall through to an owned SQLite mailbox");
+
+        let message = error.to_string();
+        assert!(message.contains(server_rejection));
+        assert!(message.contains("Refusing local SQLite fallback"));
+        assert!(
+            pending_send_failure_from_error(&error).is_none(),
+            "an actionable scope rejection must not become a retryable lock artifact"
+        );
+    }
+
+    #[test]
+    fn scope_rejection_fallback_remains_available_for_unowned_memory_database() {
+        let server_rejection = "project not found: /tmp/legacy-project";
+
+        assert!(mail_server_rejection_allows_local_fallback(
+            server_rejection
+        ));
+        reject_local_fallback_with_ownership_probe(
+            "mail send",
+            "http://127.0.0.1:8765/mcp/",
+            server_rejection,
+            "sqlite:///:memory:",
+            std::path::Path::new("/tmp/archive"),
+            |_sqlite_path, _root| panic!("memory database should not inspect ownership"),
+        )
+        .expect("unowned in-memory mailboxes retain the legacy local fallback");
     }
 
     #[test]
