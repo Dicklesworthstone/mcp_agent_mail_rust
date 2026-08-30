@@ -625,10 +625,8 @@ fn tmux_server_has_pane(pane_id: &str, socket: Option<&Path>) -> std::io::Result
 fn test_generation_socket() -> &'static Path {
     static SOCKET: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     SOCKET.get_or_init(|| {
-        let path = std::env::temp_dir().join(format!(
-            "am-test-generation-socket-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("am-test-generation-socket-{}", std::process::id()));
         let _ = std::fs::write(&path, b"");
         path
     })
@@ -660,7 +658,8 @@ fn test_binding_generation(pane_id: &str) -> Option<BindingGeneration> {
 fn capture_binding_generation(pane_id: &str) -> std::io::Result<Option<BindingGeneration>> {
     #[cfg(test)]
     if crate::config::process_env_value("AM_TEST_TMUX_BIN")
-        .is_none_or(|value| value.trim().is_empty()) {
+        .is_none_or(|value| value.trim().is_empty())
+    {
         // Unit tests have no tmux server. Record the same evidence a real
         // registration would, so the suite exercises the evidenced path.
         return Ok(test_binding_generation(pane_id));
@@ -784,7 +783,11 @@ fn binding_release_liveness(pane_id: &str, content: Option<&str>) -> std::io::Re
     if let Some(generation) = content.and_then(parse_binding_generation) {
         return binding_generation_is_live(pane_id, Some(&generation));
     }
-    match content.and_then(parse_identity_record).as_ref().map(binding_liveness) {
+    match content
+        .and_then(parse_identity_record)
+        .as_ref()
+        .map(binding_liveness)
+    {
         Some(PaneBindingLiveness::Live) => Ok(true),
         Some(PaneBindingLiveness::Dead) => Ok(false),
         _ => binding_generation_is_live(pane_id, None),
@@ -809,12 +812,10 @@ fn tmux_server_binding_generation(
             return Err(std::io::Error::other("injected late tmux liveness failure"));
         }
         let live = panes.iter().any(|candidate| {
-            candidate
-                .strip_prefix("__LIVE_AFTER_1__:")
-                .map_or_else(
-                    || tmux_pane_ids_match(pane_id, candidate.trim()),
-                    |candidate| call >= 1 && tmux_pane_ids_match(pane_id, candidate),
-                )
+            candidate.strip_prefix("__LIVE_AFTER_1__:").map_or_else(
+                || tmux_pane_ids_match(pane_id, candidate.trim()),
+                |candidate| call >= 1 && tmux_pane_ids_match(pane_id, candidate),
+            )
         });
         return Ok(live.then(|| test_binding_generation(pane_id)).flatten());
     }
@@ -4353,7 +4354,10 @@ mod tests {
     /// restart. 7x5 wins on the action, so these assertions check that the
     /// binding is gone AND that a receipt for it was returned.
     fn contains_release_receipt_for(removed: &[PathBuf], original: &Path) -> bool {
-        let Some(name) = original.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        let Some(name) = original
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+        else {
             return false;
         };
         let prefix = format!(".{name}.released-");
@@ -5332,7 +5336,10 @@ mod tests {
             "the refusal must name the missing evidence: {error}"
         );
         assert!(path.exists(), "a refused release must leave the row intact");
-        assert_eq!(resolve_identity(&project, pane).as_deref(), Some("BlueLake"));
+        assert_eq!(
+            resolve_identity(&project, pane).as_deref(),
+            Some("BlueLake")
+        );
 
         // The heal path: re-registration overwrites the unverifiable row and
         // records evidence, after which the row is releasable on its own terms.
@@ -5396,7 +5403,10 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(path.exists(), "the binding must survive a refused release");
-        assert_eq!(resolve_identity(&project, pane).as_deref(), Some("BlueLake"));
+        assert_eq!(
+            resolve_identity(&project, pane).as_deref(),
+            Some("BlueLake")
+        );
         drop(config);
     }
 }
