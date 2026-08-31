@@ -1069,6 +1069,10 @@ pub struct StorageMetricsSnapshot {
     pub wbq_peak_depth: u64,
     pub wbq_over_80_since_us: u64,
     pub wbq_queue_latency_us: HistogramSnapshot,
+    /// Trailing-window WBQ queue-wait view. Backpressure classification reads
+    /// this instead of the lifetime histogram so a historical stall cannot
+    /// resurrect a red `health_level` once traffic is healthy again (GH#272).
+    pub wbq_queue_latency_recent_us: RecentHistogramSnapshot,
     pub wbq_last_unrecoverable_error_us: u64,
     pub wbq_unrecoverable_errors_total: u64,
     pub wbq_respawn_salvaged_total: u64,
@@ -1088,6 +1092,9 @@ pub struct StorageMetricsSnapshot {
     pub commit_peak_pending_requests: u64,
     pub commit_over_80_since_us: u64,
     pub commit_queue_latency_us: HistogramSnapshot,
+    /// Trailing-window commit queue-wait view (see
+    /// `wbq_queue_latency_recent_us`; GH#272).
+    pub commit_queue_latency_recent_us: RecentHistogramSnapshot,
 
     pub needs_reindex_total: u64,
 
@@ -2214,6 +2221,7 @@ impl StorageMetrics {
             wbq_peak_depth: self.wbq_peak_depth.load(),
             wbq_over_80_since_us: self.wbq_over_80_since_us.load(),
             wbq_queue_latency_us: self.wbq_queue_latency_us.snapshot(),
+            wbq_queue_latency_recent_us: self.wbq_queue_latency_us.recent_snapshot(),
             wbq_last_unrecoverable_error_us: self.wbq_last_unrecoverable_error_us.load(),
             wbq_unrecoverable_errors_total: self.wbq_unrecoverable_errors_total.load(),
             wbq_respawn_salvaged_total: self.wbq_respawn_salvaged_total.load(),
@@ -2235,6 +2243,7 @@ impl StorageMetrics {
             commit_peak_pending_requests: self.commit_peak_pending_requests.load(),
             commit_over_80_since_us: self.commit_over_80_since_us.load(),
             commit_queue_latency_us: self.commit_queue_latency_us.snapshot(),
+            commit_queue_latency_recent_us: self.commit_queue_latency_us.recent_snapshot(),
 
             needs_reindex_total: self.needs_reindex_total.load(),
 
