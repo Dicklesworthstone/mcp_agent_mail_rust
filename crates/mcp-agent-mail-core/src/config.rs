@@ -471,6 +471,17 @@ pub struct Config {
     pub retention_report_enabled: bool,
     pub retention_report_interval_seconds: u64,
     pub retention_max_age_days: u64,
+    /// Retention horizon (days) for hard-pruning settled mail messages from the
+    /// live DB (GH#273, mirroring `file_reservations_retention_days` / GH#154).
+    /// When > 0, the retention worker `DELETE`s messages that are (a) read by
+    /// every recipient, (b) acknowledged by every recipient when the message
+    /// requires acknowledgement, and (c) older than this many days. Recipient
+    /// rows, delivery-event rows, and signal-receipt rows for the pruned
+    /// messages are removed in the same pass, and the per-project git archive
+    /// retains the full message history, so the delete is non-destructive to
+    /// the durable record. `0` (the default) disables pruning — messages are
+    /// only ever counted/reported, the historical behavior.
+    pub messages_retention_days: u64,
     pub retention_ignore_project_patterns: Vec<String>,
     pub quota_enabled: bool,
     pub quota_attachments_limit_bytes: u64,
@@ -1641,6 +1652,8 @@ impl Default for Config {
             retention_report_enabled: false,
             retention_report_interval_seconds: 3600,
             retention_max_age_days: 180,
+            // Message pruning is opt-in (GH#273): 0 = report-only, never delete.
+            messages_retention_days: 0,
             // Override via RETENTION_IGNORE_PROJECT_PATTERNS env var.
             retention_ignore_project_patterns: vec![
                 "demo".to_string(),
@@ -2439,6 +2452,8 @@ impl Config {
         );
         config.retention_max_age_days =
             env_u64("RETENTION_MAX_AGE_DAYS", config.retention_max_age_days);
+        config.messages_retention_days =
+            env_u64("MESSAGES_RETENTION_DAYS", config.messages_retention_days);
         if let Some(v) = env_value("RETENTION_IGNORE_PROJECT_PATTERNS") {
             config.retention_ignore_project_patterns = parse_csv(&v);
         }

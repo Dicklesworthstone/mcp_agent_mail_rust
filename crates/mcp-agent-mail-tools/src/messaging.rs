@@ -4351,6 +4351,118 @@ pub async fn mark_message_read(
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
+/// Default number of messages transitioned per `mark_all_read` call (GH#273).
+pub const MARK_ALL_READ_DEFAULT_LIMIT: usize = 500;
+
+/// Hard cap on messages transitioned per `mark_all_read` call (GH#273).
+pub const MARK_ALL_READ_MAX_LIMIT: usize = 1000;
+
+/// Bulk mark-read for one agent's inbox in one project (GH#273).
+///
+/// # Parameters
+/// - `project_key`: Project identifier (must already exist; never auto-created)
+/// - `agent_name`: Agent whose unread inbox rows transition to read
+/// - `older_than_days`: Only mark messages created at least this many days ago
+/// - `limit`: Max messages per call (default 500, capped at 1000)
+///
+/// # Returns
+/// `{ agent, marked_count, more, limit, older_than_days }` — `more=true` means
+/// eligible unread messages remain and the caller should call again.
+///
+/// # Conformance
+/// Rust-native (the legacy Python server only exposed bulk mark-read through
+/// the web dashboard).
+#[tool(
+    description = "Mark every unread message in an agent's project inbox as read, in bounded batches.\n\nWhat this does\n--------------\n- Sets read_ts for up to `limit` unread (agent, message) recipient rows in the project, oldest first\n- Acknowledgement state is never touched; ack_required mail still needs `acknowledge_message`\n- Does NOT delete anything; pair with MESSAGES_RETENTION_DAYS retention to bound old mail\n\nWhen to use\n-----------\n- Clearing the backlog of a departed/finished agent so its inbox stops counting as unread\n- Draining stale coordination or ATC liveness mail after a swarm winds down\n- Before enabling message retention pruning (only read+acked mail is ever pruned)\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`). The project must\n    already exist; a typo'd key is an error, never a newly minted project.\nagent_name : str\n    Agent whose inbox is being cleared. Any caller may clear any agent's backlog (operator tool).\nolder_than_days : Optional[int]\n    Only mark messages created at least this many days ago (default: no age filter).\n    Use this to keep fresh mail unread while draining aged backlog.\nlimit : Optional[int]\n    Maximum messages to transition in this call. Default 500, hard cap 1000 (larger values are\n    clamped). The response's `more` flag tells you whether another call is needed.\n\nReturns\n-------\ndict\n    { \"agent\": str, \"marked_count\": int, \"more\": bool, \"limit\": int, \"older_than_days\": int | null }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"8b\",\"method\":\"tools/call\",\"params\":{\"name\":\"mark_all_read\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"older_than_days\":7\n}}}\n```\n\nDo / Don't\n----------\nDo:\n- Loop while `more` is true to fully drain a large backlog (each call is bounded by design).\n- Use `older_than_days` when the agent is still active and fresh mail should stay unread.\nDon't:\n- Use this as a substitute for reading coordination mail an active agent still needs.\n- Expect acks: ack_required messages remain unacknowledged until `acknowledge_message`."
+)]
+pub async fn mark_all_read(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    older_than_days: Option<i64>,
+    limit: Option<i32>,
+) -> McpResult<String> {
+    let agent_name = normalize_agent_name_or_original(agent_name);
+
+    let effective_limit = match limit {
+        None => MARK_ALL_READ_DEFAULT_LIMIT,
+        Some(value) if value < 1 => {
+            return Err(legacy_tool_error(
+                "INVALID_LIMIT",
+                format!("limit must be at least 1, got {value}. Use a positive integer."),
+                true,
+                json!({ "provided": value, "min": 1, "max": MARK_ALL_READ_MAX_LIMIT }),
+            ));
+        }
+        Some(value) => usize::try_from(value)
+            .unwrap_or(MARK_ALL_READ_MAX_LIMIT)
+            .min(MARK_ALL_READ_MAX_LIMIT),
+    };
+
+    let older_than_us = match older_than_days {
+        None => None,
+        Some(days) if days < 0 => {
+            return Err(legacy_tool_error(
+                "INVALID_ARGUMENT",
+                format!("older_than_days must be >= 0, got {days}."),
+                true,
+                json!({ "field": "older_than_days", "provided": days }),
+            ));
+        }
+        Some(days) => Some(
+            mcp_agent_mail_db::now_micros()
+                .saturating_sub(days.saturating_mul(86_400).saturating_mul(1_000_000)),
+        ),
+    };
+
+    let pool = get_db_pool()?;
+    // Bulk mark-read is an operator/cleanup action: the project must already
+    // exist — a typo'd key must never mint a project.
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let project_id = project.id.unwrap_or(0);
+    let agent = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
+    let agent_id = agent.id.unwrap_or(0);
+
+    let outcome = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::mark_messages_read_bulk(
+            ctx.cx(),
+            &pool,
+            project_id,
+            agent_id,
+            older_than_us,
+            effective_limit,
+        )
+        .await,
+    )?;
+
+    tracing::info!(
+        project = %project.slug,
+        agent = %agent_name,
+        marked = outcome.marked,
+        more = outcome.more,
+        limit = effective_limit,
+        older_than_days = ?older_than_days,
+        "mark_all_read: bulk-marked inbox messages read"
+    );
+
+    serde_json::to_string(&json!({
+        "agent": agent_name,
+        "marked_count": outcome.marked,
+        "more": outcome.more,
+        "limit": effective_limit,
+        "older_than_days": older_than_days,
+    }))
+    .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
 // ── Durable ack intents (br-bvq1x.8.3 / H3) ──────────────────────────────────
 //
 // When `acknowledge_message` cannot reach the live mailbox (DB corrupt / busy /

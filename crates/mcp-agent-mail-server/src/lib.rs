@@ -168,7 +168,8 @@ use mcp_agent_mail_tools::{
     FileReservationsResource, ForceReleaseFileReservation, GetMessageDeliveryReceipt, HealthCheck,
     IdentityProjectResource, InboxResource, InstallPrecommitGuard, ListAgents, ListContacts,
     MacroContactHandshake, MacroFileReservationCycle, MacroPrepareThread, MacroStartSession,
-    MailboxResource, MailboxWithCommitsResource, MarkMessageRead, MessageDetailsResource,
+    MailboxResource, MailboxWithCommitsResource, MarkAllRead, MarkMessageRead,
+    MessageDetailsResource,
     OutboxResource, ProductDetailsResource, ProductsLink, ProjectDetailsResource,
     ProjectsListQueryResource, ProjectsListResource, RegisterAgent, ReleaseBuildSlot,
     ReleaseFileReservations, RenewBuildSlot, RenewFileReservations, ReplyMessage, RequestContact,
@@ -755,6 +756,13 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
         "mark_message_read",
         clusters::MESSAGING,
         MarkMessageRead,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "mark_all_read",
+        clusters::MESSAGING,
+        MarkAllRead,
     );
     let server = add_tool(
         server,

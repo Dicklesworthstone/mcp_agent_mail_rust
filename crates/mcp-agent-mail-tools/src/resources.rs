@@ -1209,6 +1209,17 @@ fn build_tool_directory() -> ToolDirectory {
                     complexity: "medium".to_string(),
                 },
                 ToolDirectoryEntry {
+                    name: "mark_all_read".to_string(),
+                    summary: "Bulk-mark an agent's unread project inbox read in bounded batches (GH#273).".to_string(),
+                    use_when: "Clearing a departed agent's backlog or draining aged mail without a browser.".to_string(),
+                    related: vec!["mark_message_read".to_string(), "fetch_inbox".to_string()],
+                    expected_frequency: "Occasional operator/coordinator cleanup.".to_string(),
+                    required_capabilities: vec!["messaging".to_string(), "write".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Drain backlog".to_string(), sample: "mark_all_read(project_key='backend', agent_name='BlueLake', older_than_days=7)".to_string() }],
+                    capabilities: vec!["messaging".to_string(), "write".to_string()],
+                    complexity: "medium".to_string(),
+                },
+                ToolDirectoryEntry {
                     name: "acknowledge_message".to_string(),
                     summary: "Set read_ts and ack_ts so senders know action items landed.".to_string(),
                     use_when: "Responding to ack_required messages.".to_string(),

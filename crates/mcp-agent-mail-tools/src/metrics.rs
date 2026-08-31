@@ -313,6 +313,15 @@ pub const TOOL_META_MAP: &[(&str, ToolMeta)] = &[
         },
     ),
     (
+        // Bulk mark-read (GH#273): bounded batch transition of an agent's
+        // unread inbox rows; a write despite the "read" name.
+        "mark_all_read",
+        ToolMeta {
+            capabilities: &["messaging", "write"],
+            complexity: "medium",
+        },
+    ),
+    (
         "acknowledge_message",
         ToolMeta {
             capabilities: &["ack", "messaging"],

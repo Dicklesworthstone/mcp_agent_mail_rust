@@ -11493,6 +11493,379 @@ pub async fn mark_all_messages_read_in_project(
     .await
 }
 
+/// Result of a capped bulk mark-read pass (GH#273).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BulkMarkReadOutcome {
+    /// Number of messages newly marked read for the agent in this call.
+    pub marked: u64,
+    /// True when more unread messages matching the filters remain (the caller
+    /// should call again to continue draining the backlog).
+    pub more: bool,
+}
+
+/// Mark up to `limit` unread messages read for one agent in one project
+/// (GH#273: the bulk mark-read primitive behind the `mark_all_read` MCP tool
+/// and the `am mark-all-read` CLI verb).
+///
+/// Differences from [`mark_all_messages_read_in_project`] (the uncapped web
+/// dashboard path):
+/// - `older_than_us`: when `Some`, only messages with `created_ts <=
+///   older_than_us` are marked (lets operators drain aged backlog while
+///   keeping fresh mail unread).
+/// - `limit`: hard cap on messages transitioned per call; oldest messages
+///   (lowest id) are marked first, and the returned `more` flag reports
+///   whether eligible unread rows remain past the cap.
+///
+/// Read receipts only: acknowledgement state (`ack_ts`) is never touched.
+pub async fn mark_messages_read_bulk(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    older_than_us: Option<i64>,
+    limit: usize,
+) -> Outcome<BulkMarkReadOutcome, DbError> {
+    if limit == 0 {
+        return Outcome::Ok(BulkMarkReadOutcome {
+            marked: 0,
+            more: false,
+        });
+    }
+    let now = now_micros();
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    run_with_mvcc_retry(cx, "mark_messages_read_bulk", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        // Select the exact unread rows this call will transition (oldest-first
+        // by id, over-fetch by one to detect remaining backlog) so the count
+        // and the `more` flag are truthful even with unreliable rows_affected.
+        let mut find_sql = String::from(
+            "SELECT m.id FROM message_recipients r \
+             JOIN messages m ON m.id = r.message_id \
+             WHERE r.agent_id = ? AND r.read_ts IS NULL \
+             AND m.project_id = ?",
+        );
+        let mut find_params = vec![Value::BigInt(agent_id), Value::BigInt(project_id)];
+        if let Some(cutoff) = older_than_us {
+            find_sql.push_str(" AND m.created_ts <= ?");
+            find_params.push(Value::BigInt(cutoff));
+        }
+        find_sql.push_str(" ORDER BY m.id LIMIT ?");
+        let overfetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        find_params.push(Value::BigInt(overfetch));
+
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &find_sql, &find_params).await)
+        );
+
+        let mut message_ids = Vec::with_capacity(rows.len().min(limit));
+        for row in &rows {
+            let Some(message_id) = row_first_i64(row) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "bulk mark-read query returned a message without an integer id".to_string(),
+                ));
+            };
+            if message_ids.len() < limit {
+                message_ids.push(message_id);
+            }
+        }
+        let more = rows.len() > limit;
+
+        if !message_ids.is_empty() {
+            for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+                let ph = placeholders(chunk.len());
+                let sql = format!(
+                    "UPDATE message_recipients \
+                     SET read_ts = ? \
+                     WHERE agent_id = ? AND read_ts IS NULL \
+                     AND message_id IN ({ph})"
+                );
+                let mut params = Vec::with_capacity(2 + chunk.len());
+                params.push(Value::BigInt(now));
+                params.push(Value::BigInt(agent_id));
+                params.extend(chunk.iter().copied().map(Value::BigInt));
+                try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await)
+                );
+
+                // Do not report success unless every selected row in this
+                // chunk is now read (see mark_all_messages_read_in_project).
+                let verify_sql = format!(
+                    "SELECT COUNT(*) FROM message_recipients \
+                     WHERE agent_id = ? AND read_ts IS NULL AND message_id IN ({ph})"
+                );
+                let mut verify_params = Vec::with_capacity(1 + chunk.len());
+                verify_params.push(Value::BigInt(agent_id));
+                verify_params.extend(chunk.iter().copied().map(Value::BigInt));
+                let verify_rows = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_query(cx, &tracked, &verify_sql, &verify_params).await)
+                );
+                let remaining = verify_rows.first().and_then(row_first_i64).unwrap_or(0);
+                if remaining > 0 {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::Internal(format!(
+                        "bulk mark-read left {remaining} unread rows in project {project_id} for agent {agent_id}"
+                    )));
+                }
+            }
+
+            // Rebuild inbox_stats from ground truth.
+            try_in_tx!(
+                cx,
+                &tracked,
+                rebuild_agents_inbox_stats_in_tx(cx, &tracked, &[agent_id]).await
+            );
+        }
+
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        // Post-commit invalidation — see mark_message_read.
+        crate::cache::read_cache()
+            .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
+
+        Outcome::Ok(BulkMarkReadOutcome {
+            marked: u64::try_from(message_ids.len()).unwrap_or(u64::MAX),
+            more,
+        })
+    })
+    .await
+}
+
+/// SQL predicate selecting "settled" messages eligible for retention pruning
+/// (GH#273): every recipient has read the message, and — when the message
+/// requires acknowledgement — every recipient has acknowledged it. A message
+/// with no recipient rows left (e.g. repaired FK orphans) is vacuously
+/// settled. The caller adds the age horizon (`m.created_ts <= ?`).
+const SETTLED_MESSAGE_PREDICATE: &str = "NOT EXISTS (\
+     SELECT 1 FROM message_recipients r \
+     WHERE r.message_id = m.id \
+       AND (r.read_ts IS NULL \
+            OR (m.ack_required != 0 AND r.ack_ts IS NULL)))";
+
+/// Count messages that are settled (read + acked where required by every
+/// recipient) and older than `older_than_us` — i.e. what a retention prune at
+/// that horizon WOULD delete. Used by the retention worker's report-only mode
+/// when `MESSAGES_RETENTION_DAYS` is off (GH#273).
+pub async fn count_prunable_messages(
+    cx: &Cx,
+    pool: &DbPool,
+    older_than_us: i64,
+) -> Outcome<u64, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    let sql = format!(
+        "SELECT COUNT(*) FROM messages m WHERE m.created_ts <= ? AND {SETTLED_MESSAGE_PREDICATE}"
+    );
+    let params = [Value::BigInt(older_than_us)];
+    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let count = rows.first().and_then(row_first_i64).unwrap_or(0);
+            Outcome::Ok(u64::try_from(count).unwrap_or(0))
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Result of one retention prune sweep over the `messages` table (GH#273).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MessagePruneReport {
+    /// `messages` rows deleted.
+    pub deleted_messages: u64,
+    /// `message_recipients` rows deleted alongside their messages.
+    pub deleted_recipients: u64,
+    /// True when eligible messages remain past the per-sweep cap (the next
+    /// sweep will continue).
+    pub more: bool,
+}
+
+/// Retention sweep: hard-`DELETE` settled messages older than `older_than_us`
+/// (GH#273, the demand-side twin of [`prune_released_file_reservations`]).
+///
+/// A message is eligible when BOTH:
+///   1. it is settled — every recipient has `read_ts`, and every recipient
+///      has `ack_ts` when the message has `ack_required` — so unread or
+///      unacknowledged mail is NEVER pruned, AND
+///   2. `created_ts <= older_than_us`.
+///
+/// The per-project git archive (`projects/<slug>/messages/YYYY/MM/*.md` plus
+/// mailbox copies) retains the full message history independently, so the DB
+/// delete is non-destructive to the durable record — the same precedent as
+/// the file-reservation retention prune (GH#154).
+///
+/// Deletes are executed oldest-first in bounded batches of `batch_size`
+/// messages, each in its own transaction (fsqlite-friendly: bounded write
+/// sets, never one giant transaction), with at most `max_messages` messages
+/// removed per sweep. Rows referencing each pruned message are removed in
+/// FK-safe order inside the same transaction: signal receipts and delivery
+/// events first, then recipient rows, then the message itself (the
+/// `messages_ad` trigger clears `fts_messages`). Affected agents'
+/// `inbox_stats` are rebuilt in-transaction and their cached counts
+/// invalidated post-commit.
+pub async fn prune_settled_messages(
+    cx: &Cx,
+    pool: &DbPool,
+    older_than_us: i64,
+    batch_size: usize,
+    max_messages: usize,
+) -> Outcome<MessagePruneReport, DbError> {
+    let mut report = MessagePruneReport::default();
+    if max_messages == 0 {
+        return Outcome::Ok(report);
+    }
+    let batch_size = batch_size.clamp(1, MAX_IN_CLAUSE_ITEMS);
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    // Select eligible ids first (mirrors prune_released_file_reservations —
+    // never trust a correlated DELETE), over-fetching by one so the report
+    // can state whether backlog remains past the per-sweep cap.
+    let select_sql = format!(
+        "SELECT m.id FROM messages m \
+         WHERE m.created_ts <= ? AND {SETTLED_MESSAGE_PREDICATE} \
+         ORDER BY m.id LIMIT ?"
+    );
+    let overfetch = i64::try_from(max_messages.saturating_add(1)).unwrap_or(i64::MAX);
+    let params = [Value::BigInt(older_than_us), Value::BigInt(overfetch)];
+    let rows = match map_sql_outcome(traw_query(cx, &tracked, &select_sql, &params).await) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let mut ids: Vec<i64> = Vec::with_capacity(rows.len().min(max_messages));
+    for row in &rows {
+        if let Some(id) = row_first_i64(row)
+            && ids.len() < max_messages
+        {
+            ids.push(id);
+        }
+    }
+    report.more = rows.len() > max_messages;
+    if ids.is_empty() {
+        return Outcome::Ok(report);
+    }
+
+    for chunk in ids.chunks(batch_size) {
+        let ph = placeholders(chunk.len());
+        let chunk_params: Vec<Value> = chunk.iter().copied().map(Value::BigInt).collect();
+
+        let batch_outcome = run_with_mvcc_retry(cx, "prune_settled_messages_batch", || async {
+            try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+            // Capture affected recipients before their rows are removed so
+            // inbox_stats can be rebuilt from ground truth in this
+            // transaction.
+            let agents_sql = format!(
+                "SELECT DISTINCT agent_id FROM message_recipients WHERE message_id IN ({ph})"
+            );
+            let agent_rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(cx, &tracked, &agents_sql, &chunk_params).await)
+            );
+            let mut agent_ids: Vec<i64> = Vec::with_capacity(agent_rows.len());
+            for row in &agent_rows {
+                if let Some(agent_id) = row_first_i64(row) {
+                    agent_ids.push(agent_id);
+                }
+            }
+
+            // FK-safe cascade order: children first, message row last.
+            let del_receipts = format!(
+                "DELETE FROM message_delivery_signal_receipts WHERE message_id IN ({ph})"
+            );
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, &del_receipts, &chunk_params).await)
+            );
+
+            let del_events =
+                format!("DELETE FROM inbox_delivery_events WHERE message_id IN ({ph})");
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, &del_events, &chunk_params).await)
+            );
+
+            let del_recipients =
+                format!("DELETE FROM message_recipients WHERE message_id IN ({ph})");
+            let recipients_deleted = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, &del_recipients, &chunk_params).await)
+            );
+
+            let del_messages = format!("DELETE FROM messages WHERE id IN ({ph})");
+            let messages_deleted = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, &del_messages, &chunk_params).await)
+            );
+
+            if !agent_ids.is_empty() {
+                try_in_tx!(
+                    cx,
+                    &tracked,
+                    rebuild_agents_inbox_stats_in_tx(cx, &tracked, &agent_ids).await
+                );
+            }
+
+            try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+            Outcome::Ok((messages_deleted, recipients_deleted, agent_ids))
+        })
+        .await;
+
+        let chunk_agents = match batch_outcome {
+            Outcome::Ok((messages_deleted, recipients_deleted, agent_ids)) => {
+                report.deleted_messages = report.deleted_messages.saturating_add(messages_deleted);
+                report.deleted_recipients =
+                    report.deleted_recipients.saturating_add(recipients_deleted);
+                agent_ids
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        // Post-commit invalidation so concurrent readers repopulate fresh
+        // counts (see mark_message_read).
+        let scope = cache_scope_for_pool(pool);
+        for agent_id in chunk_agents {
+            crate::cache::read_cache().invalidate_inbox_stats_scoped(&scope, agent_id);
+        }
+    }
+
+    Outcome::Ok(report)
+}
+
 /// Acknowledge message
 pub async fn acknowledge_message(
     cx: &Cx,
@@ -22891,6 +23264,337 @@ mod tests {
                 )
                 .expect("select ledger");
             assert!(ledger.is_empty(), "pruned reservation's ledger row is removed");
+        });
+    }
+
+    /// GH#273: capped bulk mark-read honors the older-than filter, the per-call
+    /// cap (with a truthful `more` flag), never touches ack state, and leaves
+    /// other agents' unread rows alone.
+    #[test]
+    fn mark_messages_read_bulk_respects_filters_and_cap() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("mark_messages_read_bulk.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/bulk-mark-read")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender = register_agent(
+                &cx, &pool, project_id, "BlueLake", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let sender_id = sender.id.expect("sender id");
+            let recipient = register_agent(
+                &cx, &pool, project_id, "GreenStone", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+            let recipient_id = recipient.id.expect("recipient id");
+            let bystander = register_agent(
+                &cx, &pool, project_id, "AmberHill", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register bystander");
+            let bystander_id = bystander.id.expect("bystander id");
+
+            let day_us: i64 = 86_400 * 1_000_000;
+            let now = now_micros();
+            let old_ts = now - 30 * day_us;
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            // Messages 1-3 old, 4-5 fresh; all unread for the recipient. The
+            // bystander also receives message 1 (must stay unread for them).
+            for (id, created_ts) in [
+                (1, old_ts),
+                (2, old_ts + 1),
+                (3, old_ts + 2),
+                (4, now),
+                (5, now + 1),
+            ] {
+                conn.execute_raw(&format!(
+                    "INSERT INTO messages \
+                     (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+                     VALUES ({id}, {project_id}, {sender_id}, 'bulk', 's{id}', 'b', 'normal', 0, {created_ts}, '[]')"
+                ))
+                .expect("insert message");
+                conn.execute_raw(&format!(
+                    "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                     VALUES ({id}, {recipient_id}, 'to', NULL, NULL)"
+                ))
+                .expect("insert recipient row");
+            }
+            conn.execute_raw(&format!(
+                "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                 VALUES (1, {bystander_id}, 'cc', NULL, NULL)"
+            ))
+            .expect("insert bystander row");
+            drop(conn);
+
+            // Older-than filter: only the three aged messages transition.
+            let outcome = mark_messages_read_bulk(
+                &cx,
+                &pool,
+                project_id,
+                recipient_id,
+                Some(old_ts + 2),
+                500,
+            )
+            .await
+            .into_result()
+            .expect("bulk mark aged");
+            assert_eq!(outcome.marked, 3, "exactly the aged messages are marked");
+            assert!(!outcome.more, "no aged backlog remains");
+
+            // Cap: one of the two remaining unread messages, more=true.
+            let outcome =
+                mark_messages_read_bulk(&cx, &pool, project_id, recipient_id, None, 1)
+                    .await
+                    .into_result()
+                    .expect("bulk mark capped");
+            assert_eq!(outcome.marked, 1);
+            assert!(outcome.more, "one unread message remains past the cap");
+
+            // Drain the rest.
+            let outcome =
+                mark_messages_read_bulk(&cx, &pool, project_id, recipient_id, None, 500)
+                    .await
+                    .into_result()
+                    .expect("bulk mark drain");
+            assert_eq!(outcome.marked, 1);
+            assert!(!outcome.more);
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("reacquire connection");
+            let unread = conn
+                .query_sync(
+                    &format!(
+                        "SELECT COUNT(*) AS c FROM message_recipients \
+                         WHERE agent_id = {recipient_id} AND read_ts IS NULL"
+                    ),
+                    &[],
+                )
+                .expect("count unread");
+            assert_eq!(unread[0].get_named::<i64>("c").unwrap(), 0);
+            // Ack state untouched; bystander unaffected.
+            let acked = conn
+                .query_sync(
+                    &format!(
+                        "SELECT COUNT(*) AS c FROM message_recipients \
+                         WHERE agent_id = {recipient_id} AND ack_ts IS NOT NULL"
+                    ),
+                    &[],
+                )
+                .expect("count acked");
+            assert_eq!(acked[0].get_named::<i64>("c").unwrap(), 0, "read-only: never acks");
+            let bystander_unread = conn
+                .query_sync(
+                    &format!(
+                        "SELECT COUNT(*) AS c FROM message_recipients \
+                         WHERE agent_id = {bystander_id} AND read_ts IS NULL"
+                    ),
+                    &[],
+                )
+                .expect("count bystander unread");
+            assert_eq!(
+                bystander_unread[0].get_named::<i64>("c").unwrap(),
+                1,
+                "another agent's unread state is untouched"
+            );
+        });
+    }
+
+    /// GH#273: the message retention prune deletes only settled (fully read,
+    /// fully acked where required) messages past the horizon — inclusive at
+    /// the boundary — cascades FK-safely through recipient/delivery/receipt
+    /// rows, respects the per-sweep cap, and reports would-prune counts.
+    #[test]
+    fn prune_settled_messages_eligibility_cascade_and_cap() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("prune_settled_messages.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/prune-messages")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender = register_agent(
+                &cx, &pool, project_id, "BlueLake", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let sender_id = sender.id.expect("sender id");
+            let reader_a = register_agent(
+                &cx, &pool, project_id, "GreenStone", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register reader A");
+            let a_id = reader_a.id.expect("reader A id");
+            let reader_b = register_agent(
+                &cx, &pool, project_id, "AmberHill", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register reader B");
+            let b_id = reader_b.id.expect("reader B id");
+
+            let day_us: i64 = 86_400 * 1_000_000;
+            let now = now_micros();
+            let horizon = now - 30 * day_us;
+            let old_ts = horizon - day_us;
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            // m1: read by both, no ack required, created EXACTLY at the
+            //     horizon (inclusive boundary) → prunable.
+            // m2: read by A only → NOT prunable (unread mail is never pruned).
+            // m3: ack required, read+acked by both → prunable.
+            // m4: ack required, read by both, acked by A only → NOT prunable.
+            // m5: read by both but fresh → NOT prunable (horizon).
+            // m6: zero recipient rows, old → vacuously settled, prunable.
+            let seed: &[(i64, i64, i64)] = &[
+                (1, 0, horizon),
+                (2, 0, old_ts),
+                (3, 1, old_ts),
+                (4, 1, old_ts),
+                (5, 0, now),
+                (6, 0, old_ts),
+            ];
+            for (id, ack_required, created_ts) in seed {
+                conn.execute_raw(&format!(
+                    "INSERT INTO messages \
+                     (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+                     VALUES ({id}, {project_id}, {sender_id}, 'ret', 's{id}', 'b', 'normal', {ack_required}, {created_ts}, '[]')"
+                ))
+                .expect("insert message");
+            }
+            let read = now - day_us;
+            let read_s = read.to_string();
+            let recipient_rows: Vec<(i64, i64, &str, &str)> = vec![
+                (1, a_id, read_s.as_str(), "NULL"),
+                (1, b_id, read_s.as_str(), "NULL"),
+                (2, a_id, read_s.as_str(), "NULL"),
+                (2, b_id, "NULL", "NULL"),
+                (3, a_id, read_s.as_str(), read_s.as_str()),
+                (3, b_id, read_s.as_str(), read_s.as_str()),
+                (4, a_id, read_s.as_str(), read_s.as_str()),
+                (4, b_id, read_s.as_str(), "NULL"),
+                (5, a_id, read_s.as_str(), "NULL"),
+            ];
+            for (message_id, agent_id, read_ts, ack_ts) in &recipient_rows {
+                conn.execute_raw(&format!(
+                    "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                     VALUES ({message_id}, {agent_id}, 'to', {read_ts}, {ack_ts})"
+                ))
+                .expect("insert recipient row");
+            }
+            // Message-bound signal receipt for a prunable message (the v26
+            // ledger has no delete path of its own).
+            conn.execute_raw(&format!(
+                "INSERT INTO message_delivery_signal_receipts \
+                 (message_id, agent_id, delivery_route, signal_path_digest, observed_ts) \
+                 VALUES (1, {a_id}, 'signal_file', 'digest', {read})"
+            ))
+            .expect("insert signal receipt");
+            drop(conn);
+
+            // Report-only counter: three messages WOULD be pruned.
+            let would_prune = count_prunable_messages(&cx, &pool, horizon)
+                .await
+                .into_result()
+                .expect("count prunable");
+            assert_eq!(would_prune, 3, "m1, m3, m6 are settled and past the horizon");
+
+            // Per-sweep cap: only the oldest eligible message goes, more=true.
+            let capped = prune_settled_messages(&cx, &pool, horizon, 500, 1)
+                .await
+                .into_result()
+                .expect("capped prune");
+            assert_eq!(capped.deleted_messages, 1);
+            assert!(capped.more, "eligible backlog remains past the cap");
+
+            // Drain with a small batch size to exercise multi-batch commits.
+            let report = prune_settled_messages(&cx, &pool, horizon, 1, 500)
+                .await
+                .into_result()
+                .expect("full prune");
+            assert_eq!(report.deleted_messages, 2);
+            assert!(!report.more);
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("reacquire connection");
+            let remaining = conn
+                .query_sync("SELECT id FROM messages ORDER BY id", &[])
+                .expect("select remaining messages");
+            let ids: Vec<i64> = remaining
+                .iter()
+                .filter_map(|r| r.get_named::<i64>("id").ok())
+                .collect();
+            assert_eq!(
+                ids,
+                vec![2, 4, 5],
+                "unread (m2), unacked (m4), and fresh (m5) messages survive"
+            );
+
+            // FK integrity: no child table may reference a pruned message.
+            for (table, column) in [
+                ("message_recipients", "message_id"),
+                ("inbox_delivery_events", "message_id"),
+                ("message_delivery_signal_receipts", "message_id"),
+                ("fts_messages", "message_id"),
+            ] {
+                let orphans = conn
+                    .query_sync(
+                        &format!(
+                            "SELECT COUNT(*) AS c FROM {table} t \
+                             LEFT JOIN messages m ON m.id = t.{column} \
+                             WHERE m.id IS NULL"
+                        ),
+                        &[],
+                    )
+                    .expect("count orphans");
+                assert_eq!(
+                    orphans[0].get_named::<i64>("c").unwrap(),
+                    0,
+                    "{table} must hold no rows for pruned messages"
+                );
+            }
+            // Unread state for survivors is intact.
+            let unread_b = conn
+                .query_sync(
+                    &format!(
+                        "SELECT COUNT(*) AS c FROM message_recipients \
+                         WHERE agent_id = {b_id} AND read_ts IS NULL"
+                    ),
+                    &[],
+                )
+                .expect("count unread");
+            assert_eq!(unread_b[0].get_named::<i64>("c").unwrap(), 1, "m2 stays unread for B");
         });
     }
 
