@@ -10,7 +10,7 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## [Unreleased]
 
-## [v0.3.31](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.31) — 2026-08-27 **[Release]**
+## [v0.3.31](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.31) — 2026-08-31 **[Release]**
 
 Durability-diagnostics release: the database layer learned to explain itself.
 A dedicated corruption-forensics engine, connection-pool lease tracking, and
@@ -19,6 +19,34 @@ mode with reports that name the page, the lease, and the checkpoint that went
 wrong. Also lands first-class Oh My Pi support and verifiable pane-identity
 bindings (GH#252), and unsticks the container image, which had been frozen at
 v0.3.13 and amd64-only since June (GH#256).
+
+This is also the first release under the new installer trust model: releases
+are authenticated by a minisign signature over `SHA256SUMS` made with a
+maintainer-held key, replacing the GitHub-Actions Sigstore identity that no
+new release could satisfy (GH#269 in the Python repo; acfs#365). See the
+Security section below.
+
+### Security
+
+- **Installer trust model: mandatory minisign for v0.3.31 and later.**
+  Releases are no longer built by GitHub Actions, so the installers' previous
+  requirement — a keyless Sigstore bundle certified for the
+  `dist.yml@refs/tags/<tag>` Actions workflow identity — had become
+  unsatisfiable: v0.3.30 shipped without bundles and `install.sh` correctly
+  failed closed on every host. For releases >= v0.3.31, `install.sh` and
+  `install.ps1` instead require (a) the per-archive SHA-256 resolved from the
+  release `SHA256SUMS` manifest AND (b) a valid detached minisign signature
+  (`SHA256SUMS.minisig`) over the exact manifest bytes, verified against the
+  maintainer release key pinned in the script (epoch 2, key id
+  `1BBD79B28BF718D0`, shared with the frankensqlite release line). A missing
+  `minisign` binary, manifest, signature, or checksum entry aborts the
+  install; verification never degrades to checksum-only, and `--no-verify`
+  semantics are unchanged. The Sigstore/cosign path is preserved intact for
+  installing releases older than v0.3.31 — `cosign` is no longer required for
+  current releases (which also sidesteps the unrelated Ubuntu 26.04
+  packaged-cosign breakage). The trust anchor moved from "GitHub's CI
+  identity for this repository" to "a signing key the maintainer controls";
+  the model stays fail-closed. Details in `SECURITY.md`.
 
 ### Added
 
@@ -103,6 +131,29 @@ v0.3.13 and amd64-only since June (GH#256).
   metadata recorded alongside the snapshot.
 
 ### Fixed
+
+- **`am check-inbox` matches the daemon's view of the inbox (GH#269)** and the
+  CLI gains an `am agents reap` verb (GH#275) for reclaiming dead agent
+  identities without hand-editing state.
+
+- **Backpressure health is classified from rolling queue-wait windows
+  (GH#272)** instead of instantaneous samples, so a single slow acquisition
+  can no longer flap the health verdict, and the KPI/metrics surfaces report
+  the same windowed classification.
+
+- **Reservation-scan SQL is computed in Rust and guarded against ledger
+  anti-join regressions (GH#274).** The TUI poller's release-ledger joins no
+  longer depend on SQLite schema variations, the duplicated reservation
+  helpers were de-duplicated, and a regression test pins the anti-join shape.
+
+- **`get_project_by_human_key` falls back to the stable slug (GH#267)** when
+  the human key lookup misses, so renamed projects resolve consistently.
+
+- **Archive reconstruction no longer lets salvage rows collide with archive
+  identities.** Reconstruction and live WAL readiness were hardened, archive
+  reservation identity now wins over a salvaged local row id, and
+  archive+salvage lease dedup is pinned by test — this disproved the salvage
+  hypothesis for the 881/873 reservation-parity field outage.
 
 - **ATC hydration is bounded and fair for large recent populations (GH#258).**
   Liveness evaluation drains at most eight scheduled or policy-dirty agents per
