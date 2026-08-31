@@ -1316,7 +1316,7 @@ mod tests {
         // Leg 1: no pending commits -> green despite the poisoned lifetime p95.
         let mut snap = GlobalMetrics::default().snapshot();
         let now_us = 1_000_000_000;
-        snap.storage.commit_queue_latency_us = lifetime.clone();
+        snap.storage.commit_queue_latency_us = lifetime;
         snap.storage.commit_pending_requests = 0;
         let signals = HealthSignals::from_snapshot(&snap, now_us);
         assert_eq!(signals.commit_queue_p95_us, 0);
