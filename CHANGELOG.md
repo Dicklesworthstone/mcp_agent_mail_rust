@@ -149,6 +149,12 @@ Security section below.
 - **`get_project_by_human_key` falls back to the stable slug (GH#267)** when
   the human key lookup misses, so renamed projects resolve consistently.
 
+- **macOS builds compile again**: `rustix::fs::RawMode` is `u16` on Apple
+  targets (libc `mode_t`) but `u32` on Linux, and the setup-file permission
+  helper passed a `u32` straight through — Apple-target builds failed with
+  E0308 after the rustix 1.1.x refresh. The permission bits are now narrowed
+  explicitly (always <= `0o7777`, so the cast is lossless).
+
 - **Archive reconstruction no longer lets salvage rows collide with archive
   identities.** Reconstruction and live WAL readiness were hardened, archive
   reservation identity now wins over a salvaged local row id, and

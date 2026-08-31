@@ -2765,8 +2765,13 @@ fn create_unique_setup_file_at(
     suffix: &str,
     permissions: u32,
 ) -> Result<(String, std::fs::File), SetupError> {
-    use rustix::fs::{Mode, OFlags, fchmod, openat};
+    use rustix::fs::{Mode, OFlags, RawMode, fchmod, openat};
 
+    // `RawMode` is `u32` on Linux but `u16` on Apple targets (libc `mode_t`),
+    // so the caller's `u32` permission bits are narrowed explicitly. Setup
+    // permissions are always <= 0o7777 and therefore lossless under this cast.
+    #[allow(clippy::unnecessary_cast, clippy::cast_possible_truncation)]
+    let raw_mode = permissions as RawMode;
     let pid = std::process::id();
     let now = crate::timestamps::now_micros();
     for attempt in 0..1024 {
@@ -2775,11 +2780,11 @@ fn create_unique_setup_file_at(
             &authority.fd,
             candidate.as_str(),
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::from_raw_mode(permissions),
+            Mode::from_raw_mode(raw_mode),
         ) {
             Ok(fd) => {
                 let file = std::fs::File::from(fd);
-                fchmod(&file, Mode::from_raw_mode(permissions)).map_err(std::io::Error::from)?;
+                fchmod(&file, Mode::from_raw_mode(raw_mode)).map_err(std::io::Error::from)?;
                 return Ok((candidate, file));
             }
             Err(rustix::io::Errno::EXIST) => {}
