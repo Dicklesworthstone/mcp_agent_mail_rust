@@ -1,0 +1,145 @@
+{
+  "version": "rust-native@2026-08-31",
+  "generated_at": "2026-08-31T00:00:00Z",
+  "tool": "mark_all_read",
+  "classification": "rust_native",
+  "cases": [
+    {
+      "name": "marks_all_unread_and_reports_no_more",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/mark-all-read-basic",
+        "agent_name": "GreenPeak"
+      },
+      "setup": {
+        "tool_calls": [
+          {
+            "name": "ensure_project",
+            "input": {
+              "human_key": "__FIXTURE_ROOT__/projects/mark-all-read-basic"
+            }
+          },
+          {
+            "name": "register_agent",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/mark-all-read-basic",
+              "program": "codex-cli",
+              "model": "gpt-5",
+              "name": "BlueLake"
+            }
+          },
+          {
+            "name": "register_agent",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/mark-all-read-basic",
+              "program": "claude-code",
+              "model": "opus-4.1",
+              "name": "GreenPeak"
+            }
+          },
+          {
+            "name": "set_contact_policy",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/mark-all-read-basic",
+              "agent_name": "GreenPeak",
+              "policy": "open"
+            }
+          },
+          {
+            "name": "send_message",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/mark-all-read-basic",
+              "sender_name": "BlueLake",
+              "to": ["GreenPeak"],
+              "subject": "Backlog one",
+              "body_md": "First unread message"
+            }
+          },
+          {
+            "name": "send_message",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/mark-all-read-basic",
+              "sender_name": "BlueLake",
+              "to": ["GreenPeak"],
+              "subject": "Backlog two",
+              "body_md": "Second unread message"
+            }
+          }
+        ]
+      },
+      "expect": {
+        "ok_golden_output_path": "rust_native/mark_all_read/marks_all_unread_and_reports_no_more.output.json"
+      }
+    },
+    {
+      "name": "older_than_filter_skips_fresh_mail",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/mark-all-read-aged",
+        "agent_name": "GreenPeak",
+        "older_than_days": 30
+      },
+      "setup": {
+        "tool_calls": [
+          {
+            "name": "ensure_project",
+            "input": {
+              "human_key": "__FIXTURE_ROOT__/projects/mark-all-read-aged"
+            }
+          },
+          {
+            "name": "register_agent",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/mark-all-read-aged",
+              "program": "codex-cli",
+              "model": "gpt-5",
+              "name": "BlueLake"
+            }
+          },
+          {
+            "name": "register_agent",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/mark-all-read-aged",
+              "program": "claude-code",
+              "model": "opus-4.1",
+              "name": "GreenPeak"
+            }
+          },
+          {
+            "name": "set_contact_policy",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/mark-all-read-aged",
+              "agent_name": "GreenPeak",
+              "policy": "open"
+            }
+          },
+          {
+            "name": "send_message",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/mark-all-read-aged",
+              "sender_name": "BlueLake",
+              "to": ["GreenPeak"],
+              "subject": "Fresh mail",
+              "body_md": "Sent just now; must stay unread under older_than_days"
+            }
+          }
+        ]
+      },
+      "expect": {
+        "ok_golden_output_path": "rust_native/mark_all_read/older_than_filter_skips_fresh_mail.output.json"
+      }
+    },
+    {
+      "name": "zero_limit_is_rejected",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/mark-all-read-invalid",
+        "agent_name": "GreenPeak",
+        "limit": 0
+      },
+      "expect": {
+        "err": {
+          "error_type": "INVALID_LIMIT",
+          "message_contains": "limit must be at least 1"
+        }
+      }
+    }
+  ]
+}

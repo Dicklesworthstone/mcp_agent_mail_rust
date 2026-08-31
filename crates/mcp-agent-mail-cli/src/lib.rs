@@ -577,6 +577,46 @@ pub enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Bulk mark-read for an agent's project inbox (GH#273).
+    ///
+    /// Marks up to --limit unread messages read (oldest first) through the
+    /// same machinery as the `mark_all_read` MCP tool. Useful for clearing a
+    /// departed agent's backlog or draining aged mail without a browser.
+    /// Acknowledgement state is never touched.
+    #[command(name = "mark-all-read")]
+    MarkAllRead {
+        /// Agent whose inbox to mark read (default: AGENT_NAME or AGENT_MAIL_AGENT).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Project key (default: AGENT_MAIL_PROJECT env var or current directory).
+        #[arg(long)]
+        project: Option<String>,
+        /// Only mark messages created at least this many days ago.
+        #[arg(long)]
+        older_than_days: Option<i64>,
+        /// Maximum messages per call (default 500; the server caps at 1000).
+        /// The output's `more` flag reports whether backlog remains.
+        #[arg(long, default_value_t = 500, value_parser = parse_positive_usize_arg)]
+        limit: usize,
+        /// Allow a direct SQLite write for co-located setups. Still prefers
+        /// the running daemon over HTTP when it is reachable (avoids WAL
+        /// contention with the daemon's writer) and only writes SQLite
+        /// directly when no daemon is listening.
+        #[arg(long)]
+        direct: bool,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+        /// Server host for HTTP mode (default: 127.0.0.1).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Server port for HTTP mode (default: 8765).
+        #[arg(long, default_value_t = 8765)]
+        port: u16,
+    },
     /// Read durable, restart-safe inbox delivery events for one recipient.
     #[command(name = "inbox-events")]
     InboxEvents {
@@ -3787,6 +3827,27 @@ fn dispatch_command(command: Commands) -> CliResult<()> {
             port,
             project,
         } => handle_check_inbox(agent, rate_limit, direct, format, json, host, port, project),
+        Commands::MarkAllRead {
+            agent,
+            project,
+            older_than_days,
+            limit,
+            direct,
+            format,
+            json,
+            host,
+            port,
+        } => handle_mark_all_read(
+            agent,
+            project,
+            older_than_days,
+            limit,
+            direct,
+            format,
+            json,
+            host,
+            port,
+        ),
         Commands::InboxEvents {
             agent,
             project,
@@ -9070,6 +9131,310 @@ fn handle_check_inbox(
     });
 
     Ok(())
+}
+
+/// Handle the mark-all-read command (GH#273).
+///
+/// Routes through the running daemon's `mark_all_read` MCP tool over
+/// JSON-RPC when one is reachable (same preference order as check-inbox:
+/// a bulk UPDATE must not contend on the WAL with a running `serve-http`
+/// daemon's long-lived writer, GH#158), and falls back to the same
+/// `mark_messages_read_bulk` query over direct SQLite only when no daemon is
+/// listening and `--direct` was requested.
+#[allow(clippy::too_many_arguments)]
+fn handle_mark_all_read(
+    agent: Option<String>,
+    project: Option<String>,
+    older_than_days: Option<i64>,
+    limit: usize,
+    direct: bool,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+    host: String,
+    port: u16,
+) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json);
+
+    let agent_name = agent
+        .or_else(|| std::env::var("AGENT_NAME").ok())
+        .or_else(|| std::env::var("AGENT_MAIL_AGENT").ok())
+        .filter(|value| !value_looks_like_template(value));
+    let Some(agent_name) = agent_name else {
+        return Err(CliError::InvalidArgument(
+            "agent is required; pass --agent or set AGENT_MAIL_AGENT".to_string(),
+        ));
+    };
+    let project_key = project
+        .or_else(|| std::env::var("AGENT_MAIL_PROJECT").ok())
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default()
+        });
+    if let Some(days) = older_than_days
+        && days < 0
+    {
+        return Err(CliError::InvalidArgument(
+            "--older-than-days must be >= 0".to_string(),
+        ));
+    }
+
+    // Same routing decision as check-inbox (GH#158): prefer the daemon
+    // whenever it is reachable; only touch SQLite directly when `--direct`
+    // was requested AND no daemon is listening.
+    let daemon_reachable = direct && process_owner_port_reachable(&host, port);
+    let use_daemon = check_inbox_should_use_daemon(direct, daemon_reachable);
+
+    let payload = if use_daemon {
+        let config = Config::from_env();
+        let rpc_config = resolve_check_inbox_rpc_config_reader(
+            |key| std::env::var(key).ok(),
+            &project_key,
+            &agent_name,
+            &host,
+            port,
+            &config.http_path,
+        );
+        let server_urls = rpc_config.server_urls.clone();
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .map_err(|e| CliError::Other(format!("runtime error: {e}")))?;
+        let via_daemon = rt.block_on(async {
+            mark_all_read_via_jsonrpc(&rpc_config, &server_urls, older_than_days, limit).await
+        });
+
+        match via_daemon {
+            Ok(payload) => payload,
+            // The daemon went away between the reachability probe and the
+            // call; honor the co-located `--direct` intent.
+            Err(_) if direct => {
+                mark_all_read_direct(&project_key, &agent_name, older_than_days, limit)?
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        mark_all_read_direct(&project_key, &agent_name, older_than_days, limit)?
+    };
+
+    render_mark_all_read_payload(&payload, fmt);
+    Ok(())
+}
+
+/// Build the `tools/call mark_all_read` JSON-RPC request. The arguments must
+/// stay semantically identical to what [`mark_all_read_direct_with_pool`]
+/// passes to `mark_messages_read_bulk` — the daemon and direct paths must
+/// agree (the GH#269 lesson for check-inbox).
+fn build_mark_all_read_jsonrpc_request(
+    config: &CheckInboxRpcConfig,
+    older_than_days: Option<i64>,
+    limit: usize,
+) -> serde_json::Value {
+    let mut arguments = serde_json::json!({
+        "project_key": config.project_key,
+        "agent_name": config.agent_name,
+        "limit": limit,
+    });
+    if let Some(days) = older_than_days {
+        arguments["older_than_days"] = serde_json::Value::from(days);
+    }
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "mark-all-read",
+        "method": "tools/call",
+        "params": {
+            "name": "mark_all_read",
+            "arguments": arguments,
+        }
+    })
+}
+
+/// Invoke the daemon's `mark_all_read` tool, trying each candidate server URL.
+async fn mark_all_read_via_jsonrpc(
+    config: &CheckInboxRpcConfig,
+    server_urls: &[String],
+    older_than_days: Option<i64>,
+    limit: usize,
+) -> CliResult<serde_json::Value> {
+    let mut urls = Vec::with_capacity(config.server_urls.len() + server_urls.len() + 1);
+    urls.push(config.server_url.clone());
+    for url in server_urls.iter().chain(config.server_urls.iter()) {
+        if !urls.iter().any(|existing| existing == url) {
+            urls.push(url.clone());
+        }
+    }
+
+    let request = build_mark_all_read_jsonrpc_request(config, older_than_days, limit);
+    let mut last_error: Option<CliError> = None;
+    for server_url in urls {
+        let payload = match post_jsonrpc_request(
+            &server_url,
+            config.bearer_token.as_deref(),
+            &request,
+            config.timeout_seconds,
+        )
+        .await
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+        if let Some(error) = parse_jsonrpc_error(&payload) {
+            // A tool-level refusal (bad limit, unknown project/agent) is
+            // authoritative — surface it instead of retrying other URLs.
+            return Err(CliError::Other(error));
+        }
+        let Some(result) = payload.get("result").cloned() else {
+            last_error = Some(CliError::Other(
+                "missing JSON-RPC result payload".to_string(),
+            ));
+            continue;
+        };
+        match coerce_tool_result_json(result) {
+            Some(value) if value.get("marked_count").is_some() => return Ok(value),
+            Some(other) => {
+                last_error = Some(CliError::Other(format!(
+                    "unexpected mark_all_read response shape: {other}"
+                )));
+            }
+            None => {
+                last_error = Some(CliError::Other(
+                    "unexpected mark_all_read response shape".to_string(),
+                ));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        CliError::Other("no server URLs configured for mark-all-read HTTP mode".to_string())
+    }))
+}
+
+/// Direct-SQLite fallback for mark-all-read (no daemon listening).
+fn mark_all_read_direct(
+    project_key: &str,
+    agent_name: &str,
+    older_than_days: Option<i64>,
+    limit: usize,
+) -> CliResult<serde_json::Value> {
+    let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|e| CliError::Other(format!("runtime error: {e}")))?;
+    rt.block_on(async {
+        let ctx = context::AsyncCliContext::open()?;
+        let cx = asupersync::Cx::for_request();
+        mark_all_read_direct_with_pool(&cx, &ctx.pool, project_key, agent_name, older_than_days, limit)
+            .await
+    })
+}
+
+/// Core of the direct mark-all-read path: resolve project + agent WITHOUT
+/// auto-creating either (an administrative sweep must never mint a project
+/// from a typo'd key) and run the same `mark_messages_read_bulk` query the
+/// `mark_all_read` MCP tool uses, with the same 1000-message clamp. Split
+/// from the runtime wrapper so tests can drive it against a seeded pool.
+async fn mark_all_read_direct_with_pool(
+    cx: &asupersync::Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_key: &str,
+    agent_name: &str,
+    older_than_days: Option<i64>,
+    limit: usize,
+) -> CliResult<serde_json::Value> {
+    let by_slug =
+        match mcp_agent_mail_db::queries::get_project_by_slug(cx, pool, project_key).await {
+            asupersync::Outcome::Ok(row) => Some(row),
+            asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => None,
+            other => Some(outcome_to_result(other)?),
+        };
+    let project = match by_slug {
+        Some(row) => row,
+        None => {
+            match mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, project_key).await
+            {
+                asupersync::Outcome::Ok(row) => row,
+                asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
+                    return Err(CliError::InvalidArgument(format!(
+                        "project not found: {project_key}"
+                    )));
+                }
+                other => outcome_to_result(other)?,
+            }
+        }
+    };
+    let project_id = project.id.unwrap_or(0);
+
+    let agent =
+        match mcp_agent_mail_db::queries::get_agent(cx, pool, project_id, agent_name).await {
+            asupersync::Outcome::Ok(row) => row,
+            asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
+                return Err(CliError::InvalidArgument(format!(
+                    "agent not found in project {}: {agent_name}",
+                    project.slug
+                )));
+            }
+            other => outcome_to_result(other)?,
+        };
+    let agent_id = agent.id.unwrap_or(0);
+
+    // Mirror the MCP tool's interpretation exactly (daemon/direct parity).
+    let effective_limit = limit.clamp(1, MARK_ALL_READ_CLI_MAX_LIMIT);
+    let older_than_us = older_than_days.map(|days| {
+        mcp_agent_mail_db::now_micros()
+            .saturating_sub(days.saturating_mul(86_400).saturating_mul(1_000_000))
+    });
+
+    let outcome = outcome_to_result(
+        mcp_agent_mail_db::queries::mark_messages_read_bulk(
+            cx,
+            pool,
+            project_id,
+            agent_id,
+            older_than_us,
+            effective_limit,
+        )
+        .await,
+    )?;
+
+    Ok(serde_json::json!({
+        "agent": agent_name,
+        "marked_count": outcome.marked,
+        "more": outcome.more,
+        "limit": effective_limit,
+        "older_than_days": older_than_days,
+    }))
+}
+
+/// Hard cap on messages per mark-all-read call — must match the
+/// `mark_all_read` MCP tool's `MARK_ALL_READ_MAX_LIMIT`.
+const MARK_ALL_READ_CLI_MAX_LIMIT: usize = mcp_agent_mail_tools::MARK_ALL_READ_MAX_LIMIT;
+
+fn render_mark_all_read_payload(payload: &serde_json::Value, fmt: output::CliOutputFormat) {
+    let marked = payload
+        .get("marked_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let more = payload
+        .get("more")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let agent = payload
+        .get("agent")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    output::emit_output(payload, fmt, || {
+        if marked == 0 {
+            output::success(&format!("No unread messages matched for {agent}."));
+        } else if more {
+            output::success(&format!(
+                "Marked {marked} message(s) read for {agent}; more remain — run again to continue."
+            ));
+        } else {
+            output::success(&format!("Marked {marked} message(s) read for {agent}."));
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -43877,6 +44242,282 @@ http_headers = { Authorization = "Bearer secret" }
             "daemon and direct check-inbox paths must agree on unread_count"
         );
         assert_eq!(daemon_rows[0].message.subject, "unread message");
+    }
+
+    #[test]
+    fn clap_parses_mark_all_read_defaults_and_flags() {
+        let cli = Cli::try_parse_from(["am", "mark-all-read", "--agent", "BlueLake"])
+            .expect("parse mark-all-read defaults");
+        match cli.command.expect("expected command") {
+            Commands::MarkAllRead {
+                agent,
+                project,
+                older_than_days,
+                limit,
+                direct,
+                json,
+                host,
+                port,
+                ..
+            } => {
+                assert_eq!(agent.as_deref(), Some("BlueLake"));
+                assert!(project.is_none());
+                assert!(older_than_days.is_none());
+                assert_eq!(limit, 500);
+                assert!(!direct);
+                assert!(!json);
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 8765);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "am",
+            "mark-all-read",
+            "--agent",
+            "BlueLake",
+            "--project",
+            "/tmp/proj",
+            "--older-than-days",
+            "7",
+            "--limit",
+            "50",
+            "--direct",
+            "--json",
+        ])
+        .expect("parse mark-all-read with flags");
+        match cli.command.expect("expected command") {
+            Commands::MarkAllRead {
+                project,
+                older_than_days,
+                limit,
+                direct,
+                json,
+                ..
+            } => {
+                assert_eq!(project.as_deref(), Some("/tmp/proj"));
+                assert_eq!(older_than_days, Some(7));
+                assert_eq!(limit, 50);
+                assert!(direct);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    /// GH#273: mark-all-read is a mailbox WRITE and must stay write-classified
+    /// so the mailbox-ownership guard fires (#126).
+    #[test]
+    fn mark_all_read_is_write_classified() {
+        let cli = Cli::try_parse_from(["am", "mark-all-read", "--agent", "BlueLake"])
+            .expect("parse mark-all-read");
+        let command = cli.command.expect("expected command");
+        assert!(
+            !command_is_read_only(&command),
+            "mark-all-read mutates read state and must not bypass the ownership guard"
+        );
+    }
+
+    /// GH#273: the JSON-RPC request the CLI sends to the daemon must name the
+    /// mark_all_read tool and carry the exact filter arguments — a dropped
+    /// filter would make the daemon path mark different rows than the direct
+    /// path (the GH#269 failure mode for check-inbox).
+    #[test]
+    fn mark_all_read_request_carries_tool_name_and_filters() {
+        let cfg = CheckInboxRpcConfig {
+            server_url: "http://127.0.0.1:8765/api/".to_string(),
+            server_urls: vec!["http://127.0.0.1:8765/api/".to_string()],
+            bearer_token: None,
+            project_key: "/tmp/p".to_string(),
+            agent_name: "Receiver".to_string(),
+            limit: 10,
+            include_bodies: false,
+            timeout_seconds: 3,
+        };
+        let request = build_mark_all_read_jsonrpc_request(&cfg, Some(30), 250);
+        assert_eq!(request["method"], "tools/call");
+        assert_eq!(request["params"]["name"], "mark_all_read");
+        let args = &request["params"]["arguments"];
+        assert_eq!(args["project_key"], "/tmp/p");
+        assert_eq!(args["agent_name"], "Receiver");
+        assert_eq!(args["limit"], 250);
+        assert_eq!(args["older_than_days"], 30);
+
+        let request = build_mark_all_read_jsonrpc_request(&cfg, None, 500);
+        assert!(
+            request["params"]["arguments"].get("older_than_days").is_none(),
+            "absent filter must be omitted so the tool default (no age filter) applies"
+        );
+    }
+
+    /// GH#273 agreement test (the GH#269 lesson applied to the new verb): the
+    /// daemon path and the direct-SQLite path must mark the same rows. Two
+    /// projects are seeded with identical inboxes; the direct path runs
+    /// `mark_all_read_direct_with_pool` against one, while the daemon side is
+    /// emulated by applying exactly the arguments present in the built
+    /// JSON-RPC request (with the tool's clamping rules) to the other. Both
+    /// must mark the same count and leave the same messages unread.
+    #[test]
+    fn mark_all_read_daemon_and_direct_paths_agree() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mark-all-read-agreement.sqlite3");
+        let pool_cfg = mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = mcp_agent_mail_db::create_pool(&pool_cfg).expect("create pool");
+        let cx = asupersync::Cx::for_testing();
+
+        rt.block_on(async {
+            let mut project_ids = Vec::new();
+            let mut recipient_ids = Vec::new();
+            for suffix in ["direct", "daemon"] {
+                let human_key = format!("/tmp/mark-all-read-agreement-{suffix}");
+                let project =
+                    mcp_agent_mail_db::queries::ensure_project(&cx, &pool, &human_key)
+                        .await
+                        .into_result()
+                        .expect("ensure project");
+                let project_id = project.id.expect("project id");
+                let sender = mcp_agent_mail_db::queries::register_agent(
+                    &cx, &pool, project_id, "BlueLake", "codex-cli", "gpt-5", None, None, None,
+                )
+                .await
+                .into_result()
+                .expect("register sender");
+                let recipient = mcp_agent_mail_db::queries::register_agent(
+                    &cx, &pool, project_id, "GreenStone", "codex-cli", "gpt-5", None, None, None,
+                )
+                .await
+                .into_result()
+                .expect("register recipient");
+                project_ids.push(project_id);
+                recipient_ids.push(recipient.id.expect("recipient id"));
+
+                let day_us: i64 = 86_400 * 1_000_000;
+                let now = mcp_agent_mail_db::now_micros();
+                let old_ts = now - 35 * day_us;
+                let seed_conn =
+                    mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                        .expect("open seed conn");
+                // Two aged messages (eligible under older_than_days=30) and
+                // one fresh message (must stay unread on both paths).
+                let base = project_id * 1000;
+                for (offset, created_ts, subject) in [
+                    (1, old_ts, "aged-one"),
+                    (2, old_ts + 1, "aged-two"),
+                    (3, now, "fresh"),
+                ] {
+                    let message_id = base + offset;
+                    seed_conn
+                        .execute_raw(&format!(
+                            "INSERT INTO messages \
+                             (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+                             VALUES ({message_id}, {project_id}, {}, 'agree', '{subject}', 'b', 'normal', 0, {created_ts}, '[]')",
+                            sender.id.expect("sender id"),
+                        ))
+                        .expect("insert message");
+                    seed_conn
+                        .execute_raw(&format!(
+                            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                             VALUES ({message_id}, {}, 'to', NULL, NULL)",
+                            recipient_ids.last().copied().expect("recipient id"),
+                        ))
+                        .expect("insert recipient");
+                }
+                drop(seed_conn);
+            }
+
+            // Direct path against project 0.
+            let direct_payload = mark_all_read_direct_with_pool(
+                &cx,
+                &pool,
+                "/tmp/mark-all-read-agreement-direct",
+                "GreenStone",
+                Some(30),
+                500,
+            )
+            .await
+            .expect("direct mark-all-read");
+            assert_eq!(direct_payload["marked_count"], 2);
+            assert_eq!(direct_payload["more"], false);
+
+            // Daemon side: apply exactly the arguments carried by the built
+            // JSON-RPC request, interpreted with the tool's clamping rules.
+            let cfg = CheckInboxRpcConfig {
+                server_url: "http://127.0.0.1:8765/api/".to_string(),
+                server_urls: vec!["http://127.0.0.1:8765/api/".to_string()],
+                bearer_token: None,
+                project_key: "/tmp/mark-all-read-agreement-daemon".to_string(),
+                agent_name: "GreenStone".to_string(),
+                limit: 10,
+                include_bodies: false,
+                timeout_seconds: 3,
+            };
+            let request = build_mark_all_read_jsonrpc_request(&cfg, Some(30), 500);
+            let args = &request["params"]["arguments"];
+            let req_limit = usize::try_from(args["limit"].as_u64().unwrap_or(0)).unwrap_or(0);
+            let req_older_than_days = args.get("older_than_days").and_then(serde_json::Value::as_i64);
+            let effective_limit = req_limit.clamp(1, MARK_ALL_READ_CLI_MAX_LIMIT);
+            let older_than_us = req_older_than_days.map(|days| {
+                mcp_agent_mail_db::now_micros()
+                    .saturating_sub(days.saturating_mul(86_400).saturating_mul(1_000_000))
+            });
+            let daemon_outcome = mcp_agent_mail_db::queries::mark_messages_read_bulk(
+                &cx,
+                &pool,
+                project_ids[1],
+                recipient_ids[1],
+                older_than_us,
+                effective_limit,
+            )
+            .await
+            .into_result()
+            .expect("daemon-side bulk mark");
+
+            assert_eq!(
+                daemon_outcome.marked,
+                direct_payload["marked_count"].as_u64().unwrap(),
+                "daemon and direct mark-all-read paths must mark the same number of rows"
+            );
+            assert_eq!(daemon_outcome.more, direct_payload["more"].as_bool().unwrap());
+
+            // Both projects must be left with exactly the fresh message unread.
+            let check_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                .expect("open check conn");
+            for (project_id, recipient_id) in project_ids.iter().zip(recipient_ids.iter()) {
+                let rows = check_conn
+                    .query_sync(
+                        &format!(
+                            "SELECT m.subject AS subject FROM message_recipients r \
+                             JOIN messages m ON m.id = r.message_id \
+                             WHERE r.agent_id = {recipient_id} AND r.read_ts IS NULL \
+                             AND m.project_id = {project_id}"
+                        ),
+                        &[],
+                    )
+                    .expect("query unread leftovers");
+                let subjects: Vec<String> = rows
+                    .iter()
+                    .filter_map(|r| r.get_named::<String>("subject").ok())
+                    .collect();
+                assert_eq!(
+                    subjects,
+                    vec!["fresh".to_string()],
+                    "both paths must leave exactly the fresh message unread"
+                );
+            }
+        });
     }
 
     /// GH#275 acceptance check: `am agents reap --stale-days 30 --dry-run`

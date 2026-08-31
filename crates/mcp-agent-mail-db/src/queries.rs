@@ -4530,8 +4530,9 @@ pub async fn get_project_by_human_key(
                                 mcp_agent_mail_core::resolve_project_identity(human_key).slug;
                             // Release this connection before re-entering the
                             // pool so the slug retry cannot deadlock a
-                            // single-connection pool.
-                            drop(tracked);
+                            // single-connection pool. (`tracked` is not Drop;
+                            // moving it into `_` ends its borrow of `conn`.)
+                            let _ = tracked;
                             drop(conn);
                             match get_project_by_slug(cx, pool, &slug).await {
                                 Outcome::Ok(row) => return Outcome::Ok(row),
@@ -11503,9 +11504,10 @@ pub struct BulkMarkReadOutcome {
     pub more: bool,
 }
 
-/// Mark up to `limit` unread messages read for one agent in one project
-/// (GH#273: the bulk mark-read primitive behind the `mark_all_read` MCP tool
-/// and the `am mark-all-read` CLI verb).
+/// Mark up to `limit` unread messages read for one agent in one project.
+///
+/// GH#273: the bulk mark-read primitive behind the `mark_all_read` MCP tool
+/// and the `am mark-all-read` CLI verb.
 ///
 /// Differences from [`mark_all_messages_read_in_project`] (the uncapped web
 /// dashboard path):
@@ -11656,10 +11658,12 @@ const SETTLED_MESSAGE_PREDICATE: &str = "NOT EXISTS (\
        AND (r.read_ts IS NULL \
             OR (m.ack_required != 0 AND r.ack_ts IS NULL)))";
 
-/// Count messages that are settled (read + acked where required by every
-/// recipient) and older than `older_than_us` — i.e. what a retention prune at
-/// that horizon WOULD delete. Used by the retention worker's report-only mode
-/// when `MESSAGES_RETENTION_DAYS` is off (GH#273).
+/// Count settled messages older than `older_than_us` (GH#273).
+///
+/// "Settled" means read by every recipient and acked where the message
+/// requires it — i.e. exactly what a retention prune at that horizon WOULD
+/// delete. Used by the retention worker's report-only mode when
+/// `MESSAGES_RETENTION_DAYS` is off.
 pub async fn count_prunable_messages(
     cx: &Cx,
     pool: &DbPool,
@@ -23562,12 +23566,24 @@ mod tests {
             );
 
             // FK integrity: no child table may reference a pruned message.
-            for (table, column) in [
+            // (fts_messages is only checked when the FTS table exists in this
+            // pool — the messages_ad trigger clears it wherever it does.)
+            let fts_exists = !conn
+                .query_sync(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name = 'fts_messages'",
+                    &[],
+                )
+                .expect("probe fts_messages")
+                .is_empty();
+            let mut orphan_checks: Vec<(&str, &str)> = vec![
                 ("message_recipients", "message_id"),
                 ("inbox_delivery_events", "message_id"),
                 ("message_delivery_signal_receipts", "message_id"),
-                ("fts_messages", "message_id"),
-            ] {
+            ];
+            if fts_exists {
+                orphan_checks.push(("fts_messages", "message_id"));
+            }
+            for (table, column) in orphan_checks {
                 let orphans = conn
                     .query_sync(
                         &format!(

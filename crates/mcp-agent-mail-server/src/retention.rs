@@ -171,20 +171,24 @@ fn retention_loop(config: &Config) {
             return;
         }
 
-        match run_retention_cycle(config) {
-            Ok(report) => {
-                info!(
-                    target: "maintenance",
-                    event = "retention_quota_report",
-                    projects_scanned = report.projects_scanned,
-                    total_attachment_bytes = report.total_attachment_bytes,
-                    total_inbox_count = report.total_inbox_count,
-                    warnings = report.warnings,
-                    "retention/quota report completed"
-                );
-            }
-            Err(e) => {
-                warn!(error = %e, "retention/quota report cycle failed");
+        // The filesystem walk only serves the report/quota surfaces; skip it
+        // when the worker is running solely for message retention (GH#273).
+        if config.retention_report_enabled || config.quota_enabled {
+            match run_retention_cycle(config) {
+                Ok(report) => {
+                    info!(
+                        target: "maintenance",
+                        event = "retention_quota_report",
+                        projects_scanned = report.projects_scanned,
+                        total_attachment_bytes = report.total_attachment_bytes,
+                        total_inbox_count = report.total_inbox_count,
+                        warnings = report.warnings,
+                        "retention/quota report completed"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "retention/quota report cycle failed");
+                }
             }
         }
 

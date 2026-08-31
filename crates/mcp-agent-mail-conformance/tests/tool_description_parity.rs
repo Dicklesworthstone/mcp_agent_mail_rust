@@ -48,6 +48,7 @@ const TOOLS_WITHOUT_SHARED_DESCRIPTION_FIXTURE: &[&str] = &[
     "fetch_inbox_events",
     "get_message_delivery_receipt",
     "list_agents",
+    "mark_all_read",
     "resolve_pane_identity",
 ];
 
