@@ -53,6 +53,22 @@ SIGSTORE_BUNDLE_URL="${SIGSTORE_BUNDLE_URL:-}"
 COSIGN_IDENTITY=""
 COSIGN_OIDC_ISSUER='https://token.actions.githubusercontent.com'
 COSIGN_BIN=""
+# Trust-model boundary. Releases at or above this core version are built and
+# published by the maintainer's own release infrastructure (dsr), not GitHub
+# Actions, so the Actions-workflow Sigstore identity used by older releases can
+# no longer be minted. Those releases are instead authenticated fail-closed by
+# a minisign signature over the SHA256SUMS manifest, made with a key the
+# maintainer controls (the same signing key used by the frankensqlite/dsr
+# release line). Older releases keep the original Sigstore/cosign path.
+MINISIGN_TRUST_MIN_VERSION='0.3.31'
+# Minisign signing epoch 2 public key.
+#   key id:  1BBD79B28BF718D0
+#   SHA-256: b72b704e17a786308623d43471a046c52d663ce5d5c58c512790952455bdfb78
+MINISIGN_PUBLIC_KEY='RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70'
+MINISIGN_BIN=""
+# "minisign" for releases >= MINISIGN_TRUST_MIN_VERSION, "sigstore" for older
+# releases. Set by establish_release_contract.
+RELEASE_TRUST_MODEL=""
 EXPECTED_RELEASE_VERSION=""
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/mcp-agent-mail-install.lock"
@@ -337,9 +353,10 @@ resolve_version() {
 
 # Canonicalize the requested release into the exact tag/version contract used
 # by dist.yml. Build metadata is intentionally rejected because published tags
-# do not admit it. The Sigstore certificate identity is a literal, not a
-# cross-tag regular expression, so a valid bundle from another release cannot
-# authenticate the requested archive.
+# do not admit it. For legacy releases the Sigstore certificate identity is a
+# literal, not a cross-tag regular expression, so a valid bundle from another
+# release cannot authenticate the requested archive. The trust model for the
+# requested release (minisign vs legacy Sigstore) is also fixed here.
 establish_release_contract() {
   local requested="$VERSION"
   local release_pattern='^v?([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?)$'
@@ -354,7 +371,26 @@ establish_release_contract() {
   EXPECTED_RELEASE_VERSION="${BASH_REMATCH[1]}"
   VERSION="v${EXPECTED_RELEASE_VERSION}"
   COSIGN_IDENTITY="https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/${VERSION}"
-  verbose "release_contract:tag=${VERSION} version=${EXPECTED_RELEASE_VERSION} identity=${COSIGN_IDENTITY}"
+  establish_release_trust_model
+  verbose "release_contract:tag=${VERSION} version=${EXPECTED_RELEASE_VERSION} trust=${RELEASE_TRUST_MODEL} identity=${COSIGN_IDENTITY}"
+}
+
+# Decide which authenticity witness this release must present. The version
+# match in establish_release_contract guarantees a numeric X.Y.Z core, so the
+# arithmetic comparison below is well-defined. Pre-releases share the trust
+# model of their core version.
+establish_release_trust_model() {
+  local core="${EXPECTED_RELEASE_VERSION%%-*}"
+  local maj=0 min=0 pat=0 fmaj=0 fmin=0 fpat=0
+  IFS=. read -r maj min pat <<< "$core"
+  IFS=. read -r fmaj fmin fpat <<< "$MINISIGN_TRUST_MIN_VERSION"
+  if [ "$maj" -gt "$fmaj" ] || \
+     { [ "$maj" -eq "$fmaj" ] && [ "$min" -gt "$fmin" ]; } || \
+     { [ "$maj" -eq "$fmaj" ] && [ "$min" -eq "$fmin" ] && [ "$pat" -ge "$fpat" ]; }; then
+    RELEASE_TRUST_MODEL="minisign"
+  else
+    RELEASE_TRUST_MODEL="sigstore"
+  fi
 }
 
 detect_platform() {
@@ -7186,16 +7222,18 @@ resolve_and_verify_archive_checksum() {
   verify_checksum "$archive_file" "$expected_checksum"
 }
 
-# Verify the standardized Sigstore bundle for a file. cosign is the parser and
-# verifier for the bundle, certificate identity, issuer, and transparency proof;
-# any missing dependency or invalid evidence is fatal before extraction.
+# LEGACY PATH (releases < MINISIGN_TRUST_MIN_VERSION only): verify the
+# standardized Sigstore bundle for a file. cosign is the parser and verifier
+# for the bundle, certificate identity, issuer, and transparency proof; any
+# missing dependency or invalid evidence is fatal before extraction. Releases
+# >= v0.3.31 never enter this path — see verify_minisign_signed_checksum.
 require_safe_cosign() {
   local version_output="" parsed_versions="" version_count=0 version=""
   local major=0 minor=0 patch=0
 
   COSIGN_BIN=$(type -P cosign 2>/dev/null || true)
   if [ -z "$COSIGN_BIN" ] || [ ! -x "$COSIGN_BIN" ]; then
-    err "cosign is required to verify release archive authenticity but was not found."
+    err "cosign is required to verify legacy (< v${MINISIGN_TRUST_MIN_VERSION}) release archives but was not found."
     err "Install cosign v3.1.3 or newer in the v3 line, or use --no-verify only for a trusted local artifact."
     return 1
   fi
@@ -7294,10 +7332,100 @@ verify_sigstore_bundle() {
   return 0
 }
 
+# Minisign is the verifier for releases >= MINISIGN_TRUST_MIN_VERSION. The
+# authenticity witness is a detached minisign signature over the SHA256SUMS
+# manifest, checked against the public key pinned in this script. A missing
+# minisign binary is fatal: verification never silently degrades to
+# checksum-only.
+require_minisign() {
+  MINISIGN_BIN=$(type -P minisign 2>/dev/null || true)
+  if [ -z "$MINISIGN_BIN" ] || [ ! -x "$MINISIGN_BIN" ]; then
+    err "minisign is required to verify release authenticity but was not found."
+    err "Install it (Debian/Ubuntu: apt install minisign; macOS: brew install minisign;"
+    err "other: https://jedisct1.github.io/minisign/), or use --no-verify only for a trusted local artifact."
+    return 1
+  fi
+  verbose "require_minisign:bin=${MINISIGN_BIN}"
+  return 0
+}
+
+# Fetch the release SHA256SUMS manifest plus its .minisig, verify the
+# signature over the exact manifest bytes with the pinned public key, then
+# verify the archive against the checksum recorded in the now-authenticated
+# manifest. Fail-closed at every step.
+verify_minisign_signed_checksum() {
+  local archive_file="$1"
+  local artifact_url="$2"
+  local artifact_name="$3"
+  local release_base sha256sums_url sha256sums_file sig_url sig_file
+  local expected_checksum
+
+  require_minisign || return 1
+
+  release_base="$(dirname "$artifact_url")"
+  sha256sums_url="${release_base}/SHA256SUMS"
+  sha256sums_file="$TMP/SHA256SUMS"
+  sig_url="${release_base}/SHA256SUMS.minisig"
+  sig_file="$TMP/SHA256SUMS.minisig"
+
+  info "Fetching checksum manifest from ${sha256sums_url}"
+  if ! download_to_file "$sha256sums_url" "$sha256sums_file" "sha256sums-download" || [ ! -s "$sha256sums_file" ]; then
+    err "Release checksum manifest not found at ${sha256sums_url}."
+    err "Release archives are not extracted without an authenticated checksum unless --no-verify is explicit."
+    return 1
+  fi
+
+  info "Fetching manifest signature from ${sig_url}"
+  if ! download_to_file "$sig_url" "$sig_file" "minisig-download" || [ ! -s "$sig_file" ]; then
+    err "Release manifest signature not found at ${sig_url}."
+    err "Releases v${MINISIGN_TRUST_MIN_VERSION} and later must publish SHA256SUMS.minisig."
+    err "Release archives are not extracted without a signature unless --no-verify is explicit."
+    return 1
+  fi
+
+  if ! "$MINISIGN_BIN" -Vm "$sha256sums_file" -x "$sig_file" -P "$MINISIGN_PUBLIC_KEY" >/dev/null; then
+    verbose "verify_minisign:failed manifest=${sha256sums_file} sig=${sig_file}"
+    err "Minisign verification FAILED for the release checksum manifest."
+    err "The manifest must be signed by the maintainer release key (id 1BBD79B28BF718D0)."
+    err "The release may be corrupted or tampered with; do not install it."
+    error_support_hint
+    return 1
+  fi
+  ok "Release manifest signature verified (minisign)"
+  verbose "verify_minisign:ok manifest=${sha256sums_file}"
+
+  expected_checksum=$(awk -v artifact="$artifact_name" '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1; exit}' "$sha256sums_file")
+  if [ -z "$expected_checksum" ]; then
+    err "The authenticated SHA256SUMS manifest has no entry for ${artifact_name}."
+    err "The release asset inventory is incomplete; do not install it."
+    error_support_hint
+    return 1
+  fi
+
+  verify_checksum "$archive_file" "$expected_checksum"
+}
+
 verify_release_archive() {
   local archive_file="$1"
   local artifact_url="$2"
   local artifact_name="$3"
+
+  if [ "$RELEASE_TRUST_MODEL" = "minisign" ]; then
+    # Releases >= MINISIGN_TRUST_MIN_VERSION: the SHA256 witness and the
+    # authenticity witness are one artifact — a minisign-signed SHA256SUMS.
+    # The Sigstore/cosign path is not consulted for these releases (GitHub
+    # Actions no longer builds them, so its workflow identity cannot exist).
+    verify_minisign_signed_checksum "$archive_file" "$artifact_url" "$artifact_name" || return 1
+    if [ -n "$CHECKSUM" ] || [ -n "$CHECKSUM_URL" ]; then
+      # An explicitly supplied checksum witness is honored in addition to,
+      # never instead of, the signed manifest.
+      resolve_and_verify_archive_checksum "$archive_file" "$artifact_url" "$artifact_name" || return 1
+    fi
+    if [ -n "$SIGSTORE_BUNDLE_URL" ]; then
+      warn "SIGSTORE_BUNDLE_URL is ignored for releases >= v${MINISIGN_TRUST_MIN_VERSION} (minisign trust model)."
+    fi
+    return 0
+  fi
 
   resolve_and_verify_archive_checksum "$archive_file" "$artifact_url" "$artifact_name" || return 1
   verify_sigstore_bundle "$archive_file" "$artifact_url" || return 1
@@ -7609,10 +7737,12 @@ Options:
   --verbose          Enable detailed installer diagnostics
   --offline          Skip network preflight checks
   --no-gum           Disable gum formatting even if available
-  --no-verify        UNSAFE: skip checksum + Sigstore checks; archive shape and
-                     exact staged/installed version checks remain mandatory
-                     Downloaded binaries execute during those version probes;
-                     malicious bytes can run arbitrary code (trusted artifacts only)
+  --no-verify        UNSAFE: skip checksum + signature checks (minisign for
+                     releases >= v0.3.31, Sigstore/cosign for older releases);
+                     archive shape and exact staged/installed version checks
+                     remain mandatory. Downloaded binaries execute during those
+                     version probes; malicious bytes can run arbitrary code
+                     (trusted artifacts only)
   --force            Reinstall without probing the already-installed version
   --migrate          Force Python->Rust migration/displacement when Python install is detected
   --no-migrate       Skip and remember Python->Rust migration/displacement
@@ -7801,6 +7931,8 @@ print_install_plan() {
     [ -n "${URL:-}" ] && echo "  URL:        $URL"
     if [ "$NO_VERIFY" -eq 1 ]; then
       echo "  Integrity:  UNSAFE cryptographic verification bypass (--no-verify)"
+    elif [ "$RELEASE_TRUST_MODEL" = "minisign" ]; then
+      echo "  Integrity:  required SHA256 + minisign-signed manifest before extraction"
     else
       echo "  Integrity:  required SHA256 + Sigstore/cosign before extraction"
     fi
@@ -8265,7 +8397,7 @@ else
   # Release archive verification is mandatory unless the caller explicitly
   # accepts the risk with --no-verify. This gate always runs before extraction.
   if [ "$NO_VERIFY" -eq 1 ]; then
-    warn "UNSAFE: archive checksum and Sigstore verification skipped (--no-verify)"
+    warn "UNSAFE: archive checksum and signature verification skipped (--no-verify)"
     warn "The archive's binaries will execute for version checks before installation."
     warn "Archive-member and exact-version checks remain mandatory."
   elif ! verify_release_archive "$TMP/$TAR" "$URL" "$TAR"; then

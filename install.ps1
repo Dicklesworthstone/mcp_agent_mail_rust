@@ -8,7 +8,8 @@
     -Version vX.Y.Z   Install a specific release tag (default: latest)
     -Dest PATH        Install directory (default: %LOCALAPPDATA%\Programs\mcp-agent-mail)
     -Force            Reinstall without probing the already-installed version
-    -NoVerify         UNSAFE: skip checksum + Sigstore checks; downloaded code still executes
+    -NoVerify         UNSAFE: skip checksum + signature checks (minisign for releases
+                      >= v0.3.31, Sigstore/cosign for older); downloaded code still executes
     -Verify           Explicitly require archive verification (already the default)
 #>
 
@@ -33,6 +34,17 @@ $IssuesUrl = "https://github.com/$Owner/$Repo/issues"
 $ReleasesUrl = "https://github.com/$Owner/$Repo/releases"
 $CosignIdentity = ""
 $CosignOidcIssuer = 'https://token.actions.githubusercontent.com'
+# Trust-model boundary. Releases at or above this core version are built and
+# published by the maintainer's own release infrastructure (dsr), not GitHub
+# Actions, so the Actions-workflow Sigstore identity used by older releases
+# can no longer be minted. Those releases are instead authenticated
+# fail-closed by a minisign signature over the SHA256SUMS manifest, made with
+# a key the maintainer controls. Older releases keep the Sigstore/cosign path.
+$MinisignTrustMinVersion = [Version]"0.3.31"
+# Minisign signing epoch 2 public key.
+#   key id:  1BBD79B28BF718D0
+#   SHA-256: b72b704e17a786308623d43471a046c52d663ce5d5c58c512790952455bdfb78
+$MinisignPublicKey = 'RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70'
 
 if ([string]::IsNullOrWhiteSpace($Dest)) {
     $Dest = $DefaultDest
@@ -207,9 +219,16 @@ function Get-ReleaseContract {
 
     $normalizedVersion = $releaseMatch.Groups['version'].Value
     $normalizedTag = "v$normalizedVersion"
+
+    # The regex above guarantees a numeric X.Y.Z core; pre-releases share the
+    # trust model of their core version.
+    $coreVersion = [Version]($normalizedVersion -split '-', 2)[0]
+    $trustModel = if ($coreVersion -ge $MinisignTrustMinVersion) { 'minisign' } else { 'sigstore' }
+
     return [pscustomobject]@{
         Tag = $normalizedTag
         Version = $normalizedVersion
+        TrustModel = $trustModel
         CertificateIdentity = "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/$normalizedTag"
     }
 }
@@ -350,6 +369,74 @@ function Verify-ChecksumFile {
     Write-Ok "Checksum verified ($($actual.Substring(0, 16))...)"
 }
 
+# Minisign is the verifier for releases >= $MinisignTrustMinVersion. The
+# authenticity witness is a detached minisign signature over the SHA256SUMS
+# manifest, checked against the public key pinned in this script. A missing
+# minisign binary is fatal: verification never silently degrades to
+# checksum-only.
+function Get-MinisignPath {
+    $minisignCommand = Get-Command minisign -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $minisignCommand) {
+        throw "minisign is required to verify release authenticity but was not found. Install it (winget install jedisct1.minisign, scoop install minisign, or https://jedisct1.github.io/minisign/), or use -NoVerify only for a trusted local artifact."
+    }
+    return $minisignCommand.Source
+}
+
+# Fetch the release SHA256SUMS manifest plus its .minisig, verify the
+# signature over the exact manifest bytes with the pinned public key, then
+# verify the archive against the checksum recorded in the now-authenticated
+# manifest. Fail-closed at every step.
+function Verify-MinisignSignedChecksum {
+    param(
+        [string]$FilePath,
+        [string]$AssetUrl,
+        [string]$AssetName,
+        [string]$WorkDir
+    )
+
+    $minisignPath = Get-MinisignPath
+
+    $releaseBase = [regex]::Replace($AssetUrl, "/$([regex]::Escape($AssetName))$", "")
+    $sha256sumsUrl = "$releaseBase/SHA256SUMS"
+    $sha256sumsPath = Join-Path $WorkDir "SHA256SUMS"
+    $sigUrl = "$releaseBase/SHA256SUMS.minisig"
+    $sigPath = Join-Path $WorkDir "SHA256SUMS.minisig"
+
+    Write-Info "Downloading checksum manifest $sha256sumsUrl"
+    try {
+        Download-File -Url $sha256sumsUrl -OutFile $sha256sumsPath
+    } catch {
+        throw "Release checksum manifest download failed at $sha256sumsUrl. Release archives are not extracted without an authenticated checksum unless -NoVerify is explicit. Root error: $($_.Exception.Message)"
+    }
+    Write-Info "Downloading manifest signature $sigUrl"
+    try {
+        Download-File -Url $sigUrl -OutFile $sigPath
+    } catch {
+        throw "Release manifest signature download failed at $sigUrl. Releases v$MinisignTrustMinVersion and later must publish SHA256SUMS.minisig; archives are not extracted without a signature unless -NoVerify is explicit. Root error: $($_.Exception.Message)"
+    }
+    foreach ($required in @($sha256sumsPath, $sigPath)) {
+        if (-not (Test-Path -LiteralPath $required -PathType Leaf) -or (Get-Item -LiteralPath $required).Length -eq 0) {
+            throw "Verification input is missing or empty after download: $required"
+        }
+    }
+
+    $minisignOutput = @(& $minisignPath -Vm $sha256sumsPath -x $sigPath -P $MinisignPublicKey 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        $detail = ($minisignOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+        throw "Minisign verification FAILED for the release checksum manifest. The manifest must be signed by the maintainer release key (id 1BBD79B28BF718D0). The release may be corrupted or tampered with; do not install it. minisign output: $detail"
+    }
+    Write-Ok "Release manifest signature verified (minisign)"
+
+    $assetPattern = "(?im)^([a-f0-9]{64})\s+\*?(?:\./)?$([regex]::Escape($AssetName))\s*$"
+    $manifestMatch = [regex]::Match((Get-Content -LiteralPath $sha256sumsPath -Raw), $assetPattern)
+    if (-not $manifestMatch.Success) {
+        throw "The authenticated SHA256SUMS manifest has no entry for $AssetName. The release asset inventory is incomplete; do not install it."
+    }
+    Verify-ChecksumFile -FilePath $FilePath -ExpectedChecksum $manifestMatch.Groups[1].Value
+}
+
+# LEGACY PATH (releases < $MinisignTrustMinVersion only). Releases >= v0.3.31
+# never enter this path — see Verify-MinisignSignedChecksum.
 function Verify-SigstoreBundle {
     param(
         [string]$FilePath,
@@ -1639,11 +1726,20 @@ try {
     Download-File -Url $assetUrl -OutFile $zipPath
 
     if ($ShouldVerifyArchive) {
-        $checksumText = Resolve-ChecksumText -AssetUrl $assetUrl -AssetName $AssetName -WorkDir $workDir
-        Verify-ChecksumFile -FilePath $zipPath -ExpectedChecksum $checksumText
-        Verify-SigstoreBundle -FilePath $zipPath -AssetUrl $assetUrl -WorkDir $workDir
+        if ($releaseContract.TrustModel -eq 'minisign') {
+            # Releases >= v0.3.31: the SHA256 witness and the authenticity
+            # witness are one artifact — a minisign-signed SHA256SUMS. The
+            # Sigstore/cosign path is not consulted for these releases
+            # (GitHub Actions no longer builds them, so its workflow
+            # identity cannot exist).
+            Verify-MinisignSignedChecksum -FilePath $zipPath -AssetUrl $assetUrl -AssetName $AssetName -WorkDir $workDir
+        } else {
+            $checksumText = Resolve-ChecksumText -AssetUrl $assetUrl -AssetName $AssetName -WorkDir $workDir
+            Verify-ChecksumFile -FilePath $zipPath -ExpectedChecksum $checksumText
+            Verify-SigstoreBundle -FilePath $zipPath -AssetUrl $assetUrl -WorkDir $workDir
+        }
     } else {
-        Write-WarnText "UNSAFE: archive checksum and Sigstore verification skipped (-NoVerify)"
+        Write-WarnText "UNSAFE: archive checksum and signature verification skipped (-NoVerify)"
         Write-WarnText "The downloaded archive's binaries will execute for version checks before installation; malicious bytes can run arbitrary code."
         Write-WarnText "Archive-member and exact-version checks remain mandatory."
     }
