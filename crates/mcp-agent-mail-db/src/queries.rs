@@ -4512,7 +4512,37 @@ pub async fn get_project_by_human_key(
                         crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
                         Outcome::Ok(row)
                     }
-                    Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", human_key)),
+                    Outcome::Ok(None) => {
+                        // GH-mined fix (PR #267 idea): `ensure_project` keys a
+                        // project's identity on the *stable slug* derived by
+                        // `resolve_project_identity` (which canonicalizes e.g.
+                        // GitHub owner case), while `human_key` records one
+                        // historical spelling. Reads must apply the same
+                        // identity fallback: otherwise a canonical key whose
+                        // path does not exist on disk (so no filesystem alias
+                        // matches) finds nothing by exact `human_key` even
+                        // though a write through `ensure_project` would reuse
+                        // the existing row via its slug. Only absolute keys
+                        // are eligible — relative identifiers are handled by
+                        // slug/alias resolution above.
+                        if Path::new(human_key).is_absolute() {
+                            let slug =
+                                mcp_agent_mail_core::resolve_project_identity(human_key).slug;
+                            // Release this connection before re-entering the
+                            // pool so the slug retry cannot deadlock a
+                            // single-connection pool.
+                            drop(tracked);
+                            drop(conn);
+                            match get_project_by_slug(cx, pool, &slug).await {
+                                Outcome::Ok(row) => return Outcome::Ok(row),
+                                Outcome::Err(DbError::NotFound { .. }) => {}
+                                Outcome::Err(e) => return Outcome::Err(e),
+                                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                                Outcome::Panicked(p) => return Outcome::Panicked(p),
+                            }
+                        }
+                        Outcome::Err(DbError::not_found("Project", human_key))
+                    }
                     Outcome::Err(e) => Outcome::Err(e),
                     Outcome::Cancelled(r) => Outcome::Cancelled(r),
                     Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -23190,6 +23220,55 @@ mod tests {
                 });
             },
         );
+    }
+
+    /// A canonical GitHub-style key that differs from the stored row's
+    /// spelling only in owner case (and whose path does not exist on disk, so
+    /// no filesystem alias can rescue it) must resolve to the existing row via
+    /// the stable slug — the same identity `ensure_project` would reuse —
+    /// instead of reporting the project missing.
+    #[test]
+    fn get_project_by_human_key_falls_back_to_stable_slug_for_case_alias() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("slug-fallback-case-alias");
+        let historical_key = "/repos/github.com/Dicklesworthstone/some_nonexistent_repo";
+        let canonical_key = "/repos/github.com/dicklesworthstone/some_nonexistent_repo";
+
+        rt.block_on(async {
+            let seeded = ensure_project(&cx, &pool, historical_key)
+                .await
+                .into_result()
+                .expect("seed project under historical spelling");
+
+            let resolved = get_project_by_human_key(&cx, &pool, canonical_key)
+                .await
+                .into_result()
+                .expect("canonical case alias must resolve via the stable slug");
+
+            assert_eq!(resolved.id, seeded.id);
+            assert_eq!(resolved.slug, seeded.slug);
+            assert_eq!(resolved.human_key, historical_key);
+            assert_eq!(
+                count_projects_for_test(&cx, &pool).await,
+                1,
+                "slug fallback must reuse the existing row, not imply a second one"
+            );
+
+            // A key for a genuinely different project must still miss.
+            let unrelated = get_project_by_human_key(
+                &cx,
+                &pool,
+                "/repos/github.com/dicklesworthstone/entirely_other_repo",
+            )
+            .await
+            .into_result();
+            assert!(unrelated.is_err(), "unrelated key must stay NotFound");
+        });
     }
 
     #[test]
