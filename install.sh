@@ -2958,23 +2958,22 @@ validate_installer_owned_regular_file() {
 
 validate_binary_transaction_directory() {
   local path="$1"
-  local owner="" current_uid="" links="" mode=""
+  local owner="" current_uid="" mode=""
   [ -d "$path" ] && [ ! -L "$path" ] || {
     err "Binary transaction authority is not a non-symlink directory: $path"
     return 1
   }
   current_uid=$(id -u 2>/dev/null) || return 1
   owner=$(installer_path_owner_uid "$path") || return 1
-  links=$(installer_path_link_count "$path") || return 1
   mode=$(installer_path_mode "$path") || return 1
-  # Directories cannot be hardlinked, so the link count only reflects
-  # subdirectory back-references — and only on filesystems that count them:
-  # a childless directory reports 2 on ext4/XFS but 1 on btrfs. Accept both;
-  # anything higher means an unexpected subdirectory and stays fatal.
-  if [ "$owner" != "$current_uid" ] || \
-     { [ "$links" != "1" ] && [ "$links" != "2" ]; } || \
-     [ "$mode" != "700" ]; then
-    err "Binary transaction authority has unsafe owner, mode, or link count: $path"
+  # No link-count constraint for directories: directories cannot be
+  # hardlinked, and st_nlink semantics for them are filesystem-defined
+  # (ext4/XFS report 2 + subdirectories, btrfs always reports 1, APFS
+  # reports 2 + every child entry), so any fixed expectation rejects valid
+  # transaction directories on some supported filesystem. Ownership, private
+  # mode, and the non-symlink check above carry the actual guarantees.
+  if [ "$owner" != "$current_uid" ] || [ "$mode" != "700" ]; then
+    err "Binary transaction authority has unsafe owner or mode: $path"
     return 1
   fi
 }
