@@ -137,7 +137,7 @@ fn release_ledger_index(
         };
         let released_ts = row
             .get_by_name("released_ts")
-            .and_then(|value| value_to_micros(value));
+            .and_then(value_to_micros);
         released_ts_by_id.insert(id, released_ts);
     }
     Ok(ReleaseLedgerIndex { released_ts_by_id })
@@ -9048,7 +9048,7 @@ fn build_timeline(
             let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
             let legacy_released_ts = row
                 .get_by_name("released_ts")
-                .and_then(|value| value_to_micros(value));
+                .and_then(value_to_micros);
             let released_ts: Option<i64> = row.get_named::<i64>("id").map_or(
                 legacy_released_ts,
                 |id| release_ledger.coalesce(id, legacy_released_ts),
@@ -10974,7 +10974,7 @@ fn fetch_robot_agent_reservation_stats(
                 let expires_ts = row.get_named::<i64>("expires_ts").unwrap_or(0);
                 let id = row.get_named::<i64>("id").ok();
                 let legacy_released = row.get_by_name("released_ts");
-                let legacy_released_micros = legacy_released.and_then(|v| value_to_micros(v));
+                let legacy_released_micros = legacy_released.and_then(value_to_micros);
                 let released_ts = id.map_or(legacy_released_micros, |id| {
                     release_ledger.coalesce(id, legacy_released_micros)
                 });
