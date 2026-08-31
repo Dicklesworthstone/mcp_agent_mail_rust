@@ -17619,6 +17619,7 @@ mod tests {
     use super::*;
     use asupersync::http::h1::types::Version as Http1Version;
     use chrono::Utc;
+    use fastmcp_protocol::{CallToolParams, LegacyContent};
     use ftui_runtime::stdio_capture::StdioCapture;
     use std::path::PathBuf;
     use std::sync::Mutex;
