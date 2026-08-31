@@ -1152,11 +1152,14 @@ fn lock_neutral_sqlite_generation_fingerprint(path: &Path) -> String {
         {
             use std::os::windows::fs::MetadataExt as _;
 
+            // volume_serial_number()/file_index() are still unstable
+            // (windows_by_handle) and cannot be used without a feature gate,
+            // so the generation witness hashes only the stable metadata
+            // fields; the length and modification timestamps hashed above
+            // already capture content-change signals.
             hasher.update(metadata.file_attributes().to_le_bytes());
             hasher.update(metadata.creation_time().to_le_bytes());
             hasher.update(metadata.last_write_time().to_le_bytes());
-            hasher.update(metadata.volume_serial_number().unwrap_or(0).to_le_bytes());
-            hasher.update(metadata.file_index().unwrap_or(0).to_le_bytes());
         }
 
         Ok(Some(metadata.len()))
