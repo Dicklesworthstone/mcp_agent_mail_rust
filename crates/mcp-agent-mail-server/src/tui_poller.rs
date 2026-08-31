@@ -5549,6 +5549,26 @@ first body
     }
 
     #[test]
+    fn reservation_scan_sql_never_reintroduces_release_ledger_anti_join() {
+        // GH#274/GH#180: the ledger anti-join degrades to O(N·M) under
+        // sqlmodel-frankensqlite; the ledger subtraction lives in Rust now.
+        for has_legacy in [true, false] {
+            for sql in [
+                reservation_legacy_scan_sql(has_legacy),
+                reservation_legacy_scan_minimal_sql(has_legacy),
+                reservation_active_fast_snapshots_sql(has_legacy),
+                reservation_active_fast_snapshots_minimal_sql(has_legacy),
+                reservation_active_fast_counts_sql(has_legacy),
+            ] {
+                assert!(
+                    !sql.contains("file_reservation_releases"),
+                    "ledger anti-join reintroduced in: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn max_constants_are_positive() {
         const {
             assert!(MAX_AGENTS > 0);
