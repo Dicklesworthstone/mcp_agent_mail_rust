@@ -2967,7 +2967,13 @@ validate_binary_transaction_directory() {
   owner=$(installer_path_owner_uid "$path") || return 1
   links=$(installer_path_link_count "$path") || return 1
   mode=$(installer_path_mode "$path") || return 1
-  if [ "$owner" != "$current_uid" ] || [ "$links" != "2" ] || [ "$mode" != "700" ]; then
+  # Directories cannot be hardlinked, so the link count only reflects
+  # subdirectory back-references — and only on filesystems that count them:
+  # a childless directory reports 2 on ext4/XFS but 1 on btrfs. Accept both;
+  # anything higher means an unexpected subdirectory and stays fatal.
+  if [ "$owner" != "$current_uid" ] || \
+     { [ "$links" != "1" ] && [ "$links" != "2" ]; } || \
+     [ "$mode" != "700" ]; then
     err "Binary transaction authority has unsafe owner, mode, or link count: $path"
     return 1
   fi
