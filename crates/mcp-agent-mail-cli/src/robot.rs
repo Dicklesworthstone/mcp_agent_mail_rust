@@ -187,7 +187,6 @@ fn reservation_row_is_active(
     !ledger.contains(reservation_id) && legacy_released_value_is_active(legacy_released_ts)
 }
 
-
 fn reservation_is_released(released_ts: Option<i64>) -> bool {
     released_ts.is_some_and(|ts| ts > 0)
 }
