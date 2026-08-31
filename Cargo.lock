@@ -428,6 +428,8 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "beads_rust"
 version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "083ed64e66db038f7b200cb4086fbf5a556e9b73fbfdb4efcb810536cae96820"
 dependencies = [
  "anyhow",
  "asupersync",
@@ -437,15 +439,27 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "dunce",
+ "fsqlite",
+ "fsqlite-ast",
+ "fsqlite-btree",
+ "fsqlite-core",
  "fsqlite-error",
+ "fsqlite-func",
+ "fsqlite-mvcc",
+ "fsqlite-observability",
+ "fsqlite-pager",
+ "fsqlite-parser",
+ "fsqlite-planner",
  "fsqlite-types",
+ "fsqlite-vdbe",
+ "fsqlite-vfs",
+ "fsqlite-wal",
  "indicatif",
  "libc",
  "mimalloc",
  "once_cell",
  "regex",
  "rich_rust",
- "rusqlite",
  "rustix 1.1.4",
  "schemars",
  "semver",
@@ -1737,18 +1751,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fallible-iterator"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
-
-[[package]]
-name = "fallible-streaming-iterator"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
-
-[[package]]
 name = "fancy-regex"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2058,7 +2060,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -2088,7 +2090,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-embed"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -2126,6 +2128,7 @@ name = "frankensearch-index"
 version = "0.2.3"
 dependencies = [
  "ahash",
+ "arc-swap",
  "bytemuck",
  "crc32fast",
  "frankensearch-core",
@@ -2183,7 +2186,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-rerank"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -4751,15 +4754,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hashlink"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32069d97bb81e38fa67eab65e3393bf804bb85969f2bc06bf13f64aef5aba248"
-dependencies = [
- "hashbrown 0.17.1",
-]
-
-[[package]]
 name = "heapless"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6707,7 +6701,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -7046,31 +7040,6 @@ checksum = "93411e420bcd1a75ddd1dc3caf18c23155eda2c090631a85af21ba19e97093b5"
 dependencies = [
  "smallvec",
  "str_indices",
-]
-
-[[package]]
-name = "rsqlite-vfs"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
-dependencies = [
- "hashbrown 0.16.1",
- "thiserror",
-]
-
-[[package]]
-name = "rusqlite"
-version = "0.40.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
-dependencies = [
- "bitflags 2.13.1",
- "fallible-iterator",
- "fallible-streaming-iterator",
- "hashlink",
- "libsqlite3-sys",
- "smallvec",
- "sqlite-wasm-rs",
 ]
 
 [[package]]
@@ -7615,18 +7584,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqlite-wasm-rs"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75"
-dependencies = [
- "cc",
- "js-sys",
- "rsqlite-vfs",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "sqlmodel"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8153,7 +8110,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -9540,3 +9497,7 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
+
+[[patch.unused]]
+name = "beads_rust"
+version = "0.5.7"
