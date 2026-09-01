@@ -10,6 +10,53 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## [Unreleased]
 
+### Added
+
+- **`am doctor reconstruct --reseed-receipt-chain` (GH#283).** A structurally
+  broken recovery-receipt chain (zero or multiple roots, broken link, fork,
+  cycle, invalid self-hash) used to deterministically refuse every future
+  promotion — including a fully valid archive candidate — with no supported
+  way out, forcing operators into manual DB swaps that bypass every guard.
+  The new flag (requires `--yes`; `--dry-run` previews the chain verdict
+  read-only) quarantines the entire receipts directory by rename — never
+  deletion — and lets the next promotion seed a fresh root. Refused when the
+  chain verifies cleanly or an unfinalized promotion intent exists.
+
+### Fixed
+
+- **CLI no longer queues durable UNSENT artifacts for definitive server
+  refusals (GH#285).** A daemon-proxied tool rejection arrives as the full
+  legacy error envelope; the queueing classifier ran substring heuristics
+  over that raw JSON, where a suggested recipient name or task description
+  could satisfy the WAL-sidecar-corruption pattern — so an
+  `INVALID_ARGUMENT` (bad recipient name) was recorded as
+  `wal_sidecar_corruption` / `blocks_edits: true` and queued as an UNSENT
+  artifact that could never replay successfully. Client-refusal codes
+  (`INVALID_*`, `*_NOT_FOUND`, policy/cursor/token refusals) now never
+  queue, and server-fault envelopes classify on the tool's own message text
+  instead of the envelope payload.
+- **Reconstruct promotion refusals now name the colliding reservations
+  (GH#271).** "reservations produced N rows but only M unique stable keys"
+  now appends the colliding stable keys (project, agent, path, lifecycle
+  fields; up to 5 samples) so operators no longer have to inspect the
+  refused candidate database by hand.
+- **A corrupt source that cannot even be opened no longer vetoes promotion
+  of a healthy archive candidate (GH#283 outage family).** The promotion
+  gate's full-integrity probe ran against the settled private staging copy
+  through a read-only canonical open; when the damaged main-file header
+  still demanded WAL recovery, every probe form failed with "unable to open
+  database file" and promotion refused because the source could not be
+  classified at all. The probe now opens the private throwaway copy
+  writable, letting canonical SQLite run recovery and return a real
+  corrupt/healthy verdict (the authority path stays byte-untouched).
+- **Robot snapshot caches now survive real poller cadences (GH#274).** The
+  status/inbox/reservations/overview/agents caches required both a matching
+  generation fingerprint AND an age under 500ms, so every poll on a
+  seconds-to-minutes cadence paid the full multi-query rebuild even when
+  the fingerprint proved nothing had changed. Generation-verified entries
+  now live 30s by default (`AM_ROBOT_SNAPSHOT_TTL_MS` overrides); counts
+  stay exact because the fingerprint is recomputed on every call.
+
 ## [v0.3.31](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.31) — 2026-08-31 **[Release]**
 
 Durability-diagnostics release: the database layer learned to explain itself.

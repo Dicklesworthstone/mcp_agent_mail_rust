@@ -2644,7 +2644,10 @@ fn has_file_reservation_release_ledger(conn: &DbConn) -> bool {
 /// degrades to O(N·M) under sqlmodel-frankensqlite join execution, so
 /// callers fetch candidate rows with this predicate and subtract the
 /// ledger's reservation IDs in Rust via [`ReleaseLedgerIndex`].
-fn active_reservation_candidate_sql(has_legacy_released_ts_column: bool, table_ref: &str) -> String {
+fn active_reservation_candidate_sql(
+    has_legacy_released_ts_column: bool,
+    table_ref: &str,
+) -> String {
     if has_legacy_released_ts_column {
         mcp_agent_mail_db::queries::active_reservation_candidate_predicate_for(table_ref)
     } else {
@@ -2698,7 +2701,10 @@ impl ReleaseLedgerIndex {
             let Some(id) = parse_raw_i64(row, "reservation_id") else {
                 continue;
             };
-            let value = row.get_by_name("released_ts").cloned().unwrap_or(Value::Null);
+            let value = row
+                .get_by_name("released_ts")
+                .cloned()
+                .unwrap_or(Value::Null);
             released_ts_by_id.insert(id, value);
         }
         Some(Self { released_ts_by_id })
@@ -2992,9 +2998,10 @@ fn try_fetch_reservation_snapshot_bundle(
     }
     let rows = match scan_mode {
         ReservationScanMode::ActiveFast => unreachable!("handled by fast-path early return"),
-        ReservationScanMode::FullLegacy => {
-            conn.query_sync(&reservation_legacy_scan_sql(has_legacy_released_ts_column), &[])
-        }
+        ReservationScanMode::FullLegacy => conn.query_sync(
+            &reservation_legacy_scan_sql(has_legacy_released_ts_column),
+            &[],
+        ),
     };
     let rows = match rows {
         Ok(rows) => rows,

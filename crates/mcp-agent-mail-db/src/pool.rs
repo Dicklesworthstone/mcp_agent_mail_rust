@@ -11094,6 +11094,35 @@ pub(crate) fn sqlite_file_passes_full_integrity_check(path: &Path) -> Result<boo
     sqlite_canonical_file_check_is_ok(path, integrity::CheckKind::Full)
 }
 
+/// Full `PRAGMA integrity_check` for a PRIVATE staged family copy, via a
+/// WRITABLE canonical open.
+///
+/// The guarded read-only diagnostic cannot classify every staged copy: a
+/// settled snapshot's WAL/SHM are deleted when the settle connection closes,
+/// but a damaged main-file header can still demand WAL recovery — a read-only
+/// open then fails every probe form with "unable to open database file", and
+/// promotion refuses a perfectly good archive candidate because the source
+/// could not be classified at all (observed live on a 2.7 GB cross-linked
+/// mailbox; the GH#283 outage family). A writable open lets canonical SQLite
+/// run recovery on the copy and produce a real verdict. Only ever call this
+/// on a throwaway staging copy: a writable open consumes journal/WAL
+/// sidecars, which is exactly what the authority path must never suffer.
+pub(crate) fn sqlite_private_copy_passes_full_integrity_check(
+    path: &Path,
+) -> Result<bool, SqlError> {
+    if !is_real_file(path) {
+        return Ok(false);
+    }
+    let conn =
+        crate::CanonicalDbConn::open_file(path.to_string_lossy().as_ref()).map_err(|error| {
+            SqlError::Custom(format!(
+                "private-copy canonical integrity open failed for {}: {error}",
+                path.display()
+            ))
+        })?;
+    sqlite_pragma_check_is_ok_canonical(&conn, integrity::CheckKind::Full)
+}
+
 /// Return whether a SQLite candidate is a self-contained main database file.
 ///
 /// Recovery currently stages and promotes one main file. Any adjacent SQLite

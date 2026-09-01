@@ -11802,9 +11802,8 @@ pub async fn prune_settled_messages(
             }
 
             // FK-safe cascade order: children first, message row last.
-            let del_receipts = format!(
-                "DELETE FROM message_delivery_signal_receipts WHERE message_id IN ({ph})"
-            );
+            let del_receipts =
+                format!("DELETE FROM message_delivery_signal_receipts WHERE message_id IN ({ph})");
             try_in_tx!(
                 cx,
                 &tracked,

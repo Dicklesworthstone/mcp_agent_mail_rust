@@ -67,7 +67,10 @@ fn has_file_reservation_release_ledger(conn: &DbConn) -> bool {
 /// uncorrelated `NOT IN`) degrades to O(N·M) under sqlmodel-frankensqlite
 /// join execution, so callers fetch candidate rows with this predicate and
 /// subtract the ledger's reservation IDs in Rust via [`ReleaseLedgerIndex`].
-fn active_reservation_candidate_sql(has_legacy_released_ts_column: bool, table_ref: &str) -> String {
+fn active_reservation_candidate_sql(
+    has_legacy_released_ts_column: bool,
+    table_ref: &str,
+) -> String {
     if has_legacy_released_ts_column {
         mcp_agent_mail_db::queries::active_reservation_candidate_predicate_for(table_ref)
     } else {
@@ -135,9 +138,7 @@ fn release_ledger_index(
         else {
             continue;
         };
-        let released_ts = row
-            .get_by_name("released_ts")
-            .and_then(value_to_micros);
+        let released_ts = row.get_by_name("released_ts").and_then(value_to_micros);
         released_ts_by_id.insert(id, released_ts);
     }
     Ok(ReleaseLedgerIndex { released_ts_by_id })
@@ -3632,11 +3633,33 @@ const ACK_SLA_VIOLATION_THRESHOLD_US: i64 = MICROS_PER_HOUR;
 
 /// Freshness budget for coalesced robot status/overview snapshots.
 ///
-/// The generation stamp below invalidates on mailbox writes that affect the
-/// dashboard. This TTL bounds time-derived drift such as age strings,
-/// reservation countdowns, and active-agent windows.
-const ROBOT_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(500);
+/// The generation stamp below is recomputed on every call and invalidates on
+/// mailbox writes that affect the dashboard (counts plus monotone max
+/// timestamps across messages, recipient read/ack touches, reservations, and
+/// the release ledger), so a generation-verified cache entry is exact on every
+/// counted dimension regardless of age. The TTL only bounds time-derived
+/// drift inside the cached payload — age strings, reservation countdowns,
+/// active-agent windows — and the residual fingerprint blind spots.
+///
+/// GH#274: the original 500ms budget made the cache useless to real pollers
+/// (seconds-to-minutes cadence): every poll paid the full 4-queries-per-
+/// project rebuild even when the fingerprint proved nothing had changed. 30s
+/// keeps counts exact while letting an idle multi-project mailbox answer
+/// `am robot overview` from cache. Override with `AM_ROBOT_SNAPSHOT_TTL_MS`.
+const ROBOT_SNAPSHOT_CACHE_TTL_DEFAULT_MS: u64 = 30_000;
 const ROBOT_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 64;
+
+fn robot_snapshot_cache_ttl() -> Duration {
+    static TTL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TTL.get_or_init(|| {
+        let ms = std::env::var("AM_ROBOT_SNAPSHOT_TTL_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .unwrap_or(ROBOT_SNAPSHOT_CACHE_TTL_DEFAULT_MS);
+        Duration::from_millis(ms)
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RobotSnapshotGeneration {
@@ -5203,7 +5226,7 @@ fn build_status_with_snapshot_cache(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= robot_snapshot_cache_ttl()
     {
         mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
         return Ok((entry.data.clone(), entry.actions.clone()));
@@ -6174,7 +6197,7 @@ fn build_inbox_with_snapshot_cache(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= robot_snapshot_cache_ttl()
     {
         mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
         return Ok(entry.result.clone());
@@ -8281,7 +8304,7 @@ fn build_reservations_with_snapshot_cache(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= robot_snapshot_cache_ttl()
     {
         return Ok((entry.data.clone(), entry.actions.clone()));
     }
@@ -9046,13 +9069,11 @@ fn build_timeline(
         for row in &res_rows {
             let path: String = row.get_named("path_pattern").unwrap_or_default();
             let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
-            let legacy_released_ts = row
-                .get_by_name("released_ts")
-                .and_then(value_to_micros);
-            let released_ts: Option<i64> = row.get_named::<i64>("id").map_or(
-                legacy_released_ts,
-                |id| release_ledger.coalesce(id, legacy_released_ts),
-            );
+            let legacy_released_ts = row.get_by_name("released_ts").and_then(value_to_micros);
+            let released_ts: Option<i64> =
+                row.get_named::<i64>("id").map_or(legacy_released_ts, |id| {
+                    release_ledger.coalesce(id, legacy_released_ts)
+                });
             let agent: String = row.get_named("agent").unwrap_or_default();
             if created_ts <= since_us && !released_ts.is_some_and(|ts| ts > since_us) {
                 continue;
@@ -9228,7 +9249,6 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
 
     let mut projects = Vec::new();
     for (pid, slug) in project_rows {
-
         // Count unread messages across all agents in project
         let unread: i64 = conn
             .query_sync(
@@ -9332,7 +9352,7 @@ fn build_overview_with_snapshot_cache(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= robot_snapshot_cache_ttl()
     {
         mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
         return Ok(entry.projects.clone());
@@ -10320,7 +10340,7 @@ fn build_agents_with_snapshot_cache(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= robot_snapshot_cache_ttl()
     {
         return Ok(entry.agents.clone());
     }
@@ -11378,7 +11398,7 @@ fn build_projects_with_snapshot_cache(conn: &DbConn) -> Result<Vec<ProjectRow>, 
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= robot_snapshot_cache_ttl()
     {
         return Ok(entry.projects.clone());
     }

@@ -1312,21 +1312,21 @@ mod tests {
         let human_key = project_root.to_string_lossy().to_string();
         let project = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
-            || {
-                match fastmcp_core::block_on(async {
-                    queries::ensure_project(&cx, &pool, &human_key).await
-                }) {
-                    Outcome::Ok(p) => p,
-                    other => panic!("ensure_project failed: {other:?}"),
-                }
+            || match fastmcp_core::block_on(async {
+                queries::ensure_project(&cx, &pool, &human_key).await
+            }) {
+                Outcome::Ok(p) => p,
+                other => panic!("ensure_project failed: {other:?}"),
             },
         );
         let project_id = project.id.expect("project id");
         let mut agent_ids = Vec::new();
         for name in ["BlueLake", "GreenStone"] {
             let agent = match fastmcp_core::block_on(async {
-                queries::register_agent(&cx, &pool, project_id, name, "test", "test", None, None, None)
-                    .await
+                queries::register_agent(
+                    &cx, &pool, project_id, name, "test", "test", None, None, None,
+                )
+                .await
             }) {
                 Outcome::Ok(a) => a,
                 other => panic!("register_agent failed: {other:?}"),
@@ -1395,7 +1395,11 @@ mod tests {
             .iter()
             .filter_map(|r| r.get_named::<i64>("id").ok())
             .collect();
-        assert_eq!(ids, vec![9002], "unread message survives; settled one is pruned");
+        assert_eq!(
+            ids,
+            vec![9002],
+            "unread message survives; settled one is pruned"
+        );
         let orphans = check_conn
             .query_sync(
                 "SELECT COUNT(*) AS c FROM message_recipients r \

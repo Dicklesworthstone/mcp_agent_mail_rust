@@ -2499,6 +2499,13 @@ pub enum DoctorCommand {
         /// `reclaimable` owner; never kills `am`.
         #[arg(long)]
         take_ownership: bool,
+        /// Quarantine a structurally broken recovery-receipt chain (zero or
+        /// multiple roots, broken link, fork, cycle) before reconstructing, so
+        /// promotion can seed a fresh root (GH#283). The chain directory is
+        /// renamed aside — never deleted. Refused when the chain verifies
+        /// cleanly or an unfinalized promotion intent exists. Requires --yes.
+        #[arg(long)]
+        reseed_receipt_chain: bool,
     },
     /// Report the supervised drain/restart protocol for the current mailbox
     /// owner without killing any process (read-only).
@@ -8074,6 +8081,7 @@ fn run_startup_database_self_heal(config: &Config) -> CliResult<()> {
                 false,
                 true,
                 false,
+                false,
             )
         },
     )
@@ -9324,8 +9332,15 @@ fn mark_all_read_direct(
     rt.block_on(async {
         let ctx = context::AsyncCliContext::open()?;
         let cx = asupersync::Cx::for_request();
-        mark_all_read_direct_with_pool(&cx, &ctx.pool, project_key, agent_name, older_than_days, limit)
-            .await
+        mark_all_read_direct_with_pool(
+            &cx,
+            &ctx.pool,
+            project_key,
+            agent_name,
+            older_than_days,
+            limit,
+        )
+        .await
     })
 }
 
@@ -9342,12 +9357,12 @@ async fn mark_all_read_direct_with_pool(
     older_than_days: Option<i64>,
     limit: usize,
 ) -> CliResult<serde_json::Value> {
-    let by_slug =
-        match mcp_agent_mail_db::queries::get_project_by_slug(cx, pool, project_key).await {
-            asupersync::Outcome::Ok(row) => Some(row),
-            asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => None,
-            other => Some(outcome_to_result(other)?),
-        };
+    let by_slug = match mcp_agent_mail_db::queries::get_project_by_slug(cx, pool, project_key).await
+    {
+        asupersync::Outcome::Ok(row) => Some(row),
+        asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => None,
+        other => Some(outcome_to_result(other)?),
+    };
     let project = match by_slug {
         Some(row) => row,
         None => {
@@ -9365,17 +9380,17 @@ async fn mark_all_read_direct_with_pool(
     };
     let project_id = project.id.unwrap_or(0);
 
-    let agent =
-        match mcp_agent_mail_db::queries::get_agent(cx, pool, project_id, agent_name).await {
-            asupersync::Outcome::Ok(row) => row,
-            asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
-                return Err(CliError::InvalidArgument(format!(
-                    "agent not found in project {}: {agent_name}",
-                    project.slug
-                )));
-            }
-            other => outcome_to_result(other)?,
-        };
+    let agent = match mcp_agent_mail_db::queries::get_agent(cx, pool, project_id, agent_name).await
+    {
+        asupersync::Outcome::Ok(row) => row,
+        asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
+            return Err(CliError::InvalidArgument(format!(
+                "agent not found in project {}: {agent_name}",
+                project.slug
+            )));
+        }
+        other => outcome_to_result(other)?,
+    };
     let agent_id = agent.id.unwrap_or(0);
 
     // Mirror the MCP tool's interpretation exactly (daemon/direct parity).
@@ -9843,7 +9858,15 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             json,
             allow_live_owner,
             take_ownership,
-        } => handle_doctor_reconstruct(dry_run, yes, json, allow_live_owner, take_ownership),
+            reseed_receipt_chain,
+        } => handle_doctor_reconstruct(
+            dry_run,
+            yes,
+            json,
+            allow_live_owner,
+            take_ownership,
+            reseed_receipt_chain,
+        ),
         DoctorCommand::Drain { format, json } => handle_doctor_drain(format, json),
         DoctorCommand::ArchiveScan { format, json } => handle_doctor_archive_scan(format, json),
         DoctorCommand::ArchiveVerify { format, json } => handle_doctor_archive_verify(format, json),
@@ -35764,6 +35787,27 @@ fn resolve_unconsumed_pending_send_path(base_path: &Path) -> CliResult<PathBuf> 
     )))
 }
 
+/// Extract a legacy tool-error envelope (`{"error": {"type": ..., "message":
+/// ...}}`) embedded in a failure string, returning `(type, message)`.
+///
+/// Daemon-proxied tool rejections carry the whole envelope as JSON text,
+/// including a `data` payload full of recipient suggestions, agent names, and
+/// task descriptions. Substring heuristics must never run over that payload: a
+/// suggested recipient like `TealWalrus` next to the word `Invalid` satisfies
+/// the WAL-sidecar-corruption pattern (GH#285).
+fn extract_embedded_tool_error(message: &str) -> Option<(String, String)> {
+    let start = message.find('{')?;
+    let value: serde_json::Value = serde_json::from_str(message[start..].trim()).ok()?;
+    let error = value.get("error")?;
+    let error_type = error.get("type")?.as_str()?.to_string();
+    let error_message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some((error_type, error_message))
+}
+
 fn pending_send_failure_from_error(error: &CliError) -> Option<PendingSendFailure> {
     match error {
         CliError::InvalidArgument(_) | CliError::Usage(_) | CliError::ExitCode(_) => return None,
@@ -35786,16 +35830,32 @@ fn pending_send_failure_from_error(error: &CliError) -> Option<PendingSendFailur
         return None;
     }
 
-    let classification = mcp_agent_mail_db::classify_db_error_message(&message);
+    // GH#285: a definitive server-side refusal (INVALID_ARGUMENT and friends)
+    // is not an outage. Replaying it can only fail the same way, so it must
+    // never become a durable UNSENT artifact — and it must never be classified
+    // as a database emergency. When an envelope is present, classify on the
+    // tool's own message text, not the raw JSON blob.
+    let embedded = extract_embedded_tool_error(&message);
+    if let Some((error_type, _)) = &embedded
+        && mcp_agent_mail_tools::tool_error_is_client_refusal(error_type)
+    {
+        return None;
+    }
+    let classify_target = embedded
+        .as_ref()
+        .map_or(message.as_str(), |(_, tool_message)| tool_message.as_str());
+    let target_lower = classify_target.to_ascii_lowercase();
+
+    let classification = mcp_agent_mail_db::classify_db_error_message(classify_target);
     let queueable = match classification.class {
         mcp_agent_mail_db::DbErrorClass::ConnectionOrConfigError => {
-            lower.contains("database")
-                || lower.contains("sqlite")
-                || lower.contains("mailbox")
-                || lower.contains("storage")
-                || lower.contains("wal")
-                || lower.contains("shm")
-                || lower.contains("disk")
+            target_lower.contains("database")
+                || target_lower.contains("sqlite")
+                || target_lower.contains("mailbox")
+                || target_lower.contains("storage")
+                || target_lower.contains("wal")
+                || target_lower.contains("shm")
+                || target_lower.contains("disk")
         }
         mcp_agent_mail_db::DbErrorClass::EngineProbeLimitation => false,
         _ => true,
@@ -37828,9 +37888,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             dry_run,
             format,
             json,
-        } => {
-            handle_agents_reap(stale_days, project_key.as_deref(), dry_run, format, json).await
-        }
+        } => handle_agents_reap(stale_days, project_key.as_deref(), dry_run, format, json).await,
     }
 }
 
@@ -37877,9 +37935,8 @@ async fn agents_reap_payload(
     }
 
     let now_us = mcp_agent_mail_db::now_micros();
-    let cutoff_us = now_us.saturating_sub(
-        i64::from(stale_days).saturating_mul(24 * 60 * 60 * 1_000_000),
-    );
+    let cutoff_us =
+        now_us.saturating_sub(i64::from(stale_days).saturating_mul(24 * 60 * 60 * 1_000_000));
 
     // Resolve the optional project scope WITHOUT auto-creating rows (an
     // administrative sweep must never mint a project from a typo'd key).
@@ -37891,8 +37948,7 @@ async fn agents_reap_payload(
         };
         let project = match by_slug {
             Some(row) => row,
-            None => match mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, key)
-                .await
+            None => match mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, key).await
             {
                 asupersync::Outcome::Ok(row) => row,
                 asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
@@ -37923,9 +37979,8 @@ async fn agents_reap_payload(
     let mut candidate_ids: Vec<i64> = Vec::new();
     for project in &projects {
         let project_id = project.id.unwrap_or(0);
-        let agents = outcome_to_result(
-            mcp_agent_mail_db::queries::list_agents(cx, pool, project_id).await,
-        )?;
+        let agents =
+            outcome_to_result(mcp_agent_mail_db::queries::list_agents(cx, pool, project_id).await)?;
         for agent in agents {
             let stale = agent.last_active_ts < cutoff_us;
             let eligible = stale && agent.retired_at.is_none() && agent.reaper_exempt == 0;
@@ -39330,6 +39385,58 @@ mod mail_server_cli_bridge_tests {
                 .expect("database lock should queue");
         assert_eq!(failure.class, "busy_retryable");
         assert!(failure.safe_to_retry);
+    }
+
+    #[test]
+    fn queued_send_failure_filter_skips_server_client_refusal_envelopes() {
+        // GH#285: a daemon-proxied INVALID_ARGUMENT rejection arrives as the
+        // full legacy envelope text. Its `data` payload can contain agent
+        // names / task descriptions with substrings ("TealWalrus", "wal
+        // sidecar work") that satisfy the corruption heuristics. It must not
+        // queue, and it must not classify as wal_sidecar_corruption.
+        let envelope = serde_json::json!({
+            "error": {
+                "type": "INVALID_ARGUMENT",
+                "message": "Invalid agent name 'IksqPinProbeUnknownTo'. Must be adjective+noun format",
+                "recoverable": false,
+                "data": {
+                    "suggestions": {"IksqPinProbeUnknownTo": ["TealWalrus"]},
+                    "suggested_tool_calls": [{
+                        "tool": "register_agent",
+                        "arguments": {"task_description": "fix wal sidecar replay"}
+                    }]
+                }
+            }
+        });
+        let error = CliError::Other(format!("send_message via server failed: {envelope}"));
+        assert!(pending_send_failure_from_error(&error).is_none());
+
+        // Same shape for the not-found family.
+        let not_found = serde_json::json!({
+            "error": {
+                "type": "AGENT_NOT_FOUND",
+                "message": "Agent 'GreenWall' not registered",
+                "recoverable": true,
+                "data": {}
+            }
+        });
+        let error = CliError::Other(format!("send_message via server failed: {not_found}"));
+        assert!(pending_send_failure_from_error(&error).is_none());
+
+        // A genuine server-fault envelope still queues, classified on the
+        // tool's own message text.
+        let busy = serde_json::json!({
+            "error": {
+                "type": "RESOURCE_BUSY",
+                "message": "database is locked",
+                "recoverable": true,
+                "data": {}
+            }
+        });
+        let error = CliError::Other(format!("send_message via server failed: {busy}"));
+        let failure = pending_send_failure_from_error(&error)
+            .expect("server-fault envelope should still queue");
+        assert_eq!(failure.class, "busy_retryable");
     }
 
     #[test]
@@ -44346,7 +44453,9 @@ http_headers = { Authorization = "Bearer secret" }
 
         let request = build_mark_all_read_jsonrpc_request(&cfg, None, 500);
         assert!(
-            request["params"]["arguments"].get("older_than_days").is_none(),
+            request["params"]["arguments"]
+                .get("older_than_days")
+                .is_none(),
             "absent filter must be omitted so the tool default (no age filter) applies"
         );
     }
@@ -52896,6 +53005,7 @@ http_headers = { Authorization = "Bearer secret" }
                         json,
                         allow_live_owner,
                         take_ownership,
+                        reseed_receipt_chain,
                     },
             } => {
                 assert!(!dry_run);
@@ -52908,6 +53018,10 @@ http_headers = { Authorization = "Bearer secret" }
                 assert!(
                     !take_ownership,
                     "--take-ownership must default off for reconstruct"
+                );
+                assert!(
+                    !reseed_receipt_chain,
+                    "--reseed-receipt-chain must default off for reconstruct"
                 );
             }
             _ => panic!("expected Doctor Reconstruct"),
@@ -52925,6 +53039,7 @@ http_headers = { Authorization = "Bearer secret" }
             "--json",
             "--allow-live-owner",
             "--take-ownership",
+            "--reseed-receipt-chain",
         ])
         .unwrap();
         match cli.command.unwrap() {
@@ -52936,6 +53051,7 @@ http_headers = { Authorization = "Bearer secret" }
                         json,
                         allow_live_owner,
                         take_ownership,
+                        reseed_receipt_chain,
                     },
             } => {
                 assert!(dry_run);
@@ -52943,6 +53059,7 @@ http_headers = { Authorization = "Bearer secret" }
                 assert!(json);
                 assert!(allow_live_owner);
                 assert!(take_ownership);
+                assert!(reseed_receipt_chain);
             }
             _ => panic!("expected Doctor Reconstruct"),
         }
@@ -60263,7 +60380,7 @@ startup_timeout_sec = 42
                 ("DATABASE_URL", database_url.as_str()),
                 ("STORAGE_ROOT", storage_root_text.as_str()),
             ],
-            || handle_doctor_reconstruct(true, true, false, true, false),
+            || handle_doctor_reconstruct(true, true, false, true, false, false),
         );
         let output = capture.drain_to_string();
 
@@ -79021,7 +79138,16 @@ fn handle_doctor_reconstruct(
     json: bool,
     allow_live_owner: bool,
     take_ownership: bool,
+    reseed_receipt_chain: bool,
 ) -> CliResult<()> {
+    if reseed_receipt_chain && !dry_run && !yes {
+        return Err(CliError::InvalidArgument(
+            "--reseed-receipt-chain discards the broken receipt chain's promotion lineage \
+             (the directory is renamed aside, never deleted); pass --yes to confirm, or \
+             --dry-run to preview the chain verdict"
+                .to_string(),
+        ));
+    }
     let config = Config::from_env();
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     // br-bvq1x.4.4 (D4): reconstruct replaces the live DB; refuse while a live
@@ -79035,7 +79161,14 @@ fn handle_doctor_reconstruct(
         allow_live_owner,
         take_ownership,
     )?;
-    handle_doctor_reconstruct_locked(&cfg.database_url, &config.storage_root, dry_run, yes, json)
+    handle_doctor_reconstruct_locked_full(
+        &cfg.database_url,
+        &config.storage_root,
+        dry_run,
+        yes,
+        json,
+        reseed_receipt_chain,
+    )
 }
 
 fn doctor_reconstruct_db_path_from_config(
@@ -79067,6 +79200,17 @@ fn handle_doctor_reconstruct_locked(
     yes: bool,
     json: bool,
 ) -> CliResult<()> {
+    handle_doctor_reconstruct_locked_full(database_url, storage_root, dry_run, yes, json, false)
+}
+
+fn handle_doctor_reconstruct_locked_full(
+    database_url: &str,
+    storage_root: &Path,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+    reseed_receipt_chain: bool,
+) -> CliResult<()> {
     let db_path = doctor_reconstruct_db_path_from_database_url(database_url)?;
     handle_doctor_reconstruct_locked_with_path(
         Some(&db_path),
@@ -79074,6 +79218,7 @@ fn handle_doctor_reconstruct_locked(
         dry_run,
         yes,
         json,
+        reseed_receipt_chain,
     )
 }
 
@@ -79083,6 +79228,7 @@ fn handle_doctor_reconstruct_locked_with_path(
     dry_run: bool,
     yes: bool,
     json: bool,
+    reseed_receipt_chain: bool,
 ) -> CliResult<()> {
     let config = Config::from_env();
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
@@ -79097,6 +79243,32 @@ fn handle_doctor_reconstruct_locked_with_path(
         acquire_doctor_mailbox_activity_lock_for_storage_root(&storage_root, dry_run)?;
     let _mailbox_sqlite_lock =
         acquire_doctor_mailbox_activity_lock_for_sqlite_path(&db_path, dry_run)?;
+    if reseed_receipt_chain {
+        if dry_run {
+            match mcp_agent_mail_db::forensics::broken_recovery_receipt_chain_error(
+                &storage_root,
+                &db_path,
+            ) {
+                Ok(chain_error) => output::info(&format!(
+                    "--reseed-receipt-chain would quarantine the receipt chain (broken: {chain_error})"
+                )),
+                Err(refusal) => {
+                    output::info(&format!("--reseed-receipt-chain would refuse: {refusal}"));
+                }
+            }
+        } else {
+            let outcome = mcp_agent_mail_db::forensics::quarantine_broken_recovery_receipt_chain(
+                &storage_root,
+                &db_path,
+            )
+            .map_err(|error| CliError::Other(format!("--reseed-receipt-chain refused: {error}")))?;
+            output::warn(&format!(
+                "Broken receipt chain quarantined at {} (was: {}); promotion will seed a fresh root",
+                outcome.quarantined_dir.display(),
+                outcome.chain_error
+            ));
+        }
+    }
     handle_doctor_reconstruct_with(Some(&db_path), Some(&storage_root), dry_run, yes, json)
 }
 

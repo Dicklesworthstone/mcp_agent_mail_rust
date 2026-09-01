@@ -1472,6 +1472,7 @@ fn collect_recovery_continuity_sets_with_overrides(
                 ),
             ));
         }
+        let mut duplicate_reservation_keys: Vec<String> = Vec::new();
         for row in rows {
             let project_slug = receipt_required_text(
                 &row,
@@ -1529,7 +1530,7 @@ fn collect_recovery_continuity_sets_with_overrides(
                 )?,
                 db_path,
             )?;
-            sets.reservations.insert(receipt_canonical_key(
+            let exact_key = receipt_canonical_key(
                 json!({
                     "project": {"slug": project_slug, "human_key": project_human_key},
                     "agent": agent_name,
@@ -1541,7 +1542,34 @@ fn collect_recovery_continuity_sets_with_overrides(
                     "released_ts": released_ts,
                 }),
                 db_path,
-            )?);
+            )?;
+            if !sets.reservations.insert(exact_key.clone()) {
+                duplicate_reservation_keys.push(exact_key);
+            }
+        }
+        // GH#271: an operator staring at "N rows but only M unique stable
+        // keys" cannot act without knowing WHICH reservations collide — the
+        // refused candidate had to be inspected by hand. Name the colliding
+        // identities (they are plaintext canonical keys) in the refusal.
+        if !duplicate_reservation_keys.is_empty() {
+            duplicate_reservation_keys.sort_unstable();
+            duplicate_reservation_keys.dedup();
+            let shown = duplicate_reservation_keys.len().min(5);
+            let sample = duplicate_reservation_keys[..shown].join("; ");
+            let elided = duplicate_reservation_keys.len() - shown;
+            let suffix = if elided > 0 {
+                format!("; +{elided} more colliding key(s) elided")
+            } else {
+                String::new()
+            };
+            return Err(recovery_receipt_error(
+                "stable-key collision check",
+                db_path,
+                format!(
+                    "reservations produced {table_count} rows but only {} unique stable keys; refusing ambiguous recovery; colliding stable key(s): {sample}{suffix}",
+                    sets.reservations.len()
+                ),
+            ));
         }
         require_unique_receipt_keys(&sets.reservations, table_count, "reservations", db_path)?;
     }
@@ -2697,6 +2725,128 @@ pub(crate) fn verify_recovery_receipt_state_for_promotion(
     }
 }
 
+/// Read-only verdict for a broken-chain re-seed (GH#283).
+///
+/// Returns the chain verification error a quarantine would act on.
+/// Refuse-shaped states — missing/empty receipts directory, an unfinalized
+/// promotion intent, or a chain that verifies cleanly — return `Err` with the
+/// exact refusal text the mutating quarantine would produce. Nothing is
+/// written.
+pub fn broken_recovery_receipt_chain_error(
+    storage_root: &Path,
+    db_path: &Path,
+) -> Result<String, SqlError> {
+    let authority_path = recovery_receipt_db_authority_path(db_path)?;
+    let receipts_dir = recovery_receipts_dir(storage_root, &authority_path)?;
+    broken_recovery_receipt_chain_error_in(&receipts_dir)
+}
+
+fn broken_recovery_receipt_chain_error_in(receipts_dir: &Path) -> Result<String, SqlError> {
+    if !receipts_dir.is_dir() {
+        return Err(recovery_receipt_error(
+            "broken-chain quarantine",
+            receipts_dir,
+            "no receipts directory exists for this database family; there is no chain to re-seed",
+        ));
+    }
+    let pending = pending_recovery_receipt_paths(receipts_dir)?;
+    if !pending.is_empty() {
+        return Err(recovery_receipt_error(
+            "broken-chain quarantine",
+            receipts_dir,
+            format!(
+                "unfinalized promotion intent(s) exist ({}); a possibly in-flight promotion must be resolved before the chain can be re-seeded",
+                pending
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    match verify_finalized_recovery_receipt_chain(receipts_dir) {
+        Ok(None) => Err(recovery_receipt_error(
+            "broken-chain quarantine",
+            receipts_dir,
+            "the receipts directory holds no finalized receipts; promotion already starts a fresh chain without any quarantine",
+        )),
+        Ok(Some(_)) => Err(recovery_receipt_error(
+            "broken-chain quarantine",
+            receipts_dir,
+            "the finalized receipt chain verifies cleanly; refusing to discard healthy tamper-evidence",
+        )),
+        Err(chain_error) => Ok(chain_error.to_string()),
+    }
+}
+
+/// Outcome of quarantining a structurally broken receipt chain (GH#283).
+///
+/// The chain directory was renamed — never deleted — to `quarantined_dir`,
+/// and `chain_error` records why the chain could not verify.
+#[derive(Debug)]
+pub struct QuarantinedReceiptChain {
+    /// Where the broken chain directory now lives.
+    pub quarantined_dir: PathBuf,
+    /// The verification failure that justified the quarantine.
+    pub chain_error: String,
+}
+
+/// GH#283: quarantine a structurally broken finalized recovery-receipt chain
+/// so the next promotion can seed a fresh root.
+///
+/// A chain that fails structural verification (zero or multiple roots, a
+/// broken link, a fork, a cycle, or an invalid self-hash) deterministically
+/// refuses every future promotion — including a fully valid archive
+/// candidate — and no CLI verb could resolve it. Operators then bypass ALL
+/// promotion guards with a manual database swap, which is strictly worse
+/// than an attested re-seed.
+///
+/// This renames the entire receipts directory for the database family to a
+/// timestamped `.broken-<micros>` sibling (nothing is deleted; the evidence
+/// remains inspectable) and syncs the parent directory. It REFUSES when:
+/// - the receipts directory does not exist or holds no finalized receipts
+///   (nothing is broken — promotion already starts a fresh chain);
+/// - an unfinalized promotion intent exists (indeterminate prior promotion;
+///   that must be resolved first);
+/// - the finalized chain verifies cleanly (healthy tamper-evidence is not
+///   debris and must not be discarded).
+pub fn quarantine_broken_recovery_receipt_chain(
+    storage_root: &Path,
+    db_path: &Path,
+) -> Result<QuarantinedReceiptChain, SqlError> {
+    let authority_path = recovery_receipt_db_authority_path(db_path)?;
+    let receipts_dir = recovery_receipts_dir(storage_root, &authority_path)?;
+    let chain_error = broken_recovery_receipt_chain_error_in(&receipts_dir)?;
+
+    let quarantined_dir = {
+        let now_us = mcp_agent_mail_core::timestamps::now_micros();
+        let mut name = receipts_dir.file_name().map_or_else(
+            || std::ffi::OsString::from("recovery-receipts"),
+            std::ffi::OsString::from,
+        );
+        name.push(format!(".broken-{now_us:020}"));
+        receipts_dir.with_file_name(name)
+    };
+    crate::pool::rename_noreplace_preserving_source(&receipts_dir, &quarantined_dir).map_err(
+        |error| recovery_receipt_error("broken-chain quarantine rename", &receipts_dir, error),
+    )?;
+    if let Some(parent) = receipts_dir.parent() {
+        sync_recovery_directory(parent).map_err(|error| {
+            recovery_receipt_error("broken-chain quarantine directory sync", parent, error)
+        })?;
+    }
+    tracing::warn!(
+        receipts_dir = %receipts_dir.display(),
+        quarantined_dir = %quarantined_dir.display(),
+        chain_error = %chain_error,
+        "quarantined structurally broken recovery-receipt chain; the next promotion seeds a fresh root (GH#283)"
+    );
+    Ok(QuarantinedReceiptChain {
+        quarantined_dir,
+        chain_error,
+    })
+}
+
 #[derive(Debug)]
 struct RecoveryReceiptEvidence {
     source: RecoveryContinuitySnapshot,
@@ -2725,8 +2875,14 @@ fn archive_canonical_project_identities(storage_root: &Path) -> BTreeMap<String,
 /// can still be promoted (br-r6awv).
 /// `Err` is reserved for probes that failed without proving corruption
 /// (lock/busy, I/O) — those must not look like a successful heal.
+///
+/// `path` is always a PRIVATE staged copy ([`CanonicalSnapshotSource`]), so
+/// the probe opens it writable: a settled copy whose main-file header still
+/// demands WAL recovery is unreadable to a read-only canonical open ("unable
+/// to open database file" on every probe form), which used to make an
+/// unclassifiable source veto a healthy archive candidate.
 fn source_full_integrity_refusal(path: &Path) -> Result<Option<String>, SqlError> {
-    match crate::pool::sqlite_file_passes_full_integrity_check(path) {
+    match crate::pool::sqlite_private_copy_passes_full_integrity_check(path) {
         Ok(true) => Ok(None),
         Ok(false) => Ok(Some(format!(
             "source failed full integrity_check: {}",
@@ -4270,13 +4426,14 @@ fn capture_mailbox_forensic_bundle_with_budget(
 #[cfg(test)]
 mod tests {
     use super::{
-        MailboxForensicCapture, build_archive_drift_reference, build_live_db_reference,
-        capture_mailbox_forensic_bundle, capture_pre_recovery_snapshot,
-        collect_recovery_continuity_sets, finalize_recovery_receipt,
-        finalize_recovery_receipt_with_injected_post_rename_failure,
+        MailboxForensicCapture, broken_recovery_receipt_chain_error,
+        build_archive_drift_reference, build_live_db_reference, capture_mailbox_forensic_bundle,
+        capture_pre_recovery_snapshot, collect_recovery_continuity_sets,
+        finalize_recovery_receipt, finalize_recovery_receipt_with_injected_post_rename_failure,
         finalized_recovery_receipt_paths, parse_ps_output_value, pending_recovery_receipt_paths,
-        prepare_recovery_receipt, read_sqlite_header_fields, redact_database_url,
-        verify_recovery_receipt_state, verify_recovery_receipt_state_for_promotion,
+        prepare_recovery_receipt, quarantine_broken_recovery_receipt_chain,
+        read_sqlite_header_fields, redact_database_url, verify_recovery_receipt_state,
+        verify_recovery_receipt_state_for_promotion,
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     use std::ffi::OsString;
@@ -5136,6 +5293,94 @@ mod tests {
 
         verify_recovery_receipt_state(&storage_root, &primary)
             .expect("hash-linked traversal must ignore filename order");
+    }
+
+    #[test]
+    fn broken_receipt_chain_reseed_quarantines_rootless_chain_and_allows_fresh_root() {
+        // GH#283: a finalized chain whose root receipt is gone refuses every
+        // future promotion with "expected exactly one root receipt, found 0",
+        // and no supported path existed out of that state.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first_candidate = dir.path().join("candidate-first.sqlite3");
+        let second_candidate = dir.path().join("candidate-second.sqlite3");
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("mail-root");
+        seed_recovery_receipt_db(&first_candidate, true);
+        seed_recovery_receipt_db(&second_candidate, true);
+
+        let first = prepare_recovery_receipt(&storage_root, &primary, None, &first_candidate)
+            .expect("prepare first receipt");
+        std::fs::rename(&first_candidate, &primary).expect("activate first candidate");
+        finalize_recovery_receipt(&first).expect("finalize first receipt");
+        let second =
+            prepare_recovery_receipt(&storage_root, &primary, Some(&primary), &second_candidate)
+                .expect("prepare second receipt");
+        let prior = dir.path().join("prior.sqlite3");
+        std::fs::rename(&primary, &prior).expect("preserve first generation");
+        std::fs::rename(&second_candidate, &primary).expect("activate second candidate");
+        finalize_recovery_receipt(&second).expect("finalize second receipt");
+        let receipts_dir = first.final_path.parent().expect("receipt parent");
+
+        // A healthy chain must refuse both the probe and the quarantine.
+        let healthy_refusal = broken_recovery_receipt_chain_error(&storage_root, &primary)
+            .expect_err("healthy chain must refuse the reseed probe");
+        assert!(
+            healthy_refusal.to_string().contains("verifies cleanly"),
+            "unexpected healthy-chain refusal: {healthy_refusal}"
+        );
+        quarantine_broken_recovery_receipt_chain(&storage_root, &primary)
+            .expect_err("healthy chain must refuse quarantine");
+
+        // Lose the root (simulates pruned/lost evidence): chain is rootless.
+        let root_path = finalized_recovery_receipt_paths(receipts_dir)
+            .expect("list receipts")
+            .into_iter()
+            .find(|path| {
+                let document: super::RecoveryReceiptDocument =
+                    serde_json::from_slice(&std::fs::read(path).expect("read receipt"))
+                        .expect("decode receipt");
+                document.body.previous_receipt_bytes_sha256.is_none()
+            })
+            .expect("root receipt present");
+        std::fs::rename(&root_path, dir.path().join("displaced-root.json"))
+            .expect("displace root receipt");
+
+        let chain_error = broken_recovery_receipt_chain_error(&storage_root, &primary)
+            .expect("rootless chain is quarantinable");
+        assert!(
+            chain_error.contains("expected exactly one root receipt, found 0"),
+            "unexpected chain error: {chain_error}"
+        );
+
+        let outcome = quarantine_broken_recovery_receipt_chain(&storage_root, &primary)
+            .expect("quarantine rootless chain");
+        assert!(!receipts_dir.exists(), "receipts dir must be renamed away");
+        assert!(
+            outcome.quarantined_dir.is_dir(),
+            "quarantined dir must exist at {}",
+            outcome.quarantined_dir.display()
+        );
+        assert!(
+            outcome
+                .chain_error
+                .contains("expected exactly one root receipt, found 0"),
+            "outcome must carry the chain error: {}",
+            outcome.chain_error
+        );
+
+        // With the broken chain quarantined, promotion seeds a fresh root.
+        let third_candidate = dir.path().join("candidate-third.sqlite3");
+        seed_recovery_receipt_db(&third_candidate, true);
+        let third =
+            prepare_recovery_receipt(&storage_root, &primary, Some(&primary), &third_candidate)
+                .expect("prepare fresh-root receipt after reseed");
+        let document: super::RecoveryReceiptDocument =
+            serde_json::from_slice(&std::fs::read(&third.pending_path).expect("read pending"))
+                .expect("decode pending receipt");
+        assert!(
+            document.body.previous_receipt_bytes_sha256.is_none(),
+            "fresh chain must start at a root receipt"
+        );
     }
 
     #[test]
