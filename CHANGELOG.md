@@ -10,6 +10,15 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## [Unreleased]
 
+## [v0.3.32](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.32) — 2026-09-01 **[Release]**
+
+Recovery-operability release: the promotion guards learned to explain
+themselves and to offer supported ways out, closing the operator dead-ends
+reported in GH#271, GH#283, GH#284, and GH#285. The reservation stable-key
+promotion fix was verified live: it promoted a real 2.7 GB cross-linked
+production mailbox (16 projects / 658 agents / 40,386 messages, 0 parse
+errors) that v0.3.31 refused.
+
 ### Added
 
 - **`am doctor reconstruct --reseed-receipt-chain` (GH#283).** A structurally
