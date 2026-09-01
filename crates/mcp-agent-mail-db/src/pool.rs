@@ -6502,60 +6502,14 @@ fn open_canonical_sqlite_file_read_only_with_lock_retry(
         uri: true,
         ..Default::default()
     };
-    let conn = open_sqlite_file_with_lock_retry_impl(
+    open_sqlite_file_with_lock_retry_impl(
         sqlite_path,
         |_| {
             let config = sqlmodel_sqlite::SqliteConfig::file(uri.clone()).flags(flags);
             crate::CanonicalDbConn::open(&config)
         },
         std::thread::sleep,
-    )?;
-    // `readonly_shm=1` forbids creating the `-shm` index. For a WAL-header
-    // database whose sidecars are absent (the normal resting state after a
-    // clean canonical close deletes them), the first read then fails with
-    // "unable to open database file" (SQLITE_CANTOPEN): the reader may not
-    // create the index it needs and no read-only WAL snapshot exists. Probe
-    // eagerly; when the family provably has no WAL/SHM to protect, fall back
-    // to an `immutable=1` open — byte-neutral by definition (SQLite creates
-    // nothing and takes no locks on an immutable database). Never fall back
-    // while sidecars exist: immutable mode would silently ignore committed
-    // WAL frames.
-    match conn.query_sync("SELECT COUNT(*) AS n FROM sqlite_master", &[]) {
-        Ok(_) => Ok(conn),
-        Err(probe_error) => {
-            let message = probe_error.to_string();
-            let family_is_sidecar_free = !path_is_occupied(&sqlite_sidecar_path(
-                Path::new(sqlite_path),
-                "-wal",
-            )) && !path_is_occupied(&sqlite_sidecar_path(Path::new(sqlite_path), "-shm"));
-            if !(message.contains("unable to open database file") && family_is_sidecar_free) {
-                return Err(SqlError::Custom(format!(
-                    "canonical read-only probe failed for {sqlite_path}: {probe_error}"
-                )));
-            }
-            drop(conn);
-            let mut immutable_uri = url::Url::from_file_path(Path::new(sqlite_path))
-                .map_err(|()| {
-                    SqlError::Custom(format!(
-                        "canonical read-only SQLite path {sqlite_path} cannot be represented as a file URI"
-                    ))
-                })?;
-            immutable_uri
-                .query_pairs_mut()
-                .append_pair("mode", "ro")
-                .append_pair("immutable", "1");
-            let immutable_uri = immutable_uri.to_string();
-            open_sqlite_file_with_lock_retry_impl(
-                sqlite_path,
-                |_| {
-                    let config =
-                        sqlmodel_sqlite::SqliteConfig::file(immutable_uri.clone()).flags(flags);
-                    crate::CanonicalDbConn::open(&config)
-                },
-                std::thread::sleep,
-            )
-        }
-    }
+    )
 }
 
 #[allow(clippy::result_large_err)]
