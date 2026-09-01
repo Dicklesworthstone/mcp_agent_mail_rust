@@ -180,21 +180,117 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
                 })),
                 Some("am doctor repair --dry-run".to_string()),
             ),
-            Ok(crate::DoctorDatabaseFixStrategy::Reconstruct(detail)) => (
-                serde_json::json!({
-                    "status": "fail",
-                    "detail": detail,
-                    "probe_target": probe_source,
-                }),
-                Some(serde_json::json!({
-                    "id": "live-mailbox-needs-reconstruct",
-                    "severity": "P0",
-                    "source": "live_probe",
-                    "summary": format!("live mailbox needs reconstruct: {detail}"),
-                    "remediation": "am doctor reconstruct --dry-run",
-                })),
-                Some("am doctor reconstruct --dry-run".to_string()),
-            ),
+            Ok(crate::DoctorDatabaseFixStrategy::Reconstruct(detail)) => {
+                // GH#286: one P0 "needs reconstruct" covered both
+                // leaked-pages-only (space accounting waste, every row
+                // readable) and genuine structural damage. Classify so the
+                // finding id/severity — and any alert rule built on them —
+                // can tell the two apart.
+                let classification = if crate::doctor_detail_is_integrity_verdict(&detail) {
+                    crate::doctor_live_integrity_classification(&probe_target.database_url)
+                } else {
+                    // Archive drift / missing tables / open failures keep the
+                    // reconstruct verdict regardless of page accounting.
+                    None
+                };
+                let leaked_only = classification.as_ref().is_some_and(|c| {
+                    c.class == mcp_agent_mail_db::integrity::IntegrityClass::LeakedPagesOnly
+                });
+                if leaked_only {
+                    let leaked = classification.as_ref().map_or(0, |c| c.leaked_pages);
+                    (
+                        serde_json::json!({
+                            "status": "degraded",
+                            "detail": format!(
+                                "{detail}; integrity class leaked_pages_only: {leaked} orphaned \
+                                 page(s), 0 structural errors — all rows readable, reclaim \
+                                 recommended"
+                            ),
+                            "probe_target": probe_source,
+                            "integrity_class": "leaked_pages_only",
+                            "leaked_pages": leaked,
+                            "structural_errors": 0,
+                        }),
+                        Some(serde_json::json!({
+                            "id": "live-mailbox-leaked-pages",
+                            "severity": "P2",
+                            "source": "live_probe",
+                            "summary": format!(
+                                "live mailbox has {leaked} orphaned page(s) (space accounting \
+                                 only; every b-tree/index intact and all rows readable): {detail}"
+                            ),
+                            "remediation": "am doctor vacuum",
+                            "integrity_class": "leaked_pages_only",
+                            "leaked_pages": leaked,
+                            "structural_errors": 0,
+                            "first_structural_error": serde_json::Value::Null,
+                        })),
+                        Some("am doctor vacuum".to_string()),
+                    )
+                } else {
+                    let mut finding = serde_json::json!({
+                        "id": "live-mailbox-needs-reconstruct",
+                        "severity": "P0",
+                        "source": "live_probe",
+                        "summary": format!("live mailbox needs reconstruct: {detail}"),
+                        "remediation": "am doctor reconstruct --dry-run",
+                    });
+                    if let (Some(c), Some(obj)) = (classification.as_ref(), finding.as_object_mut())
+                    {
+                        obj.insert(
+                            "integrity_class".to_string(),
+                            serde_json::json!(c.class.as_str()),
+                        );
+                        obj.insert(
+                            "leaked_pages".to_string(),
+                            serde_json::json!(c.leaked_pages),
+                        );
+                        obj.insert(
+                            "structural_errors".to_string(),
+                            serde_json::json!(c.structural_errors),
+                        );
+                        obj.insert(
+                            "first_structural_error".to_string(),
+                            serde_json::json!(c.first_structural_error),
+                        );
+                    }
+                    // GH#287: the recovery breaker beside the DB may already
+                    // record that reconstruct fails deterministically here.
+                    // Keep the remediation visible but annotate it as blocked
+                    // so operators/agents do not loop on a known-failing
+                    // command.
+                    if let Some(note) =
+                        crate::doctor_recovery_breaker_note(&probe_target.database_url)
+                        && let Some(obj) = finding.as_object_mut()
+                    {
+                        obj.insert("blocked".to_string(), serde_json::json!(true));
+                        obj.insert("blocked_reason".to_string(), serde_json::json!(note.reason));
+                        obj.insert(
+                            "blocked_since".to_string(),
+                            serde_json::json!(doctor_unix_seconds_to_rfc3339(
+                                note.last_failure_unix
+                            )),
+                        );
+                        obj.insert(
+                            "blocked_tripped".to_string(),
+                            serde_json::json!(note.tripped),
+                        );
+                        obj.insert(
+                            "blocked_consecutive_failures".to_string(),
+                            serde_json::json!(note.consecutive_failures),
+                        );
+                    }
+                    (
+                        serde_json::json!({
+                            "status": "fail",
+                            "detail": detail,
+                            "probe_target": probe_source,
+                        }),
+                        Some(finding),
+                        Some("am doctor reconstruct --dry-run".to_string()),
+                    )
+                }
+            }
             Err(error) => (
                 serde_json::json!({
                     "status": "error",
@@ -258,12 +354,24 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
                             .get("remediation")
                             .and_then(|r| r.as_str())
                             .unwrap_or("am doctor health");
-                        return Some(serde_json::json!({
+                        let mut action = serde_json::json!({
                             "id": id,
                             "severity": severity,
                             "fix_command": remediation,
                             "explain_command": "am doctor health",
-                        }));
+                        });
+                        // GH#287: carry the breaker-blocked annotation onto the
+                        // planned action, so an agent branching on
+                        // `actions_planned` sees the block without re-joining
+                        // against `findings`.
+                        if let Some(obj) = action.as_object_mut() {
+                            for key in ["blocked", "blocked_reason", "blocked_since"] {
+                                if let Some(value) = f.get(key) {
+                                    obj.insert(key.to_string(), value.clone());
+                                }
+                            }
+                        }
+                        return Some(action);
                     }
                     Some(serde_json::json!({
                         "id": id,
@@ -385,6 +493,15 @@ fn historical_report_has_only_cosmetic_reservation_parity(report: &serde_json::V
         semantic_is_clean
             && (1..=COSMETIC_RESERVATION_PARITY_DRIFT_THRESHOLD).contains(&allowed_total)
     })
+}
+
+/// GH#287: render a breaker `last_failure_unix` for the blocked annotation.
+/// Falls back to the raw number when the timestamp is out of chrono's range.
+fn doctor_unix_seconds_to_rfc3339(unix_seconds: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(unix_seconds, 0).map_or_else(
+        || unix_seconds.to_string(),
+        |ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2802,6 +2919,7 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
             "database_target: local_config_unattested (live server config unavailable)"
         );
     }
+    let mut live_mailbox_degraded = false;
     match crate::doctor_database_fix_strategy_read_only(
         &probe_target.database_url,
         &probe_target.storage_root,
@@ -2814,10 +2932,58 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
             return Err(CliError::ExitCode(1));
         }
         Ok(crate::DoctorDatabaseFixStrategy::Reconstruct(detail)) => {
-            ftui_runtime::ftui_println!(
-                "fail: live mailbox needs reconstruct: {detail}; next: am doctor reconstruct --dry-run"
-            );
-            return Err(CliError::ExitCode(1));
+            // GH#286: leaked-pages-only is space accounting waste (every
+            // b-tree/index intact, all rows readable), not damage — report it
+            // as a distinct degraded class with a reclaim remediation instead
+            // of the same P0 line as structural corruption, so alert rules can
+            // page on damage without drowning in a standing benign condition.
+            let classification = if crate::doctor_detail_is_integrity_verdict(&detail) {
+                crate::doctor_live_integrity_classification(&probe_target.database_url)
+            } else {
+                // Archive drift / missing tables / open failures keep the
+                // reconstruct verdict regardless of page accounting.
+                None
+            };
+            if let Some(c) = classification.as_ref()
+                && c.class == mcp_agent_mail_db::integrity::IntegrityClass::LeakedPagesOnly
+            {
+                ftui_runtime::ftui_println!(
+                    "degraded: live mailbox has {} orphaned page(s) (integrity_class=leaked_pages_only; space accounting only, all rows readable); next: am doctor vacuum",
+                    c.leaked_pages
+                );
+                live_mailbox_degraded = true;
+            } else {
+                if let Some(c) = classification.as_ref() {
+                    ftui_runtime::ftui_println!(
+                        "integrity_class: {} ({} structural error(s), {} leaked page(s){})",
+                        c.class.as_str(),
+                        c.structural_errors,
+                        c.leaked_pages,
+                        c.first_structural_error
+                            .as_deref()
+                            .map(|e| format!("; first: {e}"))
+                            .unwrap_or_default()
+                    );
+                }
+                ftui_runtime::ftui_println!(
+                    "fail: live mailbox needs reconstruct: {detail}; next: am doctor reconstruct --dry-run"
+                );
+                // GH#287: if the recovery breaker beside the DB records that
+                // reconstruct already fails here, say so next to the advice
+                // instead of letting the operator loop on a known-failing
+                // command.
+                if let Some(note) = crate::doctor_recovery_breaker_note(&probe_target.database_url)
+                {
+                    ftui_runtime::ftui_println!(
+                        "note: recovery breaker records {} prior reconstruct failure(s) (tripped={}) at {}: {}",
+                        note.consecutive_failures,
+                        note.tripped,
+                        doctor_unix_seconds_to_rfc3339(note.last_failure_unix),
+                        note.reason
+                    );
+                }
+                return Err(CliError::ExitCode(1));
+            }
         }
         Err(error) => {
             ftui_runtime::ftui_println!("fail: live mailbox health probe failed: {error}");
@@ -2974,7 +3140,13 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
     if path_absent_without_following_symlink(&latest)
         && path_absent_without_following_symlink(&runs_dir)
     {
-        ftui_runtime::ftui_println!("ok: live mailbox healthy; no prior runs");
+        if live_mailbox_degraded {
+            ftui_runtime::ftui_println!(
+                "ok: live mailbox degraded (leaked pages only, reclaimable); no prior runs"
+            );
+        } else {
+            ftui_runtime::ftui_println!("ok: live mailbox healthy; no prior runs");
+        }
         return Ok(());
     }
 

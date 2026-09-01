@@ -663,6 +663,129 @@ pub fn details_indicate_ok(details: &[String]) -> bool {
     details.len() == 1 && details[0].trim().eq_ignore_ascii_case("ok")
 }
 
+/// GH#286: machine-readable class of an integrity-check verdict.
+///
+/// `PRAGMA integrity_check` reports space-accounting waste (`Page N: never
+/// used`) and genuine structural damage in one undifferentiated stream, so a
+/// single P0 "possible corruption" verdict covered both "206 MB of dead space,
+/// every row readable" and "b-tree pages cross-linked". Operators (and alert
+/// rules) need to tell those apart without shelling out to canonical `sqlite3`
+/// and re-parsing its English error strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrityClass {
+    /// Every detail row is benign (`ok`, section headers, WAL/sidecar slack).
+    Clean,
+    /// Only orphaned/unaccounted pages (`Page N: never used`): space
+    /// accounting waste. Every b-tree and index is intact and every row is
+    /// readable — reclaim (VACUUM) is the remediation, not reconstruct.
+    LeakedPagesOnly,
+    /// Only index-level damage that a `REINDEX` can rebuild (possibly
+    /// alongside benign rows / small page slack).
+    IndexOnly,
+    /// At least one structural error (b-tree damage, cross-linked pages,
+    /// unreadable cells, …). Repair/reconstruct territory.
+    Structural,
+}
+
+impl IntegrityClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::LeakedPagesOnly => "leaked_pages_only",
+            Self::IndexOnly => "index_only",
+            Self::Structural => "structural",
+        }
+    }
+}
+
+/// GH#286: classification of one integrity-check detail set, with the counts
+/// an alerting rule needs to branch on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrityClassification {
+    pub class: IntegrityClass,
+    /// `Page N: never used` (and `... unused`) rows.
+    pub leaked_pages: usize,
+    /// Rows that are neither benign nor index-only damage.
+    pub structural_errors: usize,
+    /// Index-level damage rows (`wrong # of entries in index …`,
+    /// `row N missing from index …`).
+    pub index_errors: usize,
+    /// First structural error verbatim, for triage without the full stream.
+    pub first_structural_error: Option<String>,
+}
+
+/// GH#286: classify integrity-check detail rows into a typed verdict.
+///
+/// Row taxonomy matches the existing classifiers exactly
+/// ([`integrity_details_are_suspect`] for the benign/unused classes,
+/// [`index_only_corruption_index_names`] for the index-damage grammar), so
+/// this adds a machine-readable label without changing what any of those
+/// callers decide.
+#[must_use]
+pub fn classify_check_details(details: &[String]) -> IntegrityClassification {
+    fn detail_is_index_damage(detail: &str) -> bool {
+        let trimmed = detail.trim();
+        if trimmed.starts_with("wrong # of entries in index ") {
+            return trimmed.len() > "wrong # of entries in index ".len();
+        }
+        if trimmed.starts_with("row ")
+            && let Some(pos) = trimmed.find(" missing from index ")
+        {
+            let rowid = &trimmed["row ".len()..pos];
+            let name = trimmed[pos + " missing from index ".len()..].trim();
+            return !rowid.is_empty()
+                && rowid.chars().all(|c| c.is_ascii_digit())
+                && !name.is_empty();
+        }
+        false
+    }
+
+    let mut leaked_pages = 0_usize;
+    let mut structural_errors = 0_usize;
+    let mut index_errors = 0_usize;
+    let mut first_structural_error: Option<String> = None;
+    for detail in details {
+        let trimmed = detail.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower == "ok"
+            || lower.contains("wal without shm")
+            || (trimmed.starts_with("***") && trimmed.ends_with("***"))
+        {
+            continue;
+        }
+        if lower.contains("never used") || lower.contains("unused") {
+            leaked_pages += 1;
+            continue;
+        }
+        if detail_is_index_damage(trimmed) {
+            index_errors += 1;
+            continue;
+        }
+        structural_errors += 1;
+        if first_structural_error.is_none() {
+            first_structural_error = Some(trimmed.to_string());
+        }
+    }
+    let class = if structural_errors > 0 {
+        IntegrityClass::Structural
+    } else if index_errors > 0 {
+        IntegrityClass::IndexOnly
+    } else if leaked_pages > 0 {
+        IntegrityClass::LeakedPagesOnly
+    } else {
+        IntegrityClass::Clean
+    };
+    IntegrityClassification {
+        class,
+        leaked_pages,
+        structural_errors,
+        index_errors,
+        first_structural_error,
+    }
+}
+
 fn run_check(conn: &DbConn, kind: CheckKind) -> DbResult<IntegrityCheckResult> {
     let start = std::time::Instant::now();
     let rows: Vec<Row> = probe_check_rows(
@@ -967,6 +1090,66 @@ pub fn index_table_cross_count(
 mod tests {
     use super::*;
     use std::sync::{LazyLock, Mutex};
+
+    // GH#286: typed classification of integrity-check detail rows.
+    #[test]
+    fn classify_clean_details() {
+        let c = classify_check_details(&["ok".to_string()]);
+        assert_eq!(c.class, IntegrityClass::Clean);
+        assert_eq!(
+            (c.leaked_pages, c.structural_errors, c.index_errors),
+            (0, 0, 0)
+        );
+        assert!(c.first_structural_error.is_none());
+
+        let c = classify_check_details(&[]);
+        assert_eq!(c.class, IntegrityClass::Clean);
+    }
+
+    #[test]
+    fn classify_leaked_pages_only_details() {
+        let mut details = vec!["*** in database main ***".to_string()];
+        details.extend((2..=50_291).map(|n| format!("Page {n}: never used")));
+        let c = classify_check_details(&details);
+        assert_eq!(c.class, IntegrityClass::LeakedPagesOnly);
+        assert_eq!(c.leaked_pages, 50_290);
+        assert_eq!(c.structural_errors, 0);
+        assert_eq!(c.index_errors, 0);
+        assert!(c.first_structural_error.is_none());
+    }
+
+    #[test]
+    fn classify_structural_details_even_with_leaked_page_flood() {
+        // GH#286's field trap: the structural rows arrive AFTER the
+        // never-used flood, so a magnitude-capped reader misses them.
+        let mut details: Vec<String> = (2..=201).map(|n| format!("Page {n}: never used")).collect();
+        details.push("Tree 60 page 93829: btreeInitPage() returns error code 11".to_string());
+        details.push("wrong # of entries in index idx_msg_thread_created".to_string());
+        let c = classify_check_details(&details);
+        assert_eq!(c.class, IntegrityClass::Structural);
+        assert_eq!(c.leaked_pages, 200);
+        assert_eq!(c.structural_errors, 1);
+        assert_eq!(c.index_errors, 1);
+        assert_eq!(
+            c.first_structural_error.as_deref(),
+            Some("Tree 60 page 93829: btreeInitPage() returns error code 11")
+        );
+    }
+
+    #[test]
+    fn classify_index_only_details() {
+        let details = vec![
+            "*** in database main ***".to_string(),
+            "wrong # of entries in index idx_inbox_delivery_events_agent_seq".to_string(),
+            "row 17 missing from index sqlite_autoindex_inbox_delivery_events_1".to_string(),
+            "Page 9: never used".to_string(),
+        ];
+        let c = classify_check_details(&details);
+        assert_eq!(c.class, IntegrityClass::IndexOnly);
+        assert_eq!(c.index_errors, 2);
+        assert_eq!(c.leaked_pages, 1);
+        assert_eq!(c.structural_errors, 0);
+    }
 
     static TEST_STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 

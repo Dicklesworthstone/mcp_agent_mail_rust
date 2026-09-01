@@ -2711,6 +2711,34 @@ pub enum DoctorCommand {
         json: bool,
     },
 
+    /// Reclaim orphaned pages INSIDE the live database (VACUUM + ANALYZE).
+    ///
+    /// GH#289: an archive reconstruct can leave the promoted database with a
+    /// large share of orphaned pages (`Page N: never used`, freelist_count=0)
+    /// — pure space-accounting waste that keeps `am doctor health` degraded
+    /// forever with no supported reclaim path. This verb runs the
+    /// drain/ownership protocol (same guard as `repair`), then VACUUMs and
+    /// ANALYZEs the mailbox in place and reports the before/after integrity
+    /// class and page counts. Default (no `--yes`) previews. Refuses while a
+    /// live owner holds the mailbox unless `--allow-live-owner`.
+    Vacuum {
+        /// Preview: report page counts and integrity class, mutate nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply the in-place VACUUM + ANALYZE.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Output JSON (shorthand for machine-readable output).
+        #[arg(long)]
+        json: bool,
+        /// Proceed even if a live owner currently holds the mailbox (unsafe).
+        #[arg(long)]
+        allow_live_owner: bool,
+        /// Supervised takeover of a provably dead owner before vacuuming.
+        #[arg(long)]
+        take_ownership: bool,
+    },
+
     /// Build a sanitized incident bundle for maintainer support.
     #[command(name = "support-bundle")]
     SupportBundle {
@@ -3621,6 +3649,15 @@ fn doctor_command_is_read_only(action: &DoctorCommand) -> bool {
         // sidecars — so it is safe to run even while a live owner holds the
         // mailbox (the realistic case: clean up debris while the server is up).
         DoctorCommand::Reclaim { .. } => true,
+        // A vacuum PREVIEW (no `--yes`, or explicit `--dry-run`) is
+        // SELECT/PRAGMA-only (page counts + integrity classification) and must
+        // be runnable while a live owner holds the mailbox so operators can
+        // size the reclaim before draining (GH#289). Only `--yes` without
+        // `--dry-run` mutates, and that path still runs the supervised-owner
+        // guard inside the handler.
+        DoctorCommand::Vacuum { dry_run: true, .. } | DoctorCommand::Vacuum { yes: false, .. } => {
+            true
+        }
         _ => false,
     }
 }
@@ -9927,6 +9964,13 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             max_age_days,
             json,
         } => handle_doctor_reclaim(dry_run, yes, keep, max_age_days, json),
+        DoctorCommand::Vacuum {
+            dry_run,
+            yes,
+            json,
+            allow_live_owner,
+            take_ownership,
+        } => handle_doctor_vacuum(dry_run, yes, json, allow_live_owner, take_ownership),
         DoctorCommand::SupportBundle {
             output_dir,
             stdout_log,
@@ -10291,6 +10335,212 @@ struct DoctorReclaimReport {
 /// Read-only preview by default; `--yes` MOVES (never deletes) the stale
 /// forensic bundles + corrupt-DB quarantines into one reversible
 /// `<storage_root>/doctor/reclaimable/<ts>/` directory the operator can remove.
+/// Read-only page/integrity statistics for `am doctor vacuum` (GH#289).
+#[derive(Debug, Clone, Serialize)]
+struct DoctorVacuumStats {
+    page_count: i64,
+    freelist_count: i64,
+    file_bytes: u64,
+    integrity_class: String,
+    leaked_pages: usize,
+    structural_errors: usize,
+}
+
+fn doctor_vacuum_stats(db_path: &Path) -> CliResult<DoctorVacuumStats> {
+    let conn = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+        db_path,
+        "doctor vacuum statistics probe",
+    )
+    .map_err(|e| CliError::Other(format!("cannot open {} read-only: {e}", db_path.display())))?;
+    let pragma_i64 = |sql: &str| -> CliResult<i64> {
+        let rows = conn
+            .query_sync(sql, &[])
+            .map_err(|e| CliError::Other(format!("{sql} failed: {e}")))?;
+        rows.first()
+            .and_then(|row| {
+                row.values().find_map(|value| match value {
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(v) => Some(*v),
+                    mcp_agent_mail_db::sqlmodel_core::Value::Int(v) => Some(i64::from(*v)),
+                    _ => None,
+                })
+            })
+            .ok_or_else(|| CliError::Other(format!("{sql} returned no integer value")))
+    };
+    let page_count = pragma_i64("PRAGMA page_count")?;
+    let freelist_count = pragma_i64("PRAGMA freelist_count")?;
+    let classification = mcp_agent_mail_db::integrity::probe_check_rows(
+        |sql| conn.query_sync(sql, &[]).map_err(|e| e.to_string()),
+        mcp_agent_mail_db::CheckKind::Full,
+    )
+    .map(|rows| {
+        let details = mcp_agent_mail_db::integrity::extract_check_details(
+            &rows,
+            mcp_agent_mail_db::CheckKind::Full,
+        );
+        mcp_agent_mail_db::integrity::classify_check_details(&details)
+    })
+    .map_err(|e| CliError::Other(format!("PRAGMA integrity_check failed: {e}")))?;
+    Ok(DoctorVacuumStats {
+        page_count,
+        freelist_count,
+        file_bytes: std::fs::metadata(db_path).map_or(0, |m| m.len()),
+        integrity_class: classification.class.as_str().to_string(),
+        leaked_pages: classification.leaked_pages,
+        structural_errors: classification.structural_errors,
+    })
+}
+
+/// `am doctor vacuum` — in-place VACUUM + ANALYZE of the live mailbox, with
+/// the same supervised-owner protocol as `repair` (GH#289).
+fn handle_doctor_vacuum(
+    dry_run: bool,
+    yes: bool,
+    json_mode: bool,
+    allow_live_owner: bool,
+    take_ownership: bool,
+) -> CliResult<()> {
+    let config = Config::from_env();
+    let pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let database_url = pool_cfg.database_url.clone();
+    let configured_path = pool_cfg
+        .sqlite_path()
+        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+    if configured_path == ":memory:" {
+        return Err(CliError::Other(
+            "in-memory databases have no on-disk pages to reclaim".to_string(),
+        ));
+    }
+    let resolved = resolve_sqlite_runtime_path(&configured_path);
+    let db_path = PathBuf::from(&resolved);
+    if !db_path.exists() {
+        return Err(CliError::Other(format!(
+            "database file not found: {}",
+            db_path.display()
+        )));
+    }
+
+    let before = doctor_vacuum_stats(&db_path)?;
+    let apply = yes && !dry_run;
+
+    if !apply {
+        if before.structural_errors > 0 {
+            // VACUUM rewrites the whole file; on structural damage that can
+            // fail midway or launder damage. Refuse and route to the recovery
+            // surfaces instead.
+            let msg = format!(
+                "refusing vacuum plan: integrity class {} ({} structural error(s)); \
+                 next: am doctor reconstruct --dry-run",
+                before.integrity_class, before.structural_errors
+            );
+            if json_mode {
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": false,
+                        "mode": "plan",
+                        "before": before,
+                        "error": msg,
+                    })
+                );
+            } else {
+                ftui_runtime::ftui_println!("{msg}");
+            }
+            return Err(CliError::ExitCode(1));
+        }
+        if json_mode {
+            ftui_runtime::ftui_println!(
+                "{}",
+                serde_json::json!({
+                    "ok": true,
+                    "mode": "plan",
+                    "before": before,
+                    "would_run": ["VACUUM", "ANALYZE"],
+                    "apply_command": "am doctor vacuum --yes",
+                })
+            );
+        } else {
+            ftui_runtime::ftui_println!(
+                "vacuum plan: {} page(s), freelist={}, {} leaked page(s), integrity_class={} ({} bytes)",
+                before.page_count,
+                before.freelist_count,
+                before.leaked_pages,
+                before.integrity_class,
+                before.file_bytes
+            );
+            ftui_runtime::ftui_println!(
+                "would run VACUUM + ANALYZE in place; apply with: am doctor vacuum --yes"
+            );
+        }
+        return Ok(());
+    }
+
+    if before.structural_errors > 0 {
+        return Err(CliError::Other(format!(
+            "refusing vacuum: integrity class {} ({} structural error(s)) — VACUUM rewrites \
+             the whole file and can fail midway or launder damage; run `am doctor reconstruct \
+             --dry-run` instead",
+            before.integrity_class, before.structural_errors
+        )));
+    }
+
+    enforce_supervised_owner_guard(
+        &database_url,
+        &config.storage_root,
+        "vacuum",
+        false,
+        allow_live_owner,
+        take_ownership,
+    )?;
+
+    {
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .map_err(|e| CliError::Other(format!("cannot open {}: {e}", db_path.display())))?;
+        conn.execute_raw("VACUUM")
+            .map_err(|e| CliError::Other(format!("VACUUM failed: {e}")))?;
+        if let Err(e) = conn.execute_raw("ANALYZE") {
+            tracing::warn!(error = %e, "doctor vacuum: ANALYZE failed after successful VACUUM");
+        }
+        mcp_agent_mail_db::close_db_conn(conn, "doctor vacuum");
+    }
+
+    let after = doctor_vacuum_stats(&db_path)?;
+    let reclaimed_pages = before.page_count.saturating_sub(after.page_count);
+    if json_mode {
+        ftui_runtime::ftui_println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "mode": "applied",
+                "before": before,
+                "after": after,
+                "reclaimed_pages": reclaimed_pages,
+            })
+        );
+    } else {
+        ftui_runtime::ftui_println!(
+            "vacuum applied: pages {} -> {} (reclaimed {}), leaked pages {} -> {}, integrity_class {} -> {}, bytes {} -> {}",
+            before.page_count,
+            after.page_count,
+            reclaimed_pages,
+            before.leaked_pages,
+            after.leaked_pages,
+            before.integrity_class,
+            after.integrity_class,
+            before.file_bytes,
+            after.file_bytes
+        );
+    }
+    if after.leaked_pages > 0 || after.structural_errors > 0 {
+        ftui_runtime::ftui_println!(
+            "warn: integrity class {} with {} leaked page(s) remain after VACUUM; next: am doctor health",
+            after.integrity_class,
+            after.leaked_pages
+        );
+        return Err(CliError::ExitCode(1));
+    }
+    Ok(())
+}
+
 fn handle_doctor_reclaim(
     dry_run: bool,
     yes: bool,
@@ -30825,6 +31075,97 @@ fn doctor_read_only_physical_integrity_check(
     .and_then(|conn| sqlite_conn_check_ok(&conn, kind));
 
     reconcile_private_canonical_corroboration(primary_result, canonical_result)
+}
+
+/// GH#286: typed integrity classification of the live mailbox, for the doctor
+/// advice surfaces (`health`/`triage`) to split "leaked pages only — reclaim"
+/// from "structural damage — reconstruct". Read-only; `None` when the file
+/// cannot be opened or the check cannot run (callers keep their existing
+/// verdict in that case rather than inventing a class).
+/// GH#286: does a recovery-strategy detail string describe an INTEGRITY-CHECK
+/// failure (as opposed to archive drift, missing core tables, or an open
+/// failure)? The leaked-pages-only downgrade must apply only to integrity
+/// verdicts — an archive-ahead drift on a mailbox that also happens to carry
+/// leaked pages still needs the reconstruct recommendation.
+pub(crate) fn doctor_detail_is_integrity_verdict(detail: &str) -> bool {
+    detail.contains("PRAGMA integrity_check failed")
+        || detail.contains("Health probes failed")
+        || detail.contains("integrity_check detected corruption")
+}
+
+pub(crate) fn doctor_live_integrity_classification(
+    database_url: &str,
+) -> Option<mcp_agent_mail_db::integrity::IntegrityClassification> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let path = cfg.sqlite_path().ok()?;
+    if path == ":memory:" {
+        return None;
+    }
+    let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(database_url).ok()?;
+    // Probe the LIVE physical file, never a logical snapshot: a VACUUM-built
+    // private canonical snapshot compacts away exactly the orphaned pages
+    // this classification exists to count.
+    let conn = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+        Path::new(&resolved.canonical_path),
+        "read-only doctor integrity classification probe",
+    )
+    .ok()?;
+    let rows = mcp_agent_mail_db::integrity::probe_check_rows(
+        |sql| conn.query_sync(sql, &[]).map_err(|e| e.to_string()),
+        mcp_agent_mail_db::CheckKind::Full,
+    )
+    .ok()?;
+    let details = mcp_agent_mail_db::integrity::extract_check_details(
+        &rows,
+        mcp_agent_mail_db::CheckKind::Full,
+    );
+    Some(mcp_agent_mail_db::integrity::classify_check_details(
+        &details,
+    ))
+}
+
+/// GH#287: what the durable recovery breaker sidecar records about the
+/// mailbox the doctor advice surfaces are about to recommend `reconstruct`
+/// for. `None` when there is no sidecar, it is unreadable/invalid, or it
+/// records no failure.
+///
+/// Deliberately NOT gated on the breaker's db-content fingerprint: the
+/// recorded refusal (e.g. an archive stable-key collision) lives in the
+/// archive, not the database bytes, so it stays true across ordinary live
+/// writes. The note is advice-only — admission decisions still go through
+/// [`mcp_agent_mail_db::recovery_breaker::evaluate`].
+pub(crate) struct DoctorBreakerNote {
+    pub(crate) reason: String,
+    pub(crate) last_failure_unix: i64,
+    pub(crate) tripped: bool,
+    pub(crate) consecutive_failures: u32,
+}
+
+pub(crate) fn doctor_recovery_breaker_note(database_url: &str) -> Option<DoctorBreakerNote> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let path = cfg.sqlite_path().ok()?;
+    if path == ":memory:" {
+        return None;
+    }
+    let state = mcp_agent_mail_db::recovery_breaker::load(Path::new(&path))
+        .ok()
+        .flatten()?;
+    if !state.tripped && state.consecutive_failures == 0 {
+        // A cleared breaker (successful recovery) is not a block note.
+        return None;
+    }
+    Some(DoctorBreakerNote {
+        reason: state.last_failure_reason,
+        last_failure_unix: state.last_failure_unix,
+        tripped: state.tripped,
+        consecutive_failures: state.consecutive_failures,
+    })
 }
 
 fn doctor_database_fix_strategy_read_only_probes(
@@ -55503,6 +55844,90 @@ startup_timeout_sec = 42
             )
             .is_none()
         );
+    }
+
+    // GH#286: the leaked-pages-only downgrade only applies to integrity
+    // verdicts, never to archive drift / missing tables / open failures.
+    #[test]
+    fn doctor_detail_is_integrity_verdict_recognizes_integrity_wordings_only() {
+        assert!(doctor_detail_is_integrity_verdict(
+            "PRAGMA integrity_check failed for /db; reconstruct from archive /root"
+        ));
+        assert!(doctor_detail_is_integrity_verdict(
+            "Health probes failed for /db (possible corruption)"
+        ));
+        assert!(!doctor_detail_is_integrity_verdict(
+            "Archive canonical data is not fully represented in the SQLite DB \
+             (messages archive=21334 db=21333); reconstruct from archive /root"
+        ));
+        assert!(!doctor_detail_is_integrity_verdict(
+            "Core tables missing from /db: messages; reconstruct from archive /root"
+        ));
+        assert!(!doctor_detail_is_integrity_verdict(
+            "Database open probe failed: unable to open database file"
+        ));
+    }
+
+    // GH#287: the breaker note surfaces recorded reconstruct failures and
+    // stays quiet for a cleared (successful-recovery) record.
+    #[test]
+    fn doctor_recovery_breaker_note_reports_recorded_failure_and_ignores_cleared_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("breaker-note.sqlite3");
+        std::fs::write(&db_path, b"stand-in database bytes").expect("write db fixture");
+        let database_url = format!("sqlite://{}", db_path.display());
+
+        assert!(
+            doctor_recovery_breaker_note(&database_url).is_none(),
+            "no sidecar must yield no note"
+        );
+
+        let state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(&db_path),
+            consecutive_failures: 4,
+            last_failure_unix: 1_787_807_828,
+            last_failure_reason:
+                "reservations produced 220 rows but only 215 unique stable keys".to_string(),
+            tripped: false,
+        };
+        mcp_agent_mail_db::recovery_breaker::store(&db_path, &state).expect("store breaker");
+        let note = doctor_recovery_breaker_note(&database_url)
+            .expect("recorded failure must produce a note");
+        assert_eq!(note.consecutive_failures, 4);
+        assert!(!note.tripped);
+        assert!(note.reason.contains("215 unique stable keys"));
+        assert_eq!(note.last_failure_unix, 1_787_807_828);
+
+        let cleared = mcp_agent_mail_db::recovery_breaker::cleared_state(
+            &mcp_agent_mail_db::recovery_breaker::fingerprint_db(&db_path),
+        );
+        mcp_agent_mail_db::recovery_breaker::store(&db_path, &cleared).expect("store cleared");
+        assert!(
+            doctor_recovery_breaker_note(&database_url).is_none(),
+            "a cleared breaker (successful recovery) is not a block note"
+        );
+    }
+
+    // GH#289: read-only vacuum statistics on a healthy franken mailbox.
+    #[test]
+    fn doctor_vacuum_stats_reads_healthy_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("vacuum-stats.sqlite3");
+        {
+            let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("create franken fixture");
+            conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+                .expect("create table");
+            conn.execute_raw("INSERT INTO t (name) VALUES ('BlueLake')")
+                .expect("insert row");
+            mcp_agent_mail_db::close_db_conn(conn, "vacuum stats fixture");
+        }
+        let stats = doctor_vacuum_stats(&db_path).expect("stats must read");
+        assert!(stats.page_count > 0);
+        assert_eq!(stats.structural_errors, 0);
+        assert_eq!(stats.integrity_class, "clean");
+        assert!(stats.file_bytes > 0);
     }
 
     #[test]

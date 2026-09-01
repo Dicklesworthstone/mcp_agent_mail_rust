@@ -10,6 +10,55 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## [Unreleased]
 
+### Added
+
+- **`am doctor vacuum` — supported in-DB reclaim for orphaned pages (GH#289).**
+  An archive reconstruct could leave the promoted database with a majority of
+  its pages orphaned (`Page N: never used`, `freelist_count=0`) — pure
+  space-accounting waste with no supported way to reclaim it, so a successful
+  recovery ended in a permanently unhealthy-looking mailbox. The new verb runs
+  the same supervised-owner protocol as `repair` (drain first, `--take-ownership`
+  for provably dead owners, `--allow-live-owner` escape hatch), VACUUMs and
+  ANALYZEs the mailbox in place, and reports before/after page counts and the
+  typed integrity class. `--dry-run` previews read-only (allowed while a live
+  owner holds the mailbox); structural damage refuses the vacuum and routes to
+  `reconstruct` instead.
+
+- **Typed integrity classes in doctor health/triage (GH#286).** `am doctor
+  health` and `triage` reported one identical P0 "needs reconstruct" verdict
+  for a database with only leaked/orphaned pages (every b-tree and index
+  intact, every row readable) and for genuine structural damage, so alert
+  rules were either permanently noisy or blind. Integrity-check failures now
+  classify as `leaked_pages_only` / `index_only` / `structural` (with
+  `leaked_pages`, `structural_errors`, and `first_structural_error` fields on
+  the triage finding). Leaked-pages-only reports as a distinct **degraded**
+  P2 finding (`live-mailbox-leaked-pages`) recommending `am doctor vacuum`,
+  and `am doctor health` exits 0 for it; structural damage keeps the P0
+  reconstruct verdict, now annotated with the class counts.
+
+### Fixed
+
+- **Doctor advice consults the recovery breaker before recommending
+  reconstruct (GH#287).** `triage` recommended `am doctor reconstruct
+  --dry-run` while the recovery-breaker sidecar `am` itself wrote recorded
+  that reconstruct fails deterministically on this mailbox. The reconstruct
+  finding (and its planned action) now carries `blocked`, `blocked_reason`,
+  and `blocked_since` from the breaker record, and `am doctor health` prints
+  the recorded failure next to the advice, so operators and agents stop
+  looping on a known-failing command.
+
+- **Integrity guard fingerprints standing defects and backs off repeat WARNs
+  (GH#288).** The background guard re-warned the identical defect on every
+  cycle (~23x/day for days) with no dedup, saturating journal-based alerting.
+  Both the guard's detection WARN and the pool's "integrity probe and
+  canonical SQLite both rejected the file" WARN now log the transition once,
+  a "still standing since <ts>, N observations" reminder on a 6-hourly
+  cadence, and everything in between at debug; a fingerprint change or a
+  passing cycle re-arms the fresh WARN. When the recovery breaker records
+  that the promised reconstruct is blocked, the guard message now says
+  "recovery unavailable: …" with the recorded reason instead of promising a
+  recovery that never runs.
+
 ## [v0.3.32](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.32) — 2026-09-01 **[Release]**
 
 Recovery-operability release: the promotion guards learned to explain
