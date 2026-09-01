@@ -4426,10 +4426,10 @@ fn capture_mailbox_forensic_bundle_with_budget(
 #[cfg(test)]
 mod tests {
     use super::{
-        MailboxForensicCapture, broken_recovery_receipt_chain_error,
-        build_archive_drift_reference, build_live_db_reference, capture_mailbox_forensic_bundle,
-        capture_pre_recovery_snapshot, collect_recovery_continuity_sets,
-        finalize_recovery_receipt, finalize_recovery_receipt_with_injected_post_rename_failure,
+        MailboxForensicCapture, broken_recovery_receipt_chain_error, build_archive_drift_reference,
+        build_live_db_reference, capture_mailbox_forensic_bundle, capture_pre_recovery_snapshot,
+        collect_recovery_continuity_sets, finalize_recovery_receipt,
+        finalize_recovery_receipt_with_injected_post_rename_failure,
         finalized_recovery_receipt_paths, parse_ps_output_value, pending_recovery_receipt_paths,
         prepare_recovery_receipt, quarantine_broken_recovery_receipt_chain,
         read_sqlite_header_fields, redact_database_url, verify_recovery_receipt_state,

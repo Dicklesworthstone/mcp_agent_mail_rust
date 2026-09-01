@@ -30,6 +30,116 @@ const DEFAULT_QUICK_CHECK_INTERVAL_SECS: u64 = 300;
 const MIN_FULL_CHECK_INTERVAL_SECS: u64 = 3600;
 const RECOVERY_MIN_INTERVAL_SECS: u64 = 30;
 const BACKUP_MAX_AGE_SECS: u64 = 3600;
+/// GH#288: how often an UNCHANGED standing defect is re-warned. Between
+/// re-warns, repeat observations log at debug so journal-based alerting sees
+/// the transition, a low-cadence "still standing" reminder, and nothing else.
+const STANDING_DEFECT_REWARN_INTERVAL_SECS: u64 = 6 * 3600;
+
+/// GH#288: per-phase memory of the last integrity defect the guard warned
+/// about, so an unchanged standing condition is logged as a transition plus a
+/// low-cadence reminder instead of an identical WARN pair every cycle for
+/// days (~23x/day in the field report).
+#[derive(Default)]
+struct StandingDefectLog {
+    entries: std::collections::HashMap<String, StandingDefectEntry>,
+}
+
+struct StandingDefectEntry {
+    fingerprint: u64,
+    first_seen_unix: i64,
+    last_warn: Instant,
+    observations: u64,
+}
+
+impl StandingDefectLog {
+    /// Record one observation of `(phase, error_message)`. Returns
+    /// `Some(reminder)` when the caller should WARN — either a fresh/changed
+    /// defect (`observations == 1`) or the periodic reminder for a standing
+    /// one — and `None` when the observation should stay at debug.
+    fn observe(&mut self, phase: &str, error_message: &str) -> Option<StandingDefectVerdict> {
+        let fingerprint = defect_fingerprint(phase, error_message);
+        let now_unix = unix_now_seconds();
+        match self.entries.get_mut(phase) {
+            Some(entry) if entry.fingerprint == fingerprint => {
+                entry.observations += 1;
+                if entry.last_warn.elapsed()
+                    >= Duration::from_secs(STANDING_DEFECT_REWARN_INTERVAL_SECS)
+                {
+                    entry.last_warn = Instant::now();
+                    Some(StandingDefectVerdict {
+                        new_detection: false,
+                        first_seen_unix: entry.first_seen_unix,
+                        observations: entry.observations,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => {
+                self.entries.insert(
+                    phase.to_string(),
+                    StandingDefectEntry {
+                        fingerprint,
+                        first_seen_unix: now_unix,
+                        last_warn: Instant::now(),
+                        observations: 1,
+                    },
+                );
+                Some(StandingDefectVerdict {
+                    new_detection: true,
+                    first_seen_unix: now_unix,
+                    observations: 1,
+                })
+            }
+        }
+    }
+
+    /// A passing cycle for `phase` clears its standing defect, so any later
+    /// recurrence logs as a fresh transition again.
+    fn clear(&mut self, phase: &str) {
+        self.entries.remove(phase);
+    }
+}
+
+struct StandingDefectVerdict {
+    new_detection: bool,
+    first_seen_unix: i64,
+    observations: u64,
+}
+
+fn defect_fingerprint(phase: &str, error_message: &str) -> u64 {
+    use std::hash::{Hash, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    phase.hash(&mut hasher);
+    error_message.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn unix_now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or(0)
+}
+
+/// GH#288: when the recovery path the guard's message promises is recorded as
+/// failing by the durable recovery breaker, say so instead of promising it.
+fn recovery_availability_note(sqlite_path: &Path) -> String {
+    match mcp_agent_mail_db::recovery_breaker::load(sqlite_path) {
+        Ok(Some(state)) if state.tripped || state.consecutive_failures > 0 => format!(
+            "recovery unavailable: recovery breaker recorded {} reconstruct failure(s) \
+             (tripped={}) at unix {}: {}",
+            state.consecutive_failures,
+            state.tripped,
+            state.last_failure_unix,
+            state.last_failure_reason
+        ),
+        _ => "the query-path recovery flow will trigger an admission-controlled reconstruct \
+              on the next corrupt-verdict read"
+            .to_string(),
+    }
+}
 
 #[inline]
 const fn quick_check_interval() -> Duration {
@@ -176,6 +286,8 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
 
     let mut last_full_attempt: Option<Instant> = None;
     let mut last_recovery_attempt: Option<Instant> = None;
+    // GH#288: transition-aware defect logging (fingerprint + backoff).
+    let mut standing_defects = StandingDefectLog::default();
     // Bead K4: seed the maintenance schedule at "now" so the first checkpoint /
     // analyze / vacuum fires only after one full interval — never a heavy
     // startup VACUUM storm. These live on the integrity-guard worker thread, so
@@ -206,6 +318,7 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
                 sqlite_path,
                 &storage_root,
                 &mut last_recovery_attempt,
+                &mut standing_defects,
             )
         };
 
@@ -220,6 +333,7 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
                     sqlite_path,
                     &storage_root,
                     &mut last_recovery_attempt,
+                    &mut standing_defects,
                 );
                 last_full_attempt = Some(attempted_at);
                 passed
@@ -294,9 +408,11 @@ fn run_quick_cycle(
     sqlite_path: &Path,
     storage_root: &Path,
     last_recovery_attempt: &mut Option<Instant>,
+    standing_defects: &mut StandingDefectLog,
 ) -> bool {
     match pool.run_periodic_integrity_check() {
         Ok(_) => {
+            standing_defects.clear("quick_check");
             if take_deferred_proactive_backup() {
                 tracing::debug!(
                     "integrity guard: deferred proactive backup during startup quick cycle"
@@ -328,12 +444,13 @@ fn run_quick_cycle(
             true
         }
         Err(err) => {
-            handle_integrity_error(
+            handle_integrity_error_with_log(
                 "quick_check",
                 &err.to_string(),
                 sqlite_path,
                 storage_root,
                 last_recovery_attempt,
+                standing_defects,
             );
             false
         }
@@ -345,9 +462,11 @@ fn run_full_cycle(
     sqlite_path: &Path,
     storage_root: &Path,
     last_recovery_attempt: &mut Option<Instant>,
+    standing_defects: &mut StandingDefectLog,
 ) -> bool {
     match pool.run_full_integrity_check() {
         Ok(_) => {
+            standing_defects.clear("integrity_check");
             tracing::info!("integrity guard: periodic full integrity check passed");
             // GH#214: PRAGMA checks can under-report the index/table desync
             // class (quick_check misses single-row loss; the GH#213 Linux
@@ -356,15 +475,17 @@ fn run_full_cycle(
             // Runs BEFORE the verified-snapshot capture so a desynced DB is
             // never recorded as last-known-healthy.
             if let Some(mismatch) = run_index_table_cross_count(sqlite_path) {
-                handle_integrity_error(
+                handle_integrity_error_with_log(
                     "index_table_cross_count",
                     &mismatch,
                     sqlite_path,
                     storage_root,
                     last_recovery_attempt,
+                    standing_defects,
                 );
                 return false;
             }
+            standing_defects.clear("index_table_cross_count");
             // Bead K2: a passing full check means the DB is verifiably clean —
             // capture a last-known-healthy verified snapshot (best-effort; the
             // call re-verifies and records metrics, and never fails the cycle).
@@ -403,12 +524,13 @@ fn run_full_cycle(
             true
         }
         Err(err) => {
-            handle_integrity_error(
+            handle_integrity_error_with_log(
                 "integrity_check",
                 &err.to_string(),
                 sqlite_path,
                 storage_root,
                 last_recovery_attempt,
+                standing_defects,
             );
             false
         }
@@ -715,12 +837,33 @@ fn run_db_maintenance_cycle(
     }
 }
 
+#[cfg(test)]
 fn handle_integrity_error(
     phase: &str,
     error_message: &str,
     sqlite_path: &Path,
     storage_root: &Path,
     last_recovery_attempt: &mut Option<Instant>,
+) {
+    // Test compatibility shim: exercises one observation with a fresh log.
+    let mut standing_defects = StandingDefectLog::default();
+    handle_integrity_error_with_log(
+        phase,
+        error_message,
+        sqlite_path,
+        storage_root,
+        last_recovery_attempt,
+        &mut standing_defects,
+    );
+}
+
+fn handle_integrity_error_with_log(
+    phase: &str,
+    error_message: &str,
+    sqlite_path: &Path,
+    storage_root: &Path,
+    last_recovery_attempt: &mut Option<Instant>,
+    standing_defects: &mut StandingDefectLog,
 ) {
     let recoverable = is_sqlite_recovery_error_message(error_message)
         || is_corruption_error_message(error_message);
@@ -747,26 +890,159 @@ fn handle_integrity_error(
     *last_recovery_attempt = Some(now);
 
     let storage_root_present = storage_root.is_dir();
-    // #105 flagged this line as confusing — "recovery is disabled" reads as
-    // "nothing will happen" but in fact the query path triggers
-    // `reconstruct_sqlite_file_with_archive_salvage` on its own when a
-    // tool reads against a broken verdict (see
-    // `mcp-agent-mail-tools::tool_util::live_db_is_suspect`). What this
-    // branch actually does is *surface* the detection and leave the
-    // mutation to the query path's admission-controlled reconstruct, so
-    // say that plainly.
-    tracing::warn!(
-        phase,
-        path = %sqlite_path.display(),
-        error = %error_message,
-        storage_root_present,
-        "integrity guard detected recoverable sqlite corruption; background guard does not mutate the live db — the query-path recovery flow will trigger an admission-controlled reconstruct on the next corrupt-verdict read"
-    );
+    // GH#288: honest recovery wording — when the durable recovery breaker
+    // beside the DB records that reconstruct fails deterministically, do not
+    // promise a reconstruct that will never run.
+    let recovery_note = recovery_availability_note(sqlite_path);
+    // GH#288: fingerprint + backoff. An unchanged standing defect logs the
+    // TRANSITION at WARN once, a "still standing" reminder at WARN on a
+    // 6-hourly cadence, and every other observation at debug — so a journal
+    // monitor sees state changes, not ~23 identical WARN pairs per day.
+    match standing_defects.observe(phase, error_message) {
+        Some(verdict) if verdict.new_detection => {
+            // #105 flagged this line as confusing — "recovery is disabled"
+            // reads as "nothing will happen" but in fact the query path
+            // triggers `reconstruct_sqlite_file_with_archive_salvage` on its
+            // own when a tool reads against a broken verdict (see
+            // `mcp-agent-mail-tools::tool_util::live_db_is_suspect`). What
+            // this branch actually does is *surface* the detection and leave
+            // the mutation to the query path's admission-controlled
+            // reconstruct, so say that plainly.
+            tracing::warn!(
+                phase,
+                path = %sqlite_path.display(),
+                error = %error_message,
+                storage_root_present,
+                recovery = %recovery_note,
+                "integrity guard detected recoverable sqlite corruption; background guard does not mutate the live db"
+            );
+        }
+        Some(verdict) => {
+            tracing::warn!(
+                phase,
+                path = %sqlite_path.display(),
+                error = %error_message,
+                storage_root_present,
+                recovery = %recovery_note,
+                first_seen_unix = verdict.first_seen_unix,
+                observations = verdict.observations,
+                "integrity guard: standing sqlite defect unchanged since first detection"
+            );
+        }
+        None => {
+            tracing::debug!(
+                phase,
+                path = %sqlite_path.display(),
+                "integrity guard: standing sqlite defect re-observed (unchanged; suppressed repeat warn)"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // GH#288: fingerprint + backoff for standing integrity defects.
+    #[test]
+    fn standing_defect_log_warns_on_transition_and_suppresses_repeats() {
+        let mut log = StandingDefectLog::default();
+        let msg = "integrity_check detected corruption (3): page 7 is never used";
+
+        let first = log
+            .observe("integrity_check", msg)
+            .expect("first observation must warn");
+        assert!(first.new_detection);
+        assert_eq!(first.observations, 1);
+
+        // Identical defect inside the re-warn window: suppressed to debug.
+        assert!(log.observe("integrity_check", msg).is_none());
+        assert!(log.observe("integrity_check", msg).is_none());
+
+        // Different message ⇒ different fingerprint ⇒ fresh WARN transition.
+        let changed = log
+            .observe("integrity_check", "page 9 is cross-linked")
+            .expect("changed fingerprint must warn");
+        assert!(changed.new_detection);
+
+        // Phases dedupe independently.
+        let other_phase = log
+            .observe("quick_check", msg)
+            .expect("first observation in a new phase must warn");
+        assert!(other_phase.new_detection);
+    }
+
+    #[test]
+    fn standing_defect_log_clear_makes_recurrence_a_fresh_transition() {
+        let mut log = StandingDefectLog::default();
+        let msg = "page 7 is never used";
+        assert!(log.observe("integrity_check", msg).is_some());
+        assert!(log.observe("integrity_check", msg).is_none());
+
+        log.clear("integrity_check");
+        let again = log
+            .observe("integrity_check", msg)
+            .expect("recurrence after a passing cycle must warn again");
+        assert!(again.new_detection);
+    }
+
+    #[test]
+    fn standing_defect_rewarn_reminder_reports_observation_count() {
+        let mut log = StandingDefectLog::default();
+        let msg = "page 7 is never used";
+        assert!(log.observe("integrity_check", msg).is_some());
+        assert!(log.observe("integrity_check", msg).is_none());
+        // Force the reminder cadence to elapse. checked_sub: on a host with
+        // less monotonic-clock history than the cadence this is
+        // unrepresentable — skip rather than panic.
+        let Some(past) = Instant::now().checked_sub(Duration::from_secs(
+            STANDING_DEFECT_REWARN_INTERVAL_SECS + 1,
+        )) else {
+            return;
+        };
+        log.entries
+            .get_mut("integrity_check")
+            .expect("entry must exist")
+            .last_warn = past;
+        let reminder = log
+            .observe("integrity_check", msg)
+            .expect("elapsed cadence must re-warn");
+        assert!(!reminder.new_detection);
+        assert_eq!(reminder.observations, 3);
+    }
+
+    // GH#288: the guard must not promise a breaker-blocked reconstruct.
+    #[test]
+    fn recovery_availability_note_reports_breaker_recorded_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("standing-defect.sqlite3");
+        std::fs::write(&db_path, b"not a database").expect("write fixture");
+
+        assert!(
+            recovery_availability_note(&db_path).contains("admission-controlled reconstruct"),
+            "no breaker sidecar must keep the default promise wording"
+        );
+
+        let state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(&db_path),
+            consecutive_failures: 1,
+            last_failure_unix: 1_787_807_828,
+            last_failure_reason:
+                "archive reconstruction failed: reservations produced 220 rows but only 215 \
+                 unique stable keys; refusing ambiguous recovery"
+                    .to_string(),
+            tripped: false,
+        };
+        mcp_agent_mail_db::recovery_breaker::store(&db_path, &state).expect("store breaker");
+
+        let note = recovery_availability_note(&db_path);
+        assert!(
+            note.contains("recovery unavailable"),
+            "recorded breaker failure must flip the wording: {note}"
+        );
+        assert!(note.contains("215 unique stable keys"), "note: {note}");
+    }
 
     #[test]
     fn cross_count_healthy_file_reports_none() {
@@ -882,6 +1158,17 @@ mod tests {
                 .expect("insert cross-count fixture row");
             drop(conn);
 
+            // Materialize a real FrankenSQLite namespace sidecar pair
+            // (-fsqlite-ns-gate/-fsqlite-ns-use): strict read-only admission
+            // refuses a namespace-less family before it ever reaches the
+            // breaker-authority proof this test exists to exercise.
+            {
+                let franken = mcp_agent_mail_db::DbConn::open_file(path.to_string_lossy().as_ref())
+                    .expect("open cross-count fixture with franken engine");
+                let _ = franken.query_sync("SELECT count(*) FROM agents", &[]);
+                mcp_agent_mail_db::close_db_conn(franken, "cross-count namespace fixture");
+            }
+
             let wal_path = path.with_file_name(format!(
                 "{}-wal",
                 path.file_name().unwrap_or_default().to_string_lossy()
@@ -940,10 +1227,13 @@ mod tests {
                 }
                 Err(error) => error,
             };
+            let expected_refusal = match breaker_kind {
+                "malformed" => "durable recovery authority is malformed or unreadable",
+                "tripped" => "durable recovery authority is nonclean",
+                _ => unreachable!(),
+            };
             assert!(
-                error
-                    .to_string()
-                    .contains("refusing live read-only SQLite engine open"),
+                error.to_string().contains(expected_refusal),
                 "unexpected cross-count refusal for {breaker_kind}: {error}"
             );
             assert!(

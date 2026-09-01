@@ -7233,6 +7233,56 @@ fn sqlite_canonical_incremental_check_is_ok(
 /// unit-testable without a real on-disk engine divergence, and
 /// `canonical_mailbox_is_schema_only` is injected (and only invoked after a
 /// canonical acceptance for a non-NOCASE complaint) for the same reason.
+/// GH#288: how often an UNCHANGED "both engines rejected the file" verdict is
+/// re-warned per (path, message) pair. Repeats inside the window log at debug.
+const BOTH_REJECTED_REWARN_INTERVAL_SECS: u64 = 6 * 3600;
+
+/// GH#288: process-wide memory of the last WARN per (path, message
+/// fingerprint) for the standing "both rejected" verdict. Bounded: a change in
+/// the verdict text is a different fingerprint (fresh WARN), and the map is
+/// cleared if it somehow accumulates more distinct standing defects than any
+/// sane process observes.
+type BothRejectedWarnKey = (String, u64);
+type BothRejectedWarnMap =
+    std::collections::HashMap<BothRejectedWarnKey, (std::time::Instant, u64)>;
+
+static BOTH_REJECTED_WARN_LOG: std::sync::LazyLock<std::sync::Mutex<BothRejectedWarnMap>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Returns `Some(observation_count)` when the caller should WARN (first
+/// observation, changed message, or the re-warn cadence elapsed) and `None`
+/// when the identical standing verdict should stay at debug.
+fn both_rejected_should_warn(path_for_log: &str, message: &str) -> Option<u64> {
+    use std::hash::{Hash, Hasher as _};
+
+    const MAX_TRACKED: usize = 64;
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    message.hash(&mut hasher);
+    let key = (path_for_log.to_string(), hasher.finish());
+    let mut log = BOTH_REJECTED_WARN_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if log.len() > MAX_TRACKED {
+        log.clear();
+    }
+    let verdict = if let Some((last_warn, observations)) = log.get_mut(&key) {
+        *observations += 1;
+        if last_warn.elapsed() >= std::time::Duration::from_secs(BOTH_REJECTED_REWARN_INTERVAL_SECS)
+        {
+            *last_warn = std::time::Instant::now();
+            Some(*observations)
+        } else {
+            None
+        }
+    } else {
+        log.insert(key, (std::time::Instant::now(), 1));
+        Some(1)
+    };
+    drop(log);
+    verdict
+}
+
 #[allow(clippy::result_large_err)]
 fn reconcile_with_canonical(
     primary: DbResult<integrity::IntegrityCheckResult>,
@@ -7307,13 +7357,30 @@ fn reconcile_with_canonical(
                 })
             }
             Ok(false) => {
-                tracing::warn!(
-                    phase,
-                    path = %path_for_log,
-                    check = %kind,
-                    primary_error = %message,
-                    "integrity probe and canonical SQLite both rejected the file"
-                );
+                // GH#288: this verdict re-derives on every periodic probe for
+                // a standing defect. Log the transition (and a low-cadence
+                // reminder) at WARN; identical repeats drop to debug so
+                // journal monitors see state changes, not an hourly flood.
+                match both_rejected_should_warn(path_for_log, &message) {
+                    Some(observations) => {
+                        tracing::warn!(
+                            phase,
+                            path = %path_for_log,
+                            check = %kind,
+                            primary_error = %message,
+                            observations,
+                            "integrity probe and canonical SQLite both rejected the file"
+                        );
+                    }
+                    None => {
+                        tracing::debug!(
+                            phase,
+                            path = %path_for_log,
+                            check = %kind,
+                            "integrity probe and canonical SQLite both rejected the file (unchanged standing defect; suppressed repeat warn)"
+                        );
+                    }
+                }
                 if !details.is_empty() {
                     tracing::debug!(
                         phase,
@@ -13869,6 +13936,30 @@ mod tests {
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+
+    // GH#288: the "both rejected" WARN dedups per (path, message) — first
+    // observation warns, identical repeats inside the cadence stay quiet, a
+    // changed message or a different path warns fresh.
+    #[test]
+    fn both_rejected_should_warn_dedups_identical_standing_verdicts() {
+        // Unique path so parallel tests sharing the process-wide map never
+        // collide with this sequence.
+        let path = format!("/both-rejected-test/{}/db.sqlite3", std::process::id());
+        assert_eq!(both_rejected_should_warn(&path, "page 7 never used"), Some(1));
+        assert_eq!(both_rejected_should_warn(&path, "page 7 never used"), None);
+        assert_eq!(both_rejected_should_warn(&path, "page 7 never used"), None);
+        assert_eq!(
+            both_rejected_should_warn(&path, "page 9 cross-linked"),
+            Some(1),
+            "a changed message is a new fingerprint and must warn"
+        );
+        let other = format!("{path}.other");
+        assert_eq!(
+            both_rejected_should_warn(&other, "page 7 never used"),
+            Some(1),
+            "a different path tracks independently"
+        );
+    }
 
     /// GH#247 regression: a purpose-corrupted fixture whose pages are mass-
     /// orphaned (every integrity_check row is `Page N is never used`). The
