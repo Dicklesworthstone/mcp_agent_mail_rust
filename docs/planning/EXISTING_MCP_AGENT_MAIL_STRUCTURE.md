@@ -349,8 +349,8 @@ Source: `src/mcp_agent_mail/storage.py`.
 
 ### Tooling
 - `resource://tooling/directory{?format}` - All tools with cluster/capability metadata
-- `resource://tooling/schemas{?format}` - JSON schemas for all tools
-- `resource://tooling/metrics{?format}` - Tool call counts, error rates
+- `resource://tooling/schemas{?cluster,format}` - JSON schemas for all tools (`cluster=` narrows to one tool cluster)
+- `resource://tooling/metrics{?window,format}` - Tool call counts, error rates (cumulative since process start; a `window=` is echoed back with `window_applied: false`)
 - `resource://tooling/locks{?format}` - Active archive locks
 - `resource://tooling/capabilities/{agent}{?project,format}` - Agent capability mapping
 - `resource://tooling/recent/{window_seconds}{?agent,project,limit,format}` - Recent tool usage (this process's bounded in-memory ring of finished calls; not persisted)

@@ -40,6 +40,13 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   parse the query and discard it. They now accept only the documented
   `format=json` and return `InvalidParams` naming the offending key for
   anything else, so a caller passing `?project=` learns it did nothing.
+  `resource://tooling/schemas?cluster=<name>` is the one real filter: it
+  narrows the schema map to that cluster and refuses unknown cluster names
+  with the known list. `tooling/metrics` and `tooling/metrics_core` keep
+  accepting `?window=<seconds>` (their counters are cumulative since process
+  start) and now report it back as `window_seconds` with
+  `window_applied: false` and a note pointing at `tooling/recent`, instead
+  of dropping it silently.
 
 - **`am robot handoff --max-seconds <n>` (default 20) with honest partial
   output.** The dashboard used to run one `messages LEFT JOIN

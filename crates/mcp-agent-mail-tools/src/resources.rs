@@ -463,6 +463,69 @@ fn parse_query(query: &str) -> HashMap<String, String> {
 /// single parameter, `format`, and only `json` is produced. Refuse anything
 /// else instead of silently discarding it, so a caller who passes
 /// `?project=` or `?format=yaml` learns the parameter did nothing.
+/// The metrics aliases have always accepted `?window=<seconds>` alongside
+/// `format=json`. The counters are cumulative since process start, so a
+/// window cannot be applied; instead of dropping the parameter silently the
+/// response reports it back with `window_applied: false`.
+fn metrics_query_window(resource: &str, query: &str) -> McpResult<Option<u64>> {
+    let params = parse_query(query);
+    let mut window = None;
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort();
+    for key in keys {
+        let value = params[key].as_str();
+        match key.as_str() {
+            "format" if value.is_empty() || value.eq_ignore_ascii_case("json") => {}
+            "format" => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!("{resource}: unsupported format {value:?}; only json is available"),
+                ));
+            }
+            "window" => {
+                window = Some(value.trim().parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(|| {
+                    McpError::new(
+                        McpErrorCode::InvalidParams,
+                        format!("{resource}: window must be a positive integer number of seconds, got {value:?}"),
+                    )
+                })?);
+            }
+            other => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!(
+                        "{resource} does not accept query parameter {other:?}; supported: window, format"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(window)
+}
+
+fn annotate_unapplied_metrics_window(raw: &str, window_seconds: Option<u64>) -> McpResult<String> {
+    let Some(window_seconds) = window_seconds else {
+        return Ok(raw.to_string());
+    };
+    let mut value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "window_seconds".to_string(),
+            serde_json::json!(window_seconds),
+        );
+        object.insert("window_applied".to_string(), serde_json::json!(false));
+        object.insert(
+            "window_note".to_string(),
+            serde_json::json!(
+                "counters are cumulative since process start; windowed metrics are not implemented, use resource://tooling/recent/<window_seconds> for recent calls"
+            ),
+        );
+    }
+    serde_json::to_string(&value)
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
 fn reject_unsupported_query(resource: &str, query: &str) -> McpResult<()> {
     let params = parse_query(query);
     let mut keys: Vec<&String> = params.keys().collect();
@@ -1802,8 +1865,58 @@ pub fn tooling_schemas(_ctx: &McpContext) -> McpResult<String> {
     description = "Expose JSON-like parameter schemas for tools/macros to prevent drift.\n\nThis is a lightweight, hand-maintained view focusing on the most error-prone\nparameters and accepted aliases to guide clients."
 )]
 pub fn tooling_schemas_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    reject_unsupported_query("resource://tooling/schemas", &query)?;
-    tooling_schemas(ctx)
+    let params = parse_query(&query);
+    let mut cluster: Option<String> = None;
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort();
+    for key in keys {
+        let value = params[key].as_str();
+        match key.as_str() {
+            "format" if value.is_empty() || value.eq_ignore_ascii_case("json") => {}
+            "format" => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!(
+                        "resource://tooling/schemas: unsupported format {value:?}; only json is available"
+                    ),
+                ));
+            }
+            "cluster" if !value.trim().is_empty() => cluster = Some(value.trim().to_string()),
+            "cluster" => {}
+            other => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!(
+                        "resource://tooling/schemas does not accept query parameter {other:?}; supported: cluster, format"
+                    ),
+                ));
+            }
+        }
+    }
+    let raw = tooling_schemas(ctx)?;
+    let Some(cluster) = cluster else {
+        return Ok(raw);
+    };
+    let mut known_clusters: Vec<&'static str> =
+        crate::TOOL_CLUSTER_MAP.iter().map(|(_, c)| *c).collect();
+    known_clusters.sort_unstable();
+    known_clusters.dedup();
+    if !known_clusters.contains(&cluster.as_str()) {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            format!(
+                "resource://tooling/schemas: unknown cluster {cluster:?}; known clusters: {}",
+                known_clusters.join(", ")
+            ),
+        ));
+    }
+    let mut response: ToolSchemasResponse = serde_json::from_str(&raw)
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))?;
+    response
+        .tools
+        .retain(|name, _| crate::tool_cluster(name) == Some(cluster.as_str()));
+    serde_json::to_string(&response)
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
 /// Tool metrics entry
@@ -1881,8 +1994,9 @@ pub fn tooling_metrics(_ctx: &McpContext) -> McpResult<String> {
     description = "Expose aggregated tool call/error counts for analysis."
 )]
 pub fn tooling_metrics_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    reject_unsupported_query("resource://tooling/metrics", &query)?;
-    tooling_metrics(ctx)
+    let window_seconds = metrics_query_window("resource://tooling/metrics", &query)?;
+    let raw = tooling_metrics(ctx)?;
+    annotate_unapplied_metrics_window(&raw, window_seconds)
 }
 
 /// Core system metrics response.
@@ -1929,8 +2043,9 @@ pub fn tooling_metrics_core(_ctx: &McpContext) -> McpResult<String> {
     description = "Core system metrics (HTTP/DB/Storage) (with query)"
 )]
 pub fn tooling_metrics_core_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    reject_unsupported_query("resource://tooling/metrics_core", &query)?;
-    tooling_metrics_core(ctx)
+    let window_seconds = metrics_query_window("resource://tooling/metrics_core", &query)?;
+    let raw = tooling_metrics_core(ctx)?;
+    annotate_unapplied_metrics_window(&raw, window_seconds)
 }
 
 /// Get a comprehensive diagnostic report combining all system health metrics.
@@ -7850,6 +7965,78 @@ mod query_param_tests {
         assert_eq!(err.code, McpErrorCode::InvalidParams);
         tooling_recent(&ctx, "60?format=json".to_string())
             .expect("json format is the documented no-op");
+    }
+
+    /// `tooling/schemas?cluster=` is the one documented filter among the
+    /// query aliases; it narrows the hand-maintained schema map to one
+    /// cluster and refuses names that are not clusters.
+    #[test]
+    fn tooling_schemas_query_filters_by_cluster_and_refuses_unknown_clusters() {
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let all: ToolSchemasResponse =
+            serde_json::from_str(&tooling_schemas(&ctx).expect("schemas")).expect("json");
+        let messaging: ToolSchemasResponse = serde_json::from_str(
+            &tooling_schemas_query(&ctx, "cluster=messaging".to_string()).expect("filtered"),
+        )
+        .expect("json");
+        assert!(
+            !messaging.tools.is_empty(),
+            "messaging tools must have schema entries"
+        );
+        assert!(
+            messaging.tools.len() < all.tools.len(),
+            "the filter must drop other clusters"
+        );
+        assert!(
+            messaging
+                .tools
+                .keys()
+                .all(|name| crate::tool_cluster(name) == Some("messaging")),
+            "{:?}",
+            messaging.tools.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(messaging.global_optional, all.global_optional);
+
+        let unchanged: ToolSchemasResponse = serde_json::from_str(
+            &tooling_schemas_query(&ctx, "format=json".to_string()).expect("format only"),
+        )
+        .expect("json");
+        assert_eq!(unchanged.tools.len(), all.tools.len());
+
+        let err = tooling_schemas_query(&ctx, "cluster=nope".to_string()).expect_err("unknown");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(err.message.contains("known clusters"), "{err:?}");
+        let err = tooling_schemas_query(&ctx, "project=x".to_string()).expect_err("unknown key");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn metrics_query_window_is_reported_back_not_applied() {
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let plain: serde_json::Value =
+            serde_json::from_str(&tooling_metrics_query(&ctx, "format=json".to_string()).unwrap())
+                .unwrap();
+        assert!(plain.get("window_seconds").is_none());
+        let windowed: serde_json::Value =
+            serde_json::from_str(&tooling_metrics_query(&ctx, "window=60".to_string()).unwrap())
+                .unwrap();
+        assert_eq!(windowed["window_seconds"], 60);
+        assert_eq!(windowed["window_applied"], false);
+        assert!(
+            windowed["window_note"]
+                .as_str()
+                .unwrap()
+                .contains("tooling/recent")
+        );
+        let core: serde_json::Value = serde_json::from_str(
+            &tooling_metrics_core_query(&ctx, "window=60".to_string()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(core["window_applied"], false);
+        let err = tooling_metrics_query(&ctx, "window=abc".to_string()).expect_err("bad window");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        let err = tooling_metrics_query(&ctx, "project=x".to_string()).expect_err("unknown key");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
     }
 
     #[test]
