@@ -622,12 +622,14 @@ mod tests {
         assert_eq!(outcome.actions_skipped, 1);
     }
 
-    /// **NEGATIVE**: a finding whose objects all have unrecognized
-    /// kinds yields an empty DROP sequence → skipped.
+    /// **NEGATIVE**: the fixer revalidates against the live database before
+    /// it mutates, so a stale finding is never trusted. With no real residue
+    /// on disk (only the marker), a finding that names an unrecognized kind
+    /// yields nothing to drop and is skipped without error.
     #[test]
     fn fixer_skips_when_drop_sequence_empty() {
         let td = TempDir::new().unwrap();
-        let (db_path, _marker) = setup_db(&td, true, true);
+        let (db_path, _marker) = setup_db(&td, false, true);
         let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__fts_empty_seq");
         let finding = LegacyFtsResidueFinding {
             db_path,
@@ -640,6 +642,27 @@ mod tests {
         let outcome = fix(&ctx, &finding).expect("fix");
         assert_eq!(outcome.actions_taken, 0);
         assert_eq!(outcome.actions_skipped, 1);
+    }
+
+    /// **NEGATIVE**: a stale finding cannot make the fixer skip real residue:
+    /// revalidation finds the on-disk objects and drops them.
+    #[test]
+    fn fixer_revalidates_stale_finding_against_real_residue() {
+        let td = TempDir::new().unwrap();
+        let (db_path, _marker) = setup_db(&td, true, true);
+        let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__fts_stale_finding");
+        let finding = LegacyFtsResidueFinding {
+            db_path: db_path.clone(),
+            v3_marker_path: td.path().join("search_index").join(V3_MANAGED_MARKER),
+            residual_objects: vec![ResidualObject {
+                kind: "index".into(), // unrecognized; the real residue is a table + trigger
+                name: "fts_messages_idx".into(),
+            }],
+        };
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 1);
+        assert_eq!(outcome.actions_skipped, 0);
+        assert!(detect(std::slice::from_ref(&db_path)).is_empty());
     }
 
     /// Positive: fix() drops the residual objects from a real DB.
@@ -668,8 +691,9 @@ mod tests {
         );
     }
 
-    /// Idempotence: re-running on an already-clean DB drops nothing
-    /// (DROP ... IF EXISTS is a no-op) and doesn't error.
+    /// Idempotence: re-running on an already-clean DB mutates nothing and
+    /// doesn't error. The fixer revalidates before it mutates, so the second
+    /// run finds no residue and is skipped instead of issuing no-op DROPs.
     #[test]
     fn fixer_is_idempotent_on_clean_db() {
         let td = TempDir::new().unwrap();
@@ -678,17 +702,14 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-
         let ctx1 = ctx_for(&td, "2026-05-20T00-00-00Z__fts_idem_1");
         assert_eq!(fix(&ctx1, &finding).expect("fix 1").actions_taken, 1);
-
-        // Second run with the SAME finding (stale residual list):
-        // every DROP ... IF EXISTS is now a no-op. fix() still
-        // reports actions_taken: 1 because it issued the Op::DbExec,
-        // but the DB is unchanged and the detector stays clean.
+        // Second run with the SAME (now stale) finding: revalidation sees a
+        // clean database, so nothing is executed and the run is skipped.
         let ctx2 = ctx_for(&td, "2026-05-20T00-00-00Z__fts_idem_2");
         let outcome2 = fix(&ctx2, &finding).expect("fix 2");
-        assert_eq!(outcome2.actions_taken, 1);
+        assert_eq!(outcome2.actions_taken, 0);
+        assert_eq!(outcome2.actions_skipped, 1);
         assert!(detect(std::slice::from_ref(&db_path)).is_empty());
     }
 }
