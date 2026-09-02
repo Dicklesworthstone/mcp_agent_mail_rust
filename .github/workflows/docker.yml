@@ -28,7 +28,7 @@ on:
         required: false
         default: 'main'
       sibling_ref:
-        description: 'Git ref for sibling deps (frankensearch, asupersync, ...) — tag, branch, or full 40-char SHA only.'
+        description: 'Git ref for the beads_rust sibling (frankensearch is pinned by FRANKENSEARCH_COMMIT in the Dockerfile) — tag, branch, or full 40-char SHA only.'
         required: false
         default: 'main'
       tag_suffix:

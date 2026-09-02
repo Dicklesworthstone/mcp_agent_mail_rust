@@ -143,6 +143,52 @@ mod container_release_contract {
         Ok(())
     }
 
+    /// Extract the value assigned to `key` on the first line that starts with
+    /// `prefix` (after trimming), e.g. `FRANKENSEARCH_COMMIT: <sha>` in a
+    /// workflow or `ARG FRANKENSEARCH_COMMIT=<sha>` in a Dockerfile.
+    fn assigned_value<'a>(text: &'a str, prefix: &str, separator: char) -> Option<&'a str> {
+        text.lines().map(str::trim).find_map(|line| {
+            line.strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix(separator))
+                .map(str::trim)
+        })
+    }
+
+    /// The source Dockerfile must build against the exact frankensearch
+    /// revision dist.yml pins. Cloning the sibling at a floating ref broke
+    /// every `docker build` once the live frankensearch tree moved to a
+    /// newer asupersync than the rest of the workspace can follow.
+    #[test]
+    fn source_dockerfile_pins_frankensearch_to_the_dist_commit() {
+        let dist = read(".github/workflows/dist.yml");
+        let dockerfile = read("Dockerfile");
+
+        let dist_commit = assigned_value(&dist, "FRANKENSEARCH_COMMIT", ':')
+            .expect("dist.yml declares FRANKENSEARCH_COMMIT");
+        let dockerfile_commit = assigned_value(&dockerfile, "ARG FRANKENSEARCH_COMMIT", '=')
+            .expect("Dockerfile declares ARG FRANKENSEARCH_COMMIT");
+
+        assert_eq!(dist_commit.len(), 40, "dist.yml commit must be a full SHA");
+        assert!(
+            dist_commit.bytes().all(|b| b.is_ascii_hexdigit()),
+            "dist.yml commit must be hex"
+        );
+        assert_eq!(
+            dockerfile_commit, dist_commit,
+            "Dockerfile ARG FRANKENSEARCH_COMMIT drifted from dist.yml"
+        );
+        assert!(
+            dockerfile.contains(
+                "frankensearch.git \"${FRANKENSEARCH_COMMIT}\" /build/frankensearch-rel-0332"
+            ),
+            "Dockerfile must clone frankensearch at FRANKENSEARCH_COMMIT, not a sibling ref"
+        );
+        assert!(
+            !dockerfile.contains("frankensearch.git \"${SIBLING_REF}\""),
+            "frankensearch must not float with SIBLING_REF"
+        );
+    }
+
     #[test]
     fn release_container_workflow_is_artifact_bound_and_multi_arch() {
         let workflow = read(".github/workflows/docker.yml");

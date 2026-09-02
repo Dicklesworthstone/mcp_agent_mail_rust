@@ -12,12 +12,19 @@
 # ---------------
 #   AM_REF       Git ref of mcp_agent_mail_rust to build (default: main).
 #                Pass a tag, branch, or commit SHA.
-#   SIBLING_REF  Preferred Git ref for every sibling dependency (default: main).
-#                Release builds pass the release tag here first, so sibling
-#                repos with matching tags are pinned instead of floating.
+#   SIBLING_REF  Preferred Git ref for the beads_rust sibling (default: main).
+#                Release builds pass the release tag here first, so a sibling
+#                repo with a matching tag is pinned instead of floating.
 #   SIBLING_FALLBACK_REF
 #                Fallback ref when SIBLING_REF is a branch/tag that a sibling
 #                repo does not publish yet (default: main).
+#   FRANKENSEARCH_COMMIT
+#                Immutable frankensearch revision this workspace builds
+#                against. It is NOT a floating sibling: the live frankensearch
+#                tree already moved to an asupersync the rest of the workspace
+#                cannot follow, so its default here must stay identical to
+#                `FRANKENSEARCH_COMMIT` in .github/workflows/dist.yml
+#                (tests/docs_drift_ci.rs pins the two together).
 #
 # Examples
 # --------
@@ -73,6 +80,8 @@ WORKDIR /build
 ARG AM_REF=main
 ARG SIBLING_REF=main
 ARG SIBLING_FALLBACK_REF=main
+# Keep in lock-step with FRANKENSEARCH_COMMIT in .github/workflows/dist.yml.
+ARG FRANKENSEARCH_COMMIT=3bbfd8c664062f8304e7a790c51794671f9214dc
 
 # Clone the sibling checkouts that /Cargo.toml still resolves through a `path`,
 # so they're cached separately from the project source layer.
@@ -143,7 +152,7 @@ RUN set -eu; \
         git clone --depth 1 --branch "$selected_ref" "$@" "$url" "$dest"; \
       fi; \
     }; \
-    clone_at https://github.com/Dicklesworthstone/frankensearch.git "${SIBLING_REF}" /build/frankensearch-rel-0332; \
+    clone_at https://github.com/Dicklesworthstone/frankensearch.git "${FRANKENSEARCH_COMMIT}" /build/frankensearch-rel-0332; \
     clone_at https://github.com/Dicklesworthstone/beads_rust.git    "${SIBLING_REF}" /build/beads_rust
 
 # Clone the project source at the requested ref. We clone (rather than COPY
