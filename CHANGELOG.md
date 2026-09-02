@@ -92,6 +92,19 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ### Fixed
 
+- **`am doctor` reads a resting WAL family without touching it (br-s9d8a).**
+  A database left with WAL/SHM sidecars by a canonical or Python-era writer
+  and no live owner could not be read by the guarded read-only canonical
+  opener: WAL recovery needs a writable SHM, the read-only SHM policy turned
+  the open into SQLITE_CANTOPEN, and because the open was lazy the failure
+  surfaced only on the first query, so no fallback ever ran. `am doctor
+  health` reported a healthy mailbox as "Database open probe failed" and
+  the fixers' read-only probes declined. The opener now probes eagerly so a
+  refusal is an open error; a family with no WAL and no SHM is opened
+  `immutable=1` (no locks, no sidecars created beside it); and both the
+  doctor's canonical source selection and the explicit-offline candidate
+  fall back to the same private staged copy the health probe uses, which
+  applies the WAL inside the copy and leaves the source bytes alone.
 - **Startup self-heal can diagnose index-only corruption again instead of
   reconstructing from the archive.** Recovery admission arms the durable
   circuit breaker with a provisional failure before an attempt runs. The

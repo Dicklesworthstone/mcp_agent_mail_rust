@@ -58613,6 +58613,103 @@ startup_timeout_sec = 42
         }
     }
 
+    /// br-s9d8a: a sidecar-free family left with WAL frames and an SHM by a
+    /// canonical writer (a Python-era mailbox at rest) cannot be opened by
+    /// the guarded read-only opener; the doctor's canonical source selection
+    /// must fall back to the private staged copy, see the WAL-only rows there,
+    /// and leave every source-family byte untouched.
+    #[test]
+    fn doctor_canonical_source_selection_stages_a_resting_wal_family() {
+        // The shape the guarded read-only opener cannot serve: a WAL with
+        // committed frames whose SHM is missing (a crashed canonical writer,
+        // or a family copied without its SHM). A read-only SHM cannot be
+        // rebuilt, so the open fails eagerly and the selection must fall back
+        // to the private staged copy, which applies the WAL in the copy.
+        let writer_dir = tempfile::tempdir().expect("writer tempdir");
+        let writer_path = writer_dir.path().join("resting-wal.sqlite3");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("resting-wal.sqlite3");
+        {
+            let conn =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(writer_path.display().to_string())
+                    .expect("seed canonical WAL family");
+            conn.execute_raw("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+                .expect("enable WAL without automatic checkpoints");
+            conn.execute_raw(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t (id) VALUES (7);",
+            )
+            .expect("commit WAL-only rows");
+            for suffix in ["", "-wal"] {
+                let from = mcp_agent_mail_core::disk::sqlite_sidecar_path(&writer_path, suffix);
+                let to = mcp_agent_mail_core::disk::sqlite_sidecar_path(&db_path, suffix);
+                std::fs::copy(&from, &to).expect("copy family member while the writer is open");
+            }
+        }
+        let wal = mcp_agent_mail_core::disk::sqlite_sidecar_path(&db_path, "-wal");
+        assert!(
+            std::fs::metadata(&wal).is_ok_and(|m| m.len() > 32),
+            "fixture must keep committed WAL frames"
+        );
+        assert!(
+            mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(
+                &db_path, "probe"
+            )
+            .is_err(),
+            "a WAL without its SHM is the shape the guarded read-only opener cannot serve"
+        );
+        let family_before: std::collections::BTreeMap<String, Vec<u8>> =
+            std::fs::read_dir(dir.path())
+                .expect("list family")
+                .flatten()
+                .map(|e| {
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        std::fs::read(e.path()).expect("read"),
+                    )
+                })
+                .collect();
+
+        let opened = doctor_open_canonical_source_for_diagnostic(&db_path, "resting WAL test")
+            .expect("a resting WAL family must be readable through the staged copy");
+        assert!(
+            matches!(
+                opened.kind,
+                DoctorCanonicalDiagnosticSourceKind::StagedFamilyCopy
+            ),
+            "sidecar-free resting WAL family must fall back to the staged copy"
+        );
+        let rows = opened
+            .conn
+            .query_sync("SELECT id FROM t", &[])
+            .expect("read WAL-only rows from the staged copy");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 7);
+        drop(opened);
+
+        let family_after: std::collections::BTreeMap<String, Vec<u8>> =
+            std::fs::read_dir(dir.path())
+                .expect("list family")
+                .flatten()
+                .map(|e| {
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        std::fs::read(e.path()).expect("read"),
+                    )
+                })
+                .collect();
+        assert_eq!(
+            family_after.keys().collect::<Vec<_>>(),
+            family_before.keys().collect::<Vec<_>>(),
+            "the staged read must not add or remove source-family files"
+        );
+        for (name, bytes) in &family_before {
+            if name.ends_with("-shm") {
+                continue; // SQLite reader bookkeeping may move a read mark (br-00gl8)
+            }
+            assert_eq!(&family_after[name], bytes, "{name} must be byte-identical");
+        }
+    }
+
     #[test]
     fn doctor_attempt_index_only_reindex_declines_non_index_corruption() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -416,7 +416,29 @@ impl DoctorDbReadCandidate {
                 open_error: None,
                 physical_corruption_error: None,
             },
-            Err(error) => Self::unavailable(target_path, error.to_string()),
+            Err(error) => {
+                // A resting WAL family (zero-length WAL + stale SHM after a
+                // canonical truncating checkpoint, or WAL frames without a live
+                // owner) cannot be recovered through a read-only SHM. The
+                // private staged copy is the same physical bytes with the WAL
+                // applied in the copy, never the live FrankenSQLite primary
+                // (br-s9d8a).
+                match crate::doctor_open_staged_family_copy_canonical(target_path, operation) {
+                    Ok(opened) => Self {
+                        target_path: target_path.to_path_buf(),
+                        connection: Some(opened.conn),
+                        _retained_snapshot: None,
+                        _retained_staged_family: opened._staged_family,
+                        source_kind: DoctorDbReadSourceKind::StagedFamilyCopy,
+                        open_error: None,
+                        physical_corruption_error: None,
+                    },
+                    Err(staged_error) => Self::unavailable(
+                        target_path,
+                        format!("{error}; staged family copy failed: {staged_error}"),
+                    ),
+                }
+            }
         }
     }
 
