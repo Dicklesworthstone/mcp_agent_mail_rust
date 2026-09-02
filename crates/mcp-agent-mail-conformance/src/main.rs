@@ -197,8 +197,7 @@ fn absolute_path(path: &Path) -> Result<PathBuf, std::io::Error> {
 fn default_regen_output_path() -> PathBuf {
     let now_ms: u128 = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_millis());
     let pid = std::process::id();
 
     std::env::temp_dir()

@@ -166,7 +166,7 @@ pub struct ExpectedError {
     #[serde(default)]
     pub code: Option<String>,
 
-    /// Stable error_type category, if the server provides it (optional).
+    /// Stable `error_type` category, if the server provides it (optional).
     #[serde(default)]
     pub error_type: Option<String>,
 

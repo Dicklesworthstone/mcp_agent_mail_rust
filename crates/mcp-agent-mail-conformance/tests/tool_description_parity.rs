@@ -25,7 +25,7 @@ struct FixtureTool {
     input_schema: Value,
 }
 
-/// Root structure of tool_descriptions.json fixture.
+/// Root structure of `tool_descriptions.json` fixture.
 #[derive(Debug, Deserialize)]
 struct ToolDescriptionsFixture {
     tools: Vec<FixtureTool>,
@@ -78,7 +78,7 @@ fn get_rust_tools() -> Vec<Tool> {
 
     let tools_result = router
         .handle_tools_list(
-            &McpContext::new(cx.clone(), 1),
+            &McpContext::new(cx, 1),
             ListToolsParams::default(),
             None,
         )
@@ -267,8 +267,7 @@ fn compare_input_schemas(tool_name: &str, expected: &Value, actual: &Value) -> V
                 let act_type = normalized_property_type(act_prop);
                 if exp_type != act_type {
                     errors.push(format!(
-                        "[{tool_name}].{prop_name} type mismatch: expected={:?}, actual={:?}",
-                        exp_type, act_type
+                        "[{tool_name}].{prop_name} type mismatch: expected={exp_type:?}, actual={act_type:?}"
                     ));
                 }
             }
@@ -286,7 +285,7 @@ fn compare_input_schemas(tool_name: &str, expected: &Value, actual: &Value) -> V
 /// description. Historical wording is diagnostic only, not product authority.
 #[test]
 fn supported_tools_have_rust_owned_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let fixture = load_fixture();
     let rust_tools = get_rust_tools();
@@ -345,11 +344,11 @@ fn supported_tools_have_rust_owned_descriptions() {
     for rust_name in rust_by_name.keys() {
         if !fixture_names.contains(rust_name.as_str()) {
             if TOOLS_WITHOUT_SHARED_DESCRIPTION_FIXTURE.contains(&rust_name.as_str()) {
-                eprintln!("RUST-NATIVE: {} (not in Python fixture)", rust_name);
+                eprintln!("RUST-NATIVE: {rust_name} (not in Python fixture)");
                 passed += 1;
                 continue;
             }
-            eprintln!("EXTRA: {} (unexpected Rust-only tool)", rust_name);
+            eprintln!("EXTRA: {rust_name} (unexpected Rust-only tool)");
             failures.push(format!(
                 "[{rust_name}] EXTRA: registered in Rust but not declared Rust-native"
             ));
@@ -369,7 +368,7 @@ fn supported_tools_have_rust_owned_descriptions() {
 /// Test that all shared tools have matching inputSchema property names and required arrays.
 #[test]
 fn tool_input_schemas_preserve_supported_compatibility() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let fixture = load_fixture();
     let rust_tools = get_rust_tools();
@@ -506,7 +505,7 @@ fn schema_compatibility_allows_relaxed_requirements_but_rejects_new_ones() {
 /// Verify the Rust tool count matches expected shared tool count.
 #[test]
 fn rust_tool_count_matches_expected() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let rust_tools = get_rust_tools();
     let fixture = load_fixture();
@@ -549,10 +548,10 @@ fn rust_tool_count_matches_expected() {
 // Per-cluster tests for granular reporting
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Infrastructure cluster: health_check, ensure_project, install_precommit_guard, uninstall_precommit_guard
+/// Infrastructure cluster: `health_check`, `ensure_project`, `install_precommit_guard`, `uninstall_precommit_guard`
 #[test]
 fn cluster_infrastructure_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&[
         "health_check",
         "ensure_project",
@@ -564,7 +563,7 @@ fn cluster_infrastructure_descriptions() {
 /// Identity cluster: registration, lifecycle, lookup, and roster tools.
 #[test]
 fn cluster_identity_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&[
         "register_agent",
         "create_agent_identity",
@@ -575,11 +574,11 @@ fn cluster_identity_descriptions() {
     ]);
 }
 
-/// Messaging cluster: send_message, reply_message, fetch_inbox, fetch_inbox_events,
-/// get_message_delivery_receipt, mark_message_read, acknowledge_message
+/// Messaging cluster: `send_message`, `reply_message`, `fetch_inbox`, `fetch_inbox_events`,
+/// `get_message_delivery_receipt`, `mark_message_read`, `acknowledge_message`
 #[test]
 fn cluster_messaging_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&[
         "send_message",
         "reply_message",
@@ -591,10 +590,10 @@ fn cluster_messaging_descriptions() {
     ]);
 }
 
-/// Contacts cluster: request_contact, respond_contact, list_contacts, set_contact_policy
+/// Contacts cluster: `request_contact`, `respond_contact`, `list_contacts`, `set_contact_policy`
 #[test]
 fn cluster_contacts_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&[
         "request_contact",
         "respond_contact",
@@ -603,10 +602,10 @@ fn cluster_contacts_descriptions() {
     ]);
 }
 
-/// File reservations cluster: file_reservation_paths, release_file_reservations, renew_file_reservations, force_release_file_reservation
+/// File reservations cluster: `file_reservation_paths`, `release_file_reservations`, `renew_file_reservations`, `force_release_file_reservation`
 #[test]
 fn cluster_file_reservations_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&[
         "file_reservation_paths",
         "release_file_reservations",
@@ -615,17 +614,17 @@ fn cluster_file_reservations_descriptions() {
     ]);
 }
 
-/// Search cluster: search_messages, summarize_thread
+/// Search cluster: `search_messages`, `summarize_thread`
 #[test]
 fn cluster_search_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&["search_messages", "summarize_thread"]);
 }
 
-/// Macros cluster: macro_start_session, macro_prepare_thread, macro_file_reservation_cycle, macro_contact_handshake
+/// Macros cluster: `macro_start_session`, `macro_prepare_thread`, `macro_file_reservation_cycle`, `macro_contact_handshake`
 #[test]
 fn cluster_macros_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&[
         "macro_start_session",
         "macro_prepare_thread",
@@ -634,10 +633,10 @@ fn cluster_macros_descriptions() {
     ]);
 }
 
-/// Product bus cluster: ensure_product, products_link, search_messages_product, fetch_inbox_product, summarize_thread_product
+/// Product bus cluster: `ensure_product`, `products_link`, `search_messages_product`, `fetch_inbox_product`, `summarize_thread_product`
 #[test]
 fn cluster_product_bus_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&[
         "ensure_product",
         "products_link",
@@ -647,10 +646,10 @@ fn cluster_product_bus_descriptions() {
     ]);
 }
 
-/// Build slots cluster: acquire_build_slot, renew_build_slot, release_build_slot
+/// Build slots cluster: `acquire_build_slot`, `renew_build_slot`, `release_build_slot`
 #[test]
 fn cluster_build_slots_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&[
         "acquire_build_slot",
         "renew_build_slot",
@@ -695,10 +694,8 @@ fn check_cluster_descriptions(tool_names: &[&str]) {
         }
     }
 
-    if !failures.is_empty() {
-        panic!(
-            "Cluster description coverage failures:\n\n{}",
-            failures.join("\n\n")
-        );
-    }
+    assert!(failures.is_empty(), 
+        "Cluster description coverage failures:\n\n{}",
+        failures.join("\n\n")
+    )
 }

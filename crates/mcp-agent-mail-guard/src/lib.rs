@@ -194,20 +194,19 @@ pub fn resolve_hooks_dir(repo_path: &Path) -> GuardResult<PathBuf> {
 
 fn env_allows_global_hookspath() -> bool {
     std::env::var("AGENT_MAIL_GUARD_ALLOW_GLOBAL_HOOKSPATH")
-        .map(|v| {
+        .is_ok_and(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "t" | "yes" | "y"
             )
         })
-        .unwrap_or(false)
 }
 
 /// Whether an install into a `core.hooksPath` configured at `level` must be
 /// refused. Repo-scoped levels (local/worktree/app) are always honored;
 /// machine-wide levels (global/system/XDG) are refused unless explicitly
 /// allowed (GH#223).
-fn hookspath_level_refuses_install(level: git2::ConfigLevel, allow_global: bool) -> bool {
+const fn hookspath_level_refuses_install(level: git2::ConfigLevel, allow_global: bool) -> bool {
     let repo_scoped = matches!(
         level,
         git2::ConfigLevel::Local | git2::ConfigLevel::Worktree | git2::ConfigLevel::App
@@ -215,7 +214,7 @@ fn hookspath_level_refuses_install(level: git2::ConfigLevel, allow_global: bool)
     !repo_scoped && !allow_global
 }
 
-fn config_level_label(level: git2::ConfigLevel) -> &'static str {
+const fn config_level_label(level: git2::ConfigLevel) -> &'static str {
     match level {
         git2::ConfigLevel::System => "system",
         git2::ConfigLevel::XDG => "XDG",
@@ -363,11 +362,11 @@ fn render_chain_runner_script(hook_name: &str) -> String {
         "import stat".to_string(),
         "import subprocess".to_string(),
         "from pathlib import Path".to_string(),
-        "".to_string(),
+        String::new(),
         "HOOK_DIR = Path(__file__).parent".to_string(),
         format!("RUN_DIR = HOOK_DIR / 'hooks.d' / '{hook_name}'"),
         format!("ORIG = HOOK_DIR / '{hook_name}.orig'"),
-        "".to_string(),
+        String::new(),
         "def _is_exec(p: Path) -> bool:".to_string(),
         "    try:".to_string(),
         "        st = p.stat()".to_string(),
@@ -375,7 +374,7 @@ fn render_chain_runner_script(hook_name: &str) -> String {
             .to_string(),
         "    except Exception:".to_string(),
         "        return False".to_string(),
-        "".to_string(),
+        String::new(),
         "def _list_execs() -> list[Path]:".to_string(),
         "    if not RUN_DIR.exists() or not RUN_DIR.is_dir():".to_string(),
         "        return []".to_string(),
@@ -389,7 +388,7 @@ fn render_chain_runner_script(hook_name: &str) -> String {
         "        except Exception:".to_string(),
         "            pass".to_string(),
         "    return items".to_string(),
-        "".to_string(),
+        String::new(),
         "def _run_child(path: Path, * , stdin_bytes=None):".to_string(),
         "    # On Windows, prefer 'python' for .py plugins to avoid PATHEXT reliance.".to_string(),
         "    try:".to_string(),
@@ -402,14 +401,14 @@ fn render_chain_runner_script(hook_name: &str) -> String {
         "        print(f'mcp-agent-mail chain-runner: could not execute {path.name}: {exc}', file=sys.stderr)"
             .to_string(),
         "        return 126".to_string(),
-        "".to_string(),
+        String::new(),
         "def _remember_failure(path: Path, rc: int, first_failure: int) -> int:".to_string(),
         "    if rc == 0:".to_string(),
         "        return first_failure".to_string(),
         "    print(f'mcp-agent-mail chain-runner: {path.name} exited with status {rc}', file=sys.stderr)"
             .to_string(),
         "    return first_failure or rc".to_string(),
-        "".to_string(),
+        String::new(),
     ];
 
     if hook_name == "pre-push" {
@@ -420,7 +419,7 @@ fn render_chain_runner_script(hook_name: &str) -> String {
             "for exe in _list_execs():".to_string(),
             "    rc = _run_child(exe, stdin_bytes=stdin_bytes)".to_string(),
             "    first_failure = _remember_failure(exe, rc, first_failure)".to_string(),
-            "".to_string(),
+            String::new(),
             "if ORIG.exists():".to_string(),
             "    rc = _run_child(ORIG, stdin_bytes=stdin_bytes)".to_string(),
             "    first_failure = _remember_failure(ORIG, rc, first_failure)".to_string(),
@@ -432,7 +431,7 @@ fn render_chain_runner_script(hook_name: &str) -> String {
             "for exe in _list_execs():".to_string(),
             "    rc = _run_child(exe)".to_string(),
             "    first_failure = _remember_failure(exe, rc, first_failure)".to_string(),
-            "".to_string(),
+            String::new(),
             "if ORIG.exists():".to_string(),
             "    rc = _run_child(ORIG)".to_string(),
             "    first_failure = _remember_failure(ORIG, rc, first_failure)".to_string(),
@@ -443,6 +442,8 @@ fn render_chain_runner_script(hook_name: &str) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
+// One template per hook is more readable than a dozen concatenated fragments.
+#[allow(clippy::too_many_lines)]
 fn render_guard_plugin_script(project: &str, hook_name: &str) -> String {
     // Real guard plugin: checks active file reservations against staged changes (pre-commit)
     // or pushed commits (pre-push).
@@ -1512,6 +1513,7 @@ pub fn uninstall_guard(repo: &Path) -> GuardResult<()> {
 
     let hooks_dir = resolve_hooks_dir(repo)?;
 
+    #[allow(clippy::items_after_statements)]
     fn has_other_plugins(run_dir: &Path) -> bool {
         let Ok(rd) = std::fs::read_dir(run_dir) else {
             return false;
@@ -1521,8 +1523,7 @@ pub fn uninstall_guard(repo: &Path) -> GuardResult<()> {
             p.is_file()
                 && p.file_name()
                     .and_then(|n| n.to_str())
-                    .map(|n| n != PLUGIN_FILE_NAME)
-                    .unwrap_or(false)
+                    .is_some_and(|n| n != PLUGIN_FILE_NAME)
         })
     }
 
@@ -1556,11 +1557,9 @@ pub fn uninstall_guard(repo: &Path) -> GuardResult<()> {
                 continue;
             }
 
+            let _ = std::fs::remove_file(&hook_path);
             if orig_path.exists() {
-                let _ = std::fs::remove_file(&hook_path);
                 std::fs::rename(&orig_path, &hook_path)?;
-            } else {
-                let _ = std::fs::remove_file(&hook_path);
             }
             let _ = std::fs::remove_file(hooks_dir.join(format!("{hook_name}.cmd")));
             let _ = std::fs::remove_file(hooks_dir.join(format!("{hook_name}.ps1")));
@@ -1590,13 +1589,11 @@ pub fn guard_status(repo: &Path) -> GuardResult<GuardStatus> {
 
     let pre_commit_present = pre_commit_path.exists()
         && std::fs::read_to_string(&pre_commit_path)
-            .map(|c| c.contains("mcp-agent-mail"))
-            .unwrap_or(false);
+            .is_ok_and(|c| c.contains("mcp-agent-mail"));
 
     let pre_push_present = pre_push_path.exists()
         && std::fs::read_to_string(&pre_push_path)
-            .map(|c| c.contains("mcp-agent-mail"))
-            .unwrap_or(false);
+            .is_ok_and(|c| c.contains("mcp-agent-mail"));
 
     // Check if worktrees are enabled (core.hooksPath set)
     let worktrees_enabled = {
@@ -1619,13 +1616,12 @@ pub fn guard_status(repo: &Path) -> GuardResult<GuardStatus> {
 
 fn is_truthy_value(value: Option<&str>) -> bool {
     value
-        .map(|v| {
+        .is_some_and(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "t" | "yes" | "y"
             )
         })
-        .unwrap_or(false)
 }
 
 fn is_guard_gated_from_values(
@@ -1788,7 +1784,6 @@ fn check_path_conflicts(
                         "[agent-mail guard] warning: invalid glob pattern '{}' in reservation by {}: {err}",
                         res.normalized_pattern, res.agent_name
                     );
-                    continue;
                 }
             }
         }
@@ -1984,13 +1979,12 @@ fn read_active_reservations_from_archive(
             continue;
         }
 
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue, // Skip unreadable files
+        // Skip unreadable files and invalid JSON.
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
         };
-        let val: serde_json::Value = match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(_) => continue, // Skip invalid JSON
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
         };
 
         // Skip released reservations.
@@ -2014,10 +2008,12 @@ fn read_active_reservations_from_archive(
                     // Not expired, generate an ISO string or just let it pass.
                     // For simplicity, we can pass a future ISO string to `is_expired` or
                     // bypass the string logic. It's cleaner to format it.
-                    use chrono::TimeZone;
-                    match chrono::Utc
-                        .timestamp_opt(num / 1_000_000, ((num % 1_000_000) * 1000) as u32)
-                    {
+                    let nanos = u32::try_from((num % 1_000_000) * 1000).unwrap_or(0);
+                    match <chrono::Utc as chrono::TimeZone>::timestamp_opt(
+                        &chrono::Utc,
+                        num / 1_000_000,
+                        nanos,
+                    ) {
                         chrono::LocalResult::Single(dt) => dt.to_rfc3339(),
                         _ => continue,
                     }
@@ -2034,8 +2030,7 @@ fn read_active_reservations_from_archive(
         let pattern = val["path_pattern"]
             .as_str()
             .or_else(|| val["path"].as_str())
-            .map(str::trim)
-            .unwrap_or("")
+            .map_or("", str::trim)
             .to_string();
         if pattern.is_empty() {
             continue;
@@ -2047,8 +2042,7 @@ fn read_active_reservations_from_archive(
         let agent_name = val["agent_name"]
             .as_str()
             .or_else(|| val["agent"].as_str())
-            .map(str::trim)
-            .unwrap_or("")
+            .map_or("", str::trim)
             .to_string();
         if agent_name.is_empty() {
             continue;
@@ -2073,7 +2067,6 @@ fn read_active_reservations_from_archive(
 
 fn released_ts_marks_record_released(value: &serde_json::Value) -> bool {
     match value {
-        serde_json::Value::Null => false,
         serde_json::Value::Number(number) => number.as_f64().is_some_and(|value| value > 0.0),
         serde_json::Value::String(text) => {
             let trimmed = text.trim();
@@ -2097,7 +2090,7 @@ fn released_ts_marks_record_released(value: &serde_json::Value) -> bool {
             // are treated as valid release markers.
             true
         }
-        // Fail-closed: unexpected JSON types are NOT treated as released.
+        // Fail-closed: null and unexpected JSON types are NOT treated as released.
         _ => false,
     }
 }
@@ -2153,12 +2146,12 @@ fn guard_run_git_with_retry(mut cmd: Command) -> std::io::Result<std::process::O
             #[cfg(unix)]
             {
                 use std::os::unix::process::ExitStatusExt;
-                matches!(output.status.signal(), Some(11) | Some(7))
+                matches!(output.status.signal(), Some(11 | 7))
             }
             #[cfg(not(unix))]
             false
         };
-        let code_segfault = matches!(output.status.code(), Some(139) | Some(135));
+        let code_segfault = matches!(output.status.code(), Some(139 | 135));
         if !signal_segfault && !code_segfault {
             return Ok(output);
         }
@@ -2328,7 +2321,7 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
                 rev_list.status.code().unwrap_or(-1),
                 stderr.trim(),
             ))));
-        };
+        }
     }
 
     // Deduplicate
@@ -2340,6 +2333,9 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
 /// Parse NUL-delimited `git diff --name-status -z` output.
 ///
 /// Format: `STATUS\0path\0` for most, `Rxx\0old\0new\0` for renames.
+// Fallible by contract: the fuzz harness and the git callers treat parse failure as
+// a guard error, even though the current parser tolerates every byte sequence.
+#[allow(clippy::unnecessary_wraps)]
 fn parse_name_status_z(raw: &[u8]) -> GuardResult<Vec<String>> {
     let text = String::from_utf8_lossy(raw);
     let parts: Vec<&str> = text.split('\0').collect();
@@ -2427,13 +2423,10 @@ mod tests {
         if path == pattern {
             return true;
         }
-        match globset::GlobBuilder::new(pattern)
+        globset::GlobBuilder::new(pattern)
             .literal_separator(true)
             .build()
-        {
-            Ok(g) => g.compile_matcher().is_match(path),
-            Err(_) => false,
-        }
+            .is_ok_and(|g| g.compile_matcher().is_match(path))
     }
 
     /// Two paths/patterns conflict if:
@@ -3070,12 +3063,12 @@ mod tests {
     #[test]
     fn check_path_conflicts_root_reservation_blocks_everything() {
         let reservations = vec![FileReservationRecord {
-            path_pattern: "".to_string(),
+            path_pattern: String::new(),
             agent_name: "OtherAgent".to_string(),
             exclusive: true,
             expires_ts: "2099-01-01T00:00:00Z".to_string(),
             released_ts: None,
-            normalized_pattern: "".to_string(),
+            normalized_pattern: String::new(),
             has_glob: false,
         }];
 
@@ -3306,7 +3299,7 @@ mod tests {
     #[test]
     fn parse_name_status_empty() {
         let paths = parse_name_status_z(b"").expect("parse");
-        assert!(paths.is_empty());
+        assert_eq!(paths, [] as [std::string::String; 0]);
     }
 
     // -----------------------------------------------------------------------
@@ -3335,8 +3328,7 @@ mod tests {
         assert!(
             paths.contains(&"old_name.py".to_string())
                 || paths.contains(&"new_name.py".to_string()),
-            "staged paths should include rename: {:?}",
-            paths
+            "staged paths should include rename: {paths:?}"
         );
     }
 
@@ -3444,7 +3436,7 @@ mod tests {
         run_git(&repo_dir, &["init", "-q"]);
 
         let paths = get_staged_paths(&repo_dir).expect("staged paths");
-        assert!(paths.is_empty());
+        assert_eq!(paths, [] as [std::string::String; 0]);
     }
 
     // -----------------------------------------------------------------------
@@ -3648,7 +3640,7 @@ mod tests {
         // Delete push: local sha is all zeros. Should not attempt git and should return empty.
         let stdin_lines = "refs/heads/main 0000000000000000000000000000000000000000 refs/heads/main 1234567890abcdef1234567890abcdef12345678\n";
         let paths = get_push_paths(&repo_dir, stdin_lines).expect("push paths");
-        assert!(paths.is_empty());
+        assert_eq!(paths, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -4259,7 +4251,7 @@ mod tests {
     /// GH#228: an archive-resolution ERROR (permissions) must not be coerced
     /// into the "no project matches → allow" path. chmod 000 on
     /// `storage/projects` previously turned a must-block commit into a silent
-    /// allow; it must now fail closed (and honor AGENT_MAIL_GUARD_MODE=warn).
+    /// allow; it must now fail closed (and honor `AGENT_MAIL_GUARD_MODE=warn`).
     #[cfg(unix)]
     #[test]
     fn guard_plugin_archive_resolution_error_fails_closed() {
@@ -4562,7 +4554,7 @@ mod tests {
 
     /// Discover every distinct Python interpreter available on this machine so
     /// the guard-matching e2e test can exercise the generated script under each
-    /// one. This is what catches the CPython 3.14 `fnmatch.translate` fail-open
+    /// one. This is what catches the `CPython` 3.14 `fnmatch.translate` fail-open
     /// regression: `python_executable()` above only returns the first `python3`
     /// (often 3.13), whereas the guard must remain correct on 3.9-3.14+.
     fn python_executables() -> Vec<String> {
@@ -4598,7 +4590,7 @@ mod tests {
     }
 
     /// The generated guard must NOT depend on `fnmatch.translate`'s output
-    /// format (a CPython implementation detail that changed in 3.14 and broke
+    /// format (a `CPython` implementation detail that changed in 3.14 and broke
     /// the guard's regex surgery, causing a security-relevant fail-open). This
     /// unit test runs without Python and locks in the structural fix.
     #[test]
@@ -4790,8 +4782,8 @@ mod tests {
         );
     }
 
-    /// GH#224: AGENT_MAIL_BYPASS must work even when AGENT_NAME is unset
-    /// (previously the AGENT_NAME requirement exited 2 before the bypass was
+    /// GH#224: `AGENT_MAIL_BYPASS` must work even when `AGENT_NAME` is unset
+    /// (previously the `AGENT_NAME` requirement exited 2 before the bypass was
     /// consulted).
     #[test]
     fn guard_plugin_bypass_works_without_agent_name() {
@@ -4830,7 +4822,7 @@ mod tests {
         );
     }
 
-    /// When active reservations exist and neither AGENT_NAME nor a pane
+    /// When active reservations exist and neither `AGENT_NAME` nor a pane
     /// identity is available, the guard stays fail-closed in block mode
     /// (exit 2, naming the bypass) but honors warn mode (exit 0).
     #[test]

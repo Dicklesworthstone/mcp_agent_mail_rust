@@ -510,16 +510,14 @@ impl ToolFilterEnvGuard {
             if key == "AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS" {
                 let value = case_env
                     .get(key)
-                    .map(String::as_str)
-                    .unwrap_or(TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS);
+                    .map_or(TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS, String::as_str);
                 unsafe {
                     std::env::set_var(key, value);
                 }
             } else if key == "AM_SEARCH_ENGINE" {
                 let value = case_env
                     .get(key)
-                    .map(String::as_str)
-                    .unwrap_or(TEST_SEARCH_ENGINE);
+                    .map_or(TEST_SEARCH_ENGINE, String::as_str);
                 unsafe {
                     std::env::set_var(key, value);
                 }
@@ -1287,7 +1285,7 @@ fn insert_test_message(
     let message_id = next_test_message_id();
     let created_ts = mcp_agent_mail_db::now_micros();
     let recipients_json = serde_json::json!({
-        "to": [recipient.name.clone()],
+        "to": [recipient.name],
         "cc": [],
         "bcc": [],
     })
@@ -1543,7 +1541,7 @@ fn resolved_value_rewrites_legacy_fixture_repo_paths() {
 
 #[test]
 fn run_fixtures_against_rust_server_router() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let env = setup_fixture_env();
     let storage_root = env.tmp.path().join("archive");
     let fixtures = &env.fixtures;
@@ -2214,7 +2212,7 @@ fn run_fixtures_against_rust_server_router() {
 
     let ensure_params = CallToolParams {
         name: "ensure_project".to_string(),
-        arguments: Some(serde_json::json!({ "human_key": project_key.clone() })),
+        arguments: Some(serde_json::json!({ "human_key": project_key })),
         meta: None,
     };
     let ensure_result = router
@@ -2260,7 +2258,7 @@ fn run_fixtures_against_rust_server_router() {
     let send_params = CallToolParams {
         name: "send_message".to_string(),
         arguments: Some(serde_json::json!({
-            "project_key": project_key.clone(),
+            "project_key": project_key,
             "sender_name": "BoldCastle",
             "to": ["CalmRiver"],
             "cc": ["QuietMeadow"],
@@ -2326,14 +2324,14 @@ fn run_fixtures_against_rust_server_router() {
     let fetch_params = CallToolParams {
         name: "fetch_inbox".to_string(),
         arguments: Some(serde_json::json!({
-            "project_key": project_key.clone(),
+            "project_key": project_key,
             "agent_name": "CalmRiver",
         })),
         meta: None,
     };
     let fetch_result = router
         .handle_tools_call(
-            &McpContext::new(cx.clone(), req_id),
+            &McpContext::new(cx, req_id),
             fetch_params,
             SessionState::new(),
             None,
@@ -2351,7 +2349,7 @@ fn run_fixtures_against_rust_server_router() {
 
 #[test]
 fn tool_filter_profiles_match_fixtures() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let fixtures = load_tool_filter_fixtures();
 
     for case in fixtures.cases {
@@ -2433,7 +2431,7 @@ fn rust_native_fixture_coverage_matches_classification() {
 
 #[test]
 fn run_rust_native_fixtures_against_rust_server_router() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let env = setup_fixture_env();
     let fixtures = load_rust_native_tool_fixtures();
     let router = &env.router;
@@ -2644,7 +2642,7 @@ fn run_rust_native_fixtures_against_rust_server_router() {
 
 #[test]
 fn lifecycle_tools_preserve_authorization_roster_and_permanent_deregistration_contract() {
-    let _lock = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let env = setup_fixture_env();
     let project_path = env.tmp.path().join("lifecycle-project");
     std::fs::create_dir_all(&project_path).expect("create lifecycle fixture project");
@@ -2787,7 +2785,7 @@ fn lifecycle_tools_preserve_authorization_roster_and_permanent_deregistration_co
 
 #[test]
 fn topic_tools_persist_filter_and_inherit_topics_through_the_router() {
-    let _lock = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let env = setup_fixture_env();
     let project_path = env.tmp.path().join("topic-project");
     std::fs::create_dir_all(&project_path).expect("create topic fixture project");
@@ -2951,7 +2949,7 @@ fn topic_tools_persist_filter_and_inherit_topics_through_the_router() {
 
 #[test]
 fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("backpressure-shedding.sqlite3");
@@ -3044,7 +3042,7 @@ fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
     };
     let critical_result = router
         .handle_tools_call(
-            &McpContext::new(cx.clone(), req_id),
+            &McpContext::new(cx, req_id),
             critical_params,
             SessionState::new(),
             None,
@@ -3066,7 +3064,7 @@ fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
 
 #[test]
 fn product_bus_tools_end_to_end_across_linked_projects() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("product-bus-e2e.sqlite3");
@@ -3506,7 +3504,7 @@ fn fixture_tool_happy_and_failure_shape_coverage() {
 
 #[test]
 fn handwritten_tool_failure_cases_match_rust_router() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let env = setup_fixture_env();
     let cx = Cx::for_testing();
     let budget = Budget::INFINITE;
@@ -3534,7 +3532,7 @@ fn handwritten_tool_failure_cases_match_rust_router() {
 
 #[test]
 fn force_release_file_reservation_happy_path_is_covered() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("force-release-happy.sqlite3");
@@ -3641,7 +3639,7 @@ fn force_release_file_reservation_happy_path_is_covered() {
 
 #[test]
 fn generated_non_object_arguments_are_rejected_for_every_tool() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let env = setup_fixture_env();
     let cx = Cx::for_testing();
     let budget = Budget::INFINITE;
@@ -3711,7 +3709,7 @@ fn fixture_resource_identity_coverage() {
 
 #[test]
 fn resource_query_router_projects_limit_and_contains_are_honored() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("projects-query-routing.sqlite3");
@@ -3797,7 +3795,7 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
     };
     let zero_result = router
         .handle_resources_read(
-            &McpContext::new(cx.clone(), 1),
+            &McpContext::new(cx, 1),
             &zero_params,
             SessionState::new(),
             None,
@@ -3817,7 +3815,7 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
 
 #[test]
 fn resource_query_router_projects_invalid_query_values_surface_errors() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("projects-query-errors.sqlite3");
@@ -3876,10 +3874,7 @@ fn resource_query_router_projects_invalid_query_values_surface_errors() {
                     .unwrap_or("<non-text>");
                 assert!(
                     text.contains(expected_substr),
-                    "expected query validation error containing {:?}, got successful content {:?} for URI {}",
-                    expected_substr,
-                    text,
-                    uri
+                    "expected query validation error containing {expected_substr:?}, got successful content {text:?} for URI {uri}"
                 );
             }
         }
@@ -3888,7 +3883,7 @@ fn resource_query_router_projects_invalid_query_values_surface_errors() {
 
 #[test]
 fn resource_router_error_cases_missing_projects_invalid_uris_and_bad_params() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("resource-error-cases.sqlite3");
@@ -3965,10 +3960,7 @@ fn resource_router_error_cases_missing_projects_invalid_uris_and_bad_params() {
                     .unwrap_or("<non-text>");
                 assert!(
                     contains_any(text),
-                    "expected one of {:?}, got successful content {:?} for URI {}",
-                    expected_any,
-                    text,
-                    uri
+                    "expected one of {expected_any:?}, got successful content {text:?} for URI {uri}"
                 );
             }
         }
@@ -3983,7 +3975,7 @@ fn resource_router_error_cases_missing_projects_invalid_uris_and_bad_params() {
 fn toon_format_resolution_json_fallback() {
     // When TOON_BIN is empty (no encoder available), format requests should
     // resolve to JSON or produce a TOON envelope with fallback data.
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("toon-test.sqlite3");
@@ -4016,7 +4008,7 @@ fn toon_format_resolution_json_fallback() {
         meta: None,
     };
     let result = router.handle_tools_call(
-        &McpContext::new(cx.clone(), 1),
+        &McpContext::new(cx, 1),
         params,
         SessionState::new(),
         None,
@@ -4041,7 +4033,7 @@ fn toon_format_resolution_json_fallback() {
 #[test]
 fn llm_mode_parameter_accepted_by_tools() {
     // Verify that tools accepting llm_mode parameter don't reject it.
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("llm-test.sqlite3");
@@ -4167,7 +4159,7 @@ fn llm_mode_parameter_accepted_by_tools() {
         meta: None,
     };
     let result = router.handle_tools_call(
-        &McpContext::new(cx.clone(), req_id),
+        &McpContext::new(cx, req_id),
         params,
         SessionState::new(),
         None,
