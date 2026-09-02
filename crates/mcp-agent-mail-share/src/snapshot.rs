@@ -102,6 +102,7 @@ const KNOWN_TABLES: &[KnownTable] = &[
             "project_id",
             "sender_id",
             "thread_id",
+            "topic",
             "subject",
             "body_md",
             "importance",

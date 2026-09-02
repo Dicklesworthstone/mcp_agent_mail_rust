@@ -5636,7 +5636,8 @@ pub async fn update_project_sibling_status(
 // Database generation identity (br-n8qh6)
 // =============================================================================
 
-const SELECT_DB_GENERATION_SQL: &str = "SELECT generation_id FROM db_identity WHERE singleton = 0";
+pub(crate) const SELECT_DB_GENERATION_SQL: &str =
+    "SELECT generation_id FROM db_identity WHERE singleton = 0";
 
 /// Read this database's generation identity token, seeding it on first access.
 ///

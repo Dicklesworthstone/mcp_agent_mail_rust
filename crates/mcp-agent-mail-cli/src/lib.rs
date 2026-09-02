@@ -15279,6 +15279,16 @@ impl CanonicalSnapshotSource {
         }
     }
 
+    /// Materialize a private copy the async pool can open without touching
+    /// the live inode.
+    ///
+    /// GH#297: this must be a schema-preserving image (`VACUUM INTO` through
+    /// the engine that owns the family), not the share-format snapshot. The
+    /// share snapshot rebuilds each table from the export column list, which
+    /// lags the live migrations (`messages.topic`, ...) and drops
+    /// `db_identity`; every pool-backed CLI read then failed with
+    /// `column not found: m.topic` on a migrated mailbox and could not carry
+    /// the mailbox's Search V3 identity.
     fn materialize_for_async_read_pool(self, context: &str) -> CliResult<Self> {
         if matches!(
             self.kind,
@@ -15289,7 +15299,7 @@ impl CanonicalSnapshotSource {
         }
         let reported_path = self.reported_path;
         let actual_path = self.actual_path;
-        Self::live_snapshot(reported_path, &actual_path, context)
+        Self::live_full_sqlite_snapshot(reported_path, &actual_path, context)
     }
 }
 
@@ -15671,7 +15681,8 @@ fn open_db_async_canonical_read_with_database_url(
     pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
     pool_cfg.storage_root = Some(storage_root);
     let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
-        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;
+        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
+        .with_search_identity_path(&source.reported_path().display().to_string());
     Ok(CanonicalReadPool {
         pool,
         _source: source,
@@ -15695,7 +15706,8 @@ fn open_db_sync_async_canonical_read_with_database_url(
     pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
     pool_cfg.storage_root = Some(storage_root);
     let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
-        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;
+        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
+        .with_search_identity_path(&source.reported_path().display().to_string());
     Ok(CanonicalReadDbPool {
         conn,
         pool,
@@ -15727,7 +15739,8 @@ fn open_db_sync_async_canonical_read_best_effort_with_database_url(
     pool_cfg.run_migrations = false;
     pool_cfg.warmup_connections = 0;
     let pool = mcp_agent_mail_db::create_pool_without_startup_init(&pool_cfg)
-        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;
+        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
+        .with_search_identity_path(&source.reported_path().display().to_string());
     Ok(CanonicalReadDbPool {
         conn,
         pool,
@@ -26410,9 +26423,9 @@ enum DoctorCanonicalDiagnosticSourceKind {
     /// A private byte-for-byte copy of a Franken-admitted live family (main
     /// file plus every recovery sidecar, minus the FrankenSQLite namespace
     /// sidecars) staged by the same mechanism `am robot health` uses, opened
-    /// by canonical SQLite on the copy only. Selected when the logical export
-    /// fails on a family the guarded offline opener must refuse. Physical
-    /// checks on it are authoritative for the bytes that were copied.
+    /// by canonical SQLite on the copy only. The preferred source for a
+    /// Franken-admitted family (GH#293): physical checks on it are
+    /// authoritative for the bytes that were copied.
     StagedFamilyCopy,
     /// Canonical SQLite's true read-only flags on a sidecarless
     /// engine-exclusive or offline database.
@@ -26560,17 +26573,19 @@ fn sqlite_family_is_franken_admitted(db_path: &Path) -> bool {
 
 /// Select a lock-safe source for a canonical doctor diagnostic.
 ///
-/// A Franken-admitted mailbox is first exported through a guarded read-only
-/// FrankenSQLite connection and canonical SQLite sees only that private inode.
-/// When that logical export fails on a Franken-admitted family (a hot live
-/// WAL family with a live owner, where the guarded offline canonical opener
-/// must refuse a cross-engine open), the family is staged as a private
-/// byte-for-byte copy and canonical SQLite opens that copy — the exact path
-/// `am robot health` trusts. A sidecarless engine-exclusive/offline database
-/// keeps using the guarded canonical read-only opener as its authority.
-/// Partial namespace authority, hard links, and ambiguous live families fail
-/// closed in the engine-facing branches; the staged copy never runs an engine
-/// against the live inode at all.
+/// A Franken-admitted mailbox is first staged as a private byte-for-byte
+/// copy (main file plus recovery sidecars, minus the namespace sidecars) and
+/// canonical SQLite opens that copy — the exact path `am robot health`
+/// trusts, and the only source whose physical checks are authoritative for
+/// the live bytes. Only when staging fails is the family exported logically
+/// through a guarded read-only FrankenSQLite connection; that image was
+/// rebuilt by the primary engine, so canonical findings on it are never
+/// authoritative in either direction (GH#293). A sidecarless
+/// engine-exclusive/offline database keeps using the guarded canonical
+/// read-only opener as its authority. Partial namespace authority, hard
+/// links, and ambiguous live families fail closed in the engine-facing
+/// branches; the staged copy never runs an engine against the live inode at
+/// all.
 fn doctor_open_canonical_source_for_diagnostic(
     db_path: &Path,
     operation: &str,
@@ -26585,13 +26600,30 @@ fn doctor_open_canonical_source_for_diagnostic(
     }
 
     // The namespace pair decides the strategy. A Franken-admitted family is
-    // exported logically (and, failing that, staged) so canonical SQLite never
-    // opens the live inode. A family without namespace authority is opened
-    // directly by the guarded offline canonical opener: that proves the live
-    // physical b-tree itself, whereas a logical export (which the dispatching
-    // opener would happily produce for such a family) can only ever be
-    // "inconclusive" about the physical file.
+    // staged as a private byte-for-byte copy (and, failing that, exported
+    // logically) so canonical SQLite never opens the live inode. A family
+    // without namespace authority is opened directly by the guarded offline
+    // canonical opener: that proves the live physical b-tree itself.
+    //
+    // GH#293: the staged copy comes FIRST. A logical export is rebuilt by the
+    // primary engine — every index in it is re-sorted with the primary
+    // engine's collation semantics — so canonical SQLite's verdict on it says
+    // nothing about the live bytes in either direction: a pass cannot prove
+    // the physical b-tree healthy (already "inconclusive"), and a failure
+    // (`row N missing from index idx_agents_project_name_nocase`) only shows
+    // the exporting engine ordered a `COLLATE NOCASE` index differently from
+    // canonical SQLite. Treating that failure as "CONFIRMED corruption" sent
+    // canonical-ok mailboxes into reconstruct → refuse-promotion dead-ends.
     let franken_admitted = sqlite_family_is_franken_admitted(db_path);
+    let staged_error = if franken_admitted {
+        match doctor_open_staged_family_copy_canonical(db_path, operation) {
+            Ok(opened) => return Ok(opened),
+            Err(error) => error.to_string(),
+        }
+    } else {
+        "skipped because the family carries no FrankenSQLite namespace sidecars, so the guarded offline canonical opener is its authority".to_string()
+    };
+
     let live_error = if franken_admitted {
         match CanonicalSnapshotSource::live_full_sqlite_snapshot(
             db_path.to_path_buf(),
@@ -26618,15 +26650,6 @@ fn doctor_open_canonical_source_for_diagnostic(
         }
     } else {
         "skipped because the family carries no FrankenSQLite namespace sidecars; the guarded offline canonical opener proves the physical b-tree directly".to_string()
-    };
-
-    let staged_error = if franken_admitted {
-        match doctor_open_staged_family_copy_canonical(db_path, operation) {
-            Ok(opened) => return Ok(opened),
-            Err(error) => error.to_string(),
-        }
-    } else {
-        "skipped because the family carries no FrankenSQLite namespace sidecars, so the guarded offline canonical opener is its authority".to_string()
     };
 
     match mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(db_path, operation)
@@ -30933,6 +30956,28 @@ fn doctor_classify_canonical_pragma_check(
     }
 }
 
+/// GH#293: a probe that ran on a logical export (`VACUUM INTO` produced by the
+/// primary engine) can prove nothing about the live bytes. Its indexes were
+/// re-sorted by the exporting engine, so a canonical "row N missing from index
+/// idx_agents_project_name_nocase" there is the exporting engine's `COLLATE
+/// NOCASE` ordering, not on-disk damage. Demote such a finding to
+/// can't-answer; only a staged physical copy or a direct offline open may
+/// confirm corruption.
+fn doctor_demote_logical_export_corruption(
+    logical_export: bool,
+    authority: CanonicalProbeAuthority,
+) -> CanonicalProbeAuthority {
+    match authority {
+        CanonicalProbeAuthority::Corruption(detail) if logical_export => {
+            CanonicalProbeAuthority::CannotAnswer(format!(
+                "canonical checks on a private logical export (rebuilt by the primary engine) \
+                 reported damage that cannot be attributed to the live physical b-tree: {detail}"
+            ))
+        }
+        other => other,
+    }
+}
+
 /// Fold one probe's authority into the running cross-check state: an
 /// authoritative corruption short-circuits the battery (returns `Some`), a
 /// can't-answer records the first inconclusive reason, and a pass is a no-op.
@@ -31001,6 +31046,9 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
 
     // First inconclusive reason wins; an authoritative corruption short-circuits.
     let mut inconclusive_reason: Option<String> = None;
+    // GH#293: a corruption finding on a logical export can never confirm
+    // live-byte corruption (see `doctor_open_canonical_source_for_diagnostic`).
+    let logical_export = opened.is_live_logical_snapshot();
 
     // 1 + 2: quick_check then full integrity_check.
     for kind in [
@@ -31011,7 +31059,10 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
             |sql| conn.query_sync(sql, &[]).map_err(|e| e.to_string()),
             kind,
         );
-        let authority = doctor_classify_canonical_pragma_check(kind, rows);
+        let authority = doctor_demote_logical_export_corruption(
+            logical_export,
+            doctor_classify_canonical_pragma_check(kind, rows),
+        );
         if let Some(verdict) = doctor_fold_probe_authority(authority, &mut inconclusive_reason) {
             return verdict;
         }
@@ -31035,6 +31086,7 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
             doctor_classify_canonical_probe_error(&error.to_string(), "foreign_key_check")
         }
     };
+    let fk_authority = doctor_demote_logical_export_corruption(logical_export, fk_authority);
     if let Some(verdict) = doctor_fold_probe_authority(fk_authority, &mut inconclusive_reason) {
         return verdict;
     }
@@ -31052,6 +31104,8 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
             doctor_classify_canonical_probe_error(&error.to_string(), "schema-table probe")
         }
     };
+    let schema_authority =
+        doctor_demote_logical_export_corruption(logical_export, schema_authority);
     if let Some(verdict) = doctor_fold_probe_authority(schema_authority, &mut inconclusive_reason) {
         return verdict;
     }
@@ -31062,9 +31116,12 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
     if let Some(fts_table) = doctor_legacy_fts_tables_canonical(conn).first() {
         let quoted = fts_table.replace('"', "\"\"");
         if let Err(error) = conn.query_sync(&format!("SELECT count(*) FROM \"{quoted}\""), &[]) {
-            let fts_authority = doctor_classify_canonical_probe_error(
-                &error.to_string(),
-                &format!("fts probe ({fts_table})"),
+            let fts_authority = doctor_demote_logical_export_corruption(
+                logical_export,
+                doctor_classify_canonical_probe_error(
+                    &error.to_string(),
+                    &format!("fts probe ({fts_table})"),
+                ),
             );
             if let Some(verdict) =
                 doctor_fold_probe_authority(fts_authority, &mut inconclusive_reason)
@@ -56925,6 +56982,79 @@ startup_timeout_sec = 42
     }
 
     // --- br-bvq1x.1.3 (A3): canonical double-probe cross-check ---
+
+    /// GH#293: a Franken-admitted family is cross-checked on a staged
+    /// physical copy, which is authoritative in both directions, rather than
+    /// on a logical export the primary engine rebuilt. A healthy admitted
+    /// mailbox therefore proves `Healthy` (and startup fails open) instead of
+    /// dead-ending in an inconclusive precautionary reconstruct.
+    #[test]
+    fn doctor_canonical_double_probe_stages_a_physical_copy_for_an_admitted_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("admitted.sqlite3");
+        seed_project_only_db(&db_path, "admitted", "/admitted");
+        // Admit the family through the runtime engine so it carries the
+        // persistent namespace pair a live mailbox carries.
+        {
+            let conn = mcp_agent_mail_db::DbConn::open_file(&db_path.display().to_string())
+                .expect("admit fixture through the runtime engine");
+            conn.query_sync("SELECT COUNT(*) AS n FROM projects", &[])
+                .expect("read through the runtime engine");
+            mcp_agent_mail_db::close_db_conn(conn, "admit fixture");
+        }
+        assert!(
+            sqlite_family_is_franken_admitted(&db_path),
+            "precondition: the fixture must carry the FrankenSQLite namespace pair"
+        );
+
+        let opened = doctor_open_canonical_source_for_diagnostic(&db_path, "gh293")
+            .expect("select a canonical diagnostic source");
+        assert!(
+            matches!(
+                opened.kind,
+                DoctorCanonicalDiagnosticSourceKind::StagedFamilyCopy
+            ),
+            "an admitted family must be inspected on a staged physical copy first"
+        );
+        drop(opened);
+
+        assert_eq!(
+            doctor_canonical_double_probe(&db_path),
+            DoctorCanonicalCrossCheck::Healthy,
+            "a healthy admitted mailbox must prove healthy on its staged copy"
+        );
+    }
+
+    /// GH#293: canonical findings on a logical export can never confirm
+    /// live-byte corruption — the exporting engine re-sorted every index.
+    #[test]
+    fn doctor_logical_export_corruption_is_never_authoritative() {
+        let detail =
+            "integrity_check reported: row 79 missing from index idx_agents_project_name_nocase";
+        match doctor_demote_logical_export_corruption(
+            true,
+            CanonicalProbeAuthority::Corruption(detail.to_string()),
+        ) {
+            CanonicalProbeAuthority::CannotAnswer(reason) => {
+                assert!(reason.contains("logical export"), "{reason}");
+                assert!(reason.contains(detail), "{reason}");
+            }
+            CanonicalProbeAuthority::Pass | CanonicalProbeAuthority::Corruption(_) => {
+                panic!("a logical-export corruption finding must demote to can't-answer")
+            }
+        }
+        assert!(matches!(
+            doctor_demote_logical_export_corruption(
+                false,
+                CanonicalProbeAuthority::Corruption(detail.to_string()),
+            ),
+            CanonicalProbeAuthority::Corruption(_)
+        ));
+        assert!(matches!(
+            doctor_demote_logical_export_corruption(true, CanonicalProbeAuthority::Pass),
+            CanonicalProbeAuthority::Pass
+        ));
+    }
 
     #[test]
     fn doctor_canonical_double_probe_proves_healthy_db() {

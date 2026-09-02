@@ -638,8 +638,18 @@ struct IndexMetaFingerprint {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct BackfillState {
     schema_version: u32,
+    /// The canonical mailbox path the index was built for. A snapshot-backed
+    /// reader records the mailbox it snapshotted, never its temp copy.
     db_path: String,
+    /// Stat-level fingerprint of the file at `db_path` when the marker was
+    /// written. A cheap skip hint only: an inode change is NOT a database
+    /// identity change (GH#295) — `db_generation` decides that.
     db_fingerprint: BackfillDbFingerprint,
+    /// `db_identity.generation_id` of the database the index was built from:
+    /// the stable identity that survives same-path file replacement and
+    /// changes exactly when the database is re-created (GH#295, GH#296).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    db_generation: Option<String>,
     db_stats: MessageStats,
     #[serde(default)]
     message_watermark: MessageWatermark,
@@ -708,10 +718,12 @@ fn read_backfill_state(bridge: &TantivyBridge) -> Option<BackfillState> {
     (state.schema_version == BACKFILL_STATE_SCHEMA_VERSION).then_some(state)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_backfill_state(
     bridge: &TantivyBridge,
     db_path: &str,
     fingerprint: BackfillDbFingerprint,
+    db_generation: Option<&str>,
     db_stats: MessageStats,
     message_watermark: MessageWatermark,
     index_meta_fingerprint: Option<IndexMetaFingerprint>,
@@ -728,6 +740,7 @@ fn write_backfill_state(
         schema_version: BACKFILL_STATE_SCHEMA_VERSION,
         db_path: db_path.to_string(),
         db_fingerprint: fingerprint,
+        db_generation: db_generation.map(str::to_string),
         db_stats,
         message_watermark,
         index_meta_fingerprint,
@@ -1171,8 +1184,23 @@ pub(crate) fn resolve_search_sqlite_path_from_database_url(db_url: &str) -> Opti
 /// interrupted runs.
 ///
 /// Returns `(indexed_count, skipped_count)` where `skipped_count` is always 0.
-#[allow(clippy::too_many_lines)]
 pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
+    backfill_from_db_as(db_url, None)
+}
+
+/// [`backfill_from_db`] for a reader whose file at `db_url` is a private
+/// materialization of the mailbox at `identity_path` (GH#297).
+///
+/// The rows are read from `db_url`, but the persisted backfill marker and
+/// every identity comparison use `identity_path`: a snapshot-backed `am robot
+/// search` must never stamp `storage_root/search_index/backfill_state.json`
+/// with its temp path, which made every later server search report the shared
+/// index as belonging to a vanished `/tmp/...` file.
+#[allow(clippy::too_many_lines)]
+pub fn backfill_from_db_as(
+    db_url: &str,
+    identity_path: Option<&str>,
+) -> Result<(usize, usize), String> {
     const FETCH_BATCH_SIZE: i64 = 500;
     const COMMIT_EVERY_BATCHES: usize = 8;
 
@@ -1189,11 +1217,14 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         db_url.to_string()
     };
     let db_path = &db_path_owned;
+    let identity_path = identity_path.unwrap_or(db_path);
 
-    let db_fingerprint = sqlite_file_backfill_fingerprint(db_path);
+    // The marker describes the file at the identity path (the mailbox), even
+    // when the rows are read from a private copy of it.
+    let db_fingerprint = sqlite_file_backfill_fingerprint(identity_path);
     let initial_index_fingerprint = index_meta_fingerprint(&bridge);
     if let (Some(fingerprint), Some(state)) = (db_fingerprint, read_backfill_state(&bridge))
-        && state.db_path == *db_path
+        && state.db_path == identity_path
         && state.db_fingerprint == fingerprint
         && state.index_meta_fingerprint == initial_index_fingerprint
     {
@@ -1237,20 +1268,27 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         return Ok((0, 0));
     }
 
+    let db_generation = crate::queries::db_generation_id_conn(&conn);
     let message_watermark = fetch_db_message_watermark(&conn)?;
     let current_index_fingerprint = index_meta_fingerprint(&bridge);
-    if let Some(state) = read_backfill_state(&bridge)
-        && state.db_path == *db_path
+    let previous_state = read_backfill_state(&bridge);
+    if let Some(state) = previous_state.as_ref()
+        && state.db_path == identity_path
+        && state.db_generation == db_generation
         && state.message_watermark == message_watermark
         && state.index_meta_fingerprint == current_index_fingerprint
     {
+        // GH#295: same mailbox, same generation, same content — the file was
+        // merely replaced (VACUUM INTO + rename, backup restore, recovery
+        // promotion). Refresh the stat hint in place; the index is current.
         if let Some(fingerprint) = db_fingerprint
             && state.db_fingerprint != fingerprint
         {
             write_backfill_state(
                 &bridge,
-                db_path,
+                identity_path,
                 fingerprint,
+                db_generation.as_deref(),
                 state.db_stats,
                 state.message_watermark,
                 current_index_fingerprint,
@@ -1271,7 +1309,27 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
 
     let db_stats = fetch_db_message_stats(&conn)?;
     let index_stats = fetch_index_message_stats(&bridge)?;
-    let plan = choose_backfill_plan(&conn, db_stats, index_stats)?;
+    // A marker written for another mailbox path or another generation of
+    // this mailbox means the indexed documents belong to a database whose
+    // numeric ids cannot be trusted against this one, however similar the
+    // counts look: rebuild instead of appending.
+    let identity_changed = previous_state.as_ref().is_some_and(|state| {
+        state.db_path != identity_path || state.db_generation != db_generation
+    });
+    let plan = if identity_changed && index_stats.count > 0 {
+        tracing::info!(
+            identity_path,
+            previous_db_path = previous_state.as_ref().map(|state| state.db_path.as_str()),
+            previous_generation = previous_state
+                .as_ref()
+                .and_then(|state| state.db_generation.as_deref()),
+            current_generation = db_generation.as_deref(),
+            "backfill: database identity changed since the last backfill; rebuilding the index"
+        );
+        BackfillPlan::FullRebuild
+    } else {
+        choose_backfill_plan(&conn, db_stats, index_stats)?
+    };
 
     if matches!(plan, BackfillPlan::Skip) {
         tracing::info!(
@@ -1281,11 +1339,12 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
             index_max_id = index_stats.max_id,
             "backfill: Tantivy index already up-to-date, skipping"
         );
-        if let Some(fingerprint) = sqlite_file_backfill_fingerprint(db_path) {
+        if let Some(fingerprint) = sqlite_file_backfill_fingerprint(identity_path) {
             write_backfill_state(
                 &bridge,
-                db_path,
+                identity_path,
                 fingerprint,
+                db_generation.as_deref(),
                 db_stats,
                 message_watermark,
                 current_index_fingerprint,
@@ -1426,11 +1485,12 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     );
 
     let final_index_stats = fetch_index_message_stats(&bridge).unwrap_or(db_stats);
-    if let Some(fingerprint) = sqlite_file_backfill_fingerprint(db_path) {
+    if let Some(fingerprint) = sqlite_file_backfill_fingerprint(identity_path) {
         write_backfill_state(
             &bridge,
-            db_path,
+            identity_path,
             fingerprint,
+            db_generation.as_deref(),
             db_stats,
             message_watermark,
             index_meta_fingerprint(&bridge),

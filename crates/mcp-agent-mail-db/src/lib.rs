@@ -183,6 +183,14 @@ pub mod search_v3 {
     pub fn backfill_from_db(_db_url: &str) -> Result<(usize, usize), String> {
         Ok((0, 0))
     }
+
+    /// Tantivy is disabled, so lexical backfill is a deterministic no-op.
+    pub fn backfill_from_db_as(
+        _db_url: &str,
+        _identity_path: Option<&str>,
+    ) -> Result<(usize, usize), String> {
+        Ok((0, 0))
+    }
 }
 
 // Semantic/hybrid search modules (feature-gated)

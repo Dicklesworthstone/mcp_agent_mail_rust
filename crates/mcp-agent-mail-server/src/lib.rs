@@ -1082,42 +1082,13 @@ impl Drop for StartupSearchBackfillResetGuard {
 }
 
 fn record_startup_search_backfill_completion(config: &mcp_agent_mail_core::Config) {
-    // GH#261: record completion under the SAME identity the health probe and
-    // query gate compare against — the live pool's `sqlite_identity_key()`
-    // ("path@generation"). Recording the bare URL-derived path marked the
-    // daemon's own (and only) database as "active for a different database"
-    // forever, permanently degrading every search to the plain-SQL fallback
-    // whenever the startup backfill completed before the first search (the
-    // common boot order for an always-on daemon). Resolve — or create — the
-    // same env-shaped pool the request handlers use so the recorded key
-    // carries the matching cache generation.
-    if !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
-        let mut db_config = DbPoolConfig::from_env();
-        db_config.database_url = config.database_url.clone();
-        db_config.storage_root = Some(config.storage_root.clone());
-        match mcp_agent_mail_db::pool::get_or_reuse_compatible_memory_pool(&db_config) {
-            Ok(pool) => {
-                if let Err(error) =
-                    mcp_agent_mail_db::search_service::note_startup_lexical_backfill_completed_for_pool(
-                        &pool,
-                    )
-                {
-                    tracing::warn!(
-                        error = %error,
-                        "[startup-search] failed to record lexical bootstrap completion"
-                    );
-                }
-                return;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "[startup-search] could not resolve the live pool for lexical bootstrap \
-                     completion; falling back to database-url identity"
-                );
-            }
-        }
-    }
+    // GH#261 / GH#296: completion is recorded under the database's own
+    // Search V3 identity (`<path>@<db_identity generation>`), which the
+    // request handlers' pools derive identically whatever pool cache
+    // generation they carry. The earlier attempt to "resolve the live pool"
+    // here minted a throwaway file-backed pool with its own generation, so
+    // the recorded key never matched the handlers' and the daemon reported
+    // its only database as foreign whenever this thread won the boot race.
     if let Err(error) = mcp_agent_mail_db::search_service::note_startup_lexical_backfill_completed(
         &config.database_url,
     ) {
