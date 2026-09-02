@@ -16046,40 +16046,66 @@ pub async fn insert_system_agent(
     let tracked = tracked(&*conn);
     let found = match run_with_mvcc_retry(cx, "insert_system_agent", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
-
-        let insert_sql = "INSERT INTO agents \
-            (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt) \
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-            ON CONFLICT(project_id, name) DO NOTHING";
-        let insert_params = [
-            Value::BigInt(project_id),
-            Value::Text(name.to_string()),
-            Value::Text(program.to_string()),
-            Value::Text(model.to_string()),
-            Value::Text(task_description.to_string()),
-            Value::BigInt(now),
-            Value::BigInt(now),
-            Value::Text("auto".to_string()),
-            Value::Text("auto".to_string()),
-            Value::BigInt(0),
-        ];
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
-        );
-
+        // Agent names are unique per project case-insensitively through the
+        // v10b index `agents(project_id, name COLLATE NOCASE)`. An upsert with
+        // `ON CONFLICT(project_id, name)` names a different conflict target
+        // (binary collation), so a case-variant of an existing name is not
+        // routed to DO NOTHING and the index raises a UNIQUE failure instead.
+        // Select first under the index's collation, insert only when absent,
+        // and treat a UNIQUE failure from a concurrent insert as "exists".
         let select_sql = "SELECT id, project_id, name, program, model, task_description, \
                           inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                           registration_token, retired_at \
                           FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                           ORDER BY id ASC LIMIT 1";
         let select_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
-        let rows = try_in_tx!(
+        let mut rows = try_in_tx!(
             cx,
             &tracked,
             map_sql_outcome(traw_query(cx, &tracked, select_sql, &select_params).await)
         );
+        if rows.is_empty() {
+            let insert_sql = "INSERT INTO agents \
+                (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt) \
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            let insert_params = [
+                Value::BigInt(project_id),
+                Value::Text(name.to_string()),
+                Value::Text(program.to_string()),
+                Value::Text(model.to_string()),
+                Value::Text(task_description.to_string()),
+                Value::BigInt(now),
+                Value::BigInt(now),
+                Value::Text("auto".to_string()),
+                Value::Text("auto".to_string()),
+                Value::BigInt(0),
+            ];
+            match map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await) {
+                Outcome::Ok(_) => {}
+                Outcome::Err(error)
+                    if error
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains("unique constraint failed") => {}
+                Outcome::Err(error) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(error);
+                }
+                Outcome::Cancelled(r) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Panicked(p);
+                }
+            }
+            rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(cx, &tracked, select_sql, &select_params).await)
+            );
+        }
         let Some(found) = rows.first().map(decode_agent_row_indexed) else {
             rollback_tx(cx, &tracked).await;
             return Outcome::Err(DbError::Internal(format!(
