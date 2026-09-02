@@ -560,10 +560,10 @@ pub fn encrypt_with_age(input: &Path, recipients: &[String]) -> ShareResult<std:
 
     require_real_crypto_file(input, "encryption input")?;
 
-    let output = input.with_extension(
-        input
-            .extension().map_or_else(|| "age".to_string(), |e| format!("{}.age", e.to_string_lossy())),
-    );
+    let output = input.with_extension(input.extension().map_or_else(
+        || "age".to_string(),
+        |e| format!("{}.age", e.to_string_lossy()),
+    ));
 
     validate_crypto_output_path(&output, "encrypted output")?;
 

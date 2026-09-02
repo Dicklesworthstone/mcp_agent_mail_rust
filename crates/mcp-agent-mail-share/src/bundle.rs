@@ -1423,8 +1423,7 @@ fn collect_entries_ctx(
 #[cfg(unix)]
 fn file_mode(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map_or(0o644, |m| m.permissions().mode() & 0o777)
+    std::fs::metadata(path).map_or(0o644, |m| m.permissions().mode() & 0o777)
 }
 
 #[cfg(not(unix))]

@@ -155,9 +155,7 @@ fn prompt_missing_inputs(
     // Show welcome banner
     eprintln!();
     eprintln!("╭─────────────────────────────────────────────────────╮");
-    eprintln!(
-        "│       Agent Mail Deployment Wizard v{WIZARD_VERSION}        │"
-    );
+    eprintln!("│       Agent Mail Deployment Wizard v{WIZARD_VERSION}        │");
     eprintln!("╰─────────────────────────────────────────────────────╯");
     eprintln!();
 

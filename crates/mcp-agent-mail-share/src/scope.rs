@@ -216,18 +216,14 @@ pub fn apply_project_scope(
         // 5. Delete messages
         exec(
             &conn,
-            &format!(
-                "DELETE FROM messages WHERE project_id NOT IN ({placeholders})"
-            ),
+            &format!("DELETE FROM messages WHERE project_id NOT IN ({placeholders})"),
             &id_values,
         )?;
 
         // 6. Delete file_reservations
         exec(
             &conn,
-            &format!(
-                "DELETE FROM file_reservations WHERE project_id NOT IN ({placeholders})"
-            ),
+            &format!("DELETE FROM file_reservations WHERE project_id NOT IN ({placeholders})"),
             &id_values,
         )?;
         if table_exists(&conn, "file_reservation_releases")? {
@@ -278,9 +274,7 @@ pub fn apply_project_scope(
         // 9. Delete agents
         exec(
             &conn,
-            &format!(
-                "DELETE FROM agents WHERE project_id NOT IN ({placeholders})"
-            ),
+            &format!("DELETE FROM agents WHERE project_id NOT IN ({placeholders})"),
             &id_values,
         )?;
 
@@ -306,9 +300,7 @@ pub fn apply_project_scope(
         // 12. Delete projects
         exec(
             &conn,
-            &format!(
-                "DELETE FROM projects WHERE id NOT IN ({placeholders})"
-            ),
+            &format!("DELETE FROM projects WHERE id NOT IN ({placeholders})"),
             &id_values,
         )?;
 

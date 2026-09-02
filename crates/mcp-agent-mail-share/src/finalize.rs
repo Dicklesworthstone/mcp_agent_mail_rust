@@ -495,21 +495,17 @@ fn populate_attachments_by_message_mv(conn: &Conn, has_thread_id: bool) -> Resul
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 &[
                     sqlmodel_core::Value::BigInt(message_id),
-                    project_id
-                        .map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::BigInt),
+                    project_id.map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::BigInt),
                     thread_id
                         .clone()
                         .map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::Text),
                     created_ts
                         .clone()
                         .map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::Text),
-                    attachment_type
-                        .map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::Text),
-                    media_type
-                        .map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::Text),
+                    attachment_type.map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::Text),
+                    media_type.map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::Text),
                     path.map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::Text),
-                    size_bytes
-                        .map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::BigInt),
+                    size_bytes.map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::BigInt),
                 ],
             )
             .map_err(|e| ShareError::Sqlite {

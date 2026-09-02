@@ -616,8 +616,7 @@ fn generate_headers_content(provider: HostingProvider) -> String {
   Content-Type: application/x-sqlite3
 "
         .to_string(),
-        HostingProvider::S3 | HostingProvider::Custom => {
-            r"# Required headers for Agent Mail viewer
+        HostingProvider::S3 | HostingProvider::Custom => r"# Required headers for Agent Mail viewer
 # Configure these in your server/CDN:
 #
 # Cross-Origin-Opener-Policy: same-origin
@@ -630,8 +629,7 @@ fn generate_headers_content(provider: HostingProvider) -> String {
 # For .sqlite3 files:
 #   Content-Type: application/x-sqlite3
 "
-            .to_string()
-        }
+        .to_string(),
     }
 }
 
@@ -1550,7 +1548,9 @@ mod tests {
 
     #[test]
     fn execute_step_create_workflow_resolves_relative_path_against_plan_root() {
-        let _cwd_lock = CWD_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _cwd_lock = CWD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let repo = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let _cwd = CwdGuard::chdir(outside.path());
@@ -1611,7 +1611,9 @@ mod tests {
 
     #[test]
     fn execute_step_unknown_id_runs_command_in_plan_root() {
-        let _cwd_lock = CWD_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _cwd_lock = CWD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let repo = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let _cwd = CwdGuard::chdir(outside.path());

@@ -2298,11 +2298,9 @@ fn walk_dir_inner(
 fn build_security_expectations(bundle_dir: &Path, stats: &BundleStats) -> SecurityExpectations {
     let headers_path = bundle_dir.join("_headers");
     let cross_origin = if is_real_file(&headers_path) {
-        std::fs::read_to_string(&headers_path)
-            .is_ok_and(|c| {
-                c.contains("Cross-Origin-Opener-Policy")
-                    && c.contains("Cross-Origin-Embedder-Policy")
-            })
+        std::fs::read_to_string(&headers_path).is_ok_and(|c| {
+            c.contains("Cross-Origin-Opener-Policy") && c.contains("Cross-Origin-Embedder-Policy")
+        })
     } else {
         false
     };
@@ -3222,8 +3220,7 @@ mod tests {
         chunk_manifest: Option<&crate::ChunkManifest>,
     ) {
         let db_path = bundle_dir.join("mailbox.sqlite3");
-        let db_size = std::fs::metadata(&db_path)
-            .map_or(0, |meta| meta.len());
+        let db_size = std::fs::metadata(&db_path).map_or(0, |meta| meta.len());
         let manifest = serde_json::json!({
             "schema_version": "0.1.0",
             "generated_at": "2024-01-01T00:00:00Z",
