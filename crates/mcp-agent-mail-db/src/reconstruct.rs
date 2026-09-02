@@ -7742,12 +7742,9 @@ body
         .unwrap();
         let target_path = archive_dir.path().join("reconstructed.sqlite3");
 
-        let stats = reconstruct_from_archive_with_live_salvage(
-            &target_path,
-            &storage_root,
-            &source_path,
-        )
-        .expect("a sidecar-less canonical source must be salvaged, not refused");
+        let stats =
+            reconstruct_from_archive_with_live_salvage(&target_path, &storage_root, &source_path)
+                .expect("a sidecar-less canonical source must be salvaged, not refused");
         assert_eq!(stats.messages, 1, "one message came from the archive");
         assert_eq!(
             stats.salvaged_messages, 1,
@@ -7798,12 +7795,9 @@ body
         std::fs::create_dir_all(storage_root.join("projects").join("archive-project"))
             .expect("create authoritative archive fixture");
         let target_path = archive_dir.path().join("reconstructed.sqlite3");
-        let error = reconstruct_from_archive_with_live_salvage(
-            &target_path,
-            &storage_root,
-            &source_path,
-        )
-        .expect_err("an incomplete-schema live source must fail closed");
+        let error =
+            reconstruct_from_archive_with_live_salvage(&target_path, &storage_root, &source_path)
+                .expect_err("an incomplete-schema live source must fail closed");
         let message = error.to_string();
         assert!(
             message.contains("messages schema is incomplete"),

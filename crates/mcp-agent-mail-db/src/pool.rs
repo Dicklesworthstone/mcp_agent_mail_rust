@@ -8592,6 +8592,8 @@ pub fn stage_sqlite_family_for_health_probe(
     source: &Path,
 ) -> Result<Option<SqliteHealthProbeSource>, SqlError> {
     validate_sqlite_target_path(source, "SQLite health-probe source")?;
+    #[cfg(test)]
+    note_health_probe_staging_for_test(source);
     let mut last_not_found = None;
     for _ in 0..3 {
         match stage_sqlite_family_for_health_probe_once(source) {
@@ -8886,6 +8888,181 @@ fn normalize_compatibility_probe_result(
     }
 }
 
+// ============================================================================
+// Staged health verdict reuse (br-eru3j)
+// ============================================================================
+//
+// Every staged health probe copies the whole SQLite family into a private
+// tempdir and runs the FrankenSQLite quick check on the copy, then the
+// canonical one. On a 163 MB mailbox the FrankenSQLite check alone takes
+// 8-13 s (fsqlite 0.3.14 spawns a thread per validation unit), and a server
+// start pays it three times within seconds: the startup integrity probe, the
+// pool-init probe, and the first health check. A healthy verdict for a
+// family whose bytes have not changed is the same verdict, so it is kept for
+// a short window keyed by the family's metadata and reused instead of
+// staging and checking again. Only healthy verdicts are kept; an unhealthy
+// family is always re-probed.
+
+/// How long a healthy staged-probe verdict may be reused for an unchanged
+/// family. `AM_HEALTH_VERDICT_REUSE_SECS` overrides it; `0` disables reuse.
+const HEALTH_VERDICT_REUSE_WINDOW_SECS: u64 = 30;
+const HEALTH_VERDICT_REUSE_WINDOW_MAX_SECS: u64 = 600;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum HealthVerdictVariant {
+    WithFamilyCleanup,
+    WithoutFamilyCleanup,
+}
+
+/// Family metadata that must be unchanged for a healthy verdict to be reused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HealthVerdictFingerprint {
+    /// Main database file: device, inode, length, mtime in nanoseconds.
+    main: (u64, u64, u64, i128),
+    /// Sidecars whose bytes decide the verdict: suffix, length, mtime.
+    content_sidecars: Vec<(&'static str, u64, i128)>,
+    /// Sidecars whose presence and length matter but whose bytes churn with
+    /// every reader (`-shm` read marks, namespace use counters): suffix, length.
+    shape_sidecars: Vec<(&'static str, u64)>,
+}
+
+struct HealthVerdictEntry {
+    fingerprint: HealthVerdictFingerprint,
+    verified_at: Instant,
+}
+
+static HEALTHY_VERDICT_CACHE: OnceLock<
+    Mutex<HashMap<(PathBuf, HealthVerdictVariant), HealthVerdictEntry>>,
+> = OnceLock::new();
+
+fn healthy_verdict_cache()
+-> &'static Mutex<HashMap<(PathBuf, HealthVerdictVariant), HealthVerdictEntry>> {
+    HEALTHY_VERDICT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn health_verdict_reuse_window() -> Duration {
+    let secs = mcp_agent_mail_core::config::process_env_value("AM_HEALTH_VERDICT_REUSE_SECS")
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(HEALTH_VERDICT_REUSE_WINDOW_SECS);
+    Duration::from_secs(secs.min(HEALTH_VERDICT_REUSE_WINDOW_MAX_SECS))
+}
+
+/// Device, inode, length, and mtime of a regular file; `None` for anything
+/// else (missing, symlink, directory), which also means "never reuse".
+fn health_probe_file_stamp(path: &Path) -> Option<(u64, u64, u64, i128)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let mtime = i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec());
+    Some((metadata.dev(), metadata.ino(), metadata.len(), mtime))
+}
+
+fn health_verdict_fingerprint(path: &Path) -> Option<HealthVerdictFingerprint> {
+    let main = health_probe_file_stamp(path)?;
+    let mut content_sidecars = Vec::new();
+    for suffix in ["-wal", "-journal", "-wal-cert", "-wal-cert-head"] {
+        if let Some((_, _, len, mtime)) =
+            health_probe_file_stamp(&sqlite_sidecar_path(path, suffix))
+        {
+            content_sidecars.push((suffix, len, mtime));
+        }
+    }
+    let mut shape_sidecars = Vec::new();
+    for suffix in ["-shm", "-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+        if let Some((_, _, len, _)) = health_probe_file_stamp(&sqlite_sidecar_path(path, suffix)) {
+            shape_sidecars.push((suffix, len));
+        }
+    }
+    Some(HealthVerdictFingerprint {
+        main,
+        content_sidecars,
+        shape_sidecars,
+    })
+}
+
+fn healthy_verdict_reusable(
+    path: &Path,
+    variant: HealthVerdictVariant,
+    fingerprint: &HealthVerdictFingerprint,
+) -> bool {
+    let window = health_verdict_reuse_window();
+    if window.is_zero() {
+        return false;
+    }
+    let now = Instant::now();
+    let mut cache = healthy_verdict_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    cache.retain(|_, entry| now.saturating_duration_since(entry.verified_at) <= window);
+    let key = (normalize_sqlite_identity_path_buf(path), variant);
+    let reusable = cache
+        .get(&key)
+        .is_some_and(|entry| entry.fingerprint == *fingerprint);
+    drop(cache);
+    if reusable {
+        tracing::debug!(
+            path = %path.display(),
+            variant = ?variant,
+            "reusing the recent healthy staged-probe verdict for an unchanged sqlite family"
+        );
+    }
+    reusable
+}
+
+/// Keep a healthy verdict, but only when the family is still exactly what was
+/// staged: a write that landed during the probe changes the fingerprint and
+/// the verdict is dropped rather than stored against the new bytes.
+fn remember_healthy_verdict(
+    path: &Path,
+    variant: HealthVerdictVariant,
+    staged_fingerprint: Option<HealthVerdictFingerprint>,
+) {
+    let Some(fingerprint) = staged_fingerprint else {
+        return;
+    };
+    if health_verdict_reuse_window().is_zero()
+        || health_verdict_fingerprint(path).as_ref() != Some(&fingerprint)
+    {
+        return;
+    }
+    healthy_verdict_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(
+            (normalize_sqlite_identity_path_buf(path), variant),
+            HealthVerdictEntry {
+                fingerprint,
+                verified_at: Instant::now(),
+            },
+        );
+}
+
+#[cfg(test)]
+static HEALTH_PROBE_STAGINGS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+fn note_health_probe_staging_for_test(source: &Path) {
+    *HEALTH_PROBE_STAGINGS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(normalize_sqlite_identity_path_buf(source))
+        .or_insert(0) += 1;
+}
+
+#[cfg(test)]
+pub(crate) fn health_probe_stagings_for_test(source: &Path) -> usize {
+    HEALTH_PROBE_STAGINGS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&normalize_sqlite_identity_path_buf(source))
+        .copied()
+        .unwrap_or(0)
+}
+
 #[allow(clippy::result_large_err)]
 pub fn sqlite_compatibility_read_path_is_healthy(path: &Path) -> Result<bool, SqlError> {
     let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
@@ -8899,10 +9076,20 @@ pub fn sqlite_compatibility_read_path_is_healthy(path: &Path) -> Result<bool, Sq
 
 #[allow(clippy::result_large_err)]
 pub fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
+    let fingerprint = health_verdict_fingerprint(path);
+    if let Some(fingerprint) = &fingerprint
+        && healthy_verdict_reusable(path, HealthVerdictVariant::WithFamilyCleanup, fingerprint)
+    {
+        return Ok(true);
+    }
     let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
         return Ok(false);
     };
-    sqlite_file_is_healthy_staged(&staged.path, true)
+    let healthy = sqlite_file_is_healthy_staged(&staged.path, true)?;
+    if healthy {
+        remember_healthy_verdict(path, HealthVerdictVariant::WithFamilyCleanup, fingerprint);
+    }
+    Ok(healthy)
 }
 
 /// Prove that the current SQLite family is healthy without first detaching a
@@ -8917,6 +9104,29 @@ pub fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
 /// refusal to the runtime's first database open.
 #[allow(clippy::result_large_err)]
 pub fn sqlite_file_is_healthy_without_family_cleanup(path: &Path) -> Result<bool, SqlError> {
+    let fingerprint = health_verdict_fingerprint(path);
+    if let Some(fingerprint) = &fingerprint
+        && healthy_verdict_reusable(
+            path,
+            HealthVerdictVariant::WithoutFamilyCleanup,
+            fingerprint,
+        )
+    {
+        return Ok(true);
+    }
+    let healthy = sqlite_file_is_healthy_without_family_cleanup_uncached(path)?;
+    if healthy {
+        remember_healthy_verdict(
+            path,
+            HealthVerdictVariant::WithoutFamilyCleanup,
+            fingerprint,
+        );
+    }
+    Ok(healthy)
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_file_is_healthy_without_family_cleanup_uncached(path: &Path) -> Result<bool, SqlError> {
     let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
         return Ok(false);
     };
@@ -22230,6 +22440,94 @@ mod tests {
         drop(conn);
         let healthy = sqlite_file_is_healthy(&path).expect("should not error");
         assert!(healthy, "valid DB should be healthy");
+    }
+
+    fn seed_healthy_probe_db(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        let conn = DbConn::open_file(path.to_string_lossy().as_ref()).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create");
+        conn.execute_raw("INSERT INTO t(x) VALUES (1)")
+            .expect("insert");
+        crate::close_db_conn(conn, "seed healthy probe db");
+        path
+    }
+
+    /// br-eru3j: back-to-back probes of an unchanged family stage and check
+    /// it once; the second call reuses the healthy verdict.
+    #[test]
+    fn healthy_staged_verdict_is_reused_for_an_unchanged_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seed_healthy_probe_db(dir.path(), "reuse.db");
+        let before = health_probe_stagings_for_test(&path);
+
+        assert!(sqlite_file_is_healthy(&path).expect("first probe"));
+        assert_eq!(health_probe_stagings_for_test(&path), before + 1);
+        assert!(sqlite_file_is_healthy(&path).expect("second probe"));
+        assert_eq!(
+            health_probe_stagings_for_test(&path),
+            before + 1,
+            "an unchanged healthy family must not be staged again inside the reuse window"
+        );
+
+        // The no-cleanup contract is a stricter verdict and keeps its own entry.
+        assert!(sqlite_file_is_healthy_without_family_cleanup(&path).expect("no-cleanup probe"));
+        assert_eq!(health_probe_stagings_for_test(&path), before + 2);
+        assert!(sqlite_file_is_healthy_without_family_cleanup(&path).expect("no-cleanup reuse"));
+        assert_eq!(health_probe_stagings_for_test(&path), before + 2);
+    }
+
+    #[test]
+    fn healthy_staged_verdict_is_dropped_when_the_family_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seed_healthy_probe_db(dir.path(), "changed.db");
+        let before = health_probe_stagings_for_test(&path);
+        assert!(sqlite_file_is_healthy(&path).expect("first probe"));
+        assert_eq!(health_probe_stagings_for_test(&path), before + 1);
+
+        let conn = DbConn::open_file(path.to_string_lossy().as_ref()).expect("reopen");
+        conn.execute_raw("INSERT INTO t(x) VALUES (2)")
+            .expect("write");
+        crate::close_db_conn(conn, "mutate probed db");
+
+        assert!(sqlite_file_is_healthy(&path).expect("probe after write"));
+        assert_eq!(
+            health_probe_stagings_for_test(&path),
+            before + 2,
+            "a write changes the family fingerprint, so the verdict must be recomputed"
+        );
+    }
+
+    #[test]
+    fn unhealthy_staged_verdict_is_never_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.db");
+        std::fs::write(&path, b"not a sqlite database at all, just bytes").unwrap();
+        let before = health_probe_stagings_for_test(&path);
+        assert!(!sqlite_file_is_healthy(&path).expect("corrupt probe"));
+        assert!(!sqlite_file_is_healthy(&path).expect("corrupt probe again"));
+        assert_eq!(
+            health_probe_stagings_for_test(&path),
+            before + 2,
+            "an unhealthy family is re-probed every time"
+        );
+    }
+
+    #[test]
+    fn healthy_staged_verdict_reuse_can_be_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seed_healthy_probe_db(dir.path(), "disabled.db");
+        let before = health_probe_stagings_for_test(&path);
+        let overrides = [("AM_HEALTH_VERDICT_REUSE_SECS", "0")];
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(&overrides, || {
+            assert!(sqlite_file_is_healthy(&path).expect("first probe"));
+            assert!(sqlite_file_is_healthy(&path).expect("second probe"));
+        });
+        assert_eq!(
+            health_probe_stagings_for_test(&path),
+            before + 2,
+            "AM_HEALTH_VERDICT_REUSE_SECS=0 must stage every probe"
+        );
     }
 
     #[test]

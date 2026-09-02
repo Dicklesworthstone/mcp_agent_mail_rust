@@ -67,6 +67,20 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ### Fixed
 
+- **Startup no longer pays the staged FrankenSQLite health check three times
+  (br-eru3j).** Every staged health probe copies the SQLite family into a
+  private tempdir and runs the FrankenSQLite quick check on the copy; on a
+  163 MB mailbox that check alone takes 8-13 s under fsqlite 0.3.14, and a
+  server start ran it for the startup integrity probe, the pool-init probe,
+  and the first `health_check` within seconds of each other (measured
+  `initialize` 16-19 s, first tool call 8 s). A healthy verdict is now kept
+  for 30 s keyed by the family's metadata (main file device/inode/length/
+  mtime, WAL/journal/cert length+mtime, shm and namespace sidecar
+  presence+length) and reused while nothing changed, so the check runs once
+  per start. Any write invalidates it, unhealthy verdicts are never kept, and
+  `AM_HEALTH_VERDICT_REUSE_SECS=0` disables the reuse (max 600). The
+  per-validation-unit thread storm inside fsqlite's quick check itself is an
+  upstream defect and remains.
 - **A healthy live database keeps serving when its archive-ahead reconcile
   fails (br-bgwj1, br-plksu).** Startup and pool initialization reconcile a
   healthy primary against an archive that is ahead of it by rebuilding a
