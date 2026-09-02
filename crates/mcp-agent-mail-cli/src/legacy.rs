@@ -2524,7 +2524,10 @@ mod tests {
     /// in the importing process and cannot observe a namespace-sidecar
     /// refusal that only a new process hits.
     #[cfg(target_os = "linux")]
-    fn assert_target_passes_startup_probe_in_fresh_process(target_db: &Path, target_storage: &Path) {
+    fn assert_target_passes_startup_probe_in_fresh_process(
+        target_db: &Path,
+        target_storage: &Path,
+    ) {
         let output = std::process::Command::new(
             std::env::current_exe().expect("resolve current test executable"),
         )
@@ -2561,15 +2564,19 @@ mod tests {
         let target_storage = std::env::var_os(LEGACY_IMPORT_PROBE_STORAGE_ENV)
             .map(PathBuf::from)
             .expect("fresh-process probe helper requires the target storage root");
-        let mut config = Config::default();
-        config.database_url = format!("sqlite:///{}", target_db.display());
-        config.storage_root = target_storage;
-        config.integrity_check_on_startup = true;
+        let config = Config {
+            database_url: format!("sqlite:///{}", target_db.display()),
+            storage_root: target_storage,
+            integrity_check_on_startup: true,
+            ..Config::default()
+        };
         match mcp_agent_mail_server::startup_checks::probe_integrity(&config) {
             mcp_agent_mail_server::startup_checks::ProbeResult::Ok { .. } => {
                 println!("fresh-process startup integrity probe passed");
             }
-            other => panic!("startup integrity probe must pass on a freshly imported target: {other:?}"),
+            other => {
+                panic!("startup integrity probe must pass on a freshly imported target: {other:?}")
+            }
         }
     }
 

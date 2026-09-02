@@ -184,6 +184,23 @@ ASSET_SHA="$(e2e_sha256 "${ASSET_PATH}")"
 printf "%s  %s\n" "${ASSET_SHA}" "${ASSET_NAME}" > "${ASSET_PATH}.sha256"
 printf "%s  %s\n" "${ASSET_SHA}" "${ASSET_NAME}" > "${ASSET_DIR}/SHA256SUMS"
 
+# The updater only trusts a SHA256SUMS manifest whose minisign signature
+# verifies with a pinned release key (GH#292). Sign the mock manifest with a
+# throwaway key and hand that key to the debug binary via the test-only
+# override. Without a `minisign` executable the signed-path cases are skipped;
+# the unsigned/tampered negative cases still run.
+MINISIGN_PUBKEY_LINE=""
+if command -v minisign >/dev/null 2>&1; then
+    MINISIGN_KEY_DIR="${WORK}/minisign"
+    mkdir -p "${MINISIGN_KEY_DIR}"
+    if minisign -G -W -f -p "${MINISIGN_KEY_DIR}/minisign.pub" -s "${MINISIGN_KEY_DIR}/minisign.key" >/dev/null 2>&1 \
+        && minisign -S -W -s "${MINISIGN_KEY_DIR}/minisign.key" -m "${ASSET_DIR}/SHA256SUMS" -t "e2e mock release v${CURRENT_VERSION}" >/dev/null 2>&1; then
+        MINISIGN_PUBKEY_LINE="$(tail -n 1 "${MINISIGN_KEY_DIR}/minisign.pub")"
+        e2e_save_artifact "mock_minisign.pub" "$(cat "${MINISIGN_KEY_DIR}/minisign.pub")"
+        e2e_save_artifact "mock_SHA256SUMS.minisig" "$(cat "${ASSET_DIR}/SHA256SUMS.minisig")"
+    fi
+fi
+
 if command -v python3 >/dev/null 2>&1; then
     PORT="$(python3 - <<'PY'
 import socket
@@ -240,6 +257,7 @@ run_self_update_cmd() {
         XDG_CACHE_HOME="${CACHE_HOME}" \
         AM_SELF_UPDATE_API_URL="${API_URL}" \
         AM_SELF_UPDATE_RELEASES_BASE_URL="${RELEASE_BASE_URL}" \
+        AM_SELF_UPDATE_MINISIGN_PUBKEY="${MINISIGN_PUBKEY_LINE}" \
         "${INSTALL_DIR}/am" "$@"
     ) >"${stdout_file}" 2>"${stderr_file}"
     LAST_RC=$?
@@ -268,18 +286,23 @@ e2e_assert_not_contains "check stderr has no fatal error" "${LAST_STDERR}" "Upda
 e2e_case_banner "self-update --version current"
 e2e_mark_case_start "case05_selfupdate_version_current"
 
-reset_install_binaries
-run_self_update_cmd "case_02_version" self-update --version "${CURRENT_VERSION}"
-e2e_assert_exit_code "self-update --version exits cleanly" "0" "${LAST_RC}"
-e2e_assert_contains "download verification output present" "${LAST_STDOUT}" "Downloaded and verified v${CURRENT_VERSION}"
-e2e_assert_contains "update completion output present" "${LAST_STDOUT}" "Update complete"
+if [ -z "${MINISIGN_PUBKEY_LINE}" ]; then
+    e2e_skip "minisign executable not available; cannot sign the mock manifest for the install path"
+else
+    reset_install_binaries
+    run_self_update_cmd "case_02_version" self-update --version "${CURRENT_VERSION}"
+    e2e_assert_exit_code "self-update --version exits cleanly" "0" "${LAST_RC}"
+    e2e_assert_contains "manifest signature verified before install" "${LAST_STDERR}" "Manifest signature verified (minisign key"
+    e2e_assert_contains "download verification output present" "${LAST_STDOUT}" "Downloaded and verified v${CURRENT_VERSION}"
+    e2e_assert_contains "update completion output present" "${LAST_STDOUT}" "Update complete"
 
-set +e
-VERSION_AFTER_VERSION_CMD="$("${INSTALL_DIR}/am" --version 2>&1)"
-VERSION_AFTER_VERSION_RC=$?
-set -e
-e2e_assert_exit_code "am --version after explicit reinstall" "0" "${VERSION_AFTER_VERSION_RC}"
-e2e_assert_contains "version remains current after explicit reinstall" "${VERSION_AFTER_VERSION_CMD}" "${CURRENT_VERSION}"
+    set +e
+    VERSION_AFTER_VERSION_CMD="$("${INSTALL_DIR}/am" --version 2>&1)"
+    VERSION_AFTER_VERSION_RC=$?
+    set -e
+    e2e_assert_exit_code "am --version after explicit reinstall" "0" "${VERSION_AFTER_VERSION_RC}"
+    e2e_assert_contains "version remains current after explicit reinstall" "${VERSION_AFTER_VERSION_CMD}" "${CURRENT_VERSION}"
+fi
 
 # ===========================================================================
 # Case 3: --force reinstall works for current version
@@ -287,18 +310,84 @@ e2e_assert_contains "version remains current after explicit reinstall" "${VERSIO
 e2e_case_banner "self-update --force current version"
 e2e_mark_case_start "case06_selfupdate_force_current_version"
 
-reset_install_binaries
-run_self_update_cmd "case_03_force" self-update --force
-e2e_assert_exit_code "self-update --force exits cleanly" "0" "${LAST_RC}"
-e2e_assert_contains "force path announces current version" "${LAST_STDOUT}" "Force reinstalling v${CURRENT_VERSION}"
-e2e_assert_contains "force path completes update" "${LAST_STDOUT}" "Update complete"
+if [ -z "${MINISIGN_PUBKEY_LINE}" ]; then
+    e2e_skip "minisign executable not available; cannot sign the mock manifest for the install path"
+else
+    reset_install_binaries
+    run_self_update_cmd "case_03_force" self-update --force
+    e2e_assert_exit_code "self-update --force exits cleanly" "0" "${LAST_RC}"
+    e2e_assert_contains "force path announces current version" "${LAST_STDOUT}" "Force reinstalling v${CURRENT_VERSION}"
+    e2e_assert_contains "force path completes update" "${LAST_STDOUT}" "Update complete"
 
-set +e
-VERSION_AFTER_FORCE="$("${INSTALL_DIR}/am" --version 2>&1)"
-VERSION_AFTER_FORCE_RC=$?
-set -e
-e2e_assert_exit_code "am --version after force reinstall" "0" "${VERSION_AFTER_FORCE_RC}"
-e2e_assert_contains "version remains current after force reinstall" "${VERSION_AFTER_FORCE}" "${CURRENT_VERSION}"
+    set +e
+    VERSION_AFTER_FORCE="$("${INSTALL_DIR}/am" --version 2>&1)"
+    VERSION_AFTER_FORCE_RC=$?
+    set -e
+    e2e_assert_exit_code "am --version after force reinstall" "0" "${VERSION_AFTER_FORCE_RC}"
+    e2e_assert_contains "version remains current after force reinstall" "${VERSION_AFTER_FORCE}" "${CURRENT_VERSION}"
+fi
+
+# ===========================================================================
+# Case 3b: a correctly hashed archive with a TAMPERED manifest is refused
+# (GH#292). The archive digest is right, the manifest bytes changed after
+# signing, so the signature no longer covers them.
+# ===========================================================================
+e2e_case_banner "self-update refuses tampered manifest"
+e2e_mark_case_start "case06b_selfupdate_refuses_tampered_manifest"
+
+if [ -z "${MINISIGN_PUBKEY_LINE}" ]; then
+    e2e_skip "minisign executable not available; cannot produce a signed manifest to tamper with"
+else
+    reset_install_binaries
+    INSTALLED_SHA_BEFORE="$(e2e_sha256 "${INSTALL_DIR}/am")"
+    cp "${ASSET_DIR}/SHA256SUMS" "${WORK}/SHA256SUMS.signed"
+    printf "%s  %s\n" "${ASSET_SHA}" "extra-entry.tar.xz" >> "${ASSET_DIR}/SHA256SUMS"
+    run_self_update_cmd "case_03b_tampered_manifest" self-update --force
+    cp "${WORK}/SHA256SUMS.signed" "${ASSET_DIR}/SHA256SUMS"
+    INSTALLED_SHA_AFTER="$(e2e_sha256 "${INSTALL_DIR}/am")"
+    if [ "${LAST_RC}" -ne 0 ]; then
+        e2e_pass "self-update fails on a tampered manifest (rc=${LAST_RC})"
+    else
+        e2e_fail "self-update must fail on a tampered manifest (rc=${LAST_RC})"
+    fi
+    e2e_assert_contains "tampered manifest error names signature verification" "${LAST_STDERR}" "release manifest signature verification failed"
+    e2e_assert_not_contains "tampered manifest never reports verified" "${LAST_STDOUT}" "Downloaded and verified"
+    if [ "${INSTALLED_SHA_BEFORE}" = "${INSTALLED_SHA_AFTER}" ]; then
+        e2e_pass "installed am binary untouched after tampered manifest"
+    else
+        e2e_fail "installed am binary was replaced despite tampered manifest"
+    fi
+fi
+
+# ===========================================================================
+# Case 3c: a correctly hashed archive with an UNSIGNED manifest is refused
+# (GH#292). Runs even without minisign: no signature means no install.
+# ===========================================================================
+e2e_case_banner "self-update refuses unsigned manifest"
+e2e_mark_case_start "case06c_selfupdate_refuses_unsigned_manifest"
+
+reset_install_binaries
+INSTALLED_SHA_BEFORE="$(e2e_sha256 "${INSTALL_DIR}/am")"
+if [ -f "${ASSET_DIR}/SHA256SUMS.minisig" ]; then
+    mv "${ASSET_DIR}/SHA256SUMS.minisig" "${WORK}/SHA256SUMS.minisig.aside"
+fi
+run_self_update_cmd "case_03c_unsigned_manifest" self-update --force
+if [ -f "${WORK}/SHA256SUMS.minisig.aside" ]; then
+    mv "${WORK}/SHA256SUMS.minisig.aside" "${ASSET_DIR}/SHA256SUMS.minisig"
+fi
+INSTALLED_SHA_AFTER="$(e2e_sha256 "${INSTALL_DIR}/am")"
+if [ "${LAST_RC}" -ne 0 ]; then
+    e2e_pass "self-update fails on an unsigned manifest (rc=${LAST_RC})"
+else
+    e2e_fail "self-update must fail on an unsigned manifest (rc=${LAST_RC})"
+fi
+e2e_assert_contains "unsigned manifest error names the missing signature" "${LAST_STDERR}" "SHA256SUMS.minisig"
+e2e_assert_not_contains "unsigned manifest never reports verified" "${LAST_STDOUT}" "Downloaded and verified"
+if [ "${INSTALLED_SHA_BEFORE}" = "${INSTALLED_SHA_AFTER}" ]; then
+    e2e_pass "installed am binary untouched after unsigned manifest"
+else
+    e2e_fail "installed am binary was replaced despite unsigned manifest"
+fi
 
 # ===========================================================================
 # Case 4: repeat --check remains stable and actionable

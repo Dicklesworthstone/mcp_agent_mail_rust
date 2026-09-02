@@ -79,6 +79,15 @@ mitigations — lives in [`docs/SPEC-threat-model.md`](docs/SPEC-threat-model.md
   bytes, then verify each archive's SHA-256 against the authenticated
   manifest, before extraction. A missing `minisign` binary, manifest,
   signature, or checksum entry aborts the install.
+- **`am self-update` enforces the same model** with a built-in pure-Rust
+  minisign verifier (no `minisign` executable needed): it downloads
+  `SHA256SUMS` and `SHA256SUMS.minisig`, verifies the signature over the exact
+  manifest bytes against the release keys embedded in the binary, and only
+  then trusts the archive digest. The signature's key id selects the trusted
+  key, so rotating the release key means shipping a release that trusts both
+  keys before signing with the new one. An unsigned, tampered, or
+  unknown-key manifest aborts the update before any binary is replaced; the
+  updater cannot install pre-v0.3.31 releases (use the installer for those).
 - **Releases before v0.3.31** were built by GitHub Actions and are verified
   with the original Sigstore/cosign keyless path: a per-archive
   `.sigstore.json` bundle validated against the literal

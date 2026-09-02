@@ -5512,11 +5512,14 @@ name = "mcp-agent-mail-cli"
 version = "0.3.32"
 dependencies = [
  "asupersync",
+ "base64 0.23.1",
  "beads_rust",
+ "blake2",
  "chrono",
  "clap",
  "crossterm",
  "dirs",
+ "ed25519-dalek 3.0.0",
  "fastmcp-rust",
  "fs2",
  "ftui",

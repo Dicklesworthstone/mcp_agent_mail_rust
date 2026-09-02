@@ -19,6 +19,24 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   which does not build the image). Until an image is published by the same
   tooling, install from the release archives or build from source.
 
+### Security
+
+- **`am self-update` now verifies the signed release manifest (GH#292).** The
+  updater used to compare the archive against an unsigned `SHA256SUMS`
+  fetched from the same place as the archive, which is weaker than the
+  installer's trust model and than "Downloaded and verified" implied. It now
+  downloads `SHA256SUMS.minisig` as well and verifies it over the exact
+  manifest bytes with a pure-Rust minisign verifier (ed25519 + BLAKE2b, no
+  `minisign` executable required) against the maintainer release key embedded
+  in the binary (id `1BBD79B28BF718D0`, the key pinned in the installers).
+  Only an authenticated manifest is consulted for the archive digest. A
+  missing signature, a tampered manifest or trusted comment, an unknown
+  signing key, or a checksum mismatch aborts the update before any binary is
+  replaced. The trusted key set is a list so a future key rotation can trust
+  old and new keys across a transition. Debug builds accept
+  `AM_SELF_UPDATE_MINISIGN_PUBKEY` for the mocked E2E suite; release builds
+  refuse to run the updater when that variable is set.
+
 ### Added
 
 - **`resource://tooling/recent/{window_seconds}` returns real activity.** The

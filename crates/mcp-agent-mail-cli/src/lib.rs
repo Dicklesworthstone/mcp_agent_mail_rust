@@ -25,6 +25,7 @@ pub mod flags;
 pub mod golden;
 pub mod legacy;
 pub mod output;
+mod release_signing;
 pub mod reliability_coverage;
 pub mod robot;
 
@@ -22893,24 +22894,37 @@ fn download_and_verify_release(version: &str) -> Result<DownloadedRelease, Strin
     let (asset_url, filename) = release_asset_url(&version, &target);
     let base = self_update_releases_base_url();
     let checksum_url = format!("{base}/v{version}/SHA256SUMS");
+    let signature_url = format!("{checksum_url}.minisig");
 
-    // Download SHA256SUMS file first (small, validates availability)
-    ftui_runtime::ftui_eprintln!("Downloading checksum...");
+    // Resolve the trust anchors before touching the network so a
+    // misconfigured process fails before it downloads anything.
+    let trusted_keys = release_signing::trusted_release_keys()?;
+
+    // Download SHA256SUMS and its detached minisign signature first (small,
+    // validates availability). The manifest is only trusted once the
+    // signature over its exact bytes verifies with a pinned release key —
+    // the same fail-closed model the installer enforces (GH#292). A release
+    // without a signature (pre-v0.3.31) cannot be installed by the updater;
+    // the error points at the installer, which knows the older trust model.
+    ftui_runtime::ftui_eprintln!("Downloading checksum manifest...");
     let checksum_body = download_file_sync(&checksum_url)?;
+    ftui_runtime::ftui_eprintln!("Downloading manifest signature...");
+    let signature_body = download_file_sync(&signature_url).map_err(|e| {
+        format!(
+            "release manifest signature {signature_url} is unavailable ({e}); \
+             releases v0.3.31 and later must publish SHA256SUMS.minisig and the updater refuses unsigned manifests"
+        )
+    })?;
+    let signer_key_id =
+        release_signing::verify_manifest_signature(&checksum_body, &signature_body, &trusted_keys)
+            .map_err(|e| format!("release manifest signature verification failed: {e}"))?;
+    ftui_runtime::ftui_eprintln!("Manifest signature verified (minisign key {signer_key_id}).");
+
     let checksum_text = String::from_utf8(checksum_body)
         .map_err(|_| "checksum file is not valid UTF-8".to_string())?;
     // SHA256SUMS format: "<hex>  <filename>" per line — find the line matching our artifact.
-    // Use exact filename match (not substring) to avoid matching .sig/.asc sidecars.
-    let expected_hash = checksum_text
-        .lines()
-        .find(|line| {
-            line.split_whitespace()
-                .last()
-                .is_some_and(|name| name == filename)
-        })
-        .and_then(|line| line.split_whitespace().next())
-        .ok_or_else(|| format!("no checksum found for {filename} in SHA256SUMS"))?
-        .to_string();
+    // Exact filename match (not substring) so .minisig/.sig sidecars never match.
+    let expected_hash = release_signing::manifest_sha256_for(&checksum_text, &filename)?;
 
     // Create temp directory for extraction before the download so the
     // streaming sink has a stable path to write into.
