@@ -6645,6 +6645,37 @@ fn open_sqlite_file_read_only_with_lock_retry(sqlite_path: &str) -> Result<DbCon
     )
 }
 
+/// Open a sidecar-free SQLite file with `immutable=1`: no locks, no `-wal`
+/// or `-shm` creation, no recovery. Only valid when the family carries no
+/// WAL, otherwise committed WAL frames would be invisible.
+#[allow(clippy::result_large_err)]
+fn open_canonical_sqlite_file_immutable_with_lock_retry(
+    sqlite_path: &str,
+) -> Result<crate::CanonicalDbConn, SqlError> {
+    let mut uri = url::Url::from_file_path(Path::new(sqlite_path)).map_err(|()| {
+        SqlError::Custom(format!(
+            "canonical immutable SQLite path {sqlite_path} cannot be represented as a file URI"
+        ))
+    })?;
+    uri.query_pairs_mut()
+        .append_pair("mode", "ro")
+        .append_pair("immutable", "1");
+    let uri = uri.to_string();
+    let flags = sqlmodel_sqlite::OpenFlags {
+        read_only: true,
+        uri: true,
+        ..Default::default()
+    };
+    open_sqlite_file_with_lock_retry_impl(
+        sqlite_path,
+        |_| {
+            let config = sqlmodel_sqlite::SqliteConfig::file(uri.clone()).flags(flags);
+            crate::CanonicalDbConn::open(&config)
+        },
+        std::thread::sleep,
+    )
+}
+
 #[allow(clippy::result_large_err)]
 fn open_canonical_sqlite_file_read_only_with_lock_retry(
     sqlite_path: &str,
@@ -11610,17 +11641,47 @@ pub fn open_guarded_read_only_canonical_sqlite_file(
     }
     let stable_path = preflight_guarded_offline_canonical_sqlite_family(sqlite_path, context)?;
     let sqlite_path_str = sqlite_path_as_utf8(&stable_path)?;
-    let conn =
+    // A family with no WAL and no SHM has nothing a WAL-index could reveal,
+    // so it is opened `immutable=1`: SQLite then neither locks the file nor
+    // creates `-wal`/`-shm` beside it, which a WAL-mode header would
+    // otherwise force even for a read-only connection (br-s9d8a). A family
+    // that does carry a WAL keeps the read-only-SHM open so committed WAL
+    // frames stay visible; when its SHM is missing or stale the open fails
+    // eagerly below and callers fall back to a private staged copy.
+    let sidecar_free = ["-wal", "-shm"]
+        .iter()
+        .all(|suffix| !path_is_occupied(&sqlite_sidecar_path(&stable_path, suffix)));
+    let conn = if sidecar_free {
+        open_canonical_sqlite_file_immutable_with_lock_retry(sqlite_path_str).map_err(|error| {
+            SqlError::Custom(format!(
+                "{context}: cannot open sidecar-free {} with canonical SQLite immutable read-only flags: {error}",
+                stable_path.display()
+            ))
+        })?
+    } else {
         open_canonical_sqlite_file_read_only_with_lock_retry(sqlite_path_str).map_err(|error| {
             SqlError::Custom(format!(
                 "{context}: cannot open {} with canonical SQLite read-only flags: {error}",
                 stable_path.display()
             ))
-        })?;
+        })?
+    };
     conn.execute_raw("PRAGMA query_only = ON;")
         .map_err(|error| {
             SqlError::Custom(format!(
                 "{context}: cannot enforce canonical query-only mode for {}: {error}",
+                stable_path.display()
+            ))
+        })?;
+    // A canonical open is lazy: the file is not touched until the first
+    // statement. Force page 1 and the schema now so a family the read-only
+    // SHM policy cannot recover (a resting WAL family, br-s9d8a) fails here
+    // as an open error that callers can fall back from, instead of
+    // surfacing as an unrelated query failure later.
+    conn.query_sync("SELECT COUNT(*) AS schema_objects FROM sqlite_master", &[])
+        .map_err(|error| {
+            SqlError::Custom(format!(
+                "{context}: cannot read {} with canonical SQLite read-only flags: {error}",
                 stable_path.display()
             ))
         })?;
