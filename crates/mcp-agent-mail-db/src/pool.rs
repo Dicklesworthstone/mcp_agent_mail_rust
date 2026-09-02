@@ -6368,7 +6368,7 @@ fn reconcile_archive_state_before_init(
     // reservation release metadata, product-bus rows, and read state) while
     // replaying archive-ahead content. Archive-only replacement silently
     // discarded those rows even though the current database was healthy.
-    let stats = reconstruct_sqlite_file_with_archive_salvage(primary_path, storage_root)?;
+    let stats = reconstruct_archive_drift_of_healthy_primary(primary_path, storage_root)?;
     clear_pending_archive_drift(primary_path);
     tracing::warn!(
         path = %primary_path.display(),
@@ -6386,6 +6386,47 @@ fn reconcile_archive_state_before_init(
         "reconciled sqlite database from archive before initialization because archive inventory or project identity state was ahead"
     );
     Ok(true)
+}
+
+/// Reconcile archive-ahead drift for a primary that has just been proven
+/// healthy, without letting a failed reconcile take the healthy primary down.
+///
+/// A drift reconcile is best-effort maintenance on a database that already
+/// serves: if the archive-backed candidate cannot be promoted (a receipt
+/// refusal over archive debris, a busy writer, a candidate that fails its
+/// integrity check, an environmental write failure), the right outcome is
+/// to keep serving the healthy primary, remember the drift so the periodic
+/// retry and `am doctor` surface it, and say so — not to fail startup into
+/// a restart loop (br-bgwj1) or to arm the recovery breaker against a file
+/// that was never unhealthy (br-plksu). Only a primary that is no longer
+/// healthy after the attempt turns the failure into an error.
+#[allow(clippy::result_large_err)]
+fn reconcile_archive_drift_of_healthy_primary(
+    primary_path: &Path,
+    storage_root: &Path,
+) -> Result<(), SqlError> {
+    let error = match reconcile_archive_state_before_init(primary_path, storage_root) {
+        Ok(_) => return Ok(()),
+        Err(error) => error,
+    };
+    match sqlite_file_is_healthy(primary_path) {
+        Ok(true) => {
+            record_pending_archive_drift(primary_path);
+            tracing::warn!(
+                path = %primary_path.display(),
+                storage_root = %storage_root.display(),
+                error = %error,
+                "archive-ahead reconcile failed; the healthy live database keeps serving and the drift stays pending (run `am doctor health`, then `am doctor reconstruct --yes` to retry under supervision)"
+            );
+            Ok(())
+        }
+        Ok(false) => Err(SqlError::Custom(format!(
+            "archive-ahead reconcile failed and the live database is no longer healthy afterwards: {error}"
+        ))),
+        Err(probe_error) => Err(SqlError::Custom(format!(
+            "archive-ahead reconcile failed ({error}) and the live database could not be re-probed afterwards: {probe_error}"
+        ))),
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -6890,7 +6931,7 @@ async fn initialize_sqlite_file_once(
     // not just the server startup probe, preserves durable message IDs when a
     // DB is missing or stale relative to the archive.
     if sqlite_path != ":memory:"
-        && let Err(err) = reconcile_archive_state_before_init(path, storage_root)
+        && let Err(err) = reconcile_archive_drift_of_healthy_primary(path, storage_root)
     {
         return Outcome::Err(err);
     }
@@ -13384,10 +13425,30 @@ fn validate_archive_salvage_storage_root(
 fn reconstruct_sqlite_file_with_archive_salvage_uncached(
     primary_path: &Path,
     storage_root: &Path,
+    outcome_policy: RecoveryAdmissionOutcomePolicy,
 ) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
-    let result = with_recovery_admission(primary_path, "archive salvage reconstruction", || {
+    let operation = || {
         reconstruct_sqlite_file_with_archive_salvage_inner(primary_path, storage_root, true, true)
-    });
+    };
+    // A reconstruct of a MISSING or unhealthy primary is a recovery: its
+    // outcome feeds the durable breaker so repeated failures back off. A
+    // drift reconstruct of a HEALTHY primary is not: the live database keeps
+    // serving whether or not the archive-ahead candidate promotes, and
+    // recording that refusal as a recovery failure poisoned every later
+    // guarded read-only open ("recovery authority nonclean") and crash-looped
+    // startup on a perfectly healthy file (br-plksu, br-bgwj1). The mutation
+    // guard still serializes against other recoveries and honors a tripped
+    // breaker; it just never arms it.
+    let result = match outcome_policy {
+        RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome => with_recovery_admission(
+            primary_path,
+            "archive salvage reconstruction",
+            operation,
+        ),
+        RecoveryAdmissionOutcomePolicy::GuardMutationOnly => {
+            with_recovery_mutation_admission(primary_path, "archive drift reconstruction", operation)
+        }
+    };
     if let Ok(stats) = &result {
         let completed_archive_inventory =
             crate::reconstruct::scan_archive_message_inventory(storage_root);
@@ -13410,6 +13471,39 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
     primary_path: &Path,
     storage_root: &Path,
 ) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
+    reconstruct_sqlite_file_with_archive_salvage_with_policy(
+        primary_path,
+        storage_root,
+        RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome,
+    )
+}
+
+/// Archive-ahead drift reconstruct of a primary that is HEALTHY right now.
+///
+/// Same reconstruction and promotion as
+/// [`reconstruct_sqlite_file_with_archive_salvage`], but under the mutation
+/// guard only: a refused promotion (a receipt collision, a busy writer, a
+/// candidate that fails its integrity check) is reported to the caller and
+/// never recorded as a recovery failure, because the live database stays
+/// authoritative and keeps serving (br-plksu, br-bgwj1).
+#[allow(clippy::result_large_err)]
+fn reconstruct_archive_drift_of_healthy_primary(
+    primary_path: &Path,
+    storage_root: &Path,
+) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
+    reconstruct_sqlite_file_with_archive_salvage_with_policy(
+        primary_path,
+        storage_root,
+        RecoveryAdmissionOutcomePolicy::GuardMutationOnly,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn reconstruct_sqlite_file_with_archive_salvage_with_policy(
+    primary_path: &Path,
+    storage_root: &Path,
+    outcome_policy: RecoveryAdmissionOutcomePolicy,
+) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
     validate_sqlite_target_path(primary_path, "archive salvage reconstruction target")?;
     validate_archive_salvage_storage_root(primary_path, storage_root)?;
 
@@ -13428,6 +13522,7 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
                 return reconstruct_sqlite_file_with_archive_salvage_uncached(
                     primary_path,
                     storage_root,
+                    outcome_policy,
                 );
             }
             Err(error) => {
@@ -13439,6 +13534,7 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
                 return reconstruct_sqlite_file_with_archive_salvage_uncached(
                     primary_path,
                     storage_root,
+                    outcome_policy,
                 );
             }
         }
@@ -13455,7 +13551,7 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
         return Ok(stats);
     }
 
-    reconstruct_sqlite_file_with_archive_salvage_uncached(primary_path, storage_root)
+    reconstruct_sqlite_file_with_archive_salvage_uncached(primary_path, storage_root, outcome_policy)
 }
 
 #[allow(clippy::result_large_err)]
@@ -13741,7 +13837,7 @@ pub fn ensure_sqlite_file_healthy_with_archive(
         }
         let _ = cleanup_empty_wal_sidecar(primary_path)?;
         if sqlite_file_is_healthy(primary_path)? {
-            let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
+            reconcile_archive_drift_of_healthy_primary(primary_path, storage_root)?;
             return Ok(());
         }
     } else if find_healthy_backup(primary_path).is_none()
@@ -13790,7 +13886,7 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
         let _ = cleanup_empty_wal_sidecar(primary_path)?;
     }
     if had_primary && sqlite_file_is_healthy(primary_path)? {
-        let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
+        reconcile_archive_drift_of_healthy_primary(primary_path, storage_root)?;
         return Ok(());
     }
 
@@ -13802,7 +13898,7 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
     if had_primary {
         match try_repair_index_only_corruption(primary_path) {
             Ok(true) => {
-                let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
+                reconcile_archive_drift_of_healthy_primary(primary_path, storage_root)?;
                 return Ok(());
             }
             Ok(false) => {}
@@ -13827,7 +13923,7 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
     if let Some(backup_path) = find_healthy_backup(primary_path) {
         restore_from_backup(primary_path, &backup_path, storage_root)?;
         if sqlite_file_is_healthy(primary_path)? {
-            let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
+            reconcile_archive_drift_of_healthy_primary(primary_path, storage_root)?;
             return Ok(());
         }
         tracing::warn!(
@@ -25173,6 +25269,178 @@ mod tests {
         assert!(primary.exists(), "original database should be restored");
         assert_eq!(std::fs::read(&wal).unwrap(), b"original wal");
         assert_eq!(std::fs::read(&shm).unwrap(), b"original shm");
+    }
+
+    /// Seed an archive with one project, one agent, and one message, and
+    /// reconstruct the primary from it so the database is healthy and in
+    /// sync with the archive. Returns the message directory so a caller can
+    /// push the archive ahead by dropping in another message file.
+    fn seed_reconstructed_primary_from_archive(primary: &Path, storage_root: &Path) -> PathBuf {
+        let proj_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = proj_dir.join("agents").join("Alice");
+        let msg_dir = proj_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"First\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:00:00Z\",\"attachments\":[]}\n---\n\nfirst body\n",
+        )
+        .unwrap();
+        crate::reconstruct::reconstruct_from_archive(primary, storage_root)
+            .expect("seed initial reconstructed db");
+        msg_dir
+    }
+
+    fn push_archive_ahead(msg_dir: &Path) {
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-05-00Z__second__2.md"),
+            "---json\n{\"id\":2,\"from\":\"Alice\",\"to\":[\"Carol\"],\"subject\":\"Second\",\"importance\":\"urgent\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:05:00Z\",\"attachments\":[]}\n---\n\nsecond body\n",
+        )
+        .unwrap();
+    }
+
+    fn count_messages(primary: &Path) -> i64 {
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS count FROM messages", &[])
+            .unwrap();
+        rows.first()
+            .and_then(|row| row.get_named::<i64>("count").ok())
+            .unwrap_or(0)
+    }
+
+    /// Restores a directory's permissions when dropped so a failed assertion
+    /// never leaves the tempdir undeletable.
+    struct RestoreDirMode {
+        path: PathBuf,
+        mode: u32,
+    }
+
+    impl Drop for RestoreDirMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
+        }
+    }
+
+    /// br-bgwj1: a healthy primary whose archive is ahead must keep serving
+    /// when the drift reconcile cannot complete. Here the primary's parent
+    /// directory is made read-only so the reconstruction candidate cannot be
+    /// created; before this fix that error propagated out of
+    /// `ensure_sqlite_file_healthy_with_archive` and failed startup even
+    /// though the live database was fine.
+    #[test]
+    fn archive_drift_reconcile_failure_keeps_healthy_primary_serving() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let primary = db_dir.join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let msg_dir = seed_reconstructed_primary_from_archive(&primary, &storage_root);
+        assert_eq!(count_messages(&primary), 1);
+        push_archive_ahead(&msg_dir);
+        clear_pending_archive_drift(&primary);
+
+        std::fs::set_permissions(&db_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let restore = RestoreDirMode {
+            path: db_dir.clone(),
+            mode: 0o755,
+        };
+        if std::fs::write(db_dir.join("write-probe"), b"x").is_ok() {
+            // Running as a user that ignores directory modes (root); the
+            // failure injection cannot work here, so there is nothing to prove.
+            let _ = std::fs::remove_file(db_dir.join("write-probe"));
+            return;
+        }
+
+        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root).expect(
+            "a healthy primary must keep serving when the archive-drift reconcile fails",
+        );
+        assert!(
+            has_pending_archive_drift(&primary),
+            "the failed reconcile must leave the drift pending for the periodic retry"
+        );
+        assert_eq!(
+            count_messages(&primary),
+            1,
+            "the live database must be untouched by the failed reconcile"
+        );
+        assert!(
+            matches!(sqlite_file_is_healthy(&primary), Ok(true)),
+            "the live database must still be healthy after the failed reconcile"
+        );
+
+        drop(restore);
+        retry_archive_drift_reconcile(&primary, &storage_root)
+            .expect("once the environment is writable again the pending drift reconciles");
+        assert_eq!(count_messages(&primary), 2);
+        assert!(!has_pending_archive_drift(&primary));
+    }
+
+    /// br-plksu: a drift reconcile of a healthy primary is guarded against
+    /// concurrent mutation but never records a recovery outcome, so a
+    /// failed reconcile cannot arm the recovery breaker against a database
+    /// that was never unhealthy. The failure injected here is a held
+    /// in-process writer, which makes the promotion barrier refuse to drain
+    /// (the default drain timeout applies, so this test takes about ten
+    /// seconds). A plain recovery admission of the same failure records it.
+    #[test]
+    fn archive_drift_reconcile_failure_does_not_arm_recovery_breaker() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let msg_dir = seed_reconstructed_primary_from_archive(&primary, &storage_root);
+        push_archive_ahead(&msg_dir);
+        let primary_bytes_before = std::fs::read(&primary).unwrap();
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            let _writer = crate::write_barrier::begin_write_activity();
+            ready_tx.send(()).expect("signal held writer");
+            release_rx.recv().expect("wait for release");
+        });
+        ready_rx.recv().expect("writer must hold its activity guard");
+
+        let drift_result = reconstruct_archive_drift_of_healthy_primary(&primary, &storage_root);
+        let recorded_result = with_recovery_admission(&primary, "test recovery", || {
+            Err::<(), SqlError>(SqlError::Custom("injected recovery failure".into()))
+        });
+        release_tx.send(()).expect("release held writer");
+        writer.join().expect("join held writer");
+
+        let drift_error = drift_result
+            .expect_err("the drift reconcile must fail while a writer refuses to drain");
+        assert!(
+            drift_error.to_string().contains("did not drain"),
+            "unexpected drift failure: {drift_error}"
+        );
+        assert_eq!(
+            std::fs::read(&primary).unwrap(),
+            primary_bytes_before,
+            "a failed drift reconcile must not touch the live database"
+        );
+        recorded_result.expect_err("the injected recovery failure propagates");
+
+        let breaker = crate::recovery_breaker::load(&primary)
+            .expect("breaker state must be readable")
+            .expect("a plain recovery admission records its failure");
+        assert_eq!(
+            breaker.consecutive_failures, 1,
+            "only the plain recovery admission may record a failure; the drift reconcile must not: {breaker:?}"
+        );
     }
 
     /// Archive-aware recovery should skip when DB is already healthy.
