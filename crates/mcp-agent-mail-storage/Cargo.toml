@@ -49,5 +49,8 @@ toml.workspace = true
 name = "boot_check_bench"
 harness = false
 
-[lints]
-workspace = true
+# [lints] workspace = true is deferred: clippy also lints workspace path dependencies,
+# so inheriting here turns this crate's ~200 remaining pedantic warnings into
+# -D warnings failures for every dependent. Burn-down tracked in br-sox5q.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

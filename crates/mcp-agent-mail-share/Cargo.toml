@@ -11,8 +11,9 @@ description = "Share/export pipeline for MCP Agent Mail archives"
 # Workspace depends on unpublished sibling path crates, so cargo publish is not viable.
 publish = false
 
-[lints]
-workspace = true
+# [lints] workspace = true is deferred: clippy also lints workspace path dependencies,
+# so inheriting here turns this crate's ~180 remaining pedantic warnings into
+# -D warnings failures for every dependent. Burn-down tracked in br-sox5q.
 
 [dependencies]
 serde.workspace = true
