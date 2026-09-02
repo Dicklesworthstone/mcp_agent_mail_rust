@@ -6368,7 +6368,16 @@ fn reconcile_archive_state_before_init(
     // reservation release metadata, product-bus rows, and read state) while
     // replaying archive-ahead content. Archive-only replacement silently
     // discarded those rows even though the current database was healthy.
-    let stats = reconstruct_archive_drift_of_healthy_primary(primary_path, storage_root)?;
+    let stats = match reconstruct_archive_drift_of_healthy_primary(primary_path, storage_root) {
+        Ok(stats) => stats,
+        Err(error) => {
+            return archive_drift_reconstruction_failed_on_healthy_primary(
+                primary_path,
+                storage_root,
+                &error,
+            );
+        }
+    };
     clear_pending_archive_drift(primary_path);
     tracing::warn!(
         path = %primary_path.display(),
@@ -6388,27 +6397,27 @@ fn reconcile_archive_state_before_init(
     Ok(true)
 }
 
-/// Reconcile archive-ahead drift for a primary that has just been proven
-/// healthy, without letting a failed reconcile take the healthy primary down.
+/// A drift reconstruction of a primary that has just been proven healthy
+/// failed. Decide whether the healthy primary keeps serving.
 ///
-/// A drift reconcile is best-effort maintenance on a database that already
-/// serves: if the archive-backed candidate cannot be promoted (a receipt
-/// refusal over archive debris, a busy writer, a candidate that fails its
-/// integrity check, an environmental write failure), the right outcome is
-/// to keep serving the healthy primary, remember the drift so the periodic
-/// retry and `am doctor` surface it, and say so — not to fail startup into
-/// a restart loop (br-bgwj1) or to arm the recovery breaker against a file
-/// that was never unhealthy (br-plksu). Only a primary that is no longer
-/// healthy after the attempt turns the failure into an error.
+/// The reconcile is best-effort maintenance on a database that already
+/// serves: if the archive-backed candidate cannot be built or promoted (a
+/// receipt refusal over archive debris, a writer that will not drain, a
+/// candidate that fails its integrity check, an environmental write
+/// failure), the right outcome is to keep serving the healthy primary,
+/// remember the drift so the periodic retry and `am doctor` surface it,
+/// and say so; not to fail startup into a restart loop (br-bgwj1) or to arm
+/// the recovery breaker against a file that was never unhealthy
+/// (br-plksu). Only a primary that is no longer healthy after the attempt
+/// turns the failure into an error. Policy refusals that run before the
+/// reconstruction (read-only intent, symlinked paths, a tripped breaker, a
+/// live owner) are not routed through here and stay fatal.
 #[allow(clippy::result_large_err)]
-fn reconcile_archive_drift_of_healthy_primary(
+fn archive_drift_reconstruction_failed_on_healthy_primary(
     primary_path: &Path,
     storage_root: &Path,
-) -> Result<(), SqlError> {
-    let error = match reconcile_archive_state_before_init(primary_path, storage_root) {
-        Ok(_) => return Ok(()),
-        Err(error) => error,
-    };
+    error: &SqlError,
+) -> Result<bool, SqlError> {
     match sqlite_file_is_healthy(primary_path) {
         Ok(true) => {
             record_pending_archive_drift(primary_path);
@@ -6418,7 +6427,7 @@ fn reconcile_archive_drift_of_healthy_primary(
                 error = %error,
                 "archive-ahead reconcile failed; the healthy live database keeps serving and the drift stays pending (run `am doctor health`, then `am doctor reconstruct --yes` to retry under supervision)"
             );
-            Ok(())
+            Ok(false)
         }
         Ok(false) => Err(SqlError::Custom(format!(
             "archive-ahead reconcile failed and the live database is no longer healthy afterwards: {error}"
@@ -6931,7 +6940,7 @@ async fn initialize_sqlite_file_once(
     // not just the server startup probe, preserves durable message IDs when a
     // DB is missing or stale relative to the archive.
     if sqlite_path != ":memory:"
-        && let Err(err) = reconcile_archive_drift_of_healthy_primary(path, storage_root)
+        && let Err(err) = reconcile_archive_state_before_init(path, storage_root)
     {
         return Outcome::Err(err);
     }
@@ -13837,7 +13846,7 @@ pub fn ensure_sqlite_file_healthy_with_archive(
         }
         let _ = cleanup_empty_wal_sidecar(primary_path)?;
         if sqlite_file_is_healthy(primary_path)? {
-            reconcile_archive_drift_of_healthy_primary(primary_path, storage_root)?;
+            let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
             return Ok(());
         }
     } else if find_healthy_backup(primary_path).is_none()
@@ -13886,7 +13895,7 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
         let _ = cleanup_empty_wal_sidecar(primary_path)?;
     }
     if had_primary && sqlite_file_is_healthy(primary_path)? {
-        reconcile_archive_drift_of_healthy_primary(primary_path, storage_root)?;
+        let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
         return Ok(());
     }
 
@@ -13898,7 +13907,7 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
     if had_primary {
         match try_repair_index_only_corruption(primary_path) {
             Ok(true) => {
-                reconcile_archive_drift_of_healthy_primary(primary_path, storage_root)?;
+                let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
                 return Ok(());
             }
             Ok(false) => {}
@@ -13923,7 +13932,7 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
     if let Some(backup_path) = find_healthy_backup(primary_path) {
         restore_from_backup(primary_path, &backup_path, storage_root)?;
         if sqlite_file_is_healthy(primary_path)? {
-            reconcile_archive_drift_of_healthy_primary(primary_path, storage_root)?;
+            let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
             return Ok(());
         }
         tracing::warn!(

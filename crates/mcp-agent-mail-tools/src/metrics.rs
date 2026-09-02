@@ -12,7 +12,10 @@
 
 use mcp_agent_mail_core::Log2Histogram;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -35,6 +38,74 @@ static TOOL_LATENCIES: LazyLock<[RwLock<Log2Histogram>; TOOL_COUNT]> =
 /// Convert tool name -> stable index into the pre-allocated counter arrays.
 ///
 /// The index corresponds to the tool's position in `TOOL_CLUSTER_MAP`.
+/// How many finished tool calls the in-memory ring keeps for
+/// `resource://tooling/recent/{window_seconds}`.
+pub const RECENT_TOOL_CALL_CAPACITY: usize = 512;
+
+/// How a recorded tool call ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecentToolCallOutcome {
+    /// The handler returned a result.
+    Ok,
+    /// The handler failed for a server-side reason.
+    Error,
+    /// The call was refused for a client-side reason (invalid input,
+    /// not-found, policy) or shed under load.
+    Rejected,
+}
+
+/// One finished tool call, as seen by the server's dispatch wrapper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentToolCall {
+    /// Microseconds since the Unix epoch at which the call finished.
+    pub finished_at_micros: i64,
+    pub tool: String,
+    /// `project_key` (or its aliases) as the caller passed it, if any.
+    pub project: Option<String>,
+    /// `agent_name` (or its aliases) as the caller passed it, if any.
+    pub agent: Option<String>,
+    pub latency_us: u64,
+    pub outcome: RecentToolCallOutcome,
+}
+
+static RECENT_TOOL_CALLS: LazyLock<Mutex<VecDeque<RecentToolCall>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::with_capacity(RECENT_TOOL_CALL_CAPACITY)));
+
+/// Append a finished call to the bounded ring, evicting the oldest entry
+/// once the ring is full. Called once per dispatched tool call.
+pub fn record_recent_call(call: RecentToolCall) {
+    let mut ring = RECENT_TOOL_CALLS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if ring.len() >= RECENT_TOOL_CALL_CAPACITY {
+        ring.pop_front();
+    }
+    ring.push_back(call);
+}
+
+/// Calls that finished at or after `cutoff_micros`, newest first.
+#[must_use]
+pub fn recent_calls_since(cutoff_micros: i64) -> Vec<RecentToolCall> {
+    RECENT_TOOL_CALLS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .rev()
+        .filter(|call| call.finished_at_micros >= cutoff_micros)
+        .cloned()
+        .collect()
+}
+
+/// Number of calls currently held by the ring.
+#[must_use]
+pub fn recent_call_count() -> usize {
+    RECENT_TOOL_CALLS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .len()
+}
+
 #[must_use]
 pub fn tool_index(tool_name: &str) -> Option<usize> {
     TOOL_CLUSTER_MAP
