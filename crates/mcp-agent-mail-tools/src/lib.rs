@@ -50,10 +50,11 @@ pub use identity::*;
 pub use macros::*;
 pub use messaging::*;
 pub use metrics::{
-    LatencySnapshot, MetricsSnapshotEntry, record_call, record_call_idx, record_error,
-    record_error_idx, record_latency, record_latency_idx, record_rejection, record_rejection_idx,
-    reset_tool_latencies, reset_tool_metrics, slow_tools, tool_index, tool_meta,
-    tool_metrics_snapshot, tool_metrics_snapshot_full,
+    LatencySnapshot, MetricsSnapshotEntry, RECENT_TOOL_CALL_CAPACITY, RecentToolCall,
+    RecentToolCallOutcome, recent_call_count, recent_calls_since, record_call, record_call_idx,
+    record_error, record_error_idx, record_latency, record_latency_idx, record_recent_call,
+    record_rejection, record_rejection_idx, reset_tool_latencies, reset_tool_metrics, slow_tools,
+    tool_index, tool_meta, tool_metrics_snapshot, tool_metrics_snapshot_full,
 };
 pub use products::*;
 pub use reservation_parity::*;

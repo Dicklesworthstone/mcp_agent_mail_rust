@@ -618,17 +618,17 @@ assert_resource_shape_matches_fixture \
     "tooling/recent 1h shape matches fixture" \
     "$RESP" \
     600 \
-    "resource://tooling/recent/60?agent=BlueLake&project=abs-path-backend"
+    "resource://tooling/recent/60?agent=NoSuchAgent&project=abs-path-backend"
 assert_resource_shape_matches_fixture \
     "tooling/recent 6h shape matches fixture" \
     "$RESP" \
     601 \
-    "resource://tooling/recent/60?agent=BlueLake&project=abs-path-backend"
+    "resource://tooling/recent/60?agent=NoSuchAgent&project=abs-path-backend"
 assert_resource_shape_matches_fixture \
     "tooling/recent 24h shape matches fixture" \
     "$RESP" \
     602 \
-    "resource://tooling/recent/60?agent=BlueLake&project=abs-path-backend"
+    "resource://tooling/recent/60?agent=NoSuchAgent&project=abs-path-backend"
 
 RECENT_CHECK="$(
     RESP="$RESP" EXPECT_AGENT="$AGENT_NAME" EXPECT_PROJECT="$PROJECT_SLUG" python3 - <<'PY'

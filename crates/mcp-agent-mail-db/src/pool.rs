@@ -13449,14 +13449,14 @@ fn reconstruct_sqlite_file_with_archive_salvage_uncached(
     // guard still serializes against other recoveries and honors a tripped
     // breaker; it just never arms it.
     let result = match outcome_policy {
-        RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome => with_recovery_admission(
+        RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome => {
+            with_recovery_admission(primary_path, "archive salvage reconstruction", operation)
+        }
+        RecoveryAdmissionOutcomePolicy::GuardMutationOnly => with_recovery_mutation_admission(
             primary_path,
-            "archive salvage reconstruction",
+            "archive drift reconstruction",
             operation,
         ),
-        RecoveryAdmissionOutcomePolicy::GuardMutationOnly => {
-            with_recovery_mutation_admission(primary_path, "archive drift reconstruction", operation)
-        }
     };
     if let Ok(stats) = &result {
         let completed_archive_inventory =
@@ -13560,7 +13560,11 @@ fn reconstruct_sqlite_file_with_archive_salvage_with_policy(
         return Ok(stats);
     }
 
-    reconstruct_sqlite_file_with_archive_salvage_uncached(primary_path, storage_root, outcome_policy)
+    reconstruct_sqlite_file_with_archive_salvage_uncached(
+        primary_path,
+        storage_root,
+        outcome_policy,
+    )
 }
 
 #[allow(clippy::result_large_err)]
@@ -25338,7 +25342,8 @@ mod tests {
     impl Drop for RestoreDirMode {
         fn drop(&mut self) {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
+            let _ =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
         }
     }
 
@@ -25374,9 +25379,8 @@ mod tests {
             return;
         }
 
-        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root).expect(
-            "a healthy primary must keep serving when the archive-drift reconcile fails",
-        );
+        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect("a healthy primary must keep serving when the archive-drift reconcile fails");
         assert!(
             has_pending_archive_drift(&primary),
             "the failed reconcile must leave the drift pending for the periodic retry"
@@ -25421,7 +25425,9 @@ mod tests {
             ready_tx.send(()).expect("signal held writer");
             release_rx.recv().expect("wait for release");
         });
-        ready_rx.recv().expect("writer must hold its activity guard");
+        ready_rx
+            .recv()
+            .expect("writer must hold its activity guard");
 
         let drift_result = reconstruct_archive_drift_of_healthy_primary(&primary, &storage_root);
         let recorded_result = with_recovery_admission(&primary, "test recovery", || {

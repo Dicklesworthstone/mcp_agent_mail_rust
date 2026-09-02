@@ -459,6 +459,37 @@ fn parse_query(query: &str) -> HashMap<String, String> {
     params
 }
 
+/// The `?{query}` aliases of the static tooling/config resources document a
+/// single parameter, `format`, and only `json` is produced. Refuse anything
+/// else instead of silently discarding it, so a caller who passes
+/// `?project=` or `?format=yaml` learns the parameter did nothing.
+fn reject_unsupported_query(resource: &str, query: &str) -> McpResult<()> {
+    let params = parse_query(query);
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort();
+    for key in keys {
+        let value = params[key].as_str();
+        match key.as_str() {
+            "format" if value.is_empty() || value.eq_ignore_ascii_case("json") => {}
+            "format" => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!("{resource}: unsupported format {value:?}; only json is available"),
+                ));
+            }
+            other => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!(
+                        "{resource} does not accept query parameter {other:?}; only format=json is supported"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn percent_decode_path_component(input: &str) -> String {
     percent_decode_component(input, false)
 }
@@ -706,7 +737,7 @@ pub fn config_environment(_ctx: &McpContext) -> McpResult<String> {
     description = "Inspect the server's current environment and HTTP settings.\n\nWhen to use\n-----------\n- Debugging client connection issues (wrong host/port/path).\n- Verifying which environment (dev/stage/prod) the server is running in.\n\nNotes\n-----\n- This surfaces configuration only; it does not perform live health checks.\n\nReturns\n-------\ndict\n    {\n      \"environment\": str,\n      \"database_url\": str,\n      \"http\": { \"host\": str, \"port\": int, \"path\": str }\n    }\n\nExample (JSON-RPC)\n------------------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r1\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://config/environment\"}}\n```"
 )]
 pub fn config_environment_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    let _query = parse_query(&query);
+    reject_unsupported_query("resource://config/environment", &query)?;
     config_environment(ctx)
 }
 
@@ -1624,7 +1655,7 @@ pub fn tooling_directory(_ctx: &McpContext) -> McpResult<String> {
     description = "Provide a clustered view of exposed MCP tools to combat option overload.\n\nThe directory groups tools by workflow, outlines primary use cases,\nhighlights nearby alternatives, and shares starter playbooks so agents\ncan focus on the verbs relevant to their immediate task."
 )]
 pub fn tooling_directory_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    let _query = parse_query(&query);
+    reject_unsupported_query("resource://tooling/directory", &query)?;
     tooling_directory(ctx)
 }
 
@@ -1771,7 +1802,7 @@ pub fn tooling_schemas(_ctx: &McpContext) -> McpResult<String> {
     description = "Expose JSON-like parameter schemas for tools/macros to prevent drift.\n\nThis is a lightweight, hand-maintained view focusing on the most error-prone\nparameters and accepted aliases to guide clients."
 )]
 pub fn tooling_schemas_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    let _query = parse_query(&query);
+    reject_unsupported_query("resource://tooling/schemas", &query)?;
     tooling_schemas(ctx)
 }
 
@@ -1850,7 +1881,7 @@ pub fn tooling_metrics(_ctx: &McpContext) -> McpResult<String> {
     description = "Expose aggregated tool call/error counts for analysis."
 )]
 pub fn tooling_metrics_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    let _query = parse_query(&query);
+    reject_unsupported_query("resource://tooling/metrics", &query)?;
     tooling_metrics(ctx)
 }
 
@@ -1898,7 +1929,7 @@ pub fn tooling_metrics_core(_ctx: &McpContext) -> McpResult<String> {
     description = "Core system metrics (HTTP/DB/Storage) (with query)"
 )]
 pub fn tooling_metrics_core_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    let _query = parse_query(&query);
+    reject_unsupported_query("resource://tooling/metrics_core", &query)?;
     tooling_metrics_core(ctx)
 }
 
@@ -1930,7 +1961,7 @@ pub fn tooling_diagnostics(_ctx: &McpContext) -> McpResult<String> {
     description = "Comprehensive diagnostic report with health metrics and recommendations (with query)"
 )]
 pub fn tooling_diagnostics_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    let _query = parse_query(&query);
+    reject_unsupported_query("resource://tooling/diagnostics", &query)?;
     tooling_diagnostics(ctx)
 }
 
@@ -2067,7 +2098,7 @@ pub fn tooling_locks(_ctx: &McpContext) -> McpResult<String> {
     description = "Return lock metadata from the shared archive storage."
 )]
 pub fn tooling_locks_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    let _query = parse_query(&query);
+    reject_unsupported_query("resource://tooling/locks", &query)?;
     tooling_locks(ctx)
 }
 
@@ -2104,11 +2135,14 @@ pub fn tooling_capabilities(_ctx: &McpContext, agent: String) -> McpResult<Strin
 /// Recent tool activity entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolingRecentEntry {
+    /// RFC 3339 time at which the call finished.
     pub timestamp: Option<String>,
     pub tool: String,
     pub project: String,
     pub agent: String,
     pub cluster: String,
+    pub latency_ms: u64,
+    pub outcome: crate::metrics::RecentToolCallOutcome,
 }
 
 /// Recent tool activity snapshot
@@ -2120,31 +2154,131 @@ pub struct ToolingRecentSnapshot {
     pub entries: Vec<ToolingRecentEntry>,
 }
 
+/// RFC 3339 rendering of a microsecond Unix timestamp, without a lossy
+/// float round trip.
+fn micros_to_rfc3339(micros: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_micros(micros).map(|dt| dt.to_rfc3339())
+}
+
+/// Longest window the recent-activity resource accepts (7 days).
+const TOOLING_RECENT_MAX_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60;
+/// Default and hard cap on entries returned per read.
+const TOOLING_RECENT_DEFAULT_LIMIT: usize = 100;
+const TOOLING_RECENT_MAX_LIMIT: usize = crate::metrics::RECENT_TOOL_CALL_CAPACITY;
+
 /// Get recent tool activity within a time window.
+///
+/// Reads the server's bounded in-memory ring of finished tool calls (the
+/// dispatch wrapper records every call with its `project_key` /
+/// `agent_name` arguments). The ring holds the last
+/// [`crate::metrics::RECENT_TOOL_CALL_CAPACITY`] calls of this process only;
+/// it is not persisted across restarts. Query parameters: `agent` and
+/// `project` filter by exact argument value, `limit` caps the entry count
+/// (default 100), `format=json` is accepted as a no-op; any other parameter
+/// is refused.
 #[resource(
     uri = "resource://tooling/recent/{window_seconds}",
     description = "Recent tool activity"
 )]
-#[allow(clippy::too_many_lines)]
 pub fn tooling_recent(_ctx: &McpContext, window_seconds: String) -> McpResult<String> {
     let config = &Config::get();
     let (window_seconds_str, query) = split_param_and_query(&window_seconds);
-    let window_seconds: u64 = window_seconds_str.parse().unwrap_or(0);
-    let agent = query.get("agent").cloned();
-    let project = query.get("project").cloned();
+    let window_seconds: u64 = window_seconds_str
+        .trim()
+        .parse()
+        .ok()
+        .filter(|seconds| (1..=TOOLING_RECENT_MAX_WINDOW_SECONDS).contains(seconds))
+        .ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::InvalidParams,
+                format!(
+                    "resource://tooling/recent/{{window_seconds}}: window_seconds must be an integer between 1 and {TOOLING_RECENT_MAX_WINDOW_SECONDS}, got {window_seconds_str:?}"
+                ),
+            )
+        })?;
 
-    // Per-tool activity tracking is not yet implemented; return real data only.
-    // Previously returned hardcoded static entries which misled consumers.
-    let _ = (agent, project, config);
-    let mut entries: Vec<ToolingRecentEntry> = vec![];
-
-    if config.tool_filter.enabled {
-        entries.retain(|entry| tool_filter_allows(config, &entry.tool));
+    let mut agent = None;
+    let mut project = None;
+    let mut limit = TOOLING_RECENT_DEFAULT_LIMIT;
+    let mut keys: Vec<&String> = query.keys().collect();
+    keys.sort();
+    for key in keys {
+        let value = query[key].as_str();
+        match key.as_str() {
+            "agent" if !value.trim().is_empty() => agent = Some(value.trim().to_string()),
+            "project" if !value.trim().is_empty() => project = Some(value.trim().to_string()),
+            "agent" | "project" => {}
+            "limit" => {
+                limit = value
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| (1..=TOOLING_RECENT_MAX_LIMIT).contains(n))
+                    .ok_or_else(|| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!(
+                                "resource://tooling/recent: limit must be an integer between 1 and {TOOLING_RECENT_MAX_LIMIT}, got {value:?}"
+                            ),
+                        )
+                    })?;
+            }
+            "format" if value.is_empty() || value.eq_ignore_ascii_case("json") => {}
+            "format" => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!(
+                        "resource://tooling/recent: unsupported format {value:?}; only json is available"
+                    ),
+                ));
+            }
+            other => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!(
+                        "resource://tooling/recent does not accept query parameter {other:?}; supported: agent, project, limit, format"
+                    ),
+                ));
+            }
+        }
     }
+
+    let now_micros = mcp_agent_mail_core::now_micros();
+    let cutoff_micros = now_micros.saturating_sub(
+        i64::try_from(window_seconds)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1_000_000),
+    );
+    let entries: Vec<ToolingRecentEntry> = crate::metrics::recent_calls_since(cutoff_micros)
+        .into_iter()
+        .filter(|call| {
+            agent
+                .as_deref()
+                .is_none_or(|wanted| call.agent.as_deref() == Some(wanted))
+        })
+        .filter(|call| {
+            project
+                .as_deref()
+                .is_none_or(|wanted| call.project.as_deref() == Some(wanted))
+        })
+        .filter(|call| !config.tool_filter.enabled || tool_filter_allows(config, &call.tool))
+        .take(limit)
+        .map(|call| ToolingRecentEntry {
+            timestamp: micros_to_rfc3339(call.finished_at_micros),
+            cluster: crate::tool_cluster(&call.tool)
+                .unwrap_or("unknown")
+                .to_string(),
+            tool: call.tool,
+            project: call.project.unwrap_or_default(),
+            agent: call.agent.unwrap_or_default(),
+            latency_ms: call.latency_us / 1000,
+            outcome: call.outcome,
+        })
+        .collect();
 
     let count = entries.len();
     let snapshot = ToolingRecentSnapshot {
-        generated_at: None,
+        generated_at: micros_to_rfc3339(now_micros),
         window_seconds,
         count,
         entries,
@@ -7591,6 +7725,150 @@ mod query_param_tests {
     // -----------------------------------------------------------------------
     // parse_query
     // -----------------------------------------------------------------------
+
+    fn recent_call(
+        tool: &str,
+        agent: &str,
+        project: &str,
+        age_secs: i64,
+    ) -> crate::metrics::RecentToolCall {
+        crate::metrics::RecentToolCall {
+            finished_at_micros: mcp_agent_mail_core::now_micros() - age_secs * 1_000_000,
+            tool: tool.to_string(),
+            project: Some(project.to_string()),
+            agent: Some(agent.to_string()),
+            latency_us: 1_500,
+            outcome: crate::metrics::RecentToolCallOutcome::Ok,
+        }
+    }
+
+    fn tooling_recent_snapshot(param: &str) -> ToolingRecentSnapshot {
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let raw = tooling_recent(&ctx, param.to_string()).expect("tooling/recent read");
+        serde_json::from_str(&raw).expect("tooling/recent json")
+    }
+
+    /// br-ciwph: the resource reads the dispatch ring and honors its filters.
+    /// Other tests share the process-wide ring, so every assertion is scoped
+    /// to agent/project names unique to this test.
+    #[test]
+    fn tooling_recent_reads_ring_and_filters_by_agent_project_and_window() {
+        crate::metrics::record_recent_call(recent_call(
+            "send_message",
+            "RecentAlpha",
+            "recent-proj-a",
+            5,
+        ));
+        crate::metrics::record_recent_call(recent_call(
+            "fetch_inbox",
+            "RecentAlpha",
+            "recent-proj-a",
+            2,
+        ));
+        crate::metrics::record_recent_call(recent_call("whois", "RecentBeta", "recent-proj-a", 1));
+        crate::metrics::record_recent_call(recent_call(
+            "send_message",
+            "RecentAlpha",
+            "recent-proj-b",
+            1,
+        ));
+        crate::metrics::record_recent_call(recent_call(
+            "health_check",
+            "RecentAlpha",
+            "recent-proj-a",
+            3_600,
+        ));
+
+        let snap = tooling_recent_snapshot("60?agent=RecentAlpha&project=recent-proj-a");
+        assert_eq!(snap.window_seconds, 60);
+        assert_eq!(snap.count, 2, "{snap:?}");
+        assert!(snap.generated_at.is_some());
+        let tools: Vec<&str> = snap.entries.iter().map(|e| e.tool.as_str()).collect();
+        assert_eq!(tools, ["fetch_inbox", "send_message"], "newest first");
+        assert!(
+            snap.entries
+                .iter()
+                .all(|e| e.agent == "RecentAlpha" && e.project == "recent-proj-a")
+        );
+        assert_eq!(snap.entries[0].cluster, "messaging");
+        assert_eq!(snap.entries[0].latency_ms, 1);
+        assert!(
+            snap.entries[0]
+                .timestamp
+                .as_deref()
+                .is_some_and(|t| t.starts_with("20"))
+        );
+
+        let by_project = tooling_recent_snapshot("60?project=recent-proj-a");
+        let agents: Vec<&str> = by_project
+            .entries
+            .iter()
+            .map(|e| e.agent.as_str())
+            .collect();
+        assert!(
+            agents.contains(&"RecentBeta") && agents.contains(&"RecentAlpha"),
+            "{agents:?}"
+        );
+        assert!(
+            by_project
+                .entries
+                .iter()
+                .all(|e| e.project == "recent-proj-a")
+        );
+        assert!(
+            by_project.entries.iter().all(|e| e.tool != "health_check"),
+            "outside the window"
+        );
+
+        let wide = tooling_recent_snapshot("7200?agent=RecentAlpha&project=recent-proj-a&limit=1");
+        assert_eq!(wide.count, 1, "limit caps the entries");
+
+        let wide_all = tooling_recent_snapshot("7200?agent=RecentAlpha&project=recent-proj-a");
+        assert!(
+            wide_all.entries.iter().any(|e| e.tool == "health_check"),
+            "wider window includes the hour-old call"
+        );
+
+        let unknown = tooling_recent_snapshot("60?agent=RecentNobody&project=recent-proj-a");
+        assert_eq!(unknown.count, 0);
+        assert!(unknown.entries.is_empty());
+    }
+
+    #[test]
+    fn tooling_recent_refuses_bad_window_and_unknown_parameters() {
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        for bad in ["0", "abc", "", "-5", "9999999999"] {
+            let err = tooling_recent(&ctx, bad.to_string()).expect_err(bad);
+            assert_eq!(err.code, McpErrorCode::InvalidParams, "{bad}: {err:?}");
+        }
+        let err = tooling_recent(&ctx, "60?since=yesterday".to_string()).expect_err("unknown key");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(err.message.contains("since"), "{err:?}");
+        let err = tooling_recent(&ctx, "60?limit=0".to_string()).expect_err("zero limit");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        let err = tooling_recent(&ctx, "60?format=yaml".to_string()).expect_err("yaml");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        tooling_recent(&ctx, "60?format=json".to_string())
+            .expect("json format is the documented no-op");
+    }
+
+    #[test]
+    fn query_aliases_accept_only_format_json() {
+        reject_unsupported_query("resource://tooling/metrics", "").unwrap();
+        reject_unsupported_query("resource://tooling/metrics", "format=json").unwrap();
+        reject_unsupported_query("resource://tooling/metrics", "format=JSON").unwrap();
+        let err =
+            reject_unsupported_query("resource://tooling/metrics", "format=yaml").unwrap_err();
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(err.message.contains("yaml"));
+        let err = reject_unsupported_query("resource://tooling/locks", "project=abc&format=json")
+            .unwrap_err();
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(
+            err.message.contains("resource://tooling/locks") && err.message.contains("project"),
+            "{err:?}"
+        );
+    }
 
     #[test]
     fn parse_query_basic() {

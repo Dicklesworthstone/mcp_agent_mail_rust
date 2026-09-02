@@ -2973,7 +2973,7 @@
                         "file_reservation_paths",
                         "uninstall_precommit_guard"
                       ],
-                      "expected_frequency": "Infrequent\u2014per repository setup.",
+                      "expected_frequency": "Infrequent—per repository setup.",
                       "required_capabilities": [
                         "infrastructure",
                         "repository"
@@ -3128,7 +3128,7 @@
                         "reply_message",
                         "request_contact"
                       ],
-                      "expected_frequency": "Frequent\u2014core write operation.",
+                      "expected_frequency": "Frequent—core write operation.",
                       "required_capabilities": [
                         "messaging",
                         "write"
@@ -3256,7 +3256,7 @@
                         "respond_contact",
                         "set_contact_policy"
                       ],
-                      "expected_frequency": "Occasional\u2014when new communication lines are needed.",
+                      "expected_frequency": "Occasional—when new communication lines are needed.",
                       "required_capabilities": [
                         "contact"
                       ],
@@ -3719,7 +3719,7 @@
                         "file_reservation_paths",
                         "uninstall_precommit_guard"
                       ],
-                      "expected_frequency": "Infrequent\u2014per repository setup.",
+                      "expected_frequency": "Infrequent—per repository setup.",
                       "required_capabilities": [
                         "infrastructure",
                         "repository"
@@ -3874,7 +3874,7 @@
                         "reply_message",
                         "request_contact"
                       ],
-                      "expected_frequency": "Frequent\u2014core write operation.",
+                      "expected_frequency": "Frequent—core write operation.",
                       "required_capabilities": [
                         "messaging",
                         "write"
@@ -4002,7 +4002,7 @@
                         "respond_contact",
                         "set_contact_policy"
                       ],
-                      "expected_frequency": "Occasional\u2014when new communication lines are needed.",
+                      "expected_frequency": "Occasional—when new communication lines are needed.",
                       "required_capabilities": [
                         "contact"
                       ],
@@ -5534,10 +5534,10 @@
         }
       ]
     },
-    "resource://tooling/recent/60?agent=BlueLake&project=abs-path-backend": {
+    "resource://tooling/recent/60?agent=NoSuchAgent&project=abs-path-backend": {
       "cases": [
         {
-          "name": "tooling_recent",
+          "name": "tooling_recent_unknown_agent_is_empty",
           "input": {},
           "expect": {
             "ok": {

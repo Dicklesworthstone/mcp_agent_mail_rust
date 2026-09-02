@@ -21,6 +21,26 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ### Added
 
+- **`resource://tooling/recent/{window_seconds}` returns real activity.** The
+  server's tool dispatch wrapper now records every finished call (tool,
+  `project_key`, `agent_name`, latency, ok/error/rejected) into a bounded
+  in-memory ring of the last 512 calls, and the resource reads that ring:
+  `?agent=` and `?project=` filter by exact argument value, `?limit=` caps the
+  entries (default 100), `format=json` stays a no-op, anything else is
+  refused with `InvalidParams`, and a window outside 1..=604800 seconds is
+  refused instead of silently returning nothing. The ring is per process and
+  not persisted across restarts. Previously the resource parsed its
+  parameters and always returned `count: 0` (br-ciwph). The Python-parity
+  fixture case now pins the filter semantics (an unknown agent yields no
+  entries) instead of the old always-empty result.
+- **The seven `?{query}` aliases of the static tooling and config resources
+  refuse unsupported parameters.** `resource://config/environment`,
+  `tooling/directory`, `tooling/schemas`, `tooling/metrics`,
+  `tooling/metrics_core`, `tooling/diagnostics`, and `tooling/locks` used to
+  parse the query and discard it. They now accept only the documented
+  `format=json` and return `InvalidParams` naming the offending key for
+  anything else, so a caller passing `?project=` learns it did nothing.
+
 - **`am robot handoff --max-seconds <n>` (default 20) with honest partial
   output.** The dashboard used to run one `messages LEFT JOIN
   message_recipients` aggregate per in-progress bead; FrankenSQLite executes
@@ -46,6 +66,29 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   robot counted as 16/17/18, 5 themes of 42).
 
 ### Fixed
+
+- **A healthy live database keeps serving when its archive-ahead reconcile
+  fails (br-bgwj1, br-plksu).** Startup and pool initialization reconcile a
+  healthy primary against an archive that is ahead of it by rebuilding a
+  candidate from the archive and promoting it. When that reconstruction or
+  promotion failed (a recovery-receipt refusal over duplicate reservation
+  artifacts, a writer that would not drain, an unwritable directory), the
+  error propagated out of the integrity probe and the process exited 1 into
+  a systemd restart loop, even though the live database had just passed its
+  health check. The failure is now caught at the reconstruction step: if the
+  primary is still healthy afterwards the server keeps serving it, the drift
+  is recorded as pending for the periodic retry and `am doctor health`, and a
+  warning names the retry path (`am doctor reconstruct --yes`). Only a
+  primary that is no longer healthy after the attempt still fails startup.
+  Policy refusals that run before the reconstruction (read-only intent,
+  symlinked paths, a tripped breaker, a live owner) are unchanged and stay
+  fatal.
+- **A failed archive-drift reconcile no longer arms the recovery breaker
+  (br-plksu).** The drift reconcile of a healthy primary now runs under the
+  mutation-only admission (it still refuses to run concurrently with a real
+  recovery) instead of the outcome-recording admission, so its failures
+  cannot count toward tripping the breaker against a database that was never
+  unhealthy. Regression tests cover both behaviours.
 
 - **Read-only diagnostics can open a database that was never
   Franken-admitted.** Every read-only consumer (mailbox inventory, the

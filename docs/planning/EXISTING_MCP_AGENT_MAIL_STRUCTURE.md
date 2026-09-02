@@ -353,7 +353,7 @@ Source: `src/mcp_agent_mail/storage.py`.
 - `resource://tooling/metrics{?format}` - Tool call counts, error rates
 - `resource://tooling/locks{?format}` - Active archive locks
 - `resource://tooling/capabilities/{agent}{?project,format}` - Agent capability mapping
-- `resource://tooling/recent/{window_seconds}{?agent,project,format}` - Recent tool usage
+- `resource://tooling/recent/{window_seconds}{?agent,project,limit,format}` - Recent tool usage (this process's bounded in-memory ring of finished calls; not persisted)
 
 ### Projects
 - `resource://projects{?format}` - All projects

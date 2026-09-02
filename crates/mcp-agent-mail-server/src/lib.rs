@@ -329,6 +329,14 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
             .tools
             .record_call(latency_us, is_error);
         mcp_agent_mail_tools::record_latency_idx(self.tool_index, latency_us);
+        mcp_agent_mail_tools::record_recent_call(mcp_agent_mail_tools::RecentToolCall {
+            finished_at_micros: mcp_agent_mail_core::now_micros(),
+            tool: self.tool_name.to_string(),
+            project: project.clone(),
+            agent: agent.clone(),
+            latency_us,
+            outcome: recent_call_outcome(is_error, is_client_refusal),
+        });
 
         // Emit ToolCallEnd with duration and query delta
         let qt_after = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
@@ -456,6 +464,14 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
                 .tools
                 .record_call(latency_us, is_error);
             mcp_agent_mail_tools::record_latency_idx(self.tool_index, latency_us);
+            mcp_agent_mail_tools::record_recent_call(mcp_agent_mail_tools::RecentToolCall {
+                finished_at_micros: mcp_agent_mail_core::now_micros(),
+                tool: self.tool_name.to_string(),
+                project: project.clone(),
+                agent: agent.clone(),
+                latency_us,
+                outcome: recent_call_outcome(is_error, is_client_refusal),
+            });
 
             // Emit ToolCallEnd with duration and query delta
             let qt_after = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
@@ -517,6 +533,20 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
 }
 
 /// Extract `project_key` and agent name from tool arguments for event tagging.
+/// Classify a finished tool call for the `resource://tooling/recent` ring.
+const fn recent_call_outcome(
+    is_error: bool,
+    is_client_refusal: bool,
+) -> mcp_agent_mail_tools::RecentToolCallOutcome {
+    if is_client_refusal {
+        mcp_agent_mail_tools::RecentToolCallOutcome::Rejected
+    } else if is_error {
+        mcp_agent_mail_tools::RecentToolCallOutcome::Error
+    } else {
+        mcp_agent_mail_tools::RecentToolCallOutcome::Ok
+    }
+}
+
 fn extract_project_agent(args: &serde_json::Value) -> (Option<String>, Option<String>) {
     let obj = args.as_object();
     let project = obj
