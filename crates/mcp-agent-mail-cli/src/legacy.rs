@@ -4075,10 +4075,27 @@ mod tests {
             wal_bytes_before,
             "source -wal bytes must be unchanged by detect+import"
         );
+        // The WAL-index is transient shared memory: SQLite's reader protocol
+        // records the snapshot a read-only connection uses in the
+        // checkpoint-info block (nBackfill + aReadMark[5], header bytes
+        // 96..116), and detect+import open the source read-only. That block
+        // may move; every other byte of the shm must be untouched (br-00gl8).
+        let shm_bytes_after = fs::read(&shm_path).expect("reread shm bytes");
         assert_eq!(
-            fs::read(&shm_path).expect("reread shm bytes"),
-            shm_bytes_before,
-            "source -shm bytes must be unchanged by detect+import"
+            shm_bytes_after.len(),
+            shm_bytes_before.len(),
+            "source -shm must keep its size across detect+import"
+        );
+        let shm_changed: Vec<usize> = shm_bytes_before
+            .iter()
+            .zip(shm_bytes_after.iter())
+            .enumerate()
+            .filter(|(_, (before, after))| before != after)
+            .map(|(offset, _)| offset)
+            .collect();
+        assert!(
+            shm_changed.iter().all(|offset| (96..116).contains(offset)),
+            "source -shm may only change inside the reader checkpoint-info block 96..116; changed offsets: {shm_changed:?}"
         );
         assert_eq!(
             fs::read(&source_db).expect("reread source db bytes"),
