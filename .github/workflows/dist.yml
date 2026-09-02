@@ -139,7 +139,7 @@ jobs:
             fi
           }
 
-          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch "$FRANKENSEARCH_COMMIT"
+          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch-rel-0332 "$FRANKENSEARCH_COMMIT"
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
           checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
@@ -210,7 +210,7 @@ jobs:
             fi
           }
 
-          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch "$FRANKENSEARCH_COMMIT"
+          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch-rel-0332 "$FRANKENSEARCH_COMMIT"
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
           checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
@@ -296,7 +296,7 @@ jobs:
             fi
           }
 
-          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch "$FRANKENSEARCH_COMMIT"
+          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch-rel-0332 "$FRANKENSEARCH_COMMIT"
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
           checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"

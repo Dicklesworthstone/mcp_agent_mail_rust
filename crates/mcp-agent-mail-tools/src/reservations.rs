@@ -3251,7 +3251,9 @@ pub async fn force_release_file_reservation(
 ///
 /// # Conformance
 /// Python-parity.
-#[tool(description = "")]
+#[tool(
+    description = "Install the Agent Mail pre-commit guard into a git repository.\n\nWrites a chain-runner pre-commit hook plus an Agent Mail guard plugin that checks the files staged for a commit against the project's active exclusive file reservations held by other agents. Commits that touch another agent's reserved paths are blocked; `.beads/**` and the holder's own reservations are exempt.\n\nParameters\n----------\nproject_key : str\n    Project identifier (human key or slug).\ncode_repo_path : str\n    Absolute path to the git repository whose hooks should be installed.\n\nReturns\n-------\ndict\n    `{\"hook\": \"<path>\"}` with the installed hook location, or `{\"hook\": \"\"}` when the guard is disabled by configuration.\n\nNotes\n-----\n- Idempotent: re-running refreshes the plugin in place.\n- Advisory by design: `git commit --no-verify` still bypasses the hook.\n- Pair with `uninstall_precommit_guard` to remove the hook."
+)]
 pub fn install_precommit_guard(
     _ctx: &McpContext,
     project_key: String,
@@ -3314,7 +3316,9 @@ pub fn install_precommit_guard(
 ///
 /// # Conformance
 /// Python-parity.
-#[tool(description = "")]
+#[tool(
+    description = "Remove the Agent Mail pre-commit guard from a git repository.\n\nDeletes the guard plugin written by `install_precommit_guard`, removes the chain-runner hook when no other plugins remain, and restores any previously preserved pre-commit hook.\n\nParameters\n----------\ncode_repo_path : str\n    Absolute path to the git repository.\n\nReturns\n-------\ndict\n    `{\"removed\": true}` when guard artifacts were removed, `{\"removed\": false}` when nothing was installed.\n\nNotes\n-----\n- Idempotent: safe to call when the guard is already absent."
+)]
 pub fn uninstall_precommit_guard(_ctx: &McpContext, code_repo_path: String) -> McpResult<String> {
     let repo_path = normalize_repo_path(&code_repo_path)?;
 

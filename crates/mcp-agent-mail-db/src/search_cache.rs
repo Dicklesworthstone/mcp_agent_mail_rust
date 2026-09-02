@@ -497,8 +497,8 @@ impl Default for WarmWorkerConfig {
 
 /// Warm worker for pre-loading search resources.
 ///
-/// This is a placeholder for the warm worker infrastructure.
-/// Actual warmup logic depends on the specific resource implementations.
+/// Tracks warmup status per resource; `search_service` drives the actual
+/// embedder/vector-index warmups and reports back through this registry.
 pub struct WarmWorker {
     config: WarmWorkerConfig,
     status: RwLock<HashMap<WarmResource, WarmStatus>>,

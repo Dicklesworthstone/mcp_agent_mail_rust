@@ -89,7 +89,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 | **45 MCP Tools** | Infrastructure, identity, messaging, contacts, reservations, search, macros, product bus, and build slots |
 | **16-Screen TUI** | Live operator cockpit for messages, threads, agents, search, reservations, metrics, health, analytics, attachments, archive browsing, and ATC |
 | **Web UI** | Server-rendered `/mail/` routes for human oversight, unified inbox review, search, attachments, and overseer messaging |
-| **Robot Mode** | 18 agent-optimized CLI subcommands with `toon`/`json`/`md` output for non-interactive workflows |
+| **Robot Mode** | 19 agent-optimized CLI subcommands with `toon`/`json` output (`md` for thread and message views) for non-interactive workflows |
 | **Git-Backed Archive** | Every message, reservation, and agent profile stored as files in per-project Git repos |
 | **Hybrid Search** | Search V3 via frankensearch. The lexical tier ships by default; semantic and hybrid routing are controlled by the hybrid feature flag (`feature = "hybrid"`). |
 | **Pre-Commit Guard** | Git hook that blocks commits touching files reserved by other agents |
@@ -192,7 +192,7 @@ Agent Mail has been available since October 2025 and was designed around real mu
 - **Prevents conflicts:** Explicit file reservations (leases) for files/globs prevent agents from overwriting each other
 - **Reduces human relay work:** Agents send messages directly to each other with threaded conversations, acknowledgments, and priority levels
 - **Keeps communication off the token budget:** Messages stored in per-project Git archive, not consuming agent context windows
-- **Offers quick reads:** `resource://inbox/{Agent}?project=<abs-path>`, `resource://thread/{id}?project=<abs-path>`, and 31 other MCP resources
+- **Offers quick reads:** `resource://inbox/{Agent}?project=<abs-path>`, `resource://thread/{id}?project=<abs-path>`, and 23 other MCP resources
 - **Provides full audit trails:** Every instruction, lease, message, and attachment is in Git for human review
 - **Scales across repos:** Frontend and backend agents in different repos coordinate through the product bus and contact system
 
@@ -328,7 +328,7 @@ installed binary always matches the freshly-built artifact regardless of
 `CARGO_TARGET_DIR` overrides or workspace settings. Do **not** manually copy from
 `target/release/am` -- if `CARGO_TARGET_DIR` is set, that path may be stale.
 
-Requires Rust nightly (see `rust-toolchain.toml`). A manual local source build expects sibling checkouts in the parent directory for **two** repos: [`../frankensearch`](https://github.com/Dicklesworthstone/frankensearch) (a path dependency; its workspace also needs [`../fast_cmaes`](https://github.com/Dicklesworthstone/fast_cmaes) for workspace-wide `cargo metadata`) and [`../beads_rust`](https://github.com/Dicklesworthstone/beads_rust) (path-patched until the required 0.5.x release is available on crates.io). Use the exact sibling revisions recorded by the checked-out release workflow; `install.sh --from-source` resolves those immutable pins automatically. Everything else -- asupersync, fastmcp, SQLmodel, FrankenSQLite, FrankenTUI, franken-agent-detection, tru, and rich_rust -- resolves from crates.io.
+Requires Rust nightly (see `rust-toolchain.toml`). A manual local source build expects sibling checkouts in the parent directory for **two** repos: [`../frankensearch-rel-0332`](https://github.com/Dicklesworthstone/frankensearch) (a path dependency pinned to the release commit recorded as `FRANKENSEARCH_COMMIT` in `.github/workflows/dist.yml`; the gated directory name keeps a live `../frankensearch` checkout from silently changing the build; its workspace also needs [`../fast_cmaes`](https://github.com/Dicklesworthstone/fast_cmaes) for workspace-wide `cargo metadata`) and [`../beads_rust`](https://github.com/Dicklesworthstone/beads_rust) (path-patched until the required 0.5.x release is available on crates.io). Use the exact sibling revisions recorded by the checked-out release workflow; `install.sh --from-source` resolves those immutable pins automatically. Everything else -- asupersync, fastmcp, SQLmodel, FrankenSQLite, FrankenTUI, franken-agent-detection, tru, and rich_rust -- resolves from crates.io.
 
 ### Platforms
 
@@ -596,7 +596,7 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 | Quality gates | `ci`, `verify`, `lint`, `typecheck`, `bench` | Run the native quality pipeline, build-slot-protected verification lanes, and CLI/perf baselines |
 | E2E and determinism | `e2e list|run|show`, `golden capture|verify|list`, `flake-triage scan|reproduce|detect` | Test transports and workflows, guard CLI output contracts, and triage flaky failures |
 | Share and deploy | `share export|update|preview|verify|decrypt|wizard|static-export`, `share deploy validate|tooling|verify|verify-live` | Build portable mailbox bundles, preview them, and validate live static deployments |
-| Archive and recovery | `archive save|list|restore`, `doctor check|archive-scan|archive-normalize|repair|backups|restore|reconstruct|fix` | Snapshot mailbox state, scan/archive hygiene, normalize safe archive debt, or repair/rebuild SQLite from the Git archive |
+| Archive and recovery | `archive save|list|restore`, `doctor ...` (28 verbs: `check`, `health`, `triage`, `locks`, `drain`, `fix`, `undo`, `repair`, `reconstruct`, ...; see Family Detail) | Snapshot mailbox state, scan/archive hygiene, normalize safe archive debt, or repair/rebuild SQLite from the Git archive |
 | Coordination data | `agents ...`, `mail ...`, `contacts ...`, `macros ...`, `file_reservations ...`, `acks ...`, `list-acks` | Operate directly on the same concepts the MCP tools expose |
 | Project and product routing | `projects ...`, `products ...`, `list-projects`, `beads ...` | Manage project identity, cross-project product groupings, and task-tracker views |
 | Platform and setup | `setup run|status`, `config set-port|show-port`, `amctl env`, `tooling ...`, `docs insert-blurbs` | Bootstrap connectors, inspect runtime config, introspect tool schemas/metrics/locks, and stamp docs |
@@ -632,10 +632,10 @@ token values.
 | `file_reservations` | `list`, `active`, `soon`, `reserve`, `renew`, `release`, `conflicts` |
 | `acks` | `pending`, `remind`, `overdue` |
 | `projects` | `mark-identity`, `discovery-init`, `adopt` |
-| `mail` | `status`, `send`, `reply`, `inbox`, `read`, `ack`, `search`, `summarize-thread` |
+| `mail` | `status`, `send`, `reply`, `inbox`, `read`, `ack`, `search`, `summarize-thread`, `replay-queued` |
 | `products` | `ensure`, `link`, `status`, `search`, `inbox`, `summarize-thread` |
-| `doctor` | `check`, `archive-scan`, `archive-normalize`, `repair`, `backups`, `restore`, `reconstruct`, `fix` |
-| `agents` | `register`, `create`, `list`, `show`, `detect` |
+| `doctor` (28 verbs) | `check`, `health`, `triage`, `locks`, `drain`, `fix`, `undo`, `ls`, `explain`, `fixers`, `capabilities`, `robot-docs`, `artifacts`, `reclaim`, `selftest`, `mcp-selftest`, `write-selftest`, `support-bundle`, `repair`, `reconstruct`, `backups`, `restore`, `archive-scan`, `archive-verify`, `archive-normalize`, `fix-orphan-refs`, `pack-archive`, `vacuum` (`vacuum` is on `main` and unreleased as of 2026-09-01) |
+| `agents` | `register`, `create`, `list`, `show`, `detect`, `reap`, `resolve-pane` |
 | `tooling` | `directory`, `schemas`, `metrics`, `metrics-core`, `diagnostics`, `locks`, `decommission-fts` |
 | `macros` | `start-session`, `prepare-thread`, `file-reservation-cycle`, `contact-handshake` |
 | `contacts` | `request`, `respond`, `list`, `policy` |
@@ -643,7 +643,7 @@ token values.
 | `setup` | `run`, `status` |
 | `golden` | `capture`, `verify`, `list` |
 | `flake-triage` | `scan`, `reproduce`, `detect` |
-| `robot` | `status`, `inbox`, `timeline`, `overview`, `thread`, `search`, `message`, `navigate`, `reservations`, `metrics`, `health`, `analytics`, `agents`, `contacts`, `projects`, `attachments`, `atc` |
+| `robot` | `status`, `inbox`, `timeline`, `overview`, `thread`, `search`, `message`, `navigate`, `reservations`, `metrics`, `health`, `analytics`, `agents`, `contacts`, `projects`, `attachments`, `atc`, `handoff`, `tui-dump` |
 | `verify` | `cargo-fmt`, `cargo-check`, `cargo-clippy`, `cargo-test`, `e2e-list`, `e2e-stdio`, `bench-quick`, `reliability-coverage` |
 | `legacy` | `detect`, `import`, `status` |
 | `service` | `install`, `uninstall`, `status`, `logs`, `restart` |
@@ -751,7 +751,7 @@ The interactive TUI has 16 screens. Jump directly with `1`-`9`, `0` (screen 10),
 
 **Command palette:** Press `Ctrl+P` (or `:` outside text-entry) to open a searchable action launcher that includes screen navigation, transport/layout controls, and dynamic entities (agents/projects/threads/tools/reservations).
 
-**Themes:** Cyberpunk Aurora, Darcula, Lumen Light, Nordic Frost, High Contrast. Accessibility support includes high-contrast mode and reduced motion.
+**Themes:** 42 named palettes are in the `Ctrl+T`/`Shift+T` cycle (Cyberpunk Aurora, Darcula, Lumen Light, Nordic Frost, High Contrast, Dracula, Monokai, Nord, and more; see `NAMED_THEMES` in `crates/mcp-agent-mail-server/src/tui_theme.rs`). The five config-level themes are selectable through `TUI_THEME`. Accessibility support includes high-contrast mode and reduced motion.
 Archive Browser note: use `Enter` to expand/preview, `Tab` to switch tree vs preview pane, `/` to filter filenames, and `Ctrl+D/U` for preview paging.
 
 If an interactive `am` attaches to an already running service, this terminal is
@@ -764,7 +764,7 @@ Use an explicit `--takeover` only when replacement is intended.
 
 Non-interactive, agent-first CLI surface for TUI-equivalent situational awareness. Use it when you need structured snapshots quickly, especially in automated loops and when tokens matter.
 
-### 18 Subcommands
+### 19 Subcommands
 
 | Command | Purpose | Key flags |
 |---------|---------|-----------|
@@ -786,6 +786,7 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 | `am robot attachments` | Attachment inventory and provenance | `--format`, `--project`, `--agent` |
 | `am robot atc` | Live ATC snapshot with local DB fallback when the server is unavailable | `--since`, `--stratum`, `--summary-only`, `--limit` |
 | `am robot handoff` | Read-only stale bead ownership and handoff dashboard | `--stale-minutes`, `--active-minutes`, `--fresh-comment-minutes`, `--include-fresh`, `--dry-run` |
+| `am robot tui-dump` | TUI freeze escape hatch (alias of `am tui-dump`): the situational snapshot the TUI renders, fetched live or from local SQLite | `--format` |
 
 ### Output Formats
 
@@ -1146,7 +1147,7 @@ MCP Client / Operator / Browser
 
 ```
 mcp_agent_mail_rust/
-├── Cargo.toml                              # Workspace root (11 member crates)
+├── Cargo.toml                              # Workspace root (12 member crates; dashboard-wasm is excluded and built standalone)
 ├── crates/
 │   ├── mcp-agent-mail-core/                # Zero-dep: config, models, errors, metrics
 │   ├── mcp-agent-mail-db/                  # SQLite schema, queries, pool, cache, Search V3 integration
@@ -1158,7 +1159,8 @@ mcp_agent_mail_rust/
 │   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI (16 screens)
 │   ├── mcp-agent-mail/                     # Server binary (mcp-agent-mail)
 │   ├── mcp-agent-mail-cli/                 # CLI binary (am) with robot mode
-│   ├── mcp-agent-mail-dashboard-wasm/      # Standalone public DashboardScreen WASM replay + safe exporter
+│   ├── mcp-agent-mail-test-helpers/        # Shared test scaffolding
+│   ├── mcp-agent-mail-dashboard-wasm/      # Standalone public DashboardScreen WASM replay + safe exporter (excluded from the workspace)
 │   └── mcp-agent-mail-conformance/         # Python parity tests
 ├── experimental/
 │   └── mcp-agent-mail-wasm/                # Parked standalone WASM/browser prototype
@@ -1250,7 +1252,7 @@ The `br-0qt6e` ATC learning work is intentionally cross-cutting, but it should n
 
 - Session/bootstrap and liveness hooks already land at the server dispatch boundary: successful `register_agent` and `macro_start_session` calls register agents with ATC, and tool execution updates ATC activity timestamps.
 - The durable append path now belongs in that same server/runtime seam, not inside individual UIs. Message and reservation learning hooks flow from the tool-result/event boundary in `mcp-agent-mail-server/src/lib.rs` into the ATC-facing note functions in `mcp-agent-mail-server/src/atc.rs`: `atc_note_message_sent()`, `atc_note_message_received()`, `atc_note_reservation_granted()`, `atc_note_reservation_released()`, and `atc_note_reservation_conflicts()`.
-- Outcome resolution now flows through the server ATC runtime via `atc_record_outcome()` and the overdue/retention sweeps, with the DB crate owning the actual row mutation and rollup updates.
+- Outcome resolution now flows through the server ATC runtime: message outcomes are resolved from the tool-result boundary (`record_atc_message_outcome_from_tool_payload_with_pool` in `mcp-agent-mail-server/src/lib.rs`) plus the overdue/retention sweeps, with the DB crate owning the actual row mutation and rollup updates. (`atc_record_outcome()` in `atc.rs` is the in-memory engine hook and currently has no production caller.)
 - `/mail/ws-state` polling, `am robot atc`, the ATC TUI screen, and the System Health screen stay snapshot-driven consumers of `atc_operator_snapshot()` / `atc_summary()`, not alternate sources of learning state. The deferred `/web-dashboard/*` browser mirror is intentionally outside the supported live ATC surface today.
 
 ### Hot path vs. cold path boundaries
@@ -1272,7 +1274,7 @@ The `br-0qt6e` ATC learning work is intentionally cross-cutting, but it should n
 
 1. Keep `mcp-agent-mail-core` as the schema-and-policy contract so experience/evidence/config changes stay centralized and reviewable.
 2. Preserve `mcp-agent-mail-db` as the only durable ATC mutation/query surface for append, resolve, rollup, retention, and replay behavior.
-3. Continue routing real runtime events through `atc_note_*` and `atc_record_outcome()` instead of duplicating learning logic in tools, UIs, or ad-hoc SQL paths.
+3. Continue routing real runtime events through `atc_note_*` and the server-side outcome-resolution path instead of duplicating learning logic in tools, UIs, or ad-hoc SQL paths.
 4. Keep robot, TUI, and browser/dashboard surfaces snapshot-driven consumers of `atc_operator_snapshot()` rather than alternate sources of ATC truth.
 5. Land remaining rollout/default-flip, data-minimization, and operator-hardening work on top of the existing live path rather than reopening seam ownership questions.
 
@@ -1496,7 +1498,7 @@ The native CLI benchmark runner is built around four categories in `crates/mcp-a
 | Startup | `help` | Pure CLI startup and argument parsing |
 | Analysis | `lint`, `typecheck` | Cost of native quality commands |
 | Stub encoder | `stub_encode_1k`, `stub_encode_10k`, `stub_encode_100k` | Compact encoding subprocess path |
-| Operational | `mail_inbox`, `mail_send`, `mail_search`, `mail_threads`, `doctor_check`, `message_count`, `agents_list` | Real mailbox/operator workflows over a seeded DB |
+| Operational | `mail_inbox`, `mail_send`, `mail_send_no_atc`, `mail_send_atc_shadow`, `mail_send_atc_live`, `mail_search`, `robot_status`, `doctor_check`, `message_count`, `agents_list` | Real mailbox/operator workflows over a seeded DB (`am bench --list` is authoritative) |
 
 ### Checked-In Baselines
 
@@ -1652,7 +1654,7 @@ What `check` inspects:
 | Search returns nothing | Try simpler terms and fewer filters; inspect diagnostics in `search_messages` explain output |
 | Pre-commit guard blocking | Check `am robot reservations --conflicts` for active reservations |
 | Tools time out / "Database corruption detected" under heavy load | Inspect the timeout response or `health_check` timeout diagnostics: they report `contended_path`, whether that stage exceeded the client deadline, p99 pool-acquire/database-write/archive queue/archive-commit latency, and blocking-dispatch occupancy. An unattributed dispatch timeout is reported as such, not blamed on SQLite. Also run `am robot health --include-host --format json`; if `host_pressure_likely` is true (low disk/inodes, high load-per-CPU, low free memory) or the data dir is not writable, relieve host pressure before reconstructing. |
-| `am serve-http` shows systemd `active (running)` but port 8765 is **not reachable** (high memory, single thread) | A degraded/corrupt DB is making the startup recovery slow. The server binds the listener within `STARTUP_READINESS_BIND_TIMEOUT_SECS` (default 20s) regardless, so `/healthz` returns 200 while the DB recovers in the background and `/health` reports `warming_up`/`unavailable`. If it persists: stop the service and run `am doctor --json`; or quarantine `storage.sqlite3*` (move, don't delete) and restart to rebuild from the Git archive. Fast unblock: `INTEGRITY_CHECK_ON_STARTUP=false am serve-http --no-tui`. |
+| `am serve-http` shows systemd `active (running)` but port 8765 is **not reachable** (high memory, single thread) | A degraded/corrupt DB is making the startup recovery slow. The server binds the listener within `STARTUP_READINESS_BIND_TIMEOUT_SECS` (default 20s) regardless, so `/healthz` returns 200 while the DB recovers in the background and `/health` reports `warming_up`/`unavailable`. If it persists: stop the service and run `am doctor check --json`; or quarantine `storage.sqlite3*` (move, don't delete) and restart to rebuild from the Git archive. Fast unblock: `INTEGRITY_CHECK_ON_STARTUP=false am serve-http --no-tui`. |
 | Kernel-log `segfault ... ip 0x1db250 ... in git[...]` | System has **git 2.51.0** which races `.git/index` under multi-agent load. See [Known-bad git versions](#known-bad-git-versions) below. |
 | `fatal: bad object HEAD` or orphan stashes that appear after sessions | Same as above. Set `AM_GIT_BINARY` to a safer git, then run `am doctor fix-orphan-refs --all --dry-run`. |
 
@@ -1692,7 +1694,7 @@ need to do anything.
 ## FAQ
 
 **Q: How is this different from the Python version?**
-A: This is a ground-up Rust rewrite with the same conceptual model but significant improvements: a 16-screen interactive TUI, robot mode CLI, hybrid search, build slots, the product bus for cross-project coordination, and substantially better performance. The conformance suite protects supported compatibility for 38 tools (37 through the captured sequential behavior fixture plus `fetch_topic` through its retained schema/description and topic-bearing router tests), covers 7 Rust-native tools, and exercises all 25 MCP resources. The Rust implementation remains authoritative.
+A: This is a ground-up Rust rewrite with the same conceptual model but significant improvements: a 16-screen interactive TUI, robot mode CLI, Search V3 (lexical tier in release binaries; the semantic/hybrid tier is compiled into default-feature source builds), build slots, the product bus for cross-project coordination, and substantially better performance. The conformance suite protects supported compatibility for 38 tools (37 through the captured sequential behavior fixture plus `fetch_topic` through its retained schema/description and topic-bearing router tests), covers 7 Rust-native tools, and exercises all 25 MCP resources (23 through the captured fixture; the two Rust-native tooling resources through unit tests). The Rust implementation remains authoritative.
 
 **Q: Do I need to run a separate server for each project?**
 A: No. One server handles multiple projects. Each project is identified by its absolute filesystem path as the `project_key`.

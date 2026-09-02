@@ -1880,10 +1880,84 @@ fn materialize_live_franken_salvage(path: &Path) -> DbResult<MaterializedLiveSal
     // The read-only source connection drops without a checkpoint. Keep the
     // private directory alive across every subsequent canonical probe/merge.
     drop(conn);
+    neutralize_private_salvage_artifact(&snapshot_path, snapshot_text)?;
     Ok(MaterializedLiveSalvage {
         _directory: directory,
         path: snapshot_path,
     })
+}
+
+/// FrankenSQLite namespace sidecars it leaves beside a `VACUUM INTO`
+/// destination.
+const PRIVATE_SALVAGE_FRANKEN_NAMESPACE_SUFFIXES: [&str; 2] =
+    ["-fsqlite-ns-gate", "-fsqlite-ns-use"];
+
+/// Engine-specific WAL witnesses FrankenSQLite may leave beside the
+/// destination; meaningless to the canonical readers that consume it.
+const PRIVATE_SALVAGE_FRANKEN_WAL_WITNESS_SUFFIXES: [&str; 2] = ["-wal-cert", "-wal-cert-head"];
+
+/// Turn the freshly materialized, process-private salvage artifact into a
+/// self-contained rollback-journal SQLite file that any engine can open.
+///
+/// `VACUUM INTO` runs through the guarded FrankenSQLite source connection, so
+/// the engine admits the private destination into its own protocol: it
+/// leaves `-fsqlite-ns-gate` / `-fsqlite-ns-use` namespace records, may
+/// finish the destination in WAL mode with an unpopulated `-shm`, and writes
+/// its `-wal-cert` witnesses. Every downstream validator and merge reader
+/// (`pool::sqlite_file_passes_full_integrity_check`, the canonical salvage
+/// readers) opens the artifact through the guarded canonical read-only path,
+/// which refuses any Franken-admitted path outright and, past that, cannot
+/// read a resting WAL whose `-shm` it may not recover read-only
+/// (`readonly_shm=1`). The salvage therefore never validated and
+/// archive-ahead recovery could not promote.
+///
+/// The destination is a fresh inode in a private snapshot directory with no
+/// other referent, so it is safe to (1) retire the namespace records, (2)
+/// open the copy read-write with canonical SQLite and fold any WAL frames
+/// into the main file (`journal_mode = DELETE` checkpoints and removes the
+/// WAL and its index), and (3) retire the engine-specific WAL witnesses.
+/// Nothing is deleted: residue is renamed inside the private directory, which
+/// is discarded with [`MaterializedLiveSalvage`].
+fn neutralize_private_salvage_artifact(snapshot_path: &Path, snapshot_text: &str) -> DbResult<()> {
+    retire_private_salvage_residue(snapshot_path, &PRIVATE_SALVAGE_FRANKEN_NAMESPACE_SUFFIXES);
+    let conn = crate::CanonicalDbConn::open_file(snapshot_text).map_err(|error| {
+        DbError::Sqlite(format!(
+            "reconstruct live salvage: cannot open private snapshot {} for engine-neutral checkpoint: {error}",
+            snapshot_path.display()
+        ))
+    })?;
+    conn.execute_raw("PRAGMA journal_mode = DELETE;")
+        .map_err(|error| {
+            DbError::Sqlite(format!(
+                "reconstruct live salvage: cannot fold private snapshot {} into a self-contained rollback-journal file: {error}",
+                snapshot_path.display()
+            ))
+        })?;
+    drop(conn);
+    retire_private_salvage_residue(snapshot_path, &PRIVATE_SALVAGE_FRANKEN_WAL_WITNESS_SUFFIXES);
+    Ok(())
+}
+
+/// Rename FrankenSQLite residue away from the private salvage artifact so
+/// no reader can mistake the artifact for a Franken-admitted family.
+fn retire_private_salvage_residue(snapshot_path: &Path, suffixes: &[&str]) {
+    for suffix in suffixes {
+        let sidecar = mcp_agent_mail_core::disk::sqlite_sidecar_path(snapshot_path, suffix);
+        if std::fs::symlink_metadata(&sidecar).is_err() {
+            continue;
+        }
+        let retired = mcp_agent_mail_core::disk::sqlite_sidecar_path(
+            snapshot_path,
+            &format!("{suffix}.retired-private-salvage"),
+        );
+        if let Err(error) = std::fs::rename(&sidecar, &retired) {
+            tracing::warn!(
+                sidecar = %sidecar.display(),
+                error = %error,
+                "reconstruct live salvage: could not retire FrankenSQLite residue beside the private artifact"
+            );
+        }
+    }
 }
 
 /// Reconstruct from the Git archive and merge an engine-exclusive private or
@@ -7413,6 +7487,54 @@ body
             "guarded materialization must preserve every live source-family byte"
         );
         crate::close_db_conn(writer, "clean up WAL salvage materialization fixture");
+    }
+
+    #[test]
+    fn live_franken_salvage_artifact_is_engine_neutral_and_passes_canonical_validation() {
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let source_path = source_dir.path().join("live.sqlite3");
+        let writer = crate::DbConn::open_file(source_path.to_string_lossy().as_ref())
+            .expect("open live Franken salvage source");
+        writer
+            .execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable WAL mode");
+        writer
+            .execute_raw("CREATE TABLE salvage_witness(value INTEGER NOT NULL);")
+            .expect("create salvage witness table");
+        writer
+            .execute_raw("INSERT INTO salvage_witness(value) VALUES (7);")
+            .expect("commit salvage witness");
+
+        let materialized = materialize_live_franken_salvage(&source_path)
+            .expect("materialize guarded live salvage source");
+
+        for suffix in PRIVATE_SALVAGE_FRANKEN_NAMESPACE_SUFFIXES
+            .iter()
+            .chain(PRIVATE_SALVAGE_FRANKEN_WAL_WITNESS_SUFFIXES.iter())
+            .chain(["-wal", "-shm"].iter())
+        {
+            let sidecar =
+                mcp_agent_mail_core::disk::sqlite_sidecar_path(&materialized.path, suffix);
+            assert!(
+                std::fs::symlink_metadata(&sidecar).is_err(),
+                "private salvage artifact must be a self-contained file without {suffix} residue: {}",
+                sidecar.display()
+            );
+        }
+        // The validator every downstream promotion path uses refuses any
+        // Franken-admitted path; the private artifact must pass it.
+        crate::pool::sqlite_file_passes_full_integrity_check(&materialized.path).expect(
+            "engine-neutral private salvage artifact must pass the canonical full integrity check",
+        );
+        let private = open_read_only_salvage_db(&materialized.path)
+            .expect("open private materialized salvage");
+        let rows = private
+            .query_sync("SELECT value FROM salvage_witness", &[])
+            .expect("query witness from private materialization");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("value").unwrap(), 7);
+        drop(private);
+        crate::close_db_conn(writer, "clean up engine-neutral salvage fixture");
     }
 
     #[test]

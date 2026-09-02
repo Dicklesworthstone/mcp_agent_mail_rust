@@ -238,8 +238,13 @@ fn error_code_catalog_is_stable() {
     let actual = collect_declared_error_codes();
     let expected: BTreeSet<String> = [
         "ACK_INTENT_WRITE_FAILED",
+        // GH#255 lifecycle tools (retire/unretire/deregister) refuse with
+        // typed codes so agents never mistake a retired identity for a typo.
+        "AGENT_DEREGISTERED",
         "AGENT_NOT_FOUND",
+        "AGENT_RETIRED",
         "ARCHIVE_ERROR",
+        "AUTHENTICATION_REQUIRED",
         "BROADCAST_DISABLED",
         "CONFIGURATION_ERROR",
         "CONFLICT",
@@ -268,6 +273,9 @@ fn error_code_catalog_is_stable() {
         "INVALID_PROJECT_KEY",
         "INVALID_THREAD_ID",
         "INVALID_TIMESTAMP",
+        // GH#259 durable message topics: malformed `topic` values are a
+        // typed argument refusal.
+        "INVALID_TOPIC",
         "MALFORMED_ACTIVE_RESERVATION",
         "MISSING_FIELD",
         "MISSING_PANE_ID",

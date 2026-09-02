@@ -8358,7 +8358,7 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
 
   if ! checkout_pinned_dependency \
       "https://github.com/Dicklesworthstone/frankensearch.git" \
-      "$TMP/frankensearch" "$frankensearch_commit" || \
+      "$TMP/frankensearch-rel-0332" "$frankensearch_commit" || \
      ! checkout_pinned_dependency \
       "https://github.com/Dicklesworthstone/fast_cmaes.git" \
       "$TMP/fast_cmaes" "$fast_cmaes_commit" || \

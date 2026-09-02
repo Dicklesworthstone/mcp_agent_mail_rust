@@ -90,6 +90,12 @@ pub struct MailboxOwnershipProcess {
     pub executable_deleted: bool,
     pub holds_storage_root_lock: bool,
     pub holds_sqlite_lock: bool,
+    /// The process holds at least one mailbox activity lock in exclusive
+    /// (`flock` `WRITE`) mode. A live server always does; a shared-mode
+    /// observer or a plain database-file reader never does. On platforms
+    /// without `/proc/locks` every lock-file holder is reported exclusive
+    /// (fail-closed).
+    pub holds_exclusive_lock: bool,
     pub holds_database_file: bool,
 }
 
@@ -99,7 +105,15 @@ pub struct MailboxOwnershipState {
     pub storage_lock_path: String,
     pub sqlite_lock_path: String,
     pub processes: Vec<MailboxOwnershipProcess>,
+    /// Live Agent Mail processes that count as mailbox *owners*: exclusive
+    /// activity-lock holders and server command lines (including a legacy
+    /// Python shadow server).
     pub competing_pids: Vec<u32>,
+    /// Live Agent Mail processes that merely read the mailbox (a transient
+    /// `am inbox` / `am robot handoff` with the database file open, or a
+    /// shared-mode lock observer). Reported for operators, never counted as
+    /// owners, so they can no longer produce a false split-brain verdict.
+    pub readers: Vec<u32>,
     pub supervised_restart_required: bool,
     pub detail: String,
 }
@@ -846,6 +860,26 @@ impl RecoveryAdmissionDepthGuard {
 
     fn active_path() -> Option<PathBuf> {
         RECOVERY_ADMISSION_PATHS.with(|paths| paths.borrow().last().cloned())
+    }
+
+    /// Whether the current thread is inside an admitted recovery attempt for
+    /// `stable_path` (a canonicalized primary path).
+    ///
+    /// Recovery admission arms the durable recovery breaker with a
+    /// provisional failure record *before* running the attempt so a crash
+    /// mid-attempt still starts a cooldown. Read-only opens performed by that
+    /// same attempt (live-salvage materialization, archive-ahead inventory)
+    /// must not treat their own arming as evidence against the file: the
+    /// admission decision already weighed the breaker history.
+    fn active_for(stable_path: &Path) -> bool {
+        RECOVERY_ADMISSION_PATHS.with(|paths| {
+            paths.borrow().iter().any(|active| {
+                active == stable_path
+                    || std::fs::canonicalize(active).is_ok_and(|resolved| resolved == stable_path)
+                    || normalize_sqlite_identity_path_lossless(active)
+                        == normalize_sqlite_identity_path_lossless(stable_path)
+            })
+        })
     }
 }
 
@@ -5081,6 +5115,40 @@ fn normalize_lexical_path(path: &Path) -> PathBuf {
     normalized
 }
 
+/// Render a pool identity key (`sqlite_identity_key()`) for operator-facing
+/// output.
+///
+/// The cache key carries an encoding discriminator (`utf8:` / `unix-hex:` /
+/// `windows-hex:`) so byte-distinct paths never collide inside process-global
+/// caches. That discriminator is an internal detail: surfaces such as
+/// `search_index_generation.db_identity` must show `<path>@<generation>`,
+/// not the namespaced spelling. Only the lossless UTF-8 form is stripped;
+/// hex-encoded non-UTF-8 paths keep their prefix so they stay unambiguous.
+#[must_use]
+pub fn display_sqlite_identity_key(key: &str) -> String {
+    key.strip_prefix("utf8:")
+        .map_or_else(|| key.to_string(), str::to_string)
+}
+
+#[cfg(test)]
+mod display_sqlite_identity_key_tests {
+    use super::display_sqlite_identity_key;
+
+    #[test]
+    fn strips_only_the_utf8_namespace_prefix() {
+        assert_eq!(
+            display_sqlite_identity_key("utf8:/tmp/mailbox.sqlite3@1"),
+            "/tmp/mailbox.sqlite3@1"
+        );
+        assert_eq!(display_sqlite_identity_key(":memory:@3"), ":memory:@3");
+        assert_eq!(
+            display_sqlite_identity_key("unix-hex:2f746d70@1"),
+            "unix-hex:2f746d70@1",
+            "non-UTF-8 paths must keep their encoding discriminator"
+        );
+    }
+}
+
 fn sqlite_identity_cache_namespace(path: &Path) -> String {
     if let Some(path) = path.to_str() {
         return format!("utf8:{path}");
@@ -8387,14 +8455,19 @@ fn os_str_starts_with(value: &OsStr, prefix: &OsStr) -> bool {
     }
 }
 
-pub(crate) struct SqliteHealthProbeSource {
+/// A private, source-byte-neutral copy of a SQLite family (main file plus
+/// every recovery sidecar) staged into a caller-owned tempdir.
+///
+/// Dropping the value removes the staged copy; keep it alive for as long as a
+/// connection opened on [`Self::path`] is in use.
+pub struct SqliteHealthProbeSource {
     _directory: CanonicalSnapshotTempDir,
     path: PathBuf,
 }
 
 impl SqliteHealthProbeSource {
     #[must_use]
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 }
@@ -8438,8 +8511,18 @@ fn stage_sqlite_family_for_health_probe_once(
     }))
 }
 
+/// Stage a private copy of the SQLite family at `source` for a read-only
+/// health probe, retrying up to three times when a sidecar appears or
+/// disappears between classification and copy.
+///
+/// The copy carries `-journal`, `-wal`, `-shm`, `-wal-cert`, and
+/// `-wal-cert-head` but deliberately not the FrankenSQLite namespace sidecars
+/// (`-fsqlite-ns-gate` / `-fsqlite-ns-use`): those describe the live inode's
+/// engine authority, which the private copy must not inherit. Returns
+/// `Ok(None)` when `source` is not a regular file or a sidecar slot holds a
+/// non-file.
 #[allow(clippy::result_large_err)]
-pub(crate) fn stage_sqlite_family_for_health_probe(
+pub fn stage_sqlite_family_for_health_probe(
     source: &Path,
 ) -> Result<Option<SqliteHealthProbeSource>, SqlError> {
     validate_sqlite_target_path(source, "SQLite health-probe source")?;
@@ -9602,8 +9685,14 @@ fn linux_device_numbers(dev: u64) -> (u32, u32) {
     (major, minor)
 }
 
+/// Enumerate `(pid, exclusive)` `flock` holders of `path` from `/proc/locks`.
+///
+/// `exclusive` is `true` for a `WRITE` lock and `false` for a `READ` (shared)
+/// lock; a PID that somehow holds both is reported exclusive. The mode is what
+/// separates a live server (exclusive activity lock) from a shared-mode
+/// observer when classifying mailbox ownership.
 #[cfg(target_os = "linux")]
-fn lock_holder_pids_via_proc(path: &Path) -> Vec<u32> {
+fn lock_holder_pids_via_proc(path: &Path) -> Vec<(u32, bool)> {
     use std::os::unix::fs::MetadataExt;
 
     let Ok(meta) = std::fs::metadata(path) else {
@@ -9616,8 +9705,9 @@ fn lock_holder_pids_via_proc(path: &Path) -> Vec<u32> {
         return Vec::new();
     };
 
-    let mut pids = BTreeSet::new();
+    let mut holders = std::collections::BTreeMap::new();
     for line in locks_content.lines() {
+        // `<n>: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> <start> <end>`
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 8 || fields[1] != "FLOCK" {
             continue;
@@ -9641,20 +9731,27 @@ fn lock_holder_pids_via_proc(path: &Path) -> Vec<u32> {
         let Ok(pid) = fields[4].parse::<u32>() else {
             continue;
         };
-        pids.insert(pid);
+        let exclusive = fields[3] == "WRITE";
+        let entry = holders.entry(pid).or_insert(false);
+        *entry |= exclusive;
     }
-    pids.into_iter().collect()
+    holders.into_iter().collect()
 }
 
 #[cfg(not(target_os = "linux"))]
-fn lock_holder_pids_via_proc(path: &Path) -> Vec<u32> {
+fn lock_holder_pids_via_proc(path: &Path) -> Vec<(u32, bool)> {
     // macOS/BSD do not expose `/proc/locks`.  Treat an Agent Mail process
     // with the activity-lock file open as a conservative holder candidate;
     // the caller filters these PIDs through `pid_is_agent_mail`.  This is
     // intentionally fail-closed: misclassifying an open-but-not-locked Agent
     // Mail process as live only defers repair, while missing the real holder
     // can authorize repair/reconstruct against an active database (GH#195).
+    // Without a lock-mode column every candidate is reported as an exclusive
+    // holder for the same fail-closed reason.
     pids_holding_file_via_lsof(path)
+        .into_iter()
+        .map(|pid| (pid, true))
+        .collect()
 }
 
 #[cfg(target_os = "linux")]
@@ -9910,6 +10007,7 @@ fn add_mailbox_process_surface(
             executable_deleted: false,
             holds_storage_root_lock: false,
             holds_sqlite_lock: false,
+            holds_exclusive_lock: false,
             holds_database_file: false,
         });
     mark(entry);
@@ -9922,6 +10020,9 @@ fn describe_mailbox_process(process: &MailboxOwnershipProcess) -> String {
     }
     if process.holds_sqlite_lock {
         surfaces.push("sqlite_lock");
+    }
+    if process.holds_exclusive_lock {
+        surfaces.push("exclusive_lock");
     }
     if process.holds_database_file {
         surfaces.push("db_file");
@@ -9952,15 +10053,70 @@ fn describe_mailbox_process(process: &MailboxOwnershipProcess) -> String {
     )
 }
 
+/// Result of [`classify_mailbox_ownership`]: the disposition plus the PIDs it
+/// was derived from, split into counted owners and reported-only readers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MailboxOwnershipClassification {
+    disposition: MailboxOwnershipDisposition,
+    competing_pids: Vec<u32>,
+    readers: Vec<u32>,
+    supervised_restart_required: bool,
+    detail: String,
+}
+
+/// Whether a live Agent Mail process counts as a mailbox *owner* rather than
+/// a transient reader.
+///
+/// A live server holds an exclusive (`flock` `WRITE`) mailbox activity lock
+/// for as long as it is alive and its argv names a serve transport. A legacy
+/// Python shadow server never takes our activity locks but must still gate
+/// writes (br-bvq1x.9.4 / I4), so its command line is an owner signal too. A
+/// read-only CLI reader (`am inbox`, `am robot handoff`, ...) merely has the
+/// database file open; counting it as a second owner produced false
+/// split-brain / `unsafe-to-touch` verdicts that blocked supervised repair.
+fn mailbox_process_is_owner(process: &MailboxOwnershipProcess) -> bool {
+    process.holds_exclusive_lock
+        || process.command.as_deref().is_some_and(|command| {
+            command_line_is_agent_mail_server(command)
+                || command_is_python_agent_mail_shadow(command)
+        })
+}
+
+fn describe_mailbox_readers(readers: &[&MailboxOwnershipProcess]) -> String {
+    if readers.is_empty() {
+        return String::new();
+    }
+    format!(
+        "; read-only Agent Mail reader(s) not counted as owners: {}",
+        readers
+            .iter()
+            .map(|process| describe_mailbox_process(process))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
 fn classify_mailbox_ownership(
     processes: &[MailboxOwnershipProcess],
     current_pid: u32,
-) -> (MailboxOwnershipDisposition, Vec<u32>, bool, String) {
-    let competing: Vec<&MailboxOwnershipProcess> = processes
-        .iter()
-        .filter(|process| process.pid != current_pid)
-        .collect();
+) -> MailboxOwnershipClassification {
+    let (competing, readers): (Vec<&MailboxOwnershipProcess>, Vec<&MailboxOwnershipProcess>) =
+        processes
+            .iter()
+            .filter(|process| process.pid != current_pid)
+            .partition(|process| mailbox_process_is_owner(process));
     let competing_pids: Vec<u32> = competing.iter().map(|process| process.pid).collect();
+    let reader_pids: Vec<u32> = readers.iter().map(|process| process.pid).collect();
+    let reader_detail = describe_mailbox_readers(&readers);
+    let classification = |disposition: MailboxOwnershipDisposition,
+                          supervised_restart_required: bool,
+                          detail: String| MailboxOwnershipClassification {
+        disposition,
+        competing_pids: competing_pids.clone(),
+        readers: reader_pids.clone(),
+        supervised_restart_required,
+        detail: format!("{detail}{reader_detail}"),
+    };
 
     if competing.len() > 1 {
         let detail = format!(
@@ -9971,20 +10127,14 @@ fn classify_mailbox_ownership(
                 .collect::<Vec<_>>()
                 .join("; ")
         );
-        return (
-            MailboxOwnershipDisposition::SplitBrain,
-            competing_pids,
-            true,
-            detail,
-        );
+        return classification(MailboxOwnershipDisposition::SplitBrain, true, detail);
     }
 
     if let Some(process) = competing.first()
         && process.executable_deleted
     {
-        return (
+        return classification(
             MailboxOwnershipDisposition::DeletedExecutable,
-            competing_pids,
             true,
             format!(
                 "another live Agent Mail mailbox owner is running a deleted executable: {}",
@@ -10012,9 +10162,8 @@ fn classify_mailbox_ownership(
                 .as_deref()
                 .is_some_and(command_line_is_agent_mail_server)
             {
-                return (
+                return classification(
                     MailboxOwnershipDisposition::ActiveOtherOwner,
-                    competing_pids,
                     false,
                     format!(
                         "another Agent Mail server owns the mailbox database: {}",
@@ -10022,9 +10171,11 @@ fn classify_mailbox_ownership(
                     ),
                 );
             }
-            return (
+            // Reachable only for an owner-by-command-line that is not a Rust
+            // serve transport (a legacy Python shadow server): it holds the
+            // database without any activity lock and needs a supervised stop.
+            return classification(
                 MailboxOwnershipDisposition::StaleLiveProcess,
-                competing_pids,
                 true,
                 format!(
                     "live Agent Mail process still holds the mailbox database without mailbox activity locks: {}",
@@ -10032,9 +10183,8 @@ fn classify_mailbox_ownership(
                 ),
             );
         }
-        return (
+        return classification(
             MailboxOwnershipDisposition::ActiveOtherOwner,
-            competing_pids,
             false,
             format!(
                 "another Agent Mail process already owns the mailbox: {}",
@@ -10043,9 +10193,8 @@ fn classify_mailbox_ownership(
         );
     }
 
-    (
+    classification(
         MailboxOwnershipDisposition::Unowned,
-        Vec::new(),
         false,
         "no competing Agent Mail mailbox owners or live database holders detected".to_string(),
     )
@@ -10060,17 +10209,19 @@ pub fn inspect_mailbox_ownership(
     let sqlite_lock_path = mailbox_activity_lock_path_for_sqlite(primary_path);
 
     let mut processes = HashMap::new();
-    for pid in lock_holder_pids_via_proc(&storage_lock_path) {
+    for (pid, exclusive) in lock_holder_pids_via_proc(&storage_lock_path) {
         if pid_is_agent_mail(pid) {
             add_mailbox_process_surface(&mut processes, pid, |process| {
                 process.holds_storage_root_lock = true;
+                process.holds_exclusive_lock |= exclusive;
             });
         }
     }
-    for pid in lock_holder_pids_via_proc(&sqlite_lock_path) {
+    for (pid, exclusive) in lock_holder_pids_via_proc(&sqlite_lock_path) {
         if pid_is_agent_mail(pid) {
             add_mailbox_process_surface(&mut processes, pid, |process| {
                 process.holds_sqlite_lock = true;
+                process.holds_exclusive_lock |= exclusive;
             });
         }
     }
@@ -10104,16 +10255,16 @@ pub fn inspect_mailbox_ownership(
         .collect();
     processes.sort_by_key(|process| process.pid);
 
-    let (disposition, competing_pids, supervised_restart_required, detail) =
-        classify_mailbox_ownership(&processes, current_pid);
+    let classification = classify_mailbox_ownership(&processes, current_pid);
     MailboxOwnershipState {
-        disposition,
+        disposition: classification.disposition,
         storage_lock_path: storage_lock_path.display().to_string(),
         sqlite_lock_path: sqlite_lock_path.display().to_string(),
         processes,
-        competing_pids,
-        supervised_restart_required,
-        detail,
+        competing_pids: classification.competing_pids,
+        readers: classification.readers,
+        supervised_restart_required: classification.supervised_restart_required,
+        detail: classification.detail,
     }
 }
 
@@ -10133,7 +10284,7 @@ pub fn mailbox_owner_executable_deleted(primary_path: &Path, storage_root: &Path
     lock_holder_pids_via_proc(&storage_lock_path)
         .into_iter()
         .chain(lock_holder_pids_via_proc(&sqlite_lock_path))
-        .any(|pid| pid_is_agent_mail(pid) && pid_executable_deleted(pid))
+        .any(|(pid, _exclusive)| pid_is_agent_mail(pid) && pid_executable_deleted(pid))
 }
 
 /// Non-Linux platforms do not expose Linux's deleted `/proc/<pid>/exe` marker.
@@ -10700,6 +10851,25 @@ fn preflight_bound_live_franken_family(stable_path: &Path, context: &str) -> Res
     }
 
     match crate::recovery_breaker::load(stable_path) {
+        Ok(Some(state))
+            if (state.tripped || state.consecutive_failures > 0)
+                && RecoveryAdmissionDepthGuard::active_for(stable_path) =>
+        {
+            // This read-only open belongs to the very recovery attempt that
+            // armed (or is retrying past) the breaker. Refusing here made
+            // every archive-ahead reconcile self-refuse its own live-salvage
+            // read, record a real failure, and crash-loop readiness on a
+            // healthy database (br-plksu). The admission gate already
+            // consulted the breaker; the remaining family checks below still
+            // apply.
+            tracing::debug!(
+                operation = context,
+                path = %stable_path.display(),
+                consecutive_failures = state.consecutive_failures,
+                tripped = state.tripped,
+                "live read-only FrankenSQLite open proceeding inside its own admitted recovery attempt despite a nonclean breaker record"
+            );
+        }
         Ok(Some(state)) if state.tripped || state.consecutive_failures > 0 => {
             return Err(SqlError::Custom(format!(
                 "{context}: refusing live read-only FrankenSQLite open for {} because durable recovery authority is nonclean and cannot be fingerprinted without opening the live main inode",
@@ -13945,7 +14115,10 @@ mod tests {
         // Unique path so parallel tests sharing the process-wide map never
         // collide with this sequence.
         let path = format!("/both-rejected-test/{}/db.sqlite3", std::process::id());
-        assert_eq!(both_rejected_should_warn(&path, "page 7 never used"), Some(1));
+        assert_eq!(
+            both_rejected_should_warn(&path, "page 7 never used"),
+            Some(1)
+        );
         assert_eq!(both_rejected_should_warn(&path, "page 7 never used"), None);
         assert_eq!(both_rejected_should_warn(&path, "page 7 never used"), None);
         assert_eq!(
@@ -14892,6 +15065,54 @@ mod tests {
             },
         )
         .expect("store tripped diagnostic breaker");
+    }
+
+    #[test]
+    fn guarded_read_only_franken_open_proceeds_inside_own_recovery_admission() {
+        // Recovery admission arms the breaker with a provisional failure
+        // before the attempt runs. The attempt's own live-salvage read must
+        // not be refused by that arming (br-plksu self-poisoning), while an
+        // unrelated reader outside any admission still is.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("armed-breaker.sqlite3");
+        seed_settled_diagnostic_database(&db_path);
+        admit_diagnostic_database_with_franken(&db_path);
+        let config = crate::recovery_breaker::config_from_env();
+        let armed = crate::recovery_breaker::record_failure(
+            None,
+            &crate::recovery_breaker::fingerprint_db(&db_path),
+            "automatic recovery attempt did not complete",
+            config,
+            recovery_breaker_now_unix(),
+        );
+        assert_eq!(armed.consecutive_failures, 1);
+        assert!(
+            !armed.tripped,
+            "a single provisional arming must not trip the breaker"
+        );
+        crate::recovery_breaker::store(&db_path, &armed).expect("store armed breaker");
+
+        let refused =
+            match open_guarded_read_only_franken_existing_file(&db_path, "outside admission") {
+                Ok(_) => panic!("an unrelated reader must still honor the nonclean breaker"),
+                Err(error) => error,
+            };
+        assert!(
+            refused.to_string().contains("nonclean"),
+            "unexpected refusal text: {refused}"
+        );
+
+        let stable_path = std::fs::canonicalize(&db_path).expect("canonicalize fixture");
+        let _admission = RecoveryAdmissionDepthGuard::enter(
+            normalize_sqlite_identity_path_lossless(&stable_path),
+        );
+        let conn = open_guarded_read_only_franken_existing_file(&db_path, "inside admission")
+            .expect("the admitted recovery attempt may read the file it armed");
+        let rows = conn
+            .query_sync("SELECT value FROM diagnostic_fixture", &[])
+            .expect("read through the admitted open");
+        assert!(!rows.is_empty());
+        crate::close_db_conn(conn, "settle admitted read-only open");
     }
 
     #[test]
@@ -22959,13 +23180,12 @@ mod tests {
     #[test]
     fn reconcile_archive_state_before_init_ignores_unrelated_default_archive_overlap() {
         let dir = tempfile::tempdir().unwrap();
-        let xdg_data_root = dir.path().join("xdg-data");
-        std::fs::create_dir_all(&xdg_data_root).unwrap();
-        let xdg_data_root_str = xdg_data_root.to_str().unwrap().to_string();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("XDG_DATA_HOME", xdg_data_root_str.as_str())],
-            || {
+        // br-99aih: redirect the *default* storage root into a private tempdir
+        // (HOME + XDG_DATA_HOME); an XDG-only override still resolved to the
+        // operator's live archive on any host that had run the daemon.
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(
+            |_isolated_default_root| {
                 let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
                 assert!(mcp_agent_mail_core::config::is_default_storage_root(
                     &storage_root
@@ -23900,13 +24120,12 @@ mod tests {
     #[test]
     fn archive_recovery_ignores_unrelated_default_archive_overlap_for_missing_external_db() {
         let dir = tempfile::tempdir().unwrap();
-        let xdg_data_root = dir.path().join("xdg-data");
-        std::fs::create_dir_all(&xdg_data_root).unwrap();
-        let xdg_data_root_str = xdg_data_root.to_str().unwrap().to_string();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("XDG_DATA_HOME", xdg_data_root_str.as_str())],
-            || {
+        // br-99aih: redirect the *default* storage root into a private tempdir
+        // (HOME + XDG_DATA_HOME); an XDG-only override still resolved to the
+        // operator's live archive on any host that had run the daemon.
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(
+            |_isolated_default_root| {
                 let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
                 assert!(mcp_agent_mail_core::config::is_default_storage_root(
                     &storage_root
@@ -23957,16 +24176,20 @@ mod tests {
             executable_deleted: false,
             holds_storage_root_lock: true,
             holds_sqlite_lock: true,
+            holds_exclusive_lock: true,
             holds_database_file: true,
         }];
 
-        let (disposition, competing_pids, supervised_restart_required, detail) =
-            classify_mailbox_ownership(&processes, current_pid);
+        let classification = classify_mailbox_ownership(&processes, current_pid);
 
-        assert_eq!(disposition, MailboxOwnershipDisposition::Unowned);
-        assert_eq!(competing_pids, [] as [u32; 0]);
-        assert!(!supervised_restart_required);
-        assert!(detail.contains("no competing"));
+        assert_eq!(
+            classification.disposition,
+            MailboxOwnershipDisposition::Unowned
+        );
+        assert_eq!(classification.competing_pids, [] as [u32; 0]);
+        assert_eq!(classification.readers, [] as [u32; 0]);
+        assert!(!classification.supervised_restart_required);
+        assert!(classification.detail.contains("no competing"));
     }
 
     #[test]
@@ -23978,37 +24201,51 @@ mod tests {
             executable_deleted: true,
             holds_storage_root_lock: true,
             holds_sqlite_lock: false,
+            holds_exclusive_lock: true,
             holds_database_file: true,
         }];
 
-        let (disposition, competing_pids, supervised_restart_required, detail) =
-            classify_mailbox_ownership(&processes, std::process::id());
+        let classification = classify_mailbox_ownership(&processes, std::process::id());
 
-        assert_eq!(disposition, MailboxOwnershipDisposition::DeletedExecutable);
-        assert_eq!(competing_pids, vec![4242]);
-        assert!(supervised_restart_required);
-        assert!(detail.contains("deleted executable"));
+        assert_eq!(
+            classification.disposition,
+            MailboxOwnershipDisposition::DeletedExecutable
+        );
+        assert_eq!(classification.competing_pids, vec![4242]);
+        assert!(classification.supervised_restart_required);
+        assert!(classification.detail.contains("deleted executable"));
     }
 
     #[test]
     fn classify_mailbox_ownership_flags_stale_live_process_without_activity_locks() {
+        // A legacy Python shadow server never takes our activity locks but is
+        // an owner by command line (br-bvq1x.9.4 / I4): it must keep gating
+        // writes as a lockless live process, not slip through as a reader.
         let processes = vec![MailboxOwnershipProcess {
             pid: 4343,
-            command: Some("mcp-agent-mail serve".to_string()),
-            executable_path: Some("/tmp/mcp-agent-mail".to_string()),
+            command: Some("python3 -m mcp_agent_mail serve".to_string()),
+            executable_path: Some("/usr/bin/python3".to_string()),
             executable_deleted: false,
             holds_storage_root_lock: false,
             holds_sqlite_lock: false,
+            holds_exclusive_lock: false,
             holds_database_file: true,
         }];
 
-        let (disposition, competing_pids, supervised_restart_required, detail) =
-            classify_mailbox_ownership(&processes, std::process::id());
+        let classification = classify_mailbox_ownership(&processes, std::process::id());
 
-        assert_eq!(disposition, MailboxOwnershipDisposition::StaleLiveProcess);
-        assert_eq!(competing_pids, vec![4343]);
-        assert!(supervised_restart_required);
-        assert!(detail.contains("without mailbox activity locks"));
+        assert_eq!(
+            classification.disposition,
+            MailboxOwnershipDisposition::StaleLiveProcess
+        );
+        assert_eq!(classification.competing_pids, vec![4343]);
+        assert_eq!(classification.readers, [] as [u32; 0]);
+        assert!(classification.supervised_restart_required);
+        assert!(
+            classification
+                .detail
+                .contains("without mailbox activity locks")
+        );
     }
 
     #[test]
@@ -24020,16 +24257,23 @@ mod tests {
             executable_deleted: false,
             holds_storage_root_lock: false,
             holds_sqlite_lock: false,
+            holds_exclusive_lock: false,
             holds_database_file: true,
         }];
 
-        let (disposition, competing_pids, supervised_restart_required, detail) =
-            classify_mailbox_ownership(&processes, std::process::id());
+        let classification = classify_mailbox_ownership(&processes, std::process::id());
 
-        assert_eq!(disposition, MailboxOwnershipDisposition::ActiveOtherOwner);
-        assert_eq!(competing_pids, vec![4344]);
-        assert!(!supervised_restart_required);
-        assert!(detail.contains("server owns the mailbox database"));
+        assert_eq!(
+            classification.disposition,
+            MailboxOwnershipDisposition::ActiveOtherOwner
+        );
+        assert_eq!(classification.competing_pids, vec![4344]);
+        assert!(!classification.supervised_restart_required);
+        assert!(
+            classification
+                .detail
+                .contains("server owns the mailbox database")
+        );
     }
 
     #[test]
@@ -24042,6 +24286,7 @@ mod tests {
                 executable_deleted: false,
                 holds_storage_root_lock: true,
                 holds_sqlite_lock: false,
+                holds_exclusive_lock: true,
                 holds_database_file: true,
             },
             MailboxOwnershipProcess {
@@ -24051,17 +24296,144 @@ mod tests {
                 executable_deleted: false,
                 holds_storage_root_lock: false,
                 holds_sqlite_lock: true,
+                holds_exclusive_lock: true,
                 holds_database_file: true,
             },
         ];
 
-        let (disposition, competing_pids, supervised_restart_required, detail) =
-            classify_mailbox_ownership(&processes, std::process::id());
+        let classification = classify_mailbox_ownership(&processes, std::process::id());
 
-        assert_eq!(disposition, MailboxOwnershipDisposition::SplitBrain);
-        assert_eq!(competing_pids, vec![4444, 5555]);
-        assert!(supervised_restart_required);
-        assert!(detail.contains("split-brain"));
+        assert_eq!(
+            classification.disposition,
+            MailboxOwnershipDisposition::SplitBrain
+        );
+        assert_eq!(classification.competing_pids, vec![4444, 5555]);
+        assert!(classification.supervised_restart_required);
+        assert!(classification.detail.contains("split-brain"));
+    }
+
+    #[test]
+    fn classify_mailbox_ownership_ignores_read_only_cli_reader() {
+        // Production shape: the server's argv can be just `am` (rewritten
+        // process title), so only its exclusive activity lock proves
+        // ownership; a transient `am robot handoff` merely has the database
+        // file open.
+        let processes = vec![
+            MailboxOwnershipProcess {
+                pid: 4444,
+                command: Some("am".to_string()),
+                executable_path: Some("/home/ubuntu/.local/bin/am".to_string()),
+                executable_deleted: false,
+                holds_storage_root_lock: true,
+                holds_sqlite_lock: false,
+                holds_exclusive_lock: true,
+                holds_database_file: true,
+            },
+            MailboxOwnershipProcess {
+                pid: 5555,
+                command: Some("am robot handoff".to_string()),
+                executable_path: Some("/home/ubuntu/.local/bin/am".to_string()),
+                executable_deleted: false,
+                holds_storage_root_lock: false,
+                holds_sqlite_lock: false,
+                holds_exclusive_lock: false,
+                holds_database_file: true,
+            },
+        ];
+
+        let classification = classify_mailbox_ownership(&processes, std::process::id());
+
+        assert_eq!(
+            classification.disposition,
+            MailboxOwnershipDisposition::ActiveOtherOwner
+        );
+        assert_eq!(classification.competing_pids, vec![4444]);
+        assert_eq!(classification.readers, vec![5555]);
+        assert!(!classification.supervised_restart_required);
+        assert!(
+            !classification.detail.contains("split-brain"),
+            "a read-only reader must not produce a split-brain verdict: {}",
+            classification.detail
+        );
+        assert!(
+            classification
+                .detail
+                .contains("reader(s) not counted as owners: PID 5555"),
+            "readers must still be reported for operators: {}",
+            classification.detail
+        );
+    }
+
+    #[test]
+    fn classify_mailbox_ownership_lone_read_only_reader_is_unowned() {
+        let processes = vec![MailboxOwnershipProcess {
+            pid: 6666,
+            command: Some("am inbox --json".to_string()),
+            executable_path: Some("/home/ubuntu/.local/bin/am".to_string()),
+            executable_deleted: false,
+            holds_storage_root_lock: false,
+            holds_sqlite_lock: false,
+            holds_exclusive_lock: false,
+            holds_database_file: true,
+        }];
+
+        let classification = classify_mailbox_ownership(&processes, std::process::id());
+
+        assert_eq!(
+            classification.disposition,
+            MailboxOwnershipDisposition::Unowned
+        );
+        assert_eq!(classification.competing_pids, [] as [u32; 0]);
+        assert_eq!(classification.readers, vec![6666]);
+        assert!(!classification.supervised_restart_required);
+        assert!(classification.detail.contains("PID 6666"));
+    }
+
+    #[test]
+    fn classify_mailbox_ownership_still_flags_two_exclusive_owners() {
+        let processes = vec![
+            MailboxOwnershipProcess {
+                pid: 4444,
+                command: Some("am".to_string()),
+                executable_path: Some("/home/ubuntu/.local/bin/am".to_string()),
+                executable_deleted: false,
+                holds_storage_root_lock: true,
+                holds_sqlite_lock: false,
+                holds_exclusive_lock: true,
+                holds_database_file: true,
+            },
+            MailboxOwnershipProcess {
+                pid: 5555,
+                command: Some("am serve-stdio".to_string()),
+                executable_path: Some("/tmp/mcp-agent-mail-cli".to_string()),
+                executable_deleted: false,
+                holds_storage_root_lock: false,
+                holds_sqlite_lock: true,
+                holds_exclusive_lock: true,
+                holds_database_file: true,
+            },
+            MailboxOwnershipProcess {
+                pid: 7777,
+                command: Some("am robot status".to_string()),
+                executable_path: Some("/home/ubuntu/.local/bin/am".to_string()),
+                executable_deleted: false,
+                holds_storage_root_lock: false,
+                holds_sqlite_lock: false,
+                holds_exclusive_lock: false,
+                holds_database_file: true,
+            },
+        ];
+
+        let classification = classify_mailbox_ownership(&processes, std::process::id());
+
+        assert_eq!(
+            classification.disposition,
+            MailboxOwnershipDisposition::SplitBrain
+        );
+        assert_eq!(classification.competing_pids, vec![4444, 5555]);
+        assert_eq!(classification.readers, vec![7777]);
+        assert!(classification.supervised_restart_required);
+        assert!(classification.detail.contains("split-brain"));
     }
 
     #[cfg(unix)]

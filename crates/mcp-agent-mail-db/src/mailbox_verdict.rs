@@ -863,6 +863,7 @@ pub fn compute_mailbox_verdict(
                     sqlite_lock_path: String::new(),
                     processes: Vec::new(),
                     competing_pids: Vec::new(),
+                    readers: Vec::new(),
                     supervised_restart_required: false,
                     detail: "Ownership inspection skipped because canonical path resolution failed"
                         .to_string(),
@@ -919,6 +920,7 @@ pub fn compute_mailbox_verdict(
             sqlite_lock_path: format!("{}.activity.lock", db_path.display()),
             processes: Vec::new(),
             competing_pids: Vec::new(),
+            readers: Vec::new(),
             supervised_restart_required: false,
             detail: "Ownership inspection skipped by verdict options".to_string(),
         }
@@ -1944,6 +1946,7 @@ mod tests {
                 sqlite_lock_path: "storage.sqlite3.activity.lock".to_string(),
                 processes: Vec::new(),
                 competing_pids: Vec::new(),
+                readers: Vec::new(),
                 supervised_restart_required: false,
                 detail: "test mailbox ownership".to_string(),
             },
@@ -2468,6 +2471,7 @@ mod tests {
             sqlite_lock_path: "storage.sqlite3.activity.lock".to_string(),
             processes: Vec::new(),
             competing_pids: Vec::new(),
+            readers: Vec::new(),
             supervised_restart_required: false,
             detail: "clean".to_string(),
         });
@@ -2479,6 +2483,7 @@ mod tests {
             sqlite_lock_path: "storage.sqlite3.activity.lock".to_string(),
             processes: Vec::new(),
             competing_pids: vec![1234],
+            readers: Vec::new(),
             supervised_restart_required: false,
             detail: "other owner".to_string(),
         });
@@ -2491,6 +2496,7 @@ mod tests {
             sqlite_lock_path: "storage.sqlite3.activity.lock".to_string(),
             processes: Vec::new(),
             competing_pids: vec![1234, 5678],
+            readers: Vec::new(),
             supervised_restart_required: true,
             detail: "split-brain".to_string(),
         });

@@ -653,12 +653,15 @@ pub fn slow_tools() -> Vec<MetricsSnapshotEntry> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Tests that reset global metrics and assert exact counts must be
     /// serialized to prevent parallel tests from polluting each other.
-    static METRICS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Crate-visible (the enclosing `tests` module is `pub(crate)`) so sibling
+    /// modules such as `resources::tests` that read the same global registry
+    /// can take the same lock.
+    pub static METRICS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn record_and_snapshot() {

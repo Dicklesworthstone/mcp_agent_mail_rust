@@ -85,7 +85,8 @@ ARG SIBLING_FALLBACK_REF=main
 # the two that *do* still need a sibling failed for unrelated reasons. As of the
 # 2026-08-22 registry adoption exactly two remain:
 #
-#   frankensearch  — [workspace.dependencies] path = "../frankensearch/..."
+#   frankensearch  — [workspace.dependencies] path = "../frankensearch-rel-0332/..."
+#                    (gated clone name; the pinned commit is cloned under it)
 #   beads_rust     — [patch.crates-io] path = "../beads_rust"
 #                    (registry 0.3.2 pins asupersync =0.4.4, unsatisfiable in
 #                     the =0.4.9 universe; drops out when 0.4.x publishes)
@@ -142,7 +143,7 @@ RUN set -eu; \
         git clone --depth 1 --branch "$selected_ref" "$@" "$url" "$dest"; \
       fi; \
     }; \
-    clone_at https://github.com/Dicklesworthstone/frankensearch.git "${SIBLING_REF}" /build/frankensearch; \
+    clone_at https://github.com/Dicklesworthstone/frankensearch.git "${SIBLING_REF}" /build/frankensearch-rel-0332; \
     clone_at https://github.com/Dicklesworthstone/beads_rust.git    "${SIBLING_REF}" /build/beads_rust
 
 # Clone the project source at the requested ref. We clone (rather than COPY

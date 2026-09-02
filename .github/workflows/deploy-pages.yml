@@ -1,20 +1,26 @@
 # Deploy MCP Agent Mail static export to GitHub Pages
 #
 # Usage:
-#   1. Place your bundle output in the `.rch-tmp/.tmpx0g0RY/docs` directory (or configure path below)
+#   1. Produce a bundle with `am share export -o <dir> --no-zip` (or
+#      `am share static-export -o <dir>`) and commit it under `docs/site/`
+#      (or pass another committed directory as the `bundle_dir` input).
 #   2. Enable GitHub Pages in repo Settings > Pages > Source: "GitHub Actions"
-#   3. Push to main branch to trigger deployment
+#   3. Actions > "Deploy to GitHub Pages" > "Run workflow"
 #
-# Or manually: Actions > "Deploy to GitHub Pages" > "Run workflow"
+# This workflow is dispatch-only on purpose: an earlier revision watched a
+# leaked rch temp path (`.rch-tmp/.tmpx0g0RY/docs/**`) that never existed in
+# the repository, so every push-triggered run failed at validation.
 
 name: Deploy to GitHub Pages
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - '.rch-tmp/.tmpx0g0RY/docs/**'
   workflow_dispatch:
+    inputs:
+      bundle_dir:
+        description: 'Committed directory holding the exported bundle (manifest.json + index.html)'
+        required: false
+        default: 'docs/site'
+        type: string
 
 permissions:
   contents: read
@@ -33,7 +39,7 @@ jobs:
 
       - name: Validate bundle
         run: |
-          BUNDLE_DIR=".rch-tmp/.tmpx0g0RY/docs"
+          BUNDLE_DIR="${{ inputs.bundle_dir || 'docs/site' }}"
           echo "=== Pre-flight checks ==="
           test -f "$BUNDLE_DIR/manifest.json" || { echo "FAIL: manifest.json missing"; exit 1; }
           test -f "$BUNDLE_DIR/index.html" || { echo "FAIL: index.html missing"; exit 1; }
@@ -61,7 +67,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: '.rch-tmp/.tmpx0g0RY/docs'
+          path: ${{ inputs.bundle_dir || 'docs/site' }}
 
       - name: Deploy to GitHub Pages
         id: deployment

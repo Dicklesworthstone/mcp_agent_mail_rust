@@ -3,12 +3,12 @@
     "agents": [
       {
         "model": "test",
-        "name": "GreenCastle",
+        "name": "PurpleBear",
         "program": "test"
       },
       {
         "model": "test",
-        "name": "PurpleBear",
+        "name": "GreenCastle",
         "program": "test"
       }
     ],
@@ -21,12 +21,12 @@
     "agents": [
       {
         "model": "test",
-        "name": "GreenCastle",
+        "name": "OrangeFish",
         "program": "test"
       },
       {
         "model": "test",
-        "name": "OrangeFish",
+        "name": "GreenCastle",
         "program": "test"
       }
     ],

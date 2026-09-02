@@ -10,7 +10,8 @@
     "project_id": 2,
     "sender_id": 4,
     "subject": "Beta ping",
-    "thread_id": null
+    "thread_id": null,
+    "topic": null
   },
   {
     "ack_required": false,
@@ -23,6 +24,7 @@
     "project_id": 1,
     "sender_id": 3,
     "subject": "Unicorn alpha",
-    "thread_id": null
+    "thread_id": null,
+    "topic": null
   }
 ]

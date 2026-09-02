@@ -121,27 +121,99 @@ fn normalized_property_names(schema: &Value) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
+/// Normalize a JSON Schema property to its non-null base type.
+///
+/// Nullable parameters have two legal spellings and both must map to the
+/// same base type:
+///
+/// - `{"anyOf": [{"type": "integer"}, {"type": "null"}]}`
+/// - `{"type": ["integer", "null"]}` — what fastmcp >= 0.7.1 publishes for
+///   `Option<T>` tool parameters so callers may spell "omitted" as an
+///   explicit JSON `null` (CHANGELOG v0.3.31, GH#255). This is the intended
+///   wire contract, not a regression: the base type is still asserted
+///   against the Python fixture, only the `null` widening is normalized away.
+///
+/// A property with no non-null type at all still returns `None` so a real
+/// type regression keeps failing the comparison.
 fn normalized_property_type(prop: &Value) -> Option<String> {
     if let Some(kind) = prop.get("type").and_then(Value::as_str) {
         return Some(kind.to_string());
     }
     let mut non_null: Vec<String> = prop
-        .get("anyOf")
+        .get("type")
         .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|branch| branch.get("type").and_then(Value::as_str))
+        .map(|types| {
+            types
+                .iter()
+                .filter_map(Value::as_str)
                 .filter(|kind| *kind != "null")
                 .map(ToString::to_string)
                 .collect()
         })
         .unwrap_or_default();
     if non_null.is_empty() {
+        non_null = prop
+            .get("anyOf")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|branch| branch.get("type").and_then(Value::as_str))
+                    .filter(|kind| *kind != "null")
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    if non_null.is_empty() {
         return None;
     }
     non_null.sort_unstable();
     non_null.dedup();
     Some(non_null.join("|"))
+}
+
+#[test]
+fn normalized_property_type_reads_nullable_type_arrays_as_base_type() {
+    assert_eq!(
+        normalized_property_type(&serde_json::json!({"type": ["integer", "null"]})),
+        Some("integer".to_string()),
+        "fastmcp >= 0.7.1 nullable spelling must normalize to the base type"
+    );
+    assert_eq!(
+        normalized_property_type(
+            &serde_json::json!({"type": ["array", "null"], "items": {"type": "string"}})
+        ),
+        Some("array".to_string())
+    );
+    assert_eq!(
+        normalized_property_type(
+            &serde_json::json!({"anyOf": [{"type": "boolean"}, {"type": "null"}]})
+        ),
+        Some("boolean".to_string()),
+        "the anyOf nullable spelling must keep normalizing"
+    );
+    assert_eq!(
+        normalized_property_type(&serde_json::json!({"type": "string"})),
+        Some("string".to_string())
+    );
+}
+
+#[test]
+fn normalized_property_type_still_rejects_typeless_properties() {
+    assert_eq!(
+        normalized_property_type(&serde_json::json!({"description": "no type at all"})),
+        None,
+        "a property with no type must not be normalized into a passing value"
+    );
+    assert_eq!(
+        normalized_property_type(&serde_json::json!({"type": ["null"]})),
+        None,
+        "null-only type arrays carry no base type"
+    );
+    assert_eq!(
+        normalized_property_type(&serde_json::json!({"anyOf": [{"type": "null"}]})),
+        None
+    );
 }
 
 /// Compare the supported input-schema contract.

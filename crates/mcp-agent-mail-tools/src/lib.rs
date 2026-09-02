@@ -2292,15 +2292,14 @@ body
             let temp = tempfile::tempdir().expect("tempdir");
             let db_path = temp.path().join("custom.sqlite3");
             let database_url = format!("sqlite:///{}", db_path.display());
-            let xdg_data_home = temp.path().join("xdg");
-            let xdg_data_home_text = xdg_data_home.to_string_lossy().into_owned();
 
-            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-                &[
-                    ("DATABASE_URL", database_url.as_str()),
-                    ("XDG_DATA_HOME", xdg_data_home_text.as_str()),
-                ],
-                || {
+            // br-99aih: redirect the *default* storage root into a private
+            // tempdir (HOME + XDG_DATA_HOME); an XDG-only override still
+            // resolved to the operator's live archive on any host that had run
+            // the daemon.
+            mcp_agent_mail_core::config::with_isolated_default_storage_root_and_env_overrides_for_test(
+                &[("DATABASE_URL", database_url.as_str())],
+                |_isolated_default_root| {
                     Config::reset_cached();
                     let storage_root = Config::from_env().storage_root;
                     let project_dir = storage_root.join("projects").join("ahead-project");

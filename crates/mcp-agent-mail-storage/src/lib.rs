@@ -7326,12 +7326,41 @@ const ARCHIVE_GITIGNORE_ENTRIES: &[&str] =
 /// Ensure the global archive root directory exists and is a git repository.
 ///
 /// Returns `(repo_root, was_freshly_initialized)`.
+///
+/// This is the single funnel every archive write passes through
+/// (`ensure_archive` and each `WriteOp`), so it is also where a test harness
+/// is refused the operator's real default archive (br-99aih): background
+/// workers rehydrate `Config` from the process env after a test's override
+/// scope ends and would otherwise initialize and write into the live
+/// `~/.mcp_agent_mail_git_mailbox_repo`.
 pub fn ensure_archive_root(config: &Config) -> Result<(PathBuf, bool)> {
     let root = archive_storage_root(config);
+    refuse_default_storage_root_under_test_harness(&root)?;
     ensure_dir(&root)?;
 
     let fresh = ensure_repo(&root, config)?;
     Ok((root, fresh))
+}
+
+/// Refuse to initialize the operator's real default archive from a
+/// cargo/nextest/insta test harness (br-99aih).
+///
+/// Same predicate as the `Config::from_env` guard; the only bypass is
+/// `AM_ALLOW_HOME_STORAGE_ROOT=1`, which
+/// `config::with_isolated_default_storage_root_for_test` sets because its
+/// "default" root is a private tempdir. Production processes never satisfy
+/// the harness predicate, so for them this costs a few env lookups.
+fn refuse_default_storage_root_under_test_harness(root: &Path) -> Result<()> {
+    if config::default_storage_root_refused_under_test_harness(root) {
+        return Err(StorageError::InvalidPath(format!(
+            "refusing to initialize the default user archive at {} from a cargo/nextest/insta \
+             test harness (br-99aih). Set STORAGE_ROOT to an isolated directory, redirect HOME \
+             and XDG_DATA_HOME into a tempdir (`with_isolated_default_storage_root_for_test`), \
+             or export AM_ALLOW_HOME_STORAGE_ROOT=1 for an intentional test",
+            root.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Open an existing per-project archive directory without creating it.
@@ -12661,6 +12690,131 @@ mod tests {
         // Second call should not re-initialize
         let (_root2, fresh2) = ensure_archive_root(&config).unwrap();
         assert!(!fresh2);
+    }
+
+    /// Redirected `HOME` / `XDG_DATA_HOME` values that move the *default*
+    /// storage root into a tempdir for the br-99aih funnel tests.
+    struct IsolatedDefaultRootEnv {
+        home: String,
+        xdg_data: String,
+    }
+
+    impl IsolatedDefaultRootEnv {
+        fn new(tmp: &Path) -> Self {
+            let home = tmp.join("home");
+            let xdg_data = tmp.join("xdg-data");
+            fs::create_dir_all(&home).expect("create isolated home");
+            fs::create_dir_all(&xdg_data).expect("create isolated xdg data dir");
+            Self {
+                home: home.to_string_lossy().into_owned(),
+                xdg_data: xdg_data.to_string_lossy().into_owned(),
+            }
+        }
+
+        /// Overrides for `config::with_process_env_overrides_for_test`: the
+        /// redirected home/XDG dirs plus a pinned harness marker so the guard
+        /// predicate is deterministic even when a remote runner relocates the
+        /// unit-test binary off `deps/`.
+        fn overrides<'a>(&'a self, allow_home_storage_root: &'a str) -> [(&'a str, &'a str); 5] {
+            [
+                ("HOME", self.home.as_str()),
+                ("USERPROFILE", self.home.as_str()),
+                ("XDG_DATA_HOME", self.xdg_data.as_str()),
+                ("NEXTEST_RUN_ID", "storage-default-root-guard"),
+                ("AM_ALLOW_HOME_STORAGE_ROOT", allow_home_storage_root),
+            ]
+        }
+    }
+
+    #[test]
+    fn ensure_archive_root_refuses_default_root_under_test_harness() {
+        // br-99aih: every archive write funnels through `ensure_archive_root`,
+        // so a background worker that rehydrates `Config` from the ambient env
+        // after a test's override scope ends must be refused the operator's
+        // real default archive. Redirect HOME/XDG into a tempdir so the
+        // "default root" is private, then prove the refusal happens before
+        // anything is created.
+        let tmp = TempDir::new().unwrap();
+        let env = IsolatedDefaultRootEnv::new(tmp.path());
+
+        config::with_process_env_overrides_for_test(&env.overrides(""), || {
+            let default_root = config::default_storage_root_path();
+            assert!(
+                default_root.starts_with(tmp.path()),
+                "redirected default root {} must live inside the tempdir",
+                default_root.display()
+            );
+            assert!(config::is_running_under_cargo_test_harness());
+
+            let refused = ensure_archive_root(&test_config(&default_root))
+                .expect_err("default root must be refused under a test harness");
+            assert!(
+                matches!(refused, StorageError::InvalidPath(_)),
+                "unexpected error variant: {refused:?}"
+            );
+            let message = refused.to_string();
+            assert!(message.contains("AM_ALLOW_HOME_STORAGE_ROOT"), "{message}");
+            assert!(message.contains("STORAGE_ROOT"), "{message}");
+            assert!(
+                !default_root.exists(),
+                "refusal must happen before the archive root is created"
+            );
+
+            // `ensure_archive` (and therefore every WriteOp) shares the funnel.
+            let refused_project = ensure_archive(&test_config(&default_root), "leak-probe")
+                .expect_err("ensure_archive must share the refusal");
+            assert!(
+                matches!(refused_project, StorageError::InvalidPath(_)),
+                "unexpected error variant: {refused_project:?}"
+            );
+            assert!(!default_root.join("projects").exists());
+
+            // An isolated (non-default) root is still accepted as usual.
+            let isolated = tmp.path().join("isolated-root");
+            let (root, fresh) = ensure_archive_root(&test_config(&isolated))
+                .expect("isolated root must be accepted");
+            assert!(fresh);
+            assert!(root.join(".git").exists());
+        });
+    }
+
+    #[test]
+    fn ensure_archive_root_accepts_default_root_with_explicit_escape_hatch() {
+        // Same harness setup, but AM_ALLOW_HOME_STORAGE_ROOT=1: the escape
+        // hatch used by `with_isolated_default_storage_root_for_test` must let
+        // a (private) default root initialize normally.
+        let tmp = TempDir::new().unwrap();
+        let env = IsolatedDefaultRootEnv::new(tmp.path());
+
+        config::with_process_env_overrides_for_test(&env.overrides("1"), || {
+            let default_root = config::default_storage_root_path();
+            assert!(default_root.starts_with(tmp.path()));
+            assert!(config::is_running_under_cargo_test_harness());
+
+            let (root, fresh) = ensure_archive_root(&test_config(&default_root))
+                .expect("escape hatch must admit the private default root");
+            assert!(fresh);
+            assert_eq!(root, default_root);
+            assert!(root.join(".git").exists());
+        });
+    }
+
+    #[test]
+    fn ensure_archive_accepts_isolated_default_root_helper() {
+        // The core helper redirects the default root and sets the escape
+        // hatch itself, so archive writes through the funnel just work.
+        let created = config::with_isolated_default_storage_root_for_test(|root| {
+            let archive = ensure_archive(&test_config(root), "helper-probe")
+                .expect("isolated default root must accept archive writes");
+            assert!(archive.root.starts_with(root));
+            assert!(root.join(".git").exists());
+            archive.root
+        });
+        assert!(
+            !created.exists(),
+            "helper must remove its tempdir after the closure returns: {}",
+            created.display()
+        );
     }
 
     #[test]

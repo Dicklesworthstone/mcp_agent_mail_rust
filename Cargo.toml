@@ -131,11 +131,22 @@ winsafe = { version = "=0.0.28", features = ["kernel"] }
 # Do not enable frankensearch's aggregate `hybrid`/`semantic` features here:
 # those currently include FastEmbed, which pulls hf-hub/reqwest/hyper/tokio.
 # Downstream crates opt into the exact no-Tokio subfeatures they need.
-frankensearch = { version = "0.4.0", path = "../frankensearch/frankensearch", default-features = false, features = ["lexical-tantivy"] }
-frankensearch-core = { version = "0.2.2", path = "../frankensearch/crates/frankensearch-core" }
-frankensearch-embed = { version = "0.2.2", path = "../frankensearch/crates/frankensearch-embed", default-features = false }
-frankensearch-index = { version = "0.2.2", path = "../frankensearch/crates/frankensearch-index" }
-frankensearch-fusion = { version = "0.2.2", path = "../frankensearch/crates/frankensearch-fusion" }
+#
+# 2026-09-01: the sibling is a GATED CLONE at the v0.3.32 release pin
+# (dist.yml `FRANKENSEARCH_COMMIT` = 3bbfd8c6), not the live `../frankensearch`
+# checkout. The live tree moved to asupersync 0.4.10 (`Cx::is_cancelled` in
+# frankensearch-quill, commit 29d88ae6) while fastmcp — even 0.8.1 — still
+# pins asupersync =0.4.9, so building against the live sibling stopped
+# compiling for every agent on the host. dist.yml, Dockerfile, and
+# install.sh --from-source check the pinned commit out under the same name.
+# Cleanup trigger: fastmcp publishes a release on asupersync >=0.4.10 (then
+# retarget the live sibling or adopt registry frankensearch), or frankensearch
+# ships a tagged release that this workspace can pin from crates.io.
+frankensearch = { version = "0.4.0", path = "../frankensearch-rel-0332/frankensearch", default-features = false, features = ["lexical-tantivy"] }
+frankensearch-core = { version = "0.2.2", path = "../frankensearch-rel-0332/crates/frankensearch-core" }
+frankensearch-embed = { version = "0.2.2", path = "../frankensearch-rel-0332/crates/frankensearch-embed", default-features = false }
+frankensearch-index = { version = "0.2.2", path = "../frankensearch-rel-0332/crates/frankensearch-index" }
+frankensearch-fusion = { version = "0.2.2", path = "../frankensearch-rel-0332/crates/frankensearch-fusion" }
 
 # Two-tier search dependencies (legacy, being replaced by frankensearch)
 half = "2"

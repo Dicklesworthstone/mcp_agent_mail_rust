@@ -1177,45 +1177,56 @@ fn current_exe_is_cargo_test_artifact() -> bool {
 /// to the `am` binary and the binary silently starts writing to the real
 /// user archive.
 ///
-/// ## Mode
+/// ## Behavior
 ///
-/// - **Default (warn mode)**: logs a WARN with guidance and returns. This
-///   avoids breaking the many existing tests that call `Config::from_env`
-///   purely to inspect config defaults without ever touching storage.
-/// - **Strict mode** (`AM_STRICT_HOME_STORAGE_GUARD=1`): panics instead
-///   of warning. Useful in CI to force test suites to set `STORAGE_ROOT`
-///   explicitly, and in production if operators want to ensure no stray
-///   test invocation can write to the real archive.
+/// Refuses — panics with actionable guidance — whenever both hold: the
+/// process is a cargo/nextest/insta test harness (or was spawned by one) and
+/// `storage_root` is the real user default archive. There is no warn-only
+/// mode any more (br-99aih): a warning logged into the void let workspace
+/// test runs seed junk projects into the live
+/// `~/.mcp_agent_mail_git_mailbox_repo/projects/`, which later triggered an
+/// archive-ahead reconcile that crash-looped the live daemon.
 ///
-/// Override (both modes) with `AM_ALLOW_HOME_STORAGE_ROOT=1` for the rare
-/// case where a test intentionally exercises the home-archive path.
+/// The only escape hatch is `AM_ALLOW_HOME_STORAGE_ROOT=1`, for a test that
+/// intentionally exercises the home-archive path — normally because it first
+/// redirected `HOME`/`XDG_DATA_HOME` into a tempdir (see
+/// [`with_isolated_default_storage_root_for_test`]).
+/// `AM_STRICT_HOME_STORAGE_GUARD` used to upgrade the warning to a panic; it
+/// is now a redundant alias of the default behavior and is ignored.
+///
+/// Production binaries are unaffected: the harness predicate
+/// ([`is_running_under_cargo_test_harness`]) is unchanged and never fires for
+/// a shipped `am` binary that is not running under a test harness.
 fn guard_against_default_storage_root_in_test_mode(storage_root: &Path) {
-    if !is_running_under_cargo_test_harness() {
+    if !default_storage_root_refused_under_test_harness(storage_root) {
         return;
     }
-    if !matches_default_storage_root(storage_root) {
-        return;
-    }
-    if env_truthy("AM_ALLOW_HOME_STORAGE_ROOT") {
-        return;
-    }
-
-    let message = format!(
+    panic!(
         "Config::from_env resolved storage_root to the default user archive ({}) while \
          running under a cargo/nextest/insta test harness. This is almost always a bug — \
          a subprocess-spawning test likely forgot to pass STORAGE_ROOT=<tempdir> through \
          to the `am` binary, or an integration test forgot to set an isolated STORAGE_ROOT \
-         before constructing Config. Fixes: set STORAGE_ROOT explicitly, or export \
-         AM_ALLOW_HOME_STORAGE_ROOT=1 to bypass this guard for an intentional test.",
+         before constructing Config. Fixes: set STORAGE_ROOT explicitly, redirect HOME and \
+         XDG_DATA_HOME into a tempdir (`with_isolated_default_storage_root_for_test`), or \
+         export AM_ALLOW_HOME_STORAGE_ROOT=1 to bypass this guard for an intentional test.",
         storage_root.display()
     );
+}
 
-    assert!(!env_truthy("AM_STRICT_HOME_STORAGE_GUARD"), "{}", message);
-    tracing::warn!(
-        storage_root = %storage_root.display(),
-        "{}",
-        message
-    );
+/// True when a test harness must be refused the real default archive root.
+///
+/// All three conditions must hold: this process is a cargo/nextest/insta test
+/// harness (or a child of one), `storage_root` is the real user default
+/// archive, and `AM_ALLOW_HOME_STORAGE_ROOT` is not set.
+///
+/// Shared by the `Config::from_env` guard and the storage crate's
+/// archive-root funnel (`ensure_archive_root`) so both layers refuse under
+/// exactly the same conditions (br-99aih).
+#[must_use]
+pub fn default_storage_root_refused_under_test_harness(storage_root: &Path) -> bool {
+    is_running_under_cargo_test_harness()
+        && matches_default_storage_root(storage_root)
+        && !env_truthy("AM_ALLOW_HOME_STORAGE_ROOT")
 }
 
 /// Returns `true` when the given env var is set to a truthy value through
@@ -2870,13 +2881,13 @@ impl Config {
         }
 
         // ────────────────────────────────────────────────────────────
-        // Test-mode guard (C2): if this process looks like it's running
-        // under a cargo integration-test / nextest / insta harness and is
-        // about to fall back to the DEFAULT user storage_root, flag it.
-        // Default mode is WARN (so existing test suites that call
-        // `Config::from_env` purely to inspect defaults aren't broken);
-        // `AM_STRICT_HOME_STORAGE_GUARD=1` upgrades to panic for CI gating.
-        // `AM_ALLOW_HOME_STORAGE_ROOT=1` bypasses both.
+        // Test-mode guard (C2, br-99aih): if this process looks like it's
+        // running under a cargo integration-test / nextest / insta harness
+        // and just resolved the DEFAULT user storage_root, refuse (panic) so
+        // a test can never write into the operator's live archive. The only
+        // bypass is `AM_ALLOW_HOME_STORAGE_ROOT=1`; the former
+        // `AM_STRICT_HOME_STORAGE_GUARD` is a redundant alias of this
+        // always-on behavior.
         // ────────────────────────────────────────────────────────────
         config.user_env_authority_error = user_env_authority_error();
         guard_against_default_storage_root_in_test_mode(&config.storage_root);
@@ -3357,6 +3368,89 @@ pub fn with_process_env_overrides_for_test<R>(
     let restore = ProcessEnvOverrideGuard { previous };
     let result = f();
     drop(restore);
+    result
+}
+
+/// Run `f` with the *default* storage root redirected into a private tempdir,
+/// for tests that must exercise the "storage root is the default mailbox"
+/// code paths (`is_default_storage_root(..) == true`) without ever touching
+/// the operator's real archive.
+///
+/// `default_storage_root_path()` prefers `$HOME/.mcp_agent_mail_git_mailbox_repo`
+/// whenever that legacy archive holds a `projects/` dir, so overriding only
+/// `XDG_DATA_HOME` still resolves to the live archive on any host that has
+/// run the daemon (br-99aih). This helper overrides `HOME`, `USERPROFILE`,
+/// and `XDG_DATA_HOME` together, pins `STORAGE_ROOT` to the resolved root
+/// (a user-global `config.env` that sets `STORAGE_ROOT` is loaded once per
+/// process and would otherwise win over the redirected default), and sets
+/// `AM_ALLOW_HOME_STORAGE_ROOT=1` because the redirected default root is, by
+/// construction, private to the test. The closure receives the resolved
+/// default root; it does not exist yet, and the whole tempdir is removed when
+/// `f` returns.
+///
+/// The env-override lock is not reentrant: use
+/// [`with_isolated_default_storage_root_and_env_overrides_for_test`] when the
+/// test also needs other overrides (`DATABASE_URL`, ...).
+#[doc(hidden)]
+pub fn with_isolated_default_storage_root_for_test<R>(f: impl FnOnce(&Path) -> R) -> R {
+    with_isolated_default_storage_root_and_env_overrides_for_test(&[], f)
+}
+
+/// [`with_isolated_default_storage_root_for_test`] with additional process-env
+/// overrides applied in the same (non-reentrant) override scope. The isolation
+/// keys (`HOME`, `USERPROFILE`, `XDG_DATA_HOME`, `STORAGE_ROOT`,
+/// `AM_ALLOW_HOME_STORAGE_ROOT`) are applied after `extra_overrides`, so they
+/// cannot be undone by it.
+#[doc(hidden)]
+pub fn with_isolated_default_storage_root_and_env_overrides_for_test<R>(
+    extra_overrides: &[(&str, &str)],
+    f: impl FnOnce(&Path) -> R,
+) -> R {
+    let tmp = tempfile::tempdir().expect("isolated default storage root tempdir");
+    // Canonicalize so `Config::from_env`'s canonicalized `storage_root` compares
+    // equal to the raw `default_storage_root_path()`; a symlinked TMPDIR would
+    // otherwise make `is_default_storage_root` false for the resolved config.
+    let base = fs::canonicalize(tmp.path()).expect("canonicalize isolated tempdir");
+    let home = base.join("home");
+    let xdg_data = base.join("xdg-data");
+    fs::create_dir_all(&home).expect("create isolated home");
+    fs::create_dir_all(&xdg_data).expect("create isolated xdg data dir");
+    // No legacy `<home>/.mcp_agent_mail_git_mailbox_repo/projects/` exists in
+    // the fresh home, so the XDG branch of `default_storage_root_path()` wins.
+    let expected_root = xdg_data.join(XDG_APP_DIR).join("git_mailbox_repo");
+    let home_text = home.to_string_lossy().into_owned();
+    let xdg_data_text = xdg_data.to_string_lossy().into_owned();
+    let expected_root_text = expected_root.to_string_lossy().into_owned();
+
+    let mut overrides = extra_overrides.to_vec();
+    overrides.extend([
+        ("HOME", home_text.as_str()),
+        ("USERPROFILE", home_text.as_str()),
+        ("XDG_DATA_HOME", xdg_data_text.as_str()),
+        ("STORAGE_ROOT", expected_root_text.as_str()),
+        ("AM_ALLOW_HOME_STORAGE_ROOT", "1"),
+    ]);
+
+    let result = with_process_env_overrides_for_test(&overrides, || {
+        let root = default_storage_root_path();
+        assert!(
+            root.starts_with(&base),
+            "isolated default storage root {} escaped the tempdir {}",
+            root.display(),
+            base.display()
+        );
+        assert_eq!(
+            root, expected_root,
+            "isolated default storage root must resolve through the XDG branch"
+        );
+        assert!(
+            is_default_storage_root(&root),
+            "resolved root {} must be the default storage root",
+            root.display()
+        );
+        f(&root)
+    });
+    drop(tmp);
     result
 }
 
@@ -6284,6 +6378,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn isolated_default_storage_root_helper_redirects_default_root_into_tempdir() {
+        // br-99aih: the helper must hand tests a default storage root that is
+        // (a) the default root by every definition the guard uses, (b) not
+        // refused by the guard, (c) what `Config::from_env` resolves to, and
+        // (d) private to the test — inside the tempdir and gone afterwards —
+        // even on a host whose real `~/.mcp_agent_mail_git_mailbox_repo/projects/`
+        // exists.
+        let temp_base =
+            std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp directory");
+
+        let (root, from_env_root) = with_isolated_default_storage_root_for_test(|root| {
+            assert!(is_default_storage_root(root));
+            assert!(
+                !default_storage_root_refused_under_test_harness(root),
+                "isolated default root must not be refused: {}",
+                root.display()
+            );
+            assert!(
+                root.starts_with(&temp_base),
+                "isolated root {} must live under the temp dir {}",
+                root.display(),
+                temp_base.display()
+            );
+            // Simulate a test seeding the archive so cleanup is observable.
+            std::fs::create_dir_all(root.join("projects").join("probe"))
+                .expect("seed isolated archive");
+            let config = Config::from_env();
+            assert!(is_default_storage_root(&config.storage_root));
+            (root.to_path_buf(), config.storage_root)
+        });
+
+        assert_eq!(root, from_env_root);
+        assert!(
+            root.ends_with(Path::new(XDG_APP_DIR).join("git_mailbox_repo")),
+            "isolated root must be the XDG default layout: {}",
+            root.display()
+        );
+        assert!(
+            !root.exists(),
+            "isolated tempdir must be removed once the closure returns: {}",
+            root.display()
+        );
+    }
+
+    #[test]
+    fn isolated_default_storage_root_helper_applies_extra_overrides_but_keeps_isolation() {
+        let temp_base =
+            std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp directory");
+        with_isolated_default_storage_root_and_env_overrides_for_test(
+            &[
+                ("HTTP_PORT", "48123"),
+                // Isolation keys win over extra overrides.
+                ("HOME", "/definitely/not/a/home"),
+                ("AM_ALLOW_HOME_STORAGE_ROOT", ""),
+            ],
+            |root| {
+                let config = Config::from_env();
+                assert_eq!(config.http_port, 48123, "extra override must apply");
+                assert_eq!(config.storage_root, root);
+                assert!(root.starts_with(&temp_base));
+                assert!(!root.starts_with("/definitely/not/a/home"));
+                assert!(!default_storage_root_refused_under_test_harness(root));
+            },
+        );
+    }
+
     // -----------------------------------------------------------------------
     // C2/C3 — test-mode guard against default storage_root fall-through
     // -----------------------------------------------------------------------
@@ -6316,46 +6477,64 @@ mod tests {
     }
 
     #[test]
-    fn test_mode_guard_warns_but_does_not_panic_by_default_under_harness() {
-        // Default behavior when a test harness is active and storage_root is
-        // the default: WARN, don't panic. This avoids breaking the many
-        // existing integration tests that call `Config::from_env` just to
-        // inspect config defaults without ever writing to storage.
+    fn test_mode_guard_refuses_default_root_under_harness_by_default() {
+        // br-99aih: default behavior when a test harness is active and
+        // storage_root is the default: REFUSE (panic). The former warn-only
+        // mode let workspace test runs seed junk projects into the live
+        // archive. Seed `<home>/.mcp_agent_mail_git_mailbox_repo/projects/`
+        // so the legacy branch of `default_storage_root_path()` wins, exactly
+        // as on a host that has run the daemon.
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().join("home");
+        let legacy = home.join(".mcp_agent_mail_git_mailbox_repo");
         let xdg_data = tmp.path().join("xdg-data");
-        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(legacy.join("projects")).unwrap();
         std::fs::create_dir_all(&xdg_data).unwrap();
 
-        let result = std::panic::catch_unwind(|| {
-            with_process_env_overrides_for_test(
-                &[
-                    ("HOME", home.to_string_lossy().as_ref()),
-                    ("XDG_DATA_HOME", xdg_data.to_string_lossy().as_ref()),
-                    ("CARGO_TARGET_TMPDIR", tmp.path().to_string_lossy().as_ref()),
-                    // Neither bypass nor strict mode enabled.
-                    ("AM_ALLOW_HOME_STORAGE_ROOT", ""),
-                    ("AM_STRICT_HOME_STORAGE_GUARD", ""),
-                ],
-                || {
-                    let default_path = default_storage_root_path();
-                    guard_against_default_storage_root_in_test_mode(&default_path);
-                },
-            );
-        });
+        with_process_env_overrides_for_test(
+            &[
+                ("HOME", home.to_string_lossy().as_ref()),
+                ("XDG_DATA_HOME", xdg_data.to_string_lossy().as_ref()),
+                ("CARGO_TARGET_TMPDIR", tmp.path().to_string_lossy().as_ref()),
+                // Pin STORAGE_ROOT to the seeded legacy root: the user-global
+                // config.env is loaded once per process and may carry its own
+                // STORAGE_ROOT, which would otherwise steer `Config::from_env`
+                // away from the default root this test is about.
+                ("STORAGE_ROOT", legacy.to_string_lossy().as_ref()),
+                // Neither the bypass nor the (now redundant) strict flag.
+                ("AM_ALLOW_HOME_STORAGE_ROOT", ""),
+                ("AM_STRICT_HOME_STORAGE_GUARD", ""),
+            ],
+            || {
+                let default_path = default_storage_root_path();
+                assert_eq!(default_path, legacy, "seeded legacy archive must win");
+                assert!(
+                    default_storage_root_refused_under_test_harness(&default_path),
+                    "shared predicate must flag the default root under a harness"
+                );
 
-        assert!(
-            result.is_ok(),
-            "guard must NOT panic in the default (warn-only) mode"
+                let direct = std::panic::catch_unwind(|| {
+                    guard_against_default_storage_root_in_test_mode(&default_path);
+                });
+                assert!(
+                    direct.is_err(),
+                    "guard must refuse the default root under a harness by default"
+                );
+
+                let via_from_env = std::panic::catch_unwind(Config::from_env);
+                assert!(
+                    via_from_env.is_err(),
+                    "Config::from_env must refuse the default root under a harness by default"
+                );
+            },
         );
     }
 
     #[test]
     fn test_mode_guard_panics_in_strict_mode_under_harness() {
-        // Strict mode (`AM_STRICT_HOME_STORAGE_GUARD=1`): panic instead of
-        // warn. Used in CI to force test suites to set STORAGE_ROOT and in
-        // production to ensure no stray test invocation can write to the
-        // real archive.
+        // `AM_STRICT_HOME_STORAGE_GUARD=1` used to upgrade the warning to a
+        // panic; since br-99aih the refusal is always on and the flag is a
+        // redundant alias. Setting it must still refuse.
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().join("home");
         let xdg_data = tmp.path().join("xdg-data");
@@ -6413,15 +6592,24 @@ mod tests {
         // even if storage_root matches the default. This is the production
         // binary case.
         let tmp = tempfile::tempdir().expect("tempdir");
-        let home = tmp.path().join("home");
-        let xdg_data = tmp.path().join("xdg-data");
+        // Canonical base so `Config::from_env`'s canonicalized storage_root
+        // compares equal to the raw default path below.
+        let base = std::fs::canonicalize(tmp.path()).expect("canonical tempdir");
+        let home = base.join("home");
+        let xdg_data = base.join("xdg-data");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&xdg_data).unwrap();
+        let expected_default = xdg_data.join(XDG_APP_DIR).join("git_mailbox_repo");
 
         with_process_env_overrides_for_test(
             &[
                 ("HOME", home.to_string_lossy().as_ref()),
                 ("XDG_DATA_HOME", xdg_data.to_string_lossy().as_ref()),
+                // Pin STORAGE_ROOT to the default so a user-global config.env
+                // (loaded once per process) cannot steer `Config::from_env`
+                // away from the default root under test.
+                ("STORAGE_ROOT", expected_default.to_string_lossy().as_ref()),
+                ("AM_ALLOW_HOME_STORAGE_ROOT", ""),
                 // Clear all harness markers via override, and force the exe-in-deps
                 // fallback off (br-3jkqw) so this test can exercise the true
                 // production path from within a (necessarily deps-hosted) test binary.
@@ -6432,8 +6620,21 @@ mod tests {
             ],
             || {
                 let default_path = default_storage_root_path();
+                assert_eq!(default_path, expected_default);
                 // Must not panic when no harness marker is set.
                 guard_against_default_storage_root_in_test_mode(&default_path);
+                assert!(
+                    !default_storage_root_refused_under_test_harness(&default_path),
+                    "production path must never be refused"
+                );
+                // br-99aih: the production path must still resolve the default
+                // root through `Config::from_env` — the refusal is test-only.
+                let config = Config::from_env();
+                assert_eq!(
+                    config.storage_root, default_path,
+                    "production Config::from_env must still yield default_storage_root_path()"
+                );
+                assert!(is_default_storage_root(&config.storage_root));
             },
         );
     }

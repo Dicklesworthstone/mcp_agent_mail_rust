@@ -2964,39 +2964,66 @@ fn collect_recovery_receipt_evidence(
                     // Re-stage once so a semantic-query failure can still be
                     // distinguished from a corrupt source. Never fall back to
                     // a writable integrity open on the authority path: if the
-                    // source-neutral family copy itself cannot be obtained,
-                    // recovery must remain fail-closed.
-                    let integrity_snapshot = CanonicalSnapshotSource::for_family(path).map_err(
-                        |staging_error| {
-                            recovery_receipt_error(
+                    // source-neutral family copy cannot be obtained for an
+                    // environmental reason (ENOSPC, EPERM, a non-regular
+                    // family member), recovery must remain fail-closed. A
+                    // staging failure that is itself a corruption verdict
+                    // ("file is not a database" on the private copy) is the
+                    // strongest possible proof that the source is not a
+                    // trustworthy promotion authority, which is exactly what
+                    // `unverified_source_sets` records; refusing there wedged
+                    // every backup/archive promotion for a corrupt primary.
+                    match CanonicalSnapshotSource::for_family(path) {
+                        Err(staging_error)
+                            if crate::pool::is_corruption_error_message(
+                                &staging_error.to_string(),
+                            ) =>
+                        {
+                            tracing::warn!(
+                                source = %path.display(),
+                                snapshot_error = %snapshot_error,
+                                staging_error = %staging_error,
+                                "recovery receipt: source snapshot failed and the source-neutral \
+                                 copy is not a readable SQLite generation; not using it as \
+                                 promotion authority"
+                            );
+                            unverified_source_sets(&format!(
+                                "{snapshot_error}; source-neutral staging failed: {staging_error}"
+                            ))
+                        }
+                        Err(staging_error) => {
+                            return Err(recovery_receipt_error(
                                 "source generation health staging",
                                 path,
                                 format!(
                                     "semantic snapshot failed ({snapshot_error}) and the source-neutral full-integrity copy failed ({staging_error})"
                                 ),
-                            )
-                        },
-                    )?;
-                    match source_full_integrity_refusal(integrity_snapshot.snapshot_path()) {
-                        Ok(None) => return Err(snapshot_error),
-                        Ok(Some(reason)) => {
-                            tracing::warn!(
-                                source = %path.display(),
-                                snapshot_error = %snapshot_error,
-                                reason = %reason,
-                                "recovery receipt: source snapshot failed and the file is not \
-                                 a trustworthy SQLite generation; not using it as promotion authority"
-                            );
-                            unverified_source_sets(&format!("{snapshot_error}; {reason}"))
-                        }
-                        Err(health_error) => {
-                            return Err(recovery_receipt_error(
-                                "source generation health classification",
-                                path,
-                                format!(
-                                    "semantic snapshot failed ({snapshot_error}); full integrity_check also failed ({health_error})"
-                                ),
                             ));
+                        }
+                        Ok(integrity_snapshot) => {
+                            match source_full_integrity_refusal(integrity_snapshot.snapshot_path())
+                            {
+                                Ok(None) => return Err(snapshot_error),
+                                Ok(Some(reason)) => {
+                                    tracing::warn!(
+                                        source = %path.display(),
+                                        snapshot_error = %snapshot_error,
+                                        reason = %reason,
+                                        "recovery receipt: source snapshot failed and the file is not \
+                                         a trustworthy SQLite generation; not using it as promotion authority"
+                                    );
+                                    unverified_source_sets(&format!("{snapshot_error}; {reason}"))
+                                }
+                                Err(health_error) => {
+                                    return Err(recovery_receipt_error(
+                                        "source generation health classification",
+                                        path,
+                                        format!(
+                                            "semantic snapshot failed ({snapshot_error}); full integrity_check also failed ({health_error})"
+                                        ),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -5071,6 +5098,57 @@ mod tests {
             readiness_error
                 .to_string()
                 .contains("unfinalized recovery receipt")
+        );
+    }
+
+    #[test]
+    fn recovery_receipt_treats_unreadable_garbage_source_as_unverified_not_fatal() {
+        // A primary that is not a SQLite file at all is exactly the shape
+        // recovery runs for. Staging its family copy fails with a corruption
+        // verdict ("file is not a database"); that must attest the source
+        // as unverifiable and let the candidate promote, not wedge recovery.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let candidate = dir.path().join("candidate.sqlite3");
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("mail-root");
+        seed_recovery_receipt_db(&candidate, true);
+        std::fs::write(&primary, vec![b'Z'; 8192]).expect("write garbage primary");
+
+        let receipt = prepare_recovery_receipt(&storage_root, &primary, Some(&primary), &candidate)
+            .expect("garbage source must be attested as unverified, not refused");
+        let document: super::RecoveryReceiptDocument = serde_json::from_slice(
+            &std::fs::read(&receipt.pending_path).expect("read pending receipt"),
+        )
+        .expect("decode pending receipt");
+        assert!(
+            document.body.source_snapshot_failure_sha256.is_some(),
+            "receipt must attest that the garbage source could not be verified"
+        );
+        assert_eq!(document.body.source.projects.count, 0);
+        assert!(
+            document.body.source.projects.count == 0
+                && document.body.source_snapshot_failure_sha256.is_some(),
+            "an unreadable source must never contribute continuity sets as promotion authority"
+        );
+    }
+
+    #[test]
+    fn recovery_receipt_still_refuses_non_corruption_staging_failures() {
+        // A source path that is a directory cannot be staged for an
+        // environmental (non-corruption) reason; that must stay fail-closed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let candidate = dir.path().join("candidate.sqlite3");
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("mail-root");
+        seed_recovery_receipt_db(&candidate, true);
+        std::fs::create_dir_all(&primary).expect("create directory in place of the primary");
+
+        let error = prepare_recovery_receipt(&storage_root, &primary, Some(&primary), &candidate)
+            .expect_err("a non-regular source must keep recovery fail-closed");
+        let text = error.to_string();
+        assert!(
+            !text.contains("file is not a database"),
+            "directory source must not be misclassified as a corrupt SQLite file: {text}"
         );
     }
 

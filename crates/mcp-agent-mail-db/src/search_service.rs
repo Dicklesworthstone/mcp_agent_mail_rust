@@ -1108,19 +1108,26 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
     let active_key = lexical_active_db_key()
         .lock()
         .map_or(None, |guard| guard.clone());
+    // `sqlite_key` / `active_key` are process-global cache keys and carry an
+    // encoding discriminator; the report shows the operator-facing
+    // `<path>@<generation>` spelling instead.
+    let db_identity = crate::pool::display_sqlite_identity_key(&sqlite_key);
+    let active_db_identity = active_key
+        .as_deref()
+        .map(crate::pool::display_sqlite_identity_key);
     let index_dir = match direct_surface_index_dir(pool) {
         Ok(index_dir) => index_dir,
         Err(error) => {
             return LexicalBackfillHealth {
                 state: "unavailable".to_string(),
-                db_identity: sqlite_key,
+                db_identity: db_identity.clone(),
                 index_dir: stable_direct_surface_index_dir(pool).display().to_string(),
                 indexed_messages: 0,
                 source_messages: None,
                 skipped_messages: 0,
                 last_backfill_at_micros: None,
                 rebuild_in_progress: false,
-                active_db_identity: active_key,
+                active_db_identity: active_db_identity.clone(),
                 stale_reason: Some(error.to_string()),
                 safe_remediation: Some(
                     "Restore the configured SQLite and storage-root paths to their original filesystem authorities, then retry lexical health"
@@ -1134,14 +1141,14 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
     if pool.sqlite_path() == ":memory:" {
         return LexicalBackfillHealth {
             state: "in_memory".to_string(),
-            db_identity: sqlite_key,
+            db_identity: db_identity.clone(),
             index_dir: index_dir_display,
             indexed_messages: 0,
             source_messages: None,
             skipped_messages: 0,
             last_backfill_at_micros: None,
             rebuild_in_progress: false,
-            active_db_identity: active_key,
+            active_db_identity: active_db_identity.clone(),
             stale_reason: Some(
                 "lexical backfill cannot inspect pooled sqlite:///:memory: contents".to_string(),
             ),
@@ -1158,14 +1165,14 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
     if let Some(Err(error)) = cached_bootstrap {
         return LexicalBackfillHealth {
             state: "unavailable".to_string(),
-            db_identity: sqlite_key,
+            db_identity: db_identity.clone(),
             index_dir: index_dir_display,
             indexed_messages: 0,
             source_messages: None,
             skipped_messages: 0,
             last_backfill_at_micros: None,
             rebuild_in_progress: false,
-            active_db_identity: active_key,
+            active_db_identity: active_db_identity.clone(),
             stale_reason: Some(error),
             safe_remediation: Some("Retry search bootstrap or run `am doctor health`".to_string()),
         };
@@ -1178,14 +1185,14 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
         Err(error) => {
             return LexicalBackfillHealth {
                 state: "unavailable".to_string(),
-                db_identity: sqlite_key,
+                db_identity: db_identity.clone(),
                 index_dir: index_dir_display,
                 indexed_messages: 0,
                 source_messages: None,
                 skipped_messages: 0,
                 last_backfill_at_micros: None,
                 rebuild_in_progress: false,
-                active_db_identity: active_key,
+                active_db_identity: active_db_identity.clone(),
                 stale_reason: Some(error),
                 safe_remediation: Some(
                     "Run `am robot search <query>` to retry lexical bridge initialization"
@@ -1203,14 +1210,14 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
         };
         return LexicalBackfillHealth {
             state: "delayed".to_string(),
-            db_identity: sqlite_key,
+            db_identity: db_identity.clone(),
             index_dir: index_dir_display,
             indexed_messages: 0,
             source_messages: None,
             skipped_messages: 0,
             last_backfill_at_micros: None,
             rebuild_in_progress: false,
-            active_db_identity: active_key,
+            active_db_identity: active_db_identity.clone(),
             stale_reason: Some(reason.to_string()),
             safe_remediation: Some(
                 "Run `am robot search <query>` or wait for startup search backfill, then recheck `am robot health --format json`"
@@ -1285,14 +1292,14 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
 
     LexicalBackfillHealth {
         state: health_state.to_string(),
-        db_identity: sqlite_key,
+        db_identity,
         index_dir: index_dir_display,
         indexed_messages,
         source_messages: Some(source_messages),
         skipped_messages,
         last_backfill_at_micros: Some(state.updated_at_micros),
         rebuild_in_progress: false,
-        active_db_identity: active_key,
+        active_db_identity,
         safe_remediation: (health_state != "fresh").then(|| {
             if stale_reason
                 .as_deref()
@@ -5678,6 +5685,39 @@ mod tests {
         assert!(key_a.starts_with(":memory:@"));
         assert!(key_b.starts_with(":memory:@"));
         assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn lexical_backfill_health_reports_plain_db_identity_without_cache_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mailbox.sqlite3");
+        let config = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..crate::pool::DbPoolConfig::default()
+        };
+        let pool = DbPool::new(&config).expect("file-backed pool");
+
+        let health = lexical_backfill_health(&pool);
+        let expected_prefix = format!("{}@", db_path.display());
+        assert!(
+            health.db_identity.starts_with(&expected_prefix),
+            "db_identity must be the operator-facing `<path>@<generation>` spelling, got {}",
+            health.db_identity
+        );
+        assert!(
+            !health.db_identity.starts_with("utf8:"),
+            "internal cache-key namespace must not leak into db_identity: {}",
+            health.db_identity
+        );
+        if let Some(active) = health.active_db_identity.as_deref() {
+            assert!(
+                !active.starts_with("utf8:"),
+                "internal cache-key namespace must not leak into active_db_identity: {active}"
+            );
+        }
+        // The cache key itself keeps its discriminator so byte-distinct paths
+        // cannot collide inside process-global caches.
+        assert!(sqlite_key_for_pool(&pool).starts_with("utf8:"));
     }
 
     #[test]

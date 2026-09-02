@@ -2492,7 +2492,10 @@ fn reset_probe_state(config: &mcp_agent_mail_core::Config) -> (u32, Instant, Ins
 }
 
 #[allow(clippy::too_many_lines)]
-fn run_http_headless_supervisor(config: mcp_agent_mail_core::Config) -> std::io::Result<()> {
+fn run_http_headless_supervisor(
+    config: mcp_agent_mail_core::Config,
+    control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
+) -> std::io::Result<()> {
     tracing::info!(
         host = %config.http_host,
         port = config.http_port,
@@ -2500,10 +2503,11 @@ fn run_http_headless_supervisor(config: mcp_agent_mail_core::Config) -> std::io:
         "HTTP server supervisor started"
     );
     let runtime = build_http_runtime()?;
-    let result_rx = spawn_http_supervisor_task(runtime.handle(), config, None, None, None)?;
-    // Unbounded by design: with no TUI there is no shutdown flag or control
-    // channel — this park is what keeps the headless process serving until
-    // the supervisor exits on its own (error) or the process is signalled.
+    let result_rx = spawn_http_supervisor_task(runtime.handle(), config, None, control_rx, None)?;
+    // Unbounded by design: with no TUI there is no shutdown flag — this park
+    // is what keeps the headless process serving until the supervisor exits on
+    // its own (error), the process is signalled, or an embedder's control
+    // channel (`run_http_with_control`) delivers `Shutdown` / disconnects.
     let result = recv_http_supervisor_result(result_rx);
     drop(runtime);
     result
@@ -3940,6 +3944,32 @@ fn write_crash_marker(storage_root: &Path, info: &std::panic::PanicHookInfo<'_>,
 }
 
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    run_http_supervised(config, None)
+}
+
+/// Run the headless HTTP server exactly like [`run_http`], but stoppable by
+/// the caller.
+///
+/// A [`tui_bridge::ServerControlMsg::Shutdown`] on `control_rx` (or dropping
+/// every sender) stops the listener and then runs the same worker shutdown
+/// sequence a signalled headless process would, before returning.
+///
+/// Embedders that host the server on a thread — integration tests in
+/// particular — use this so every background worker is stopped and joined
+/// before the caller's environment scope ends. A worker that outlived a
+/// test's env-override scope rehydrated `Config` from the ambient env and
+/// wrote into the operator's live archive (br-99aih).
+pub fn run_http_with_control(
+    config: &mcp_agent_mail_core::Config,
+    control_rx: mpsc::Receiver<tui_bridge::ServerControlMsg>,
+) -> std::io::Result<()> {
+    run_http_supervised(config, Some(control_rx))
+}
+
+fn run_http_supervised(
+    config: &mcp_agent_mail_core::Config,
+    control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
+) -> std::io::Result<()> {
     config.validate_user_env_authority()?;
     install_crash_marker_panic_hook(config.storage_root.clone());
     // Initialize console theme from parsed config (includes persisted envfile values).
@@ -3991,7 +4021,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     // Keep headless HTTP (`serve --no-tui`) under the same supervised restart
     // policy as the TUI path so long-lived operator sessions self-heal from
     // transport starvation or listener crashes.
-    let result = run_http_headless_supervisor(config.clone());
+    let result = run_http_headless_supervisor(config.clone(), control_rx);
     clear_startup_readiness_fast_path();
 
     retention::shutdown();
@@ -19323,16 +19353,12 @@ first body
         *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
 
         let temp = tempfile::tempdir().expect("tempdir");
-        let xdg_data_root = temp.path().join("xdg-data");
-        std::fs::create_dir_all(&xdg_data_root).expect("create xdg data root");
-        let xdg_data_root_str = xdg_data_root
-            .to_str()
-            .expect("xdg data root utf-8")
-            .to_string();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("XDG_DATA_HOME", xdg_data_root_str.as_str())],
-            || {
+        // br-99aih: redirect the *default* storage root into a private tempdir
+        // (HOME + XDG_DATA_HOME); an XDG-only override still resolved to the
+        // operator's live archive on any host that had run the daemon.
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(
+            |_isolated_default_root| {
                 let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
                 assert!(
                     mcp_agent_mail_core::config::is_default_storage_root(&storage_root),
@@ -29624,16 +29650,12 @@ first body
     fn open_observability_sync_db_connection_ignores_unrelated_default_archive_overlap() {
         let _env_lock = lock_mutex(&TOOL_DISPATCH_ENV_TEST_LOCK);
         let dir = tempfile::tempdir().expect("tempdir");
-        let xdg_data_root = dir.path().join("xdg-data");
-        std::fs::create_dir_all(&xdg_data_root).expect("create xdg data root");
-        let xdg_data_root_str = xdg_data_root
-            .to_str()
-            .expect("xdg data root utf-8")
-            .to_string();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("XDG_DATA_HOME", xdg_data_root_str.as_str())],
-            || {
+        // br-99aih: redirect the *default* storage root into a private tempdir
+        // (HOME + XDG_DATA_HOME); an XDG-only override still resolved to the
+        // operator's live archive on any host that had run the daemon.
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(
+            |_isolated_default_root| {
                 let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
                 assert!(
                     mcp_agent_mail_core::config::is_default_storage_root(&storage_root),

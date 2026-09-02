@@ -10,7 +10,141 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## [Unreleased]
 
+### Known issues
+
+- **The published container image is still frozen at `v0.3.13`.** The v0.3.31
+  notes said the ghcr image was unstuck; the registry disagrees. `docker.yml`
+  has never completed a successful run and has not been triggered since the
+  v0.3.29 tag (releases are cut by the maintainer's local release tooling,
+  which does not build the image). Until an image is published by the same
+  tooling, install from the release archives or build from source.
+
 ### Added
+
+- **`am robot handoff --max-seconds <n>` (default 20) with honest partial
+  output.** The dashboard used to run one `messages LEFT JOIN
+  message_recipients` aggregate per in-progress bead; FrankenSQLite executes
+  that join as a whole-table nested loop, so on a 40k-message mailbox the
+  command produced no output inside a 600 s timeout. The mail state is now
+  gathered in two batched, join-free `IN (...)` lookups with the exact
+  `LEFT JOIN` semantics reproduced in Rust (proven against the old SQL as an
+  oracle), the `.beads/issues.jsonl` parse skips non-`in_progress` records
+  before decoding them, and a wall-clock budget stops the enrichment loop
+  with `summary.scanned` / `summary.truncated_by_budget` plus a warn alert
+  instead of hanging. Measured on the reference mailbox (16 projects, 697
+  agents, 40,422 messages, 66 in-progress beads): 0.30 s end to end.
+- **`am doctor capabilities --json` and `am doctor triage --json` are
+  accepted.** Both outputs were already JSON, but the flag the agent handbook,
+  AGENTS.md, and `triage.capabilities_url` all advertised was a usage error.
+- **Real MCP descriptions for `install_precommit_guard` and
+  `uninstall_precommit_guard`.** Both tools shipped with an empty
+  `description`, so every MCP client listed them without any guidance.
+- **The doc-drift guard now pins the `am doctor` verb count, the `am robot`
+  subcommand count, and the TUI theme count** straight from the clap tree and
+  `NAMED_THEME_COUNT`, so README/AGENTS tables can no longer drift from the
+  shipped CLI surface the way they had (8 documented doctor verbs of 28,
+  robot counted as 16/17/18, 5 themes of 42).
+
+### Fixed
+
+- **`am doctor health` / `triage` no longer report a false P0 "cannot open
+  database, reconstruct" on a healthy live mailbox.** The doctor's canonical
+  diagnostic source had two branches: a `VACUUM INTO` snapshot through the
+  read-only FrankenSQLite connection, and a cross-engine canonical open that
+  is refused outright for any Franken-admitted family (the `-fsqlite-ns-*`
+  sidecars every live mailbox carries). When the snapshot failed on a hot WAL
+  the composite error was truncated to 160 characters and the verdict was
+  "reconstruct". The doctor now has a third source — the same byte-neutral
+  staged family copy `am robot health` already used for `db_file_sanity`,
+  opened read-write on the private copy so WAL frames recover — and the
+  refusal detail keeps both underlying causes readable. Verified on the
+  reference host: the P0 vanished and the doctor reported the mailbox's real
+  reservation-parity drift instead.
+- **Recovery no longer poisons itself (br-plksu).** Automatic recovery
+  admission arms the durable recovery breaker with a provisional failure
+  record before running the attempt; the attempt's own live-salvage
+  read-only open then refused itself because the breaker was "nonclean",
+  recorded a real failure, and readiness crash-looped a healthy database
+  until an operator hand-cleared the sidecar. The Franken read-only preflight
+  now recognizes an open issued from inside its own admitted recovery
+  attempt and proceeds (unrelated readers are still refused).
+- **`am doctor drain` / `locks` no longer count a transient read-only CLI
+  reader as a second mailbox owner.** Ownership is now decided by an
+  exclusive activity lock or a `serve-*` command line; processes that merely
+  have the database file open are reported as readers. Previously a
+  concurrent `am robot handoff` flipped the verdict to split-brain /
+  unsafe-to-touch and blocked every supervised repair.
+- **Workspace tests can no longer write into the live default mailbox
+  archive (br-99aih).** Thirteen tests overrode only `XDG_DATA_HOME` while
+  the legacy `$HOME/.mcp_agent_mail_git_mailbox_repo` branch wins whenever it
+  exists, so on any host that has run the daemon they wrote junk projects
+  into production and later triggered an archive-ahead reconcile. The
+  test-harness guard now refuses the default root outright (escape hatch
+  `AM_ALLOW_HOME_STORAGE_ROOT=1`), the storage crate's archive-root funnel
+  refuses it too, a shared `with_isolated_default_storage_root_for_test`
+  helper redirects `HOME`/`XDG_DATA_HOME`, and the leaking tests use it.
+- **`am robot metrics` no longer prints zeros from the CLI's own process
+  counters.** It reads `resource://tooling/metrics` from the running server
+  (which now carries per-tool latency) and labels the payload
+  `source: "live-server"`; without a reachable server it reports
+  `source: "local-process"` with an explicit alert instead of fabricated
+  numbers.
+- **Archive-ahead recovery could never promote a live-salvaged candidate.**
+  `materialize_live_franken_salvage` ran `VACUUM INTO` through the guarded
+  FrankenSQLite source connection, which left `-fsqlite-ns-gate` /
+  `-fsqlite-ns-use` namespace sidecars beside the process-private artifact;
+  every downstream validator opens that artifact through the guarded
+  canonical opener, which refuses any Franken-admitted path outright, so the
+  salvage always failed validation with `refusing an archive-only candidate
+  because DB-only coordination state could be lost`. The residue is now
+  retired (renamed, never deleted) inside the private snapshot directory
+  before validation. This is the single root cause behind ~23 deterministic
+  test failures on main (the `*_uses_archive_snapshot_when_live_db_is_stale`
+  and doctor-reconstruct salvage families).
+- **Recovery receipts no longer wedge on a source that cannot even be
+  staged.** When the primary is not a readable SQLite file — exactly the
+  shape recovery runs for — staging the source-neutral family copy fails with
+  a corruption verdict (`file is not a database`), and
+  `collect_recovery_receipt_evidence` turned that into a hard
+  `source generation health staging` refusal, so no backup or archive
+  candidate could ever promote. A corruption-class staging failure now
+  attests the source as unverified (the same outcome an unreadable source
+  already got when staging succeeded); environmental failures (ENOSPC,
+  EPERM, a non-regular family member) stay fail-closed. Root cause of ~20
+  deterministic `restore/staging/reconstruct` test failures on main.
+- **`search_index_generation.db_identity` no longer leaks the internal cache
+  namespace** (`utf8:<path>@<gen>`); operator surfaces show
+  `<path>@<generation>` while process-global caches keep the discriminator.
+- **Tool input-schema parity understands nullable type arrays.** fastmcp
+  0.7.1 deliberately publishes `Option<T>` parameters as
+  `{"type": ["T", "null"]}` (GH#255 Python parity, CHANGELOG v0.3.31); the
+  conformance comparator only read `type` as a string and reported 108
+  "lost" parameter types across 29 tools. The comparator now normalizes both
+  nullable spellings to the base type and still fails a property with no
+  non-null type at all. The Python fixture is untouched.
+- **The `mark_all_read` landing is finished:** the CLI mode matrix, the
+  conformance audit baseline (45 tools = 38 compatibility + 7 Rust-native),
+  the audit document table, and the error-code catalog (`AGENT_DEREGISTERED`,
+  `AGENT_RETIRED`, `AUTHENTICATION_REQUIRED`, `INVALID_TOPIC`, all shipped
+  in earlier releases) now agree with the live inventory.
+- **Source builds pin the frankensearch sibling to the release commit.** The
+  live `../frankensearch` checkout moved to asupersync 0.4.10
+  (`Cx::is_cancelled` in frankensearch-quill) while fastmcp — including 0.8.1
+  — still pins asupersync =0.4.9, which made the whole workspace uncompilable
+  from a live sibling. `Cargo.toml`, `dist.yml`, `Dockerfile`, and
+  `install.sh --from-source` now use a gated `../frankensearch-rel-0332`
+  checkout at `FRANKENSEARCH_COMMIT`.
+- **`deploy-pages.yml` no longer watches a leaked rch temp path**; it is
+  dispatch-only with a `bundle_dir` input.
+- **Docs match the binary:** AGENTS.md's doctor examples used flags the
+  binary rejects (`am doctor --fix`, `--dry-run --fix`, `--json`); its
+  dependency table named crates that are not in the workspace and a
+  `DATABASE_URL` default that is not the default; README's family table
+  listed 8 of 28 doctor verbs, 17 of 19 robot subcommands, and 5 of 42
+  themes, and claimed hybrid search for release binaries that ship the
+  lexical tier only. VISION.md carries dated reality notes for the two
+  claims the code contradicts (C SQLite is statically bundled for
+  verification cross-checks; tool-prose parity is Rust-owned, not gated).
 
 - **`am doctor vacuum` — supported in-DB reclaim for orphaned pages (GH#289).**
   An archive reconstruct could leave the promoted database with a majority of

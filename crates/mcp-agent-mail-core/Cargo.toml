@@ -35,11 +35,15 @@ globset.workspace = true
 nix = { workspace = true, features = ["fs"] }
 rustix.workspace = true
 tracing.workspace = true
+# Regular (not dev) dependency: `config::with_isolated_default_storage_root_for_test`
+# is compiled into the library so sibling crates' tests can redirect the
+# default storage root into a private tempdir (br-99aih). Windows already
+# needed it unconditionally.
+tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 cap-fs-ext.workspace = true
 cap-std.workspace = true
-tempfile.workspace = true
 winsafe.workspace = true
 
 [features]

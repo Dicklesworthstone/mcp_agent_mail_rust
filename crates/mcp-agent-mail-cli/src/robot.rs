@@ -1700,6 +1700,365 @@ pub fn derive_wbq_breaker_alerts(
     alerts
 }
 
+// ── Tool metrics provenance (br-4myjj) ──────────────────────────────────────
+//
+// Tool call/error/latency counters live in the *server* process's atomics. A
+// fresh CLI process owns a separate, always-empty registry, so `am robot
+// metrics` used to report zero forever. The helpers below read the daemon's
+// `resource://tooling/metrics` over the JSON-RPC lane when a server answers
+// and fall back to this process's registry — labelled as such — otherwise.
+
+/// `source` value when the counters were read from a running daemon.
+pub const TOOL_METRICS_SOURCE_LIVE: &str = "live-server";
+/// `source` value when the counters are this CLI process's own registry.
+pub const TOOL_METRICS_SOURCE_LOCAL: &str = "local-process";
+
+/// robot metrics — aggregated tool call/error/latency view.
+#[derive(Debug, Serialize)]
+pub struct MetricsData {
+    /// `"live-server"` when read from a running daemon via
+    /// `resources/read resource://tooling/metrics`; `"local-process"` when
+    /// the counters are this CLI process's own registry (zero unless this
+    /// process invoked MCP tools in-process).
+    pub source: &'static str,
+    /// Why the live read was not used (local fallback), or a caveat about the
+    /// live payload (e.g. a daemon build that carries no latency samples).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_detail: Option<String>,
+    pub total_calls: u64,
+    pub total_errors: u64,
+    pub error_rate_pct: f64,
+    pub avg_latency_ms: f64,
+    pub tools: Vec<MetricEntry>,
+}
+
+/// Why a live `resources/read` did not yield a usable payload.
+#[derive(Debug, Clone)]
+struct LiveResourceFailure {
+    /// True when a server answered (rejected the read, or returned a payload
+    /// we could not parse) rather than being unreachable; the fallback alert
+    /// wording depends on it so an auth/version problem is not misreported as
+    /// "no server running".
+    reachable: bool,
+    detail: String,
+}
+
+/// Tool metrics entries plus their provenance.
+struct ResolvedToolMetrics {
+    entries: Vec<mcp_agent_mail_tools::MetricsSnapshotEntry>,
+    source: &'static str,
+    detail: Option<String>,
+    live_failure: Option<LiveResourceFailure>,
+}
+
+/// Read a JSON resource from the first local daemon endpoint that answers.
+///
+/// Every candidate endpoint (the configured path and its `/mcp/` ↔ `/api/`
+/// alias) is tried; the last failure is returned so the caller can label a
+/// local fallback with the concrete reason instead of a generic "unavailable".
+fn try_read_live_server_resource(
+    config: &mcp_agent_mail_core::Config,
+    uri: &str,
+) -> Result<serde_json::Value, LiveResourceFailure> {
+    let urls = robot_inbox_server_urls(config);
+    if urls.is_empty() {
+        return Err(LiveResourceFailure {
+            reachable: false,
+            detail: "no local server endpoint candidates resolved from config".to_string(),
+        });
+    }
+    let bearer = crate::local_server_bearer_token(config);
+    let mut last_failure: Option<LiveResourceFailure> = None;
+
+    for server_url in urls {
+        let call = crate::context::run_async(async {
+            Ok(crate::try_read_server_resource(&server_url, bearer.as_deref(), uri).await)
+        });
+        let failure = match call {
+            Ok(crate::ServerToolCall::Success(result)) => {
+                match crate::parse_resource_read_json(uri, &result) {
+                    Ok(payload) => return Ok(payload),
+                    Err(error) => LiveResourceFailure {
+                        reachable: true,
+                        detail: format!("{server_url}: {error}"),
+                    },
+                }
+            }
+            Ok(crate::ServerToolCall::Rejected(message)) => LiveResourceFailure {
+                reachable: true,
+                detail: format!("{server_url}: {message}"),
+            },
+            Ok(crate::ServerToolCall::Unavailable(message)) => LiveResourceFailure {
+                reachable: false,
+                detail: format!("{server_url}: {message}"),
+            },
+            Err(error) => LiveResourceFailure {
+                reachable: false,
+                detail: format!("{server_url}: {error}"),
+            },
+        };
+        tracing::debug!(
+            uri = %uri,
+            reachable = failure.reachable,
+            detail = %failure.detail,
+            "live resource read failed; trying next endpoint or local fallback"
+        );
+        last_failure = Some(failure);
+    }
+
+    Err(last_failure.unwrap_or_else(|| LiveResourceFailure {
+        reachable: false,
+        detail: "no local server endpoint answered".to_string(),
+    }))
+}
+
+/// Parse a live `resource://tooling/metrics` payload into snapshot entries.
+///
+/// The resource lists the full catalogue (zero-call tools included); this
+/// keeps only tools that were actually called, matching the local
+/// `tool_metrics_snapshot()` contract `am robot metrics` has always rendered.
+fn parse_live_tool_metrics_payload(
+    payload: &serde_json::Value,
+) -> Result<Vec<mcp_agent_mail_tools::MetricsSnapshotEntry>, String> {
+    let tools = payload
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            "live resource://tooling/metrics payload has no `tools` array".to_string()
+        })?;
+    let mut entries = tools
+        .iter()
+        .map(|tool| {
+            serde_json::from_value::<mcp_agent_mail_tools::MetricsSnapshotEntry>(tool.clone())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("live resource://tooling/metrics entry is malformed: {error}"))?;
+    entries.retain(|entry| entry.calls > 0);
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(entries)
+}
+
+/// Caveat for a live payload whose called tools carry no latency samples —
+/// a daemon built before `resource://tooling/metrics` exposed latency — so
+/// the zeros in `avg_ms`/`p95_ms` read as "unavailable", not "instant".
+fn live_tool_metrics_detail(
+    entries: &[mcp_agent_mail_tools::MetricsSnapshotEntry],
+) -> Option<String> {
+    (!entries.is_empty() && entries.iter().all(|entry| entry.latency.is_none())).then(|| {
+        "live payload carries no per-tool latency (the running daemon predates latency in \
+         resource://tooling/metrics); avg_ms/p95_ms/p99_ms are unavailable, not zero"
+            .to_string()
+    })
+}
+
+/// Resolve tool metrics: the live daemon's counters when one answers, this
+/// process's own registry (labelled `local-process`) otherwise.
+fn resolve_tool_metrics_entries(config: &mcp_agent_mail_core::Config) -> ResolvedToolMetrics {
+    let live_failure = match try_read_live_server_resource(config, "resource://tooling/metrics") {
+        Ok(payload) => match parse_live_tool_metrics_payload(&payload) {
+            Ok(entries) => {
+                let detail = live_tool_metrics_detail(&entries);
+                return ResolvedToolMetrics {
+                    entries,
+                    source: TOOL_METRICS_SOURCE_LIVE,
+                    detail,
+                    live_failure: None,
+                };
+            }
+            Err(detail) => LiveResourceFailure {
+                reachable: true,
+                detail,
+            },
+        },
+        Err(failure) => failure,
+    };
+    ResolvedToolMetrics {
+        entries: mcp_agent_mail_tools::tool_metrics_snapshot(),
+        source: TOOL_METRICS_SOURCE_LOCAL,
+        detail: Some(live_failure.detail.clone()),
+        live_failure: Some(live_failure),
+    }
+}
+
+/// `(summary, action)` for the info alert explaining a `local-process`
+/// fallback.
+fn tool_metrics_scope_alert(failure: &LiveResourceFailure) -> (String, Option<String>) {
+    if failure.reachable {
+        (
+            "Tool metrics are for THIS CLI process only; the live server answered but rejected \
+             the metrics read, so counters are zero unless this process invoked MCP tools"
+                .to_string(),
+            Some(
+                "Check the server's bearer token / version (see source_detail), then re-run \
+                 am robot metrics"
+                    .to_string(),
+            ),
+        )
+    } else {
+        (
+            "Tool metrics are for THIS CLI process only; no live server was reachable, so \
+             counters are zero unless this process invoked MCP tools"
+                .to_string(),
+            Some("am serve-http --no-tui  # then re-run am robot metrics".to_string()),
+        )
+    }
+}
+
+/// Stamp `source` / `source_detail` onto a tooling resource payload so a
+/// `navigate` reader can tell daemon counters from this process's registry.
+fn label_tooling_payload_source(
+    payload: &mut serde_json::Value,
+    source: &str,
+    detail: Option<String>,
+) {
+    if let serde_json::Value::Object(map) = payload {
+        map.insert(
+            "source".to_string(),
+            serde_json::Value::String(source.to_string()),
+        );
+        if let Some(detail) = detail {
+            map.insert(
+                "source_detail".to_string(),
+                serde_json::Value::String(detail),
+            );
+        }
+    }
+}
+
+/// Pure mapping from snapshot entries to the `am robot metrics` payload.
+///
+/// `avg_latency_ms` is the call-weighted mean over tools that carry latency,
+/// normalised by *all* calls (tools without samples contribute zero) — the
+/// contract this command has always exposed.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn build_metrics_data(
+    entries: Vec<mcp_agent_mail_tools::MetricsSnapshotEntry>,
+    source: &'static str,
+    source_detail: Option<String>,
+) -> MetricsData {
+    let total_calls: u64 = entries.iter().map(|e| e.calls).sum();
+    let total_errors: u64 = entries.iter().map(|e| e.errors).sum();
+    let error_rate = if total_calls > 0 {
+        (total_errors as f64 / total_calls as f64) * 100.0
+    } else {
+        0.0
+    };
+    let avg_latency = if total_calls > 0 {
+        let weighted: f64 = entries
+            .iter()
+            .filter_map(|e| e.latency.as_ref().map(|l| l.avg_ms * e.calls as f64))
+            .sum();
+        weighted / total_calls as f64
+    } else {
+        0.0
+    };
+
+    let tools: Vec<MetricEntry> = entries
+        .into_iter()
+        .map(|e| {
+            let error_pct = if e.calls > 0 {
+                (e.errors as f64 / e.calls as f64) * 100.0
+            } else {
+                0.0
+            };
+            MetricEntry {
+                name: e.name,
+                calls: e.calls,
+                errors: e.errors,
+                error_pct,
+                avg_ms: e.latency.as_ref().map_or(0.0, |l| l.avg_ms),
+                p95_ms: e.latency.as_ref().map_or(0.0, |l| l.p95_ms),
+                p99_ms: e.latency.as_ref().map_or(0.0, |l| l.p99_ms),
+            }
+        })
+        .collect();
+
+    MetricsData {
+        source,
+        source_detail,
+        total_calls,
+        total_errors,
+        error_rate_pct: (error_rate * 100.0).round() / 100.0,
+        avg_latency_ms: (avg_latency * 100.0).round() / 100.0,
+        tools,
+    }
+}
+
+/// `(severity, summary)` alerts for problematic tools and the overall error
+/// rate, derived from the rendered rows so live and local sources are judged
+/// identically.
+fn tool_metrics_alerts(data: &MetricsData) -> Vec<(&'static str, String)> {
+    let mut alerts = Vec::new();
+    for tool in &data.tools {
+        if tool.error_pct > 50.0 {
+            alerts.push((
+                "error",
+                format!(
+                    "{} has {:.1}% error rate ({}/{})",
+                    tool.name, tool.error_pct, tool.errors, tool.calls
+                ),
+            ));
+        } else if tool.error_pct > 10.0 {
+            alerts.push((
+                "warn",
+                format!(
+                    "{} has {:.1}% error rate ({}/{})",
+                    tool.name, tool.error_pct, tool.errors, tool.calls
+                ),
+            ));
+        }
+        if tool.avg_ms > 2000.0 {
+            alerts.push((
+                "warn",
+                format!("{} avg latency {:.0}ms (>2s)", tool.name, tool.avg_ms),
+            ));
+        }
+    }
+    if data.error_rate_pct > 5.0 {
+        alerts.push((
+            "error",
+            format!(
+                "Overall error rate {:.1}% (>{} threshold)",
+                data.error_rate_pct, 5
+            ),
+        ));
+    }
+    alerts
+}
+
+/// Tool error-rate anomaly cards for `am robot analytics`.
+///
+/// Takes already-resolved entries so the caller controls provenance: with an
+/// empty `local-process` registry there is nothing to judge and no card is
+/// emitted, instead of "no tool errors" being implied by a process that never
+/// ran a tool (br-4myjj).
+#[allow(clippy::cast_precision_loss)]
+fn tool_error_anomalies(
+    entries: &[mcp_agent_mail_tools::MetricsSnapshotEntry],
+    source: &str,
+) -> Vec<AnomalyCard> {
+    entries
+        .iter()
+        .filter(|entry| entry.calls >= 10)
+        .filter_map(|entry| {
+            let error_pct = (entry.errors as f64 / entry.calls as f64) * 100.0;
+            (error_pct > 25.0).then(|| AnomalyCard {
+                severity: "warn".to_string(),
+                confidence: 0.85,
+                category: "tool_errors".to_string(),
+                headline: format!("{} error rate {error_pct:.1}%", entry.name),
+                rationale: format!(
+                    "{}/{} calls failed for {} (source: {source})",
+                    entry.errors, entry.calls, entry.name
+                ),
+                remediation: "am robot metrics".to_string(),
+                playbooks: vec![],
+            })
+        })
+        .collect()
+}
+
 /// robot health — system probe entry.
 #[derive(Debug, Serialize)]
 pub struct HealthProbe {
@@ -2343,10 +2702,22 @@ struct AtcData {
 // ── Stale handoff command data model ────────────────────────────────────────
 
 const ROBOT_HANDOFF_DEFAULT_LIMIT: usize = 50;
+/// Wall-clock budget for the per-bead enrichment loop. The dashboard is a
+/// read-only triage aid: partial-but-honest output beats a hung process.
+const ROBOT_HANDOFF_DEFAULT_MAX_SECONDS: u64 = 20;
+/// Thread ids / message ids per `IN (...)` batch. Well under SQLite's bound
+/// parameter limit and small enough to keep each statement cheap.
+const HANDOFF_MAIL_BATCH: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Default)]
 struct HandoffSummary {
     total_in_progress: usize,
+    /// Beads actually classified before the wall-clock budget (or the end of
+    /// the list) was reached. Equal to `total_in_progress` on a full run.
+    scanned: usize,
+    /// True when the enrichment loop stopped at `--max-seconds`; the records
+    /// and counts below then cover only the scanned prefix.
+    truncated_by_budget: bool,
     shown: usize,
     keep: usize,
     ask_owner: usize,
@@ -2569,7 +2940,8 @@ fn parse_output_format(s: &str) -> Result<OutputFormat, String> {
     s.parse()
 }
 
-/// All `am robot` subcommands (17 commands across 5 tracks).
+/// All `am robot` subcommands (19 as of 2026-09-01; `am robot --help` and the
+/// conformance doc-drift guard are authoritative for the count).
 #[derive(Debug, Subcommand)]
 pub enum RobotSubcommand {
     // ── Track 2: Situational Awareness ──────────────────────────────────
@@ -2766,6 +3138,10 @@ pub enum RobotSubcommand {
         /// Maximum records to return.
         #[arg(long)]
         limit: Option<usize>,
+        /// Stop classifying beads after this many seconds and return the
+        /// partial dashboard with `summary.truncated_by_budget = true`.
+        #[arg(long, default_value_t = ROBOT_HANDOFF_DEFAULT_MAX_SECONDS)]
+        max_seconds: u64,
         /// Explicitly request dry-run output. The command is always read-only.
         #[arg(long)]
         dry_run: bool,
@@ -8441,6 +8817,14 @@ fn read_in_progress_beads(path: &Path) -> Result<Vec<BeadsIssueJson>, CliError> 
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
+        // Cheap textual prefilter: a record whose parsed status is
+        // `in_progress` necessarily contains that token, so skipping the
+        // other ~97% of lines before JSON-decoding them (and materializing
+        // their comment arrays) cannot drop a real hit. The parsed status
+        // check below stays authoritative.
+        if !line.contains("in_progress") {
+            continue;
+        }
         if let Some(issue) = decode_beads_issue_line(line)?
             && issue.status == "in_progress"
         {
@@ -8619,40 +9003,152 @@ fn handoff_reservations_for_issue(
     matched
 }
 
-fn fetch_handoff_mail_state(
+/// Per-message facts needed to reproduce the handoff mail aggregates.
+#[derive(Debug, Default, Clone)]
+struct HandoffMailMessageFacts {
+    thread_id: String,
+    ack_required: bool,
+    created_ts: i64,
+    recipients: usize,
+    unread_recipients: usize,
+    ack_pending_recipients: usize,
+}
+
+fn handoff_in_placeholders(len: usize) -> String {
+    std::iter::repeat_n("?", len).collect::<Vec<_>>().join(", ")
+}
+
+/// Mail state for every handoff thread in two batched, join-free passes.
+///
+/// The previous shape ran one `messages LEFT JOIN message_recipients`
+/// aggregate per in-progress bead. FrankenSQLite executes that join as a
+/// whole-table nested loop (see the planner notes in
+/// `mcp_agent_mail_db::queries`), which on a 40k-message mailbox cost
+/// roughly `beads × messages × recipients` row visits and left
+/// `am robot handoff` producing no output inside a 600 s timeout. Two
+/// narrow `IN (...)` lookups over indexed columns plus a Rust fold keep the
+/// exact `LEFT JOIN` semantics: a message with no recipient rows still
+/// counts once as unread (and once as ack-pending when it requires an ack),
+/// matching the NULL row the join used to produce.
+fn fetch_handoff_mail_states(
     conn: &DbConn,
     project_id: i64,
-    thread_id: &str,
+    thread_ids: &[String],
     now_us: i64,
-) -> Result<HandoffMailState, CliError> {
-    let rows = conn
-        .query_sync(
-            "SELECT COUNT(DISTINCT m.id) AS message_count,
-                    COALESCE(SUM(CASE WHEN m.ack_required = 1 AND mr.ack_ts IS NULL THEN 1 ELSE 0 END), 0) AS ack_pending,
-                    COALESCE(SUM(CASE WHEN mr.read_ts IS NULL THEN 1 ELSE 0 END), 0) AS unread_count,
-                    COALESCE(MAX(m.created_ts), 0) AS latest_ts
-             FROM messages m
-             LEFT JOIN message_recipients mr ON mr.message_id = m.id
-             WHERE m.project_id = ? AND m.thread_id = ?",
-            &[Value::BigInt(project_id), Value::Text(thread_id.to_string())],
-        )
-        .map_err(|error| CliError::Other(format!("handoff mail query failed: {error}")))?;
-    let Some(row) = rows.first() else {
-        return Ok(HandoffMailState {
-            thread_id: thread_id.to_string(),
-            ..HandoffMailState::default()
-        });
-    };
-    let latest_ts = row.get_named::<i64>("latest_ts").unwrap_or(0);
-    Ok(HandoffMailState {
-        thread_id: thread_id.to_string(),
-        messages: row.get_named::<i64>("message_count").unwrap_or(0).max(0) as usize,
-        ack_required_pending: row.get_named::<i64>("ack_pending").unwrap_or(0).max(0) as usize,
-        unread: row.get_named::<i64>("unread_count").unwrap_or(0).max(0) as usize,
-        latest_message_at: (latest_ts > 0).then(|| mcp_agent_mail_db::micros_to_iso(latest_ts)),
-        latest_message_age_seconds: (latest_ts > 0)
-            .then(|| age_seconds_from_micros(now_us, latest_ts)),
-    })
+) -> Result<HashMap<String, HandoffMailState>, CliError> {
+    let mut facts: BTreeMap<i64, HandoffMailMessageFacts> = BTreeMap::new();
+    for chunk in thread_ids.chunks(HANDOFF_MAIL_BATCH) {
+        let sql = format!(
+            "SELECT id, thread_id, ack_required, created_ts
+             FROM messages
+             WHERE project_id = ? AND thread_id IN ({})",
+            handoff_in_placeholders(chunk.len())
+        );
+        let mut params = Vec::with_capacity(chunk.len() + 1);
+        params.push(Value::BigInt(project_id));
+        params.extend(chunk.iter().map(|thread| Value::Text(thread.clone())));
+        let rows = conn
+            .query_sync(&sql, &params)
+            .map_err(|error| CliError::Other(format!("handoff mail query failed: {error}")))?;
+        for row in &rows {
+            let Ok(id) = row.get_named::<i64>("id") else {
+                continue;
+            };
+            let Ok(thread_id) = row.get_named::<String>("thread_id") else {
+                continue;
+            };
+            facts.insert(
+                id,
+                HandoffMailMessageFacts {
+                    thread_id,
+                    ack_required: row.get_named::<i64>("ack_required").unwrap_or(0) == 1,
+                    created_ts: row.get_named::<i64>("created_ts").unwrap_or(0),
+                    ..HandoffMailMessageFacts::default()
+                },
+            );
+        }
+    }
+
+    let message_ids: Vec<i64> = facts.keys().copied().collect();
+    for chunk in message_ids.chunks(HANDOFF_MAIL_BATCH) {
+        let sql = format!(
+            "SELECT message_id, read_ts, ack_ts
+             FROM message_recipients
+             WHERE message_id IN ({})",
+            handoff_in_placeholders(chunk.len())
+        );
+        let params: Vec<Value> = chunk.iter().map(|id| Value::BigInt(*id)).collect();
+        let rows = conn
+            .query_sync(&sql, &params)
+            .map_err(|error| CliError::Other(format!("handoff recipient query failed: {error}")))?;
+        for row in &rows {
+            let Ok(message_id) = row.get_named::<i64>("message_id") else {
+                continue;
+            };
+            let Some(entry) = facts.get_mut(&message_id) else {
+                continue;
+            };
+            entry.recipients += 1;
+            if row.get_named::<i64>("read_ts").ok().is_none() {
+                entry.unread_recipients += 1;
+            }
+            if row.get_named::<i64>("ack_ts").ok().is_none() {
+                entry.ack_pending_recipients += 1;
+            }
+        }
+    }
+
+    let mut states: HashMap<String, HandoffMailState> = thread_ids
+        .iter()
+        .map(|thread| {
+            (
+                thread.clone(),
+                HandoffMailState {
+                    thread_id: thread.clone(),
+                    ..HandoffMailState::default()
+                },
+            )
+        })
+        .collect();
+    let mut latest_by_thread: HashMap<String, i64> = HashMap::new();
+    for message in facts.values() {
+        let Some(state) = states.get_mut(&message.thread_id) else {
+            continue;
+        };
+        state.messages += 1;
+        // LEFT JOIN semantics: a message without recipient rows contributed a
+        // single NULL-recipient row to the old aggregate.
+        let joined_rows = message.recipients.max(1);
+        let unread_rows = if message.recipients == 0 {
+            1
+        } else {
+            message.unread_recipients
+        };
+        let ack_pending_rows = if message.recipients == 0 {
+            1
+        } else {
+            message.ack_pending_recipients
+        };
+        debug_assert!(unread_rows <= joined_rows && ack_pending_rows <= joined_rows);
+        state.unread += unread_rows;
+        if message.ack_required {
+            state.ack_required_pending += ack_pending_rows;
+        }
+        let latest = latest_by_thread
+            .entry(message.thread_id.clone())
+            .or_insert(0);
+        *latest = (*latest).max(message.created_ts);
+    }
+    for (thread, latest_ts) in latest_by_thread {
+        if latest_ts <= 0 {
+            continue;
+        }
+        if let Some(state) = states.get_mut(&thread) {
+            state.latest_message_at = Some(mcp_agent_mail_db::micros_to_iso(latest_ts));
+            state.latest_message_age_seconds = Some(age_seconds_from_micros(now_us, latest_ts));
+        }
+    }
+    Ok(states)
 }
 
 fn handoff_owner_state(
@@ -8791,10 +9287,14 @@ fn handoff_rationale(
 
 fn summarize_handoff_records(
     total_in_progress: usize,
+    scanned: usize,
+    truncated_by_budget: bool,
     records: &[HandoffRecord],
 ) -> HandoffSummary {
     let mut summary = HandoffSummary {
         total_in_progress,
+        scanned,
+        truncated_by_budget,
         shown: records.len(),
         ..HandoffSummary::default()
     };
@@ -8812,6 +9312,7 @@ fn summarize_handoff_records(
     summary
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_handoff(
     scope: &ResolvedRobotProjectScope,
     stale_minutes: u32,
@@ -8819,8 +9320,11 @@ fn build_handoff(
     fresh_comment_minutes: u32,
     include_fresh: bool,
     limit: Option<usize>,
+    max_seconds: u64,
     explicit_dry_run: bool,
 ) -> Result<(HandoffData, Vec<String>), CliError> {
+    let started = Instant::now();
+    let budget = Duration::from_secs(max_seconds.max(1));
     let now_us = mcp_agent_mail_db::now_micros();
     let stale_cutoff_us = micros_ago(now_us, i64::from(stale_minutes) * MICROS_PER_MINUTE);
     let active_cutoff_us = micros_ago(now_us, i64::from(active_minutes) * MICROS_PER_MINUTE);
@@ -8845,9 +9349,19 @@ fn build_handoff(
     let agents = fetch_handoff_agents(scope.conn(), scope.project_id)?;
     let active_reservations_all =
         fetch_handoff_active_reservations(scope.conn(), scope.project_id, now_us)?;
+    let thread_ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
+    let mut mail_by_thread =
+        fetch_handoff_mail_states(scope.conn(), scope.project_id, &thread_ids, now_us)?;
 
     let mut records = Vec::new();
+    let mut scanned = 0usize;
+    let mut truncated_by_budget = false;
     for issue in issues {
+        if started.elapsed() >= budget {
+            truncated_by_budget = true;
+            break;
+        }
+        scanned += 1;
         let updated_ts = parse_handoff_timestamp_micros(issue.updated_at.as_deref());
         let updated_age_seconds = updated_ts.map(|ts| age_seconds_from_micros(now_us, ts));
         let stale = updated_ts.is_none_or(|ts| ts <= stale_cutoff_us);
@@ -8874,7 +9388,12 @@ fn build_handoff(
             &issue.id,
         );
         let active_reservations = handoff_reservation_views(&owner_reservations, now_us);
-        let mail = fetch_handoff_mail_state(scope.conn(), scope.project_id, &issue.id, now_us)?;
+        let mail = mail_by_thread
+            .remove(&issue.id)
+            .unwrap_or_else(|| HandoffMailState {
+                thread_id: issue.id.clone(),
+                ..HandoffMailState::default()
+            });
         let classification = classify_handoff(&HandoffClassificationInput {
             stale,
             owner_present: inferred_owner.is_some(),
@@ -8943,7 +9462,8 @@ fn build_handoff(
     });
     records.truncate(limit.unwrap_or(ROBOT_HANDOFF_DEFAULT_LIMIT));
 
-    let summary = summarize_handoff_records(total_in_progress, &records);
+    let summary =
+        summarize_handoff_records(total_in_progress, scanned, truncated_by_budget, &records);
     let mut actions: Vec<String> = records
         .iter()
         .filter(|record| record.action != "keep")
@@ -9533,27 +10053,10 @@ fn build_analytics(
         });
     }
 
-    // Tool error rate anomaly
-    let snapshot = mcp_agent_mail_tools::tool_metrics_snapshot();
-    for entry in &snapshot {
-        if entry.calls >= 10 {
-            let error_pct = (entry.errors as f64 / entry.calls as f64) * 100.0;
-            if error_pct > 25.0 {
-                anomalies.push(AnomalyCard {
-                    severity: "warn".to_string(),
-                    confidence: 0.85,
-                    category: "tool_errors".to_string(),
-                    headline: format!("{} error rate {error_pct:.1}%", entry.name),
-                    rationale: format!(
-                        "{}/{} calls failed for {}",
-                        entry.errors, entry.calls, entry.name
-                    ),
-                    remediation: "am robot metrics".to_string(),
-                    playbooks: vec![],
-                });
-            }
-        }
-    }
+    // Tool error-rate cards are appended by the `analytics` handler from
+    // source-resolved metrics (`tool_error_anomalies`, br-4myjj): this
+    // process's registry is empty unless it ran MCP tools in-process, so
+    // judging it here would silently report "no tool errors" for the daemon.
 
     Ok(anomalies)
 }
@@ -13508,6 +14011,22 @@ fn build_navigate_tooling(
     let (resource_type, data) = match parts_ref {
         ["tooling", "metrics"] => {
             let config = mcp_agent_mail_core::Config::get();
+            // br-4myjj: proxy the running daemon's counters when a server
+            // answers; this process's registry is empty otherwise, so label it.
+            let live_failure =
+                match try_read_live_server_resource(&config, "resource://tooling/metrics") {
+                    Ok(mut payload) => {
+                        label_tooling_payload_source(&mut payload, TOOL_METRICS_SOURCE_LIVE, None);
+                        return Ok((
+                            NavigateResult::Generic {
+                                resource_type: "tooling/metrics".to_string(),
+                                data: payload,
+                            },
+                            None,
+                        ));
+                    }
+                    Err(failure) => failure,
+                };
             let mut tools: Vec<serde_json::Value> =
                 mcp_agent_mail_tools::tool_metrics_snapshot_full()
                     .into_iter()
@@ -13534,14 +14053,17 @@ fn build_navigate_tooling(
                         })
                 });
             }
-            (
-                "tooling/metrics".to_string(),
-                serde_json::json!({
-                    "generated_at": serde_json::Value::Null,
-                    "health_level": mcp_agent_mail_core::compute_health_level().to_string(),
-                    "tools": tools,
-                }),
-            )
+            let mut data = serde_json::json!({
+                "generated_at": serde_json::Value::Null,
+                "health_level": mcp_agent_mail_core::compute_health_level().to_string(),
+                "tools": tools,
+            });
+            label_tooling_payload_source(
+                &mut data,
+                TOOL_METRICS_SOURCE_LOCAL,
+                Some(live_failure.detail),
+            );
+            ("tooling/metrics".to_string(), data)
         }
         ["tooling", "metrics_core"] => (
             "tooling/metrics_core".to_string(),
@@ -13553,6 +14075,22 @@ fn build_navigate_tooling(
             }),
         ),
         ["tooling", "diagnostics"] => {
+            // br-4myjj: same live-first / labelled-local rule as tooling/metrics.
+            let config = mcp_agent_mail_core::Config::get();
+            let live_failure =
+                match try_read_live_server_resource(&config, "resource://tooling/diagnostics") {
+                    Ok(mut payload) => {
+                        label_tooling_payload_source(&mut payload, TOOL_METRICS_SOURCE_LIVE, None);
+                        return Ok((
+                            NavigateResult::Generic {
+                                resource_type: "tooling/diagnostics".to_string(),
+                                data: payload,
+                            },
+                            None,
+                        ));
+                    }
+                    Err(failure) => failure,
+                };
             let tools_detail: Vec<serde_json::Value> =
                 mcp_agent_mail_tools::tool_metrics_snapshot()
                     .into_iter()
@@ -13563,8 +14101,13 @@ fn build_navigate_tooling(
                 .filter_map(|entry| serde_json::to_value(entry).ok())
                 .collect();
             let report = mcp_agent_mail_core::DiagnosticReport::build(tools_detail, slow);
-            let data = serde_json::from_str::<serde_json::Value>(&report.to_json())
+            let mut data = serde_json::from_str::<serde_json::Value>(&report.to_json())
                 .map_err(|e| CliError::Other(format!("diagnostics serialization failed: {e}")))?;
+            label_tooling_payload_source(
+                &mut data,
+                TOOL_METRICS_SOURCE_LOCAL,
+                Some(live_failure.detail),
+            );
             ("tooling/diagnostics".to_string(), data)
         }
         ["tooling", "locks"] => {
@@ -14648,48 +15191,19 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output(&env, format)?
         }
         RobotSubcommand::Metrics => {
-            let snapshot = mcp_agent_mail_tools::tool_metrics_snapshot();
-
-            let total_calls: u64 = snapshot.iter().map(|e| e.calls).sum();
-            let total_errors: u64 = snapshot.iter().map(|e| e.errors).sum();
-            let error_rate = if total_calls > 0 {
-                (total_errors as f64 / total_calls as f64) * 100.0
-            } else {
-                0.0
-            };
-            let avg_latency = if !snapshot.is_empty() {
-                let sum: f64 = snapshot
-                    .iter()
-                    .filter_map(|e| e.latency.as_ref().map(|l| l.avg_ms * e.calls as f64))
-                    .sum();
-                if total_calls > 0 {
-                    sum / total_calls as f64
-                } else {
-                    0.0
-                }
-            } else {
-                0.0
-            };
-
-            let tools: Vec<MetricEntry> = snapshot
-                .iter()
-                .map(|e| {
-                    let error_pct = if e.calls > 0 {
-                        (e.errors as f64 / e.calls as f64) * 100.0
-                    } else {
-                        0.0
-                    };
-                    MetricEntry {
-                        name: e.name.clone(),
-                        calls: e.calls,
-                        errors: e.errors,
-                        error_pct,
-                        avg_ms: e.latency.as_ref().map_or(0.0, |l| l.avg_ms),
-                        p95_ms: e.latency.as_ref().map_or(0.0, |l| l.p95_ms),
-                        p99_ms: e.latency.as_ref().map_or(0.0, |l| l.p99_ms),
-                    }
-                })
-                .collect();
+            // br-4myjj: tool counters live in the server process. Read them
+            // over the daemon's `resources/read` lane when a server answers;
+            // otherwise fall back to this process's registry, labelled so an
+            // empty CLI process is never mistaken for an idle daemon.
+            let config = mcp_agent_mail_core::Config::from_env();
+            let ResolvedToolMetrics {
+                entries,
+                source,
+                detail,
+                live_failure,
+            } = resolve_tool_metrics_entries(&config);
+            let metrics = build_metrics_data(entries, source, detail);
+            let tool_alerts = tool_metrics_alerts(&metrics);
 
             // A5 (br-bvq1x.1.5): surface corruption-class metrics so agents and
             // operators get trend visibility on integrity/classification events.
@@ -14727,12 +15241,9 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             ));
 
             #[derive(Serialize)]
-            struct MetricsData {
-                total_calls: u64,
-                total_errors: u64,
-                error_rate_pct: f64,
-                avg_latency_ms: f64,
-                tools: Vec<MetricEntry>,
+            struct MetricsReport {
+                #[serde(flatten)]
+                metrics: MetricsData,
                 corruption: mcp_agent_mail_core::CorruptionMetricsSnapshot,
                 resources: ResourcePressure,
             }
@@ -14740,16 +15251,19 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let mut env = RobotEnvelope::new(
                 cmd_name,
                 format,
-                MetricsData {
-                    total_calls,
-                    total_errors,
-                    error_rate_pct: (error_rate * 100.0).round() / 100.0,
-                    avg_latency_ms: (avg_latency * 100.0).round() / 100.0,
-                    tools,
+                MetricsReport {
+                    metrics,
                     corruption: corruption.clone(),
                     resources,
                 },
             );
+
+            // Say up front when the tool counters are NOT the daemon's, so the
+            // zeros below are read as "this process ran no tools", not "idle".
+            if let Some(failure) = &live_failure {
+                let (summary, action) = tool_metrics_scope_alert(failure);
+                env = env.with_alert("info", summary, action);
+            }
 
             // Emit the specific pool/FD backpressure guidance (bead K5). These
             // fire only on real threshold breaches, so a healthy process stays quiet.
@@ -14779,48 +15293,9 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 );
             }
 
-            // Generate alerts for problematic tools
-            for e in &snapshot {
-                let error_pct = if e.calls > 0 {
-                    (e.errors as f64 / e.calls as f64) * 100.0
-                } else {
-                    0.0
-                };
-                if error_pct > 50.0 {
-                    env = env.with_alert(
-                        "error",
-                        format!(
-                            "{} has {:.1}% error rate ({}/{})",
-                            e.name, error_pct, e.errors, e.calls
-                        ),
-                        None,
-                    );
-                } else if error_pct > 10.0 {
-                    env = env.with_alert(
-                        "warn",
-                        format!(
-                            "{} has {:.1}% error rate ({}/{})",
-                            e.name, error_pct, e.errors, e.calls
-                        ),
-                        None,
-                    );
-                }
-                if let Some(lat) = &e.latency
-                    && lat.avg_ms > 2000.0
-                {
-                    env = env.with_alert(
-                        "warn",
-                        format!("{} avg latency {:.0}ms (>2s)", e.name, lat.avg_ms),
-                        None,
-                    );
-                }
-            }
-            if error_rate > 5.0 {
-                env = env.with_alert(
-                    "error",
-                    format!("Overall error rate {error_rate:.1}% (>{} threshold)", 5),
-                    None,
-                );
+            // Generate alerts for problematic tools and the overall error rate.
+            for (severity, summary) in tool_alerts {
+                env = env.with_alert(severity, summary, None);
             }
 
             format_output(&env, format)?
@@ -15504,13 +15979,20 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         }
         RobotSubcommand::Analytics => {
             let scope = resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
-            let anomalies = build_analytics(
+            let mut anomalies = build_analytics(
                 scope.conn(),
                 scope.project_id,
                 &scope.project_slug,
                 scope.agent.clone(),
             )?;
             let config = mcp_agent_mail_core::Config::from_env();
+            // br-4myjj: judge tool error rates on the daemon's counters when a
+            // server answers; an empty local-process registry yields no card.
+            let tool_metrics = resolve_tool_metrics_entries(&config);
+            anomalies.extend(tool_error_anomalies(
+                &tool_metrics.entries,
+                tool_metrics.source,
+            ));
             let topology = build_swarm_topology(
                 scope.conn(),
                 scope.project_id,
@@ -15719,6 +16201,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             fresh_comment_minutes,
             include_fresh,
             limit,
+            max_seconds,
             dry_run,
         } => {
             let scope = resolve_robot_project_scope(args.project.as_deref())?;
@@ -15729,6 +16212,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 fresh_comment_minutes,
                 include_fresh,
                 limit,
+                max_seconds,
                 dry_run,
             )?;
             let mut env = RobotEnvelope::new(cmd_name, format, data);
@@ -15736,6 +16220,17 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             env = env.with_action(
                 "Read-only dashboard: inspect commands before running any ownership change",
             );
+            if env.data.summary.truncated_by_budget {
+                let scanned = env.data.summary.scanned;
+                let total = env.data.summary.total_in_progress;
+                env = env.with_alert(
+                    "warn",
+                    format!(
+                        "Handoff stopped at the {max_seconds}s wall-clock budget after {scanned} of {total} in-progress beads; results are partial"
+                    ),
+                    Some("Rerun with --max-seconds <n> (or --limit <n>) to cover the rest".to_string()),
+                );
+            }
             for action in actions {
                 env = env.with_action(action);
             }
@@ -15983,6 +16478,30 @@ mod tests {
     static NAVIGATE_RESOURCE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static ROBOT_COMMAND_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Open a file-backed test database carrying the REAL production schema.
+    ///
+    /// Applies `mcp_agent_mail_db::schema::init_schema_sql_base()` — the same
+    /// base DDL the runtime pool bootstraps before migrations — so the tables,
+    /// columns, constraints and defaults are exactly production's. Robot
+    /// fixtures used to hand-write `CREATE TABLE messages` / `agents` DDL that
+    /// silently drifted behind schema v27 (`messages.topic`), v28
+    /// (`agent_deregistrations`) and `agents.retired_at`; every production
+    /// SELECT referencing those then failed only under the unit tests.
+    /// Routing fixtures through this helper makes such drift impossible.
+    ///
+    /// `foreign_keys` is switched OFF first, mirroring the production PRAGMA
+    /// bundles (`REFERENCES` is documentation-only at runtime); several
+    /// fixtures deliberately seed orphaned rows to exercise drift handling.
+    fn open_robot_test_db_with_real_schema(db_path: &Path) -> mcp_agent_mail_db::DbConn {
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        conn.execute_raw("PRAGMA foreign_keys = OFF;")
+            .expect("disable foreign key enforcement like the production pool");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("apply production base schema");
+        conn
+    }
+
     // ── Degraded-mode queued-intent surface (br-bvq1x.8.3 / H3) ──────────────
 
     fn queued_intents_test_config(dir: &Path) -> mcp_agent_mail_core::Config {
@@ -16110,69 +16629,17 @@ mod tests {
     fn setup_robot_status_snapshot_test_db() -> (tempfile::TempDir, mcp_agent_mail_db::DbConn) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_status_snapshot.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
-        conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                program TEXT NOT NULL DEFAULT '',
-                model TEXT NOT NULL DEFAULT '',
-                last_active_ts INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create agents");
-        conn.query_sync(
-            "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                sender_id INTEGER NOT NULL,
-                thread_id TEXT,
-                subject TEXT NOT NULL,
-                created_ts INTEGER NOT NULL,
-                ack_required INTEGER NOT NULL DEFAULT 0,
-                importance TEXT NOT NULL DEFAULT 'normal'
-            )",
-            &empty,
-        )
-        .expect("create messages");
-        conn.query_sync(
-            "CREATE TABLE message_recipients (
-                id INTEGER PRIMARY KEY,
-                message_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                read_ts INTEGER,
-                ack_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create recipients");
-        conn.query_sync(
-            "CREATE TABLE file_reservations (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                path_pattern TEXT NOT NULL,
-                exclusive INTEGER NOT NULL,
-                reason TEXT NOT NULL,
-                created_ts INTEGER NOT NULL,
-                expires_ts INTEGER NOT NULL,
-                released_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create reservations");
         let now_us = mcp_agent_mail_db::now_micros();
         conn.query_sync(
-            "INSERT INTO agents (id, project_id, name, last_active_ts) VALUES
-                (1, 1, 'Sender', ?),
-                (2, 1, 'Reader', ?)",
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES
+                (1, 1, 'Sender', '', '', ?, ?),
+                (2, 1, 'Reader', '', '', ?, ?)",
             &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
                 mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
                 mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
             ],
@@ -16180,14 +16647,14 @@ mod tests {
         .expect("seed agents");
         conn.query_sync(
             "INSERT INTO messages
-             (id, project_id, sender_id, thread_id, subject, created_ts, ack_required, importance)
-             VALUES (1, 1, 1, 'thread-1', 'Initial subject', ?, 0, 'normal')",
+             (id, project_id, sender_id, thread_id, subject, body_md, created_ts, ack_required, importance)
+             VALUES (1, 1, 1, 'thread-1', 'Initial subject', '', ?, 0, 'normal')",
             &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us)],
         )
         .expect("seed message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (1, 1, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (1, 2, 'to', NULL, NULL)",
             &empty,
         )
         .expect("seed recipient");
@@ -16199,72 +16666,34 @@ mod tests {
     fn robot_contact_stats_only_treats_approved_links_as_respected() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_contact_stats.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
         conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                contact_policy TEXT NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create agents");
-        conn.query_sync(
-            "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                sender_id INTEGER NOT NULL,
-                created_ts INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create messages");
-        conn.query_sync(
-            "CREATE TABLE message_recipients (
-                id INTEGER PRIMARY KEY,
-                message_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create recipients");
-        conn.query_sync(
-            "CREATE TABLE agent_links (
-                id INTEGER PRIMARY KEY,
-                a_agent_id INTEGER NOT NULL,
-                b_agent_id INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                expires_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create links");
-
-        conn.query_sync(
-            "INSERT INTO agents (id, project_id, contact_policy) VALUES
-                (1, 1, 'open'),
-                (2, 1, 'contacts_only')",
+            "INSERT INTO agents
+             (id, project_id, name, program, model, inception_ts, last_active_ts, contact_policy)
+             VALUES
+                (1, 1, 'Opener', '', '', 0, 0, 'open'),
+                (2, 1, 'Guarded', '', '', 0, 0, 'contacts_only')",
             &empty,
         )
         .expect("seed agents");
         conn.query_sync(
-            "INSERT INTO messages (id, project_id, sender_id, created_ts)
-             VALUES (1, 1, 1, 100)",
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts)
+             VALUES (1, 1, 1, 'contact stats', '', 100)",
             &empty,
         )
         .expect("seed message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id)
-             VALUES (1, 1, 2)",
+            "INSERT INTO message_recipients (message_id, agent_id)
+             VALUES (1, 2)",
             &empty,
         )
         .expect("seed recipient");
         conn.query_sync(
-            "INSERT INTO agent_links (id, a_agent_id, b_agent_id, status, expires_ts)
-             VALUES (1, 1, 2, 'accepted', NULL)",
+            "INSERT INTO agent_links
+             (id, a_project_id, a_agent_id, b_project_id, b_agent_id, status, created_ts, updated_ts, expires_ts)
+             VALUES (1, 1, 1, 1, 2, 'accepted', 0, 0, NULL)",
             &empty,
         )
         .expect("seed stale link");
@@ -16492,41 +16921,15 @@ mod tests {
     fn fetch_handoff_active_reservations_ignores_expired_stale_claims() {
         let db_dir = tempfile::tempdir().expect("db tempdir");
         let db_path = db_dir.path().join("handoff_expired_reservations.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open handoff db");
-        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
-        conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                program TEXT NOT NULL,
-                model TEXT NOT NULL,
-                last_active_ts INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create agents");
-        conn.query_sync(
-            "CREATE TABLE file_reservations (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                path_pattern TEXT NOT NULL,
-                exclusive INTEGER NOT NULL,
-                reason TEXT NOT NULL,
-                created_ts INTEGER NOT NULL,
-                expires_ts INTEGER NOT NULL,
-                released_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create reservations");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let now_us = mcp_agent_mail_db::now_micros();
         conn.query_sync(
-            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts)
-             VALUES (1, 1, 'OtherAgent', 'codex-cli', 'gpt-5.5', ?)",
-            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us)],
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (1, 1, 'OtherAgent', 'codex-cli', 'gpt-5.5', ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
+            ],
         )
         .expect("insert agent");
         conn.query_sync(
@@ -16552,6 +16955,167 @@ mod tests {
         assert_eq!(reservations[0].reason, "working br-active");
     }
 
+    /// The aggregate the batched path replaced: one `LEFT JOIN` per thread.
+    /// Kept here as the semantic oracle so the join-free fold is proven
+    /// equivalent (including the NULL-recipient row a recipient-less message
+    /// used to contribute).
+    fn legacy_handoff_mail_state(
+        conn: &mcp_agent_mail_db::DbConn,
+        project_id: i64,
+        thread_id: &str,
+    ) -> (usize, usize, usize, i64) {
+        use mcp_agent_mail_db::sqlmodel_core::Value as SqlValue;
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(DISTINCT m.id) AS message_count,
+                        COALESCE(SUM(CASE WHEN m.ack_required = 1 AND mr.ack_ts IS NULL THEN 1 ELSE 0 END), 0) AS ack_pending,
+                        COALESCE(SUM(CASE WHEN mr.read_ts IS NULL THEN 1 ELSE 0 END), 0) AS unread_count,
+                        COALESCE(MAX(m.created_ts), 0) AS latest_ts
+                 FROM messages m
+                 LEFT JOIN message_recipients mr ON mr.message_id = m.id
+                 WHERE m.project_id = ? AND m.thread_id = ?",
+                &[
+                    SqlValue::BigInt(project_id),
+                    SqlValue::Text(thread_id.to_string()),
+                ],
+            )
+            .expect("legacy handoff aggregate");
+        let row = &rows[0];
+        (
+            row.get_named::<i64>("message_count").unwrap_or(0).max(0) as usize,
+            row.get_named::<i64>("ack_pending").unwrap_or(0).max(0) as usize,
+            row.get_named::<i64>("unread_count").unwrap_or(0).max(0) as usize,
+            row.get_named::<i64>("latest_ts").unwrap_or(0),
+        )
+    }
+
+    #[test]
+    fn fetch_handoff_mail_states_matches_legacy_join_semantics() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("handoff-mail.sqlite3");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
+        use mcp_agent_mail_db::sqlmodel_core::Value as SqlValue;
+        let insert_message = |id: i64,
+                              project_id: i64,
+                              thread: &str,
+                              ack_required: i64,
+                              created_ts: i64| {
+            conn.execute_sync(
+                "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts)
+                 VALUES (?, ?, 1, ?, 'subject', 'body', 'normal', ?, ?)",
+                &[
+                    SqlValue::BigInt(id),
+                    SqlValue::BigInt(project_id),
+                    SqlValue::Text(thread.to_string()),
+                    SqlValue::BigInt(ack_required),
+                    SqlValue::BigInt(created_ts),
+                ],
+            )
+            .expect("insert message");
+        };
+        let insert_recipient = |message_id: i64,
+                                agent_id: i64,
+                                read_ts: Option<i64>,
+                                ack_ts: Option<i64>| {
+            conn.execute_sync(
+                "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (?, ?, 'to', ?, ?)",
+                &[
+                    SqlValue::BigInt(message_id),
+                    SqlValue::BigInt(agent_id),
+                    read_ts.map_or(SqlValue::Null, SqlValue::BigInt),
+                    ack_ts.map_or(SqlValue::Null, SqlValue::BigInt),
+                ],
+            )
+            .expect("insert recipient");
+        };
+
+        // br-a: one ack-required message with a mixed recipient set, plus one
+        // message with no recipient rows at all (the LEFT JOIN NULL row case).
+        insert_message(1, 1, "br-a", 1, 1_000);
+        insert_recipient(1, 10, None, None);
+        insert_recipient(1, 11, Some(500), Some(600));
+        insert_message(2, 1, "br-a", 0, 3_000);
+        // br-b: ack-required message with no recipients.
+        insert_message(3, 1, "br-b", 1, 2_000);
+        // Same thread id in another project must not leak in.
+        insert_message(4, 2, "br-a", 1, 9_000);
+        insert_recipient(4, 12, None, None);
+
+        let now_us = 10_000_000;
+        let threads = vec![
+            "br-a".to_string(),
+            "br-b".to_string(),
+            "br-none".to_string(),
+        ];
+        let states = fetch_handoff_mail_states(&conn, 1, &threads, now_us)
+            .expect("batched handoff mail states");
+        assert_eq!(states.len(), 3, "every requested thread gets a state");
+
+        for thread in ["br-a", "br-b", "br-none"] {
+            let (messages, ack_pending, unread, latest_ts) =
+                legacy_handoff_mail_state(&conn, 1, thread);
+            let state = states.get(thread).expect("state present");
+            assert_eq!(state.thread_id, thread);
+            assert_eq!(state.messages, messages, "{thread}: message count");
+            assert_eq!(
+                state.ack_required_pending, ack_pending,
+                "{thread}: ack pending"
+            );
+            assert_eq!(state.unread, unread, "{thread}: unread");
+            assert_eq!(
+                state.latest_message_at.is_some(),
+                latest_ts > 0,
+                "{thread}: latest_message_at presence"
+            );
+            if latest_ts > 0 {
+                assert_eq!(
+                    state.latest_message_age_seconds,
+                    Some(age_seconds_from_micros(now_us, latest_ts)),
+                    "{thread}: latest age"
+                );
+            }
+        }
+        // Concrete expectations so a wrong oracle cannot silently agree with
+        // a wrong implementation.
+        let a = &states["br-a"];
+        assert_eq!((a.messages, a.ack_required_pending, a.unread), (2, 1, 2));
+        let b = &states["br-b"];
+        assert_eq!((b.messages, b.ack_required_pending, b.unread), (1, 1, 1));
+        let none = &states["br-none"];
+        assert_eq!(
+            (none.messages, none.ack_required_pending, none.unread),
+            (0, 0, 0)
+        );
+        assert!(none.latest_message_at.is_none());
+
+        // Empty input never touches the database.
+        assert!(
+            fetch_handoff_mail_states(&conn, 1, &[], now_us)
+                .expect("empty batch")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn read_in_progress_beads_prefilter_keeps_every_in_progress_record() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("issues.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"id\":\"br-1\",\"title\":\"open one\",\"status\":\"open\"}\n",
+                "{\"id\":\"br-2\",\"title\":\"claimed\",\"status\":\"in_progress\",\"assignee\":\"BlueLake\"}\n",
+                "{\"id\":\"br-3\",\"title\":\"mentions in_progress in text only\",\"status\":\"closed\"}\n",
+                "{\"id\":\"br-4\",\"title\":\"also claimed\",\"status\":\"in_progress\"}\n",
+            ),
+        )
+        .expect("write issues.jsonl");
+        let issues = read_in_progress_beads(&path).expect("read in-progress beads");
+        let ids: Vec<&str> = issues.iter().map(|issue| issue.id.as_str()).collect();
+        assert_eq!(ids, vec!["br-2", "br-4"]);
+        assert_eq!(issues[0].assignee.as_deref(), Some("BlueLake"));
+    }
+
     #[test]
     fn build_handoff_blocks_no_owner_bead_with_reason_reservation() {
         let project_dir = tempfile::tempdir().expect("project tempdir");
@@ -16571,72 +17135,7 @@ mod tests {
 
         let db_dir = tempfile::tempdir().expect("db tempdir");
         let db_path = db_dir.path().join("handoff.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open handoff db");
-        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
-        conn.query_sync(
-            "CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL,
-                human_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create projects");
-        conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                program TEXT NOT NULL,
-                model TEXT NOT NULL,
-                last_active_ts INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create agents");
-        conn.query_sync(
-            "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                sender_id INTEGER NOT NULL,
-                thread_id TEXT,
-                subject TEXT NOT NULL,
-                created_ts INTEGER NOT NULL,
-                ack_required INTEGER NOT NULL DEFAULT 0,
-                importance TEXT NOT NULL DEFAULT 'normal'
-            )",
-            &empty,
-        )
-        .expect("create messages");
-        conn.query_sync(
-            "CREATE TABLE message_recipients (
-                id INTEGER PRIMARY KEY,
-                message_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                read_ts INTEGER,
-                ack_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create recipients");
-        conn.query_sync(
-            "CREATE TABLE file_reservations (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                path_pattern TEXT NOT NULL,
-                exclusive INTEGER NOT NULL,
-                reason TEXT NOT NULL,
-                created_ts INTEGER NOT NULL,
-                expires_ts INTEGER NOT NULL,
-                released_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create reservations");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         conn.query_sync(
             "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'demo', ?, ?)",
             &[
@@ -16648,9 +17147,12 @@ mod tests {
         )
         .expect("insert project");
         conn.query_sync(
-            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts)
-             VALUES (1, 1, 'OtherAgent', 'codex-cli', 'gpt-5.5', ?)",
-            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us)],
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (1, 1, 'OtherAgent', 'codex-cli', 'gpt-5.5', ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
+            ],
         )
         .expect("insert agent");
         conn.query_sync(
@@ -16669,8 +17171,17 @@ mod tests {
             project_id: 1,
             project_slug: "demo".to_string(),
         };
-        let (data, _actions) =
-            build_handoff(&scope, 30, 30, 30, false, None, false).expect("build handoff");
+        let (data, _actions) = build_handoff(
+            &scope,
+            30,
+            30,
+            30,
+            false,
+            None,
+            ROBOT_HANDOFF_DEFAULT_MAX_SECONDS,
+            false,
+        )
+        .expect("build handoff");
 
         assert_eq!(data.records.len(), 1);
         assert_eq!(data.records[0].action, "blocked_by_reservation");
@@ -18888,22 +19399,12 @@ mod tests {
     fn build_contacts_keeps_orphaned_counterparty_rows_visible() {
         let (_temp_dir, conn) = setup_robot_thread_message_test_db();
         let now_us = mcp_agent_mail_db::now_micros();
-        conn.query_sync(
-            "CREATE TABLE agent_links (
-                id INTEGER PRIMARY KEY,
-                a_project_id INTEGER NOT NULL,
-                a_agent_id INTEGER NOT NULL,
-                b_project_id INTEGER NOT NULL,
-                b_agent_id INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                created_ts INTEGER NOT NULL,
-                updated_ts INTEGER NOT NULL,
-                expires_ts INTEGER NOT NULL
-            )",
-            &[],
-        )
-        .expect("create agent_links");
+        // `policy` is read from the a-side agent
+        // (`COALESCE(NULLIF(a1.contact_policy, ''), 'unknown')`). The real
+        // schema defaults `contact_policy` to 'auto', so pin the legacy
+        // empty-policy state this test's "unknown" expectation depends on.
+        conn.query_sync("UPDATE agents SET contact_policy = '' WHERE id = 1", &[])
+            .expect("clear a-side contact policy");
         conn.query_sync(
             "INSERT INTO agent_links
              (id, a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts)
@@ -18941,8 +19442,8 @@ mod tests {
         )
         .expect("insert drifted project");
         conn.query_sync(
-            "INSERT INTO agents (id, project_id, name, program, model)
-             VALUES (7, 7, 'DriftedAgent', 'codex-cli', 'gpt-5')",
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (7, 7, 'DriftedAgent', 'codex-cli', 'gpt-5', 0, 0)",
             &empty,
         )
         .expect("insert drifted agent");
@@ -18993,8 +19494,8 @@ mod tests {
         )
         .expect("insert drifted project");
         conn.query_sync(
-            "INSERT INTO agents (id, project_id, name, program, model)
-             VALUES (7, 7, 'DriftedAgent', 'codex-cli', 'gpt-5')",
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (7, 7, 'DriftedAgent', 'codex-cli', 'gpt-5', 0, 0)",
             &empty,
         )
         .expect("insert drifted agent");
@@ -19007,8 +19508,8 @@ mod tests {
         .expect("insert drifted overview message");
         conn.query_sync(
             "INSERT INTO message_recipients
-             (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (7, 7, 7, 'to', NULL, NULL)",
+             (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (7, 7, 'to', NULL, NULL)",
             &empty,
         )
         .expect("insert drifted overview recipient");
@@ -19393,73 +19894,21 @@ mod tests {
     fn build_status_uses_latest_thread_subject_and_all_participants() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_status.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
         conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                last_active_ts INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create agents");
-        conn.query_sync(
-            "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                sender_id INTEGER NOT NULL,
-                thread_id TEXT,
-                subject TEXT NOT NULL,
-                created_ts INTEGER NOT NULL,
-                ack_required INTEGER NOT NULL DEFAULT 0,
-                importance TEXT NOT NULL DEFAULT 'normal'
-            )",
-            &empty,
-        )
-        .expect("create messages");
-        conn.query_sync(
-            "CREATE TABLE message_recipients (
-                message_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                read_ts INTEGER,
-                ack_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create recipients");
-        conn.query_sync(
-            "CREATE TABLE file_reservations (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                path_pattern TEXT NOT NULL,
-                exclusive INTEGER NOT NULL,
-                reason TEXT NOT NULL,
-                created_ts INTEGER NOT NULL,
-                expires_ts INTEGER NOT NULL,
-                released_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create reservations");
-
-        conn.query_sync(
-            "INSERT INTO agents (id, project_id, name, last_active_ts) VALUES
-                (1, 1, 'Alpha', 1),
-                (2, 1, 'Beta', 1),
-                (3, 1, 'Gamma', 1)",
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES
+                (1, 1, 'Alpha', '', '', 1, 1),
+                (2, 1, 'Beta', '', '', 1, 1),
+                (3, 1, 'Gamma', '', '', 1, 1)",
             &empty,
         )
         .expect("seed agents");
         conn.query_sync(
-            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, created_ts, ack_required, importance) VALUES
-                (1, 1, 1, 'thread-1', 'Alpha subject', 100, 0, 'normal'),
-                (2, 1, 1, 'thread-1', 'Latest subject', 200, 0, 'normal')",
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, created_ts, ack_required, importance) VALUES
+                (1, 1, 1, 'thread-1', 'Alpha subject', '', 100, 0, 'normal'),
+                (2, 1, 1, 'thread-1', 'Latest subject', '', 200, 0, 'normal')",
             &empty,
         )
         .expect("seed messages");
@@ -19492,10 +19941,10 @@ mod tests {
         )
         .expect("insert thread messages");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
              VALUES
-                (210, 210, 2, 'to', NULL, NULL),
-                (211, 211, 3, 'cc', NULL, NULL)",
+                (210, 2, 'to', NULL, NULL),
+                (211, 3, 'cc', NULL, NULL)",
             &[],
         )
         .expect("insert recipients");
@@ -19522,10 +19971,10 @@ mod tests {
         )
         .expect("insert root messages");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
              VALUES
-                (310, 310, 2, 'to', NULL, NULL),
-                (320, 320, 1, 'to', NULL, NULL)",
+                (310, 2, 'to', NULL, NULL),
+                (320, 1, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert recipients");
@@ -19545,16 +19994,16 @@ mod tests {
         let now_us = mcp_agent_mail_db::now_micros();
         conn.query_sync(
             "INSERT INTO messages
-             (id, project_id, sender_id, thread_id, subject, created_ts, ack_required, importance)
-             VALUES (2, 1, 1, 'ack-thread', 'Ack overdue', ?, 1, 'high')",
+             (id, project_id, sender_id, thread_id, subject, body_md, created_ts, ack_required, importance)
+             VALUES (2, 1, 1, 'ack-thread', 'Ack overdue', '', ?, 1, 'high')",
             &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
                 now_us - ACK_OVERDUE_THRESHOLD_US - 1,
             )],
         )
         .expect("insert overdue message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (2, 2, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (2, 2, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert overdue recipient");
@@ -19606,9 +20055,12 @@ mod tests {
         let (_temp_dir, conn) = setup_robot_status_snapshot_test_db();
         let now_us = mcp_agent_mail_db::now_micros();
         conn.query_sync(
-            "INSERT INTO agents (id, project_id, name, last_active_ts)
-             VALUES (3, 1, 'Writer', ?)",
-            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us)],
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (3, 1, 'Writer', '', '', ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
+            ],
         )
         .expect("insert writer");
         conn.query_sync(
@@ -19700,14 +20152,14 @@ mod tests {
         let now_us = mcp_agent_mail_db::now_micros();
         conn.query_sync(
             "INSERT INTO messages
-             (id, project_id, sender_id, thread_id, subject, created_ts, ack_required, importance)
-             VALUES (2, 1, 1, 'thread-2', 'New subject', ?, 0, 'normal')",
+             (id, project_id, sender_id, thread_id, subject, body_md, created_ts, ack_required, importance)
+             VALUES (2, 1, 1, 'thread-2', 'New subject', '', ?, 0, 'normal')",
             &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us)],
         )
         .expect("insert invalidating message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (2, 2, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (2, 2, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert invalidating recipient");
@@ -19806,8 +20258,8 @@ mod tests {
         )
         .expect("insert overview message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (410, 410, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (410, 2, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert overview recipient");
@@ -19905,14 +20357,14 @@ mod tests {
         let now_us = mcp_agent_mail_db::now_micros();
         conn.query_sync(
             "INSERT INTO messages
-             (id, project_id, sender_id, thread_id, subject, created_ts, ack_required, importance)
-             VALUES (2, 1, 1, 'thread-2', 'New inbox subject', ?, 0, 'normal')",
+             (id, project_id, sender_id, thread_id, subject, body_md, created_ts, ack_required, importance)
+             VALUES (2, 1, 1, 'thread-2', 'New inbox subject', '', ?, 0, 'normal')",
             &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us)],
         )
         .expect("insert invalidating message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (2, 2, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (2, 2, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert invalidating recipient");
@@ -20057,9 +20509,12 @@ mod tests {
         )
         .expect("insert invalidating reservation");
         conn.query_sync(
-            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts)
-             VALUES (4, 1, 'Delta', 'codex-cli', 'gpt-5', ?)",
-            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 2)],
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (4, 1, 'Delta', 'codex-cli', 'gpt-5', ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 2),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 2),
+            ],
         )
         .expect("insert invalidating agent");
         conn.query_sync(
@@ -20806,20 +21261,9 @@ mod tests {
             .join("robot_navigate_canonical_projects.sqlite3");
         let storage_root = temp_dir.path().join("storage-root");
         std::fs::create_dir_all(&storage_root).expect("create storage root");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
-        conn.query_sync(
-            "CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL,
-                human_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create projects");
         conn.query_sync(
             "INSERT INTO projects (id, slug, human_key, created_at)
              VALUES
@@ -20859,64 +21303,17 @@ mod tests {
     fn test_build_navigate_outbox_returns_sent_messages() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_outbox_test.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
         conn.query_sync(
-            "CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL,
-                human_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT 0
-            )",
-            &empty,
-        )
-        .expect("create projects");
-        conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create agents");
-        conn.query_sync(
-            "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                sender_id INTEGER NOT NULL,
-                subject TEXT NOT NULL,
-                thread_id TEXT,
-                importance TEXT NOT NULL,
-                ack_required INTEGER NOT NULL,
-                created_ts INTEGER NOT NULL,
-                body_md TEXT
-            )",
-            &empty,
-        )
-        .expect("create messages");
-        conn.query_sync(
-            "CREATE TABLE message_recipients (
-                id INTEGER PRIMARY KEY,
-                message_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                read_ts INTEGER,
-                ack_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create message_recipients");
-
-        conn.query_sync(
-            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'proj', '/tmp/proj')",
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'proj', '/tmp/proj', 0)",
             &empty,
         )
         .expect("insert project");
         conn.query_sync(
-            "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'Sender'), (2, 1, 'Recipient')",
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (1, 1, 'Sender', '', '', 0, 0), (2, 1, 'Recipient', '', '', 0, 0)",
             &empty,
         )
         .expect("insert agents");
@@ -20929,10 +21326,10 @@ mod tests {
         )
         .expect("insert messages");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
              VALUES
-                (1, 10, 2, 'to', NULL, NULL),
-                (2, 20, 1, 'to', NULL, NULL)",
+                (10, 2, 'to', NULL, NULL),
+                (20, 1, 'to', NULL, NULL)",
             &empty,
         )
         .expect("insert recipients");
@@ -20956,35 +21353,20 @@ mod tests {
     fn test_outbox_partial_ack_shows_fractional_status() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_outbox_ack_test.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
         conn.query_sync(
-            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT 0)",
-            &empty,
-        ).expect("create projects");
-        conn.query_sync(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
-            &empty,
-        ).expect("create agents");
-        conn.query_sync(
-            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, subject TEXT NOT NULL, thread_id TEXT, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts INTEGER NOT NULL, body_md TEXT)",
-            &empty,
-        ).expect("create messages");
-        conn.query_sync(
-            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts INTEGER, ack_ts INTEGER)",
-            &empty,
-        ).expect("create message_recipients");
-
-        conn.query_sync(
-            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'proj', '/tmp/proj')",
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'proj', '/tmp/proj', 0)",
             &empty,
         )
         .expect("insert project");
         conn.query_sync(
-            "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'Sender'), (2, 1, 'RecipA'), (3, 1, 'RecipB')",
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES
+                (1, 1, 'Sender', '', '', 0, 0),
+                (2, 1, 'RecipA', '', '', 0, 0),
+                (3, 1, 'RecipB', '', '', 0, 0)",
             &empty,
         ).expect("insert agents");
 
@@ -20996,10 +21378,10 @@ mod tests {
             &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now)],
         ).expect("insert message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
              VALUES
-                (1, 10, 2, 'to', NULL, 999),
-                (2, 10, 3, 'to', NULL, NULL)",
+                (10, 2, 'to', NULL, 999),
+                (10, 3, 'to', NULL, NULL)",
             &empty,
         )
         .expect("insert recipients");
@@ -21023,66 +21405,19 @@ mod tests {
     fn test_build_navigate_honors_project_query_parameter() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_navigate_project_query.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
         conn.query_sync(
-            "CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL,
-                human_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT 0
-            )",
-            &empty,
-        )
-        .expect("create projects");
-        conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create agents");
-        conn.query_sync(
-            "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                sender_id INTEGER NOT NULL,
-                subject TEXT NOT NULL,
-                thread_id TEXT,
-                importance TEXT NOT NULL,
-                ack_required INTEGER NOT NULL,
-                created_ts INTEGER NOT NULL,
-                body_md TEXT
-            )",
-            &empty,
-        )
-        .expect("create messages");
-        conn.query_sync(
-            "CREATE TABLE message_recipients (
-                id INTEGER PRIMARY KEY,
-                message_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                read_ts INTEGER,
-                ack_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create message_recipients");
-
-        conn.query_sync(
-            "INSERT INTO projects (id, slug, human_key) VALUES \
-             (1, 'wrong', '/tmp/wrong'), \
-             (2, 'proj', '/tmp/proj')",
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+             (1, 'wrong', '/tmp/wrong', 0), \
+             (2, 'proj', '/tmp/proj', 0)",
             &empty,
         )
         .expect("insert projects");
         conn.query_sync(
-            "INSERT INTO agents (id, project_id, name) VALUES (1, 2, 'Sender'), (2, 2, 'Recipient')",
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (1, 2, 'Sender', '', '', 0, 0), (2, 2, 'Recipient', '', '', 0, 0)",
             &empty,
         )
         .expect("insert agents");
@@ -21093,8 +21428,8 @@ mod tests {
         )
         .expect("insert message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (1, 10, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (10, 2, 'to', NULL, NULL)",
             &empty,
         )
         .expect("insert recipient");
@@ -21122,20 +21457,8 @@ mod tests {
     fn resolve_project_sync_rejects_slug_collision_for_absolute_path() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_resolve_project_sync.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
-
-        conn.query_sync(
-            "CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL,
-                human_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create projects");
 
         let project_a = temp_dir.path().join("repo").join("a-b");
         let project_b = temp_dir.path().join("repo").join("a").join("b");
@@ -21175,60 +21498,8 @@ mod tests {
     fn test_build_navigate_supports_project_keys_in_path_segments() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_navigate_project_key.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
-
-        conn.query_sync(
-            "CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL,
-                human_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create projects");
-        conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                program TEXT NOT NULL,
-                model TEXT NOT NULL,
-                task_description TEXT,
-                created_at INTEGER,
-                updated_at INTEGER,
-                contact_policy TEXT,
-                attachments_policy TEXT,
-                last_active_ts INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create agents");
-        conn.query_sync(
-            "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                sender_id INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create messages");
-        conn.query_sync(
-            "CREATE TABLE file_reservations (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                path_pattern TEXT NOT NULL,
-                \"exclusive\" INTEGER NOT NULL,
-                reason TEXT,
-                created_ts INTEGER NOT NULL,
-                expires_ts INTEGER NOT NULL,
-                released_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create file reservations");
 
         conn.query_sync(
             "INSERT INTO projects (id, slug, human_key, created_at)
@@ -21239,10 +21510,10 @@ mod tests {
         conn.query_sync(
             "INSERT INTO agents (
                 id, project_id, name, program, model, task_description,
-                created_at, updated_at, contact_policy, attachments_policy, last_active_ts
+                inception_ts, contact_policy, attachments_policy, last_active_ts
              ) VALUES (
                 1, 1, 'Sender', 'codex-cli', 'gpt-5', 'task',
-                1000, 1000, 'auto', 'inline', 1000
+                1000, 'auto', 'inline', 1000
              )",
             &empty,
         )
@@ -21419,60 +21690,8 @@ mod tests {
         let db_path = temp_dir
             .path()
             .join("robot_navigate_reservation_release_ledger.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
-
-        conn.query_sync(
-            "CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL,
-                human_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create projects");
-        conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                program TEXT NOT NULL,
-                model TEXT NOT NULL,
-                task_description TEXT,
-                created_at INTEGER,
-                updated_at INTEGER,
-                contact_policy TEXT,
-                attachments_policy TEXT,
-                last_active_ts INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create agents");
-        conn.query_sync(
-            "CREATE TABLE file_reservations (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                path_pattern TEXT NOT NULL,
-                \"exclusive\" INTEGER NOT NULL,
-                reason TEXT,
-                created_ts INTEGER NOT NULL,
-                expires_ts INTEGER NOT NULL,
-                released_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create file reservations");
-        conn.query_sync(
-            "CREATE TABLE file_reservation_releases (
-                reservation_id INTEGER PRIMARY KEY,
-                released_ts INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create file reservation releases");
 
         conn.query_sync(
             "INSERT INTO projects (id, slug, human_key, created_at)
@@ -21483,10 +21702,10 @@ mod tests {
         conn.query_sync(
             "INSERT INTO agents (
                 id, project_id, name, program, model, task_description,
-                created_at, updated_at, contact_policy, attachments_policy, last_active_ts
+                inception_ts, contact_policy, attachments_policy, last_active_ts
              ) VALUES (
                 1, 1, 'Sender', 'codex-cli', 'gpt-5', 'task',
-                1000, 1000, 'auto', 'inline', 1000
+                1000, 'auto', 'inline', 1000
              )",
             &empty,
         )
@@ -21546,52 +21765,9 @@ mod tests {
         let db_path = temp_dir
             .path()
             .join("robot_navigate_reservation_orphan_agent.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
-        conn.query_sync(
-            "CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL,
-                human_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create projects");
-        conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                program TEXT NOT NULL,
-                model TEXT NOT NULL,
-                task_description TEXT,
-                created_at INTEGER,
-                updated_at INTEGER,
-                contact_policy TEXT,
-                attachments_policy TEXT,
-                last_active_ts INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create agents");
-        conn.query_sync(
-            "CREATE TABLE file_reservations (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                path_pattern TEXT NOT NULL,
-                \"exclusive\" INTEGER NOT NULL,
-                reason TEXT,
-                created_ts INTEGER NOT NULL,
-                expires_ts INTEGER NOT NULL,
-                released_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create file reservations");
         conn.query_sync(
             "INSERT INTO projects (id, slug, human_key, created_at)
              VALUES (1, 'proj', '/tmp/proj', 1000)",
@@ -21601,10 +21777,10 @@ mod tests {
         conn.query_sync(
             "INSERT INTO agents (
                 id, project_id, name, program, model, task_description,
-                created_at, updated_at, contact_policy, attachments_policy, last_active_ts
+                inception_ts, contact_policy, attachments_policy, last_active_ts
              ) VALUES (
                 1, 1, 'Sender', 'codex-cli', 'gpt-5', 'task',
-                1000, 1000, 'auto', 'inline', 1000
+                1000, 'auto', 'inline', 1000
              )",
             &empty,
         )
@@ -21699,6 +21875,10 @@ mod tests {
             .expect("open sqlite db");
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
+        // Deliberately bespoke legacy DDL: this test pins a `file_reservations`
+        // WITHOUT the legacy `released_ts` column (GH#274). The agents side is
+        // carried forward to schema v28 (`retired_at`, `agent_deregistrations`)
+        // so production SELECTs resolve as on a real mailbox.
         conn.query_sync(
             "CREATE TABLE projects (
                 id INTEGER PRIMARY KEY,
@@ -21721,11 +21901,20 @@ mod tests {
                 updated_at INTEGER,
                 contact_policy TEXT,
                 attachments_policy TEXT,
-                last_active_ts INTEGER NOT NULL
+                last_active_ts INTEGER NOT NULL,
+                retired_at INTEGER
             )",
             &empty,
         )
         .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE agent_deregistrations (
+                agent_id INTEGER PRIMARY KEY REFERENCES agents(id),
+                deregistered_at INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agent deregistrations");
         conn.query_sync(
             "CREATE TABLE file_reservations (
                 id INTEGER PRIMARY KEY,
@@ -21811,20 +22000,8 @@ mod tests {
     fn test_build_navigate_preserves_literal_plus_in_path_segments() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_navigate_project_plus.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
-
-        conn.query_sync(
-            "CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL,
-                human_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create projects");
 
         conn.query_sync(
             "INSERT INTO projects (id, slug, human_key, created_at)
@@ -21938,8 +22115,8 @@ mod tests {
         )
         .expect("insert urgent message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (301, 301, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (301, 2, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert urgent recipient");
@@ -21988,8 +22165,8 @@ mod tests {
         )
         .expect("insert ack overdue message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (302, 302, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (302, 2, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert ack overdue recipient");
@@ -22019,12 +22196,23 @@ mod tests {
         assert_eq!(scope.as_deref(), Some("proj"));
     }
 
+    /// Pin the resolved server endpoint to an unused port so tooling navigate
+    /// resources deterministically take the labelled local-process path
+    /// instead of proxying whatever daemon is bound on 8765 (br-4myjj).
+    fn with_unreachable_server<R>(f: impl FnOnce() -> R) -> R {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("HTTP_PORT", "47351")],
+            f,
+        )
+    }
+
     #[test]
     fn test_build_navigate_supports_tooling_metrics_resource() {
         let conn = mcp_agent_mail_db::DbConn::open_memory().expect("open memory db");
-        let (result, scope) =
+        let (result, scope) = with_unreachable_server(|| {
             build_navigate(&conn, "resource://tooling/metrics", 99, "wrong", None)
-                .expect("navigate tooling metrics");
+        })
+        .expect("navigate tooling metrics");
 
         match result {
             NavigateResult::Generic {
@@ -22034,6 +22222,16 @@ mod tests {
                 assert_eq!(resource_type, "tooling/metrics");
                 assert!(data["health_level"].is_string());
                 assert!(data["tools"].is_array());
+                assert_eq!(
+                    data["source"], "local-process",
+                    "no reachable daemon: counters must be labelled as this process's: {data}"
+                );
+                assert!(
+                    data["source_detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains("47351")),
+                    "source_detail must name the probed endpoint: {data}"
+                );
             }
             other => panic!("unexpected tooling metrics result: {other:?}"),
         }
@@ -22042,9 +22240,10 @@ mod tests {
 
     #[test]
     fn test_build_navigate_without_db_supports_tooling_metrics_resource() {
-        let (result, scope) = build_navigate_without_db("resource://tooling/metrics")
-            .expect("navigate tooling without db")
-            .expect("tooling metrics should bypass db");
+        let (result, scope) =
+            with_unreachable_server(|| build_navigate_without_db("resource://tooling/metrics"))
+                .expect("navigate tooling without db")
+                .expect("tooling metrics should bypass db");
 
         match result {
             NavigateResult::Generic {
@@ -22054,8 +22253,36 @@ mod tests {
                 assert_eq!(resource_type, "tooling/metrics");
                 assert!(data["health_level"].is_string());
                 assert!(data["tools"].is_array());
+                assert_eq!(data["source"], "local-process");
             }
             other => panic!("unexpected tooling metrics result: {other:?}"),
+        }
+        assert!(scope.is_none());
+    }
+
+    #[test]
+    fn test_build_navigate_without_db_labels_tooling_diagnostics_source() {
+        let (result, scope) =
+            with_unreachable_server(|| build_navigate_without_db("resource://tooling/diagnostics"))
+                .expect("navigate tooling diagnostics without db")
+                .expect("tooling diagnostics should bypass db");
+
+        match result {
+            NavigateResult::Generic {
+                resource_type,
+                data,
+            } => {
+                assert_eq!(resource_type, "tooling/diagnostics");
+                assert!(data["tools_detail"].is_array(), "{data}");
+                assert_eq!(data["source"], "local-process", "{data}");
+                assert!(
+                    data["source_detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains("47351")),
+                    "source_detail must name the probed endpoint: {data}"
+                );
+            }
+            other => panic!("unexpected tooling diagnostics result: {other:?}"),
         }
         assert!(scope.is_none());
     }
@@ -22142,42 +22369,21 @@ mod tests {
     fn build_agents_deduplicates_case_insensitive_names() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_agents_dedupe.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
         conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                program TEXT NOT NULL,
-                model TEXT NOT NULL,
-                last_active_ts INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create agents table");
-        conn.query_sync(
-            "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                sender_id INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create messages table");
-
-        conn.query_sync(
-            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts)
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
              VALUES
-                (1, 1, 'RubyPrairie', 'claude-code', 'opus-4.6', 1000),
-                (2, 1, 'rubyprairie', 'codex-cli', 'gpt-5', 2000),
-                (3, 1, 'JadePine', 'codex-cli', 'gpt-5', 1500)",
+                (1, 1, 'RubyPrairie', 'claude-code', 'opus-4.6', 1000, 1000),
+                (2, 1, 'rubyprairie', 'codex-cli', 'gpt-5', 2000, 2000),
+                (3, 1, 'JadePine', 'codex-cli', 'gpt-5', 1500, 1500)",
             &empty,
         )
         .expect("insert agents");
         conn.query_sync(
-            "INSERT INTO messages (id, sender_id) VALUES (10, 2), (20, 2), (30, 3)",
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts)
+             VALUES (10, 1, 2, '', '', 0), (20, 1, 2, '', '', 0), (30, 1, 3, '', '', 0)",
             &empty,
         )
         .expect("insert messages");
@@ -22185,9 +22391,21 @@ mod tests {
         let rows = build_agents(&conn, 1, false, None).expect("build agents");
 
         assert_eq!(rows.len(), 2, "duplicate logical agent should be collapsed");
-        assert_eq!(rows[0].name, "rubyprairie");
-        assert_eq!(rows[0].program, "codex-cli");
-        assert_eq!(rows[0].msg_count, 2);
+        // Since 5c672682 the roster keeps the canonical identity — the lowest
+        // id among case-insensitive name collisions — rather than the most
+        // recently active duplicate, and rows are ordered by last activity.
+        // The canonical row reports only its own message count; merging the
+        // duplicate's messages onto it is tracked separately (br-6jpu3 /
+        // GH#213 name-collision merge semantics).
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, vec!["JadePine", "RubyPrairie"]);
+        let canonical = &rows[1];
+        assert_eq!(canonical.program, "claude-code");
+        assert_eq!(canonical.msg_count, 0);
+        assert!(
+            !rows.iter().any(|row| row.name == "rubyprairie"),
+            "the non-canonical duplicate must not appear in the roster"
+        );
     }
 
     #[test]
@@ -22197,8 +22415,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_agent_lifecycle.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
         let project_key = temp_dir
             .path()
@@ -22210,41 +22427,20 @@ mod tests {
         let xdg_config_home = temp_dir.path().join("xdg-config");
 
         conn.query_sync(
-            "CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL,
-                human_key TEXT NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create projects");
-        conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                program TEXT NOT NULL,
-                model TEXT NOT NULL,
-                last_active_ts INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create agents");
-        conn.query_sync(
-            "INSERT INTO projects (id, slug, human_key)
-             VALUES (1, 'project-alpha', ?), (2, 'project-beta', '/tmp/project-beta')",
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'project-alpha', ?, 0), (2, 'project-beta', '/tmp/project-beta', 0)",
             &[mcp_agent_mail_db::sqlmodel_core::Value::Text(
                 project_key.clone(),
             )],
         )
         .expect("insert projects");
         conn.query_sync(
-            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts)
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
              VALUES
-                (1, 1, 'BlueLake', 'codex-cli', 'gpt-5', 1000),
-                (2, 1, 'bluelake', 'codex-cli', 'gpt-5', 2000),
-                (3, 1, 'bad_name', 'codex-cli', 'gpt-5', 1500),
-                (4, 2, 'SilverCove', 'codex-cli', 'gpt-5', 2500)",
+                (1, 1, 'BlueLake', 'codex-cli', 'gpt-5', 1000, 1000),
+                (2, 1, 'bluelake', 'codex-cli', 'gpt-5', 2000, 2000),
+                (3, 1, 'bad_name', 'codex-cli', 'gpt-5', 1500, 1500),
+                (4, 2, 'SilverCove', 'codex-cli', 'gpt-5', 2500, 2500)",
             &empty,
         )
         .expect("insert agents");
@@ -22322,21 +22518,12 @@ mod tests {
     fn resolve_agent_id_finds_case_insensitive_agent() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_agent_resolve_case.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
         conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create agents table");
-        conn.query_sync(
-            "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'BlueLake')",
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (1, 1, 'BlueLake', '', '', 0, 0)",
             &empty,
         )
         .expect("insert agent");
@@ -22352,22 +22539,12 @@ mod tests {
         let db_path = temp_dir
             .path()
             .join("robot_agent_resolve_ambiguous.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
         conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create agents table");
-        conn.query_sync(
-            "INSERT INTO agents (id, project_id, name)
-             VALUES (1, 1, 'BlueLake'), (2, 1, 'bluelake')",
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (1, 1, 'BlueLake', '', '', 0, 0), (2, 1, 'bluelake', '', '', 0, 0)",
             &empty,
         )
         .expect("insert duplicate logical agents");
@@ -22384,8 +22561,7 @@ mod tests {
     fn build_agents_with_health_reports_p50_latency_detail() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_agents_health.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
         let now_us = mcp_agent_mail_db::now_micros();
         let last_active_ts = now_us - 5 * 60 * 1_000_000;
@@ -22397,55 +22573,21 @@ mod tests {
         let ack_third = created_third + 2 * 60 * 60 * 1_000_000;
 
         conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                program TEXT NOT NULL,
-                model TEXT NOT NULL,
-                last_active_ts INTEGER NOT NULL,
-                contact_policy TEXT NOT NULL DEFAULT 'auto'
-            )",
-            &empty,
-        )
-        .expect("create agents");
-        conn.query_sync(
-            "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                sender_id INTEGER NOT NULL,
-                created_ts INTEGER NOT NULL,
-                ack_required INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create messages");
-        conn.query_sync(
-            "CREATE TABLE message_recipients (
-                message_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                ack_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create recipients");
-
-        conn.query_sync(
             &format!(
                 "INSERT INTO agents
-                (id, project_id, name, program, model, last_active_ts, contact_policy)
+                (id, project_id, name, program, model, inception_ts, last_active_ts, contact_policy)
              VALUES
-                (1, 1, 'GreenCastle', 'codex-cli', 'gpt-5', {last_active_ts}, 'auto')"
+                (1, 1, 'GreenCastle', 'codex-cli', 'gpt-5', {last_active_ts}, {last_active_ts}, 'auto')"
             ),
             &empty,
         )
         .expect("insert agent");
         conn.query_sync(
             &format!(
-                "INSERT INTO messages (id, project_id, sender_id, created_ts, ack_required) VALUES
-                (1, 1, 1, {created_first}, 1),
-                (2, 1, 1, {created_second}, 1),
-                (3, 1, 1, {created_third}, 1)"
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts, ack_required) VALUES
+                (1, 1, 1, '', '', {created_first}, 1),
+                (2, 1, 1, '', '', {created_second}, 1),
+                (3, 1, 1, '', '', {created_third}, 1)"
             ),
             &empty,
         )
@@ -22480,9 +22622,7 @@ mod tests {
     fn fetch_robot_agent_ack_stats_rejects_impossible_and_keeps_zero_latency_ack() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_ack_health_timestamps.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
-        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let now_us = mcp_agent_mail_db::now_micros();
         let created_immediate = micros_ago(now_us, 10 * MICROS_PER_MINUTE);
         let created_impossible = micros_ago(now_us, 9 * MICROS_PER_MINUTE);
@@ -22490,29 +22630,10 @@ mod tests {
         let created_pending = micros_ago(now_us, 8 * MICROS_PER_MINUTE);
 
         conn.query_sync(
-            "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                created_ts INTEGER NOT NULL,
-                ack_required INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create messages");
-        conn.query_sync(
-            "CREATE TABLE message_recipients (
-                message_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                ack_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create recipients");
-        conn.query_sync(
-            "INSERT INTO messages (id, project_id, created_ts, ack_required) VALUES
-                (1, 1, ?, 1),
-                (2, 1, ?, 1),
-                (3, 1, ?, 1)",
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts, ack_required) VALUES
+                (1, 1, 1, '', '', ?, 1),
+                (2, 1, 1, '', '', ?, 1),
+                (3, 1, 1, '', '', ?, 1)",
             &[
                 mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_immediate),
                 mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_impossible),
@@ -22608,32 +22729,12 @@ mod tests {
     fn resolve_robot_scope_falls_back_to_archive_snapshot_for_missing_explicit_agent() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let local_db_path = temp_dir.path().join("robot_scope_fallback.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&local_db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
         conn.query_sync(
-            "CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL,
-                human_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT 0
-            )",
-            &empty,
-        )
-        .expect("create projects table");
-        conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create agents table");
-        conn.query_sync(
-            "INSERT INTO projects (id, slug, human_key)
-             VALUES (1, 'demo-project', '/tmp/demo-project')",
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'demo-project', '/tmp/demo-project', 0)",
             &empty,
         )
         .expect("insert local project");
@@ -22774,72 +22875,29 @@ mod tests {
     fn resolve_scope_retries_local_db_when_archive_snapshot_misses_agent() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let local_db_path = temp_dir.path().join("robot_scope_local_retry.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&local_db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
         conn.query_sync(
-            "CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL,
-                human_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT 0
-            )",
-            &empty,
-        )
-        .expect("create projects table");
-        conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create agents table");
-        conn.query_sync(
-            "INSERT INTO projects (id, slug, human_key)
-             VALUES (1, 'demo-project', '/tmp/demo-project')",
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'demo-project', '/tmp/demo-project', 0)",
             &empty,
         )
         .expect("insert project");
         conn.query_sync(
-            "INSERT INTO agents (id, project_id, name)
-             VALUES (1, 1, 'CoralMarsh')",
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (1, 1, 'CoralMarsh', '', '', 0, 0)",
             &empty,
         )
         .expect("insert agent into local db");
 
         // Archive snapshot DB that has the project but NOT the agent
         let archive_db_path = temp_dir.path().join("robot_scope_archive_no_agent.sqlite3");
-        let archive_conn =
-            mcp_agent_mail_db::DbConn::open_file(archive_db_path.display().to_string())
-                .expect("open archive db");
+        let archive_conn = open_robot_test_db_with_real_schema(&archive_db_path);
         archive_conn
             .query_sync(
-                "CREATE TABLE projects (
-                    id INTEGER PRIMARY KEY,
-                    slug TEXT NOT NULL,
-                    human_key TEXT NOT NULL,
-                    created_at INTEGER NOT NULL DEFAULT 0
-                )",
-                &empty,
-            )
-            .expect("create projects table in archive");
-        archive_conn
-            .query_sync(
-                "CREATE TABLE agents (
-                    id INTEGER PRIMARY KEY,
-                    project_id INTEGER NOT NULL,
-                    name TEXT NOT NULL
-                )",
-                &empty,
-            )
-            .expect("create agents table in archive");
-        archive_conn
-            .query_sync(
-                "INSERT INTO projects (id, slug, human_key)
-                 VALUES (1, 'demo-project', '/tmp/demo-project')",
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'demo-project', '/tmp/demo-project', 0)",
                 &empty,
             )
             .expect("insert project in archive");
@@ -22877,23 +22935,12 @@ mod tests {
     fn resolve_robot_project_scope_falls_back_to_archive_snapshot_for_missing_project() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let local_db_path = temp_dir.path().join("robot_project_scope_fallback.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&local_db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
         conn.query_sync(
-            "CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL,
-                human_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT 0
-            )",
-            &empty,
-        )
-        .expect("create projects table");
-        conn.query_sync(
-            "INSERT INTO projects (id, slug, human_key)
-             VALUES (1, 'other-project', '/tmp/other-project')",
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'other-project', '/tmp/other-project', 0)",
             &empty,
         )
         .expect("insert unrelated local project");
@@ -22926,23 +22973,12 @@ mod tests {
             .path()
             .join("robot_attachment_scope_fallback.sqlite3");
         let local_db_url = format!("sqlite:///{}", local_db_path.display());
-        let conn = mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&local_db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
         conn.query_sync(
-            "CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL,
-                human_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT 0
-            )",
-            &empty,
-        )
-        .expect("create projects table");
-        conn.query_sync(
-            "INSERT INTO projects (id, slug, human_key)
-             VALUES (1, 'other-project', '/tmp/other-project')",
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'other-project', '/tmp/other-project', 0)",
             &empty,
         )
         .expect("insert unrelated local project");
@@ -23188,11 +23224,11 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let local_db_path = temp_dir.path().join("robot_archive_unrelated.sqlite3");
         let local_db_url = format!("sqlite:///{}", local_db_path.display());
-        let xdg_data_home = temp_dir.path().join("xdg");
-        let xdg_data_home_text = xdg_data_home.to_string_lossy().into_owned();
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("XDG_DATA_HOME", xdg_data_home_text.as_str())],
-            || {
+        // br-99aih: redirect the *default* storage root into a private tempdir
+        // (HOME + XDG_DATA_HOME); an XDG-only override still resolved to the
+        // operator's live archive on any host that had run the daemon.
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(
+            |_isolated_default_root| {
                 crate::handle_migrate_with_database_url(&local_db_url).expect("migrate local db");
 
                 let local_conn =
@@ -23380,87 +23416,20 @@ mod tests {
     fn setup_robot_thread_message_test_db() -> (tempfile::TempDir, mcp_agent_mail_db::DbConn) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_thread_message_test.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
         conn.query_sync(
-            "CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL,
-                human_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT 0
-            )",
-            &empty,
-        )
-        .expect("create projects");
-        conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                program TEXT,
-                model TEXT,
-                contact_policy TEXT,
-                last_active_ts INTEGER NOT NULL DEFAULT 0
-            )",
-            &empty,
-        )
-        .expect("create agents");
-        conn.query_sync(
-            "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                sender_id INTEGER NOT NULL,
-                subject TEXT NOT NULL,
-                thread_id TEXT,
-                importance TEXT NOT NULL,
-                ack_required INTEGER NOT NULL,
-                created_ts INTEGER NOT NULL,
-                body_md TEXT NOT NULL,
-                attachments TEXT
-            )",
-            &empty,
-        )
-        .expect("create messages");
-        conn.query_sync(
-            "CREATE TABLE message_recipients (
-                id INTEGER PRIMARY KEY,
-                message_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                read_ts INTEGER,
-                ack_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create recipients");
-        conn.query_sync(
-            "CREATE TABLE file_reservations (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                path_pattern TEXT NOT NULL,
-                exclusive INTEGER NOT NULL,
-                reason TEXT NOT NULL,
-                created_ts INTEGER NOT NULL,
-                expires_ts INTEGER NOT NULL,
-                released_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create reservations");
-        conn.query_sync(
-            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'proj', '/tmp/proj')",
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'proj', '/tmp/proj', 0)",
             &empty,
         )
         .expect("insert project");
         conn.query_sync(
-            "INSERT INTO agents (id, project_id, name, program, model)
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
              VALUES
-                (1, 1, 'Alice', 'claude-code', 'opus'),
-                (2, 1, 'Bob', 'codex-cli', 'gpt-5'),
-                (3, 1, 'Carol', 'codex-cli', 'gpt-5')",
+                (1, 1, 'Alice', 'claude-code', 'opus', 0, 0),
+                (2, 1, 'Bob', 'codex-cli', 'gpt-5', 0, 0),
+                (3, 1, 'Carol', 'codex-cli', 'gpt-5', 0, 0)",
             &empty,
         )
         .expect("insert agents");
@@ -23509,10 +23478,10 @@ mod tests {
         )
         .expect("insert message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
              VALUES
-                (1, 100, 2, 'to', NULL, 123456789),
-                (2, 100, 3, 'to', NULL, NULL)",
+                (100, 2, 'to', NULL, 123456789),
+                (100, 3, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert recipients");
@@ -23534,8 +23503,8 @@ mod tests {
         )
         .expect("insert message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (102, 102, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (102, 2, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert recipient");
@@ -23565,11 +23534,11 @@ mod tests {
         )
         .expect("insert messages");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
              VALUES
-                (10, 110, 2, 'to', NULL, NULL),
-                (11, 110, 3, 'cc', NULL, NULL),
-                (12, 111, 1, 'to', NULL, NULL)",
+                (110, 2, 'to', NULL, NULL),
+                (110, 3, 'cc', NULL, NULL),
+                (111, 1, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert recipients");
@@ -23599,11 +23568,11 @@ mod tests {
         )
         .expect("insert messages");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
              VALUES
-                (30, 210, 2, 'to', NULL, NULL),
-                (31, 210, 3, 'cc', NULL, NULL),
-                (32, 211, 1, 'to', NULL, NULL)",
+                (210, 2, 'to', NULL, NULL),
+                (210, 3, 'cc', NULL, NULL),
+                (211, 1, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert recipients");
@@ -23634,11 +23603,11 @@ mod tests {
         )
         .expect("insert message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
              VALUES
-                (20, 112, 2, 'to', NULL, NULL),
-                (21, 112, 3, 'cc', NULL, NULL),
-                (22, 112, 1, 'bcc', NULL, NULL)",
+                (112, 2, 'to', NULL, NULL),
+                (112, 3, 'cc', NULL, NULL),
+                (112, 1, 'bcc', NULL, NULL)",
             &[],
         )
         .expect("insert recipients");
@@ -23668,8 +23637,8 @@ mod tests {
         )
         .expect("insert inbox message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (120, 120, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (120, 2, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert inbox recipient");
@@ -23698,8 +23667,8 @@ mod tests {
         )
         .expect("insert inbox message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (122, 122, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (122, 2, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert inbox recipient");
@@ -23724,8 +23693,8 @@ mod tests {
         )
         .expect("insert inbox message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (123, 123, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (123, 2, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert inbox recipient");
@@ -23751,20 +23720,9 @@ mod tests {
         std::fs::create_dir_all(&nested).expect("create nested workspace path");
 
         let db_path = temp_dir.path().join("project_lookup.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         conn.query_sync(
-            "CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL,
-                human_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT 0
-            )",
-            &[],
-        )
-        .expect("create projects");
-        conn.query_sync(
-            "INSERT INTO projects (id, slug, human_key) VALUES (?, ?, ?)",
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, 0)",
             &[
                 mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
                 mcp_agent_mail_db::sqlmodel_core::Value::Text("workspace".to_string()),
@@ -23804,8 +23762,12 @@ mod tests {
         for stmt in [
             "PRAGMA foreign_keys = OFF",
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL, created_at DATETIME NOT NULL)",
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL, inception_ts DATETIME NOT NULL, last_active_ts DATETIME NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto')",
-            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL, attachments TEXT NOT NULL DEFAULT '[]')",
+            // Deliberately bespoke legacy (Python-era DATETIME) schema, carried
+            // forward to schema v28 (`retired_at`, `agent_deregistrations`,
+            // `messages.topic`) so production SELECTs resolve as on a real mailbox.
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL, inception_ts DATETIME NOT NULL, last_active_ts DATETIME NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto', retired_at INTEGER)",
+            "CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY REFERENCES agents(id), deregistered_at INTEGER NOT NULL)",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, topic TEXT COLLATE NOCASE, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL, attachments TEXT NOT NULL DEFAULT '[]')",
             "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
             "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'robot-lock', '/tmp/robot-lock', '2026-03-12 11:00:00')",
             "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (1, 1, 'Sender', 'codex-cli', 'test', 'robot', '2026-03-12 11:00:01', '2026-03-12 11:00:02', 'auto', 'auto')",
@@ -24410,6 +24372,372 @@ mod tests {
             host_probe.is_some(),
             "expected a host probe in {with_host:?}"
         );
+    }
+
+    // ---- br-4myjj: tool metrics provenance (live daemon vs this process) ----
+
+    fn metrics_entry(
+        name: &str,
+        calls: u64,
+        errors: u64,
+        latency: Option<mcp_agent_mail_tools::LatencySnapshot>,
+    ) -> mcp_agent_mail_tools::MetricsSnapshotEntry {
+        mcp_agent_mail_tools::MetricsSnapshotEntry {
+            name: name.to_string(),
+            calls,
+            errors,
+            rejections: 0,
+            cluster: "messaging".to_string(),
+            capabilities: vec!["messaging".to_string()],
+            complexity: "medium".to_string(),
+            latency,
+        }
+    }
+
+    #[test]
+    fn robot_metrics_labels_local_process_source_when_no_server_is_reachable() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_metrics_source.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        // `run_robot_json_capture` pins HTTP_PORT to an unused port, so the
+        // live `resources/read` deterministically fails and the command must
+        // fall back to this process's (empty) registry — and say so, rather
+        // than presenting the zeros as the daemon's activity.
+        let value = run_robot_json_capture(
+            RobotArgs {
+                format: Some(OutputFormat::Json),
+                json: false,
+                project: None,
+                agent: None,
+                command: RobotSubcommand::Metrics,
+            },
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        );
+
+        assert_eq!(value["source"], "local-process", "{value}");
+        assert_eq!(value["total_calls"], 0, "{value}");
+        assert_eq!(value["total_errors"], 0, "{value}");
+        assert_eq!(value["avg_latency_ms"], 0.0, "{value}");
+        assert!(
+            value["tools"].as_array().is_some_and(Vec::is_empty),
+            "no fabricated tool rows for an empty process registry: {}",
+            value["tools"]
+        );
+        let detail = value["source_detail"]
+            .as_str()
+            .expect("source_detail must say why the live read failed");
+        assert!(
+            detail.contains("47351"),
+            "source_detail must name the probed endpoint: {detail}"
+        );
+
+        let alerts = value["_alerts"]
+            .as_array()
+            .expect("scope alert must be present for a local-process fallback");
+        let scope_alert = alerts
+            .iter()
+            .find(|alert| {
+                alert["summary"]
+                    .as_str()
+                    .is_some_and(|summary| summary.contains("THIS CLI process only"))
+            })
+            .unwrap_or_else(|| panic!("missing tool-metrics scope alert in {alerts:?}"));
+        assert_eq!(scope_alert["severity"], "info");
+        assert!(
+            scope_alert["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("no live server was reachable")),
+            "connection refused must read as unreachable: {scope_alert}"
+        );
+        assert_eq!(
+            scope_alert["action"],
+            "am serve-http --no-tui  # then re-run am robot metrics"
+        );
+        // The process-local resource gauges keep their existing label.
+        assert_eq!(value["resources"]["scope"], "current_process");
+    }
+
+    #[test]
+    fn live_tool_metrics_payload_populates_totals_and_latency() {
+        // Stub of what a daemon returns for
+        // `resources/read resource://tooling/metrics`: the full catalogue,
+        // including a zero-call tool, with latency only where sampled.
+        let resource_json = serde_json::json!({
+            "generated_at": null,
+            "health_level": "green",
+            "tools": [
+                {
+                    "name": "whois",
+                    "calls": 10,
+                    "errors": 0,
+                    "rejections": 0,
+                    "cluster": "identity",
+                    "capabilities": ["identity"],
+                    "complexity": "low"
+                },
+                {
+                    "name": "send_message",
+                    "calls": 40,
+                    "errors": 5,
+                    "rejections": 2,
+                    "cluster": "messaging",
+                    "capabilities": ["messaging"],
+                    "complexity": "medium",
+                    "latency": {
+                        "avg_ms": 120.0,
+                        "min_ms": 10.0,
+                        "max_ms": 900.0,
+                        "p50_ms": 100.0,
+                        "p95_ms": 600.0,
+                        "p99_ms": 850.0,
+                        "is_slow": true
+                    }
+                },
+                {
+                    "name": "health_check",
+                    "calls": 0,
+                    "errors": 0,
+                    "rejections": 0,
+                    "cluster": "tooling",
+                    "capabilities": [],
+                    "complexity": "low"
+                }
+            ]
+        });
+        let read_result = serde_json::json!({
+            "contents": [{
+                "uri": "resource://tooling/metrics",
+                "mimeType": "application/json",
+                "text": resource_json.to_string(),
+            }]
+        });
+
+        let payload = crate::parse_resource_read_json("resource://tooling/metrics", &read_result)
+            .expect("resources/read text content parses as JSON");
+        assert_eq!(payload["health_level"], "green");
+
+        let entries = parse_live_tool_metrics_payload(&payload).expect("live entries parse");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["send_message", "whois"],
+            "zero-call catalogue rows are dropped and the rest sorted by name"
+        );
+
+        let data = build_metrics_data(entries, TOOL_METRICS_SOURCE_LIVE, None);
+        assert_eq!(data.source, "live-server");
+        assert!(data.source_detail.is_none());
+        assert_eq!(data.total_calls, 50);
+        assert_eq!(data.total_errors, 5);
+        assert!(
+            (data.error_rate_pct - 10.0).abs() < 1e-9,
+            "5/50 errors, got {}",
+            data.error_rate_pct
+        );
+        assert!(
+            (data.avg_latency_ms - 96.0).abs() < 1e-9,
+            "call-weighted mean (120*40 + 0*10)/50, got {}",
+            data.avg_latency_ms
+        );
+
+        let send = &data.tools[0];
+        assert_eq!(send.name, "send_message");
+        assert_eq!(send.calls, 40);
+        assert_eq!(send.errors, 5);
+        assert!((send.error_pct - 12.5).abs() < 1e-9, "{}", send.error_pct);
+        assert!((send.avg_ms - 120.0).abs() < 1e-9, "{}", send.avg_ms);
+        assert!((send.p95_ms - 600.0).abs() < 1e-9, "{}", send.p95_ms);
+        assert!((send.p99_ms - 850.0).abs() < 1e-9, "{}", send.p99_ms);
+        let whois = &data.tools[1];
+        assert_eq!(whois.name, "whois");
+        assert_eq!(whois.calls, 10);
+        assert_eq!(whois.errors, 0);
+        assert_eq!(whois.error_pct, 0.0);
+        assert_eq!(whois.avg_ms, 0.0);
+        assert_eq!(whois.p95_ms, 0.0);
+
+        // Alerts are judged on the live rows with the historical thresholds.
+        let alerts = tool_metrics_alerts(&data);
+        assert_eq!(
+            alerts,
+            vec![
+                (
+                    "warn",
+                    "send_message has 12.5% error rate (5/40)".to_string()
+                ),
+                (
+                    "error",
+                    "Overall error rate 10.0% (>5 threshold)".to_string()
+                ),
+            ]
+        );
+
+        // Serialized shape: provenance is first-class alongside the totals.
+        let json = serde_json::to_value(&data).expect("serialize metrics data");
+        assert_eq!(json["source"], "live-server");
+        assert!(json.get("source_detail").is_none());
+        assert_eq!(json["total_calls"], 50);
+        assert_eq!(json["tools"][0]["p95_ms"], 600.0);
+
+        // An empty live catalogue is still a live answer with honest zeros.
+        let empty = parse_live_tool_metrics_payload(&serde_json::json!({
+            "generated_at": null,
+            "health_level": "green",
+            "tools": []
+        }))
+        .expect("empty live catalogue parses");
+        let data = build_metrics_data(empty, TOOL_METRICS_SOURCE_LIVE, None);
+        assert_eq!(data.source, "live-server");
+        assert_eq!(data.total_calls, 0);
+        assert_eq!(data.total_errors, 0);
+        assert_eq!(data.error_rate_pct, 0.0);
+        assert_eq!(data.avg_latency_ms, 0.0);
+        assert!(data.tools.is_empty());
+        assert!(tool_metrics_alerts(&data).is_empty());
+
+        // Called tools without any latency sample get an explicit caveat
+        // (older daemon build) instead of silently rendering zero latency.
+        let no_latency = vec![metrics_entry("whois", 10, 0, None)];
+        assert!(
+            live_tool_metrics_detail(&no_latency)
+                .is_some_and(|detail| detail.contains("no per-tool latency")),
+        );
+        assert!(live_tool_metrics_detail(&[]).is_none());
+        let sampled = vec![metrics_entry(
+            "whois",
+            10,
+            0,
+            Some(mcp_agent_mail_tools::LatencySnapshot {
+                avg_ms: 1.0,
+                min_ms: 1.0,
+                max_ms: 1.0,
+                p50_ms: 1.0,
+                p95_ms: 1.0,
+                p99_ms: 1.0,
+                is_slow: false,
+            }),
+        )];
+        assert!(live_tool_metrics_detail(&sampled).is_none());
+    }
+
+    #[test]
+    fn live_resource_read_parse_rejects_missing_or_malformed_content() {
+        let error = crate::parse_resource_read_json(
+            "resource://tooling/metrics",
+            &serde_json::json!({ "contents": [] }),
+        )
+        .expect_err("empty contents must fail");
+        assert!(
+            error.to_string().contains("no text content"),
+            "unexpected error: {error}"
+        );
+
+        let error = crate::parse_resource_read_json(
+            "resource://tooling/metrics",
+            &serde_json::json!({
+                "contents": [{ "uri": "resource://tooling/metrics", "text": "not json" }]
+            }),
+        )
+        .expect_err("non-JSON text must fail");
+        assert!(
+            error.to_string().contains("invalid JSON"),
+            "unexpected error: {error}"
+        );
+
+        let error =
+            parse_live_tool_metrics_payload(&serde_json::json!({ "health_level": "green" }))
+                .expect_err("payload without tools must fail");
+        assert!(
+            error.contains("no `tools` array"),
+            "unexpected error: {error}"
+        );
+
+        let error = parse_live_tool_metrics_payload(&serde_json::json!({
+            "tools": [{ "name": "whois" }]
+        }))
+        .expect_err("malformed entry must fail");
+        assert!(error.contains("malformed"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn resolve_tool_metrics_entries_falls_back_to_local_process_when_unreachable() {
+        let resolved = with_unreachable_server(|| {
+            let config = mcp_agent_mail_core::Config::from_env();
+            resolve_tool_metrics_entries(&config)
+        });
+
+        assert_eq!(resolved.source, "local-process");
+        let failure = resolved
+            .live_failure
+            .expect("fallback must record why the live read failed");
+        assert!(
+            !failure.reachable,
+            "connection refused must classify as unreachable: {failure:?}"
+        );
+        assert!(
+            failure.detail.contains("47351"),
+            "detail must name the probed endpoint: {}",
+            failure.detail
+        );
+        assert_eq!(resolved.detail.as_deref(), Some(failure.detail.as_str()));
+
+        let (summary, action) = tool_metrics_scope_alert(&failure);
+        assert!(
+            summary.contains("THIS CLI process only")
+                && summary.contains("no live server was reachable"),
+            "unexpected summary: {summary}"
+        );
+        assert_eq!(
+            action.as_deref(),
+            Some("am serve-http --no-tui  # then re-run am robot metrics")
+        );
+
+        // A reachable server that rejects the read (auth / old build) must not
+        // be misreported as "no server running".
+        let (summary, action) = tool_metrics_scope_alert(&LiveResourceFailure {
+            reachable: true,
+            detail: "http://127.0.0.1:8765/mcp/: unexpected HTTP status 401".to_string(),
+        });
+        assert!(
+            summary.contains("rejected the metrics read"),
+            "unexpected summary: {summary}"
+        );
+        assert!(
+            action
+                .as_deref()
+                .is_some_and(|action| action.contains("bearer token")),
+            "unexpected action: {action:?}"
+        );
+    }
+
+    #[test]
+    fn tool_error_anomalies_skip_empty_snapshot_and_flag_high_error_rates() {
+        // An empty local-process registry proves nothing: no card, no
+        // implied "no tool errors".
+        assert!(tool_error_anomalies(&[], TOOL_METRICS_SOURCE_LOCAL).is_empty());
+
+        let entries = vec![
+            metrics_entry("send_message", 40, 12, None), // 30% -> card
+            metrics_entry("whois", 5, 5, None),          // <10 calls -> ignored
+            metrics_entry("fetch_inbox", 40, 4, None),   // 10% -> below threshold
+        ];
+        let cards = tool_error_anomalies(&entries, TOOL_METRICS_SOURCE_LIVE);
+        assert_eq!(cards.len(), 1, "{cards:?}");
+        let card = &cards[0];
+        assert_eq!(card.category, "tool_errors");
+        assert_eq!(card.severity, "warn");
+        assert_eq!(card.headline, "send_message error rate 30.0%");
+        assert_eq!(
+            card.rationale,
+            "12/40 calls failed for send_message (source: live-server)"
+        );
+        assert_eq!(card.remediation, "am robot metrics");
     }
 
     // ---- K5 (br-bvq1x.11.5): pool/FD backpressure metrics ----
@@ -25290,14 +25618,6 @@ mod tests {
         let (_temp_dir, conn) = setup_robot_thread_message_test_db();
         let now_us = mcp_agent_mail_db::now_micros();
         conn.query_sync(
-            "CREATE TABLE file_reservation_releases (
-                reservation_id INTEGER PRIMARY KEY,
-                released_ts INTEGER NOT NULL
-            )",
-            &[],
-        )
-        .expect("create release ledger");
-        conn.query_sync(
             "INSERT INTO file_reservations
              (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
              VALUES
@@ -25423,14 +25743,9 @@ mod tests {
             )
             .expect("insert hot message");
             conn.query_sync(
-                "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-                 VALUES (?, ?, 2, 'to', NULL, NULL), (?, ?, 3, 'cc', NULL, NULL)",
-                &[
-                    DbValue::BigInt(10_000 + (offset * 2)),
-                    DbValue::BigInt(message_id),
-                    DbValue::BigInt(10_001 + (offset * 2)),
-                    DbValue::BigInt(message_id),
-                ],
+                "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+                 VALUES (?, 2, 'to', NULL, NULL), (?, 3, 'cc', NULL, NULL)",
+                &[DbValue::BigInt(message_id), DbValue::BigInt(message_id)],
             )
             .expect("insert hot recipients");
         }
@@ -25450,12 +25765,9 @@ mod tests {
             )
             .expect("insert cold message");
             conn.query_sync(
-                "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-                 VALUES (?, ?, 2, 'to', NULL, NULL)",
-                &[
-                    DbValue::BigInt(20_000 + offset),
-                    DbValue::BigInt(message_id),
-                ],
+                "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+                 VALUES (?, 2, 'to', NULL, NULL)",
+                &[DbValue::BigInt(message_id)],
             )
             .expect("insert cold recipient");
         }
@@ -25474,26 +25786,6 @@ mod tests {
             ],
         )
         .expect("insert active reservations");
-        conn.query_sync(
-            "CREATE TABLE products (
-                id INTEGER PRIMARY KEY,
-                product_uid TEXT NOT NULL,
-                name TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            )",
-            &[],
-        )
-        .expect("create products");
-        conn.query_sync(
-            "CREATE TABLE product_project_links (
-                id INTEGER PRIMARY KEY,
-                product_id INTEGER NOT NULL,
-                project_id INTEGER NOT NULL,
-                created_at INTEGER NOT NULL
-            )",
-            &[],
-        )
-        .expect("create product links");
         conn.query_sync(
             "INSERT INTO products (id, product_uid, name, created_at)
              VALUES (1, 'prod-mail', 'Agent Mail', ?)",
@@ -25606,8 +25898,8 @@ mod tests {
         )
         .expect("insert outbox message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (121, 121, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (121, 2, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert outbox recipient");
@@ -25629,8 +25921,8 @@ mod tests {
         )
         .expect("insert outbox message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (124, 124, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (124, 2, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert outbox recipient");
@@ -25709,8 +26001,8 @@ mod tests {
         )
         .expect("insert message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (3, 101, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (101, 2, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert recipient");
@@ -25729,10 +26021,10 @@ mod tests {
     fn test_load_recipient_display_names_labels_non_to_recipients_when_primary_is_absent() {
         let (_temp_dir, conn) = setup_robot_thread_message_test_db();
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
              VALUES
-                (30, 101, 3, 'cc', NULL, NULL),
-                (31, 101, 1, 'bcc', NULL, NULL)",
+                (101, 3, 'cc', NULL, NULL),
+                (101, 1, 'bcc', NULL, NULL)",
             &[],
         )
         .expect("insert recipients");
@@ -25750,36 +26042,16 @@ mod tests {
     fn test_load_recipient_display_names_supports_real_schema_without_recipient_id_column() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_recipients_real_schema.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        // The production `message_recipients` has no `id` column and is keyed
+        // by (message_id, agent_id); use the real schema outright.
+        let conn = open_robot_test_db_with_real_schema(&db_path);
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
         conn.query_sync(
-            "CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                name TEXT NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create agents");
-        conn.query_sync(
-            "CREATE TABLE message_recipients (
-                message_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                read_ts INTEGER,
-                ack_ts INTEGER,
-                PRIMARY KEY (message_id, agent_id)
-            )",
-            &empty,
-        )
-        .expect("create recipients");
-        conn.query_sync(
-            "INSERT INTO agents (id, project_id, name) VALUES
-                (1, 1, 'Alice'),
-                (2, 1, 'Bob'),
-                (3, 1, 'Carol')",
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES
+                (1, 1, 'Alice', '', '', 0, 0),
+                (2, 1, 'Bob', '', '', 0, 0),
+                (3, 1, 'Carol', '', '', 0, 0)",
             &empty,
         )
         .expect("insert agents");
@@ -25838,15 +26110,28 @@ mod tests {
             .expect("open sqlite db");
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
+        // Deliberately bespoke legacy DDL: this test pins a `message_recipients`
+        // keyed by (message_id, agent_id, kind) with no `id` column. Carried
+        // forward to schema v28 (`retired_at`, `agent_deregistrations`,
+        // `messages.topic`) so production SELECTs resolve as on a real mailbox.
         conn.query_sync(
             "CREATE TABLE agents (
                 id INTEGER PRIMARY KEY,
                 project_id INTEGER NOT NULL,
-                name TEXT NOT NULL
+                name TEXT NOT NULL,
+                retired_at INTEGER
             )",
             &empty,
         )
         .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE agent_deregistrations (
+                agent_id INTEGER PRIMARY KEY REFERENCES agents(id),
+                deregistered_at INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agent deregistrations");
         conn.query_sync(
             "CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
@@ -25854,6 +26139,7 @@ mod tests {
                 sender_id INTEGER NOT NULL,
                 subject TEXT NOT NULL,
                 thread_id TEXT,
+                topic TEXT COLLATE NOCASE,
                 importance TEXT NOT NULL,
                 ack_required INTEGER NOT NULL,
                 created_ts INTEGER NOT NULL,
@@ -25921,12 +26207,12 @@ mod tests {
         )
         .expect("insert messages");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
              VALUES
-                (30, 102, 2, 'to', NULL, NULL),
-                (31, 102, 3, 'cc', NULL, NULL),
-                (32, 102, 1, 'bcc', NULL, NULL),
-                (33, 103, 3, 'cc', NULL, NULL)",
+                (102, 2, 'to', NULL, NULL),
+                (102, 3, 'cc', NULL, NULL),
+                (102, 1, 'bcc', NULL, NULL),
+                (103, 3, 'cc', NULL, NULL)",
             &[],
         )
         .expect("insert recipients");
@@ -25964,8 +26250,8 @@ mod tests {
         )
         .expect("insert message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (106, 106, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (106, 2, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert recipient");
@@ -26008,8 +26294,8 @@ mod tests {
         )
         .expect("insert message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (4, 102, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (102, 2, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert recipient");
@@ -26061,10 +26347,10 @@ mod tests {
         .expect("insert message");
         // Both recipients have ack_ts set
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
              VALUES
-                (5, 103, 2, 'to', NULL, 111111),
-                (6, 103, 3, 'to', NULL, 222222)",
+                (103, 2, 'to', NULL, 111111),
+                (103, 3, 'to', NULL, 222222)",
             &[],
         )
         .expect("insert recipients");
@@ -26098,10 +26384,10 @@ mod tests {
         .expect("insert message");
         // Both recipients have ack_ts = NULL
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
              VALUES
-                (7, 104, 2, 'to', NULL, NULL),
-                (8, 104, 3, 'to', NULL, NULL)",
+                (104, 2, 'to', NULL, NULL),
+                (104, 3, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert recipients");
@@ -26134,8 +26420,8 @@ mod tests {
         )
         .expect("insert message");
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-             VALUES (9, 105, 2, 'to', NULL, NULL)",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (105, 2, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert recipient");
@@ -26187,10 +26473,9 @@ mod tests {
             )
             .expect("insert message");
             conn.query_sync(
-                "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-                 VALUES (?, ?, ?, 'to', NULL, NULL)",
+                "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+                 VALUES (?, ?, 'to', NULL, NULL)",
                 &[
-                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
                     mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
                     mcp_agent_mail_db::sqlmodel_core::Value::BigInt(2),
                 ],
@@ -26238,12 +26523,9 @@ mod tests {
             )
             .expect("insert long-thread message");
             conn.query_sync(
-                "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
-                 VALUES (?, ?, 2, 'to', NULL, NULL)",
-                &[
-                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
-                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
-                ],
+                "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+                 VALUES (?, 2, 'to', NULL, NULL)",
+                &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id)],
             )
             .expect("insert long-thread recipient");
         }
@@ -26306,10 +26588,10 @@ mod tests {
             .expect("insert message");
         }
         conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
              VALUES
-                (300, 300, 2, 'to', NULL, NULL),
-                (301, 301, 1, 'to', NULL, NULL)",
+                (300, 2, 'to', NULL, NULL),
+                (301, 1, 'to', NULL, NULL)",
             &[],
         )
         .expect("insert recipients");

@@ -270,6 +270,11 @@ pub(crate) fn wait_for_cross_process_release(path: &std::path::Path) -> bool {
 enum DoctorDbReadSourceKind {
     /// A live FrankenSQLite family exported through guarded `VACUUM INTO`.
     LiveLogicalSnapshot,
+    /// A live Franken-admitted family whose logical export failed, staged as
+    /// a private byte-for-byte copy (main file plus recovery sidecars) by the
+    /// health-probe mechanism. Physical checks on the copy are authoritative
+    /// for the copied bytes, so the copy owns its own integrity verdict.
+    StagedFamilyCopy,
     /// A caller-designated engine-exclusive/offline SQLite family.
     ExplicitOffline,
     /// Source selection failed before a canonical connection was available.
@@ -286,15 +291,17 @@ pub(crate) enum DoctorIntegrityProbe {
 /// inode canonical SQLite is allowed to open.
 ///
 /// Live FrankenSQLite mailboxes are materialized to one retained private
-/// logical snapshot before any fixer detector runs. Explicitly offline
-/// families use the guarded WAL-aware canonical opener directly. The
-/// connection and any backing tempdir live for this value's entire lifetime,
-/// so aggregate detection observes one coherent source rather than reopening
-/// the live primary once per failure mode.
+/// logical snapshot (or, when that export fails, one retained staged family
+/// copy) before any fixer detector runs. Explicitly offline families use the
+/// guarded WAL-aware canonical opener directly. The connection and any
+/// backing tempdir live for this value's entire lifetime, so aggregate
+/// detection observes one coherent source rather than reopening the live
+/// primary once per failure mode.
 pub(crate) struct DoctorDbReadCandidate {
     target_path: std::path::PathBuf,
     connection: Option<mcp_agent_mail_db::CanonicalDbConn>,
     _retained_snapshot: Option<crate::CanonicalSnapshotSource>,
+    _retained_staged_family: Option<mcp_agent_mail_db::pool::SqliteHealthProbeSource>,
     source_kind: DoctorDbReadSourceKind,
     open_error: Option<String>,
     physical_corruption_error: Option<String>,
@@ -306,6 +313,7 @@ impl DoctorDbReadCandidate {
             target_path: target_path.to_path_buf(),
             connection: None,
             _retained_snapshot: None,
+            _retained_staged_family: None,
             source_kind: DoctorDbReadSourceKind::Unavailable,
             open_error: Some(error.into()),
             physical_corruption_error: None,
@@ -321,6 +329,7 @@ impl DoctorDbReadCandidate {
             target_path: target_path.to_path_buf(),
             connection: None,
             _retained_snapshot: None,
+            _retained_staged_family: None,
             source_kind: DoctorDbReadSourceKind::Unavailable,
             open_error: Some(error.into()),
             physical_corruption_error: Some(physical_corruption_error),
@@ -340,6 +349,9 @@ impl DoctorDbReadCandidate {
                     crate::DoctorCanonicalDiagnosticSourceKind::LiveLogicalSnapshot => {
                         DoctorDbReadSourceKind::LiveLogicalSnapshot
                     }
+                    crate::DoctorCanonicalDiagnosticSourceKind::StagedFamilyCopy => {
+                        DoctorDbReadSourceKind::StagedFamilyCopy
+                    }
                     crate::DoctorCanonicalDiagnosticSourceKind::OfflineCanonical => {
                         DoctorDbReadSourceKind::ExplicitOffline
                     }
@@ -354,6 +366,7 @@ impl DoctorDbReadCandidate {
                     target_path: target_path.to_path_buf(),
                     connection: Some(opened.conn),
                     _retained_snapshot: opened._snapshot_source,
+                    _retained_staged_family: opened._staged_family,
                     source_kind,
                     open_error: None,
                     physical_corruption_error: None,
@@ -398,6 +411,7 @@ impl DoctorDbReadCandidate {
                 target_path: target_path.to_path_buf(),
                 connection: Some(connection),
                 _retained_snapshot: None,
+                _retained_staged_family: None,
                 source_kind: DoctorDbReadSourceKind::ExplicitOffline,
                 open_error: None,
                 physical_corruption_error: None,
@@ -417,7 +431,8 @@ impl DoctorDbReadCandidate {
     /// Run the integrity probe against the physical source that owns the
     /// verdict. A VACUUM snapshot is correct for logical rows but can rebuild
     /// a damaged index and therefore cannot prove a live primary's b-tree is
-    /// healthy.
+    /// healthy. A staged family copy carries the live bytes verbatim, so its
+    /// own connection answers, like an explicitly offline family.
     pub(crate) fn integrity_check_one(&self) -> DoctorIntegrityProbe {
         match self.source_kind {
             DoctorDbReadSourceKind::LiveLogicalSnapshot => {
@@ -442,7 +457,7 @@ impl DoctorDbReadCandidate {
                     Err(error) => classify_integrity_probe_error(error.to_string()),
                 }
             }
-            DoctorDbReadSourceKind::ExplicitOffline => {
+            DoctorDbReadSourceKind::ExplicitOffline | DoctorDbReadSourceKind::StagedFamilyCopy => {
                 let Some(conn) = self.connection() else {
                     return DoctorIntegrityProbe::Unavailable;
                 };
@@ -465,13 +480,20 @@ impl DoctorDbReadCandidate {
     }
 
     /// Re-observe the decisive database invariants immediately before a
-    /// mutating fixer acts. Live sources must remain live; explicit-offline
-    /// sources must remain accepted by the offline guard.
+    /// mutating fixer acts. Live sources must remain live (a logical
+    /// snapshot or a staged family copy are both Franken-admitted live
+    /// sources); explicit-offline sources must remain accepted by the offline
+    /// guard.
     pub(crate) fn refresh(&self, operation: &str) -> Self {
         match self.source_kind {
-            DoctorDbReadSourceKind::LiveLogicalSnapshot => {
+            DoctorDbReadSourceKind::LiveLogicalSnapshot
+            | DoctorDbReadSourceKind::StagedFamilyCopy => {
                 let refreshed = Self::open_live_or_explicit_offline(&self.target_path, operation);
-                if refreshed.source_kind == DoctorDbReadSourceKind::LiveLogicalSnapshot {
+                if matches!(
+                    refreshed.source_kind,
+                    DoctorDbReadSourceKind::LiveLogicalSnapshot
+                        | DoctorDbReadSourceKind::StagedFamilyCopy
+                ) {
                     refreshed
                 } else {
                     Self::unavailable(

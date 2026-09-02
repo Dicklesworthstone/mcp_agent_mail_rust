@@ -7,8 +7,9 @@
 //! - Project, mail, and product helpers
 //! - Build slot utilities
 //!
-//! Command execution is stubbed while lower layers are implemented, but
-//! argument parsing and validation match the legacy CLI.
+//! Every command is fully implemented against the shared db/storage/tools
+//! layers; argument parsing and validation match the legacy CLI where a
+//! legacy command exists.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::too_many_arguments)]
@@ -2773,6 +2774,12 @@ pub enum DoctorCommand {
         /// request, but accepted for symmetry with other commands.
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
+        /// Accepted for symmetry with `check --json` / `locks --json`; the
+        /// output is JSON regardless. Agent handbooks and AGENTS.md cite
+        /// `am doctor capabilities --json`, so the flag must not be a usage
+        /// error.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Print the paste-ready agent handbook (Markdown).
@@ -2849,6 +2856,10 @@ pub enum DoctorCommand {
         /// Budget < 200ms total. For pre-commit hooks.
         #[arg(long)]
         quick: bool,
+        /// Accepted for symmetry with the other doctor verbs; triage output
+        /// is JSON regardless.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Expand a single finding by id with full evidence + remediation.
@@ -9986,7 +9997,7 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             format,
             json,
         ),
-        DoctorCommand::Capabilities { format } => doctor::handle_capabilities(format),
+        DoctorCommand::Capabilities { format, json: _ } => doctor::handle_capabilities(format),
         DoctorCommand::RobotDocs => doctor::handle_robot_docs(),
         DoctorCommand::Undo {
             run_id,
@@ -10006,7 +10017,7 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             doctor::handle_health(&target)
         }
         DoctorCommand::Locks { format, json } => handle_doctor_locks(format, json),
-        DoctorCommand::Triage { quick } => {
+        DoctorCommand::Triage { quick, json: _ } => {
             let target = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             doctor::handle_triage(&target, quick)
         }
@@ -12145,12 +12156,18 @@ fn doctor_locks_owner_state(
         );
     }
 
+    // Mirror `pool::classify_mailbox_ownership`: a transient read-only CLI
+    // reader (`am inbox`, `am robot handoff`) that merely has storage.sqlite3
+    // open is reported in `ownership.readers`, never treated as a wedged
+    // owner, so `am doctor locks` and `am doctor drain` agree with the
+    // ownership disposition instead of blocking supervised repair.
     let live_without_activity_locks = processes
         .iter()
         .filter(|process| {
             process.holds_database_file
                 && !process.holds_storage_root_lock
                 && !process.holds_sqlite_lock
+                && !ownership.readers.contains(&process.pid)
         })
         .map(|process| process.pid)
         .collect::<Vec<_>>();
@@ -25064,6 +25081,9 @@ struct DoctorReadOnlyOpenContext {
     // Retain a private logical snapshot for as long as `conn` can read it.
     // `None` means an explicitly offline canonical or in-memory source.
     _snapshot_source: Option<CanonicalSnapshotSource>,
+    // Retain a staged byte-for-byte family copy for as long as `conn` can
+    // read it (`DoctorCanonicalDiagnosticSourceKind::StagedFamilyCopy`).
+    _staged_family: Option<mcp_agent_mail_db::pool::SqliteHealthProbeSource>,
     source_kind: DoctorCanonicalDiagnosticSourceKind,
     configured_path: String,
     opened_path: String,
@@ -25207,6 +25227,7 @@ fn open_db_for_doctor_check_read_only_with_context_inner(
         return Ok(DoctorReadOnlyOpenContext {
             conn,
             _snapshot_source: None,
+            _staged_family: None,
             source_kind: DoctorCanonicalDiagnosticSourceKind::InMemory,
             configured_path: path.clone(),
             opened_path: path,
@@ -25251,6 +25272,7 @@ fn open_db_for_doctor_check_read_only_with_context_inner(
             Ok(_) => Ok(DoctorReadOnlyOpenContext {
                 conn: opened.conn,
                 _snapshot_source: opened._snapshot_source,
+                _staged_family: opened._staged_family,
                 source_kind: opened.kind,
                 configured_path: path.clone(),
                 opened_path: candidate_path.clone(),
@@ -25282,6 +25304,7 @@ fn open_db_for_doctor_check_read_only_with_context_inner(
                     return Ok(DoctorReadOnlyOpenContext {
                         conn: fallback.conn,
                         _snapshot_source: fallback._snapshot_source,
+                        _staged_family: fallback._staged_family,
                         source_kind: fallback.kind,
                         configured_path: path.clone(),
                         opened_path: fallback_path.clone(),
@@ -25319,6 +25342,7 @@ fn open_db_for_doctor_check_read_only_with_context_inner(
                 return Ok(DoctorReadOnlyOpenContext {
                     conn: fallback.conn,
                     _snapshot_source: fallback._snapshot_source,
+                    _staged_family: fallback._staged_family,
                     source_kind: fallback.kind,
                     configured_path: path.clone(),
                     opened_path: fallback_path.clone(),
@@ -26315,14 +26339,26 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoctorCanonicalDiagnosticSourceKind {
     InMemory,
+    /// A private logical rebuild (`VACUUM INTO`) exported through a guarded
+    /// read-only FrankenSQLite connection.
     LiveLogicalSnapshot,
+    /// A private byte-for-byte copy of a Franken-admitted live family (main
+    /// file plus every recovery sidecar, minus the FrankenSQLite namespace
+    /// sidecars) staged by the same mechanism `am robot health` uses, opened
+    /// by canonical SQLite on the copy only. Selected when the logical export
+    /// fails on a family the guarded offline opener must refuse. Physical
+    /// checks on it are authoritative for the bytes that were copied.
+    StagedFamilyCopy,
+    /// Canonical SQLite's true read-only flags on a sidecarless
+    /// engine-exclusive or offline database.
     OfflineCanonical,
 }
 
 struct DoctorCanonicalDiagnosticOpen {
-    // Drop the connection before the retained tempdir.
+    // Drop the connection before the retained tempdir(s).
     conn: mcp_agent_mail_db::CanonicalDbConn,
     _snapshot_source: Option<CanonicalSnapshotSource>,
+    _staged_family: Option<mcp_agent_mail_db::pool::SqliteHealthProbeSource>,
     kind: DoctorCanonicalDiagnosticSourceKind,
 }
 
@@ -26384,13 +26420,92 @@ fn doctor_open_private_immutable_canonical_snapshot(
     })
 }
 
+/// Open canonical SQLite on a private, source-byte-neutral copy of the live
+/// family — the same staging `pool::sqlite_file_is_healthy` (`am robot
+/// health`, and the doctor's own file-sanity gate) already uses.
+///
+/// The copy carries `-wal`/`-shm`/`-wal-cert*` but not the namespace
+/// sidecars and is opened read-write on the private inode so SQLite can
+/// recover the WAL frames into a fresh `-shm` inside the tempdir
+/// (`immutable=1` would hide those frames — see the revert of the
+/// sidecar-free `immutable=1` fallback). Canonical SQLite never opens the
+/// live main inode, so no live FrankenSQLite `fcntl` lock can be disturbed,
+/// and the cross-engine refusal for Franken-admitted families stays intact.
+fn doctor_open_staged_family_copy_canonical(
+    db_path: &Path,
+    operation: &str,
+) -> CliResult<DoctorCanonicalDiagnosticOpen> {
+    let staged = mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(db_path)
+        .map_err(|error| {
+            CliError::Other(format!(
+                "{operation} staged family copy of {} failed: {error}",
+                db_path.display()
+            ))
+        })?
+        .ok_or_else(|| {
+            CliError::Other(format!(
+                "{operation} staged family copy is unavailable for {}: source is not a regular SQLite family",
+                db_path.display()
+            ))
+        })?;
+    let staged_path = staged.path().to_str().ok_or_else(|| {
+        CliError::Other(format!(
+            "{operation} refuses non-UTF-8 staged family copy path {}",
+            staged.path().display()
+        ))
+    })?;
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(staged_path).map_err(|error| {
+        CliError::Other(format!(
+            "cannot open staged family copy of {} for canonical {operation}: {error}",
+            db_path.display()
+        ))
+    })?;
+    // A canonical open is lazy: force page 1 and the schema to be read now so
+    // an unreadable copy (truncated header, garbage file) fails here as an
+    // open failure instead of surfacing later as a table-probe error.
+    conn.query_sync("SELECT COUNT(*) AS schema_objects FROM sqlite_master", &[])
+        .map_err(|error| {
+            CliError::Other(format!(
+                "staged family copy of {} is not readable by canonical {operation}: {error}",
+                db_path.display()
+            ))
+        })?;
+    conn.execute_raw("PRAGMA query_only = ON;").map_err(|error| {
+        CliError::Other(format!(
+            "cannot enforce query-only mode on the staged family copy of {} for canonical {operation}: {error}",
+            db_path.display()
+        ))
+    })?;
+    Ok(DoctorCanonicalDiagnosticOpen {
+        conn,
+        _snapshot_source: None,
+        _staged_family: Some(staged),
+        kind: DoctorCanonicalDiagnosticSourceKind::StagedFamilyCopy,
+    })
+}
+
+/// Whether a SQLite family carries FrankenSQLite namespace authority
+/// (`-fsqlite-ns-gate` / `-fsqlite-ns-use`): the exact condition under which
+/// the guarded offline canonical opener refuses a cross-engine open.
+fn sqlite_family_is_franken_admitted(db_path: &Path) -> bool {
+    ["-fsqlite-ns-gate", "-fsqlite-ns-use"]
+        .into_iter()
+        .any(|suffix| std::fs::symlink_metadata(sqlite_sidecar_path(db_path, suffix)).is_ok())
+}
+
 /// Select a lock-safe source for a canonical doctor diagnostic.
 ///
 /// A Franken-admitted mailbox is first exported through a guarded read-only
 /// FrankenSQLite connection and canonical SQLite sees only that private inode.
-/// A sidecarless engine-exclusive/offline database may instead use the guarded
-/// canonical read-only opener. Partial namespace authority, hard links, and
-/// ambiguous live families fail closed in both branches.
+/// When that logical export fails on a Franken-admitted family (a hot live
+/// WAL family with a live owner, where the guarded offline canonical opener
+/// must refuse a cross-engine open), the family is staged as a private
+/// byte-for-byte copy and canonical SQLite opens that copy — the exact path
+/// `am robot health` trusts. A sidecarless engine-exclusive/offline database
+/// keeps using the guarded canonical read-only opener as its authority.
+/// Partial namespace authority, hard links, and ambiguous live families fail
+/// closed in the engine-facing branches; the staged copy never runs an engine
+/// against the live inode at all.
 fn doctor_open_canonical_source_for_diagnostic(
     db_path: &Path,
     operation: &str,
@@ -26421,10 +26536,20 @@ fn doctor_open_canonical_source_for_diagnostic(
             return Ok(DoctorCanonicalDiagnosticOpen {
                 conn,
                 _snapshot_source: Some(snapshot_source),
+                _staged_family: None,
                 kind: DoctorCanonicalDiagnosticSourceKind::LiveLogicalSnapshot,
             });
         }
         Err(error) => error,
+    };
+
+    let staged_error = if sqlite_family_is_franken_admitted(db_path) {
+        match doctor_open_staged_family_copy_canonical(db_path, operation) {
+            Ok(opened) => return Ok(opened),
+            Err(error) => error.to_string(),
+        }
+    } else {
+        "skipped because the family carries no FrankenSQLite namespace sidecars, so the guarded offline canonical opener is its authority".to_string()
     };
 
     match mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(db_path, operation)
@@ -26432,15 +26557,20 @@ fn doctor_open_canonical_source_for_diagnostic(
         Ok(conn) => Ok(DoctorCanonicalDiagnosticOpen {
             conn,
             _snapshot_source: None,
+            _staged_family: None,
             kind: DoctorCanonicalDiagnosticSourceKind::OfflineCanonical,
         }),
         Err(offline_error) => {
             let offline_authority_error = offline_error.to_string();
+            // Each branch's real cause is bounded separately so none of them
+            // can crowd the others out of the operator-facing detail.
             Err(DoctorCanonicalDiagnosticOpenFailure {
                 detail: format!(
-                    "cannot open {} for canonical {operation}: guarded live snapshot failed: {}; guarded offline canonical open failed: {offline_authority_error}",
+                    "cannot open {} for canonical {operation}: guarded live snapshot failed: {}; staged family copy failed: {}; guarded offline canonical open failed: {}",
                     db_path.display(),
-                    truncate_doctor_command(&live_error.to_string())
+                    truncate_doctor_open_source_clause(&live_error.to_string()),
+                    truncate_doctor_open_source_clause(&staged_error),
+                    truncate_doctor_open_source_clause(&offline_authority_error)
                 ),
                 offline_authority_error: Some(offline_authority_error),
             })
@@ -28565,6 +28695,33 @@ fn truncate_doctor_command(raw: &str) -> String {
     truncate_str(&collapse_whitespace(raw.trim()), 160)
 }
 
+/// Bound for one branch clause of a composite canonical-source open failure
+/// (`guarded live snapshot failed: ...; staged family copy failed: ...;
+/// guarded offline canonical open failed: ...`), so every branch's real cause
+/// survives into the reported detail.
+const DOCTOR_OPEN_SOURCE_CLAUSE_LIMIT: usize = 200;
+
+/// Bound for the whole `Database open probe failed: ...` detail: the
+/// path/operation prefix plus three separately bounded branch clauses fit
+/// under it, so a by-construction-bounded composite is never re-truncated
+/// down to a single unreadable clause, while a pathological message is still
+/// capped.
+const DOCTOR_OPEN_PROBE_DETAIL_LIMIT: usize = 1024;
+
+fn truncate_doctor_open_source_clause(raw: &str) -> String {
+    truncate_str(
+        &collapse_whitespace(raw.trim()),
+        DOCTOR_OPEN_SOURCE_CLAUSE_LIMIT,
+    )
+}
+
+fn truncate_doctor_open_probe_detail(raw: &str) -> String {
+    truncate_str(
+        &collapse_whitespace(raw.trim()),
+        DOCTOR_OPEN_PROBE_DETAIL_LIMIT,
+    )
+}
+
 fn doctor_check_value_str<'a>(check: &'a serde_json::Value, field: &str) -> Option<&'a str> {
     check.get(field).and_then(|value| value.as_str())
 }
@@ -30622,8 +30779,10 @@ fn doctor_truncated_wal_sidecar_detail(sqlite_path: &Path) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DoctorCanonicalCrossCheck {
     /// Every applicable canonical probe passed on an explicitly offline
-    /// canonical source, so that file is proven healthy. A clean private
-    /// logical rebuild is never promoted to this variant.
+    /// canonical source or on a staged byte-for-byte copy of the live family
+    /// (the `am robot health` staging), so that file is proven healthy. A
+    /// clean private logical rebuild (`VACUUM INTO`) is never promoted to
+    /// this variant.
     Healthy,
     /// A canonical probe reported damage (integrity/quick-check rows or a
     /// foreign-key violation). On a private logical image this corroborates the
@@ -31180,16 +31339,20 @@ fn doctor_database_fix_strategy_read_only_probes(
     let opened = match open_db_for_doctor_check_read_only_with_context(database_url) {
         Ok(opened) => opened,
         Err(error) => {
+            // The open error is a composite of every canonical-source branch
+            // (`guarded live snapshot failed: ...; staged family copy failed:
+            // ...; guarded offline canonical open failed: ...`); keep all of
+            // them readable instead of cutting the detail to one clause.
             return Ok(if archive_reconstruct_available {
                 DoctorDatabaseFixStrategy::Reconstruct(format!(
                     "Database open probe failed: {}; archive recovery is available under {}",
-                    truncate_doctor_command(&error.to_string()),
+                    truncate_doctor_open_probe_detail(&error.to_string()),
                     archive_root.display()
                 ))
             } else {
                 DoctorDatabaseFixStrategy::Repair(format!(
                     "Database open probe failed: {}",
-                    truncate_doctor_command(&error.to_string())
+                    truncate_doctor_open_probe_detail(&error.to_string())
                 ))
             });
         }
@@ -41022,6 +41185,7 @@ mod mail_server_cli_bridge_tests {
                 sqlite_lock_path: format!("{}.activity.lock", sqlite_path.display()),
                 processes: Vec::new(),
                 competing_pids: vec![42],
+                readers: Vec::new(),
                 supervised_restart_required: false,
                 detail: "another Agent Mail server owns the mailbox database".to_string(),
             },
@@ -42294,7 +42458,10 @@ mod tests {
             json: false,
         };
         let doctor_capabilities = Commands::Doctor {
-            action: DoctorCommand::Capabilities { format: None },
+            action: DoctorCommand::Capabilities {
+                format: None,
+                json: false,
+            },
         };
         let doctor_robot_docs = Commands::Doctor {
             action: DoctorCommand::RobotDocs,
@@ -50152,12 +50319,12 @@ http_headers = { Authorization = "Bearer secret" }
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("custom-migrate.db");
         let url = format!("sqlite:///{}", db_path.display());
-        let xdg_data_home = dir.path().join("xdg");
-        let xdg_data_home_text = xdg_data_home.to_string_lossy().into_owned();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("XDG_DATA_HOME", xdg_data_home_text.as_str())],
-            || {
+        // br-99aih: redirect the *default* storage root into a private tempdir
+        // (HOME + XDG_DATA_HOME); an XDG-only override still resolved to the
+        // operator's live archive on any host that had run the daemon.
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(
+            |_isolated_default_root| {
                 let storage_root = mcp_agent_mail_core::config::default_storage_root_path();
                 let project_dir = storage_root.join("projects").join("demo-project");
                 let agent_dir = project_dir.join("agents").join("BlueLake");
@@ -51363,12 +51530,12 @@ http_headers = { Authorization = "Bearer secret" }
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("custom.sqlite3");
-        let xdg_data_home = dir.path().join("xdg");
-        let xdg_data_home_text = xdg_data_home.to_string_lossy().into_owned();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("XDG_DATA_HOME", xdg_data_home_text.as_str())],
-            || {
+        // br-99aih: redirect the *default* storage root into a private tempdir
+        // (HOME + XDG_DATA_HOME); an XDG-only override still resolved to the
+        // operator's live archive on any host that had run the daemon.
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(
+            |_isolated_default_root| {
                 let storage_root = mcp_agent_mail_core::config::default_storage_root_path();
                 assert!(
                     mcp_agent_mail_core::config::is_default_storage_root(&storage_root),
@@ -53640,6 +53807,7 @@ http_headers = { Authorization = "Bearer secret" }
             sqlite_lock_path: "/tmp/storage/storage.sqlite3.activity.lock".to_string(),
             processes: Vec::new(),
             competing_pids,
+            readers: Vec::new(),
             supervised_restart_required: false,
             detail: "test ownership".to_string(),
         }
@@ -53786,6 +53954,50 @@ http_headers = { Authorization = "Bearer secret" }
             state.safe_next_command,
             "ps -p 17,23 -o pid,ppid,stat,lstart,cmd"
         );
+    }
+
+    #[test]
+    fn doctor_locks_owner_state_ignores_read_only_cli_reader() {
+        // Server 23 holds the storage-root activity lock exclusively; PID 17
+        // is a transient `am robot handoff` that only has storage.sqlite3
+        // open. `pool::classify_mailbox_ownership` lists 17 as a reader, not
+        // an owner, and the doctor mirror must agree: a single Live owner,
+        // never Wedged or UnsafeToTouch.
+        let mut ownership = doctor_locks_test_ownership(
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::ActiveOtherOwner,
+            vec![23],
+        );
+        ownership.readers = vec![17];
+        let storage_lock = doctor_locks_test_lock("storage_root", true, vec![23]);
+        let sqlite_lock = doctor_locks_test_lock("sqlite", false, Vec::new());
+        let mut reader = doctor_locks_test_process(17, false, false, true);
+        reader.command = Some("am robot handoff".to_string());
+        let processes = vec![reader, doctor_locks_test_process(23, true, false, true)];
+
+        let state = doctor_locks_owner_state(
+            &ownership,
+            &storage_lock,
+            &sqlite_lock,
+            &processes,
+            &[],
+            &DoctorReclaimContext::inert(),
+        );
+        let action = doctor_locks_recommended_next_action(&state, &[]);
+
+        assert_eq!(state.class, DoctorLockOwnerClass::Live);
+        assert_eq!(state.safe_next_command, "am doctor health");
+        assert!(
+            state.reason.contains("single live Agent Mail owner"),
+            "{}",
+            state.reason
+        );
+        assert!(!action.contains("kill"));
+        // `am doctor drain` derives its verdict from the same class: a live
+        // owner still blocks a plain mutating repair, but the mailbox is not
+        // "unsafe to touch" and the supervised drain protocol applies.
+        assert!(doctor_mutation_blocked_by_owner(state.class, false));
+        assert_ne!(state.class, DoctorLockOwnerClass::UnsafeToTouch);
+        assert_ne!(state.class, DoctorLockOwnerClass::Wedged);
     }
 
     // ─── br-z41ij: reclaimable-owner classification + supervised takeover ────
@@ -54396,6 +54608,7 @@ http_headers = { Authorization = "Bearer secret" }
             executable_deleted: false,
             holds_storage_root_lock: false,
             holds_sqlite_lock: false,
+            holds_exclusive_lock: false,
             holds_database_file: true,
         }];
         let storage_root_lock = DoctorLockPathReport {
@@ -54487,6 +54700,7 @@ http_headers = { Authorization = "Bearer secret" }
             executable_deleted: false,
             holds_storage_root_lock: true,
             holds_sqlite_lock: true,
+            holds_exclusive_lock: true,
             holds_database_file: true,
         }];
         let storage_root_lock = DoctorLockPathReport {
@@ -55887,8 +56101,8 @@ startup_timeout_sec = 42
             db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(&db_path),
             consecutive_failures: 4,
             last_failure_unix: 1_787_807_828,
-            last_failure_reason:
-                "reservations produced 220 rows but only 215 unique stable keys".to_string(),
+            last_failure_reason: "reservations produced 220 rows but only 215 unique stable keys"
+                .to_string(),
             tripped: false,
         };
         mcp_agent_mail_db::recovery_breaker::store(&db_path, &state).expect("store breaker");
@@ -56147,6 +56361,356 @@ startup_timeout_sec = 42
             shm_path.exists(),
             "read-only strategy must not quarantine SHM"
         );
+    }
+
+    /// Production shape of a healthy live mailbox that used to draw a false
+    /// `Database open probe failed` reconstruct verdict: a FrankenSQLite
+    /// writer keeps the family admitted (both `-fsqlite-ns-*` sidecars exist),
+    /// `-wal` carries uncheckpointed frames, `-wal-cert` is materialized, and
+    /// `-shm` is absent or empty. The returned writer must stay alive for the
+    /// duration of the probe under test.
+    #[cfg(unix)]
+    fn seed_hot_franken_wal_family_with_live_owner(
+        db_path: &Path,
+        slug: &str,
+    ) -> mcp_agent_mail_db::DbConn {
+        seed_project_only_db(db_path, slug, &format!("/{slug}"));
+        {
+            let settle =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string())
+                    .expect("open seeded db to settle its journal mode");
+            settle
+                .execute_raw("PRAGMA journal_mode = DELETE;")
+                .expect("settle seeded db into rollback-journal mode");
+        }
+        let writer = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open FrankenSQLite live writer");
+        writer
+            .execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("switch the live writer to WAL");
+        writer
+            .execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable automatic checkpoints on the live writer");
+        writer
+            .execute_raw(&format!(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (2, '{slug}-live', '/{slug}-live', 0);"
+            ))
+            .expect("commit an uncheckpointed WAL frame");
+
+        let wal_len = std::fs::metadata(sqlite_sidecar_path(db_path, "-wal"))
+            .map(|meta| meta.len())
+            .expect("live WAL must exist");
+        assert!(
+            wal_len > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES,
+            "fixture must retain committed WAL frames (wal len {wal_len})"
+        );
+        assert!(
+            std::fs::metadata(sqlite_sidecar_path(db_path, "-wal-cert"))
+                .is_ok_and(|meta| meta.len() > 0),
+            "fixture must carry a materialized WAL certificate"
+        );
+        // Whether the live engine leaves `-shm` absent, empty, or populated
+        // is an engine-version detail (fsqlite 0.3.11 left it empty on the
+        // reference host; 0.3.14 writes a 32 KiB index). The probe under test
+        // must accept every shape a live Franken writer produces, so the
+        // fixture deliberately does not pin the `-shm` size.
+        assert!(sqlite_sidecar_path(db_path, "-fsqlite-ns-gate").is_file());
+        assert!(sqlite_sidecar_path(db_path, "-fsqlite-ns-use").is_file());
+        writer
+    }
+
+    /// An authoritative archive that mirrors the seeded project, so the archive
+    /// itself can never justify a reconstruct: any Reconstruct verdict in these
+    /// tests comes from the database probes, and a passing probe yields `None`.
+    #[cfg(unix)]
+    fn seed_matching_archive_project(storage_root: &Path, slug: &str) {
+        let project_dir = storage_root.join("projects").join(slug);
+        std::fs::create_dir_all(project_dir.join("agents")).expect("create archive agents dir");
+        std::fs::create_dir_all(project_dir.join("messages")).expect("create archive messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            format!(r#"{{"slug":"{slug}","human_key":"/{slug}"}}"#),
+        )
+        .expect("write archive project metadata");
+    }
+
+    /// `(suffix, len, mtime, inode)` for the live main file and both namespace
+    /// sidecars: a read-only doctor probe must leave all of them untouched.
+    #[cfg(unix)]
+    fn live_family_identity(db_path: &Path) -> Vec<(String, u64, std::time::SystemTime, u64)> {
+        use std::os::unix::fs::MetadataExt as _;
+        ["", "-fsqlite-ns-gate", "-fsqlite-ns-use"]
+            .into_iter()
+            .map(|suffix| {
+                let path = if suffix.is_empty() {
+                    db_path.to_path_buf()
+                } else {
+                    sqlite_sidecar_path(db_path, suffix)
+                };
+                let meta = std::fs::metadata(&path)
+                    .unwrap_or_else(|error| panic!("stat {}: {error}", path.display()));
+                (
+                    suffix.to_string(),
+                    meta.len(),
+                    meta.modified().expect("mtime"),
+                    meta.ino(),
+                )
+            })
+            .collect()
+    }
+
+    /// Overwrite one page of the main file in place (same inode) with a byte
+    /// pattern that is not a valid b-tree page.
+    #[cfg(unix)]
+    fn corrupt_main_file_page_in_place(db_path: &Path, page_number: u64) {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(db_path)
+            .expect("open main file for in-place page corruption");
+        let mut header = [0_u8; 100];
+        file.read_exact(&mut header).expect("read SQLite header");
+        let raw = u16::from_be_bytes([header[16], header[17]]);
+        let page_size = if raw == 1 { 65_536_u64 } else { u64::from(raw) };
+        file.seek(SeekFrom::Start((page_number - 1) * page_size))
+            .expect("seek to page");
+        file.write_all(&vec![
+            0xA5_u8;
+            usize::try_from(page_size).expect("page size")
+        ])
+        .expect("overwrite page");
+        file.sync_all().expect("sync corrupted page");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_read_only_probe_accepts_hot_franken_wal_family_with_live_owner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let slug = "hot-wal-live-owner";
+        seed_matching_archive_project(dir.path(), slug);
+        let db_path = dir.path().join("storage.sqlite3");
+        let writer = seed_hot_franken_wal_family_with_live_owner(&db_path, slug);
+        let before = live_family_identity(&db_path);
+        let entries_before = directory_entry_names_for_cli_open_test(dir.path());
+
+        // The cross-engine guard is untouched: canonical SQLite must still
+        // refuse to open the Franken-admitted live inode directly.
+        let refusal = mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(
+            &db_path,
+            "doctor_check",
+        )
+        .err()
+        .map(|error| error.to_string())
+        .expect("guarded canonical open must refuse a Franken-admitted family");
+        assert!(
+            refusal.contains("refuses a cross-engine canonical open"),
+            "{refusal}"
+        );
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let strategy = doctor_database_fix_strategy_read_only(&db_url, dir.path())
+            .expect("read-only doctor strategy");
+        match &strategy {
+            DoctorDatabaseFixStrategy::None(detail) => {
+                assert!(
+                    !detail.contains("Database open probe failed"),
+                    "healthy verdict must not be a suppressed open failure: {detail}"
+                );
+            }
+            other => panic!(
+                "a healthy hot Franken WAL family with a live owner must not draw a repair/reconstruct verdict: {other:?}"
+            ),
+        }
+
+        assert_eq!(
+            live_family_identity(&db_path),
+            before,
+            "read-only probe must leave the live main file and namespace sidecars byte-identical (len/mtime/inode)"
+        );
+        assert_eq!(
+            directory_entry_names_for_cli_open_test(dir.path()),
+            entries_before,
+            "read-only probe must not publish artifacts beside the live family"
+        );
+        // The live owner is still a working writer afterwards.
+        writer
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (3, 'after-probe', '/after-probe', 0);",
+            )
+            .expect("live writer keeps working after the read-only probe");
+        mcp_agent_mail_db::close_db_conn(writer, "settle hot WAL live-owner fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_staged_family_copy_source_reads_hot_franken_wal_family() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let writer = seed_hot_franken_wal_family_with_live_owner(&db_path, "staged-copy");
+        let before = live_family_identity(&db_path);
+        let entries_before = directory_entry_names_for_cli_open_test(dir.path());
+
+        let opened = doctor_open_staged_family_copy_canonical(&db_path, "doctor_check")
+            .expect("stage and open a private copy of the live family");
+        assert_eq!(
+            opened.kind,
+            DoctorCanonicalDiagnosticSourceKind::StagedFamilyCopy
+        );
+        assert!(!opened.is_live_logical_snapshot());
+        // The uncheckpointed WAL frame is visible through the copy; an
+        // `immutable=1` open would have hidden it.
+        let rows = opened
+            .conn
+            .query_sync("SELECT COUNT(*) AS count FROM projects", &[])
+            .expect("count projects through the staged copy");
+        assert_eq!(rows[0].get_named::<i64>("count").expect("count"), 2);
+        assert!(
+            sqlite_conn_check_ok_canonical(&opened.conn, mcp_agent_mail_db::CheckKind::Full)
+                .expect("integrity check on the staged copy"),
+            "staged copy of a healthy hot WAL family must pass integrity_check"
+        );
+        let staged_path = opened
+            ._staged_family
+            .as_ref()
+            .expect("staged family retained while the connection is open")
+            .path()
+            .to_path_buf();
+        assert_ne!(
+            staged_path.parent(),
+            db_path.parent(),
+            "staged copy must live in its own tempdir"
+        );
+        assert!(
+            !sqlite_sidecar_path(&staged_path, "-fsqlite-ns-gate").exists()
+                && !sqlite_sidecar_path(&staged_path, "-fsqlite-ns-use").exists(),
+            "staged copy must not inherit the live namespace sidecars"
+        );
+        drop(opened);
+        assert!(
+            !staged_path.exists(),
+            "dropping the open must remove the staged copy"
+        );
+        assert_eq!(live_family_identity(&db_path), before);
+        assert_eq!(
+            directory_entry_names_for_cli_open_test(dir.path()),
+            entries_before
+        );
+        mcp_agent_mail_db::close_db_conn(writer, "settle staged-copy fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_read_only_probe_still_fails_on_structurally_corrupt_main_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let slug = "hot-wal-corrupt";
+        seed_matching_archive_project(dir.path(), slug);
+        let db_path = dir.path().join("storage.sqlite3");
+        let writer = seed_hot_franken_wal_family_with_live_owner(&db_path, slug);
+        // Damage the root page of a table the WAL never rewrote, so no WAL
+        // frame can mask the corruption in the staged copy.
+        let rows = writer
+            .query_sync(
+                "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'agents'",
+                &[],
+            )
+            .expect("look up agents root page");
+        let root_page = rows[0].get_named::<i64>("rootpage").expect("rootpage");
+        assert!(root_page > 1, "agents root page must not be page 1");
+        corrupt_main_file_page_in_place(&db_path, u64::try_from(root_page).expect("page"));
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let strategy = doctor_database_fix_strategy_read_only(&db_url, dir.path())
+            .expect("read-only doctor strategy");
+        match &strategy {
+            DoctorDatabaseFixStrategy::Reconstruct(detail) => {
+                assert!(
+                    doctor_detail_is_integrity_verdict(detail),
+                    "corrupt b-tree page must yield an integrity verdict, got: {detail}"
+                );
+            }
+            other => panic!(
+                "a corrupt b-tree page in a hot Franken WAL family must still reconstruct: {other:?}"
+            ),
+        }
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_read_only_probe_still_fails_on_unopenable_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let slug = "hot-wal-truncated";
+        seed_matching_archive_project(dir.path(), slug);
+        let db_path = dir.path().join("storage.sqlite3");
+        let writer = seed_hot_franken_wal_family_with_live_owner(&db_path, slug);
+        // Truncate the main file in place (same inode) to less than a SQLite
+        // header while the family shape (ns sidecars, hot WAL) stays intact.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db_path)
+            .expect("open main file for truncation")
+            .set_len(50)
+            .expect("truncate main file");
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let strategy = doctor_database_fix_strategy_read_only(&db_url, dir.path())
+            .expect("read-only doctor strategy");
+        assert!(
+            matches!(strategy, DoctorDatabaseFixStrategy::Reconstruct(_)),
+            "an unopenable main file must still reconstruct: {strategy:?}"
+        );
+
+        // The open-probe layer reports the composite cause with every branch
+        // readable instead of truncating it down to the first clause.
+        let archive_root = dir.path().join("projects");
+        let probe = doctor_database_fix_strategy_read_only_probes(
+            &db_url,
+            dir.path(),
+            true,
+            &archive_root,
+            false,
+            None,
+            true,
+        )
+        .expect("open-probe strategy");
+        match probe {
+            DoctorDatabaseFixStrategy::Reconstruct(detail) => {
+                assert!(
+                    detail.starts_with("Database open probe failed: "),
+                    "{detail}"
+                );
+                for clause in [
+                    "guarded live snapshot failed:",
+                    "staged family copy failed:",
+                    "guarded offline canonical open failed:",
+                ] {
+                    assert!(
+                        detail.contains(clause),
+                        "composite open failure must keep the `{clause}` clause readable: {detail}"
+                    );
+                }
+                assert!(
+                    detail.contains("refuses a cross-engine canonical open"),
+                    "the offline clause must carry the real guard refusal: {detail}"
+                );
+                assert!(
+                    detail.contains("archive recovery is available under"),
+                    "{detail}"
+                );
+                assert!(
+                    detail.chars().count()
+                        <= DOCTOR_OPEN_PROBE_DETAIL_LIMIT
+                            + "Database open probe failed: ".len()
+                            + "; archive recovery is available under ".len()
+                            + archive_root.display().to_string().len(),
+                    "open-probe detail must stay bounded ({} chars): {detail}",
+                    detail.chars().count()
+                );
+            }
+            other => panic!("truncated main file must report an open-probe failure: {other:?}"),
+        }
+        drop(writer);
     }
 
     #[test]
@@ -56831,12 +57395,12 @@ startup_timeout_sec = 42
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("custom.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
-        let xdg_data_home = dir.path().join("xdg");
-        let xdg_data_home_text = xdg_data_home.to_string_lossy().into_owned();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("XDG_DATA_HOME", xdg_data_home_text.as_str())],
-            || {
+        // br-99aih: redirect the *default* storage root into a private tempdir
+        // (HOME + XDG_DATA_HOME); an XDG-only override still resolved to the
+        // operator's live archive on any host that had run the daemon.
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(
+            |_isolated_default_root| {
                 let storage_root = mcp_agent_mail_core::config::default_storage_root_path();
                 let message_dir = seed_archive_mailbox_project(&storage_root);
                 write_archive_mailbox_message(
@@ -56866,12 +57430,12 @@ startup_timeout_sec = 42
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("missing-custom.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
-        let xdg_data_home = dir.path().join("xdg");
-        let xdg_data_home_text = xdg_data_home.to_string_lossy().into_owned();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("XDG_DATA_HOME", xdg_data_home_text.as_str())],
-            || {
+        // br-99aih: redirect the *default* storage root into a private tempdir
+        // (HOME + XDG_DATA_HOME); an XDG-only override still resolved to the
+        // operator's live archive on any host that had run the daemon.
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(
+            |_isolated_default_root| {
                 let storage_root = mcp_agent_mail_core::config::default_storage_root_path();
                 seed_archive_mailbox_project(&storage_root);
 
@@ -73387,12 +73951,12 @@ startup_timeout_sec = 42
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("custom.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
-        let xdg_data_home = dir.path().join("xdg");
-        let xdg_data_home_text = xdg_data_home.to_string_lossy().into_owned();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("XDG_DATA_HOME", xdg_data_home_text.as_str())],
-            || {
+        // br-99aih: redirect the *default* storage root into a private tempdir
+        // (HOME + XDG_DATA_HOME); an XDG-only override still resolved to the
+        // operator's live archive on any host that had run the daemon.
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(
+            |_isolated_default_root| {
                 let storage_root = mcp_agent_mail_core::config::default_storage_root_path();
                 let message_dir = seed_archive_mailbox_project(&storage_root);
                 write_archive_mailbox_message(
@@ -84153,6 +84717,56 @@ pub(crate) async fn try_call_server_tool(
         tool_name,
         post_jsonrpc_request(server_url, bearer, &req, SERVER_TOOL_CALL_TIMEOUT_SECS).await,
     )
+}
+
+/// Read an MCP resource over the daemon's JSON-RPC lane (`resources/read`).
+///
+/// Shares the request deadline and the Success / Rejected / Unavailable
+/// classification with [`try_call_server_tool`], so callers decide about a
+/// local fallback on the same terms (br-4myjj: `am robot metrics` reads the
+/// server's tool counters instead of its own always-empty atomics).
+pub(crate) async fn try_read_server_resource(
+    server_url: &str,
+    bearer: Option<&str>,
+    uri: &str,
+) -> ServerToolCall {
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": format!("cli-resources-read-{uri}"),
+        "method": "resources/read",
+        "params": {
+            "uri": uri,
+        }
+    });
+    classify_server_tool_call(
+        uri,
+        post_jsonrpc_request(server_url, bearer, &req, SERVER_TOOL_CALL_TIMEOUT_SECS).await,
+    )
+}
+
+/// Extract the first text content item of a `resources/read` result and
+/// parse it as JSON.
+///
+/// The MCP wire shape is `{ "contents": [{ "uri", "mimeType", "text" }] }`
+/// and every agent-mail resource serializes one JSON document into `text`.
+pub(crate) fn parse_resource_read_json(
+    uri: &str,
+    result: &serde_json::Value,
+) -> CliResult<serde_json::Value> {
+    let text = result
+        .get("contents")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            CliError::Other(format!(
+                "server returned no text content for {uri} (resources/read)"
+            ))
+        })?;
+    serde_json::from_str(text).map_err(|error| {
+        CliError::Other(format!("invalid JSON in {uri} resource content: {error}"))
+    })
 }
 
 /// Response deadline for daemon-proxied tool calls.

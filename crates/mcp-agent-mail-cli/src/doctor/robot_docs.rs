@@ -41,9 +41,9 @@ quarantines via rename.
 
 | Verb | Purpose | Mutates? | Default exit |
 |------|---------|----------|--------------|
-| `am doctor` (or `check`) | Run all detectors. Read-only. | No | 0 healthy / 1 findings |
-| `am doctor --fix` | Run detectors + apply fixers. Backups first. | Yes (via `mutate()`) | 0 / 2 / 3 / 4 |
-| `am doctor --dry-run --fix` | Print the fix plan; do not execute. | No | 0 |
+| `am doctor check` (`--json`) | Run all detectors. Read-only. | No | 0 healthy / 1 findings |
+| `am doctor fix --yes` | Run detectors + apply fixers. Backups first. | Yes (via `mutate()`) | 0 / 2 / 3 / 4 |
+| `am doctor fix --dry-run` | Print the fix plan; do not execute. | No | 0 |
 | `am doctor fix --only <fm-id>` | Run a single registered FM through the chokepoint. | Yes (via `mutate()`) | 0 / 3 / 4 / 64 |
 | `am doctor fix --only <fm-id> --list` | Detect a single FM only — no chokepoint. | No | 0 |
 | `am doctor fix --list` | Detect every registered FM in one round-trip. | No | 0 |

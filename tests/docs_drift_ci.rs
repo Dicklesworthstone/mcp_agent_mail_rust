@@ -257,7 +257,9 @@ mod dist_release_contract {
     const DOWNLOAD_ACTION: &str =
         "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093";
     const SETUP_ZIG_ACTION: &str = "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29";
-    const BEADS_RUST_COMMIT: &str = "a3f89e6624661259ffa73f876d105656c5b5246e";
+    // Must match the `BEADS_RUST_COMMIT` env pin in .github/workflows/dist.yml
+    // (beads_rust 0.5.4 source, pinned in 4e8c661a).
+    const BEADS_RUST_COMMIT: &str = "ba6ff75da25529c8cad8395352f5c5fc2162ee95";
     const RELEASE_TARGETS: [&str; 6] = [
         "x86_64-unknown-linux-gnu",
         "x86_64-unknown-linux-musl",
@@ -804,7 +806,7 @@ mod dist_release_contract {
         require_once(workflow, &format!("BEADS_RUST_COMMIT: {BEADS_RUST_COMMIT}"))?;
         require_exactly(
             workflow,
-            "# Cargo.lock resolves beads_rust 0.5.2, so the workspace patch",
+            "# Cargo.lock resolves beads_rust 0.5.4, so the workspace patch",
             3,
         )?;
         require_exactly(

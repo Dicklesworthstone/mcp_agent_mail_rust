@@ -30,6 +30,10 @@ mcp-agent-mail-core.workspace = true
 mcp-agent-mail-db.workspace = true
 mcp-agent-mail-storage.workspace = true
 mcp-agent-mail-tools.workspace = true
+# The doc-drift guard counts live `am doctor` verbs and `am robot`
+# subcommands straight from the clap tree, so README/AGENTS tables cannot
+# drift from the shipped CLI surface.
+mcp-agent-mail-cli = { path = "../mcp-agent-mail-cli" }
 # test-internals enables `Cx::for_testing()` for the conformance test suite
 # only (dev-dependency); the capability-security gate stays intact elsewhere.
 asupersync = { workspace = true, features = ["test-internals"] }

@@ -1789,6 +1789,12 @@ pub struct ToolMetricsEntry {
     pub cluster: String,
     pub capabilities: Vec<String>,
     pub complexity: String,
+    /// Per-tool latency statistics (avg/min/max/p50/p95/p99 in ms). `None`
+    /// when the tool has recorded no latency sample. Additive (br-4myjj):
+    /// omitted from the JSON when absent, so consumers and fixtures written
+    /// before this field existed keep matching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency: Option<crate::metrics::LatencySnapshot>,
 }
 
 /// Tool metrics response
@@ -1820,6 +1826,7 @@ pub fn tooling_metrics(_ctx: &McpContext) -> McpResult<String> {
             cluster: e.cluster,
             capabilities: e.capabilities,
             complexity: e.complexity,
+            latency: e.latency,
         })
         .collect();
 
@@ -5426,6 +5433,71 @@ mod resource_shape_tests {
         assert_eq!(outbox_value["agent"], fixture.sender_name);
     }
 
+    /// br-4myjj: `resource://tooling/metrics` carries per-tool latency so a
+    /// CLI reading the daemon's counters can report avg/p95/p99 without a
+    /// second round-trip. Tools without samples omit the key (legacy shape).
+    #[test]
+    fn tooling_metrics_entries_carry_latency_when_recorded() {
+        let _metrics_guard = crate::metrics::tests::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::metrics::reset_tool_metrics();
+        crate::metrics::record_call("health_check");
+        crate::metrics::record_latency("health_check", 1_500);
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let value = parse_json(&tooling_metrics(&ctx).expect("tooling metrics"));
+        let tools = value["tools"].as_array().expect("tools array");
+
+        let sampled = tools
+            .iter()
+            .find(|entry| entry["name"] == "health_check")
+            .expect("health_check entry present in the full catalogue");
+        assert_eq!(sampled["calls"], 1);
+        let avg_ms = sampled["latency"]["avg_ms"]
+            .as_f64()
+            .expect("latency.avg_ms present for a sampled tool");
+        assert!(
+            (avg_ms - 1.5).abs() < 1e-9,
+            "1500us sample must surface as 1.5ms avg, got {avg_ms}"
+        );
+        assert!(
+            sampled["latency"]["p95_ms"]
+                .as_f64()
+                .is_some_and(|p95| p95 > 0.0),
+            "p95 must be populated: {sampled}"
+        );
+        assert!(
+            sampled["latency"]["p99_ms"].is_number() && sampled["latency"]["p50_ms"].is_number(),
+            "p50/p99 must be populated: {sampled}"
+        );
+
+        let unsampled = tools
+            .iter()
+            .find(|entry| entry["name"] == "whois")
+            .expect("whois entry present in the full catalogue");
+        assert_eq!(unsampled["calls"], 0);
+        assert!(
+            unsampled.get("latency").is_none(),
+            "tools without samples must omit `latency` (legacy wire shape): {unsampled}"
+        );
+
+        // Payloads produced before the field existed still deserialize.
+        let legacy: ToolMetricsEntry = serde_json::from_value(serde_json::json!({
+            "name": "whois",
+            "calls": 3,
+            "errors": 0,
+            "rejections": 0,
+            "cluster": "identity",
+            "capabilities": ["identity"],
+            "complexity": "low",
+        }))
+        .expect("legacy entry without latency deserializes");
+        assert!(legacy.latency.is_none());
+
+        crate::metrics::reset_tool_metrics();
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn empty_dataset_resources_return_expected_shapes() {
@@ -7340,15 +7412,13 @@ mod resource_shape_tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("custom.sqlite3");
         let database_url = format!("sqlite:///{}", db_path.display());
-        let xdg_data_home = temp.path().join("xdg");
-        let xdg_data_home_text = xdg_data_home.to_string_lossy().into_owned();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("DATABASE_URL", database_url.as_str()),
-                ("XDG_DATA_HOME", xdg_data_home_text.as_str()),
-            ],
-            || {
+        // br-99aih: redirect the *default* storage root into a private tempdir
+        // (HOME + XDG_DATA_HOME); an XDG-only override still resolved to the
+        // operator's live archive on any host that had run the daemon.
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_and_env_overrides_for_test(
+            &[("DATABASE_URL", database_url.as_str())],
+            |_isolated_default_root| {
                 Config::reset_cached();
                 let storage_root = Config::from_env().storage_root;
                 let project_dir = storage_root.join("projects").join("ahead-project");
