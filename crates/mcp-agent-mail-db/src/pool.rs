@@ -15573,7 +15573,49 @@ mod tests {
                 .is_err()
         );
         drop(conn);
-        assert_eq!(family(&db_path), before);
+        // Every durable file must be byte-identical. The `-shm` WAL-index is
+        // exempt in one region only: SQLite's reader protocol records the
+        // snapshot a reader uses in the checkpoint-info block (`nBackfill` +
+        // `aReadMark[5]`, header bytes 96..116) and a query-only connection
+        // is such a reader (br-00gl8: observed as `aReadMark[1]` at offset
+        // 104). The WAL-index is transient shared memory rebuilt from the
+        // WAL, so a moved read mark changes no durable state.
+        let after = family(&db_path);
+        assert_eq!(after.len(), before.len());
+        for ((path, before_bytes), (after_path, after_bytes)) in before.iter().zip(after.iter()) {
+            assert_eq!(path, after_path);
+            let is_shm = path.to_string_lossy().ends_with("-shm");
+            if !is_shm {
+                assert_eq!(
+                    before_bytes,
+                    after_bytes,
+                    "{} must not change",
+                    path.display()
+                );
+                continue;
+            }
+            match (before_bytes, after_bytes) {
+                (Some(before_bytes), Some(after_bytes)) => {
+                    assert_eq!(
+                        before_bytes.len(),
+                        after_bytes.len(),
+                        "shm size must not change"
+                    );
+                    let changed: Vec<usize> = before_bytes
+                        .iter()
+                        .zip(after_bytes.iter())
+                        .enumerate()
+                        .filter(|(_, (b, a))| b != a)
+                        .map(|(offset, _)| offset)
+                        .collect();
+                    assert!(
+                        changed.iter().all(|offset| (96..116).contains(offset)),
+                        "shm may only change inside the reader checkpoint-info block 96..116; changed offsets: {changed:?}"
+                    );
+                }
+                (before_bytes, after_bytes) => assert_eq!(before_bytes, after_bytes),
+            }
+        }
     }
 
     #[test]
