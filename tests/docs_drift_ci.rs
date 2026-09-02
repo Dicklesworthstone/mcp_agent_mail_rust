@@ -53,9 +53,17 @@ mod container_release_contract {
             "actual_api_digest=\"sha256:$(sha256sum",
             "before_fingerprint=\"$(asset_fingerprint",
             "after_fingerprint=\"$(asset_fingerprint",
-            "file: ${{ needs.prepare.outputs.dockerfile }}",
-            "AM_VERSION=${{ needs.prepare.outputs.version }}",
-            "AM_REVISION=${{ needs.prepare.outputs.revision }}",
+            "target=\"$MODE\"",
+            "docker buildx bake \"$target\" --metadata-file \"$metadata_file\"",
+            "--set \"${target}.platform=${PLATFORM}\"",
+            "--set \"${target}.output=${output}\"",
+            "--set \"${target}.args.AM_VERSION=${VERSION}\"",
+            "--set \"${target}.args.AM_REVISION=${REVISION}\"",
+            "--set \"${target}.args.AM_REF=${AM_REF}\"",
+            "--set \"${target}.cache-from=type=gha,scope=${CACHE_SCOPE}\"",
+            "--set \"${target}.cache-to=type=gha,mode=max,scope=${CACHE_SCOPE}\"",
+            "--set \"${target}.attest=type=provenance,mode=max\"",
+            "--set \"${target}.attest=type=sbom\"",
             "requested_am_ref=\"${INPUT_AM_REF:-main}\"",
             "git ls-remote --heads --tags origin",
             "git fetch --no-tags --depth=1 origin \"$fetch_ref\"",
@@ -67,7 +75,6 @@ mod container_release_contract {
             "[ \"$AM_REF\" = \"$REVISION\" ]",
             "grep -Fq 'git fetch --depth 1 origin \"${AM_REF}\"' \"$DOCKERFILE\"",
             "grep -Fq 'git checkout -q FETCH_HEAD' \"$DOCKERFILE\"",
-            "provenance: mode=max",
             "expected_digest_files=(linux-amd64.digest linux-arm64.digest)",
             "docker buildx imagetools inspect --raw \"$IMAGE@$digest\"",
         ];
@@ -99,6 +106,9 @@ mod container_release_contract {
 
         if workflow.contains("file: ./Dockerfile\n") {
             return Err("a hard-coded source Dockerfile publication lane remains".to_string());
+        }
+        if workflow.contains("docker/build-push-action@") {
+            return Err("container publication bypasses the Bake contract".to_string());
         }
         if workflow.contains("value=latest-${{ github.sha }}") || workflow.contains("prefix=sha-") {
             return Err("source and release tag namespaces can collide".to_string());
@@ -201,7 +211,11 @@ mod container_release_contract {
                 "grep -Fq 'git checkout -q main' \"$DOCKERFILE\"",
                 1,
             ),
-            workflow.replacen("provenance: mode=max", "provenance: true", 1),
+            workflow.replacen(
+                "--set \"${target}.attest=type=provenance,mode=max\"",
+                "--set \"${target}.attest=type=provenance,mode=min\"",
+                1,
+            ),
             workflow.replacen(
                 "expected_digest_files=(linux-amd64.digest linux-arm64.digest)",
                 "expected_digest_files=(linux-amd64.digest)",
