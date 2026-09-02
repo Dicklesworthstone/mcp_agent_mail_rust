@@ -1986,9 +1986,11 @@ fn retire_private_salvage_residue(snapshot_path: &Path, suffixes: &[&str]) {
 /// Reconstruct from the Git archive and merge an engine-exclusive private or
 /// offline canonical `SQLite` salvage artifact.
 ///
-/// This entry point must never receive a live FrankenSQLite primary. Live
-/// callers use [`reconstruct_from_archive_with_live_franken_salvage`] so the
-/// source inode is materialized through guarded same-engine access first.
+/// This entry point must never receive a live primary. Live callers use
+/// [`reconstruct_from_archive_with_live_salvage`] so the source inode is
+/// materialized first through the guarded opener that matches its engine
+/// (FrankenSQLite when the namespace sidecar pair exists, canonical
+/// `SQLite` otherwise).
 ///
 /// # Errors
 ///
@@ -2042,7 +2044,7 @@ pub fn reconstruct_from_archive_with_private_salvage(
 ///
 /// Returns an error when guarded live-source admission or materialization
 /// fails for a non-corruption reason, or when archive reconstruction fails.
-pub fn reconstruct_from_archive_with_live_franken_salvage(
+pub fn reconstruct_from_archive_with_live_salvage(
     db_path: &Path,
     storage_root: &Path,
     live_salvage_db_path: &Path,
@@ -7740,7 +7742,7 @@ body
         .unwrap();
         let target_path = archive_dir.path().join("reconstructed.sqlite3");
 
-        let stats = reconstruct_from_archive_with_live_franken_salvage(
+        let stats = reconstruct_from_archive_with_live_salvage(
             &target_path,
             &storage_root,
             &source_path,
@@ -7796,7 +7798,7 @@ body
         std::fs::create_dir_all(storage_root.join("projects").join("archive-project"))
             .expect("create authoritative archive fixture");
         let target_path = archive_dir.path().join("reconstructed.sqlite3");
-        let error = reconstruct_from_archive_with_live_franken_salvage(
+        let error = reconstruct_from_archive_with_live_salvage(
             &target_path,
             &storage_root,
             &source_path,

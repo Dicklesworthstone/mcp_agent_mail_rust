@@ -12901,7 +12901,7 @@ where
     let candidate_path = reconstruction_candidate_path(primary_path, timestamp);
     let reconstruct_result = match live_salvage_db_path {
         Some(live_salvage_db_path) => {
-            crate::reconstruct::reconstruct_from_archive_with_live_franken_salvage(
+            crate::reconstruct::reconstruct_from_archive_with_live_salvage(
                 &candidate_path,
                 storage_root,
                 live_salvage_db_path,

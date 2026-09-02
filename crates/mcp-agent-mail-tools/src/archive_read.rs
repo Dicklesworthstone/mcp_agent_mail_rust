@@ -722,7 +722,7 @@ fn build_snapshot(
             .map_err(AcquireError::failed)?;
     let snapshot_path = directory.path().join("mailbox.sqlite3");
     let stats = if slot.scope.sqlite_path.exists() {
-        mcp_agent_mail_db::reconstruct_from_archive_with_live_franken_salvage(
+        mcp_agent_mail_db::reconstruct_from_archive_with_live_salvage(
             &snapshot_path,
             &slot.scope.storage_root,
             &slot.scope.sqlite_path,

@@ -3279,7 +3279,7 @@ impl ObservabilitySyncDb {
         let reconstruct = live_salvage_db_path.map_or_else(
             || mcp_agent_mail_db::reconstruct_from_archive(&sqlite_path, storage_root),
             |live_salvage_db_path| {
-                mcp_agent_mail_db::reconstruct_from_archive_with_live_franken_salvage(
+                mcp_agent_mail_db::reconstruct_from_archive_with_live_salvage(
                     &sqlite_path,
                     storage_root,
                     live_salvage_db_path,

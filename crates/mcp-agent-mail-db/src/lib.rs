@@ -326,7 +326,7 @@ pub use reconstruct::{
     ProjectIdentityMismatch, ReconstructStats, archive_missing_project_identities,
     collect_db_message_ids, collect_db_project_identities, compute_archive_drift_report,
     mailbox_project_identity_matches_db, neutralize_private_salvage_artifact,
-    reconstruct_from_archive, reconstruct_from_archive_with_live_franken_salvage,
+    reconstruct_from_archive, reconstruct_from_archive_with_live_salvage,
     reconstruct_from_archive_with_private_salvage, scan_archive_message_ids,
     scan_archive_message_inventory,
 };
