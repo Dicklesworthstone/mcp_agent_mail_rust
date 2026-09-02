@@ -13,7 +13,6 @@
 // Integration scenarios are long and quote user-facing strings by design;
 // these pedantic style lints add nothing in a test harness.
 #![allow(clippy::too_many_lines)]
-
 // Note: unsafe required for env::set_var in Rust 2024
 #![allow(unsafe_code)]
 
@@ -191,7 +190,9 @@ fn ensure_project_direct(project_key: &str) {
 /// remain intact, so the message is created successfully.
 #[test]
 fn contact_enforcement_db_outage_fail_open() {
-    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let tmp = tempfile::TempDir::new().expect("create tempdir");
     let db_path = tmp.path().join("outage_test.sqlite3");
     let db_url = format!("sqlite://{}", db_path.display());
@@ -494,7 +495,9 @@ fn contact_enforcement_db_outage_fail_open() {
 /// independently, proving counter atomicity under contention.
 #[test]
 fn contact_enforcement_outage_counter_atomicity() {
-    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let tmp = tempfile::TempDir::new().expect("create tempdir");
     let db_path = tmp.path().join("atomicity_test.sqlite3");
     let db_url = format!("sqlite://{}", db_path.display());

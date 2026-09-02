@@ -1574,7 +1574,7 @@ mod tests {
 
         let plan = DeploymentPlan {
             provider: HostingProvider::GithubPages,
-            bundle_path: bundle_path,
+            bundle_path,
             steps: vec![],
             expected_url: None,
             generated_files: vec![
@@ -1626,7 +1626,7 @@ mod tests {
         let outside_marker = outside.path().join("command-cwd.txt");
         let plan = DeploymentPlan {
             provider: HostingProvider::Custom,
-            bundle_path: bundle_path,
+            bundle_path,
             steps: vec![],
             expected_url: None,
             generated_files: vec![],

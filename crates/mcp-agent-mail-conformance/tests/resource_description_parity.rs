@@ -56,7 +56,9 @@ impl Drop for EnvVarGuard {
 }
 
 fn collect_all_resources() -> Vec<ResourceEntry> {
-    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvVarGuard::set(&[
         ("WORKTREES_ENABLED", "true"),
         ("TOOL_FILTER_PROFILE", "full"),
@@ -144,7 +146,8 @@ fn supported_resources_have_rust_owned_descriptions() {
         }
     }
 
-    assert!(mismatches.is_empty(), 
+    assert!(
+        mismatches.is_empty(),
         "Supported resource description failures ({}/{}):\n{}",
         mismatches.len(),
         SUPPORTED_RESOURCE_URIS.len(),

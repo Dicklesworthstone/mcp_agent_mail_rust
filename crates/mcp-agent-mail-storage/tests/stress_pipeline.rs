@@ -666,16 +666,15 @@ fn stress_commit_coalescer_batching_100_writes() {
         max_archive_lag_us,
         adaptive_target_ms,
         adaptive_effective_ms,
-    ) = repo_stats
-        .map_or((0, 0, 0, 0, 0), |s| {
-            (
-                s.enqueued_total,
-                s.commits_total,
-                s.max_archive_lag_us,
-                s.adaptive_flush_target_ms,
-                s.adaptive_flush_effective_ms,
-            )
-        });
+    ) = repo_stats.map_or((0, 0, 0, 0, 0), |s| {
+        (
+            s.enqueued_total,
+            s.commits_total,
+            s.max_archive_lag_us,
+            s.adaptive_flush_target_ms,
+            s.adaptive_flush_effective_ms,
+        )
+    });
 
     eprintln!("\n=== stress_commit_coalescer_batching_100_writes ===");
     eprintln!("  Writes enqueued: {n_writes}");

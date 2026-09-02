@@ -6106,9 +6106,10 @@ where
                                 grace_secs,
                                 zombies,
                                 "hard grace timeout: blocking work ignored cancellation; \
-                                 accounting it as a zombie so it keeps occupying admission \
-                                 capacity until the thread exits (prevents retry-amplified \
-                                 CPU storms)"
+                                 accounting it as a zombie that occupies admission capacity \
+                                 until its thread exits or the zombie admission TTL elapses \
+                                 (AM_DISPATCH_ZOMBIE_ADMISSION_TTL_SECS; prevents \
+                                 retry-amplified CPU storms without wedging admission)"
                             );
                         }
                     }

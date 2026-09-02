@@ -961,7 +961,10 @@ fn new_write_behind_queue() -> WriteBehindQueue {
 }
 
 fn wbq_start_inner(wbq: &WriteBehindQueue) {
-    let _lifecycle = wbq.lifecycle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lifecycle = wbq
+        .lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let should_spawn = {
         let handle = wbq.drain_handle.lock();
@@ -1054,12 +1057,17 @@ fn wbq_start_inner(wbq: &WriteBehindQueue) {
         })
         .unwrap_or_else(|error| panic!("failed to spawn wbq-drain thread: {error}"));
 
-    *wbq.sender.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+    *wbq.sender
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
     *wbq.drain_handle.lock() = Some(handle);
 }
 
 fn wbq_sender_clone(wbq: &WriteBehindQueue) -> Option<std::sync::mpsc::SyncSender<WbqMsg>> {
-    wbq.sender.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    wbq.sender
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 /// Spawn the WBQ drain thread. Safe to call multiple times.
@@ -1601,7 +1609,10 @@ impl ArchiveRetryBacklog {
         // Reserve a slot under the lock: count both live entries and in-flight
         // reservations against `cap` so parallel pushers serialize on the bound.
         {
-            let queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let queue = self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let occupied = u64::try_from(queue.len())
                 .unwrap_or(u64::MAX)
                 .saturating_add(self.reserved.load(Ordering::Relaxed));
@@ -1623,7 +1634,10 @@ impl ArchiveRetryBacklog {
         let journal_path = archive_backlog_journal_write(&op);
         let durable = journal_path.is_some();
         {
-            let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut queue = self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // Release the reservation and enqueue the real entry atomically.
             self.reserved.fetch_sub(1, Ordering::Relaxed);
             queue.push_back(ArchiveBacklogEntry {
@@ -1653,7 +1667,10 @@ impl ArchiveRetryBacklog {
 
     /// Enqueue an op recovered from its on-disk journal (already durable).
     fn push_recovered(&self, op: WriteOp, journal_path: PathBuf) {
-        let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         queue.push_back(ArchiveBacklogEntry {
             op,
             journal_path: Some(journal_path),
@@ -1667,7 +1684,10 @@ impl ArchiveRetryBacklog {
 
     /// Current `(depth, oldest_age_us)` of the backlog.
     fn backlog_state(&self) -> (u64, u64) {
-        let queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let depth = u64::try_from(queue.len()).unwrap_or(u64::MAX);
         let oldest = queue.front().map_or(0, |entry| {
             duration_as_micros_u64(entry.first_enqueued_at.elapsed())
@@ -1682,7 +1702,10 @@ impl ArchiveRetryBacklog {
     /// once the artifact is on disk.
     fn drain_step(&self) -> ArchiveBacklogDrainStep {
         let front = {
-            let queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let queue = self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             queue
                 .front()
                 .map(|entry| (entry.op.clone(), entry.attempts, entry.journal_path.clone()))
@@ -1692,7 +1715,10 @@ impl ArchiveRetryBacklog {
         };
         match write_op_sync(&op) {
             Ok(()) => {
-                let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut queue = self
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 queue.pop_front();
                 self.store_depth(&queue);
                 drop(queue);
@@ -1719,7 +1745,10 @@ impl ArchiveRetryBacklog {
                     "archive backlog: materialization failed; will retry (journal retained)"
                 );
                 {
-                    let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut queue = self
+                        .queue
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if let Some(front) = queue.front_mut() {
                         front.attempts = next_attempts;
                     }
@@ -1743,7 +1772,10 @@ impl ArchiveRetryBacklog {
     fn dead_letter_front(&self, op: &WriteOp, attempts: u32, error: &StorageError) {
         archive_backlog_dead_letter_append(op, attempts, error);
         let journal_path = {
-            let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut queue = self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let entry = queue.pop_front();
             self.store_depth(&queue);
             entry.and_then(|entry| entry.journal_path)
@@ -1960,7 +1992,10 @@ fn archive_backlog_journal_resolve(path: &Path) {
 }
 
 fn archive_backlog_ensure_drain(backlog: &'static ArchiveRetryBacklog) {
-    let _lifecycle = backlog.lifecycle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lifecycle = backlog
+        .lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     {
         let handle = backlog
             .drain_handle
@@ -2309,7 +2344,10 @@ pub fn wbq_flush() {
 /// never dropped.
 pub fn wbq_shutdown() {
     if let Some(wbq) = WBQ.get() {
-        let _lifecycle = wbq.lifecycle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lifecycle = wbq
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Join only when the drain thread demonstrably keeps consuming (flush
         // acknowledged and Shutdown delivered) or is already gone. A wedged
         // thread with a full channel must not hang shutdown forever (br-lrrry).
@@ -2363,7 +2401,9 @@ pub fn wbq_shutdown() {
         // Dropping the stored sender (and our clone above, at scope end) lets
         // the channel disconnect once in-flight clones die, which is a second
         // exit path for the drain loop even if Shutdown was never delivered.
-        *wbq.sender.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *wbq.sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let handle = {
             let mut guard = wbq.drain_handle.lock();
             guard.take()
@@ -2523,7 +2563,10 @@ impl WbqCircuitBreaker {
         now_micros: i64,
         cooldown_micros: i64,
     ) -> (bool, ArchiveFailureState) {
-        let mut map = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = map.get(archive_key).copied().unwrap_or_default();
         let (next, trip) =
             circuit_breaker_decide(prev, failed, threshold, now_micros, cooldown_micros);
@@ -2537,7 +2580,10 @@ impl WbqCircuitBreaker {
     }
 
     fn snapshot(&self) -> Vec<WbqCircuitBreakerArchive> {
-        let map = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut out: Vec<WbqCircuitBreakerArchive> = map
             .iter()
             .map(|(k, v)| WbqCircuitBreakerArchive {
@@ -3414,8 +3460,10 @@ fn startup_quarantine_path_with_nonce(
     timestamp: &str,
     nonce: u64,
 ) -> PathBuf {
-    let mut name = path
-        .file_name().map_or_else(|| OsString::from(fallback_name), std::ffi::OsStr::to_os_string);
+    let mut name = path.file_name().map_or_else(
+        || OsString::from(fallback_name),
+        std::ffi::OsStr::to_os_string,
+    );
     name.push(format!(
         ".startup-quarantine-{timestamp}-{}-{nonce:06}",
         std::process::id()
@@ -3616,8 +3664,7 @@ impl FileLock {
                     .saturating_sub(base_ms / 4)
                     .saturating_add(jitter)
                     .max(10);
-                let remaining_ms =
-                    self.timeout.saturating_sub(start.elapsed()).as_millis() as u64;
+                let remaining_ms = self.timeout.saturating_sub(start.elapsed()).as_millis() as u64;
                 std::thread::sleep(Duration::from_millis(sleep_ms.min(remaining_ms)));
             }
         }
@@ -3947,11 +3994,17 @@ impl CommitQueue {
         let repo_root = normalize_repo_root_key(&repo_root);
 
         {
-            let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut stats = self
+                .stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             stats.enqueued += 1;
         }
 
-        let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if queue.len() >= self.max_queue_size {
             // Queue full - fall back to direct commit
             drop(queue);
@@ -3981,7 +4034,10 @@ impl CommitQueue {
         loop {
             // Collect a batch
             let batch = {
-                let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut queue = self
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if queue.is_empty() {
                     break;
                 }
@@ -4008,8 +4064,14 @@ impl CommitQueue {
 
         // Update queue_size stat
         {
-            let queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let queue = self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut stats = self
+                .stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             stats.queue_size = queue.len();
         }
 
@@ -4023,7 +4085,10 @@ impl CommitQueue {
         }
 
         {
-            let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut stats = self
+                .stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             stats.batched += batch.len();
         }
 
@@ -4092,17 +4157,30 @@ impl CommitQueue {
     }
 
     fn record_commit(&self, batch_size: usize) {
-        let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stats = self
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         stats.commits += 1;
 
-        let mut sizes = self.batch_sizes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut sizes = self
+            .batch_sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         record_batch_size_samples(&mut stats, &mut sizes, batch_size, 1);
     }
 
     /// Get queue statistics.
     pub fn stats(&self) -> CommitQueueStats {
-        let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-        let queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stats = self
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         stats.queue_size = queue.len();
         stats
     }
@@ -4355,13 +4433,12 @@ fn parse_archive_batch_u64(primary_key: &str, legacy_key: &str, default: u64) ->
 }
 
 fn parse_archive_bool(key: &str, default: bool) -> bool {
-    config::env_value(key)
-        .map_or(default, |value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+    config::env_value(key).map_or(default, |value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn configured_coalescer_flush_interval() -> Duration {
@@ -4501,7 +4578,10 @@ fn coalescer_failure_backoff(streak: u64) -> Duration {
 }
 
 fn coalescer_retry_wait(rq: &RepoQueue) -> Option<Duration> {
-    let mut guard = rq.retry_after.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = rq
+        .retry_after
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let retry_at = (*guard)?;
     let now = Instant::now();
     if retry_at > now {
@@ -4521,7 +4601,9 @@ fn coalescer_note_commit_failure(rq: &RepoQueue) {
 
     let delay = coalescer_failure_backoff(streak);
     let retry_at = Instant::now() + delay;
-    *rq.retry_after.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(retry_at);
+    *rq.retry_after
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(retry_at);
 
     tracing::warn!(
         streak,
@@ -4532,7 +4614,9 @@ fn coalescer_note_commit_failure(rq: &RepoQueue) {
 
 fn coalescer_note_commit_success(rq: &RepoQueue) {
     rq.failure_streak.store(0, Ordering::Relaxed);
-    *rq.retry_after.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    *rq.retry_after
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 /// Auto-detect worker count bounded by `Config::coalescer_max_workers`.
@@ -4621,7 +4705,10 @@ impl CommitCoalescer {
 
     /// Get or create a per-repo queue for the given `repo_root`.
     fn get_or_create_repo(&self, repo_root: &Path) -> Arc<RepoQueue> {
-        let mut repos = self.repos.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut repos = self
+            .repos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(rq) = repos.get(repo_root) {
             return Arc::clone(rq);
         }
@@ -4644,7 +4731,10 @@ impl CommitCoalescer {
             .take(COALESCER_SPILL_MESSAGE_LINE_MAX_CHARS)
             .collect();
 
-        let mut guard = rq.spill.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = rq
+            .spill
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = guard.inner.get_or_insert_with(|| CoalescerSpillRepo {
             pending_requests: 0,
             earliest_enqueued_at: fields.enqueued_at,
@@ -4714,7 +4804,10 @@ impl CommitCoalescer {
         metrics.storage.commit_enqueued_total.inc();
 
         {
-            let mut s = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut s = self
+                .stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             s.enqueued += 1;
         }
 
@@ -4759,7 +4852,10 @@ impl CommitCoalescer {
         let repo_queue_cap = config.coalescer_queue_cap;
         let queue_depth = rq.depth.load(Ordering::Relaxed);
         if queue_depth < repo_queue_cap as u64 {
-            let mut q = rq.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut q = rq
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // Re-check under lock
             if q.len() < repo_queue_cap {
                 q.push_back(fields);
@@ -4776,7 +4872,9 @@ impl CommitCoalescer {
         // Wake a worker
         let (lock, cvar) = &*self.work_cv;
         {
-            let mut wake_tokens = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut wake_tokens = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *wake_tokens = wake_tokens.saturating_add(1).min(self.worker_count as u64);
         }
         cvar.notify_one();
@@ -4794,7 +4892,9 @@ impl CommitCoalescer {
             // Wake all workers
             {
                 let (lock, cvar) = &*self.work_cv;
-                let mut wake_tokens = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut wake_tokens = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 *wake_tokens = wake_tokens
                     .saturating_add(self.worker_count as u64)
                     .min(self.worker_count as u64);
@@ -4806,7 +4906,10 @@ impl CommitCoalescer {
                 if self.pending_requests.load(Ordering::Relaxed) > 0 {
                     false
                 } else {
-                    let repos = self.repos.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let repos = self
+                        .repos
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     repos.values().all(|rq| {
                         rq.depth.load(Ordering::Relaxed) == 0
                             && !rq.processing.load(Ordering::Relaxed)
@@ -4840,17 +4943,26 @@ impl CommitCoalescer {
     /// archive age.
     #[must_use]
     pub fn oldest_pending_age_us(&self) -> u64 {
-        let repos = self.repos.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let repos = self
+            .repos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut oldest: Option<Instant> = None;
         for rq in repos.values() {
             {
-                let queue = rq.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let queue = rq
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(front) = queue.front() {
                     oldest = Some(oldest.map_or(front.enqueued_at, |o| o.min(front.enqueued_at)));
                 }
             }
             {
-                let spill = rq.spill.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let spill = rq
+                    .spill
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(repo) = spill.inner.as_ref() {
                     oldest = Some(oldest.map_or(repo.earliest_enqueued_at, |o| {
                         o.min(repo.earliest_enqueued_at)
@@ -4864,9 +4976,16 @@ impl CommitCoalescer {
     /// Get coalescer statistics (aggregate across all repos).
     #[must_use]
     pub fn stats(&self) -> CommitQueueStats {
-        let mut s = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let mut s = self
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         // Sum queue depths across all repos
-        let repos = self.repos.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let repos = self
+            .repos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         s.queue_size = repos
             .values()
             .map(|rq| rq.depth.load(Ordering::Relaxed) as usize)
@@ -4877,7 +4996,10 @@ impl CommitCoalescer {
     /// Get per-repo commit statistics for observability.
     #[must_use]
     pub fn per_repo_stats(&self) -> HashMap<PathBuf, RepoCommitStats> {
-        let repos = self.repos.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let repos = self
+            .repos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         repos
             .iter()
             .map(|(path, rq)| {
@@ -4962,7 +5084,10 @@ fn coalescer_repo_readiness(
 
     let mut earliest: Option<Instant> = None;
     {
-        let q = rq.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let q = rq
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if q.len() >= max_batch_size {
             return CoalescerRepoReadiness::Ready;
         }
@@ -4972,7 +5097,10 @@ fn coalescer_repo_readiness(
     }
 
     {
-        let spill = rq.spill.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let spill = rq
+            .spill
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(repo) = spill.inner.as_ref() {
             if repo.pending_requests >= u64::try_from(max_batch_size).unwrap_or(u64::MAX) {
                 return CoalescerRepoReadiness::Ready;
@@ -5002,7 +5130,9 @@ fn coalescer_wait_for_due_work(
     wait_for: Duration,
 ) {
     let (lock, cvar) = &**work_cv;
-    let mut wake_tokens = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut wake_tokens = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if *wake_tokens == 0 && !shutdown.load(Ordering::Relaxed) {
         let (guard, _) = cvar
             .wait_timeout(wake_tokens, wait_for)
@@ -5083,7 +5213,9 @@ fn coalescer_pool_worker(
         // Phase 1: Wait for work
         {
             let (lock, cvar) = &*work_cv;
-            let mut wake_tokens = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut wake_tokens = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             while *wake_tokens == 0 && !shutdown.load(Ordering::Relaxed) {
                 let (guard, _) = cvar
                     .wait_timeout(wake_tokens, idle_wait)
@@ -5113,7 +5245,9 @@ fn coalescer_pool_worker(
             let force_now = force_flush.load(Ordering::Acquire);
             let mut next_due: Option<Duration> = None;
             let chosen: Option<(PathBuf, Arc<RepoQueue>)> = {
-                let repos_guard = repos.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let repos_guard = repos
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut best: Option<(PathBuf, Arc<RepoQueue>, u64)> = None;
                 for (path, rq) in repos_guard.iter() {
                     // Skip repos already being processed by another worker
@@ -5226,7 +5360,10 @@ fn self_process_repo(
     // Phase 3: Drain queue + spill for this repo
     let mut batch: Vec<CoalescerCommitFields> = Vec::new();
     let queue_is_empty = {
-        let mut q = rq.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut q = rq
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         while batch.len() < max_batch_size {
             let next = q.front();
             if let Some(next_fields) = next {
@@ -5431,7 +5568,9 @@ fn self_process_repo(
 
     // If any repo still has work, wake another worker
     let more_work = {
-        let repos_guard = repos.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let repos_guard = repos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         repos_guard
             .values()
             .any(|r| r.depth.load(Ordering::Relaxed) > 0)
@@ -5472,7 +5611,9 @@ fn coalescer_update_pending(pending_requests: &Arc<AtomicU64>, drained: u64) {
 fn coalescer_signal_worker(work_cv: &Arc<(Mutex<u64>, std::sync::Condvar)>, worker_count: usize) {
     let (lock, cvar) = &**work_cv;
     {
-        let mut wake_tokens = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut wake_tokens = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *wake_tokens = wake_tokens.saturating_add(1).min(worker_count as u64);
     }
     cvar.notify_one();
@@ -5518,7 +5659,10 @@ fn coalescer_depth_decrement(depth: &AtomicU64, drained: u64) -> u64 {
 
 /// Drain a single repo's spill buffer into a `CoalescerSpilledWork`.
 fn coalescer_drain_repo_spill(rq: &RepoQueue, repo_root: &Path) -> Option<CoalescerSpilledWork> {
-    let mut guard = rq.spill.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = rq
+        .spill
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let repo = guard.inner.take()?;
     if repo.pending_requests == 0 {
         return None;
@@ -5544,7 +5688,10 @@ fn coalescer_requeue_requests(rq: &RepoQueue, failed_requests: Vec<CoalescerComm
         return;
     }
     let requeued = u64::try_from(failed_requests.len()).unwrap_or(u64::MAX);
-    let mut queue = rq.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut queue = rq
+        .queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for request in failed_requests.into_iter().rev() {
         queue.push_front(request);
     }
@@ -5556,7 +5703,10 @@ fn coalescer_restore_spilled_work(rq: &RepoQueue, work: CoalescerSpilledWork) {
         return;
     }
 
-    let mut spill = rq.spill.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut spill = rq
+        .spill
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let repo = spill.inner.get_or_insert_with(|| CoalescerSpillRepo {
         pending_requests: 0,
         earliest_enqueued_at: work.earliest_enqueued_at,
@@ -5612,11 +5762,17 @@ fn coalescer_restore_spilled_work(rq: &RepoQueue, work: CoalescerSpilledWork) {
 /// Recompute and store the true per-repo queue depth.
 fn coalescer_reconcile_repo_depth(rq: &RepoQueue) -> u64 {
     let queue_depth = {
-        let queue = rq.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let queue = rq
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         u64::try_from(queue.len()).unwrap_or(u64::MAX)
     };
     let spill_depth = {
-        let spill = rq.spill.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let spill = rq
+            .spill
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         spill.inner.as_ref().map_or(0, |repo| repo.pending_requests)
     };
     let actual = queue_depth.saturating_add(spill_depth);
@@ -6017,11 +6173,12 @@ fn coalescer_commit_with_retry(
 
                 // Jittered exponential backoff: base * 2^attempt + random jitter
                 let base_ms = 50 * (1u64 << attempt.min(5)); // 50, 100, 200, 400, 800, 1600
-                let jitter = u64::from(SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .subsec_micros())
-                    % (base_ms / 2 + 1);
+                let jitter = u64::from(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_micros(),
+                ) % (base_ms / 2 + 1);
                 std::thread::sleep(Duration::from_millis(base_ms + jitter));
 
                 // Try cleaning stale locks on later attempts
@@ -6089,11 +6246,12 @@ fn coalescer_commit_all_with_retry(repo_root: &Path, config: &Config, message: &
                 }
 
                 let base_ms = 50 * (1u64 << attempt.min(5));
-                let jitter = u64::from(SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .subsec_micros())
-                    % (base_ms / 2 + 1);
+                let jitter = u64::from(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_micros(),
+                ) % (base_ms / 2 + 1);
                 std::thread::sleep(Duration::from_millis(base_ms + jitter));
 
                 if attempt >= 3 {
@@ -7231,7 +7389,9 @@ fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
 fn ensure_dir(dir: &Path) -> std::io::Result<()> {
     let _mutation = ArchiveMutationGuard::begin_at(dir);
     {
-        let cache = DIR_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cache = DIR_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if cache.contains(dir) {
             return Ok(());
         }
@@ -7247,7 +7407,9 @@ fn ensure_dir(dir: &Path) -> std::io::Result<()> {
     }
     fs::create_dir_all(dir)?;
     {
-        let mut cache = DIR_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cache = DIR_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.insert(dir.to_path_buf());
     }
     Ok(())
@@ -9795,7 +9957,9 @@ pub fn emit_notification_signal(
         });
     }
 
-    if let Ok(()) = write_json(&signal_path, &signal_data, false) { SignalEmitOutcome::Emitted } else {
+    if let Ok(()) = write_json(&signal_path, &signal_data, false) {
+        SignalEmitOutcome::Emitted
+    } else {
         let mut map = signal_debounce().lock();
         if map.get(&key).copied() == Some(now_ms) {
             map.remove(&key);
@@ -9942,7 +10106,9 @@ pub fn list_pending_signals(config: &Config, project_slug: Option<&str>) -> Vec<
                     Ok(c) => c,
                     Err(_) => continue,
                 };
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) { results.push(val) } else {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    results.push(val)
+                } else {
                     let agent = entry
                         .path()
                         .file_stem()
@@ -10243,7 +10409,10 @@ fn relative_date_from_secs(authored_secs: i64) -> String {
     let days = delta / 86400;
     if days > 30 {
         // Format as "Feb 08, 2026"
-        DateTime::from_timestamp(authored_secs, 0).map_or_else(|| "unknown".to_string(), |dt| dt.format("%b %d, %Y").to_string())
+        DateTime::from_timestamp(authored_secs, 0).map_or_else(
+            || "unknown".to_string(),
+            |dt| dt.format("%b %d, %Y").to_string(),
+        )
     } else if days > 0 {
         if days == 1 {
             "1 day ago".to_string()
@@ -10604,9 +10773,7 @@ pub fn get_archive_tree(archive: &ProjectArchive, path: &str) -> Result<Vec<Tree
         let (entry_type, size) = match item.kind() {
             Some(git2::ObjectType::Tree) => ("dir".to_string(), 0),
             Some(git2::ObjectType::Blob) => {
-                let sz = repo
-                    .find_blob(item.id())
-                    .map_or(0, |b| b.size() as u64);
+                let sz = repo.find_blob(item.id()).map_or(0, |b| b.size() as u64);
                 ("file".to_string(), sz)
             }
             _ => ("file".to_string(), 0),
@@ -12105,7 +12272,11 @@ pub fn check_archive_consistency(
     let mut missing_ids: Vec<i64> = Vec::new();
 
     for msg in messages {
-        let project_slug = if let Ok(project_slug) = validate_archive_component("project slug", &msg.project_slug) { project_slug } else {
+        let project_slug = if let Ok(project_slug) =
+            validate_archive_component("project slug", &msg.project_slug)
+        {
+            project_slug
+        } else {
             missing += 1;
             if missing_ids.len() < 20 {
                 missing_ids.push(msg.message_id);
@@ -12117,7 +12288,9 @@ pub fn check_archive_consistency(
         let project_dir = storage_root.join("projects").join(project_slug);
 
         // Parse the ISO timestamp to extract year/month
-        let (year, month) = if let Some(ym) = parse_year_month(&msg.created_ts_iso) { ym } else {
+        let (year, month) = if let Some(ym) = parse_year_month(&msg.created_ts_iso) {
+            ym
+        } else {
             // Can't determine path; count as missing
             missing += 1;
             if missing_ids.len() < 20 {

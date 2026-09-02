@@ -40,7 +40,10 @@ struct SharedBufferWriter {
 
 impl SharedBufferWriter {
     fn snapshot(&self) -> Vec<u8> {
-        self.buf.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 

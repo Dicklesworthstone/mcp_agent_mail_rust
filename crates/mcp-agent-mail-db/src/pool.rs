@@ -3303,7 +3303,6 @@ impl DbPool {
         Self::new_with_options(config, true, true)
     }
 
-    #[must_use]
     /// Bind the canonical mailbox path this wrapper is a private read-only
     /// materialization of.
     ///
@@ -3319,9 +3318,10 @@ impl DbPool {
         self
     }
 
-    /// The path Search V3 identifies this pool's database by: the bound
-    /// canonical mailbox path for a snapshot-backed wrapper, otherwise the
-    /// file actually opened.
+    /// The path Search V3 identifies this pool's database by.
+    ///
+    /// The bound canonical mailbox path for a snapshot-backed wrapper,
+    /// otherwise the file actually opened.
     #[must_use]
     pub fn search_identity_path(&self) -> &str {
         self.search_identity_path
@@ -3329,6 +3329,7 @@ impl DbPool {
             .unwrap_or(&self.sqlite_path)
     }
 
+    #[must_use]
     pub fn sqlite_path(&self) -> &str {
         &self.sqlite_path
     }
@@ -7133,7 +7134,84 @@ fn sqlite_pragma_check_is_ok_canonical(
 ) -> Result<bool, SqlError> {
     let details = sqlite_pragma_check_details_canonical(conn, kind)?;
     Ok(integrity::details_indicate_ok(&details)
-        || integrity::integrity_details_are_suspect(&details))
+        || integrity::integrity_details_are_suspect(&details)
+        || canonical_details_are_collated_index_disagreement(conn, &details))
+}
+
+/// GH#293: whether a canonical verdict is only collated-index lookup misses.
+///
+/// True when the `integrity_check` details consist solely of
+/// `row N missing from index <name>` rows for indexes that declare a
+/// non-BINARY collation — the signature canonical SQLite produces on a
+/// `COLLATE NOCASE` index the primary engine wrote (or re-sorted in a
+/// `VACUUM INTO` image), because the two engines fold case in opposite
+/// directions. Every entry is present (no `wrong # of entries` row), so this
+/// is a collation-order disagreement, not damage. Logs the acceptance so the
+/// class stays visible to operators.
+#[must_use]
+pub fn canonical_details_are_collated_index_disagreement(
+    conn: &crate::CanonicalDbConn,
+    details: &[String],
+) -> bool {
+    let Some(index_names) = integrity::collated_index_disagreement_index_names(details) else {
+        return false;
+    };
+    let all_collated = index_names.iter().all(|index_name| {
+        canonical_conn_index_declares_collation(conn, index_name).unwrap_or(false)
+    });
+    if all_collated {
+        tracing::info!(
+            indexes = ?index_names,
+            rows = details.len(),
+            "canonical integrity_check only reported lookup misses on collated indexes; \
+             treating the verdict as a cross-engine NOCASE ordering disagreement, not damage (GH#293)"
+        );
+    }
+    all_collated
+}
+
+/// Whether `index_name` (or a column of its table) declares a non-BINARY
+/// collation.
+///
+/// Read from `sqlite_master` on an open canonical connection. `None` when the schema cannot be read or the index does not exist.
+#[must_use]
+fn canonical_conn_index_declares_collation(
+    conn: &crate::CanonicalDbConn,
+    index_name: &str,
+) -> Option<bool> {
+    let quoted = index_name.replace('\'', "''");
+    let rows = conn
+        .query_sync(
+            &format!(
+                "SELECT COALESCE(sql, '') AS sql, tbl_name FROM sqlite_master \
+                 WHERE type = 'index' AND name = '{quoted}' LIMIT 1"
+            ),
+            &[],
+        )
+        .ok()?;
+    let row = rows.first()?;
+    let index_sql = row.get_named::<String>("sql").unwrap_or_default();
+    if sql_declares_non_binary_collation(&index_sql) {
+        return Some(true);
+    }
+    let table = row
+        .get_named::<String>("tbl_name")
+        .unwrap_or_default()
+        .replace('\'', "''");
+    let table_rows = conn
+        .query_sync(
+            &format!(
+                "SELECT COALESCE(sql, '') AS sql FROM sqlite_master \
+                 WHERE type = 'table' AND name = '{table}' LIMIT 1"
+            ),
+            &[],
+        )
+        .ok()?;
+    let table_sql = table_rows
+        .first()
+        .and_then(|row| row.get_named::<String>("sql").ok())
+        .unwrap_or_default();
+    Some(sql_declares_non_binary_collation(&table_sql))
 }
 
 #[allow(clippy::result_large_err)]
@@ -7165,9 +7243,10 @@ fn sqlite_canonical_file_check_is_ok(
     })
 }
 
-/// Marker embedded in the error a canonical second opinion returns when it
-/// could only inspect a private staged copy of a live family and that copy
-/// did NOT pass. A copy taken under a live writer can be torn, so its
+/// Marker for a canonical second opinion that could only inspect a staged
+/// copy which did not pass.
+///
+/// Embedded in the returned error. A copy taken under a live writer can be torn, so its
 /// rejection is never authoritative; [`reconcile_with_canonical`] defers on
 /// this class exactly like a lock/busy failure instead of confirming
 /// corruption from it. Acceptance of the copy is authoritative (a torn copy
@@ -7179,8 +7258,10 @@ fn is_canonical_second_opinion_inconclusive(message: &str) -> bool {
     message.contains(CANONICAL_SECOND_OPINION_INCONCLUSIVE)
 }
 
-/// Whether the SQLite family at `path` currently carries FrankenSQLite
-/// namespace authority (`-fsqlite-ns-gate` / `-fsqlite-ns-use`), the exact
+/// Whether the SQLite family at `path` carries FrankenSQLite namespace
+/// authority.
+///
+/// That is the `-fsqlite-ns-gate` / `-fsqlite-ns-use` pair, the exact
 /// condition under which the guarded canonical opener refuses a cross-engine
 /// open of the live inode.
 #[must_use]
@@ -7201,6 +7282,8 @@ fn sqlite_family_carries_franken_namespace(path: &Path) -> bool {
 /// `am robot health` trusts. Before this seam the admitted case was simply
 /// refused, which left every runtime second opinion on a live mailbox
 /// unanswerable and a primary-engine false positive unrefutable (GH#293).
+///
+/// Run a canonical diagnostic directly or on a staged copy.
 ///
 /// Returns the probe's value plus whether it ran on a staged copy, so callers
 /// that fold a boolean verdict can refuse to trust a *rejection* of a copy
@@ -7226,8 +7309,9 @@ fn with_canonical_diagnostic_conn_raw<T>(
     probe(&conn).map(|value| (value, true))
 }
 
-/// Boolean canonical verdict on the family at `path`. A verdict from a staged
-/// copy is only trusted when it ACCEPTS the copy: a copy taken under a live
+/// Boolean canonical verdict on the family at `path`.
+///
+/// A verdict from a staged copy is only trusted when it ACCEPTS the copy: a copy taken under a live
 /// writer can be torn, so its rejection is reported as
 /// [`CANONICAL_SECOND_OPINION_INCONCLUSIVE`] rather than as a canonical
 /// rejection.
@@ -7248,45 +7332,21 @@ fn with_canonical_diagnostic_conn(
     }
 }
 
-/// The index name a primary-probe integrity complaint refers to, when the
-/// complaint is about index ordering or an index lookup miss. Understands the
+/// The index name a primary-probe integrity complaint refers to.
+///
+/// Only for ordering or lookup-miss complaints. Understands the
 /// FrankenSQLite spellings (``index `NAME` entries are out of order …`` and
 /// ``table `t` rowid N is missing from index `NAME` ``) and canonical
 /// SQLite's (`row N missing from index NAME`).
 #[must_use]
 fn primary_complaint_index_name(message: &str) -> Option<String> {
-    let lower = message.to_ascii_lowercase();
-    if !(lower.contains("entries are out of order") || lower.contains("missing from index")) {
-        return None;
-    }
-    let name_token = |rest: &str| -> Option<String> {
-        let rest = rest.trim_start().trim_start_matches(['`', '"']);
-        let name: String = rest
-            .chars()
-            .take_while(|c| !(c.is_whitespace() || matches!(c, '`' | '"' | ';' | ',' | ')')))
-            .collect();
-        (!name.is_empty()).then_some(name)
-    };
-    // Every spelling names the index right after the word "index": the
-    // FrankenSQLite leaf-scan report (``index `NAME` entries …``), its lookup
-    // report (``… missing from index `NAME` ``), canonical SQLite's
-    // (`… missing from index NAME`), and the older `… for index NAME` form.
-    // Skip an "index" that is followed by prose rather than a name.
-    let mut search_from = 0;
-    while let Some(rel) = lower[search_from..].find("index ") {
-        let after = search_from + rel + "index ".len();
-        if let Some(name) = name_token(&message[after..])
-            && !matches!(name.as_str(), "entries" | "entry" | "is" | "for")
-        {
-            return Some(name);
-        }
-        search_from = after;
-    }
-    None
+    integrity::index_order_complaint_index_name(message)
 }
 
 /// Whether a primary-probe corruption complaint is the KNOWN frankensqlite
-/// collated-index class (GH#185, GH#293, upstream fsqlite#112): the primary
+/// collated-index class.
+///
+/// (GH#185, GH#293, upstream fsqlite#112.) The primary
 /// engine has compared or probed a `COLLATE NOCASE` index with a different
 /// key order than the one the index was written in, so a healthy index (e.g.
 /// `idx_agents_project_name_nocase`, whose order around `[` (0x5B) versus
@@ -7337,44 +7397,17 @@ fn sql_declares_non_binary_collation(sql: &str) -> bool {
 }
 
 /// Ask canonical SQLite whether `index_name` in the family at `path` declares
-/// (directly, or through a column of its table) a non-BINARY collation.
-/// `None` when the schema cannot be inspected or the index does not exist.
+/// a non-BINARY collation.
+///
+/// Directly, or through a column of its table. `None` when the schema cannot be inspected or the index does not exist.
 #[must_use]
 fn canonical_index_declares_collation(path: &Path, index_name: &str) -> Option<bool> {
-    let quoted = index_name.replace('\'', "''");
     with_canonical_diagnostic_conn_raw(path, "collated index diagnostic", |conn| {
-        let rows = conn.query_sync(
-            &format!(
-                "SELECT COALESCE(sql, '') AS sql, tbl_name FROM sqlite_master \
-                 WHERE type = 'index' AND name = '{quoted}' LIMIT 1"
-            ),
-            &[],
-        )?;
-        let Some(row) = rows.first() else {
-            return Err(SqlError::Custom(format!(
+        canonical_conn_index_declares_collation(conn, index_name).ok_or_else(|| {
+            SqlError::Custom(format!(
                 "index {index_name} is not present in sqlite_master"
-            )));
-        };
-        let index_sql = row.get_named::<String>("sql").unwrap_or_default();
-        if sql_declares_non_binary_collation(&index_sql) {
-            return Ok(true);
-        }
-        let table = row
-            .get_named::<String>("tbl_name")
-            .unwrap_or_default()
-            .replace('\'', "''");
-        let table_rows = conn.query_sync(
-            &format!(
-                "SELECT COALESCE(sql, '') AS sql FROM sqlite_master \
-                 WHERE type = 'table' AND name = '{table}' LIMIT 1"
-            ),
-            &[],
-        )?;
-        let table_sql = table_rows
-            .first()
-            .and_then(|row| row.get_named::<String>("sql").ok())
-            .unwrap_or_default();
-        Ok(sql_declares_non_binary_collation(&table_sql))
+            ))
+        })
     })
     .ok()
     .map(|(declares, _staged)| declares)
@@ -11831,8 +11864,9 @@ pub fn open_guarded_read_only_sqlite_file(
 }
 
 /// Read the mailbox generation token (`db_identity.generation_id`) from the
-/// SQLite file at `path` through the engine-dispatching guarded read-only
-/// opener. The token is minted when a database file is first created and
+/// SQLite file at `path`.
+///
+/// Uses the engine-dispatching guarded read-only opener. The token is minted when a database file is first created and
 /// re-minted only when the file is wiped and re-created, so it identifies a
 /// database *generation* independently of the inode that currently holds it
 /// (a same-path replacement by `VACUUM INTO` + rename, a backup restore, or
@@ -21415,9 +21449,10 @@ mod tests {
         );
     }
 
-    /// GH#293: every spelling the primary engine (and canonical SQLite, on an
-    /// image the primary engine rebuilt) uses for a collated-index order or
-    /// lookup complaint must resolve to the same index name.
+    /// GH#293: every engine spelling resolves to the same index name.
+    ///
+    /// Covers the primary engine and canonical SQLite (on an image the
+    /// primary engine rebuilt) for collated-index order or lookup complaints.
     #[test]
     fn primary_complaint_index_name_understands_every_engine_spelling() {
         assert_eq!(
@@ -21451,22 +21486,30 @@ mod tests {
             Some("idx_agents_project_name_nocase")
         );
         assert_eq!(
-            primary_complaint_index_name("row 4107 missing from index idx_agents_last_active_id_desc")
-                .as_deref(),
+            primary_complaint_index_name(
+                "row 4107 missing from index idx_agents_last_active_id_desc"
+            )
+            .as_deref(),
             Some("idx_agents_last_active_id_desc")
         );
         assert!(primary_complaint_index_name("database disk image is malformed").is_none());
     }
 
-    /// GH#293: the collated-index class is decided by the index's declared
-    /// collation when the schema can be read, and only by the `*_nocase`
-    /// naming convention when it cannot. An index on a BINARY column is never
+    /// GH#293: the collated-index class follows the declared collation.
+    ///
+    /// Decided by the index's declared collation when the schema can be read,
+    /// and only by the `*_nocase` naming convention when it cannot. An index on a BINARY column is never
     /// waved through, whatever its name.
     #[test]
     fn collated_index_false_positive_requires_a_collated_index() {
-        let missing = "table `agents` rowid 79 is missing from index `idx_agents_project_name_nocase`";
-        assert!(is_known_collated_index_false_positive(missing, |_| Some(true)));
-        assert!(!is_known_collated_index_false_positive(missing, |_| Some(false)));
+        let missing =
+            "table `agents` rowid 79 is missing from index `idx_agents_project_name_nocase`";
+        assert!(is_known_collated_index_false_positive(missing, |_| Some(
+            true
+        )));
+        assert!(!is_known_collated_index_false_positive(missing, |_| Some(
+            false
+        )));
         assert!(is_known_collated_index_false_positive(missing, |_| None));
         assert!(!is_known_collated_index_false_positive(
             "row 4107 missing from index idx_agents_last_active_id_desc",
@@ -21489,7 +21532,9 @@ mod tests {
         assert!(!sql_declares_non_binary_collation(
             "CREATE INDEX idx_x ON t(name COLLATE BINARY)"
         ));
-        assert!(!sql_declares_non_binary_collation("CREATE INDEX idx_x ON t(name)"));
+        assert!(!sql_declares_non_binary_collation(
+            "CREATE INDEX idx_x ON t(name)"
+        ));
     }
 
     #[test]
@@ -22865,103 +22910,184 @@ mod tests {
         assert!(healthy, "valid DB should be healthy");
     }
 
-    /// GH#293 exploration: canonical-built NOCASE index whose order depends on
-    /// how `[` (0x5B) folds against ASCII letters.
+    /// GH#293: agent names around the `[` (0x5B) boundary.
+    ///
+    /// A `COLLATE NOCASE` key order there depends on whether the engine folds case
+    /// upward (`'Y'` 0x59 < `'['`) or downward (`'['` < `'y'` 0x79).
+    /// Canonical SQLite folds down; the primary engine folds up.
+    const NOCASE_BOUNDARY_NAMES: &[&str] = &[
+        "YellowTurtle",
+        "BlueDog",
+        "YellowStork",
+        "apple",
+        "Zulu",
+        "[unknown-agent-94]",
+        "_under",
+        "yak",
+        "[bracket]",
+        "Yak2",
+    ];
+
+    const NOCASE_FIXTURE_DDL: &[&str] = &[
+        "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+        "CREATE UNIQUE INDEX idx_agents_project_name_nocase ON agents(project_id, name COLLATE NOCASE)",
+    ];
+
+    fn nocase_fixture_inserts() -> Vec<String> {
+        NOCASE_BOUNDARY_NAMES
+            .iter()
+            .map(|name| format!("INSERT INTO agents(project_id, name) VALUES (1, '{name}')"))
+            .collect()
+    }
+
+    /// A NOCASE-indexed mailbox fragment written by canonical SQLite.
+    ///
+    /// The shape `am doctor reconstruct`, a `.bak` restore, or canonical
+    /// tooling leaves behind.
+    fn seed_nocase_fixture_canonical(path: &Path) {
+        let conn = crate::CanonicalDbConn::open_file(sqlite_path_as_utf8(path).unwrap())
+            .expect("canonical open");
+        for sql in NOCASE_FIXTURE_DDL
+            .iter()
+            .copied()
+            .map(str::to_string)
+            .chain(nocase_fixture_inserts())
+        {
+            conn.execute_raw(&sql).expect("canonical seed");
+        }
+        let rows = conn
+            .query_sync("PRAGMA integrity_check", &[])
+            .expect("canonical check");
+        let details = integrity::extract_check_details(&rows, integrity::CheckKind::Full);
+        assert!(
+            integrity::details_indicate_ok(&details),
+            "precondition: canonical-built fixture is canonical-ok: {details:?}"
+        );
+    }
+
+    /// The same fragment written by the primary engine.
+    ///
+    /// The shape a live mailbox has after the daemon registered the agents.
+    fn seed_nocase_fixture_franken(path: &Path) {
+        let conn = DbConn::open_file(sqlite_path_as_utf8(path).unwrap()).expect("franken open");
+        for sql in NOCASE_FIXTURE_DDL
+            .iter()
+            .copied()
+            .map(str::to_string)
+            .chain(nocase_fixture_inserts())
+        {
+            conn.execute_raw(&sql).expect("franken seed");
+        }
+        let rows = conn
+            .query_sync("PRAGMA integrity_check", &[])
+            .expect("franken check");
+        let details = integrity::extract_check_details(&rows, integrity::CheckKind::Full);
+        assert!(
+            integrity::details_indicate_ok(&details),
+            "precondition: primary-built fixture is primary-ok: {details:?}"
+        );
+        crate::close_db_conn(conn, "nocase fixture");
+    }
+
+    /// GH#293: a canonical-written NOCASE index is healthy.
+    ///
+    /// The primary engine's `integrity_check` calls it "entries are out of
+    /// order"; the
+    /// canonical second opinion (on the physical bytes) overrules it, both on
+    /// the health-probe path and on the integrity-guard reconcile path.
     #[test]
-    fn nocase_probe_exploration() {
+    fn nocase_index_written_by_canonical_is_healthy_despite_primary_order_complaint() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nocase.db");
-        let path_str = path.to_string_lossy().to_string();
-        {
-            let conn = crate::CanonicalDbConn::open_file(&path_str).expect("canonical open");
-            conn.execute_raw(
-                "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
-            )
-            .unwrap();
-            conn.execute_raw(
-                "CREATE UNIQUE INDEX idx_agents_project_name_nocase ON agents(project_id, name COLLATE NOCASE)",
-            )
-            .unwrap();
-            for name in [
-                "YellowTurtle",
-                "BlueDog",
-                "YellowStork",
-                "apple",
-                "Zulu",
-                "[unknown-agent-94]",
-                "_under",
-                "yak",
-                "[bracket]",
-                "Yak2",
-            ] {
-                conn.execute_raw(&format!(
-                    "INSERT INTO agents(project_id, name) VALUES (1, '{name}')"
-                ))
-                .unwrap();
-            }
-            let rows = conn.query_sync("PRAGMA integrity_check", &[]).unwrap();
-            eprintln!("canonical-built canonical check rows={}", rows.len());
+        let path = dir.path().join("canonical-nocase.sqlite3");
+        seed_nocase_fixture_canonical(&path);
+
+        assert!(
+            sqlite_file_is_healthy(&path).expect("health probe"),
+            "a canonical-ok mailbox must never be declared unhealthy over NOCASE order"
+        );
+        assert!(
+            sqlite_file_is_healthy_without_family_cleanup(&path).expect("fail-open probe"),
+            "the startup fail-open check must accept the canonical-ok mailbox"
+        );
+
+        // The verdict the primary engine actually raises on this file, fed
+        // through the runtime reconcile with the REAL canonical second opinion.
+        let primary = Err(DbError::IntegrityCorruption {
+            message: "database disk image is malformed: index `idx_agents_project_name_nocase` \
+                      entries are out of order for their declared key directions"
+                .to_string(),
+            details: vec![],
+        });
+        let out = reconcile_with_canonical(
+            primary,
+            integrity::CheckKind::Full,
+            "gh293",
+            sqlite_path_as_utf8(&path).unwrap(),
+            || sqlite_canonical_file_check_is_ok(&path, integrity::CheckKind::Full),
+            || false,
+        )
+        .expect("reconcile must accept the collated-index false positive");
+        assert!(out.ok);
+    }
+
+    /// GH#293: a NOCASE index the primary engine wrote passes canonical.
+    ///
+    /// It is in the primary engine's key order, so canonical SQLite's `integrity_check` reports
+    /// every boundary row as `missing from index` while every entry is
+    /// present. That is a collation-order disagreement, not damage: the
+    /// canonical second opinion must still accept the file.
+    #[test]
+    fn nocase_index_written_by_primary_engine_passes_canonical_second_opinion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("franken-nocase.sqlite3");
+        seed_nocase_fixture_franken(&path);
+
+        let raw_canonical_details =
+            with_canonical_diagnostic_conn_raw(&path, "gh293 raw", |conn| {
+                sqlite_pragma_check_details_canonical(conn, integrity::CheckKind::Full)
+            })
+            .expect("canonical raw details")
+            .0;
+        if !integrity::details_indicate_ok(&raw_canonical_details) {
+            assert_eq!(
+                integrity::collated_index_disagreement_index_names(&raw_canonical_details)
+                    .as_deref(),
+                Some(&["idx_agents_project_name_nocase".to_string()][..]),
+                "canonical may only disagree through collated-index lookup misses: {raw_canonical_details:?}"
+            );
         }
-        let conn = DbConn::open_file(&path_str).expect("franken open");
-        let rows = conn.query_sync("PRAGMA integrity_check", &[]);
-        eprintln!("FSQLITE integrity_check on canonical-built: {rows:?}");
-        let rows = conn.query_sync("PRAGMA quick_check", &[]);
-        eprintln!("FSQLITE quick_check on canonical-built: {rows:?}");
-        let vac = dir.path().join("vac.db");
-        let vac_str = vac.to_string_lossy().to_string();
-        let r = conn.execute_raw(&format!("VACUUM INTO '{vac_str}'"));
-        eprintln!("FSQLITE vacuum into: {r:?}");
-        drop(conn);
-        if vac.exists() {
-            let cconn = crate::CanonicalDbConn::open_file(&vac_str).expect("canonical open vac");
-            let rows = cconn.query_sync("PRAGMA integrity_check", &[]).unwrap();
-            eprintln!("CANONICAL integrity_check on fsqlite VACUUM INTO image: {rows:?}");
-        }
-        // fsqlite-built DB checked by canonical
-        let path2 = dir.path().join("fbuilt.db");
-        let path2_str = path2.to_string_lossy().to_string();
-        {
-            let conn = DbConn::open_file(&path2_str).expect("franken open");
-            conn.execute_raw(
-                "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
-            )
-            .unwrap();
-            conn.execute_raw(
-                "CREATE UNIQUE INDEX idx_agents_project_name_nocase ON agents(project_id, name COLLATE NOCASE)",
-            )
-            .unwrap();
-            for name in [
-                "YellowTurtle",
-                "BlueDog",
-                "YellowStork",
-                "apple",
-                "Zulu",
-                "[unknown-agent-94]",
-                "_under",
-                "yak",
-                "[bracket]",
-                "Yak2",
-            ] {
-                conn.execute_raw(&format!(
-                    "INSERT INTO agents(project_id, name) VALUES (1, '{name}')"
-                ))
-                .unwrap();
-            }
-            let rows = conn.query_sync("PRAGMA integrity_check", &[]);
-            eprintln!("FSQLITE integrity_check on fsqlite-built: {rows:?}");
-            crate::close_db_conn(conn, "fbuilt");
-        }
-        let cconn = crate::CanonicalDbConn::open_file(&path2_str).expect("canonical open fbuilt");
-        let rows = cconn.query_sync("PRAGMA integrity_check", &[]).unwrap();
-        eprintln!("CANONICAL integrity_check on fsqlite-built: {rows:?}");
-        let rows = cconn
-            .query_sync(
-                "SELECT name FROM agents WHERE project_id=1 ORDER BY name COLLATE NOCASE",
-                &[],
-            )
-            .unwrap();
-        eprintln!("canonical NOCASE order on fsqlite-built: {rows:?}");
-        panic!("exploration done");
+
+        assert!(
+            sqlite_canonical_file_check_is_ok(&path, integrity::CheckKind::Full)
+                .expect("canonical second opinion"),
+            "canonical lookup misses on a collated index the primary engine wrote are not damage"
+        );
+        assert!(sqlite_file_is_healthy(&path).expect("health probe"));
+        assert!(sqlite_file_is_healthy_without_family_cleanup(&path).expect("fail-open probe"));
+    }
+
+    /// The collated-index class never absorbs a real entry-count mismatch.
+    #[test]
+    fn collated_index_disagreement_requires_every_row_to_be_a_lookup_miss() {
+        let only_misses = vec![
+            "row 1 missing from index idx_agents_project_name_nocase".to_string(),
+            "row 9 missing from index idx_agents_project_name_nocase".to_string(),
+        ];
+        assert_eq!(
+            integrity::collated_index_disagreement_index_names(&only_misses).as_deref(),
+            Some(&["idx_agents_project_name_nocase".to_string()][..])
+        );
+        let with_count_mismatch = vec![
+            "row 1 missing from index idx_agents_project_name_nocase".to_string(),
+            "wrong # of entries in index idx_agents_project_name_nocase".to_string(),
+        ];
+        assert!(integrity::collated_index_disagreement_index_names(&with_count_mismatch).is_none());
+        let with_page_damage = vec![
+            "row 1 missing from index idx_agents_project_name_nocase".to_string(),
+            "Page 7 is never used".to_string(),
+        ];
+        assert!(integrity::collated_index_disagreement_index_names(&with_page_damage).is_none());
+        assert!(integrity::collated_index_disagreement_index_names(&["ok".to_string()]).is_none());
     }
 
     fn seed_healthy_probe_db(dir: &Path, name: &str) -> PathBuf {

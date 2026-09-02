@@ -455,6 +455,80 @@ pub fn index_only_corruption_index_names(details: &[String]) -> Option<Vec<Strin
     if names.is_empty() { None } else { Some(names) }
 }
 
+/// GH#293: index names when every integrity-check row is a collated-index
+/// ordering or lookup complaint.
+///
+/// Matches when EVERY non-benign integrity-check row is
+/// an index *ordering* or *lookup* complaint — canonical SQLite's
+/// `row <N> missing from index <name>` or the primary engine's
+/// ``index `<name>` entries are out of order …`` — and no row reports an
+/// entry-count mismatch or any other damage.
+///
+/// That exact signature is what two engines produce when they fold a
+/// `COLLATE NOCASE` key in opposite directions: every entry is present (the
+/// counts agree), but the checker's binary search misses the rows whose
+/// position depends on how `[` (0x5B) compares to ASCII letters. Callers
+/// confirm each named index really declares a non-BINARY collation before
+/// treating the verdict as a collation disagreement rather than damage. A
+/// genuinely torn index also loses entries, which surfaces as
+/// `wrong # of entries in index …` and disqualifies this class.
+#[must_use]
+pub fn collated_index_disagreement_index_names(details: &[String]) -> Option<Vec<String>> {
+    fn detail_is_ignorable(detail: &str) -> bool {
+        let trimmed = detail.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        (trimmed.starts_with("***") && trimmed.ends_with("***"))
+            || lower == "ok"
+            || lower.contains("wal without shm")
+    }
+
+    let mut names: Vec<String> = Vec::new();
+    for detail in details {
+        if detail_is_ignorable(detail) {
+            continue;
+        }
+        let name = index_order_complaint_index_name(detail)?;
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() { None } else { Some(names) }
+}
+
+/// The index an ordering/lookup complaint names.
+///
+/// Understands every spelling the two engines use: ``index `NAME` entries are out of order …`` and
+/// ``table `t` rowid N is missing from index `NAME` `` (primary engine),
+/// `row N missing from index NAME` (canonical SQLite), and the older
+/// `… for index NAME` form. `None` for every other row, including
+/// `wrong # of entries in index NAME`, which is a real count mismatch.
+#[must_use]
+pub fn index_order_complaint_index_name(detail: &str) -> Option<String> {
+    let lower = detail.to_ascii_lowercase();
+    if !(lower.contains("entries are out of order") || lower.contains("missing from index")) {
+        return None;
+    }
+    let name_token = |rest: &str| -> Option<String> {
+        let rest = rest.trim_start().trim_start_matches(['`', '"']);
+        let name: String = rest
+            .chars()
+            .take_while(|c| !(c.is_whitespace() || matches!(c, '`' | '"' | ';' | ',' | ')')))
+            .collect();
+        (!name.is_empty()).then_some(name)
+    };
+    let mut search_from = 0;
+    while let Some(rel) = lower[search_from..].find("index ") {
+        let after = search_from + rel + "index ".len();
+        if let Some(name) = name_token(&detail[after..])
+            && !matches!(name.as_str(), "entries" | "entry" | "is" | "for")
+        {
+            return Some(name);
+        }
+        search_from = after;
+    }
+    None
+}
+
 /// Run `PRAGMA quick_check` on an open connection.
 ///
 /// This is fast (typically <100ms) and catches most common corruption.

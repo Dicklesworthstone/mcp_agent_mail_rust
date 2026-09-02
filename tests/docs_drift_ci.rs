@@ -143,8 +143,9 @@ mod container_release_contract {
         Ok(())
     }
 
-    /// Extract the value assigned to `key` on the first line that starts with
-    /// `prefix` (after trimming), e.g. `FRANKENSEARCH_COMMIT: <sha>` in a
+    /// Extract the value assigned on the first line starting with `prefix`.
+    ///
+    /// Lines are trimmed first, e.g. `FRANKENSEARCH_COMMIT: <sha>` in a
     /// workflow or `ARG FRANKENSEARCH_COMMIT=<sha>` in a Dockerfile.
     fn assigned_value<'a>(text: &'a str, prefix: &str, separator: char) -> Option<&'a str> {
         text.lines().map(str::trim).find_map(|line| {
@@ -154,8 +155,10 @@ mod container_release_contract {
         })
     }
 
-    /// The source Dockerfile must build against the exact frankensearch
-    /// revision dist.yml pins. Cloning the sibling at a floating ref broke
+    /// The source Dockerfile must build against the frankensearch revision
+    /// dist.yml pins.
+    ///
+    /// Cloning the sibling at a floating ref broke
     /// every `docker build` once the live frankensearch tree moved to a
     /// newer asupersync than the rest of the workspace can follow.
     #[test]

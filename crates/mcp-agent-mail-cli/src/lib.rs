@@ -30925,12 +30925,21 @@ fn doctor_classify_canonical_probe_error(message: &str, label: &str) -> Canonica
 fn doctor_classify_canonical_pragma_check(
     kind: mcp_agent_mail_db::CheckKind,
     result: CliResult<Vec<mcp_agent_mail_db::sqlmodel_core::Row>>,
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
 ) -> CanonicalProbeAuthority {
     match result {
         Ok(rows) => {
             let details = mcp_agent_mail_db::integrity::extract_check_details(&rows, kind);
             if mcp_agent_mail_db::integrity::details_indicate_ok(&details)
                 || mcp_agent_mail_db::integrity::integrity_details_are_suspect(&details)
+                // GH#293: `row N missing from index <nocase index>` with no
+                // count mismatch is the two engines folding NOCASE keys in
+                // opposite directions on an index the primary engine wrote,
+                // not damage; the schema is consulted to confirm the
+                // collation.
+                || mcp_agent_mail_db::pool::canonical_details_are_collated_index_disagreement(
+                    conn, &details,
+                )
             {
                 // `details_indicate_ok` is a clean "ok"; `integrity_details_are_suspect`
                 // is the engine giving a DEFINITIVE benign answer — only freelist /
@@ -30956,8 +30965,9 @@ fn doctor_classify_canonical_pragma_check(
     }
 }
 
-/// GH#293: a probe that ran on a logical export (`VACUUM INTO` produced by the
-/// primary engine) can prove nothing about the live bytes. Its indexes were
+/// GH#293: a probe on a logical export can prove nothing about the live bytes.
+///
+/// The export is a `VACUUM INTO` produced by the primary engine. Its indexes were
 /// re-sorted by the exporting engine, so a canonical "row N missing from index
 /// idx_agents_project_name_nocase" there is the exporting engine's `COLLATE
 /// NOCASE` ordering, not on-disk damage. Demote such a finding to
@@ -31061,7 +31071,7 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
         );
         let authority = doctor_demote_logical_export_corruption(
             logical_export,
-            doctor_classify_canonical_pragma_check(kind, rows),
+            doctor_classify_canonical_pragma_check(kind, rows, conn),
         );
         if let Some(verdict) = doctor_fold_probe_authority(authority, &mut inconclusive_reason) {
             return verdict;
@@ -56995,9 +57005,10 @@ startup_timeout_sec = 42
 
     // --- br-bvq1x.1.3 (A3): canonical double-probe cross-check ---
 
-    /// GH#293: a Franken-admitted family is cross-checked on a staged
-    /// physical copy, which is authoritative in both directions, rather than
-    /// on a logical export the primary engine rebuilt. A healthy admitted
+    /// GH#293: an admitted family is cross-checked on a staged physical copy.
+    ///
+    /// That copy is authoritative in both directions, unlike a logical export
+    /// the primary engine rebuilt. A healthy admitted
     /// mailbox therefore proves `Healthy` (and startup fails open) instead of
     /// dead-ending in an inconclusive precautionary reconstruct.
     #[test]
@@ -57012,6 +57023,25 @@ startup_timeout_sec = 42
                 .expect("admit fixture through the runtime engine");
             conn.query_sync("SELECT COUNT(*) AS n FROM projects", &[])
                 .expect("read through the runtime engine");
+            // Register agents whose `COLLATE NOCASE` order straddles `[`
+            // (0x5B) through the runtime engine, exactly as a live daemon
+            // does: canonical SQLite then reports these rows as "missing from
+            // index idx_agents_project_name_nocase" on the staged copy because
+            // the two engines fold case in opposite directions. That is the
+            // cross-engine disagreement class, never damage.
+            for name in [
+                "YellowTurtle",
+                "YellowStork",
+                "[unknown-agent-94]",
+                "apple",
+                "Zulu",
+            ] {
+                conn.execute_raw(&format!(
+                    "INSERT INTO agents (project_id, name, program, model, inception_ts, \
+                     last_active_ts) VALUES (1, '{name}', 'test', 'test', 1, 1)"
+                ))
+                .expect("register boundary agent through the runtime engine");
+            }
             mcp_agent_mail_db::close_db_conn(conn, "admit fixture");
         }
         assert!(

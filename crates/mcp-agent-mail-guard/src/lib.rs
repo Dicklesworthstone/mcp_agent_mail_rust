@@ -193,13 +193,12 @@ pub fn resolve_hooks_dir(repo_path: &Path) -> GuardResult<PathBuf> {
 }
 
 fn env_allows_global_hookspath() -> bool {
-    std::env::var("AGENT_MAIL_GUARD_ALLOW_GLOBAL_HOOKSPATH")
-        .is_ok_and(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "t" | "yes" | "y"
-            )
-        })
+    std::env::var("AGENT_MAIL_GUARD_ALLOW_GLOBAL_HOOKSPATH").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "t" | "yes" | "y"
+        )
+    })
 }
 
 /// Whether an install into a `core.hooksPath` configured at `level` must be
@@ -1588,12 +1587,10 @@ pub fn guard_status(repo: &Path) -> GuardResult<GuardStatus> {
     let pre_push_path = hooks_dir.join("pre-push");
 
     let pre_commit_present = pre_commit_path.exists()
-        && std::fs::read_to_string(&pre_commit_path)
-            .is_ok_and(|c| c.contains("mcp-agent-mail"));
+        && std::fs::read_to_string(&pre_commit_path).is_ok_and(|c| c.contains("mcp-agent-mail"));
 
     let pre_push_present = pre_push_path.exists()
-        && std::fs::read_to_string(&pre_push_path)
-            .is_ok_and(|c| c.contains("mcp-agent-mail"));
+        && std::fs::read_to_string(&pre_push_path).is_ok_and(|c| c.contains("mcp-agent-mail"));
 
     // Check if worktrees are enabled (core.hooksPath set)
     let worktrees_enabled = {
@@ -1615,13 +1612,12 @@ pub fn guard_status(repo: &Path) -> GuardResult<GuardStatus> {
 }
 
 fn is_truthy_value(value: Option<&str>) -> bool {
-    value
-        .is_some_and(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "t" | "yes" | "y"
-            )
-        })
+    value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "t" | "yes" | "y"
+        )
+    })
 }
 
 fn is_guard_gated_from_values(

@@ -73,7 +73,9 @@ fn make_archive_with_reservations(td: &Path) -> std::path::PathBuf {
 
 #[test]
 fn guard_mode_from_env_defaults_to_block() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&["AGENT_MAIL_GUARD_MODE"]);
 
     unsafe { std::env::remove_var("AGENT_MAIL_GUARD_MODE") };
@@ -82,7 +84,9 @@ fn guard_mode_from_env_defaults_to_block() {
 
 #[test]
 fn guard_mode_from_env_warn() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&["AGENT_MAIL_GUARD_MODE"]);
 
     unsafe { std::env::set_var("AGENT_MAIL_GUARD_MODE", "warn") };
@@ -91,7 +95,9 @@ fn guard_mode_from_env_warn() {
 
 #[test]
 fn guard_mode_from_env_warn_case_insensitive() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&["AGENT_MAIL_GUARD_MODE"]);
 
     unsafe { std::env::set_var("AGENT_MAIL_GUARD_MODE", "WARN") };
@@ -100,7 +106,9 @@ fn guard_mode_from_env_warn_case_insensitive() {
 
 #[test]
 fn guard_mode_from_env_unknown_defaults_to_block() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&["AGENT_MAIL_GUARD_MODE"]);
 
     unsafe { std::env::set_var("AGENT_MAIL_GUARD_MODE", "unknown_value") };
@@ -109,7 +117,9 @@ fn guard_mode_from_env_unknown_defaults_to_block() {
 
 #[test]
 fn guard_mode_from_env_whitespace_trimmed() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&["AGENT_MAIL_GUARD_MODE"]);
 
     unsafe { std::env::set_var("AGENT_MAIL_GUARD_MODE", "  warn  ") };
@@ -122,7 +132,9 @@ fn guard_mode_from_env_whitespace_trimmed() {
 
 #[test]
 fn guard_check_full_bypass_returns_empty_conflicts() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&["AGENT_MAIL_BYPASS"]);
 
     let td = tempfile::TempDir::new().expect("tempdir");
@@ -137,7 +149,9 @@ fn guard_check_full_bypass_returns_empty_conflicts() {
 
 #[test]
 fn guard_check_full_active_when_neither_flag_set() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&[
         "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
         "WORKTREES_ENABLED",
@@ -169,7 +183,9 @@ fn guard_check_full_active_when_neither_flag_set() {
 
 #[test]
 fn guard_check_full_gated_when_enforcement_explicitly_disabled() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&[
         "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
         "WORKTREES_ENABLED",
@@ -201,7 +217,9 @@ fn guard_check_full_gated_when_enforcement_explicitly_disabled() {
 
 #[test]
 fn guard_check_full_missing_agent_name_returns_error() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&[
         "WORKTREES_ENABLED",
         "AGENT_NAME",
@@ -229,7 +247,9 @@ fn guard_check_full_missing_agent_name_returns_error() {
 
 #[test]
 fn guard_check_full_detects_conflict_when_enabled() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&["WORKTREES_ENABLED", "AGENT_NAME", "AGENT_MAIL_BYPASS"]);
 
     let td = tempfile::TempDir::new().expect("tempdir");
@@ -251,7 +271,9 @@ fn guard_check_full_detects_conflict_when_enabled() {
 
 #[test]
 fn guard_check_full_no_conflict_for_own_reservations() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&["WORKTREES_ENABLED", "AGENT_NAME", "AGENT_MAIL_BYPASS"]);
 
     let td = tempfile::TempDir::new().expect("tempdir");
@@ -273,7 +295,9 @@ fn guard_check_full_no_conflict_for_own_reservations() {
 
 #[test]
 fn guard_check_full_no_conflict_for_own_reservations_case_insensitively() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&["WORKTREES_ENABLED", "AGENT_NAME", "AGENT_MAIL_BYPASS"]);
 
     let td = tempfile::TempDir::new().expect("tempdir");
@@ -295,7 +319,9 @@ fn guard_check_full_no_conflict_for_own_reservations_case_insensitively() {
 
 #[test]
 fn guard_check_full_resolves_current_pane_identity_when_agent_name_is_unset() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&[
         "WORKTREES_ENABLED",
         "AGENT_NAME",
@@ -335,7 +361,9 @@ fn guard_check_full_resolves_current_pane_identity_when_agent_name_is_unset() {
 
 #[test]
 fn guard_check_full_empty_archive_no_conflicts() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&["WORKTREES_ENABLED", "AGENT_NAME", "AGENT_MAIL_BYPASS"]);
 
     let td = tempfile::TempDir::new().expect("tempdir");
@@ -359,7 +387,9 @@ fn guard_check_full_empty_archive_no_conflicts() {
 
 #[test]
 fn guard_check_missing_agent_name_returns_error() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&["AGENT_NAME"]);
 
     let td = tempfile::TempDir::new().expect("tempdir");
@@ -374,7 +404,9 @@ fn guard_check_missing_agent_name_returns_error() {
 
 #[test]
 fn guard_check_detects_conflicts() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&["AGENT_NAME"]);
 
     let td = tempfile::TempDir::new().expect("tempdir");
@@ -390,7 +422,9 @@ fn guard_check_detects_conflicts() {
 
 #[test]
 fn guard_check_no_conflicts_for_unrelated_paths() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&["AGENT_NAME"]);
 
     let td = tempfile::TempDir::new().expect("tempdir");
@@ -410,7 +444,9 @@ fn guard_check_no_conflicts_for_unrelated_paths() {
 
 #[test]
 fn guard_check_empty_paths_no_conflicts() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&["AGENT_NAME"]);
 
     let td = tempfile::TempDir::new().expect("tempdir");
@@ -428,7 +464,9 @@ fn guard_check_empty_paths_no_conflicts() {
 
 #[test]
 fn is_guard_gated_with_worktrees_enabled() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&[
         "WORKTREES_ENABLED",
         "GIT_IDENTITY_ENABLED",
@@ -445,7 +483,9 @@ fn is_guard_gated_with_worktrees_enabled() {
 
 #[test]
 fn is_guard_gated_with_git_identity_enabled() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&[
         "WORKTREES_ENABLED",
         "GIT_IDENTITY_ENABLED",
@@ -462,7 +502,9 @@ fn is_guard_gated_with_git_identity_enabled() {
 
 #[test]
 fn is_guard_gated_true_when_neither_set() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&[
         "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
         "WORKTREES_ENABLED",
@@ -481,7 +523,9 @@ fn is_guard_gated_true_when_neither_set() {
 
 #[test]
 fn is_guard_gated_false_only_when_enforcement_explicitly_disabled() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&[
         "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
         "WORKTREES_ENABLED",
@@ -498,7 +542,9 @@ fn is_guard_gated_false_only_when_enforcement_explicitly_disabled() {
 
 #[test]
 fn is_guard_gated_not_disabled_by_worktrees_false() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&[
         "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
         "WORKTREES_ENABLED",
@@ -516,7 +562,9 @@ fn is_guard_gated_not_disabled_by_worktrees_false() {
 
 #[test]
 fn is_bypass_active_when_set() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&["AGENT_MAIL_BYPASS"]);
 
     unsafe { std::env::set_var("AGENT_MAIL_BYPASS", "1") };
@@ -525,7 +573,9 @@ fn is_bypass_active_when_set() {
 
 #[test]
 fn is_bypass_active_false_when_unset() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&["AGENT_MAIL_BYPASS"]);
 
     unsafe { std::env::remove_var("AGENT_MAIL_BYPASS") };
@@ -534,7 +584,9 @@ fn is_bypass_active_false_when_unset() {
 
 #[test]
 fn is_bypass_active_false_for_zero() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvGuard::save(&["AGENT_MAIL_BYPASS"]);
 
     unsafe { std::env::set_var("AGENT_MAIL_BYPASS", "0") };
