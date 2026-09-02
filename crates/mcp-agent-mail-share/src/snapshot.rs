@@ -1320,11 +1320,18 @@ mod tests {
         const CHILD_WITNESS: &str = "share-snapshot-child-observed-busy";
 
         if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
-            let contender = CanonicalDbConn::open_file(PathBuf::from(path).display().to_string())
-                .expect("child opens competing canonical connection");
-            contender
-                .execute_raw("PRAGMA busy_timeout = 0")
-                .expect("child disables busy retry");
+            // Competing writer through the runtime engine (FrankenSQLite): canonical
+            // SQLite is never a mailbox writer and is not excluded by FrankenSQLite's
+            // namespace/WAL-certificate coordination (br-0dw2c). The watchdog turns a
+            // blocking engine into a visible failure instead of a hung suite.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                eprintln!("child lock probe watchdog: competing write did not fail within 15 s");
+                std::process::exit(3);
+            });
+            let contender = DbConn::open_file(PathBuf::from(path).display().to_string())
+                .expect("child opens competing runtime-engine connection");
+            let _ = contender.execute_raw("PRAGMA busy_timeout = 10");
             let error = contender
                 .execute_raw("BEGIN IMMEDIATE")
                 .expect_err("separate process must not acquire the parent's reserved lock");

@@ -16801,16 +16801,27 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    /// Child side of the cross-process writer-lock probes. The competitor
+    /// opens the database through the runtime engine (FrankenSQLite), because
+    /// that is the only writer the mailbox ever has in production: canonical
+    /// SQLite is used for verification and recovery only, and FrankenSQLite
+    /// coordinates writers through its namespace sidecars and WAL
+    /// certificate rather than the classic RESERVED/EXCLUSIVE byte-range
+    /// locks, so a canonical child is not excluded and must never be used as
+    /// a runtime writer (br-0dw2c). A watchdog turns an engine that blocks
+    /// instead of failing into a visible failure rather than a hung suite.
     fn maintenance_lock_probe_child_branch(path_env: &str, witness: &str) -> bool {
         let Some(path) = std::env::var_os(path_env) else {
             return false;
         };
-        let config =
-            sqlmodel_sqlite::SqliteConfig::file(PathBuf::from(path).to_string_lossy().into_owned())
-                .flags(sqlmodel_sqlite::OpenFlags::read_write())
-                .busy_timeout(10);
-        let competitor = crate::CanonicalDbConn::open(&config)
-            .expect("child opens competing canonical connection");
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            eprintln!("child lock probe watchdog: competing write did not fail within 15 s");
+            std::process::exit(3);
+        });
+        let competitor = DbConn::open_file(PathBuf::from(path).to_string_lossy().as_ref())
+            .expect("child opens competing runtime-engine connection");
+        let _ = competitor.execute_raw("PRAGMA busy_timeout = 10;");
         let blocked = match competitor.execute_raw("BEGIN IMMEDIATE;") {
             Err(_) => true,
             Ok(()) => competitor
@@ -16884,13 +16895,18 @@ mod tests {
         const CHILD_WITNESS: &str = "guarded-read-only-child-observed-busy";
 
         if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
-            let config = sqlmodel_sqlite::SqliteConfig::file(
-                PathBuf::from(path).to_string_lossy().into_owned(),
-            )
-            .flags(sqlmodel_sqlite::OpenFlags::read_write())
-            .busy_timeout(10);
-            let competitor = crate::CanonicalDbConn::open(&config)
-                .expect("child opens competing canonical connection");
+            // Competing writer through the runtime engine (FrankenSQLite): canonical
+            // SQLite is never a mailbox writer and is not excluded by FrankenSQLite's
+            // namespace/WAL-certificate coordination (br-0dw2c). The watchdog turns a
+            // blocking engine into a visible failure instead of a hung suite.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                eprintln!("child lock probe watchdog: competing write did not fail within 15 s");
+                std::process::exit(3);
+            });
+            let competitor = DbConn::open_file(PathBuf::from(path).to_string_lossy().as_ref())
+                .expect("child opens competing runtime-engine connection");
+            let _ = competitor.execute_raw("PRAGMA busy_timeout = 10;");
             assert!(
                 competitor.execute_raw("BEGIN IMMEDIATE;").is_err(),
                 "separate process must not acquire the parent's reserved writer lock"
@@ -17020,21 +17036,26 @@ mod tests {
 
         if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
             let mode = std::env::var(CHILD_MODE_ENV).expect("child lock-probe mode");
-            let config = sqlmodel_sqlite::SqliteConfig::file(
-                PathBuf::from(path).to_string_lossy().into_owned(),
-            )
-            .flags(sqlmodel_sqlite::OpenFlags::read_write())
-            .busy_timeout(10);
-            let competitor = crate::CanonicalDbConn::open(&config)
-                .expect("child opens competing canonical connection");
-            let conflict = match mode.as_str() {
-                "reserved" => competitor.execute_raw("BEGIN IMMEDIATE;"),
-                "shared" => competitor.execute_raw("BEGIN EXCLUSIVE;"),
-                _ => panic!("unexpected child lock-probe mode: {mode}"),
-            };
+            // Competing writer through the runtime engine (FrankenSQLite): canonical
+            // SQLite is never a mailbox writer and is not excluded by FrankenSQLite's
+            // namespace/WAL-certificate coordination (br-0dw2c). The watchdog turns a
+            // blocking engine into a visible failure instead of a hung suite.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                eprintln!("child lock probe watchdog: competing write did not fail within 15 s");
+                std::process::exit(3);
+            });
+            let competitor = DbConn::open_file(PathBuf::from(path).to_string_lossy().as_ref())
+                .expect("child opens competing runtime-engine connection");
+            let _ = competitor.execute_raw("PRAGMA busy_timeout = 10;");
+            // Only the parent's writer lock is observable from another
+            // process: FrankenSQLite is MVCC, so a parent holding a read
+            // snapshot does not block a competing writer (the reader's
+            // guarantee is snapshot continuity, asserted parent-side below).
+            assert_eq!(mode, "reserved", "unexpected child lock-probe mode: {mode}");
             assert!(
-                conflict.is_err(),
-                "separate process must observe the parent's {mode} lock"
+                competitor.execute_raw("BEGIN IMMEDIATE;").is_err(),
+                "separate process must observe the parent's reserved lock"
             );
             println!("{CHILD_WITNESS}-{mode}");
             return;
@@ -17100,10 +17121,13 @@ mod tests {
             .execute_raw("ROLLBACK;")
             .expect("release parent RESERVED lock");
 
+        // Reader phase. Under FrankenSQLite's MVCC a read transaction does not
+        // exclude other-process writers, so the lock-neutral property for a
+        // reader is snapshot continuity: the fingerprint must not end or
+        // disturb the parent's open read transaction.
         writer
             .execute_raw("BEGIN; SELECT value FROM fingerprint_probe;")
-            .expect("acquire parent SHARED lock");
-        assert_child_observes_busy(&db_path, "shared");
+            .expect("acquire parent read snapshot");
         recovery_admission().reset();
         let failure =
             with_recovery_admission(&db_path, "lock-neutral fingerprint failure probe", || {
@@ -17111,10 +17135,17 @@ mod tests {
             })
             .expect_err("synthetic recovery must fail after admission");
         assert!(failure.to_string().contains("synthetic admitted failure"));
-        assert_child_observes_busy(&db_path, "shared");
+        let snapshot_rows = writer
+            .query_sync("SELECT value FROM fingerprint_probe", &[])
+            .expect("parent read snapshot must survive the admitted fingerprint");
+        assert_eq!(snapshot_rows.len(), 1);
+        assert_eq!(
+            snapshot_rows[0].get_named::<String>("value").unwrap(),
+            "settled"
+        );
         writer
             .execute_raw("ROLLBACK;")
-            .expect("release parent SHARED lock");
+            .expect("release parent read snapshot; the transaction must still be open");
 
         writer
             .execute_raw("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")

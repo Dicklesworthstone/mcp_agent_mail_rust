@@ -46,6 +46,10 @@ rayon = { workspace = true, optional = true }
 dirs = { workspace = true, optional = true }
 
 # sqlmodel dependencies
+# Direct fsqlite is for engine-boundary utilities only (namespace sidecar
+# bindings, FrankenError classification, file identity); mailbox traffic goes
+# through sqlmodel-frankensqlite. The cli manifest guard test checks that no
+# connection is opened through fsqlite directly.
 fsqlite.workspace = true
 sqlmodel.workspace = true
 sqlmodel-core.workspace = true

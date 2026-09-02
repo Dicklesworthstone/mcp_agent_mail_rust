@@ -7826,13 +7826,19 @@ body
         const CHILD_WITNESS: &str = "live-salvage-child-observed-busy";
 
         if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
-            let config = sqlmodel_sqlite::SqliteConfig::file(
-                PathBuf::from(path).to_string_lossy().into_owned(),
-            )
-            .flags(sqlmodel_sqlite::OpenFlags::read_write())
-            .busy_timeout(10);
-            let competitor = crate::CanonicalDbConn::open(&config)
-                .expect("child opens competing canonical connection");
+            // Competing writer through the runtime engine (FrankenSQLite): canonical
+            // SQLite is never a mailbox writer and is not excluded by FrankenSQLite's
+            // namespace/WAL-certificate coordination (br-0dw2c). The watchdog turns a
+            // blocking engine into a visible failure instead of a hung suite.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                eprintln!("child lock probe watchdog: competing write did not fail within 15 s");
+                std::process::exit(3);
+            });
+            let competitor =
+                crate::DbConn::open_file(PathBuf::from(path).to_string_lossy().as_ref())
+                    .expect("child opens competing runtime-engine connection");
+            let _ = competitor.execute_raw("PRAGMA busy_timeout = 10;");
             competitor
                 .query_sync("SELECT value FROM salvage_witness", &[])
                 .expect("child proves it opened the intended readable database");

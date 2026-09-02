@@ -65082,10 +65082,48 @@ startup_timeout_sec = 42
             db_manifest_path.display()
         );
         assert!(
-            !db_manifest.contains("fsqlite.workspace")
-                && !db_manifest.contains("fsqlite-core.workspace"),
-            "{} must depend on FrankenSQLite through sqlmodel-frankensqlite, not direct fsqlite crates",
+            !db_manifest.contains("fsqlite-core.workspace"),
+            "{} must not depend on fsqlite-core directly",
             db_manifest_path.display()
+        );
+        // The db crate may depend on `fsqlite` directly for engine-boundary
+        // utilities (namespace sidecar bindings, FrankenError classification,
+        // file identity); what must not happen is opening mailbox connections
+        // outside the sqlmodel adapter (br-0dw2c).
+        let db_src = workspace_root
+            .join("crates")
+            .join("mcp-agent-mail-db")
+            .join("src");
+        let mut offenders = Vec::new();
+        let mut pending = vec![db_src];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read db src dir").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("read db source");
+                for (line_no, line) in source.lines().enumerate() {
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with("//") {
+                        continue;
+                    }
+                    if trimmed.contains("fsqlite::Connection::open")
+                        || trimmed.contains("fsqlite::open(")
+                        || trimmed.contains("fsqlite::Database::open")
+                    {
+                        offenders.push(format!("{}:{}", path.display(), line_no + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "mailbox connections must be opened through sqlmodel-frankensqlite, not fsqlite directly: {offenders:?}"
         );
 
         for crate_name in [
@@ -72283,13 +72321,20 @@ startup_timeout_sec = 42
         const CHILD_WITNESS: &str = "cli-private-diagnostic-child-observed-busy";
 
         if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
-            let config = sqlmodel_sqlite::SqliteConfig::file(
-                PathBuf::from(path).to_string_lossy().into_owned(),
+            // Competing writer through the runtime engine (FrankenSQLite): canonical
+            // SQLite is never a mailbox writer and is not excluded by FrankenSQLite's
+            // namespace/WAL-certificate coordination (br-0dw2c). The watchdog turns a
+            // blocking engine into a visible failure instead of a hung suite.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                eprintln!("child lock probe watchdog: competing write did not fail within 15 s");
+                std::process::exit(3);
+            });
+            let contender = mcp_agent_mail_db::DbConn::open_file(
+                PathBuf::from(path).to_string_lossy().as_ref(),
             )
-            .flags(sqlmodel_sqlite::OpenFlags::read_write())
-            .busy_timeout(10);
-            let contender = mcp_agent_mail_db::CanonicalDbConn::open(&config)
-                .expect("child opens competing canonical connection");
+            .expect("child opens competing runtime-engine connection");
+            let _ = contender.execute_raw("PRAGMA busy_timeout = 10;");
             let error = contender
                 .execute_raw("BEGIN IMMEDIATE")
                 .expect_err("child must not acquire the parent's reserved writer lock");
