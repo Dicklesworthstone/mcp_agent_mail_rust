@@ -351,6 +351,7 @@ const CLI_ALLOW_COMMANDS: &[&[&str]] = &[
     &["setup", "--help"],
     &["golden", "--help"],
     &["flake-triage", "--help"],
+    &["flags", "--help"],
     &["atc", "--help"],
     &["robot", "--help"],
     &["robot-docs", "--help"],

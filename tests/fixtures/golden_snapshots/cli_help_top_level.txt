@@ -17,12 +17,13 @@ Commands:
   check-inbox                 Check agent inbox for unread messages (for git hooks and editor integrations)
   ci                          Run CI quality gates (format, lint, build, test)
   clear-and-reset-everything  Destructively wipe all Agent Mail state (optionally archiving first)
-  config                      Inspect and edit Agent Mail configuration
+  config                      Inspect and edit Agent Mail configuration (`config atc` lists the `AM_ATC_*` knobs)
   contacts                    Contact request/approve/reject/policy lifecycle
   docs                        Generate and insert Agent Mail documentation blurbs
   doctor                      Diagnose and repair mailbox, archive, and database health
   e2e                         Run E2E test suites
   file_reservations           Reserve, renew, release, and inspect file reservations
+  flags                       Feature-flag and tuning-knob registry: effective values, sources, defaults, docs
   flake-triage                Flake triage: scan artifacts, reproduce failures, detect flaky tests
   golden                      Capture, verify, and inspect deterministic golden CLI artifacts
   guard                       Install, check, and manage the pre-commit file-reservation guard hook
