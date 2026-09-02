@@ -6296,6 +6296,64 @@ mod tests {
             .collect()
     }
 
+    /// Human-readable difference between two directory snapshots taken with
+    /// [`exact_test_directory_files`]: which files appeared, vanished, or
+    /// changed, with lengths and the first differing byte offset, so a
+    /// byte-neutrality failure names the culprit instead of dumping bytes.
+    fn describe_directory_diff(
+        before: &std::collections::BTreeMap<std::ffi::OsString, Vec<u8>>,
+        after: &std::collections::BTreeMap<std::ffi::OsString, Vec<u8>>,
+    ) -> String {
+        let mut lines = Vec::new();
+        for (name, bytes) in before {
+            match after.get(name) {
+                None => lines.push(format!(
+                    "removed {} ({} bytes)",
+                    name.to_string_lossy(),
+                    bytes.len()
+                )),
+                Some(after_bytes) if after_bytes != bytes => {
+                    let first_diff = bytes
+                        .iter()
+                        .zip(after_bytes.iter())
+                        .position(|(a, b)| a != b)
+                        .unwrap_or_else(|| bytes.len().min(after_bytes.len()));
+                    let window = |data: &[u8]| -> String {
+                        data.iter()
+                            .skip(first_diff)
+                            .take(16)
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    };
+                    lines.push(format!(
+                        "changed {}: {} -> {} bytes, first difference at offset {first_diff} (before: [{}] after: [{}])",
+                        name.to_string_lossy(),
+                        bytes.len(),
+                        after_bytes.len(),
+                        window(bytes),
+                        window(after_bytes)
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        for (name, bytes) in after {
+            if !before.contains_key(name) {
+                lines.push(format!(
+                    "added {} ({} bytes)",
+                    name.to_string_lossy(),
+                    bytes.len()
+                ));
+            }
+        }
+        if lines.is_empty() {
+            "no differences".to_string()
+        } else {
+            lines.join("\n")
+        }
+    }
+
     fn message_one_recipients_json(conn: &DbConn) -> serde_json::Value {
         let rows = conn
             .query_sync("SELECT recipients_json FROM messages WHERE id = 1", &[])
@@ -7507,10 +7565,49 @@ body
         assert_eq!(rows[0].get_named::<i64>("value").unwrap(), 41);
         drop(private);
 
+        let source_after = exact_test_directory_files(source_dir.path());
+        // The database file, the WAL, and every namespace sidecar must be
+        // byte-identical. The `-shm` WAL-index is exempt in one region only:
+        // SQLite's own reader protocol records the snapshot a reader is
+        // using in the checkpoint-info block (`nBackfill` + `aReadMark[5]`,
+        // bytes 96..116 of the header), and fsqlite 0.3.14's guarded
+        // read-only open advances a read mark there exactly like the
+        // canonical engine does (br-00gl8: observed as `aReadMark[1]`
+        // 2 -> 3 at offset 104). The WAL-index is transient shared memory
+        // that is rebuilt from the WAL whenever it is missing, so a moved
+        // read mark changes no durable state.
+        const SHM_CHECKPOINT_INFO: std::ops::Range<usize> = 96..116;
+        let shm_name = std::ffi::OsString::from("live.sqlite3-shm");
+        let mut durable_before = source_before.clone();
+        let mut durable_after = source_after.clone();
+        let shm_before = durable_before
+            .remove(&shm_name)
+            .expect("fixture keeps its SHM sidecar");
+        let shm_after = durable_after
+            .remove(&shm_name)
+            .expect("guarded materialization must not delete the SHM sidecar");
+        assert!(
+            durable_after == durable_before,
+            "guarded materialization must preserve every durable live source-family byte; differences:\n{}",
+            describe_directory_diff(&durable_before, &durable_after)
+        );
         assert_eq!(
-            exact_test_directory_files(source_dir.path()),
-            source_before,
-            "guarded materialization must preserve every live source-family byte"
+            shm_after.len(),
+            shm_before.len(),
+            "SHM sidecar must keep its size"
+        );
+        let shm_differences: Vec<usize> = shm_before
+            .iter()
+            .zip(shm_after.iter())
+            .enumerate()
+            .filter(|(_, (before, after))| before != after)
+            .map(|(offset, _)| offset)
+            .collect();
+        assert!(
+            shm_differences
+                .iter()
+                .all(|offset| SHM_CHECKPOINT_INFO.contains(offset)),
+            "SHM sidecar may only change inside the reader checkpoint-info block {SHM_CHECKPOINT_INFO:?}; changed offsets: {shm_differences:?}"
         );
         crate::close_db_conn(writer, "clean up WAL salvage materialization fixture");
     }
