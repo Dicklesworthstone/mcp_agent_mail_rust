@@ -16,6 +16,9 @@ pub enum FlagsCommand {
         /// Only show experimental flags.
         #[arg(long, default_value_t = false)]
         experimental: bool,
+        /// Only show flags owned by this subsystem (e.g. `atc`, `tui`, `messaging`).
+        #[arg(long, value_name = "name")]
+        subsystem: Option<String>,
         /// Output format: table, json, or toon.
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
@@ -74,6 +77,7 @@ pub fn handle_flags(action: FlagsCommand) -> CliResult<()> {
         FlagsCommand::List {
             set,
             experimental,
+            subsystem,
             format,
             json,
         } => {
@@ -85,6 +89,10 @@ pub fn handle_flags(action: FlagsCommand) -> CliResult<()> {
             }
             if experimental {
                 snapshots.retain(|snapshot| snapshot.stability == "experimental");
+            }
+            if let Some(subsystem) = subsystem {
+                let wanted = subsystem.trim().to_ascii_lowercase();
+                snapshots.retain(|snapshot| snapshot.subsystem.eq_ignore_ascii_case(&wanted));
             }
             render_flag_list(&snapshots, fmt)
         }
@@ -115,6 +123,14 @@ pub fn handle_flags(action: FlagsCommand) -> CliResult<()> {
             render_flag_mutation(&snapshot, "disabled", fmt)
         }
     }
+}
+
+/// Render every registered flag owned by `subsystem` (used by `am config atc`).
+pub fn render_subsystem_flags(subsystem: &str, fmt: output::CliOutputFormat) -> CliResult<()> {
+    let config = Config::from_env();
+    let mut snapshots = core_flags::flag_snapshots(&config);
+    snapshots.retain(|snapshot| snapshot.subsystem.eq_ignore_ascii_case(subsystem));
+    render_flag_list(&snapshots, fmt)
 }
 
 fn resolve_snapshot(config: &Config, name: &str) -> CliResult<FlagSnapshot> {

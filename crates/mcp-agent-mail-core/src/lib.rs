@@ -111,8 +111,8 @@ pub use backpressure::{
     shedding_enabled, should_shed_tool,
 };
 pub use config::{
-    AppEnvironment, AtcWriteMode, Config, InterfaceMode, ProjectIdentityMode, RateLimitBackend,
-    canonical_config_env_path, compute_ephemeral_storage_root,
+    AppEnvironment, AtcExecutorMode, AtcWriteMode, Config, InterfaceMode, ProjectIdentityMode,
+    RateLimitBackend, canonical_config_env_path, compute_ephemeral_storage_root,
 };
 pub use diagnostics::{
     ArchiveScanDedupeRule, ArchiveScanDiagnostic, ArchiveScanScope, ArchiveScanSeverityBucket,

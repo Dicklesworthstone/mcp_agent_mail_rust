@@ -21,6 +21,7 @@ pub mod doctor;
 pub mod doctor_orphan_refs;
 pub mod e2e_artifacts;
 pub mod e2e_runner;
+pub mod flags;
 pub mod golden;
 pub mod legacy;
 pub mod output;
@@ -830,11 +831,22 @@ pub enum Commands {
         )]
         no_archive: bool,
     },
-    /// Inspect and edit Agent Mail configuration.
+    /// Inspect and edit Agent Mail configuration (`config atc` lists the `AM_ATC_*` knobs).
     #[command(name = "config")]
     Config {
         #[command(subcommand)]
         action: ConfigCommand,
+    },
+    /// Feature-flag and tuning-knob registry: effective values, sources, defaults, docs.
+    ///
+    /// Covers the coarse feature toggles plus the whole Air Traffic Control
+    /// (`AM_ATC_*`) surface. `am flags list --subsystem atc` shows every ATC
+    /// variable with its effective value and where it came from; `am flags
+    /// explain AM_ATC_EXECUTOR_MODE` prints accepted values and semantics.
+    #[command(name = "flags")]
+    Flags {
+        #[command(subcommand)]
+        action: flags::FlagsCommand,
     },
     /// Low-level control-plane utilities (build-slot environment inspection).
     #[command(name = "amctl")]
@@ -1902,6 +1914,20 @@ pub enum ConfigCommand {
     },
     #[command(name = "show-port")]
     ShowPort,
+    /// Show every Air Traffic Control (`AM_ATC_*`) variable: effective value,
+    /// source (env / config / .env / default), default, and meaning.
+    ///
+    /// Alias for `am flags list --subsystem atc`. Use `am flags explain
+    /// <VAR>` for accepted values and full semantics of one variable.
+    #[command(name = "atc")]
+    Atc {
+        /// Output format: table, json, or toon.
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -3983,6 +4009,7 @@ fn dispatch_command(command: Commands) -> CliResult<()> {
             no_archive,
         } => handle_clear_and_reset(force, archive, no_archive),
         Commands::Config { action } => handle_config(action),
+        Commands::Flags { action } => flags::handle_flags(action),
         Commands::Amctl { action } => handle_amctl(action),
         Commands::AmRun(args) => handle_am_run(args),
         Commands::Projects { action } => handle_projects(action),
@@ -15890,6 +15917,10 @@ pub(crate) fn open_db_sync_robot_attachments() -> CliResult<mcp_agent_mail_db::D
 
 fn handle_config(action: ConfigCommand) -> CliResult<()> {
     match action {
+        ConfigCommand::Atc { format, json } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
+            flags::render_subsystem_flags("atc", fmt)
+        }
         ConfigCommand::ShowPort => {
             let config = Config::from_env();
             ftui_runtime::ftui_println!("{}", config.http_port);

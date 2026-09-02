@@ -92,6 +92,139 @@ impl std::fmt::Display for AtcWriteMode {
     }
 }
 
+/// ATC effect executor mode (`AM_ATC_EXECUTOR_MODE`).
+///
+/// Controls whether the ATC operator loop turns its decisions into durable
+/// side effects (advisory/probe mail, reservation releases). Independent of
+/// [`AtcWriteMode`], which only gates the experience ledger.
+///
+/// - `shadow` (default): observe and decide, but emit no mail and release
+///   nothing; effects are counted as `atc.shadow.would_insert` events.
+/// - `dry_run`: like shadow, but effects are reported as suppressed
+///   dry-run executions in the operator snapshot instead of trace events.
+/// - `canary`: send advisories and liveness probes as real messages, but never
+///   force-release reservations.
+/// - `live`: execute every effect, including reservation releases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AtcExecutorMode {
+    #[default]
+    Shadow,
+    DryRun,
+    Canary,
+    Live,
+}
+
+impl AtcExecutorMode {
+    /// Environment variable that selects the executor mode.
+    pub const ENV_VAR: &str = "AM_ATC_EXECUTOR_MODE";
+    /// Accepted spellings, one per mode (aliases `dry-run`/`dryrun` also parse).
+    pub const VALUES: &[&str] = &["shadow", "dry_run", "canary", "live"];
+
+    /// Resolve the executor mode from the layered environment
+    /// (process env, then user env file, then project `.env`).
+    #[must_use]
+    pub fn from_env() -> Self {
+        full_env_value(Self::ENV_VAR).map_or(Self::Shadow, |value| Self::from_str_lossy(&value))
+    }
+
+    /// Parse a mode name. Unknown or empty values fall back to `Shadow`:
+    /// ATC observation stays active, but no durable messages or reservation
+    /// releases are emitted. Requiring an explicit Live/Canary opt-in prevents
+    /// a fresh install with the default write mode Off from turning passive
+    /// liveness sampling into an unbounded mailbox-writing workload.
+    #[must_use]
+    pub fn from_str_lossy(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "dry-run" | "dry_run" | "dryrun" => Self::DryRun,
+            "canary" => Self::Canary,
+            "live" => Self::Live,
+            _ => Self::Shadow,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shadow => "shadow",
+            Self::DryRun => "dry_run",
+            Self::Canary => "canary",
+            Self::Live => "live",
+        }
+    }
+
+    /// Whether the operator needs an async runtime to execute real effects.
+    #[must_use]
+    pub const fn requires_runtime(self) -> bool {
+        matches!(self, Self::Canary | Self::Live)
+    }
+
+    /// Whether advisory messages are actually sent.
+    #[must_use]
+    pub const fn executes_advisories(self) -> bool {
+        matches!(self, Self::Canary | Self::Live)
+    }
+
+    /// Whether liveness probe messages are actually sent.
+    #[must_use]
+    pub const fn executes_probes(self) -> bool {
+        matches!(self, Self::Canary | Self::Live)
+    }
+
+    /// Whether file reservations may be force-released.
+    #[must_use]
+    pub const fn executes_releases(self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
+impl std::fmt::Display for AtcExecutorMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Default ATC population hydration recency window (`AM_ATC_POPULATION_RECENCY_SECS`): 7 days.
+pub const ATC_POPULATION_RECENCY_SECS_DEFAULT: u64 = 7 * 24 * 3600;
+/// Default cap on agents materialized per ATC population sync (`AM_ATC_POPULATION_LIMIT`).
+pub const ATC_POPULATION_LIMIT_DEFAULT: usize = 4096;
+/// Hard ceiling for `AM_ATC_POPULATION_LIMIT`; larger values are clamped.
+pub const ATC_POPULATION_LIMIT_MAX: usize = 65_536;
+
+/// Recency window (seconds) for ATC population hydration from the durable DB.
+///
+/// Agents whose `last_active_ts` is older than this are not seeded into the
+/// ATC engine on cold start or periodic sync; they would immediately evaluate
+/// as Dead and only generate an O(agents) burst of effects. Negative or
+/// unparsable values fall back to the default. `0` hydrates nobody.
+#[must_use]
+pub fn atc_population_recency_secs() -> u64 {
+    full_env_value("AM_ATC_POPULATION_RECENCY_SECS")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(ATC_POPULATION_RECENCY_SECS_DEFAULT)
+}
+
+/// Maximum agents materialized by one ATC population sync, clamped to the
+/// range `1..=ATC_POPULATION_LIMIT_MAX` (see [`ATC_POPULATION_LIMIT_MAX`]).
+/// Zero or unparsable values fall back to the default.
+#[must_use]
+pub fn atc_population_limit() -> usize {
+    full_env_value("AM_ATC_POPULATION_LIMIT")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(ATC_POPULATION_LIMIT_DEFAULT)
+        .min(ATC_POPULATION_LIMIT_MAX)
+}
+
+/// Optional path to an ATC liveness policy bundle JSON
+/// (`AM_ATC_POLICY_BUNDLE_PATH`). Empty/whitespace values are treated as unset,
+/// in which case the compiled-in baseline policy is used.
+#[must_use]
+pub fn atc_policy_bundle_path() -> Option<String> {
+    full_env_value("AM_ATC_POLICY_BUNDLE_PATH")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// Tool filtering configuration for context reduction.
 #[derive(Debug, Clone)]
 pub struct ToolFilterSettings {

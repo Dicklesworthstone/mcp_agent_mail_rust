@@ -157,12 +157,14 @@ fn latest_atc_canary_run_report(dir: &Path) -> Option<PathBuf> {
 
 fn atc_canary_report_candidates(storage_root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Ok(path) = std::env::var(ATC_CANARY_REPORT_PATH_ENV)
+    // Layered env (process, user env file, project .env) so the value shown by
+    // `am flags` / `am config atc` is the value actually honored here.
+    if let Some(path) = crate::config::full_env_value(ATC_CANARY_REPORT_PATH_ENV)
         && !path.trim().is_empty()
     {
         paths.push(PathBuf::from(path));
     }
-    if let Ok(dir) = std::env::var(ATC_CANARY_REPORT_DIR_ENV)
+    if let Some(dir) = crate::config::full_env_value(ATC_CANARY_REPORT_DIR_ENV)
         && !dir.trim().is_empty()
     {
         paths.push(PathBuf::from(dir).join(ATC_CANARY_REPORT_FILE_NAME));

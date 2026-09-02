@@ -664,6 +664,15 @@ All configuration via environment variables. Key variables:
 
 For the full list of 100+ env vars, see `crates/mcp-agent-mail-core/src/config.rs`.
 
+The Air Traffic Control surface (`AM_ATC_*`, 19 variables: `AM_ATC_ENABLED`,
+`AM_ATC_EXECUTOR_MODE`, `AM_ATC_WRITE_MODE`, cadences, calibration thresholds,
+population hydration bounds, policy/canary paths) is registered in
+`crates/mcp-agent-mail-core/src/flags.rs` and documented in the README table
+"Air Traffic Control (ATC) configuration" and `docs/FLAGS_REGISTRY.md`. Inspect
+effective values with `am config atc` / `am flags list --subsystem atc`; a unit
+test fails if code reads an `AM_ATC_*` variable that is not registered and
+documented (GH#290).
+
 ### Exit Codes
 
 | Code | Meaning |

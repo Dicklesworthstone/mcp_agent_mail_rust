@@ -9409,10 +9409,7 @@ impl AtcEngine {
     pub fn config_from_env(config: &mcp_agent_mail_core::Config) -> AtcConfig {
         AtcConfig {
             enabled: config.atc_enabled,
-            policy_bundle_path: std::env::var("AM_ATC_POLICY_BUNDLE_PATH")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
+            policy_bundle_path: mcp_agent_mail_core::config::atc_policy_bundle_path(),
             probe_interval_micros: i64::try_from(config.atc_probe_interval_secs)
                 .unwrap_or(120)
                 .saturating_mul(1_000_000),
@@ -9643,31 +9640,15 @@ const MAX_LIVENESS_REVIEWS_PER_TICK: usize = 8;
 pub fn atc_sync_population_from_db(
     pool: &mcp_agent_mail_db::DbPool,
 ) -> Result<AtcPopulationSyncStats, String> {
-    /// Default recency window: 7 days in microseconds.  Agents silent longer
-    /// than this are already effectively Dead; loading them generates a
-    /// cold-start effect burst without any coordination value.
-    const DEFAULT_RECENCY_MICROS: i64 = 7 * 24 * 3600 * 1_000_000;
-    /// Hard upper bound on one refresh's row materialization. This is far
-    /// above observed active populations while preventing a corrupt or very
-    /// long-lived mailbox from turning a periodic control-plane task into an
-    /// unbounded allocation.
-    const DEFAULT_POPULATION_LIMIT: usize = 4096;
-    const MAX_POPULATION_LIMIT: usize = 65_536;
-
-    let recency_micros =
-        mcp_agent_mail_core::config::full_env_value("AM_ATC_POPULATION_RECENCY_SECS")
-            .and_then(|v| v.trim().parse::<i64>().ok())
-            .filter(|secs| *secs >= 0)
-            .map(|secs| secs.saturating_mul(1_000_000))
-            .unwrap_or(DEFAULT_RECENCY_MICROS);
+    // Knob parsing (defaults, clamps, env layering) lives in core so the
+    // `am flags` registry and this hydration path cannot drift (GH#290).
+    let recency_micros = i64::try_from(mcp_agent_mail_core::config::atc_population_recency_secs())
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000_000);
 
     let now = mcp_agent_mail_core::timestamps::now_micros();
     let recency_cutoff = now.saturating_sub(recency_micros);
-    let population_limit = mcp_agent_mail_core::config::full_env_value("AM_ATC_POPULATION_LIMIT")
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|limit| *limit > 0)
-        .unwrap_or(DEFAULT_POPULATION_LIMIT)
-        .min(MAX_POPULATION_LIMIT);
+    let population_limit = mcp_agent_mail_core::config::atc_population_limit();
 
     let cx = asupersync::Cx::for_request_with_budget(asupersync::Budget::INFINITE);
     let agents =

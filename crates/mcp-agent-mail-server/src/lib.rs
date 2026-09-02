@@ -153,9 +153,9 @@ use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{DecodingKey, Validation};
 use mcp_agent_mail_core::config::{ConsoleSplitMode, ConsoleUiAnchor};
 use mcp_agent_mail_core::{
-    EffectKind, ExperienceBuilder, ExperienceOutcome, ExperienceRow, ExperienceState,
-    ExperienceSubsystem, FeatureExtension, FeatureVector, NonExecutionReason, loss_to_bp,
-    prob_to_bp, saturating_u8,
+    AtcExecutorMode, EffectKind, ExperienceBuilder, ExperienceOutcome, ExperienceRow,
+    ExperienceState, ExperienceSubsystem, FeatureExtension, FeatureVector, NonExecutionReason,
+    loss_to_bp, prob_to_bp, saturating_u8,
 };
 use mcp_agent_mail_db::{
     DbConn, DbPoolConfig, QueryTracker, active_tracker, create_pool, set_active_tracker,
@@ -6335,59 +6335,8 @@ pub(crate) struct AtcOperatorExecutionSnapshot {
     pub(crate) message: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AtcExecutorMode {
-    Shadow,
-    DryRun,
-    Canary,
-    Live,
-}
-
-impl AtcExecutorMode {
-    fn from_env() -> Self {
-        match mcp_agent_mail_core::config::full_env_value("AM_ATC_EXECUTOR_MODE")
-            .as_deref()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("shadow") => Self::Shadow,
-            Some("dry-run" | "dry_run" | "dryrun") => Self::DryRun,
-            Some("canary") => Self::Canary,
-            Some("live") => Self::Live,
-            // ATC observation remains active in Shadow mode, but no durable
-            // messages or reservation releases are emitted. Requiring an
-            // explicit Live/Canary opt-in prevents a fresh install with the
-            // default write mode Off from turning passive liveness sampling
-            // into an unbounded mailbox-writing workload.
-            _ => Self::Shadow,
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Shadow => "shadow",
-            Self::DryRun => "dry_run",
-            Self::Canary => "canary",
-            Self::Live => "live",
-        }
-    }
-
-    const fn requires_runtime(self) -> bool {
-        matches!(self, Self::Canary | Self::Live)
-    }
-
-    const fn executes_advisories(self) -> bool {
-        matches!(self, Self::Canary | Self::Live)
-    }
-
-    const fn executes_probes(self) -> bool {
-        matches!(self, Self::Canary | Self::Live)
-    }
-
-    const fn executes_releases(self) -> bool {
-        matches!(self, Self::Live)
-    }
-}
+// `AtcExecutorMode` (parsing, default, predicates) lives in core so the
+// `am flags` registry, docs, and this runtime share one definition (GH#290).
 
 fn atc_durable_experience_store_writable(pool: &mcp_agent_mail_db::DbPool) -> bool {
     // Whether the backing store can physically take durable ATC rows (a real

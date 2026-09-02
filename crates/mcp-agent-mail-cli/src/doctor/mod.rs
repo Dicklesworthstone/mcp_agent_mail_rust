@@ -60,8 +60,13 @@ pub fn handle_capabilities(format: Option<CliOutputFormat>) -> CliResult<()> {
 }
 
 /// Print `robot-docs` to stdout. Markdown.
+///
+/// The static handbook is followed by the Air Traffic Control configuration
+/// section, generated from the flag registry so it can never drift from the
+/// knobs the binary actually reads (GH#290).
 pub fn handle_robot_docs() -> CliResult<()> {
     println!("{}", robot_docs::handbook());
+    println!("{}", robot_docs::atc_configuration_section());
     Ok(())
 }
 

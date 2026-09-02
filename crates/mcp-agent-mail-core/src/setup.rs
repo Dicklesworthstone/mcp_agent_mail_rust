@@ -2462,7 +2462,7 @@ fn setup_directory_authority_path(path: &Path) -> PathBuf {
             (Path::new("/etc"), Path::new("/private/etc")),
         ] {
             if path.starts_with(alias) && crate::disk::is_trusted_system_directory_alias(alias) {
-                return canonical.join(path.strip_prefix(alias).unwrap_or(Path::new("")));
+                return canonical.join(path.strip_prefix(alias).unwrap_or_else(|_| Path::new("")));
             }
         }
     }

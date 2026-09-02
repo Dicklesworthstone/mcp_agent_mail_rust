@@ -1073,6 +1073,50 @@ All configuration via environment variables. The server reads them at startup vi
 | `AM_GIT_FLOCK_TIMEOUT_SECS` | `60` | Bounded wait for the per-repo `am.git-serialize.lock` before a git shell-out fails `EX_TEMPFAIL` (75) |
 
 For the full list of 100+ env vars, see `crates/mcp-agent-mail-core/src/config.rs`.
+The feature-flag and tuning-knob registry is inspectable at runtime with
+`am flags list` (`--subsystem atc`, `--set` for non-defaults, `--json`) and
+`am flags explain <VAR>`; see [docs/FLAGS_REGISTRY.md](docs/FLAGS_REGISTRY.md).
+
+### Air Traffic Control (ATC) configuration
+
+ATC is the built-in operator that reviews agent liveness, detects reservation
+deadlocks, and can send probe/advisory mail or reclaim reservations. It is **on
+by default**, but since v0.3.31 its executor defaults to `shadow`, so a fresh
+install observes and decides without writing any mail. The whole surface is
+the `AM_ATC_*` family below; `am config atc` (alias of `am flags list
+--subsystem atc`) prints each variable's effective value and whether it came
+from the process environment, the persisted config file, a project `.env`, or
+the compiled default. Restart the server after changing any of them except the
+two canary-report paths.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `AM_ATC_ENABLED` | `true` | Master switch. `false` stops the operator loop and makes the engine ignore every hook: no probes, advisories, reservation releases, population hydration, or experience rows. Liveness surfaces then fall back to the database `last_active_ts` written by ordinary tool calls ("passive liveness only"), and reservations held by crashed agents are reclaimed only by TTL expiry. Also forced `false` by `ATC_LEARNING_DISABLED`. |
+| `AM_ATC_EXECUTOR_MODE` | `shadow` | How decisions become side effects: `shadow` (observe/decide, emit nothing durable), `dry_run` (same, suppressed effects shown in the operator snapshot), `canary` (send activity-check / acknowledgment-request mail, never force-release reservations), `live` (everything, including releases). Unknown values fall back to `shadow`. |
+| `AM_ATC_WRITE_MODE` | `off` | Experience-ledger persistence: `off`, `shadow` (trace-log only), `live` (append rows to the ATC sidecar). Durable rows additionally need `canary`/`live` executor mode and a file-backed DB. Forced `off` by `ATC_LEARNING_DISABLED`. |
+| `AM_ATC_PROBE_INTERVAL_SECS` | `120` | Operator tick interval and per-agent liveness-probe cadence (floor 5; ticks never run faster than 250 ms). |
+| `AM_ATC_ADVISORY_COOLDOWN_SECS` | `300` | Minimum seconds between advisories to the same agent (floor 10). |
+| `AM_ATC_SUMMARY_INTERVAL_SECS` | `300` | Seconds between ATC summary lines in the console/log (floor 10). |
+| `AM_ATC_SAFE_MODE_RECOVERY_COUNT` | `20` | Consecutive correct liveness predictions required to leave safe mode (floor 1). |
+| `AM_ATC_EPROCESS_THRESHOLD` | `20` | E-process calibration alert threshold; crossing it enters safe mode (`20` ≈ 5% significance). Finite, `> 0`. |
+| `AM_ATC_CUSUM_THRESHOLD` | `5` | CUSUM change-point threshold on prediction error. Finite, `> 0`. |
+| `AM_ATC_CUSUM_DELTA` | `0.1` | Minimum shift the CUSUM detector is tuned to catch. Finite, `> 0`. |
+| `AM_ATC_LEDGER_CAPACITY` | `1000` | In-memory evidence-ledger ring buffer size (entries) behind transparency cards (floor 10). |
+| `AM_ATC_SUSPICION_K` | `3` | Rhythm-based liveness factor: an agent is suspect once its silence exceeds its expected gap by `k` standard deviations; lower probes sooner. Finite, `> 0`. |
+| `AM_ATC_EXPERIENCE_MAX_ROWS` | `50000` | Ceiling on raw `atc_experiences` rows in the sidecar; the retention sweep rolls up/evicts above it. `0` disables. |
+| `AM_ATC_RETENTION_SWEEP_INTERVAL_SECS` | `900` | Cadence of the sweep enforcing the ceiling above. `0` disables the sweep. |
+| `AM_ATC_POPULATION_RECENCY_SECS` | `604800` | Only agents active within this window (7 days) are hydrated into ATC on cold start / periodic sync. Lower it on mailboxes with many recently-active identities to bound cold-start effect bursts. `0` hydrates nobody. |
+| `AM_ATC_POPULATION_LIMIT` | `4096` | Maximum agents materialized per population sync, most recently active first (clamped to `1..=65536`). |
+| `AM_ATC_POLICY_BUNDLE_PATH` | `(unset)` | Path to a liveness policy bundle JSON to load instead of the compiled-in baseline. |
+| `AM_ATC_CANARY_REPORT_PATH` | `(unset)` | Exact canary perf-gate report JSON for `am robot atc` / the TUI; default `<STORAGE_ROOT>/atc_perf_gate/latest_canary_report.json`. Read per render. |
+| `AM_ATC_CANARY_REPORT_DIR` | `(unset)` | Directory holding `latest_canary_report.json`; `AM_ATC_CANARY_REPORT_PATH` wins if both are set. Read per render. |
+| `ATC_LEARNING_DISABLED` | `false` | Hard kill switch (no `AM_` prefix, kept for compatibility): forces `AM_ATC_ENABLED=false` and `AM_ATC_WRITE_MODE=off` regardless of the values above. Dynamic: `am flags on ATC_LEARNING_DISABLED`. |
+
+The file `<STORAGE_ROOT>/.atc_kill_switch` additionally stops durable ATC writes
+without a restart (checked every operator tick).
+To keep ATC's observation but stop it from writing mail, leave the default
+`AM_ATC_EXECUTOR_MODE=shadow`; to switch ATC off entirely use
+`AM_ATC_ENABLED=false`.
 
 For operations guidance and troubleshooting, see
 [docs/OPERATOR_RUNBOOK.md](docs/OPERATOR_RUNBOOK.md). For copy-paste operator
