@@ -9,6 +9,9 @@ authors.workspace = true
 description = "Conformance test harness for MCP Agent Mail"
 publish = false
 
+[lints]
+workspace = true
+
 [[test]]
 name = "docs_drift_ci"
 path = "../../tests/docs_drift_ci.rs"

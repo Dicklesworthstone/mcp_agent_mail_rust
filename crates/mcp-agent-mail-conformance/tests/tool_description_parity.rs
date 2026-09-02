@@ -331,7 +331,10 @@ fn supported_tools_have_rust_owned_descriptions() {
             if description_matches_fixture(historical_desc, rust_desc) {
                 eprintln!("PASS");
             } else {
-                eprintln!("PASS (Rust wording revised)");
+                // Not a parity check: the Rust wording is allowed to differ from the
+                // Python fixture on purpose, so this branch only proves the tool has a
+                // non-empty description. Drift in the Rust text is not detected here.
+                eprintln!("PASS (non-empty; wording differs from the Python fixture by design)");
             }
             passed += 1;
         }

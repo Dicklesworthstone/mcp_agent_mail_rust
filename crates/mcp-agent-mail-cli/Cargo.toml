@@ -11,6 +11,9 @@ description = "CLI tool for MCP Agent Mail (am binary)"
 # Workspace depends on unpublished sibling path crates, so cargo publish is not viable.
 publish = false
 
+# [lints] workspace = true is deferred for this crate: it is ~140k lines and the
+# pedantic/nursery burn-down is tracked in br-sox5q. Its root still forbids unsafe.
+
 [[bin]]
 name = "am"
 path = "src/main.rs"

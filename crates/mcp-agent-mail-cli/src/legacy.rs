@@ -2514,6 +2514,66 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    const LEGACY_IMPORT_PROBE_DB_ENV: &str = "AM_TEST_LEGACY_IMPORT_PROBE_DB";
+    #[cfg(target_os = "linux")]
+    const LEGACY_IMPORT_PROBE_STORAGE_ENV: &str = "AM_TEST_LEGACY_IMPORT_PROBE_STORAGE_ROOT";
+
+    /// GH#268: a freshly imported target must pass the server's startup
+    /// integrity probe from a fresh process, the way `am serve-http` sees it
+    /// after `am legacy import` exits. The importer's own reopen checks run
+    /// in the importing process and cannot observe a namespace-sidecar
+    /// refusal that only a new process hits.
+    #[cfg(target_os = "linux")]
+    fn assert_target_passes_startup_probe_in_fresh_process(target_db: &Path, target_storage: &Path) {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg("legacy::tests::legacy_import_target_cross_process_startup_probe_helper")
+        .arg("--exact")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(LEGACY_IMPORT_PROBE_DB_ENV, target_db)
+        .env(LEGACY_IMPORT_PROBE_STORAGE_ENV, target_storage)
+        .output()
+        .expect("spawn fresh-process startup probe");
+        assert!(
+            output.status.success(),
+            "fresh-process startup integrity probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("fresh-process startup integrity probe passed"),
+            "fresh-process startup probe ran no causal probe: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "fresh-process helper invoked by the legacy import regression"]
+    fn legacy_import_target_cross_process_startup_probe_helper() {
+        let target_db = std::env::var_os(LEGACY_IMPORT_PROBE_DB_ENV)
+            .map(PathBuf::from)
+            .expect("fresh-process probe helper requires the target DB path");
+        let target_storage = std::env::var_os(LEGACY_IMPORT_PROBE_STORAGE_ENV)
+            .map(PathBuf::from)
+            .expect("fresh-process probe helper requires the target storage root");
+        let mut config = Config::default();
+        config.database_url = format!("sqlite:///{}", target_db.display());
+        config.storage_root = target_storage;
+        config.integrity_check_on_startup = true;
+        match mcp_agent_mail_server::startup_checks::probe_integrity(&config) {
+            mcp_agent_mail_server::startup_checks::ProbeResult::Ok { .. } => {
+                println!("fresh-process startup integrity probe passed");
+            }
+            other => panic!("startup integrity probe must pass on a freshly imported target: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "fresh-process helper invoked by the legacy import regression"]
     fn legacy_import_target_cross_process_reopen_helper() {
@@ -3712,6 +3772,8 @@ mod tests {
         drop(target_conn);
         #[cfg(target_os = "linux")]
         assert_target_reopens_in_fresh_process(&target_db);
+        #[cfg(target_os = "linux")]
+        assert_target_passes_startup_probe_in_fresh_process(&target_db, &target_storage);
         assert!(
             target_storage.join("legacy_import_receipts").exists(),
             "successful copy import must write its receipt under target storage"

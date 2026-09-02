@@ -2348,7 +2348,10 @@ fn probe_database(config: &Config) -> ProbeResult {
 ///
 /// Skipped when `INTEGRITY_CHECK_ON_STARTUP=false` or for in-memory databases.
 #[allow(dead_code)]
-fn probe_integrity(config: &Config) -> ProbeResult {
+/// Run the startup integrity probe for `config`'s database. Public so the
+/// legacy-import regression can run it from a fresh process against a
+/// freshly imported target (GH#268).
+pub fn probe_integrity(config: &Config) -> ProbeResult {
     if !config.integrity_check_on_startup {
         return ProbeResult::Ok { name: "integrity" };
     }
@@ -2512,6 +2515,9 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         Err(e) => {
             let err_str = e.to_string();
 
+            if let Some(diagnosis) = diagnose_unopenable_namespace_sidecar(config, &err_str) {
+                return diagnosis;
+            }
             if mcp_agent_mail_db::is_lock_error(&err_str) {
                 return integrity_busy_probe_failure(config, &err_str);
             }
@@ -2629,6 +2635,147 @@ fn classify_recovery_failure_root_cause(detail: &str) -> String {
     } else {
         format!("automatic recovery did not produce a safe validated mailbox candidate ({compact})")
     }
+}
+
+/// GH#268: FrankenSQLite reports a namespace sidecar it cannot open as
+/// `unable to open database file: '<db>-fsqlite-ns-gate'`, and the shared
+/// error classifier files that message under busy/retryable. A sidecar this
+/// process cannot open for a filesystem reason is not a busy mailbox: report
+/// the OS error, the directory ownership, and the process identity so the
+/// operator can fix the environment, and keep the probe out of both the
+/// "wait for the owner" advice and any recovery path.
+fn diagnose_unopenable_namespace_sidecar(config: &Config, detail: &str) -> Option<ProbeResult> {
+    if !detail.to_ascii_lowercase().contains("unable to open database") {
+        return None;
+    }
+    let sidecar = quoted_path_in_message(detail)
+        .filter(|path| is_franken_namespace_sidecar_name(path))?;
+    let db_target = resolve_server_database_url_sqlite_path(&config.database_url).map_or_else(
+        || config.database_url.clone(),
+        |path| path.display().to_string(),
+    );
+    let context = namespace_sidecar_environment_summary(&sidecar);
+    let (problem, fix) = match namespace_sidecar_access_probe(&sidecar) {
+        Err(reason) => (
+            format!(
+                "FrankenSQLite cannot open its namespace sidecar {} for {db_target}: {reason}. \
+                 The mailbox is not busy; this is a filesystem access problem ({context}). \
+                 No recovery was attempted.",
+                sidecar.display()
+            ),
+            "Make the mailbox directory and its storage.sqlite3-fsqlite-ns-* sidecars readable and writable by the user running the server (chown/chmod, or the pod's runAsUser/fsGroup), keep the volume mounted read-write, then restart. Nothing needs repair.".to_string(),
+        ),
+        Ok(()) => (
+            format!(
+                "FrankenSQLite could not open its namespace sidecar {} for {db_target} although this process can open it ({context}). \
+                 The engine refused a sidecar it did not create, most likely one left by a different user or an aborted run. \
+                 No recovery was attempted.",
+                sidecar.display()
+            ),
+            "Confirm no Agent Mail process owns the mailbox (`am doctor locks`), then remove the stale storage.sqlite3-fsqlite-ns-gate and storage.sqlite3-fsqlite-ns-use pair (or chown them to the server user) and restart.".to_string(),
+        ),
+    };
+    Some(ProbeResult::Fail(ProbeFailure {
+        name: "integrity",
+        problem,
+        fix,
+    }))
+}
+
+fn quoted_path_in_message(message: &str) -> Option<PathBuf> {
+    let start = message.find('\'')? + 1;
+    let rest = &message[start..];
+    let end = rest.find('\'')?;
+    let quoted = rest[..end].trim();
+    (!quoted.is_empty()).then(|| PathBuf::from(quoted))
+}
+
+fn is_franken_namespace_sidecar_name(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with("-fsqlite-ns-gate") || name.ends_with("-fsqlite-ns-use"))
+}
+
+/// Try what the engine tries: open the sidecar read-write, or, when it does
+/// not exist yet, create a file in its directory. Returns the OS error text.
+fn namespace_sidecar_access_probe(sidecar: &std::path::Path) -> Result<(), String> {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(sidecar)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(parent) = sidecar.parent() else {
+                return Err("the sidecar path has no parent directory".to_string());
+            };
+            let probe = parent.join(format!(".am-access-probe-{}", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)
+            {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&probe);
+                    Ok(())
+                }
+                Err(error) => Err(format!(
+                    "the sidecar does not exist and a new file cannot be created in {}: {error}",
+                    parent.display()
+                )),
+            }
+        }
+        Err(error) => Err(format!("open read-write failed: {error}")),
+    }
+}
+
+/// Ownership and mode of the sidecar (if present) and its directory, plus the
+/// identity of this process, in one line for the operator.
+fn namespace_sidecar_environment_summary(sidecar: &std::path::Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let describe = |path: &std::path::Path| -> String {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) => format!(
+                    "{} mode {:o} uid {} gid {}",
+                    path.display(),
+                    metadata.mode() & 0o7777,
+                    metadata.uid(),
+                    metadata.gid()
+                ),
+                Err(error) => format!("{} {error}", path.display()),
+            }
+        };
+        let mut parts = vec![describe(sidecar)];
+        if let Some(parent) = sidecar.parent() {
+            parts.push(describe(parent));
+        }
+        parts.push(format!("process {}", current_process_identity()));
+        parts.join("; ")
+    }
+    #[cfg(not(unix))]
+    {
+        format!("{}; process pid {}", sidecar.display(), std::process::id())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_process_identity() -> String {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |key: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .map(|rest| rest.split_whitespace().next().unwrap_or("?").to_string())
+            .unwrap_or_else(|| "?".to_string())
+    };
+    format!("pid {} uid {} gid {}", std::process::id(), field("Uid:"), field("Gid:"))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn current_process_identity() -> String {
+    format!("pid {}", std::process::id())
 }
 
 fn integrity_busy_probe_failure(config: &Config, detail: &str) -> ProbeResult {
@@ -3099,6 +3246,112 @@ pub fn run_stdio_startup_probes(config: &Config) -> StartupReport {
 mod tests {
     use super::*;
     use fs2::FileExt;
+
+    fn sidecar_diagnosis_config(db: &Path) -> Config {
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db.display());
+        config
+    }
+
+    fn expect_integrity_failure(result: Option<ProbeResult>) -> (String, String) {
+        match result {
+            Some(ProbeResult::Fail(ProbeFailure { name, problem, fix })) => {
+                assert_eq!(name, "integrity");
+                (problem, fix)
+            }
+            other => panic!("expected an integrity failure diagnosis, got {other:?}"),
+        }
+    }
+
+    /// GH#268: a namespace sidecar the process cannot create is an
+    /// environment failure, not a busy mailbox, and must not suggest waiting
+    /// for an owner or entering recovery.
+    #[cfg(unix)]
+    #[test]
+    fn unopenable_namespace_sidecar_is_reported_as_environment_not_busy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestoreMode(PathBuf);
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mailbox = dir.path().join("mailbox");
+        std::fs::create_dir_all(&mailbox).unwrap();
+        let db = mailbox.join("storage.sqlite3");
+        std::fs::write(&db, b"placeholder").unwrap();
+        let gate = mailbox.join("storage.sqlite3-fsqlite-ns-gate");
+        let config = sidecar_diagnosis_config(&db);
+        let detail = format!(
+            "Connection error: unable to open database file: '{}'",
+            gate.display()
+        );
+
+        std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let restore = RestoreMode(mailbox.clone());
+        if std::fs::write(mailbox.join("write-probe"), b"x").is_ok() {
+            // Directory modes are not enforced for this user (root); nothing to prove.
+            return;
+        }
+        let result = diagnose_unopenable_namespace_sidecar(&config, &detail);
+        drop(restore);
+
+        let (problem, fix) = expect_integrity_failure(result);
+        assert!(
+            problem.contains("cannot open its namespace sidecar")
+                && problem.contains("a new file cannot be created in")
+                && problem.contains("The mailbox is not busy")
+                && problem.contains("No recovery was attempted"),
+            "{problem}"
+        );
+        assert!(problem.contains("mode 555"), "directory mode must be reported: {problem}");
+        assert!(fix.contains("chown/chmod"), "{fix}");
+        assert!(!fix.contains("Wait for the current mailbox owner"), "{fix}");
+    }
+
+    #[test]
+    fn openable_namespace_sidecar_is_reported_as_stale_not_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("storage.sqlite3");
+        std::fs::write(&db, b"placeholder").unwrap();
+        let gate = dir.path().join("storage.sqlite3-fsqlite-ns-gate");
+        std::fs::write(&gate, b"").unwrap();
+        let config = sidecar_diagnosis_config(&db);
+        let detail = format!("unable to open database file: '{}'", gate.display());
+
+        let (problem, fix) = expect_integrity_failure(diagnose_unopenable_namespace_sidecar(&config, &detail));
+        assert!(
+            problem.contains("although this process can open it")
+                && problem.contains("No recovery was attempted"),
+            "{problem}"
+        );
+        assert!(fix.contains("am doctor locks") && fix.contains("stale"), "{fix}");
+        assert!(gate.exists(), "the diagnosis must not remove the sidecar it inspected");
+    }
+
+    #[test]
+    fn namespace_sidecar_diagnosis_ignores_unrelated_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("storage.sqlite3");
+        let config = sidecar_diagnosis_config(&db);
+        assert!(diagnose_unopenable_namespace_sidecar(&config, "database is locked").is_none());
+        assert!(
+            diagnose_unopenable_namespace_sidecar(
+                &config,
+                &format!("unable to open database file: '{}'", db.display())
+            )
+            .is_none(),
+            "only namespace sidecars are diagnosed here; the main file keeps the open classifier"
+        );
+        assert!(diagnose_unopenable_namespace_sidecar(&config, "unable to open database file").is_none());
+        assert_eq!(
+            quoted_path_in_message("x: 'a/b-fsqlite-ns-use' y"),
+            Some(PathBuf::from("a/b-fsqlite-ns-use"))
+        );
+    }
 
     fn default_config() -> Config {
         Config::default()

@@ -161,7 +161,16 @@ smallvec = { version = "1", features = ["serde"] }
 serde-wasm-bindgen = "0.6"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Every crate root still carries `#![forbid(unsafe_code)]`, which is what keeps
+# library and binary code unsafe-free. The workspace table says `deny` rather
+# than `forbid` so that integration-test files which must mutate the process
+# environment (Rust 2024 makes `std::env::set_var` unsafe) can opt in with an
+# explicit `#![allow(unsafe_code)]` while still inheriting the shared lints;
+# `forbid` cannot be overridden and would make those crates unable to inherit
+# this table at all (br-sox5q).
+unsafe_code = "deny"
+# guard and storage carry cfg(fuzzing)-gated hooks; declare the cfg once here.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

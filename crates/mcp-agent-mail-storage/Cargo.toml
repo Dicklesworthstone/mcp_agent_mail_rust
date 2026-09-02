@@ -49,5 +49,5 @@ toml.workspace = true
 name = "boot_check_bench"
 harness = false
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+[lints]
+workspace = true

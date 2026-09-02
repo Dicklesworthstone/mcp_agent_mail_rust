@@ -58,7 +58,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 - **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml workspace with `workspace = true` pattern
-- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
+- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` in every crate root). The `[workspace.lints]` table says `unsafe_code = "deny"` so crates can inherit it; the only permitted opt-out is `#![allow(unsafe_code)]` at the top of an integration-test file that must call `std::env::set_var`/`remove_var` (unsafe in Rust 2024). Never add such an opt-out to library or binary code.
 
 ### Async Runtime: asupersync (MANDATORY — NO TOKIO)
 
