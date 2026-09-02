@@ -173,34 +173,31 @@ pub fn detect_missing_refs(repo_path: &Path) -> Result<Vec<PrunableRef>, git2::E
             continue;
         };
 
-        match odb.exists(oid) {
-            true => {
-                tracing::trace!(
-                    target: "mcp_agent_mail::storage::recovery",
-                    ref = %name,
-                    oid = %oid,
-                    via = peel_reason,
-                    "recovery_ref_intact"
-                );
-            }
-            false => {
-                let category = ref_category(&name);
-                let finding = PrunableRef {
-                    ref_name: name.clone(),
-                    target_sha: oid.to_string(),
-                    reason: format!("object {oid} missing from ODB (via {peel_reason})"),
-                    category,
-                };
-                tracing::info!(
-                    target: "mcp_agent_mail::storage::recovery",
-                    ref = %name,
-                    oid = %oid,
-                    via = peel_reason,
-                    category = ?category,
-                    "recovery_ref_missing_object"
-                );
-                out.push(finding);
-            }
+        if odb.exists(oid) {
+            tracing::trace!(
+                target: "mcp_agent_mail::storage::recovery",
+                ref = %name,
+                oid = %oid,
+                via = peel_reason,
+                "recovery_ref_intact"
+            );
+        } else {
+            let category = ref_category(&name);
+            let finding = PrunableRef {
+                ref_name: name.clone(),
+                target_sha: oid.to_string(),
+                reason: format!("object {oid} missing from ODB (via {peel_reason})"),
+                category,
+            };
+            tracing::info!(
+                target: "mcp_agent_mail::storage::recovery",
+                ref = %name,
+                oid = %oid,
+                via = peel_reason,
+                category = ?category,
+                "recovery_ref_missing_object"
+            );
+            out.push(finding);
         }
     }
 

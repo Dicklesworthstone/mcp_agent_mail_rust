@@ -111,9 +111,8 @@ fn compile(pattern: &str) -> Regex {
 
 fn find_count_match(doc: &str, regex: &Regex) -> Option<CountMatch> {
     for (idx, line) in doc.lines().enumerate() {
-        let captures = match regex.captures(line) {
-            Some(captures) => captures,
-            None => continue,
+        let Some(captures) = regex.captures(line) else {
+            continue;
         };
         let found = captures["count"].parse::<usize>().unwrap_or_else(|e| {
             panic!(

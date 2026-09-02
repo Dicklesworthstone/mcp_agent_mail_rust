@@ -496,27 +496,20 @@ fn populate_attachments_by_message_mv(conn: &Conn, has_thread_id: bool) -> Resul
                 &[
                     sqlmodel_core::Value::BigInt(message_id),
                     project_id
-                        .map(sqlmodel_core::Value::BigInt)
-                        .unwrap_or(sqlmodel_core::Value::Null),
+                        .map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::BigInt),
                     thread_id
                         .clone()
-                        .map(sqlmodel_core::Value::Text)
-                        .unwrap_or(sqlmodel_core::Value::Null),
+                        .map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::Text),
                     created_ts
                         .clone()
-                        .map(sqlmodel_core::Value::Text)
-                        .unwrap_or(sqlmodel_core::Value::Null),
+                        .map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::Text),
                     attachment_type
-                        .map(sqlmodel_core::Value::Text)
-                        .unwrap_or(sqlmodel_core::Value::Null),
+                        .map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::Text),
                     media_type
-                        .map(sqlmodel_core::Value::Text)
-                        .unwrap_or(sqlmodel_core::Value::Null),
-                    path.map(sqlmodel_core::Value::Text)
-                        .unwrap_or(sqlmodel_core::Value::Null),
+                        .map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::Text),
+                    path.map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::Text),
                     size_bytes
-                        .map(sqlmodel_core::Value::BigInt)
-                        .unwrap_or(sqlmodel_core::Value::Null),
+                        .map_or(sqlmodel_core::Value::Null, sqlmodel_core::Value::BigInt),
                 ],
             )
             .map_err(|e| ShareError::Sqlite {
@@ -1392,8 +1385,8 @@ mod tests {
 
         let result = finalize_export_db(&db).unwrap();
         assert!(result.fts_enabled);
-        assert!(!result.views_created.is_empty());
-        assert!(!result.indexes_created.is_empty());
+        assert_ne!(result.views_created, [] as [std::string::String; 0]);
+        assert_ne!(result.indexes_created, [] as [std::string::String; 0]);
 
         // Verify everything is queryable
         let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
@@ -1693,7 +1686,7 @@ mod tests {
         assert_eq!(count, 2, "snapshot should remain queryable after rollback");
     }
 
-    /// Create a test DB without sender_id column on messages.
+    /// Create a test DB without `sender_id` column on messages.
     fn create_test_db_no_sender_id(dir: &std::path::Path) -> std::path::PathBuf {
         let db_path = dir.join("test_no_sender.sqlite3");
         let conn = SqliteConnection::open_file(db_path.display().to_string()).unwrap();
@@ -1752,7 +1745,7 @@ mod tests {
         assert_eq!(sender, UNKNOWN_SENDER_DISPLAY.to_lowercase());
     }
 
-    /// Create a test DB without thread_id column on messages.
+    /// Create a test DB without `thread_id` column on messages.
     fn create_test_db_no_thread_id(dir: &std::path::Path) -> std::path::PathBuf {
         let db_path = dir.join("test_no_thread.sqlite3");
         let conn = SqliteConnection::open_file(db_path.display().to_string()).unwrap();
@@ -1888,8 +1881,8 @@ mod tests {
         let result = finalize_export_db(&db).unwrap();
         // FTS should still succeed but have no data
         assert!(result.fts_enabled);
-        assert!(!result.views_created.is_empty());
-        assert!(!result.indexes_created.is_empty());
+        assert_ne!(result.views_created, [] as [std::string::String; 0]);
+        assert_ne!(result.indexes_created, [] as [std::string::String; 0]);
     }
 
     #[test]

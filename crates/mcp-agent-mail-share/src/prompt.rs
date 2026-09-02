@@ -98,7 +98,7 @@ pub fn run_interactive_wizard(config: WizardConfig) -> Result<WizardOutcome, Wiz
 
     let env = if config.skip_detection {
         DetectedEnvironment {
-            cwd: detection_root.clone(),
+            cwd: detection_root,
             ..Default::default()
         }
     } else {
@@ -156,8 +156,7 @@ fn prompt_missing_inputs(
     eprintln!();
     eprintln!("╭─────────────────────────────────────────────────────╮");
     eprintln!(
-        "│       Agent Mail Deployment Wizard v{}        │",
-        WIZARD_VERSION
+        "│       Agent Mail Deployment Wizard v{WIZARD_VERSION}        │"
     );
     eprintln!("╰─────────────────────────────────────────────────────╯");
     eprintln!();
@@ -339,7 +338,7 @@ fn prompt_provider_selection(env: &DetectedEnvironment) -> Result<HostingProvide
 
     loop {
         let prompt = if let Some(d) = default {
-            format!("Enter choice [{}]: ", d)
+            format!("Enter choice [{d}]: ")
         } else {
             "Enter choice: ".to_string()
         };
@@ -390,7 +389,7 @@ fn prompt_bundle_path(env: &DetectedEnvironment) -> Result<PathBuf, WizardError>
 
     loop {
         let prompt = if let Some(ref d) = default {
-            format!("Bundle path [{}]: ", d)
+            format!("Bundle path [{d}]: ")
         } else {
             "Bundle path: ".to_string()
         };
@@ -493,7 +492,7 @@ fn prompt_github_options(
     if inputs.github_repo.is_none() {
         let default = env.github_repo.clone();
         let prompt = if let Some(ref d) = default {
-            format!("Repository (owner/repo) [{}]: ", d)
+            format!("Repository (owner/repo) [{d}]: ")
         } else {
             "Repository (owner/repo): ".to_string()
         };
@@ -526,7 +525,7 @@ fn prompt_github_options(
         .github_branch
         .clone()
         .unwrap_or_else(|| "main".to_string());
-    let prompt = format!("Branch [{}]: ", default_branch);
+    let prompt = format!("Branch [{default_branch}]: ");
     let input = prompt_line(&prompt)?;
     let trimmed = input.trim();
     inputs.github_branch = Some(if trimmed.is_empty() {

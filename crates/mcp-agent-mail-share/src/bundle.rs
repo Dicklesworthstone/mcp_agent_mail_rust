@@ -212,7 +212,7 @@ pub fn bundle_attachments(
                     .get("path")
                     .or_else(|| obj.get("original_path"))
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+                    .map(std::string::ToString::to_string);
 
                 let Some(orig_path_str) = &original_path else {
                     continue;
@@ -1424,8 +1424,7 @@ fn collect_entries_ctx(
 fn file_mode(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
-        .map(|m| m.permissions().mode() & 0o777)
-        .unwrap_or(0o644)
+        .map_or(0o644, |m| m.permissions().mode() & 0o777)
 }
 
 #[cfg(not(unix))]
@@ -2733,7 +2732,7 @@ mod tests {
         let db = create_bundle_test_db(
             dir.path(),
             &[
-                r#"not valid json {"#,
+                r"not valid json {",
                 r#"[{"type":"file","path":"valid.txt","media_type":"text/plain"}]"#,
             ],
         );
@@ -2964,7 +2963,7 @@ mod tests {
         std::fs::create_dir_all(&output).unwrap();
 
         let copied = copy_viewer_assets(&output).unwrap();
-        assert!(!copied.is_empty());
+        assert_ne!(copied, [] as [std::string::String; 0]);
         assert!(copied.iter().any(|p| p == "viewer/index.html"));
         assert!(output.join("viewer/index.html").exists());
         assert!(output.join("viewer/vendor/sql-wasm.wasm").exists());
@@ -4186,7 +4185,7 @@ mod tests {
         );
     }
 
-    /// Corrupted manifest JSON in a bundle directory is detected by load_bundle_export_config.
+    /// Corrupted manifest JSON in a bundle directory is detected by `load_bundle_export_config`.
     #[test]
     fn corrupt_manifest_invalid_json() {
         let dir = tempfile::tempdir().unwrap();
@@ -4228,7 +4227,7 @@ mod tests {
         );
         assert_eq!(config.chunk_size, crate::DEFAULT_CHUNK_SIZE as i64);
         assert_eq!(config.scrub_preset, "standard");
-        assert!(config.projects.is_empty());
+        assert_eq!(config.projects, [] as [std::string::String; 0]);
     }
 
     /// Manifest with partial fields uses provided values and defaults for missing ones.
@@ -4274,7 +4273,7 @@ mod tests {
         );
     }
 
-    /// No manifest.json file at all triggers ManifestNotFound error.
+    /// No manifest.json file at all triggers `ManifestNotFound` error.
     #[test]
     fn corrupt_manifest_file_missing() {
         let dir = tempfile::tempdir().unwrap();
@@ -4450,7 +4449,7 @@ mod tests {
         let chunk_dir = out.join("chunks");
         let actual_files: Vec<_> = std::fs::read_dir(&chunk_dir)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
                 // Only count files matching the 5-digit pattern
@@ -4482,8 +4481,7 @@ mod tests {
         // Create a manifest with a very large padding field (1 MB of data)
         let large_value = "x".repeat(1_000_000);
         let manifest_json = format!(
-            r#"{{"schema_version": "0.1.0", "padding": "{}", "export_config": {{"scrub_preset": "archive"}}}}"#,
-            large_value
+            r#"{{"schema_version": "0.1.0", "padding": "{large_value}", "export_config": {{"scrub_preset": "archive"}}}}"#
         );
         std::fs::write(bundle.join("manifest.json"), &manifest_json).unwrap();
 
@@ -4518,7 +4516,7 @@ mod tests {
         );
     }
 
-    /// package_directory_as_zip refuses a non-directory source.
+    /// `package_directory_as_zip` refuses a non-directory source.
     #[test]
     fn zip_refuses_file_as_source() {
         let dir = tempfile::tempdir().unwrap();
@@ -4535,7 +4533,7 @@ mod tests {
         );
     }
 
-    /// package_directory_as_zip refuses to overwrite an existing archive.
+    /// `package_directory_as_zip` refuses to overwrite an existing archive.
     #[test]
     fn zip_refuses_overwrite_existing() {
         let dir = tempfile::tempdir().unwrap();

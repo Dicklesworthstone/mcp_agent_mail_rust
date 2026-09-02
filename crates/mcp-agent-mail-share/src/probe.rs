@@ -373,6 +373,9 @@ fn probe_ip_is_internal(ip: std::net::IpAddr) -> bool {
     }
 }
 
+// The test branch reads a thread-local, which is not const; only the
+// non-test branch would qualify.
+#[allow(clippy::missing_const_for_fn)]
 fn internal_probe_targets_allowed_for_tests() -> bool {
     #[cfg(test)]
     {
@@ -384,11 +387,11 @@ fn internal_probe_targets_allowed_for_tests() -> bool {
     }
 }
 
-fn probe_ipv4_is_internal(ip: std::net::Ipv4Addr) -> bool {
+const fn probe_ipv4_is_internal(ip: std::net::Ipv4Addr) -> bool {
     ip.is_private() || ip.is_loopback() || ip.is_unspecified() || ip.is_link_local()
 }
 
-fn probe_ipv6_is_internal(ip: std::net::Ipv6Addr) -> bool {
+const fn probe_ipv6_is_internal(ip: std::net::Ipv6Addr) -> bool {
     if ip.is_loopback() || ip.is_unspecified() {
         return true;
     }
@@ -693,7 +696,7 @@ fn read_chunk_trailers<R: BufRead>(reader: &mut R) -> Result<(), ProbeError> {
     }
 }
 
-fn is_redirect(status: u16) -> bool {
+const fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
@@ -701,7 +704,7 @@ fn is_server_error(status: u16) -> bool {
     (500..600).contains(&status)
 }
 
-fn is_retryable(err: &ProbeError) -> bool {
+const fn is_retryable(err: &ProbeError) -> bool {
     matches!(
         err,
         ProbeError::Timeout { .. }
@@ -1230,7 +1233,7 @@ mod tests {
     fn parse_http_response_headers_only_skips_chunk_decoding() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
         let response = parse_http_response(raw, false).expect("parse headers-only response");
-        assert!(response.body.is_empty());
+        assert_eq!(response.body, [] as [u8; 0]);
         assert_eq!(
             response.header("transfer-encoding"),
             Some("chunked"),
@@ -1492,7 +1495,7 @@ mod tests {
         let data = b"0\r\n\r\n";
         let mut cursor = std::io::Cursor::new(data.as_ref());
         let body = read_chunked_body(&mut std::io::BufReader::new(&mut cursor)).unwrap();
-        assert!(body.is_empty());
+        assert_eq!(body, [] as [u8; 0]);
     }
 
     #[test]

@@ -86,7 +86,7 @@ pub struct BootCheckReport {
 
 impl BootCheckReport {
     #[must_use]
-    pub fn has_findings(&self) -> bool {
+    pub const fn has_findings(&self) -> bool {
         !self.findings.is_empty()
     }
 
@@ -296,7 +296,7 @@ fn preflight_archive_integrity_with_timeout(
     }
 }
 
-fn finding_kind_label(kind: &BootCheckFindingKind) -> &'static str {
+const fn finding_kind_label(kind: &BootCheckFindingKind) -> &'static str {
     match kind {
         BootCheckFindingKind::RepoBroken => "repo_broken",
         BootCheckFindingKind::OrphanRefs(_) => "orphan_refs",
@@ -335,7 +335,7 @@ fn timeout_finding_if_exceeded(
     })
 }
 
-fn timeout_finding_elapsed_ms(finding: &BootCheckFinding) -> u64 {
+const fn timeout_finding_elapsed_ms(finding: &BootCheckFinding) -> u64 {
     match &finding.kind {
         BootCheckFindingKind::TimeoutExceeded { elapsed_ms, .. } => *elapsed_ms,
         _ => 0,
@@ -576,8 +576,7 @@ fn write_ref_backup(
 ) -> Result<PathBuf, String> {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_micros())
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_micros());
     let backup_dir = root
         .join("backups")
         .join("refs")
@@ -632,8 +631,7 @@ fn repack_refs(root: &Path, candidate: &ArchiveRepoCandidate) -> Result<(), Stri
     if packed_refs.is_file() {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_micros())
-            .unwrap_or(0);
+            .map_or(0, |duration| duration.as_micros());
         let backup_dir = root
             .join("backups")
             .join("refs")

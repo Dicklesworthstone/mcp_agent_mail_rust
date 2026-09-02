@@ -163,8 +163,7 @@ while [ -f "$repo/.git/am-c8-running" ]; do
         git -C "$repo" reset "$f" >/dev/null 2>&1 || true
     fi
 done
-"#,
-        id = id
+"#
     );
 
     // Sentinel file for cooperative shutdown.
@@ -198,7 +197,7 @@ fn reader_loop(repo: PathBuf, stop: Arc<AtomicBool>, stats: Arc<ReaderStats>) {
                 .statuses(Some(&mut opts))
                 .map_err(|e| e.to_string())?;
             // Drain iterator.
-            for _ in statuses.iter() {}
+            for _ in &statuses {}
             // Walk the index directly.
             let index = repo_handle.index().map_err(|e| e.to_string())?;
             let _n = index.len();
@@ -437,8 +436,7 @@ fn libgit2_index_race_immunity() {
     if let Ok(dir) = std::env::var("AM_C8_ARTIFACT_DIR") {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         let artifact_dir = PathBuf::from(&dir).join(ts.to_string());
         let _ = std::fs::create_dir_all(&artifact_dir);
         let _ = std::fs::write(artifact_dir.join("report.json"), &json);

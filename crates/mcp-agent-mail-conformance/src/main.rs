@@ -81,16 +81,13 @@ fn run_regen(args: RegenArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let default_python_venv =
         repo_root.join("legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/bin/python");
-    let python = match args.python {
-        Some(v) => v,
-        None => {
-            if default_python_venv.exists() {
-                default_python_venv.to_string_lossy().to_string()
-            } else {
-                "python3".to_string()
-            }
+    let python = args.python.unwrap_or_else(|| {
+        if default_python_venv.exists() {
+            default_python_venv.to_string_lossy().to_string()
+        } else {
+            "python3".to_string()
         }
-    };
+    });
 
     let script = args.script.unwrap_or_else(|| {
         crate_dir.join("tests/conformance/python_reference/generate_fixtures.py")
@@ -103,10 +100,10 @@ fn run_regen(args: RegenArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let output = match &args.output {
-        Some(v) => v.clone(),
-        None => default_regen_output_path(),
-    };
+    let output = args
+        .output
+        .clone()
+        .unwrap_or_else(default_regen_output_path);
     let output = absolute_path(&output)?;
 
     let fixture_repo_root = args

@@ -1,3 +1,7 @@
+// Integration scenarios are long and quote user-facing strings by design;
+// these pedantic style lints add nothing in a test harness.
+#![allow(clippy::too_many_lines, clippy::similar_names, clippy::case_sensitive_file_extension_comparisons, clippy::match_wildcard_for_single_variants, clippy::literal_string_with_formatting_args)]
+
 // Note: unsafe required for env::set_var in Rust 2024
 #![allow(unsafe_code)]
 
@@ -311,20 +315,16 @@ fn decode_json_from_tool_content(content: &[LegacyContent]) -> Result<Value, Str
     }
 
     match &content[0] {
-        LegacyContent::Text { text, .. } => match serde_json::from_str(text) {
-            Ok(v) => Ok(v),
-            Err(_) => Ok(Value::String(text.clone())),
-        },
+        LegacyContent::Text { text, .. } => {
+            Ok(serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.clone())))
+        }
         LegacyContent::Resource { resource, .. } => {
             let text = match resource {
                 LegacyResourceContent::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             }
             .ok_or_else(|| "tool returned Resource content without text".to_string())?;
-            match serde_json::from_str(text) {
-                Ok(v) => Ok(v),
-                Err(_) => Ok(Value::String(text.to_string())),
-            }
+            Ok(serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string())))
         }
         LegacyContent::Image { mime_type, .. } => Err(format!(
             "tool returned Image content (mime_type={mime_type}); JSON decode not supported yet"
@@ -348,10 +348,7 @@ fn decode_json_from_resource_contents(
         _ => None,
     }
     .ok_or_else(|| format!("resource {uri} returned no text"))?;
-    match serde_json::from_str(text) {
-        Ok(v) => Ok(v),
-        Err(_) => Ok(Value::String(text.to_string())),
-    }
+    Ok(serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string())))
 }
 
 fn assert_expected_error(got: &str, expect: &ExpectedError) {
@@ -762,7 +759,7 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
             case_name: "project_not_found_error",
             input: serde_json::json!({
                 "project_key": "missing-project",
-                "message_id": 999999,
+                "message_id": 999_999,
                 "sender_name": "BlueLake",
                 "body_md": "Reply"
             }),
@@ -793,7 +790,7 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
             input: serde_json::json!({
                 "project_key": "missing-project",
                 "agent_name": "BlueLake",
-                "message_id": 999999
+                "message_id": 999_999
             }),
             expected_err: expected_error_containing("not found"),
         },
@@ -803,7 +800,7 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
             input: serde_json::json!({
                 "project_key": "missing-project",
                 "agent_name": "BlueLake",
-                "message_id": 999999
+                "message_id": 999_999
             }),
             expected_err: expected_error_containing("not found"),
         },
@@ -1061,10 +1058,10 @@ fn resolved_value(value: &Value, tokens: &BTreeMap<String, String>) -> Value {
 fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     match payload.downcast::<String>() {
         Ok(message) => *message,
-        Err(payload) => match payload.downcast::<&'static str>() {
-            Ok(message) => (*message).to_string(),
-            Err(_) => "non-string panic payload".to_string(),
-        },
+        Err(payload) => payload.downcast::<&'static str>().map_or_else(
+            |_| "non-string panic payload".to_string(),
+            |message| (*message).to_string(),
+        ),
     }
 }
 
@@ -2110,10 +2107,9 @@ fn run_fixtures_against_rust_server_router() {
             continue;
         }
         // Compute SHA1 of path_pattern and verify the SHA1 file exists
-        use sha1::Digest;
-        let mut hasher = sha1::Sha1::new();
-        hasher.update(path_pattern.as_bytes());
-        let digest = hasher.finalize();
+        let mut hasher = <sha1::Sha1 as sha1::Digest>::new();
+        sha1::Digest::update(&mut hasher, path_pattern.as_bytes());
+        let digest = sha1::Digest::finalize(hasher);
         let digest_bytes: &[u8] = digest.as_ref();
         let mut sha1_hex = String::with_capacity(digest.len() * 2);
         for &byte in digest_bytes {
@@ -2626,10 +2622,7 @@ fn run_rust_native_fixtures_against_rust_server_router() {
                             "rust-native tool {} case {} expected error, got ok: {value}",
                             fixture.tool, case.name
                         ),
-                        Ok(Err(err_text)) => {
-                            assert_expected_error(&err_text, expected_err);
-                        }
-                        Err(err_text) => {
+                        Ok(Err(err_text)) | Err(err_text) => {
                             assert_expected_error(&err_text, expected_err);
                         }
                     }

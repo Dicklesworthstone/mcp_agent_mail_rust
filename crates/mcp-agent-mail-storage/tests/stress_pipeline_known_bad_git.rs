@@ -901,11 +901,11 @@ fn assert_test_infrastructure() {
     assert_racer_shim_prob_0_never_injects();
     assert_racer_shim_prob_1_injects_on_target_subcommand();
     assert_racer_shim_trigger_filter_passes_unrelated_commands();
-    assert!(load_thresholds().expect("valid fixture").len() == 4);
+    assert_eq!(load_thresholds().expect("valid fixture").len(), 4);
     assert!(parse_thresholds("[scenario_a]\nretry_rate_max = -0.1\n").is_err());
     assert!(
         parse_thresholds(
-            r#"
+            r"
 [scenario_a]
 retry_rate_min = 0.5
 retry_rate_max = 0.1
@@ -916,7 +916,7 @@ retry_rate_max = 0.08
 retry_rate_max = 0.05
 [scenario_d]
 retry_rate_max = 0.05
-"#
+"
         )
         .is_err()
     );

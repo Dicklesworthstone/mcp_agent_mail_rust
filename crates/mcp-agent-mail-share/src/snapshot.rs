@@ -209,9 +209,9 @@ const KNOWN_TABLES: &[KnownTable] = &[
     },
 ];
 
-/// Create a snapshot of a live FrankenSQLite database at `destination`.
+/// Create a snapshot of a live `FrankenSQLite` database at `destination`.
 ///
-/// The source must already be admitted by FrankenSQLite and retain its complete
+/// The source must already be admitted by `FrankenSQLite` and retain its complete
 /// namespace sidecar pair. It is opened through the guarded, engine-enforced
 /// read-only seam and copied inside one read transaction, so committed rows in
 /// the primary file and WAL are observed as one consistent database snapshot.
@@ -222,7 +222,7 @@ const KNOWN_TABLES: &[KnownTable] = &[
 /// Use [`create_private_canonical_sqlite_snapshot`] for a caller-owned,
 /// engine-exclusive canonical SQLite artifact. There is intentionally no
 /// namespace-absent fallback here: missing, incomplete, malformed, or stale
-/// FrankenSQLite namespace authority fails closed.
+/// `FrankenSQLite` namespace authority fails closed.
 ///
 /// Returns the destination path on success.
 ///
@@ -902,7 +902,7 @@ fn snapshot_column_prefers_text(column: &str) -> bool {
     column.ends_with("_ts") || column.ends_with("_at")
 }
 
-/// Full snapshot preparation pipeline for a live FrankenSQLite mailbox.
+/// Full snapshot preparation pipeline for a live `FrankenSQLite` mailbox.
 ///
 /// 1. Create snapshot
 /// 2. Apply project scope
@@ -910,7 +910,7 @@ fn snapshot_column_prefers_text(column: &str) -> bool {
 /// 4. Finalize (FTS, materialized views, performance indexes, VACUUM)
 ///
 /// The source assumptions are the same as [`create_sqlite_snapshot`]: a
-/// complete, valid FrankenSQLite namespace pair is mandatory and the source
+/// complete, valid `FrankenSQLite` namespace pair is mandatory and the source
 /// is opened only through the guarded read-only seam.
 pub fn create_snapshot_context(
     source: &Path,
@@ -925,7 +925,7 @@ pub fn create_snapshot_context(
 /// Full snapshot preparation pipeline for a private canonical SQLite source.
 ///
 /// The source must be a caller-owned, engine-exclusive archive reconstruction
-/// or materialized snapshot. Never pass a live FrankenSQLite mailbox path;
+/// or materialized snapshot. Never pass a live `FrankenSQLite` mailbox path;
 /// use [`create_snapshot_context`] for that case.
 ///
 /// # Errors
@@ -1268,7 +1268,7 @@ mod tests {
             CanonicalDbConn::open_file(destination.display().to_string()).unwrap();
         let (writer_trigger_tx, writer_trigger_rx) = std::sync::mpsc::sync_channel(0);
         let (writer_done_tx, writer_done_rx) = std::sync::mpsc::sync_channel(0);
-        let writer_path = source.clone();
+        let writer_path = source;
         let writer = std::thread::spawn(move || {
             let conn = DbConn::open_file(writer_path.display().to_string()).unwrap();
             conn.execute_raw("PRAGMA wal_autocheckpoint = 0").unwrap();

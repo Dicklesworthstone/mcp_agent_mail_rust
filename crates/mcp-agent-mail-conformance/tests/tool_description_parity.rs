@@ -694,8 +694,9 @@ fn check_cluster_descriptions(tool_names: &[&str]) {
         }
     }
 
-    assert!(failures.is_empty(), 
+    assert!(
+        failures.is_empty(),
         "Cluster description coverage failures:\n\n{}",
         failures.join("\n\n")
-    )
+    );
 }

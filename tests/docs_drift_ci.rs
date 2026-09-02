@@ -1,3 +1,7 @@
+// Integration scenarios are long and quote user-facing strings by design;
+// these pedantic style lints add nothing in a test harness.
+#![allow(clippy::too_many_lines, clippy::literal_string_with_formatting_args)]
+
 #[path = "../crates/mcp-agent-mail-conformance/tests/doc_consistency.rs"]
 mod doc_consistency;
 

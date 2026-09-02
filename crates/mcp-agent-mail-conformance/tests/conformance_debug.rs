@@ -1,3 +1,7 @@
+// Integration scenarios are long and quote user-facing strings by design;
+// these pedantic style lints add nothing in a test harness.
+#![allow(clippy::too_many_lines)]
+
 use mcp_agent_mail_conformance::Fixtures;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};

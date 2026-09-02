@@ -110,7 +110,7 @@ struct ScrubConfig {
     clear_tool_metrics: bool,
 }
 
-fn preset_config(preset: ScrubPreset) -> ScrubConfig {
+const fn preset_config(preset: ScrubPreset) -> ScrubConfig {
     match preset {
         ScrubPreset::Standard => ScrubConfig {
             redact_body: false,
@@ -516,6 +516,7 @@ pub fn scrub_snapshot(
 ///
 /// This is the same scanner used by `scrub_snapshot` but exposed for
 /// use by the static rendering pipeline as a defense-in-depth measure.
+#[must_use]
 pub fn scan_for_secrets(input: &str) -> (String, i64) {
     scrub_text(input)
 }
@@ -635,7 +636,7 @@ fn exec_count(conn: &Conn, sql: &str, params: &[SqlValue]) -> Result<i64, ShareE
 }
 
 /// Check if a table exists. Uses a direct SELECT probe because
-/// FrankenConnection does not support sqlite_master queries.
+/// `FrankenConnection` does not support `sqlite_master` queries.
 fn table_exists(conn: &Conn, name: &str) -> Result<bool, ShareError> {
     let probe = format!("SELECT 1 FROM \"{name}\" LIMIT 0");
     match conn.query_sync(&probe, &[]) {
@@ -1475,7 +1476,7 @@ mod tests {
             .unwrap();
         let recipients: String = overview_rows[0].get_named("recipients").unwrap();
         let attachment_count: i64 = overview_rows[0].get_named("attachment_count").unwrap();
-        assert!(recipients.is_empty());
+        assert_eq!(recipients, "");
         assert_eq!(attachment_count, 0);
 
         let attachment_rows = conn

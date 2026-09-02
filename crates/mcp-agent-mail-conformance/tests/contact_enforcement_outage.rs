@@ -6,9 +6,13 @@
 //! - Warning logs emitted with actionable context
 //!
 //! Strategy: set up a healthy DB with agents & policies, then DROP the tables
-//! queried by contact enforcement (while keeping the messages/agents/message_recipients
+//! queried by contact enforcement (while keeping the `messages`/`agents`/`message_recipients`
 //! tables intact for the write path). The enforcement reads fail with SQL errors,
 //! but the message creation write succeeds.
+
+// Integration scenarios are long and quote user-facing strings by design;
+// these pedantic style lints add nothing in a test harness.
+#![allow(clippy::too_many_lines)]
 
 // Note: unsafe required for env::set_var in Rust 2024
 #![allow(unsafe_code)]
@@ -179,7 +183,7 @@ fn ensure_project_direct(project_key: &str) {
 // ---------------------------------------------------------------------------
 
 /// E2E scenario: after dropping the `file_reservations` table (and optionally
-/// `agent_links`), a send_message with contact_enforcement_enabled=true should
+/// `agent_links`), a `send_message` with `contact_enforcement_enabled=true` should
 /// still succeed because all three metriced fail-open sites catch the SQL error,
 /// increment `contact_enforcement_bypass_total`, and return empty results.
 ///
@@ -187,7 +191,7 @@ fn ensure_project_direct(project_key: &str) {
 /// remain intact, so the message is created successfully.
 #[test]
 fn contact_enforcement_db_outage_fail_open() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let tmp = tempfile::TempDir::new().expect("create tempdir");
     let db_path = tmp.path().join("outage_test.sqlite3");
     let db_url = format!("sqlite://{}", db_path.display());
@@ -365,9 +369,8 @@ fn contact_enforcement_db_outage_fail_open() {
             .build()
             .expect("build runtime");
         rt.block_on(async {
-            let conn = match pool.acquire(&cx_corrupt).await {
-                asupersync::Outcome::Ok(c) => c,
-                _ => panic!("failed to acquire connection for corruption"),
+            let asupersync::Outcome::Ok(conn) = pool.acquire(&cx_corrupt).await else {
+                panic!("failed to acquire connection for corruption");
             };
             // Drop tables used by contact enforcement queries
             // Site 3: get_active_reservations uses file_reservations
@@ -408,7 +411,7 @@ fn contact_enforcement_db_outage_fail_open() {
     assert!(
         outage_result
             .get("count")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(0)
             > 0,
         "outage send delivery count should be > 0: {outage_result}"
@@ -491,7 +494,7 @@ fn contact_enforcement_db_outage_fail_open() {
 /// independently, proving counter atomicity under contention.
 #[test]
 fn contact_enforcement_outage_counter_atomicity() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let tmp = tempfile::TempDir::new().expect("create tempdir");
     let db_path = tmp.path().join("atomicity_test.sqlite3");
     let db_url = format!("sqlite://{}", db_path.display());
@@ -609,9 +612,8 @@ fn contact_enforcement_outage_counter_atomicity() {
             .build()
             .expect("rt");
         rt.block_on(async {
-            let conn = match pool.acquire(&cx_c).await {
-                asupersync::Outcome::Ok(c) => c,
-                _ => panic!("acquire failed"),
+            let asupersync::Outcome::Ok(conn) = pool.acquire(&cx_c).await else {
+                panic!("acquire failed");
             };
             let _ = conn.query_sync("DROP TABLE IF EXISTS file_reservations", &[]);
             let _ = conn.query_sync("DROP TABLE IF EXISTS agent_links", &[]);

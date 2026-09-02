@@ -28,6 +28,7 @@ use crate::wizard::{DetectedEnvironment, DetectedSignal, DetectionConfidence, Ho
 ///
 /// * `bundle_path` - Path to the bundle directory (or intended output location)
 /// * `cwd` - Current working directory for git/environment detection
+#[must_use]
 pub fn detect_environment(bundle_path: Option<&Path>, cwd: &Path) -> DetectedEnvironment {
     let mut env = DetectedEnvironment {
         cwd: cwd.to_path_buf(),
@@ -71,6 +72,7 @@ pub fn detect_environment(bundle_path: Option<&Path>, cwd: &Path) -> DetectedEnv
 /// - `.github/workflows/` directory with pages-related workflows
 /// - `GITHUB_REPOSITORY` environment variable
 /// - docs/ directory location
+#[must_use]
 pub fn detect_github_pages(cwd: &Path) -> Vec<DetectedSignal> {
     let git_remote = crate::git::git_remote_url(cwd);
     detect_github_pages_with_remote(cwd, git_remote.as_deref())
@@ -159,6 +161,7 @@ fn detect_github_pages_with_remote(cwd: &Path, git_remote: Option<&str>) -> Vec<
 /// - `wrangler.toml` configuration file
 /// - `CF_PAGES` environment variable
 /// - Cloudflare-related git remote (rare)
+#[must_use]
 pub fn detect_cloudflare_pages(cwd: &Path) -> Vec<DetectedSignal> {
     let mut signals = Vec::new();
 
@@ -200,6 +203,7 @@ pub fn detect_cloudflare_pages(cwd: &Path) -> Vec<DetectedSignal> {
 /// - `netlify.toml` configuration file
 /// - `NETLIFY` environment variable
 /// - Netlify-specific build environment variables
+#[must_use]
 pub fn detect_netlify(cwd: &Path) -> Vec<DetectedSignal> {
     let mut signals = Vec::new();
 
@@ -241,6 +245,7 @@ pub fn detect_netlify(cwd: &Path) -> Vec<DetectedSignal> {
 /// - AWS credentials environment variables
 /// - AWS profile configuration
 /// - S3-related deploy scripts
+#[must_use]
 pub fn detect_s3(cwd: &Path) -> Vec<DetectedSignal> {
     let mut signals = Vec::new();
 
@@ -303,6 +308,7 @@ pub fn detect_s3(cwd: &Path) -> Vec<DetectedSignal> {
 /// Trailing segments like `/tree/main` or `/issues` are ignored because the
 /// rest of the share flow expects a repository identifier, not an arbitrary URL
 /// path.
+#[must_use]
 pub fn extract_github_repo(url: &str) -> Option<String> {
     // HTTPS: https://github.com/owner/repo.git
     if let Some(rest) = url.strip_prefix("https://github.com/") {
@@ -529,7 +535,7 @@ fn determine_recommended_provider(env: &DetectedEnvironment) -> Option<HostingPr
     None
 }
 
-fn confidence_order(c: DetectionConfidence) -> u8 {
+const fn confidence_order(c: DetectionConfidence) -> u8 {
     match c {
         DetectionConfidence::High => 0,
         DetectionConfidence::Medium => 1,
@@ -737,7 +743,7 @@ mod tests {
         std::fs::write(bundle.join("manifest.json"), "{}").expect("write manifest");
 
         let env = detect_environment(Some(&bundle), dir.path());
-        assert_eq!(env.existing_bundle, Some(bundle.clone()));
+        assert_eq!(env.existing_bundle, Some(bundle));
         assert!(
             env.signals
                 .iter()
@@ -854,8 +860,8 @@ mod tests {
         // No git, no workflows, no env → may be empty
         // (GITHUB_REPOSITORY env var could leak from CI, so just check structure)
         for s in &signals {
-            assert!(!s.source.is_empty());
-            assert!(!s.detail.is_empty());
+            assert_ne!(s.source, "");
+            assert_ne!(s.detail, "");
         }
     }
 
@@ -994,7 +1000,7 @@ mod tests {
         let signals = detect_cloudflare_pages(dir.path());
         // Without CF env vars, should be empty or only env-based
         for s in &signals {
-            assert!(!s.detail.is_empty());
+            assert_ne!(s.detail, "");
         }
     }
 
@@ -1030,7 +1036,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let signals = detect_netlify(dir.path());
         for s in &signals {
-            assert!(!s.detail.is_empty());
+            assert_ne!(s.detail, "");
         }
     }
 
@@ -1141,7 +1147,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let signals = detect_s3(dir.path());
         for s in &signals {
-            assert!(!s.detail.is_empty());
+            assert_ne!(s.detail, "");
         }
     }
 
