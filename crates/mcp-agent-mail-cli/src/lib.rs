@@ -26420,10 +26420,12 @@ enum DoctorCanonicalDiagnosticSourceKind {
     /// A private logical rebuild (`VACUUM INTO`) exported through a guarded
     /// read-only FrankenSQLite connection.
     LiveLogicalSnapshot,
-    /// A private byte-for-byte copy of a Franken-admitted live family (main
-    /// file plus every recovery sidecar, minus the FrankenSQLite namespace
-    /// sidecars) staged by the same mechanism `am robot health` uses, opened
-    /// by canonical SQLite on the copy only. The preferred source for a
+    /// A private byte-for-byte copy of a live family (main file plus every
+    /// recovery sidecar, minus the FrankenSQLite namespace sidecars) staged by
+    /// the same mechanism `am robot health` uses, opened by canonical SQLite
+    /// on the copy only. Used for Franken-admitted families and, as the last
+    /// resort, for sidecar-free resting WAL families the guarded read-only
+    /// opener cannot recover (br-s9d8a). The preferred source for a
     /// Franken-admitted family (GH#293): physical checks on it are
     /// authoritative for the bytes that were copied.
     StagedFamilyCopy,
@@ -26662,6 +26664,21 @@ fn doctor_open_canonical_source_for_diagnostic(
         }),
         Err(offline_error) => {
             let offline_authority_error = offline_error.to_string();
+            // A family without namespace sidecars can still be unreadable by
+            // the guarded read-only opener: a resting WAL family (main + WAL
+            // + SHM left by a canonical or Python-era writer, no live owner)
+            // needs WAL recovery that a read-only SHM cannot perform
+            // (br-s9d8a). The private staged copy is the same physical bytes
+            // with the WAL applied in the copy, so it proves the b-tree the
+            // operator asked about while leaving the source untouched.
+            let staged_error = if franken_admitted {
+                staged_error
+            } else {
+                match doctor_open_staged_family_copy_canonical(db_path, operation) {
+                    Ok(opened) => return Ok(opened),
+                    Err(error) => error.to_string(),
+                }
+            };
             // Each branch's real cause is bounded separately so none of them
             // can crowd the others out of the operator-facing detail.
             Err(DoctorCanonicalDiagnosticOpenFailure {
