@@ -4211,7 +4211,7 @@ impl DbPool {
         // Keep consistency sampling read-only and avoid JOIN-heavy scans:
         // 1) fetch recent envelopes
         // 2) resolve slugs/names via batched point lookups
-        let conn = open_guarded_read_only_franken_existing_file(sqlite_path, "consistency probe")
+        let conn = open_guarded_read_only_sqlite_file(sqlite_path, "consistency probe")
             .map_err(|e| DbError::Sqlite(format!("consistency probe: open failed: {e}")))?;
         // This two-phase strategy is materially faster than a three-way JOIN on
         // large mailboxes and reduces startup probe lock contention.
@@ -6022,8 +6022,10 @@ pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInve
         )));
     }
 
-    let conn =
-        open_guarded_read_only_franken_existing_file(primary_path, "mailbox database inventory")?;
+    // Engine-dispatching: an inventory must read a canonical-written,
+    // restored, or reconstructed family (no namespace pair) as readily as a
+    // live Franken-admitted one.
+    let conn = open_guarded_read_only_sqlite_file(primary_path, "mailbox database inventory")?;
     let present = conn
         .query_sync(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -6081,7 +6083,7 @@ pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInve
         (0, 0)
     };
     let project_identities = if present.contains("projects") {
-        crate::reconstruct::collect_db_project_identities(&conn)?
+        crate::reconstruct::collect_db_project_identities_with(|sql| conn.query_sync(sql, &[]))?
     } else {
         BTreeSet::new()
     };
@@ -7114,14 +7116,19 @@ const DURABLE_MAILBOX_STATE_TABLES: &[&str] = &[
     "atc_rollup_snapshots",
 ];
 
-/// True only when canonical SQLite can read every *present* durable mailbox
-/// table and each is empty. A partially bootstrapped fresh file may not yet
-/// have the newest tables; an absent table cannot contain recoverable rows.
-/// Failure to inspect a present table remains fail-closed.
+/// True only when a guarded read-only open can read every *present* durable
+/// mailbox table and each is empty. A partially bootstrapped fresh file may
+/// not yet have the newest tables; an absent table cannot contain recoverable
+/// rows. Failure to inspect a present table remains fail-closed.
+///
+/// Engine-dispatching: a fresh bootstrap the runtime has already admitted
+/// carries a namespace pair and is read through FrankenSQLite; an offline or
+/// canonical-written file is read through canonical SQLite. The verdict is
+/// the same either way, and a cross-engine open of an admitted inode is
+/// never attempted.
 #[allow(clippy::result_large_err)]
 fn canonical_mailbox_has_no_durable_rows(path: &Path) -> Result<bool, SqlError> {
-    let conn =
-        open_guarded_read_only_canonical_sqlite_file(path, "canonical durable-row diagnostic")?;
+    let conn = open_guarded_read_only_sqlite_file(path, "durable-row diagnostic")?;
 
     for table in DURABLE_MAILBOX_STATE_TABLES {
         // `table` comes from the static list above, never user input. A
@@ -10740,16 +10747,33 @@ fn map_read_only_namespace_admission_error(
 
 #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
 #[allow(clippy::result_large_err)]
-fn acquire_guarded_read_only_namespace_binding(
+/// Shape of the persistent FrankenSQLite namespace sidecar pair
+/// (`-fsqlite-ns-gate` / `-fsqlite-ns-use`) beside a main database file.
+///
+/// The pair is the durable evidence that a family is Franken-admitted. It
+/// decides which read-only engine may touch the family: a complete pair means
+/// the same-engine bound opener, no pair means canonical SQLite's true
+/// read-only flags, and a half pair is ambiguous authority nobody may open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamespaceSidecarShape {
+    /// Neither sidecar exists: the family carries no Franken namespace
+    /// authority (canonical-written, restored from a `.bak`, reconstructed
+    /// from the archive, or a neutralized salvage artifact).
+    Absent,
+    /// Exactly one sidecar exists: an interrupted admission or retirement.
+    Incomplete,
+    /// Both sidecars exist as regular files: a Franken-admitted family.
+    Complete,
+}
+
+/// Inspect the namespace sidecar pair beside `stable_path` without following
+/// symlinks. A non-regular occupant or an uninspectable pathname is refused
+/// outright: neither may reach an engine's fallback behaviour.
+#[allow(clippy::result_large_err)]
+fn inspect_namespace_sidecar_shape(
     stable_path: &Path,
     context: &str,
-) -> Result<std::sync::Arc<fsqlite::fsqlite_vfs::namespace::DatabaseNamespaceBinding>, SqlError> {
-    use fsqlite::fsqlite_vfs::namespace::{NamespaceOpenIntent, PendingNamespaceOpen};
-
-    // ReadOnlyExisting intentionally treats a namespace with either sidecar
-    // absent as wholly unadmitted. Refuse an asymmetric pair here: silently
-    // ignoring an occupied peer is ambiguous authority, and a non-regular
-    // occupant must never reach the engine's Shared fallback.
+) -> Result<NamespaceSidecarShape, SqlError> {
     let mut namespace_sidecars_present = 0_u8;
     for suffix in FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES {
         let sidecar = sqlite_sidecar_path(stable_path, suffix);
@@ -10774,7 +10798,24 @@ fn acquire_guarded_read_only_namespace_binding(
             }
         }
     }
-    if namespace_sidecars_present != 2 {
+    Ok(match namespace_sidecars_present {
+        0 => NamespaceSidecarShape::Absent,
+        2 => NamespaceSidecarShape::Complete,
+        _ => NamespaceSidecarShape::Incomplete,
+    })
+}
+
+fn acquire_guarded_read_only_namespace_binding(
+    stable_path: &Path,
+    context: &str,
+) -> Result<std::sync::Arc<fsqlite::fsqlite_vfs::namespace::DatabaseNamespaceBinding>, SqlError> {
+    use fsqlite::fsqlite_vfs::namespace::{NamespaceOpenIntent, PendingNamespaceOpen};
+
+    // ReadOnlyExisting intentionally treats a namespace with either sidecar
+    // absent as wholly unadmitted. Refuse an asymmetric pair here: silently
+    // ignoring an occupied peer is ambiguous authority, and a non-regular
+    // occupant must never reach the engine's Shared fallback.
+    if inspect_namespace_sidecar_shape(stable_path, context)? != NamespaceSidecarShape::Complete {
         return Err(SqlError::Custom(format!(
             "{context}: refusing live read-only FrankenSQLite open for {} because a complete pre-existing namespace sidecar pair is required",
             stable_path.display()
@@ -11027,6 +11068,163 @@ pub fn open_guarded_read_only_canonical_sqlite_file(
     Ok(conn)
 }
 
+/// Which engine served an [`open_guarded_read_only_sqlite_file`] open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardedReadOnlyEngine {
+    /// The family carried a complete FrankenSQLite namespace pair, so the
+    /// bound same-engine read-only opener served it.
+    Franken,
+    /// The family carried no namespace authority, so canonical SQLite's true
+    /// read-only flags served it.
+    Canonical,
+}
+
+impl GuardedReadOnlyEngine {
+    /// Stable lowercase label for diagnostics and JSON payloads.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Franken => "franken",
+            Self::Canonical => "canonical",
+        }
+    }
+}
+
+/// A read-only connection produced by [`open_guarded_read_only_sqlite_file`].
+///
+/// Read-only consumers (inventories, integrity diagnostics, archive
+/// verifiers) use the delegating query methods and never need to know which
+/// engine answered. Callers whose next step is engine-specific, such as a
+/// FrankenSQLite `VACUUM INTO` export of a live family, ask for the Franken
+/// connection explicitly through [`Self::as_franken`].
+pub enum GuardedReadOnlyConn {
+    /// Served by the bound FrankenSQLite read-only opener.
+    Franken(DbConn),
+    /// Served by canonical SQLite's true read-only flags.
+    Canonical(crate::CanonicalDbConn),
+}
+
+impl GuardedReadOnlyConn {
+    /// The engine that served this connection.
+    #[must_use]
+    pub const fn engine(&self) -> GuardedReadOnlyEngine {
+        match self {
+            Self::Franken(_) => GuardedReadOnlyEngine::Franken,
+            Self::Canonical(_) => GuardedReadOnlyEngine::Canonical,
+        }
+    }
+
+    /// The underlying FrankenSQLite connection, when the family was
+    /// Franken-admitted.
+    #[must_use]
+    pub const fn as_franken(&self) -> Option<&DbConn> {
+        match self {
+            Self::Franken(conn) => Some(conn),
+            Self::Canonical(_) => None,
+        }
+    }
+
+    /// Prepare and execute a query, returning every row.
+    #[allow(clippy::result_large_err)]
+    pub fn query_sync(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<sqlmodel_core::Row>, SqlError> {
+        match self {
+            Self::Franken(conn) => conn.query_sync(sql, params),
+            Self::Canonical(conn) => conn.query_sync(sql, params),
+        }
+    }
+
+    /// Execute SQL without parameter binding (PRAGMAs on a read-only handle).
+    #[allow(clippy::result_large_err)]
+    pub fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
+        match self {
+            Self::Franken(conn) => conn.execute_raw(sql),
+            Self::Canonical(conn) => conn.execute_raw(sql),
+        }
+    }
+}
+
+/// Open an existing database read-only through whichever engine holds
+/// authority over its family.
+///
+/// The persistent namespace sidecar pair decides the engine: a complete pair
+/// routes to [`open_guarded_read_only_franken_existing_file`], no pair routes
+/// to [`open_guarded_read_only_canonical_sqlite_file`], and a half pair is
+/// refused as ambiguous authority. Neither opener's own refusal paths are
+/// bypassed: the Franken opener still preflights the live family and the
+/// canonical opener still refuses a Franken-admitted inode it observes itself.
+///
+/// Before this seam every read-only consumer called the Franken opener
+/// directly, which made any family last written by canonical SQLite, restored
+/// from a `.bak`, or produced by archive reconstruction unreadable ("a
+/// complete pre-existing namespace sidecar pair is required") even though the
+/// canonical opener existed for exactly those files.
+///
+/// A family can change engines between the shape inspection and the engine
+/// admission (a writer admitting the namespace, a salvage retiring it). When
+/// the chosen opener fails, the shape is inspected once more; a changed shape
+/// gets exactly one attempt through the other opener, an unchanged shape keeps
+/// the original error.
+#[allow(clippy::result_large_err)]
+pub fn open_guarded_read_only_sqlite_file(
+    sqlite_path: &Path,
+    context: &str,
+) -> Result<GuardedReadOnlyConn, SqlError> {
+    validate_sqlite_target_path(sqlite_path, context)?;
+    let stable_path = std::fs::canonicalize(sqlite_path).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot resolve stable SQLite path {}: {error}",
+            sqlite_path.display()
+        ))
+    })?;
+    let first_shape = inspect_namespace_sidecar_shape(&stable_path, context)?;
+    match open_guarded_read_only_for_shape(sqlite_path, &stable_path, context, first_shape) {
+        Ok(conn) => Ok(conn),
+        Err(error) => {
+            let second_shape = inspect_namespace_sidecar_shape(&stable_path, context)?;
+            if second_shape == first_shape {
+                return Err(error);
+            }
+            tracing::debug!(
+                path = %stable_path.display(),
+                context,
+                ?first_shape,
+                ?second_shape,
+                error = %error,
+                "guarded read-only open: namespace shape changed during admission; re-dispatching once"
+            );
+            open_guarded_read_only_for_shape(sqlite_path, &stable_path, context, second_shape)
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn open_guarded_read_only_for_shape(
+    sqlite_path: &Path,
+    stable_path: &Path,
+    context: &str,
+    shape: NamespaceSidecarShape,
+) -> Result<GuardedReadOnlyConn, SqlError> {
+    match shape {
+        NamespaceSidecarShape::Complete => {
+            open_guarded_read_only_franken_existing_file(sqlite_path, context)
+                .map(GuardedReadOnlyConn::Franken)
+        }
+        NamespaceSidecarShape::Absent => {
+            open_guarded_read_only_canonical_sqlite_file(sqlite_path, context)
+                .map(GuardedReadOnlyConn::Canonical)
+        }
+        NamespaceSidecarShape::Incomplete => Err(SqlError::Custom(format!(
+            "{context}: refusing read-only open for {} because its FrankenSQLite namespace sidecar pair is incomplete (exactly one of -fsqlite-ns-gate / -fsqlite-ns-use exists); finish or retire the admission before reading",
+            stable_path.display()
+        ))),
+    }
+}
+
 fn recovery_required_free_bytes(expected_write_bytes: u64) -> u64 {
     RECOVERY_DISK_RESERVE_BYTES.saturating_add(expected_write_bytes)
 }
@@ -11077,6 +11275,8 @@ fn sqlite_recovery_sidecar_label(suffix: &str) -> &'static str {
         "-shm" => "SHM",
         "-wal-cert" => "WAL-cert",
         "-wal-cert-head" => "WAL-cert-head",
+        "-fsqlite-ns-gate" => "namespace-gate",
+        "-fsqlite-ns-use" => "namespace-use",
         _ => "sqlite",
     }
 }
@@ -11548,16 +11748,19 @@ fn create_proactive_backup_stage(
             "proactive backup private export path is not usable by FrankenSQLite: {error}"
         ))
     })?;
-    let source_conn = open_guarded_read_only_franken_existing_file(
-        source,
-        "proactive backup live-source export",
-    )
-    .map_err(|error| {
-        DbError::Sqlite(format!(
-            "proactive backup failed to open live source {} through guarded FrankenSQLite authority: {error}",
-            source.display()
-        ))
-    })?;
+    // Engine-dispatching: a Franken-admitted source exports through the bound
+    // FrankenSQLite opener; a source without a namespace pair (restored,
+    // reconstructed, canonical-written) exports through canonical SQLite.
+    // Either way the source pager is engine-enforced read-only and the
+    // `VACUUM INTO` below writes only the private export.
+    let source_conn =
+        open_guarded_read_only_sqlite_file(source, "proactive backup live-source export")
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "proactive backup failed to open live source {} through guarded read-only authority: {error}",
+                    source.display()
+                ))
+            })?;
     source_conn
         .execute_raw("PRAGMA query_only = OFF;")
         .map_err(|error| DbError::Sqlite(format!("proactive backup snapshot export: {error}")))?;
@@ -12702,7 +12905,18 @@ fn quarantine_corrupt_sidecars_or_restore_primary(
     timestamp: &str,
     context: &str,
 ) -> Result<(), SqlError> {
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+    // The FrankenSQLite namespace records describe the generation that was
+    // just quarantined: they bind its file identity, and the engine's strict
+    // read-only admission refuses a promoted generation whose records "name a
+    // different database generation". They are retired by rename alongside
+    // the journal/WAL/SHM companions (never unlinked), so the promoted family
+    // is sidecar-less until the runtime's next writer-capable open re-admits
+    // it, and every guarded read-only diagnostic reads it through canonical
+    // SQLite in the meantime instead of failing on the stale record.
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .iter()
+        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+    {
         if let Err(e) = quarantine_sidecar(primary_path, suffix, timestamp) {
             let sidecar_label = sqlite_recovery_sidecar_label(suffix);
             if let Err(restore_err) =
@@ -15002,6 +15216,144 @@ mod tests {
                 "read-only diagnostic published forbidden artifact {name}"
             );
         }
+    }
+
+    /// br-vhxdc (red-test class E1): a family that was never Franken-admitted
+    /// (canonical-written, restored from a backup, reconstructed from the
+    /// archive) carries no namespace pair. The Franken opener alone refuses
+    /// it; the dispatcher must serve it through canonical SQLite, read-only,
+    /// without publishing any artifact beside it.
+    #[test]
+    fn guarded_read_only_dispatch_serves_sidecar_less_family_through_canonical_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("restored.sqlite3");
+        seed_settled_diagnostic_database(&db_path);
+
+        let refusal =
+            match open_guarded_read_only_franken_existing_file(&db_path, "dispatch fixture") {
+                Ok(_) => panic!("the Franken opener alone must still refuse a sidecar-less family"),
+                Err(error) => error.to_string(),
+            };
+        assert!(
+            refusal.contains("complete pre-existing namespace sidecar pair is required"),
+            "unexpected Franken refusal shape: {refusal}"
+        );
+
+        let before = exact_diagnostic_parent_snapshot(dir.path());
+        let conn = open_guarded_read_only_sqlite_file(&db_path, "dispatch fixture")
+            .expect("the dispatcher must serve a sidecar-less family");
+        assert_eq!(conn.engine(), GuardedReadOnlyEngine::Canonical);
+        assert!(conn.as_franken().is_none());
+        let rows = conn
+            .query_sync("SELECT value FROM diagnostic_fixture", &[])
+            .expect("query through the canonical engine");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("value").unwrap(), 7);
+        assert!(
+            conn.execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (8);")
+                .is_err(),
+            "the dispatched connection must be read-only"
+        );
+        drop(conn);
+
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(dir.path()),
+            before,
+            "a read-only dispatch must leave the family byte-identical"
+        );
+        assert_no_read_only_diagnostic_artifacts(dir.path());
+    }
+
+    /// The other half of the dispatch: a Franken-admitted family (complete
+    /// namespace pair) keeps going through the bound same-engine opener, so
+    /// the canonical opener's cross-engine refusal is never reached.
+    #[test]
+    fn guarded_read_only_dispatch_serves_franken_admitted_family_through_franken() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live.sqlite3");
+        seed_settled_diagnostic_database(&db_path);
+        admit_diagnostic_database_with_franken(&db_path);
+
+        let conn = open_guarded_read_only_sqlite_file(&db_path, "dispatch fixture")
+            .expect("the dispatcher must serve a Franken-admitted family");
+        assert_eq!(conn.engine(), GuardedReadOnlyEngine::Franken);
+        assert!(conn.as_franken().is_some());
+        let rows = conn
+            .query_sync("SELECT value FROM diagnostic_fixture", &[])
+            .expect("query through the Franken engine");
+        assert_eq!(rows[0].get_named::<i64>("value").unwrap(), 7);
+        assert!(
+            conn.execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (8);")
+                .is_err(),
+            "the dispatched connection must be read-only"
+        );
+    }
+
+    /// A half namespace pair is ambiguous authority: the dispatcher refuses it
+    /// explicitly and adds no bypass around either single-engine opener.
+    #[test]
+    fn guarded_read_only_dispatch_refuses_incomplete_namespace_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("half.sqlite3");
+        seed_settled_diagnostic_database(&db_path);
+        std::fs::write(sqlite_sidecar_path(&db_path, "-fsqlite-ns-gate"), b"")
+            .expect("plant one namespace sidecar");
+
+        let error = match open_guarded_read_only_sqlite_file(&db_path, "dispatch fixture") {
+            Ok(_) => panic!("a half namespace pair must not open through either engine"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("namespace sidecar pair is incomplete"),
+            "unexpected refusal shape: {error}"
+        );
+        assert!(
+            open_guarded_read_only_franken_existing_file(&db_path, "dispatch fixture").is_err(),
+            "the Franken opener must still refuse a half pair"
+        );
+        assert!(
+            open_guarded_read_only_canonical_sqlite_file(&db_path, "dispatch fixture").is_err(),
+            "the canonical opener must still refuse an occupied namespace pathname"
+        );
+    }
+
+    /// The concrete class-E1 consumer: `inspect_mailbox_db_inventory` on a
+    /// database that was never Franken-admitted used to fail with the
+    /// namespace-pair refusal, which made every archive-drift and health
+    /// comparison against a restored or reconstructed mailbox impossible.
+    #[test]
+    fn mailbox_db_inventory_reads_sidecar_less_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reconstructed.sqlite3");
+        let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open canonical seed database");
+        conn.execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("settle seed journal mode");
+        conn.execute_raw(&schema::init_schema_sql_base())
+            .expect("apply base schema through canonical SQLite");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) \
+             VALUES (1, 'restored-project', '/restored-project', 0);",
+        )
+        .expect("seed project");
+        drop(conn);
+        assert!(!sqlite_sidecar_path(&db_path, "-fsqlite-ns-gate").exists());
+        assert!(!sqlite_sidecar_path(&db_path, "-fsqlite-ns-use").exists());
+
+        let inventory = inspect_mailbox_db_inventory(&db_path)
+            .expect("inventory must read a family without a namespace pair");
+        assert_eq!(inventory.projects, 1);
+        assert_eq!(inventory.agents, 0);
+        assert_eq!(inventory.messages, 0);
+        assert_eq!(inventory.max_message_id, 0);
+        assert!(
+            inventory
+                .project_identities
+                .iter()
+                .any(|identity| identity.slug.as_deref() == Some("restored-project")),
+            "project identities must come from the sidecar-less family: {:?}",
+            inventory.project_identities
+        );
     }
 
     fn seed_settled_diagnostic_database(path: &Path) {

@@ -1770,19 +1770,19 @@ fn collect_archive_db_artifact_index(storage_root: &Path) -> ArchiveDbArtifactIn
     index
 }
 
-fn open_db_for_archive_verifier(db_path: &Path) -> Option<crate::DbConn> {
+fn open_db_for_archive_verifier(db_path: &Path) -> Option<crate::pool::GuardedReadOnlyConn> {
     if db_path.as_os_str() == ":memory:" {
         return None;
     }
-    crate::pool::open_guarded_read_only_franken_existing_file(
-        db_path,
-        "archive verifier database diagnostic",
-    )
-    .ok()
+    // Engine-dispatching: the verifier compares the archive against whatever
+    // database is on disk, including a restored or reconstructed one that
+    // carries no FrankenSQLite namespace pair.
+    crate::pool::open_guarded_read_only_sqlite_file(db_path, "archive verifier database diagnostic")
+        .ok()
 }
 
 fn query_db_message_expectations(
-    conn: &crate::DbConn,
+    conn: &crate::pool::GuardedReadOnlyConn,
 ) -> Result<Vec<DbMessageArtifactExpectation>, String> {
     let rows = conn
         .query_sync(
@@ -1819,7 +1819,7 @@ fn query_db_message_expectations(
 }
 
 fn query_db_mailbox_copy_expectations(
-    conn: &crate::DbConn,
+    conn: &crate::pool::GuardedReadOnlyConn,
 ) -> Result<Vec<DbMailboxCopyExpectation>, String> {
     let mut expectations = Vec::new();
 
@@ -1888,7 +1888,7 @@ fn query_db_mailbox_copy_expectations(
 }
 
 fn query_db_agent_profile_expectations(
-    conn: &crate::DbConn,
+    conn: &crate::pool::GuardedReadOnlyConn,
 ) -> Result<Vec<DbAgentProfileExpectation>, String> {
     let rows = conn
         .query_sync(
@@ -1924,7 +1924,7 @@ fn query_db_agent_profile_expectations(
 }
 
 fn query_db_reservation_expectations(
-    conn: &crate::DbConn,
+    conn: &crate::pool::GuardedReadOnlyConn,
 ) -> Result<Vec<DbReservationArtifactExpectation>, String> {
     let rows = conn
         .query_sync(

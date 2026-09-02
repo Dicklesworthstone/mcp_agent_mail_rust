@@ -10385,7 +10385,9 @@ struct DoctorVacuumStats {
 }
 
 fn doctor_vacuum_stats(db_path: &Path) -> CliResult<DoctorVacuumStats> {
-    let conn = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+    // Engine-dispatching: page statistics are equally valid from canonical
+    // SQLite for a family without a FrankenSQLite namespace pair.
+    let conn = mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(
         db_path,
         "doctor vacuum statistics probe",
     )
@@ -15330,17 +15332,21 @@ fn vacuum_live_franken_sqlite_into_snapshot(
 ) -> CliResult<()> {
     let destination_text = sqlite_snapshot_path_text(destination, context, "destination")?;
     prepare_sqlite_snapshot_destination(destination, context)?;
-    let conn =
-        mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(source, context)
-            .map_err(|error| {
-                CliError::Other(format!(
-                    "{context} guarded live snapshot source open failed for {}: {error}",
-                    source.display()
-                ))
-            })?;
+    // Engine-dispatching: a Franken-admitted source exports through the bound
+    // FrankenSQLite opener; a source without a namespace pair (restored from a
+    // backup, reconstructed from the archive, written by canonical tooling)
+    // exports through canonical SQLite. Either way the source pager is
+    // engine-enforced read-only and `VACUUM INTO` writes only the destination.
+    let conn = mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(source, context)
+        .map_err(|error| {
+            CliError::Other(format!(
+                "{context} guarded live snapshot source open failed for {}: {error}",
+                source.display()
+            ))
+        })?;
     // `query_only` is a connection-local SQL policy. The pager remains
-    // engine-enforced read-only after this is disabled, while FrankenSQLite's
-    // `VACUUM INTO` may create only the new private destination.
+    // engine-enforced read-only after this is disabled, while `VACUUM INTO`
+    // may create only the new private destination.
     conn.execute_raw("PRAGMA query_only = OFF;")
         .map_err(|error| {
             CliError::Other(format!(
@@ -31298,7 +31304,7 @@ pub(crate) fn doctor_live_integrity_classification(
     // Probe the LIVE physical file, never a logical snapshot: a VACUUM-built
     // private canonical snapshot compacts away exactly the orphaned pages
     // this classification exists to count.
-    let conn = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+    let conn = mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(
         Path::new(&resolved.canonical_path),
         "read-only doctor integrity classification probe",
     )

@@ -1036,11 +1036,12 @@ pub fn collect_db_message_ids(db_path: &Path) -> Result<BTreeSet<i64>, SqlError>
         ));
     }
 
-    let conn = crate::pool::open_guarded_read_only_franken_existing_file(
-        db_path,
-        "database message-id inventory",
-    )
-    .map_err(|error| SqlError::Custom(format!("collect_db_message_ids: {error}")))?;
+    // Engine-dispatching: the database being inventoried is frequently one
+    // this module just reconstructed or a restored backup, neither of which
+    // carries a FrankenSQLite namespace pair.
+    let conn =
+        crate::pool::open_guarded_read_only_sqlite_file(db_path, "database message-id inventory")
+            .map_err(|error| SqlError::Custom(format!("collect_db_message_ids: {error}")))?;
     // Check if messages table exists.
     let tables = conn.query_sync(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'",
@@ -1263,8 +1264,21 @@ pub fn compute_archive_drift_report(
 pub fn collect_db_project_identities(
     conn: &crate::DbConn,
 ) -> Result<BTreeSet<MailboxProjectIdentity>, SqlError> {
+    collect_db_project_identities_with(|sql| conn.query_sync(sql, &[]))
+}
+
+/// [`collect_db_project_identities`] over any query function, so the
+/// inventory can read a family through whichever engine the guarded
+/// read-only opener dispatched to.
+#[allow(clippy::result_large_err)]
+pub fn collect_db_project_identities_with<F>(
+    mut query: F,
+) -> Result<BTreeSet<MailboxProjectIdentity>, SqlError>
+where
+    F: FnMut(&str) -> Result<Vec<sqlmodel_core::Row>, SqlError>,
+{
     let mut project_identities = BTreeSet::new();
-    let project_rows = conn.query_sync("SELECT slug, human_key FROM projects", &[])?;
+    let project_rows = query("SELECT slug, human_key FROM projects")?;
     for row in project_rows {
         let slug = row.get_named::<String>("slug").ok();
         let human_key = row.get_named::<String>("human_key").ok();
@@ -1834,7 +1848,7 @@ struct MaterializedLiveSalvage {
     path: PathBuf,
 }
 
-fn materialize_live_franken_salvage(path: &Path) -> DbResult<MaterializedLiveSalvage> {
+fn materialize_live_salvage(path: &Path) -> DbResult<MaterializedLiveSalvage> {
     let directory = crate::pool::CanonicalSnapshotTempDir::new("reconstruct-live-salvage-")
         .map_err(|error| {
             DbError::Sqlite(format!(
@@ -1848,19 +1862,28 @@ fn materialize_live_franken_salvage(path: &Path) -> DbResult<MaterializedLiveSal
             snapshot_path.display()
         ))
     })?;
-    let conn = crate::pool::open_guarded_read_only_franken_existing_file(
+    // Engine-dispatching: a Franken-admitted source goes through the bound
+    // same-engine opener; a source without a namespace pair (a reconstructed
+    // or restored primary that the archive has since outrun) goes through
+    // canonical SQLite. Both keep the source engine-enforced read-only.
+    let conn = crate::pool::open_guarded_read_only_sqlite_file(
         path,
         "archive reconstruction live salvage materialization",
     )
     .map_err(|error| {
         DbError::Sqlite(format!(
-            "reconstruct live salvage: cannot open source {} through guarded FrankenSQLite read-only access: {error}",
+            "reconstruct live salvage: cannot open source {} through guarded read-only access: {error}",
             path.display()
         ))
     })?;
-    // `query_only` is a connection-local SQL policy. The pager remains in
-    // FrankenSQLite's engine-enforced read-only mode after this is disabled;
-    // `VACUUM INTO` may write only the fresh private destination.
+    tracing::debug!(
+        path = %path.display(),
+        engine = conn.engine().as_str(),
+        "reconstruct live salvage: materializing source through dispatched read-only engine"
+    );
+    // `query_only` is a connection-local SQL policy. The pager remains in the
+    // engine's enforced read-only mode after this is disabled; `VACUUM INTO`
+    // may write only the fresh private destination.
     conn.execute_raw("PRAGMA query_only = OFF;")
         .map_err(|error| {
             DbError::Sqlite(format!(
@@ -1899,11 +1922,12 @@ const PRIVATE_SALVAGE_FRANKEN_WAL_WITNESS_SUFFIXES: [&str; 2] = ["-wal-cert", "-
 /// Turn the freshly materialized, process-private salvage artifact into a
 /// self-contained rollback-journal SQLite file that any engine can open.
 ///
-/// `VACUUM INTO` runs through the guarded FrankenSQLite source connection, so
-/// the engine admits the private destination into its own protocol: it
+/// When the dispatched source connection is FrankenSQLite, `VACUUM INTO`
+/// admits the private destination into that engine's own protocol: it
 /// leaves `-fsqlite-ns-gate` / `-fsqlite-ns-use` namespace records, may
 /// finish the destination in WAL mode with an unpopulated `-shm`, and writes
-/// its `-wal-cert` witnesses. Every downstream validator and merge reader
+/// its `-wal-cert` witnesses. (A canonical-served source leaves none of this;
+/// every step below is then a no-op that still proves the artifact opens.) Every downstream validator and merge reader
 /// (`pool::sqlite_file_passes_full_integrity_check`, the canonical salvage
 /// readers) opens the artifact through the guarded canonical read-only path,
 /// which refuses any Franken-admitted path outright and, past that, cannot
@@ -2002,15 +2026,18 @@ pub fn reconstruct_from_archive_with_private_salvage(
     reconstruct_from_archive_with_salvage(db_path, storage_root, Some(private_salvage_db_path))
 }
 
-/// Reconstruct from the Git archive while salvaging a live FrankenSQLite
-/// primary without ever opening that live inode through canonical SQLite.
+/// Reconstruct from the Git archive while salvaging the live primary without
+/// ever opening a Franken-admitted inode through canonical SQLite.
 ///
-/// A complete, valid FrankenSQLite namespace is mandatory. The live source is
-/// copied logically with guarded engine-enforced read-only access into a
-/// private temporary database; only that private inode reaches the canonical
-/// integrity and merge probes. Namespace-admission, lock, permission, and
-/// other non-corruption failures refuse rather than falling back to a raw or
-/// canonical open of the live source.
+/// The live source is copied logically with guarded engine-enforced
+/// read-only access into a private temporary database; only that private
+/// inode reaches the canonical integrity and merge probes. The engine is
+/// chosen by the source's namespace authority (`pool::open_guarded_read_only_sqlite_file`):
+/// a Franken-admitted family is exported by FrankenSQLite, a family without a
+/// namespace pair (a reconstructed or restored primary the archive has since
+/// outrun) by canonical SQLite. Namespace-admission, lock, permission, and
+/// other non-corruption failures refuse rather than falling back to a raw
+/// open of the live source.
 ///
 /// # Errors
 ///
@@ -2021,7 +2048,7 @@ pub fn reconstruct_from_archive_with_live_franken_salvage(
     storage_root: &Path,
     live_salvage_db_path: &Path,
 ) -> DbResult<ReconstructStats> {
-    let materialized = match materialize_live_franken_salvage(live_salvage_db_path) {
+    let materialized = match materialize_live_salvage(live_salvage_db_path) {
         Ok(materialized) => materialized,
         Err(error) => {
             let message = error.to_string();
@@ -7470,7 +7497,7 @@ body
         );
         let source_before = exact_test_directory_files(source_dir.path());
 
-        let materialized = materialize_live_franken_salvage(&source_path)
+        let materialized = materialize_live_salvage(&source_path)
             .expect("materialize guarded live salvage source");
         let private = open_read_only_salvage_db(&materialized.path)
             .expect("open private materialized salvage");
@@ -7505,7 +7532,7 @@ body
             .execute_raw("INSERT INTO salvage_witness(value) VALUES (7);")
             .expect("commit salvage witness");
 
-        let materialized = materialize_live_franken_salvage(&source_path)
+        let materialized = materialize_live_salvage(&source_path)
             .expect("materialize guarded live salvage source");
 
         for suffix in PRIVATE_SALVAGE_FRANKEN_NAMESPACE_SUFFIXES
@@ -7537,20 +7564,27 @@ body
         crate::close_db_conn(writer, "clean up engine-neutral salvage fixture");
     }
 
-    #[test]
-    fn live_franken_salvage_refuses_sidecarless_source_without_archive_fallback() {
-        let source_dir = tempfile::tempdir().expect("source tempdir");
-        let source_path = source_dir.path().join("sidecarless.sqlite3");
+    /// Seed a canonical-written source with no FrankenSQLite namespace pair:
+    /// the shape of a primary restored from a backup or reconstructed from
+    /// the archive that the archive has since outrun. Returns the source
+    /// path and its byte-exact directory snapshot.
+    fn seed_sidecarless_canonical_salvage_source(
+        source_dir: &Path,
+        schema_and_rows: &[&str],
+    ) -> (
+        PathBuf,
+        std::collections::BTreeMap<std::ffi::OsString, Vec<u8>>,
+    ) {
+        let source_path = source_dir.join("sidecarless.sqlite3");
         let source = SqliteDbConn::open_file(source_path.to_str().unwrap())
             .expect("open canonical sidecarless source");
         source
             .execute_raw("PRAGMA journal_mode = DELETE;")
             .expect("use standalone canonical source");
-        source
-            .execute_raw("CREATE TABLE messages(id INTEGER PRIMARY KEY);")
-            .expect("create source table");
+        for sql in schema_and_rows {
+            source.execute_raw(sql).expect("seed canonical source");
+        }
         drop(source);
-        let source_before = exact_test_directory_files(source_dir.path());
         assert!(
             !mcp_agent_mail_core::disk::sqlite_sidecar_path(&source_path, "-fsqlite-ns-gate")
                 .exists()
@@ -7558,6 +7592,107 @@ body
         assert!(
             !mcp_agent_mail_core::disk::sqlite_sidecar_path(&source_path, "-fsqlite-ns-use")
                 .exists()
+        );
+        let before = exact_test_directory_files(source_dir);
+        (source_path, before)
+    }
+
+    /// br-vhxdc: a live source without a namespace pair is materialized
+    /// through canonical SQLite (engine-dispatching read-only open), leaving
+    /// the source family byte-identical, and its DB-only rows are merged
+    /// into the reconstructed target. Before the dispatcher every such source
+    /// was refused, which made archive-ahead recovery of a reconstructed or
+    /// restored primary impossible.
+    #[test]
+    fn live_salvage_merges_sidecarless_canonical_source_into_reconstructed_target() {
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let (source_path, source_before) = seed_sidecarless_canonical_salvage_source(
+            source_dir.path(),
+            &[
+                "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT, created_at INTEGER);",
+                "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL);",
+                "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, subject TEXT, body_md TEXT, created_ts INTEGER);",
+                "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts INTEGER, ack_ts INTEGER);",
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (100, 'test-project', '/test-project', 1);",
+                "INSERT INTO agents (id, project_id, name) VALUES (10, 100, 'Alice'), (11, 100, 'Bob');",
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES (1, 100, 10, 'Archive copy', 'archive body', 1771761600000000), (2, 100, 10, 'DB-only', 'db body', 2);",
+                "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (1, 11, 'to', 123, 456), (2, 11, 'to', NULL, NULL);",
+            ],
+        );
+
+        let archive_dir = tempfile::tempdir().expect("archive tempdir");
+        let storage_root = archive_dir.path().join("storage");
+        let project_dir = storage_root.join("projects").join("test-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("02");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"test-project","human_key":"/test-project","created_at":0}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-02-22T00:00:00Z","last_active_ts":"2026-02-22T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            messages_dir.join("2026-02-22T12-00-00Z__archive__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"Archive copy\",\"importance\":\"normal\",\"created_ts\":\"2026-02-22T12:00:00Z\"}\n---\n\narchive body\n",
+        )
+        .unwrap();
+        let target_path = archive_dir.path().join("reconstructed.sqlite3");
+
+        let stats = reconstruct_from_archive_with_live_franken_salvage(
+            &target_path,
+            &storage_root,
+            &source_path,
+        )
+        .expect("a sidecar-less canonical source must be salvaged, not refused");
+        assert_eq!(stats.messages, 1, "one message came from the archive");
+        assert_eq!(
+            stats.salvaged_messages, 1,
+            "the DB-only message must be merged from the canonical-served source"
+        );
+        assert!(
+            stats.warnings.is_empty(),
+            "a healthy sidecar-less source must not degrade to archive-only: {:?}",
+            stats.warnings
+        );
+
+        let target = SqliteDbConn::open_file(target_path.to_str().unwrap())
+            .expect("open reconstructed target");
+        let subjects = target
+            .query_sync("SELECT subject FROM messages ORDER BY id", &[])
+            .expect("query reconstructed messages")
+            .into_iter()
+            .map(|row| row.get_named::<String>("subject").unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            subjects,
+            vec!["Archive copy".to_string(), "DB-only".to_string()]
+        );
+        drop(target);
+
+        assert_eq!(
+            exact_test_directory_files(source_dir.path()),
+            source_before,
+            "canonical-served salvage must leave the source family byte-identical"
+        );
+    }
+
+    /// The fail-closed half of the same contract: a sidecar-less source that
+    /// canonical SQLite can open but whose mailbox schema is incomplete still
+    /// refuses, and the refusal must not degrade into an archive-only target
+    /// (which would silently drop DB-only coordination state) or touch the
+    /// source family.
+    #[test]
+    fn live_salvage_of_sidecarless_source_with_incomplete_schema_fails_closed() {
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let (source_path, source_before) = seed_sidecarless_canonical_salvage_source(
+            source_dir.path(),
+            &["CREATE TABLE messages(id INTEGER PRIMARY KEY);"],
         );
 
         let archive_dir = tempfile::tempdir().expect("archive tempdir");
@@ -7570,21 +7705,24 @@ body
             &storage_root,
             &source_path,
         )
-        .expect_err("sidecarless live source must fail closed");
+        .expect_err("an incomplete-schema live source must fail closed");
+        let message = error.to_string();
         assert!(
-            error
-                .to_string()
-                .contains("complete pre-existing namespace sidecar pair is required"),
-            "unexpected namespace refusal: {error}"
+            message.contains("messages schema is incomplete"),
+            "the refusal must name the schema problem, not an engine refusal: {message}"
         );
         assert!(
-            !target_path.exists(),
-            "namespace refusal must not silently build an archive-only target"
+            message.contains("DB-only coordination state could be lost"),
+            "the refusal must say why the archive-only candidate was not promoted: {message}"
         );
+        // Production callers hand this entry point a private candidate path
+        // and promote it only on `Ok`; the archive-only candidate built before
+        // the merge refused may remain at that path, but it is never reported
+        // as a success. The source family must be exactly as it was.
         assert_eq!(
             exact_test_directory_files(source_dir.path()),
             source_before,
-            "namespace refusal must not create or rewrite source-family state"
+            "a salvage refusal must not create or rewrite source-family state"
         );
     }
 
@@ -7659,7 +7797,7 @@ body
             .expect("acquire parent reserved writer lock");
 
         assert_child_observes_busy(&source_path);
-        let materialized = materialize_live_franken_salvage(&source_path)
+        let materialized = materialize_live_salvage(&source_path)
             .expect("materialize live source without touching parent writer lock");
         let private = open_read_only_salvage_db(&materialized.path)
             .expect("open private materialized salvage");

@@ -1312,38 +1312,43 @@ fn current_exe_is_cargo_test_artifact() -> bool {
 ///
 /// ## Behavior
 ///
-/// Refuses — panics with actionable guidance — whenever both hold: the
-/// process is a cargo/nextest/insta test harness (or was spawned by one) and
-/// `storage_root` is the real user default archive. There is no warn-only
-/// mode any more (br-99aih): a warning logged into the void let workspace
-/// test runs seed junk projects into the live
-/// `~/.mcp_agent_mail_git_mailbox_repo/projects/`, which later triggered an
-/// archive-ahead reconcile that crash-looped the live daemon.
+/// This is the *diagnostic* layer. Resolving a `Config` is not what pollutes
+/// the operator's archive; writing through it is, and that write is refused
+/// fail-closed by the storage crate's single archive funnel
+/// (`ensure_archive_root`, br-99aih), which shares this exact predicate
+/// ([`default_storage_root_refused_under_test_harness`]). Hundreds of unit
+/// tests across the workspace construct a `Config` from the ambient env
+/// merely to read sizes and flags and never touch the archive; under
+/// cargo-nextest (the release gate, whose `NEXTEST_RUN_ID` marker makes the
+/// harness predicate true in every crate) a panic here fails all of them
+/// for a leak they cannot cause. So, by default, this logs a WARN with the
+/// actionable guidance and returns.
 ///
-/// The only escape hatch is `AM_ALLOW_HOME_STORAGE_ROOT=1`, for a test that
-/// intentionally exercises the home-archive path — normally because it first
-/// redirected `HOME`/`XDG_DATA_HOME` into a tempdir (see
+/// `AM_STRICT_HOME_STORAGE_GUARD=1` upgrades the warning to a panic, for a
+/// suite that wants to force every test to set `STORAGE_ROOT` up front.
+/// `AM_ALLOW_HOME_STORAGE_ROOT=1` silences the guard entirely for a test
+/// that intentionally exercises the home-archive path — normally because it
+/// first redirected `HOME`/`XDG_DATA_HOME` into a tempdir (see
 /// [`with_isolated_default_storage_root_for_test`]).
-/// `AM_STRICT_HOME_STORAGE_GUARD` used to upgrade the warning to a panic; it
-/// is now a redundant alias of the default behavior and is ignored.
 ///
 /// Production binaries are unaffected: the harness predicate
-/// ([`is_running_under_cargo_test_harness`]) is unchanged and never fires for
-/// a shipped `am` binary that is not running under a test harness.
+/// ([`is_running_under_cargo_test_harness`]) never fires for a shipped `am`
+/// binary that is not running under a test harness.
 fn guard_against_default_storage_root_in_test_mode(storage_root: &Path) {
     if !default_storage_root_refused_under_test_harness(storage_root) {
         return;
     }
-    panic!(
+    let message = format!(
         "Config::from_env resolved storage_root to the default user archive ({}) while \
-         running under a cargo/nextest/insta test harness. This is almost always a bug — \
-         a subprocess-spawning test likely forgot to pass STORAGE_ROOT=<tempdir> through \
-         to the `am` binary, or an integration test forgot to set an isolated STORAGE_ROOT \
-         before constructing Config. Fixes: set STORAGE_ROOT explicitly, redirect HOME and \
-         XDG_DATA_HOME into a tempdir (`with_isolated_default_storage_root_for_test`), or \
-         export AM_ALLOW_HOME_STORAGE_ROOT=1 to bypass this guard for an intentional test.",
+         running under a cargo/nextest/insta test harness. Archive writes through this root \
+         are refused by the storage funnel; if this test writes to the archive it must set \
+         STORAGE_ROOT explicitly, redirect HOME and XDG_DATA_HOME into a tempdir \
+         (`with_isolated_default_storage_root_for_test`), or export \
+         AM_ALLOW_HOME_STORAGE_ROOT=1 for an intentional home-archive test.",
         storage_root.display()
     );
+    assert!(!env_truthy("AM_STRICT_HOME_STORAGE_GUARD"), "{message}");
+    tracing::warn!("{message}");
 }
 
 /// True when a test harness must be refused the real default archive root.
@@ -3016,11 +3021,11 @@ impl Config {
         // ────────────────────────────────────────────────────────────
         // Test-mode guard (C2, br-99aih): if this process looks like it's
         // running under a cargo integration-test / nextest / insta harness
-        // and just resolved the DEFAULT user storage_root, refuse (panic) so
-        // a test can never write into the operator's live archive. The only
-        // bypass is `AM_ALLOW_HOME_STORAGE_ROOT=1`; the former
-        // `AM_STRICT_HOME_STORAGE_GUARD` is a redundant alias of this
-        // always-on behavior.
+        // and just resolved the DEFAULT user storage_root, warn with
+        // guidance (`AM_STRICT_HOME_STORAGE_GUARD=1` upgrades to a panic).
+        // The fail-closed protection lives in the storage crate's archive
+        // funnel, which refuses to initialize this root under the same
+        // predicate; `AM_ALLOW_HOME_STORAGE_ROOT=1` bypasses both.
         // ────────────────────────────────────────────────────────────
         config.user_env_authority_error = user_env_authority_error();
         guard_against_default_storage_root_in_test_mode(&config.storage_root);
@@ -6610,13 +6615,16 @@ mod tests {
     }
 
     #[test]
-    fn test_mode_guard_refuses_default_root_under_harness_by_default() {
-        // br-99aih: default behavior when a test harness is active and
-        // storage_root is the default: REFUSE (panic). The former warn-only
-        // mode let workspace test runs seed junk projects into the live
-        // archive. Seed `<home>/.mcp_agent_mail_git_mailbox_repo/projects/`
-        // so the legacy branch of `default_storage_root_path()` wins, exactly
-        // as on a host that has run the daemon.
+    fn test_mode_guard_warns_but_does_not_panic_by_default_under_harness() {
+        // br-99aih: when a test harness is active and storage_root is the
+        // default, the Config-level guard WARNS and returns; the fail-closed
+        // refusal lives in the storage crate's archive funnel. A panic here
+        // would fail every unit test that merely resolves a Config under
+        // cargo-nextest (whose NEXTEST_RUN_ID marker makes the harness
+        // predicate true in every crate). Seed
+        // `<home>/.mcp_agent_mail_git_mailbox_repo/projects/` so the legacy
+        // branch of `default_storage_root_path()` wins, exactly as on a host
+        // that has run the daemon.
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().join("home");
         let legacy = home.join(".mcp_agent_mail_git_mailbox_repo");
@@ -6650,14 +6658,16 @@ mod tests {
                     guard_against_default_storage_root_in_test_mode(&default_path);
                 });
                 assert!(
-                    direct.is_err(),
-                    "guard must refuse the default root under a harness by default"
+                    direct.is_ok(),
+                    "guard must warn, not panic, under a harness by default"
                 );
 
                 let via_from_env = std::panic::catch_unwind(Config::from_env);
-                assert!(
-                    via_from_env.is_err(),
-                    "Config::from_env must refuse the default root under a harness by default"
+                let config = via_from_env
+                    .expect("Config::from_env must resolve (with a warning) under a harness");
+                assert_eq!(
+                    config.storage_root, default_path,
+                    "the resolved root is still the default; only archive writes are refused"
                 );
             },
         );
@@ -6665,9 +6675,8 @@ mod tests {
 
     #[test]
     fn test_mode_guard_panics_in_strict_mode_under_harness() {
-        // `AM_STRICT_HOME_STORAGE_GUARD=1` used to upgrade the warning to a
-        // panic; since br-99aih the refusal is always on and the flag is a
-        // redundant alias. Setting it must still refuse.
+        // `AM_STRICT_HOME_STORAGE_GUARD=1` upgrades the default warning to a
+        // panic for suites that want every test to set STORAGE_ROOT up front.
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().join("home");
         let xdg_data = tmp.path().join("xdg-data");

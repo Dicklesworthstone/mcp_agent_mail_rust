@@ -1468,7 +1468,9 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
         );
     }
 
-    let conn = match crate::pool::open_guarded_read_only_franken_existing_file(
+    // Engine-dispatching: a restored or reconstructed family (no namespace
+    // pair) must get a schema verdict, not an open refusal.
+    let conn = match crate::pool::open_guarded_read_only_sqlite_file(
         db_path,
         "mailbox schema-population diagnostic",
     ) {

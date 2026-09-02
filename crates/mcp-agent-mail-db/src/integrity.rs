@@ -268,7 +268,10 @@ pub fn inspect_mailbox_integrity(db_path: &Path, kind: CheckKind) -> MailboxInte
         };
     }
 
-    let conn = match crate::pool::open_guarded_read_only_franken_existing_file(
+    // Engine-dispatching: a family without a FrankenSQLite namespace pair
+    // (canonical-written, restored, reconstructed) is checked through
+    // canonical SQLite instead of being reported Broken at open time.
+    let conn = match crate::pool::open_guarded_read_only_sqlite_file(
         db_path,
         "mailbox integrity diagnostic",
     ) {
@@ -282,7 +285,7 @@ pub fn inspect_mailbox_integrity(db_path: &Path, kind: CheckKind) -> MailboxInte
             };
         }
     };
-    match run_check(&conn, kind) {
+    match run_check_with(|sql| conn.query_sync(sql, &[]), kind) {
         Ok(check) => MailboxIntegrityVerdict {
             status: MailboxIntegrityStatus::Healthy,
             metrics: integrity_metrics(),
@@ -787,12 +790,19 @@ pub fn classify_check_details(details: &[String]) -> IntegrityClassification {
 }
 
 fn run_check(conn: &DbConn, kind: CheckKind) -> DbResult<IntegrityCheckResult> {
+    run_check_with(|sql| conn.query_sync(sql, &[]), kind)
+}
+
+/// Run an integrity check through any query function, so a check can be
+/// issued over whichever engine the guarded read-only opener dispatched to.
+fn run_check_with<F>(mut query: F, kind: CheckKind) -> DbResult<IntegrityCheckResult>
+where
+    F: FnMut(&str) -> Result<Vec<Row>, sqlmodel_core::Error>,
+{
     let start = std::time::Instant::now();
-    let rows: Vec<Row> = probe_check_rows(
-        |sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()),
-        kind,
-    )
-    .map_err(|error| DbError::Sqlite(format!("{kind} failed: {error}")))?;
+    let rows: Vec<Row> =
+        probe_check_rows(|sql| query(sql).map_err(|error| error.to_string()), kind)
+            .map_err(|error| DbError::Sqlite(format!("{kind} failed: {error}")))?;
 
     let duration_us =
         u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);

@@ -47,6 +47,33 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ### Fixed
 
+- **Read-only diagnostics can open a database that was never
+  Franken-admitted.** Every read-only consumer (mailbox inventory, the
+  startup consistency probe, the integrity and schema-population verdicts,
+  the archive verifier, the reconstruction message-id inventory, the live
+  salvage export, `am doctor vacuum` statistics and the doctor integrity
+  classification probe) called the bound FrankenSQLite opener directly,
+  which requires the `-fsqlite-ns-gate`/`-fsqlite-ns-use` pair. A family
+  last written by canonical SQLite, restored from a `.bak`, or produced by
+  archive reconstruction has no such pair, so every one of those paths
+  failed with "a complete pre-existing namespace sidecar pair is required"
+  and, in particular, archive-ahead recovery of a reconstructed primary could
+  never reconcile. `pool::open_guarded_read_only_sqlite_file` now inspects
+  the namespace pair once and dispatches: complete pair → the same
+  FrankenSQLite opener, no pair → canonical SQLite's true read-only flags, a
+  half pair → an explicit refusal. Neither engine's own refusal paths are
+  bypassed, and a family that changes engines mid-admission gets exactly one
+  re-dispatch. The live-salvage materializer exports a sidecar-less source
+  through canonical SQLite (source bytes untouched) instead of refusing it.
+- **The Config-level default-archive guard no longer panics under
+  cargo-nextest.** The refusal added for br-99aih fired whenever a test
+  merely constructed a `Config` from the ambient env under a harness marker,
+  which under nextest (the release gate, which exports `NEXTEST_RUN_ID` into
+  every test process) failed hundreds of unit tests that never touch the
+  archive. `Config::from_env` is back to a warning with guidance
+  (`AM_STRICT_HOME_STORAGE_GUARD=1` upgrades it to a panic); the fail-closed
+  protection is the storage crate's archive funnel, which still refuses to
+  initialize the operator's real archive from any test harness.
 - **`am doctor health` / `triage` no longer report a false P0 "cannot open
   database, reconstruct" on a healthy live mailbox.** The doctor's canonical
   diagnostic source had two branches: a `VACUUM INTO` snapshot through the
@@ -79,10 +106,12 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   the legacy `$HOME/.mcp_agent_mail_git_mailbox_repo` branch wins whenever it
   exists, so on any host that has run the daemon they wrote junk projects
   into production and later triggered an archive-ahead reconcile. The
-  test-harness guard now refuses the default root outright (escape hatch
-  `AM_ALLOW_HOME_STORAGE_ROOT=1`), the storage crate's archive-root funnel
-  refuses it too, a shared `with_isolated_default_storage_root_for_test`
-  helper redirects `HOME`/`XDG_DATA_HOME`, and the leaking tests use it.
+  storage crate's archive-root funnel (every archive write passes through
+  it) now refuses to initialize the default root from any cargo / nextest /
+  insta harness (escape hatch `AM_ALLOW_HOME_STORAGE_ROOT=1`),
+  `Config::from_env` warns with guidance under the same predicate, a shared
+  `with_isolated_default_storage_root_for_test` helper redirects
+  `HOME`/`XDG_DATA_HOME`, and the leaking tests use it.
 - **`am robot metrics` no longer prints zeros from the CLI's own process
   counters.** It reads `resource://tooling/metrics` from the running server
   (which now carries per-tool latency) and labels the payload
