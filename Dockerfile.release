@@ -30,13 +30,8 @@
 #
 # Usage
 # -----
-#   docker buildx build -f Dockerfile.release \
-#       --platform linux/amd64,linux/arm64 \
-#       --build-arg AM_VERSION=0.3.31 \
-#       --build-arg AM_REVISION=<full-tag-commit-sha> \
-#       -t ghcr.io/dicklesworthstone/mcp_agent_mail_rust:0.3.31 \
-#       -t ghcr.io/dicklesworthstone/mcp_agent_mail_rust:latest \
-#       --push .
+#   AM_VERSION=0.3.31 AM_REVISION=<full-tag-commit-sha> \
+#       docker buildx bake release --set release.platform=linux/amd64,linux/arm64 --push
 #
 # Runtime
 # -------
@@ -51,40 +46,9 @@
 # minimum glibc version inferred from a runner label. The executable checks
 # below are the fail-closed compatibility gate for the exact release binaries
 # packaged on each architecture.
-FROM debian:trixie-slim AS runtime
-
-ENV DEBIAN_FRONTEND=noninteractive
-
-# Runtime needs:
-#   * ca-certificates — outbound HTTPS (e.g. share-link uploads)
-#   * curl            — HEALTHCHECK
-#   * git             — `am` shells out for repo introspection
-#   * libsqlite3-0    — frankensqlite ships its own engine but SQLite system
-#                       libs are needed for some integration paths
-#   * tini            — PID 1 reaper so signal handling and zombie reaping
-#                       work correctly when running under Docker/Kubernetes
-# `adduser` is explicit because Debian trixie's slim image no longer ships it
-# (bookworm did); without it this layer fails with exit 127 after apt succeeds.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        adduser \
-        ca-certificates \
-        curl \
-        git \
-        libsqlite3-0 \
-        tini \
-    && rm -rf /var/lib/apt/lists/* \
-    && adduser --system --group --home /home/appuser --uid 10001 appuser \
-    && mkdir -p /data/mailbox \
-    && chown -R appuser:appuser /data /home/appuser \
-    # Bind-mounted /data volumes inherit the host's uid/gid, which is rarely
-    # 10001:10001 — without `safe.directory` git refuses to run with "dubious
-    # ownership" the first time `am` touches a project's git repo. Configure
-    # both system-wide and per-user so it works regardless of who runs git.
-    && git config --system --add safe.directory '*' \
-    && install -d -o appuser -g appuser /home/appuser/.config/git \
-    && printf '[safe]\n\tdirectory = *\n' \
-        > /home/appuser/.config/git/config \
-    && chown appuser:appuser /home/appuser/.config/git/config
+# Published from main by base-images.yml. Override for a private registry.
+ARG RUNTIME_BASE=ghcr.io/dicklesworthstone/mcp_agent_mail_rust-runtime-base:main
+FROM ${RUNTIME_BASE} AS runtime
 
 # TARGETARCH is supplied by buildx per platform: "amd64" or "arm64". It selects
 # which pre-built release binary lands in this architecture's layer, which is

@@ -12,9 +12,9 @@
 # ---------------
 #   AM_REF       Git ref of mcp_agent_mail_rust to build (default: main).
 #                Pass a tag, branch, or commit SHA.
-#   SIBLING_REF  Preferred Git ref for every sibling dependency (default: main).
-#                Release builds pass the release tag here first, so sibling
-#                repos with matching tags are pinned instead of floating.
+#   SIBLING_REF  Preferred Git ref for beads_rust (default: main).
+#   FRANKENSEARCH_COMMIT
+#                Immutable frankensearch revision required by this workspace.
 #   SIBLING_FALLBACK_REF
 #                Fallback ref when SIBLING_REF is a branch/tag that a sibling
 #                repo does not publish yet (default: main).
@@ -22,13 +22,13 @@
 # Examples
 # --------
 #   # Build the current tip of main:
-#   docker build -t mcp-agent-mail-rust:dev .
+#   docker buildx bake source
 #
 #   # Build a tagged release:
-#   docker build --build-arg AM_REF=v0.3.6 -t mcp-agent-mail-rust:v0.3.6 .
+#   AM_REF=v0.3.6 docker buildx bake source
 #
 #   # Build a specific commit (e.g. between releases):
-#   docker build --build-arg AM_REF=abc1234 -t mcp-agent-mail-rust:dev .
+#   AM_REF=<full-commit-sha> docker buildx bake source
 #
 # Runtime
 # -------
@@ -41,38 +41,15 @@
 # `-it -e TUI_ENABLED=true`.
 
 # ─── Stage 1: builder ────────────────────────────────────────────────────────
-FROM debian:bookworm-slim AS builder
-
-# rustup is installed instead of FROM rust:<version>-slim because this
-# workspace pins a specific nightly via rust-toolchain.toml; rustup will
-# auto-install the pinned channel on first cargo invocation. This keeps the
-# Dockerfile in lock-step with rust-toolchain.toml without manual edits.
-ENV DEBIAN_FRONTEND=noninteractive \
-    RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        git \
-        pkg-config \
-        libsqlite3-dev \
-        build-essential \
-        cmake \
-        clang \
-        libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain none --no-modify-path \
-    && chmod -R a+rwX "$RUSTUP_HOME" "$CARGO_HOME"
-
-WORKDIR /build
+# Published from main by base-images.yml. Override for a private registry.
+ARG BUILDER_BASE=ghcr.io/dicklesworthstone/mcp_agent_mail_rust-builder-base:main
+ARG RUNTIME_BASE=ghcr.io/dicklesworthstone/mcp_agent_mail_rust-runtime-base:main
+FROM ${BUILDER_BASE} AS builder
 
 ARG AM_REF=main
 ARG SIBLING_REF=main
 ARG SIBLING_FALLBACK_REF=main
+ARG FRANKENSEARCH_COMMIT=3bbfd8c664062f8304e7a790c51794671f9214dc
 
 # Clone the sibling checkouts that /Cargo.toml still resolves through a `path`,
 # so they're cached separately from the project source layer.
@@ -143,7 +120,7 @@ RUN set -eu; \
         git clone --depth 1 --branch "$selected_ref" "$@" "$url" "$dest"; \
       fi; \
     }; \
-    clone_at https://github.com/Dicklesworthstone/frankensearch.git "${SIBLING_REF}" /build/frankensearch-rel-0332; \
+    clone_at https://github.com/Dicklesworthstone/frankensearch.git "${FRANKENSEARCH_COMMIT}" /build/frankensearch-rel-0332; \
     clone_at https://github.com/Dicklesworthstone/beads_rust.git    "${SIBLING_REF}" /build/beads_rust
 
 # Clone the project source at the requested ref. We clone (rather than COPY
@@ -235,37 +212,7 @@ RUN /out/mcp-agent-mail --help > /tmp/server.help \
     && grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)' /tmp/cli.help
 
 # ─── Stage 2: runtime ────────────────────────────────────────────────────────
-FROM debian:bookworm-slim AS runtime
-
-ENV DEBIAN_FRONTEND=noninteractive
-
-# Runtime needs:
-#   * ca-certificates — outbound HTTPS (e.g. share-link uploads)
-#   * curl            — HEALTHCHECK
-#   * git             — `am` shells out for repo introspection
-#   * libsqlite3-0    — frankensqlite ships its own engine but SQLite system
-#                       libs are needed for some integration paths
-#   * tini            — PID 1 reaper so signal handling and zombie reaping
-#                       work correctly when running under Docker/Kubernetes
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        git \
-        libsqlite3-0 \
-        tini \
-    && rm -rf /var/lib/apt/lists/* \
-    && adduser --system --group --home /home/appuser --uid 10001 appuser \
-    && mkdir -p /data/mailbox \
-    && chown -R appuser:appuser /data /home/appuser \
-    # Bind-mounted /data volumes inherit the host's uid/gid, which is rarely
-    # 10001:10001 — without `safe.directory` git refuses to run with "dubious
-    # ownership" the first time `am` touches a project's git repo. Configure
-    # both system-wide and per-user so it works regardless of who runs git.
-    && git config --system --add safe.directory '*' \
-    && install -d -o appuser -g appuser /home/appuser/.config/git \
-    && printf '[safe]\n\tdirectory = *\n' \
-        > /home/appuser/.config/git/config \
-    && chown appuser:appuser /home/appuser/.config/git/config
+FROM ${RUNTIME_BASE} AS runtime
 
 COPY --from=builder /out/mcp-agent-mail /usr/local/bin/mcp-agent-mail
 COPY --from=builder /out/am             /usr/local/bin/am

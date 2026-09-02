@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1.7
+#
+# Shared build and runtime foundations. These images are published from main
+# before source and release image builds consume them through docker-bake.hcl.
+
+FROM debian:bookworm-slim AS builder-base
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        pkg-config \
+        libsqlite3-dev \
+        build-essential \
+        cmake \
+        clang \
+        libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain none --no-modify-path \
+    && chmod -R a+rwX "$RUSTUP_HOME" "$CARGO_HOME"
+
+WORKDIR /build
+
+FROM debian:trixie-slim AS runtime-base
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        adduser \
+        ca-certificates \
+        curl \
+        git \
+        libsqlite3-0 \
+        tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && adduser --system --group --home /home/appuser --uid 10001 appuser \
+    && mkdir -p /data/mailbox \
+    && chown -R appuser:appuser /data /home/appuser \
+    && git config --system --add safe.directory '*' \
+    && install -d -o appuser -g appuser /home/appuser/.config/git \
+    && printf '[safe]\n\tdirectory = *\n' > /home/appuser/.config/git/config \
+    && chown appuser:appuser /home/appuser/.config/git/config

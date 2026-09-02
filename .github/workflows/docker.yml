@@ -5,7 +5,7 @@
 #   push tag v*          — canonical release path. Waits for dist.yml to
 #                          publish the matching GitHub Release, verifies its
 #                          Linux binaries, and packages them with
-#                          Dockerfile.release. Publishes :<tag>, :latest, and
+#                          the Bake release target. Publishes :<tag>, :latest, and
 #                          the SemVer aliases.
 #   workflow_dispatch    — non-release source build. Accepts inputs.am_ref and
 #                          inputs.sibling_ref and publishes only source-*
@@ -533,30 +533,48 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image digest
+      - name: Build and push image digest with Bake
         id: build
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
-        with:
-          context: .
-          file: ${{ needs.prepare.outputs.dockerfile }}
-          platforms: ${{ matrix.platform }}
-          labels: |
-            ${{ needs.prepare.outputs.labels }}
-            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
-            org.opencontainers.image.revision=${{ needs.prepare.outputs.revision }}
-          outputs: type=image,name=${{ needs.prepare.outputs.image }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=docker-${{ github.workflow }}-${{ needs.prepare.outputs.mode }}-${{ matrix.cache_scope }}
-          cache-to: type=gha,mode=max,scope=docker-${{ github.workflow }}-${{ needs.prepare.outputs.mode }}-${{ matrix.cache_scope }}
-          build-args: |
-            AM_VERSION=${{ needs.prepare.outputs.version }}
-            AM_REVISION=${{ needs.prepare.outputs.revision }}
-            AM_REF=${{ needs.prepare.outputs.am_ref }}
-            SIBLING_REF=${{ needs.prepare.outputs.sibling_ref }}
-            SIBLING_FALLBACK_REF=${{ needs.prepare.outputs.sibling_fallback_ref }}
-          # Max provenance records the immutable AM_REF build argument rather
-          # than leaving a manual source build identified only by github.sha.
-          provenance: mode=max
-          sbom: true
+        env:
+          MODE: ${{ needs.prepare.outputs.mode }}
+          PLATFORM: ${{ matrix.platform }}
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          REVISION: ${{ needs.prepare.outputs.revision }}
+          AM_REF: ${{ needs.prepare.outputs.am_ref }}
+          SIBLING_REF: ${{ needs.prepare.outputs.sibling_ref }}
+          SIBLING_FALLBACK_REF: ${{ needs.prepare.outputs.sibling_fallback_ref }}
+          CACHE_SCOPE: docker-${{ github.workflow }}-${{ needs.prepare.outputs.mode }}-${{ matrix.cache_scope }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          target="$MODE"
+          repository="${GITHUB_REPOSITORY,,}"
+          metadata_file="${RUNNER_TEMP}/bake-metadata.json"
+          output="type=image,name=${IMAGE},push-by-digest=true,name-canonical=true,push=true"
+          docker buildx bake "$target" --metadata-file "$metadata_file" \
+            --set "${target}.platform=${PLATFORM}" \
+            --set "${target}.output=${output}" \
+            --set "${target}.args.BUILDER_BASE=ghcr.io/${repository}-builder-base:main" \
+            --set "${target}.args.RUNTIME_BASE=ghcr.io/${repository}-runtime-base:main" \
+            --set "${target}.args.AM_VERSION=${VERSION}" \
+            --set "${target}.args.AM_REVISION=${REVISION}" \
+            --set "${target}.args.AM_REF=${AM_REF}" \
+            --set "${target}.args.SIBLING_REF=${SIBLING_REF}" \
+            --set "${target}.args.SIBLING_FALLBACK_REF=${SIBLING_FALLBACK_REF}" \
+            --set "${target}.labels.org.opencontainers.image.version=${VERSION}" \
+            --set "${target}.labels.org.opencontainers.image.revision=${REVISION}" \
+            --set "${target}.cache-from=type=gha,scope=${CACHE_SCOPE}" \
+            --set "${target}.cache-to=type=gha,mode=max,scope=${CACHE_SCOPE}" \
+            --set "${target}.attest=type=provenance,mode=max" \
+            --set "${target}.attest=type=sbom"
+          mapfile -t digests < <(jq -r 'to_entries[] | .value["containerimage.digest"] // empty' "$metadata_file")
+          digest="${digests[0]:-}"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Bake did not return a valid image digest: ${digest:-missing}" >&2
+            exit 1
+          fi
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
 
       - name: Export digest
         env:
