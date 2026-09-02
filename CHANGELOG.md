@@ -92,6 +92,24 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ### Fixed
 
+- **Startup self-heal can diagnose index-only corruption again instead of
+  reconstructing from the archive.** Recovery admission arms the durable
+  circuit breaker with a provisional failure before an attempt runs. The
+  FrankenSQLite guarded opener already let the attempt's own read-only
+  probes pass through that arming, but the offline canonical opener did not,
+  so every canonical probe issued from inside the admitted attempt (the
+  index-only REINDEX classifier and the double-probe cross-check) was refused
+  as "recovery-breaker state records 1 failed attempt(s)". The in-place
+  REINDEX fast path (br-mdfpz, the fix for the nine-day crash loop on the
+  csd host) therefore never fired under startup self-heal and every
+  index-only case fell through to archive reconstruction. The canonical
+  opener now consults the same admission guard; outside the attempt the
+  armed breaker still refuses.
+- **`AM_RECOVERY_BREAKER_MAX_CONSECUTIVE_FAILURES` and
+  `AM_RECOVERY_BREAKER_COOLDOWN_SECS` are read through the same process-env
+  layer as every other `AM_*` knob.** They were read with a raw
+  `std::env::var`, so values supplied through the configuration override
+  layer were ignored.
 - **`sqlite:` URL contract written down and the tool-metrics worker follows
   it (br-z73au).** The three-slash form names an absolute path, the same as
   four slashes; a working-directory-relative database must be spelled

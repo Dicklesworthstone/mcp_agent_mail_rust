@@ -62,18 +62,22 @@ fn parse_positive_u64(raw: Option<&str>, default: u64) -> u64 {
 
 #[must_use]
 pub fn config_from_env() -> RecoveryBreakerConfig {
+    // Read through the shared process-env accessor so the knobs honour the
+    // same override layer as every other AM_* setting (including the test
+    // override scope); a raw `std::env::var` here made the thresholds
+    // unreachable from tests and inconsistent with `Config`.
     let max_failures = parse_positive_u64(
-        std::env::var("AM_RECOVERY_BREAKER_MAX_CONSECUTIVE_FAILURES")
-            .ok()
-            .as_deref(),
+        mcp_agent_mail_core::config::process_env_value(
+            "AM_RECOVERY_BREAKER_MAX_CONSECUTIVE_FAILURES",
+        )
+        .as_deref(),
         u64::from(DEFAULT_MAX_CONSECUTIVE_FAILURES),
     );
     RecoveryBreakerConfig {
         max_consecutive_failures: u32::try_from(max_failures)
             .unwrap_or(DEFAULT_MAX_CONSECUTIVE_FAILURES),
         cooldown_secs: parse_positive_u64(
-            std::env::var("AM_RECOVERY_BREAKER_COOLDOWN_SECS")
-                .ok()
+            mcp_agent_mail_core::config::process_env_value("AM_RECOVERY_BREAKER_COOLDOWN_SECS")
                 .as_deref(),
             DEFAULT_COOLDOWN_SECS,
         ),

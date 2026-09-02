@@ -11131,7 +11131,14 @@ where
     })?;
     sqlite_path_as_utf8(&stable_path)?;
 
+    // The admitted recovery attempt for this file arms the breaker with a
+    // provisional failure before it runs; its own read-only probes (the
+    // index-only REINDEX classifier, the double-probe cross-check) must not
+    // read that arming as evidence against the file, or every in-attempt
+    // diagnosis fails and the attempt falls through to reconstruction.
+    let inside_own_admission = RecoveryAdmissionDepthGuard::active_for(&stable_path);
     let nonclean_authority = match crate::recovery_breaker::load(sqlite_path) {
+        Ok(Some(_)) if inside_own_admission => None,
         Ok(Some(state)) if state.tripped || state.consecutive_failures > 0 => {
             let fingerprint = crate::recovery_breaker::fingerprint_db(sqlite_path);
             (state.db_fingerprint == fingerprint).then(|| {
@@ -26271,6 +26278,73 @@ mod tests {
         assert_eq!(
             breaker.consecutive_failures, 1,
             "only the plain recovery admission may record a failure; the drift reconcile must not: {breaker:?}"
+        );
+    }
+
+    /// The admitted recovery attempt arms the breaker provisionally before it
+    /// runs. Its own read-only canonical probes must still pass the offline
+    /// preflight; otherwise the in-attempt diagnosis (index-only REINDEX
+    /// classification, double-probe cross-check) fails and every attempt
+    /// falls through to reconstruction. Outside the admission a nonclean
+    /// breaker on a family that is unhealthy without cleanup still refuses.
+    /// Mirrors guarded_read_only_franken_open_proceeds_inside_own_recovery_admission
+    /// for the offline canonical opener.
+    #[test]
+    fn guarded_canonical_preflight_passes_through_inside_its_own_recovery_admission() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("armed-canonical.sqlite3");
+        seed_settled_diagnostic_database(&db_path);
+        let config = crate::recovery_breaker::config_from_env();
+        let armed = crate::recovery_breaker::record_failure(
+            None,
+            &crate::recovery_breaker::fingerprint_db(&db_path),
+            "automatic recovery attempt did not complete",
+            config,
+            recovery_breaker_now_unix(),
+        );
+        assert_eq!(armed.consecutive_failures, 1);
+        crate::recovery_breaker::store(&db_path, &armed).expect("store armed breaker");
+
+        let outside_probes = std::cell::Cell::new(0_u32);
+        let refused = preflight_guarded_offline_canonical_sqlite_family_with_probe(
+            &db_path,
+            "outside admission",
+            |_| {
+                outside_probes.set(outside_probes.get() + 1);
+                Ok(false)
+            },
+        )
+        .expect_err("an unrelated reader must still honor the nonclean breaker");
+        assert!(
+            refused
+                .to_string()
+                .contains("recovery-breaker state records"),
+            "unexpected refusal text: {refused}"
+        );
+        assert_eq!(
+            outside_probes.get(),
+            1,
+            "the nonclean authority consults the exact-family proof"
+        );
+
+        let stable_path = std::fs::canonicalize(&db_path).expect("canonicalize fixture");
+        let _admission = RecoveryAdmissionDepthGuard::enter(
+            normalize_sqlite_identity_path_lossless(&stable_path),
+        );
+        let inside_probes = std::cell::Cell::new(0_u32);
+        preflight_guarded_offline_canonical_sqlite_family_with_probe(
+            &db_path,
+            "inside admission",
+            |_| {
+                inside_probes.set(inside_probes.get() + 1);
+                Ok(false)
+            },
+        )
+        .expect("the admitted recovery attempt may probe the file it armed");
+        assert_eq!(
+            inside_probes.get(),
+            0,
+            "inside its own admission the breaker arming is not evidence, so no exact-family proof is demanded"
         );
     }
 
