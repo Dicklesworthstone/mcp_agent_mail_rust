@@ -283,7 +283,9 @@ fn open_metrics_connection(database_url: &str) -> Option<DbConn> {
 // Callers must let the returned true read-only connection use ordinary Drop.
 // `DbConnGuard`/`close_db_conn` are writable close paths and may checkpoint a
 // live WAL even though these observers only issue SELECTs.
-fn open_metrics_read_connection(database_url: &str) -> Option<DbConn> {
+fn open_metrics_read_connection(
+    database_url: &str,
+) -> Option<mcp_agent_mail_db::GuardedReadOnlyConn> {
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
         return None;
     }

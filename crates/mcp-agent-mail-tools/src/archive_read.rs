@@ -637,8 +637,11 @@ fn validate_reconstruction(
     Ok(())
 }
 
-fn live_probe(path: &Path) -> Result<mcp_agent_mail_db::DbConn, String> {
-    mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+fn live_probe(path: &Path) -> Result<mcp_agent_mail_db::GuardedReadOnlyConn, String> {
+    // Engine-dispatching: a live primary that was reconstructed or restored
+    // (no namespace pair) is compared against the archive through canonical
+    // SQLite instead of being treated as unavailable.
+    mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(
         path,
         "archive-read live database probe",
     )
@@ -744,6 +747,17 @@ fn build_snapshot(
         ));
     }
     drop(probe);
+
+    // The reconstructed snapshot is a canonical, sidecar-less file in a
+    // process-private directory. The strict query-only pool below opens it
+    // through the bound FrankenSQLite opener, which requires the persistent
+    // namespace pair, so admit the private family once before handing it to
+    // the pool.
+    mcp_agent_mail_db::pool::admit_private_database_with_franken(
+        &snapshot_path,
+        "archive-read snapshot admission",
+    )
+    .map_err(AcquireError::failed)?;
 
     let pool = mcp_agent_mail_db::create_query_only_pool(&mcp_agent_mail_db::DbPoolConfig {
         database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&snapshot_path),

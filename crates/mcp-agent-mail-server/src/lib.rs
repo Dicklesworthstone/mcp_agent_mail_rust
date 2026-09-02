@@ -2764,12 +2764,17 @@ pub(crate) fn open_read_only_sync_db_connection_with_busy_timeout(
     path: &str,
     busy_timeout_ms: u32,
     context: &str,
-) -> std::io::Result<DbConn> {
+) -> std::io::Result<mcp_agent_mail_db::GuardedReadOnlyConn> {
     let path = resolve_server_sync_sqlite_path(path);
     let conn = if path == ":memory:" {
-        DbConn::open_memory()
+        DbConn::open_memory().map(mcp_agent_mail_db::GuardedReadOnlyConn::Franken)
     } else {
-        mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+        // Engine-dispatching: the readiness probe runs right after startup
+        // recovery, when the primary may be a reconstructed or restored
+        // family without a FrankenSQLite namespace pair. Such a family is
+        // read through canonical SQLite; a Franken-admitted one keeps the
+        // bound same-engine opener.
+        mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(
             Path::new(path.as_str()),
             context,
         )
@@ -2809,7 +2814,9 @@ pub(crate) fn open_interactive_sync_db_connection(path: &str) -> std::io::Result
     )
 }
 
-pub(crate) fn open_health_probe_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
+pub(crate) fn open_health_probe_sync_db_connection(
+    path: &str,
+) -> std::io::Result<mcp_agent_mail_db::GuardedReadOnlyConn> {
     open_read_only_sync_db_connection_with_busy_timeout(
         path,
         HEALTH_SYNC_DB_BUSY_TIMEOUT_MS,
@@ -2940,7 +2947,7 @@ fn archive_storage_root_is_authoritative_for_sqlite_path(
 fn inspect_archive_db_drift(
     storage_root: &Path,
     sqlite_path: &Path,
-    conn: &DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
 ) -> Result<Option<ArchiveDbDriftSummary>, String> {
     if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, sqlite_path) {
         return Ok(None);
@@ -16010,7 +16017,9 @@ fn readiness_check_quick(config: &mcp_agent_mail_core::Config) -> Result<(), Str
     };
 
     let conn = if is_memory {
-        DbConn::open_memory().map_err(|e| e.to_string())?
+        mcp_agent_mail_db::GuardedReadOnlyConn::Franken(
+            DbConn::open_memory().map_err(|e| e.to_string())?,
+        )
     } else {
         let sqlite_path = sqlite_path
             .as_ref()
@@ -16057,7 +16066,9 @@ fn readiness_check_request_path(config: &mcp_agent_mail_core::Config) -> Result<
     };
 
     let conn = if is_memory {
-        DbConn::open_memory().map_err(|e| e.to_string())?
+        mcp_agent_mail_db::GuardedReadOnlyConn::Franken(
+            DbConn::open_memory().map_err(|e| e.to_string())?,
+        )
     } else {
         let sqlite_path = sqlite_path
             .as_ref()
@@ -16127,7 +16138,7 @@ fn readiness_check_with_archive_reconcile(
 #[cfg(test)]
 fn readiness_check_cached_semantic_status(
     config: &mcp_agent_mail_core::Config,
-    conn: &DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
 ) -> Result<(), String> {
     {
         let guard = lock_mutex(&READINESS_SEMANTIC_CACHE);
@@ -16156,7 +16167,7 @@ fn readiness_check_cached_semantic_status(
 #[cfg(test)]
 fn readiness_check_semantic_status(
     config: &mcp_agent_mail_core::Config,
-    conn: &DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
 ) -> Result<(), String> {
     readiness_check_schema_status(conn)?;
 
@@ -16169,7 +16180,9 @@ fn readiness_check_semantic_status(
     Ok(())
 }
 
-fn readiness_check_schema_status(conn: &DbConn) -> Result<(), String> {
+fn readiness_check_schema_status(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+) -> Result<(), String> {
     let rows = conn
         .query_sync(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -16285,7 +16298,7 @@ fn fetch_health_live_counts(database_url: &str) -> Option<(u64, u64)> {
     counts
 }
 
-fn health_count(conn: &DbConn, sql: &str) -> Option<u64> {
+fn health_count(conn: &impl mcp_agent_mail_db::pool::SyncQuery, sql: &str) -> Option<u64> {
     conn.query_sync(sql, &[])
         .ok()
         .and_then(|rows| rows.into_iter().next())

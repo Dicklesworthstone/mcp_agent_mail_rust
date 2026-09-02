@@ -1,4 +1,4 @@
-//! GH#291: a freshly compacted (VACUUMed, `freelist_count = 0`,
+//! GH#291: a freshly compacted (`VACUUM`ed, `freelist_count = 0`,
 //! `integrity_check = ok`) mailbox must still be clean after one ordinary
 //! service startup. The report observed a clean file re-acquiring a
 //! contiguous run of `Page N: never used` orphans within ~235 ms of the first

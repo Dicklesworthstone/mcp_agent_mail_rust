@@ -475,12 +475,14 @@ mod tests {
                     FlagsCommand::List {
                         set,
                         experimental,
+                        subsystem,
                         format,
                         json,
                     },
             } => {
                 assert!(set);
                 assert!(experimental);
+                assert_eq!(subsystem, None, "no --subsystem was passed");
                 assert_eq!(format, Some(output::CliOutputFormat::Json));
                 assert!(!json);
             }

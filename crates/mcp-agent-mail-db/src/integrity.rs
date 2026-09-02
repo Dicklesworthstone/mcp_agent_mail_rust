@@ -1016,7 +1016,7 @@ impl CrossCountMismatch {
 /// where table and indexes are mutually consistent but acknowledged rows are
 /// absent — only a client-side acknowledgement ledger sees that.
 pub fn index_table_cross_count(
-    conn: &DbConn,
+    conn: &impl crate::pool::SyncQuery,
     tables: &[&str],
 ) -> DbResult<Vec<CrossCountMismatch>> {
     let mut mismatches = Vec::new();

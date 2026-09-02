@@ -6083,7 +6083,7 @@ pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInve
         (0, 0)
     };
     let project_identities = if present.contains("projects") {
-        crate::reconstruct::collect_db_project_identities_with(|sql| conn.query_sync(sql, &[]))?
+        crate::reconstruct::collect_db_project_identities(&conn)?
     } else {
         BTreeSet::new()
     };
@@ -6098,6 +6098,15 @@ pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInve
 }
 
 fn archive_has_real_projects(storage_root: &Path) -> bool {
+    // A symlinked storage root is never archive authority: the server's
+    // startup probe and `reconstruct_from_archive_impl` both refuse it, and
+    // the pre-init reconcile must not become the one path that rebuilds a
+    // mailbox from wherever the link points. `symlink_metadata` on the
+    // `projects` leaf alone would accept a real directory under a linked
+    // parent, so check the root itself first.
+    if !is_real_directory(storage_root) {
+        return false;
+    }
     let projects_dir = storage_root.join("projects");
     if !is_real_directory(&projects_dir) {
         return false;
@@ -10874,12 +10883,21 @@ fn preflight_bound_live_franken_family(stable_path: &Path, context: &str) -> Res
             stable_path.display()
         ))
     })?;
-    if !metadata.file_type().is_file()
-        || metadata.len() < u64::try_from(SQLITE_DATABASE_HEADER_BYTES).unwrap_or(u64::MAX)
-    {
+    if !metadata.file_type().is_file() {
         return Err(SqlError::Custom(format!(
-            "{context}: refusing live read-only FrankenSQLite open for {} because the admitted target is not a materialized SQLite file",
+            "{context}: refusing live read-only FrankenSQLite open for {} because the admitted target is not a regular file",
             stable_path.display()
+        )));
+    }
+    if metadata.len() < u64::try_from(SQLITE_DATABASE_HEADER_BYTES).unwrap_or(u64::MAX) {
+        // Same wording as the canonical precheck so the corruption classifier
+        // treats both the same way: a main file shorter than the 100-byte
+        // header is not a salvageable image, and archive recovery may degrade
+        // to an archive-only rebuild instead of refusing.
+        return Err(SqlError::Custom(format!(
+            "{context}: refusing live read-only FrankenSQLite open for {} because the admitted target has a truncated SQLite database header ({} bytes)",
+            stable_path.display(),
+            metadata.len()
         )));
     }
     #[cfg(unix)]
@@ -11146,6 +11164,108 @@ impl GuardedReadOnlyConn {
             Self::Canonical(conn) => conn.execute_raw(sql),
         }
     }
+}
+
+/// A connection that can run a synchronous query: the runtime FrankenSQLite
+/// connection, the canonical connection, or the engine-dispatched read-only
+/// connection.
+///
+/// Read-only diagnostics (readiness probes, archive-drift inventories,
+/// health counts) accept `&impl SyncQuery`, so one helper serves a pooled
+/// runtime connection and a dispatched read-only connection alike instead
+/// of being typed to one engine.
+pub trait SyncQuery {
+    /// Prepare and execute a query, returning every row.
+    #[allow(clippy::result_large_err)]
+    fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, SqlError>;
+}
+
+impl SyncQuery for DbConn {
+    fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, SqlError> {
+        Self::query_sync(self, sql, params)
+    }
+}
+
+impl SyncQuery for crate::CanonicalDbConn {
+    fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, SqlError> {
+        Self::query_sync(self, sql, params)
+    }
+}
+
+impl SyncQuery for GuardedReadOnlyConn {
+    fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, SqlError> {
+        Self::query_sync(self, sql, params)
+    }
+}
+
+/// Whether the family beside `sqlite_path` is Franken-admitted, judged by its
+/// persistent namespace pair.
+///
+/// `Ok(true)` for a complete pair, `Ok(false)` for none, and an error for a
+/// half pair or an uninspectable sidecar (ambiguous authority that neither
+/// engine may open).
+///
+/// Lets a caller that must choose a *source strategy* (for example, the
+/// doctor's choice between a live logical snapshot and a direct offline
+/// canonical open) make the same decision the dispatching opener makes.
+#[allow(clippy::result_large_err)]
+pub fn is_franken_admitted_family(sqlite_path: &Path, context: &str) -> Result<bool, SqlError> {
+    validate_sqlite_target_path(sqlite_path, context)?;
+    let stable_path = std::fs::canonicalize(sqlite_path).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot resolve stable SQLite path {}: {error}",
+            sqlite_path.display()
+        ))
+    })?;
+    match inspect_namespace_sidecar_shape(&stable_path, context)? {
+        NamespaceSidecarShape::Complete => Ok(true),
+        NamespaceSidecarShape::Absent => Ok(false),
+        NamespaceSidecarShape::Incomplete => Err(SqlError::Custom(format!(
+            "{context}: {} has an incomplete FrankenSQLite namespace sidecar pair (exactly one of -fsqlite-ns-gate / -fsqlite-ns-use exists); finish or retire the admission before reading",
+            stable_path.display()
+        ))),
+    }
+}
+
+/// Admit a process-private database into FrankenSQLite's namespace protocol
+/// by opening it once writer-capable and closing it cleanly.
+///
+/// A private snapshot produced by archive reconstruction or a canonical
+/// `VACUUM INTO` carries no namespace pair, so the strict query-only pool
+/// (which must use the bound Franken opener) refuses it. Admitting it first
+/// gives the private family the persistent records every guarded reader
+/// expects. Only for files this process owns exclusively: admitting a live
+/// or shared family is the runtime's job.
+#[allow(clippy::result_large_err)]
+pub fn admit_private_database_with_franken(path: &Path, context: &str) -> Result<(), SqlError> {
+    validate_sqlite_target_path(path, context)?;
+    let sqlite_path_str = sqlite_path_as_utf8(path)?;
+    let conn = DbConn::open_file(sqlite_path_str).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot admit private database {} through FrankenSQLite: {error}",
+            path.display()
+        ))
+    })?;
+    conn.query_sync("SELECT 1", &[]).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: private database {} is not readable through FrankenSQLite: {error}",
+            path.display()
+        ))
+    })?;
+    crate::close_db_conn(conn, "private database admission");
+    let stable_path = std::fs::canonicalize(path).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot resolve stable SQLite path {}: {error}",
+            path.display()
+        ))
+    })?;
+    if inspect_namespace_sidecar_shape(&stable_path, context)? != NamespaceSidecarShape::Complete {
+        return Err(SqlError::Custom(format!(
+            "{context}: FrankenSQLite did not leave a complete namespace pair beside private database {} after admission",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Open an existing database read-only through whichever engine holds
@@ -11528,7 +11648,16 @@ pub(crate) fn sqlite_file_passes_full_integrity_check(path: &Path) -> Result<boo
     if !is_real_file(path) {
         return Ok(false);
     }
-    sqlite_canonical_file_check_is_ok(path, integrity::CheckKind::Full)
+    // Engine-dispatching: a Franken-admitted salvage source (a quarantined
+    // generation, a Franken-written backup) is checked by FrankenSQLite
+    // itself instead of being refused as a cross-engine canonical open; a
+    // family without namespace authority keeps canonical SQLite's true
+    // read-only check. The acceptance rule is the same for both engines.
+    let conn = open_guarded_read_only_sqlite_file(path, "full integrity diagnostic")?;
+    let rows = sqlite_check_rows_with(|sql| conn.query_sync(sql, &[]), integrity::CheckKind::Full)?;
+    let details = integrity::extract_check_details(&rows, integrity::CheckKind::Full);
+    Ok(integrity::details_indicate_ok(&details)
+        || integrity::integrity_details_are_suspect(&details))
 }
 
 /// Full `PRAGMA integrity_check` for a PRIVATE staged family copy, via a
@@ -25244,9 +25373,7 @@ mod tests {
             Ok(_) => panic!("read-only source open must fail instead of creating a blank database"),
         };
         assert!(
-            error
-                .to_string()
-                .contains("guarded FrankenSQLite authority"),
+            error.to_string().contains("guarded read-only authority"),
             "unexpected error: {error}"
         );
         assert!(
@@ -25576,7 +25703,7 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains("proactive backup")
-                && (msg.contains("guarded FrankenSQLite authority")
+                && (msg.contains("guarded read-only authority")
                     || msg.contains("failed to materialize live source")),
             "unexpected error: {msg}"
         );
@@ -25616,7 +25743,7 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains("proactive backup")
-                && (msg.contains("guarded FrankenSQLite authority")
+                && (msg.contains("guarded read-only authority")
                     || msg.contains("failed to materialize live source")),
             "unexpected error: {msg}"
         );

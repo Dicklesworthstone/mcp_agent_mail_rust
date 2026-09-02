@@ -1154,7 +1154,7 @@ pub mod tool_util {
     }
 
     fn query_read_db_inventory(
-        conn: &mcp_agent_mail_db::DbConn,
+        conn: &impl mcp_agent_mail_db::pool::SyncQuery,
     ) -> Result<ReadReconcileInventory, String> {
         let tables = conn
             .query_sync(
@@ -1241,7 +1241,7 @@ pub mod tool_util {
     pub(crate) fn read_archive_is_ahead(
         storage_root: &Path,
         sqlite_path: &Path,
-        conn: &mcp_agent_mail_db::DbConn,
+        conn: &impl mcp_agent_mail_db::pool::SyncQuery,
         archive: &mcp_agent_mail_db::ArchiveMessageInventory,
     ) -> Result<bool, String> {
         if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, sqlite_path) {

@@ -1117,7 +1117,7 @@ mod tests {
             .collect()
     }
 
-    /// GH#290: the AM_ATC_* surface must be a single documented source of
+    /// GH#290: the `AM_ATC_*` surface must be a single documented source of
     /// truth. Any `AM_ATC_*` variable read (or even mentioned) in code must be
     /// registered here, so a new knob cannot ship undocumented again.
     #[test]
@@ -1150,7 +1150,7 @@ mod tests {
     }
 
     /// GH#290: README, the flag registry doc, and the operator runbook must
-    /// carry every AM_ATC_* variable with its registered default.
+    /// carry every `AM_ATC_*` variable with its registered default.
     #[test]
     fn every_atc_env_var_is_documented_with_its_default() {
         let root = workspace_root();

@@ -553,7 +553,7 @@ const CROSS_COUNT_TABLES: &[&str] = &[
 /// guarded read-only family and namespace admission.
 fn open_index_table_cross_count_connection(
     sqlite_path: &Path,
-) -> std::io::Result<mcp_agent_mail_db::DbConn> {
+) -> std::io::Result<mcp_agent_mail_db::GuardedReadOnlyConn> {
     crate::open_read_only_sync_db_connection_with_busy_timeout(
         sqlite_path.to_string_lossy().as_ref(),
         crate::BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS,

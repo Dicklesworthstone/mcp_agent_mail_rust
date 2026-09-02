@@ -1262,23 +1262,10 @@ pub fn compute_archive_drift_report(
 
 #[allow(clippy::result_large_err)]
 pub fn collect_db_project_identities(
-    conn: &crate::DbConn,
+    conn: &impl crate::pool::SyncQuery,
 ) -> Result<BTreeSet<MailboxProjectIdentity>, SqlError> {
-    collect_db_project_identities_with(|sql| conn.query_sync(sql, &[]))
-}
-
-/// [`collect_db_project_identities`] over any query function, so the
-/// inventory can read a family through whichever engine the guarded
-/// read-only opener dispatched to.
-#[allow(clippy::result_large_err)]
-pub fn collect_db_project_identities_with<F>(
-    mut query: F,
-) -> Result<BTreeSet<MailboxProjectIdentity>, SqlError>
-where
-    F: FnMut(&str) -> Result<Vec<sqlmodel_core::Row>, SqlError>,
-{
     let mut project_identities = BTreeSet::new();
-    let project_rows = query("SELECT slug, human_key FROM projects")?;
+    let project_rows = conn.query_sync("SELECT slug, human_key FROM projects", &[])?;
     for row in project_rows {
         let slug = row.get_named::<String>("slug").ok();
         let human_key = row.get_named::<String>("human_key").ok();
@@ -1942,7 +1929,19 @@ const PRIVATE_SALVAGE_FRANKEN_WAL_WITNESS_SUFFIXES: [&str; 2] = ["-wal-cert", "-
 /// WAL and its index), and (3) retire the engine-specific WAL witnesses.
 /// Nothing is deleted: residue is renamed inside the private directory, which
 /// is discarded with [`MaterializedLiveSalvage`].
-fn neutralize_private_salvage_artifact(snapshot_path: &Path, snapshot_text: &str) -> DbResult<()> {
+///
+/// Public so the CLI's doctor snapshot path can neutralize its own private
+/// `VACUUM INTO` output before handing it to the guarded canonical validators
+/// and the private-salvage merge, which refuse any Franken-admitted path.
+///
+/// # Errors
+///
+/// Returns an error when the artifact cannot be opened by canonical SQLite or
+/// its WAL cannot be folded into the main file.
+pub fn neutralize_private_salvage_artifact(
+    snapshot_path: &Path,
+    snapshot_text: &str,
+) -> DbResult<()> {
     retire_private_salvage_residue(snapshot_path, &PRIVATE_SALVAGE_FRANKEN_NAMESPACE_SUFFIXES);
     let conn = crate::CanonicalDbConn::open_file(snapshot_text).map_err(|error| {
         DbError::Sqlite(format!(

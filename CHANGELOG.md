@@ -63,8 +63,34 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   FrankenSQLite opener, no pair → canonical SQLite's true read-only flags, a
   half pair → an explicit refusal. Neither engine's own refusal paths are
   bypassed, and a family that changes engines mid-admission gets exactly one
-  re-dispatch. The live-salvage materializer exports a sidecar-less source
-  through canonical SQLite (source bytes untouched) instead of refusing it.
+  re-dispatch. The live-salvage materializer and the proactive-backup export
+  materialize a sidecar-less source through canonical SQLite (source bytes
+  untouched) instead of refusing it.
+- **A restored or reconstructed primary no longer carries the replaced
+  generation's FrankenSQLite namespace records.** Promotion quarantined the
+  old journal/WAL/SHM companions but left `-fsqlite-ns-gate`/`-fsqlite-ns-use`
+  beside the new bytes, so the strict read-only opener refused the promoted
+  family ("namespace record names a different database generation") and the
+  post-restore archive reconcile failed. The namespace pair is now retired by
+  rename with the quarantined generation (never unlinked); the runtime's next
+  writer-capable open re-admits the family. A salvage source whose main file
+  is shorter than the SQLite header is classified as corruption, so recovery
+  degrades to an archive-only rebuild instead of blocking on it.
+- **`am doctor` chooses its diagnostic source by namespace authority, and
+  `am doctor reconstruct` can salvage the current database.** A family
+  without a FrankenSQLite namespace pair is opened directly by the offline
+  canonical opener (a physical proof); only a Franken-admitted family goes
+  through the guarded logical snapshot, whose verdict is by design at most
+  "inconclusive" about the physical b-tree. The doctor's private `VACUUM
+  INTO` snapshot is neutralized (namespace records retired, WAL folded)
+  before the private-salvage validators see it, and the full-integrity
+  validator checks a Franken-admitted quarantined artifact through
+  FrankenSQLite instead of refusing a cross-engine open. The HTTP readiness
+  probe, the integrity-guard cross-count and the tool-metrics observer use
+  the same dispatching opener, so readiness after an archive-backed reconcile
+  no longer fails with the namespace-pair refusal. A symlinked storage root
+  is never archive authority for the pre-init reconcile, matching the
+  startup probe and reconstruct.
 - **The Config-level default-archive guard no longer panics under
   cargo-nextest.** The refusal added for br-99aih fired whenever a test
   merely constructed a `Config` from the ambient env under a harness marker,

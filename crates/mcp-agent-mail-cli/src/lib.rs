@@ -15363,6 +15363,22 @@ fn vacuum_live_franken_sqlite_into_snapshot(
                 destination.display()
             ))
         })?;
+    drop(conn);
+    // A FrankenSQLite-served export admits the private destination into its
+    // own protocol (namespace records, possibly a resting WAL, wal-cert
+    // witnesses). Every downstream reader of this snapshot is a guarded
+    // canonical validator or the private-salvage merge, both of which refuse
+    // a Franken-admitted path, so fold the artifact into one engine-neutral
+    // rollback-journal file first. For a canonical-served export this only
+    // re-proves the artifact opens.
+    mcp_agent_mail_db::neutralize_private_salvage_artifact(destination, destination_text).map_err(
+        |error| {
+            CliError::Other(format!(
+                "{context} could not neutralize the private snapshot {}: {error}",
+                destination.display()
+            ))
+        },
+    )?;
     Ok(())
 }
 
@@ -15389,12 +15405,10 @@ where
     let destination_text = sqlite_snapshot_path_text(&snapshot_path, context, "destination")?;
     vacuum_live_franken_sqlite_into_snapshot(source, &snapshot_path, context)?;
 
-    // FrankenSQLite currently leaves persistent namespace records beside a
-    // successful VACUUM INTO output. They are private to this tempdir and no
-    // Franken handle for the destination remains alive, so this direct
-    // canonical open is process-exclusive. The guarded *offline* canonical
-    // helper intentionally rejects such records and therefore is not the
-    // correct API for this engine-owned private output.
+    // The snapshot was neutralized right after `VACUUM INTO` (namespace
+    // records retired, WAL folded into the main file), so it is an ordinary
+    // process-private rollback-journal SQLite file with no other referent;
+    // a direct canonical open is process-exclusive and sufficient here.
     let snapshot =
         mcp_agent_mail_db::CanonicalDbConn::open_file(destination_text).map_err(|error| {
             CliError::Other(format!(
@@ -26556,31 +26570,43 @@ fn doctor_open_canonical_source_for_diagnostic(
         });
     }
 
-    let live_error = match CanonicalSnapshotSource::live_full_sqlite_snapshot(
-        db_path.to_path_buf(),
-        db_path,
-        operation,
-    ) {
-        Ok(snapshot_source) => {
-            let conn = doctor_open_private_immutable_canonical_snapshot(
-                snapshot_source.actual_path(),
-                operation,
-            )
-            .map_err(|error| DoctorCanonicalDiagnosticOpenFailure {
-                detail: error.to_string(),
-                offline_authority_error: None,
-            })?;
-            return Ok(DoctorCanonicalDiagnosticOpen {
-                conn,
-                _snapshot_source: Some(snapshot_source),
-                _staged_family: None,
-                kind: DoctorCanonicalDiagnosticSourceKind::LiveLogicalSnapshot,
-            });
+    // The namespace pair decides the strategy. A Franken-admitted family is
+    // exported logically (and, failing that, staged) so canonical SQLite never
+    // opens the live inode. A family without namespace authority is opened
+    // directly by the guarded offline canonical opener: that proves the live
+    // physical b-tree itself, whereas a logical export (which the dispatching
+    // opener would happily produce for such a family) can only ever be
+    // "inconclusive" about the physical file.
+    let franken_admitted = sqlite_family_is_franken_admitted(db_path);
+    let live_error = if franken_admitted {
+        match CanonicalSnapshotSource::live_full_sqlite_snapshot(
+            db_path.to_path_buf(),
+            db_path,
+            operation,
+        ) {
+            Ok(snapshot_source) => {
+                let conn = doctor_open_private_immutable_canonical_snapshot(
+                    snapshot_source.actual_path(),
+                    operation,
+                )
+                .map_err(|error| DoctorCanonicalDiagnosticOpenFailure {
+                    detail: error.to_string(),
+                    offline_authority_error: None,
+                })?;
+                return Ok(DoctorCanonicalDiagnosticOpen {
+                    conn,
+                    _snapshot_source: Some(snapshot_source),
+                    _staged_family: None,
+                    kind: DoctorCanonicalDiagnosticSourceKind::LiveLogicalSnapshot,
+                });
+            }
+            Err(error) => error.to_string(),
         }
-        Err(error) => error,
+    } else {
+        "skipped because the family carries no FrankenSQLite namespace sidecars; the guarded offline canonical opener proves the physical b-tree directly".to_string()
     };
 
-    let staged_error = if sqlite_family_is_franken_admitted(db_path) {
+    let staged_error = if franken_admitted {
         match doctor_open_staged_family_copy_canonical(db_path, operation) {
             Ok(opened) => return Ok(opened),
             Err(error) => error.to_string(),
@@ -26605,7 +26631,7 @@ fn doctor_open_canonical_source_for_diagnostic(
                 detail: format!(
                     "cannot open {} for canonical {operation}: guarded live snapshot failed: {}; staged family copy failed: {}; guarded offline canonical open failed: {}",
                     db_path.display(),
-                    truncate_doctor_open_source_clause(&live_error.to_string()),
+                    truncate_doctor_open_source_clause(&live_error),
                     truncate_doctor_open_source_clause(&staged_error),
                     truncate_doctor_open_source_clause(&offline_authority_error)
                 ),
@@ -31258,7 +31284,12 @@ fn doctor_read_only_physical_integrity_check(
     }
 
     let live_path = Path::new(&opened.opened_path);
-    let primary_result = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+    // Engine-dispatching: the logical snapshot above is produced through
+    // whichever engine holds the family (a canonical-written or restored
+    // family has no namespace pair), so the physical probe of the same live
+    // path must dispatch the same way or every such family would be reported
+    // "inconclusive" right after its snapshot proved readable.
+    let primary_result = mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(
         live_path,
         "read-only doctor physical integrity probe",
     )
@@ -31268,7 +31299,13 @@ fn doctor_read_only_physical_integrity_check(
             live_path.display()
         ))
     })
-    .and_then(|conn| sqlite_conn_check_ok(&conn, kind));
+    .and_then(|conn| {
+        let rows = sqlite_query_check_rows(
+            |sql| conn.query_sync(sql, &[]).map_err(|e| e.to_string()),
+            kind,
+        )?;
+        Ok(sqlite_pragma_check_rows_ok(&rows, kind))
+    });
 
     reconcile_private_canonical_corroboration(primary_result, canonical_result)
 }
@@ -80965,11 +81002,16 @@ fn doctor_salvage_artifact_candidates(
         }
     };
 
-    push_candidate(
-        "current database",
-        current_db.to_path_buf(),
-        DoctorSalvageSourceKind::LiveFranken,
-    );
+    // The namespace pair decides how the current database is read: a
+    // Franken-admitted family is exported through the guarded same-engine
+    // snapshot, while a family without namespace authority (canonical-written,
+    // restored, reconstructed) is read directly as a readable canonical file.
+    let current_kind = if sqlite_family_is_franken_admitted(current_db) {
+        DoctorSalvageSourceKind::LiveFranken
+    } else {
+        DoctorSalvageSourceKind::PrivateCanonical
+    };
+    push_candidate("current database", current_db.to_path_buf(), current_kind);
 
     for candidate in sqlite_backup_candidates(current_db) {
         push_candidate(
