@@ -877,6 +877,8 @@ am serve-http
 DATABASE_URL=sqlite:///path/to/new.sqlite3 am serve-http
 ```
 
+The three-slash form names an absolute path (`sqlite:///var/lib/am/x.sqlite3` is `/var/lib/am/x.sqlite3`, the same as `sqlite:////var/lib/am/x.sqlite3`). A path relative to the working directory must be spelled that way: `sqlite:///./x.sqlite3` or `sqlite://x.sqlite3`. A missing relative target is never replaced by an absolute file that happens to share the suffix.
+
 ### Run in production mode
 ```bash
 APP_ENVIRONMENT=production \

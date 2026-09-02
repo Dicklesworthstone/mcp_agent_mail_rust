@@ -5624,7 +5624,8 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_key_from_database_url_uses_absolute_candidate_when_relative_path_is_missing() {
+    fn sqlite_key_from_database_url_treats_three_slashes_as_absolute_even_when_relative_shadow_is_missing()
+     {
         let absolute_dir = tempfile::tempdir().expect("tempdir");
         let absolute_db = absolute_dir.path().join("storage-missing.sqlite3");
         let absolute_db_str = absolute_db.to_string_lossy().into_owned();

@@ -3143,7 +3143,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_search_sqlite_path_from_database_url_uses_absolute_candidate_when_relative_path_is_missing()
+    fn resolve_search_sqlite_path_from_database_url_treats_three_slashes_as_absolute_even_when_relative_shadow_is_missing()
      {
         let dir = tempfile::tempdir().expect("tempdir");
         let absolute_db = dir.path().join("backfill-missing-relative.sqlite3");
@@ -3171,9 +3171,19 @@ mod tests {
 
     #[test]
     fn backfill_url_path_extraction() {
+        let cwd_relative_expectation = std::env::current_dir()
+            .expect("cwd")
+            .join("relative/path.db")
+            .to_string_lossy()
+            .into_owned();
         let cases = [
             ("sqlite+aiosqlite:///absolute/path.db", "/absolute/path.db"),
-            ("sqlite://relative/path.db", "relative/path.db"),
+            (
+                "sqlite://relative/path.db",
+                // Host-less two-slash form is CWD-relative; the pool key is the
+                // CWD-anchored identity, so the expectation derives from CWD.
+                cwd_relative_expectation.as_str(),
+            ),
             ("sqlite:////abs/path.db", "/abs/path.db"),
             ("/plain/path.db", "/plain/path.db"),
             ("path.db", "path.db"),

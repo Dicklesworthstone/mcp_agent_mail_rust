@@ -22832,7 +22832,10 @@ mod tests {
         let resolved = resolve_sqlite_path_with_absolute_fallback(&missing_relative);
         assert_eq!(resolved, missing_relative);
 
-        let database_url = format!("sqlite:///{missing_relative}");
+        // Three slashes would name the absolute file (that is the documented
+        // contract); the explicit `./` spelling is how a CWD-relative target
+        // is requested.
+        let database_url = format!("sqlite:///./{missing_relative}");
         let mailbox_path =
             resolve_mailbox_sqlite_path(&database_url).expect("resolve shared mailbox authority");
         let pool = DbPool::new(&DbPoolConfig {

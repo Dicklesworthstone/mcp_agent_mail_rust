@@ -2645,11 +2645,14 @@ fn classify_recovery_failure_root_cause(detail: &str) -> String {
 /// operator can fix the environment, and keep the probe out of both the
 /// "wait for the owner" advice and any recovery path.
 fn diagnose_unopenable_namespace_sidecar(config: &Config, detail: &str) -> Option<ProbeResult> {
-    if !detail.to_ascii_lowercase().contains("unable to open database") {
+    if !detail
+        .to_ascii_lowercase()
+        .contains("unable to open database")
+    {
         return None;
     }
-    let sidecar = quoted_path_in_message(detail)
-        .filter(|path| is_franken_namespace_sidecar_name(path))?;
+    let sidecar =
+        quoted_path_in_message(detail).filter(|path| is_franken_namespace_sidecar_name(path))?;
     let db_target = resolve_server_database_url_sqlite_path(&config.database_url).map_or_else(
         || config.database_url.clone(),
         |path| path.display().to_string(),
@@ -2770,7 +2773,12 @@ fn current_process_identity() -> String {
             .map(|rest| rest.split_whitespace().next().unwrap_or("?").to_string())
             .unwrap_or_else(|| "?".to_string())
     };
-    format!("pid {} uid {} gid {}", std::process::id(), field("Uid:"), field("Gid:"))
+    format!(
+        "pid {} uid {} gid {}",
+        std::process::id(),
+        field("Uid:"),
+        field("Gid:")
+    )
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -3307,7 +3315,10 @@ mod tests {
                 && problem.contains("No recovery was attempted"),
             "{problem}"
         );
-        assert!(problem.contains("mode 555"), "directory mode must be reported: {problem}");
+        assert!(
+            problem.contains("mode 555"),
+            "directory mode must be reported: {problem}"
+        );
         assert!(fix.contains("chown/chmod"), "{fix}");
         assert!(!fix.contains("Wait for the current mailbox owner"), "{fix}");
     }
@@ -3322,14 +3333,21 @@ mod tests {
         let config = sidecar_diagnosis_config(&db);
         let detail = format!("unable to open database file: '{}'", gate.display());
 
-        let (problem, fix) = expect_integrity_failure(diagnose_unopenable_namespace_sidecar(&config, &detail));
+        let (problem, fix) =
+            expect_integrity_failure(diagnose_unopenable_namespace_sidecar(&config, &detail));
         assert!(
             problem.contains("although this process can open it")
                 && problem.contains("No recovery was attempted"),
             "{problem}"
         );
-        assert!(fix.contains("am doctor locks") && fix.contains("stale"), "{fix}");
-        assert!(gate.exists(), "the diagnosis must not remove the sidecar it inspected");
+        assert!(
+            fix.contains("am doctor locks") && fix.contains("stale"),
+            "{fix}"
+        );
+        assert!(
+            gate.exists(),
+            "the diagnosis must not remove the sidecar it inspected"
+        );
     }
 
     #[test]
@@ -3346,7 +3364,10 @@ mod tests {
             .is_none(),
             "only namespace sidecars are diagnosed here; the main file keeps the open classifier"
         );
-        assert!(diagnose_unopenable_namespace_sidecar(&config, "unable to open database file").is_none());
+        assert!(
+            diagnose_unopenable_namespace_sidecar(&config, "unable to open database file")
+                .is_none()
+        );
         assert_eq!(
             quoted_path_in_message("x: 'a/b-fsqlite-ns-use' y"),
             Some(PathBuf::from("a/b-fsqlite-ns-use"))
@@ -3499,7 +3520,9 @@ mod tests {
         );
 
         let mut config = default_config();
-        config.database_url = format!("sqlite:///{}", relative_path.display());
+        // Explicit CWD-relative spelling; three slashes alone would name the
+        // absolute decoy by contract.
+        config.database_url = format!("sqlite:///./{}", relative_path.display());
 
         let result = probe_database(&config);
         let ProbeResult::Fail(failure) = result else {

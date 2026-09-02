@@ -17930,17 +17930,24 @@ mod tests {
             "fixture requires a missing configured relative target"
         );
         let mut config = mcp_agent_mail_core::Config::default();
-        config.database_url = format!("sqlite:///{}", relative_db.display());
+        // `sqlite:///./...` is the explicit CWD-relative spelling; three
+        // slashes alone would name the absolute decoy by contract.
+        config.database_url = format!("sqlite:///./{}", relative_db.display());
         let runtime_authority =
             mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
                 .expect("resolve DB runtime authority");
-        assert_eq!(
-            runtime_authority.canonical_path,
-            relative_db.to_string_lossy()
+        let runtime_path = PathBuf::from(&runtime_authority.canonical_path);
+        assert_ne!(
+            runtime_path, absolute_db,
+            "a missing relative target must not be replaced by the absolute decoy"
+        );
+        assert!(
+            runtime_path.ends_with(&relative_db),
+            "the runtime authority must stay the configured relative target: {runtime_path:?}"
         );
         assert_eq!(
             resolve_server_database_url_sqlite_path(&config.database_url),
-            Some(relative_db)
+            Some(runtime_path)
         );
 
         cleanup_shutdown_sqlite_sidecars(&config);
@@ -19237,16 +19244,22 @@ mod tests {
             "fixture requires a missing configured relative target"
         );
 
-        let database_url = format!("sqlite:///{}", relative_path.display());
+        // Explicit CWD-relative spelling; three slashes alone would name the
+        // absolute decoy by contract.
+        let database_url = format!("sqlite:///./{}", relative_path.display());
         let server_path = resolve_server_database_url_sqlite_path(&database_url)
             .expect("resolve server runtime authority");
         let runtime_path = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&database_url)
             .expect("resolve DB runtime authority");
 
         assert_eq!(server_path, PathBuf::from(&runtime_path.canonical_path));
-        assert_eq!(
-            server_path, relative_path,
-            "readiness locks must retain the same missing relative authority that DbPool will initialize"
+        assert_ne!(
+            server_path, absolute_db,
+            "readiness must not adopt the absolute decoy for a missing relative target"
+        );
+        assert!(
+            server_path.ends_with(&relative_path),
+            "readiness locks must retain the same missing relative authority that DbPool will initialize: {server_path:?}"
         );
         assert_eq!(std::fs::read(&absolute_db).unwrap(), decoy_bytes);
     }

@@ -811,7 +811,8 @@ mod tests {
     // ── br-3h13: Additional tool_metrics.rs test coverage ──────────
 
     #[test]
-    fn open_metrics_connection_uses_absolute_candidate_for_missing_relative_database_url() {
+    fn open_metrics_connection_follows_the_relative_authority_for_a_missing_relative_database_url()
+    {
         let dir = tempfile::tempdir().expect("tempdir");
         let absolute_db = dir.path().join("tool_metrics_fallback.sqlite3");
         let absolute_db_str = absolute_db.to_string_lossy().into_owned();
@@ -827,18 +828,22 @@ mod tests {
         }
         assert!(
             !relative_path.exists(),
-            "relative fallback fixture should be absent so metrics connection must resolve the absolute candidate"
+            "fixture requires a missing relative target next to an absolute decoy"
         );
 
+        // `sqlite://rel` is the host-less relative spelling. The metrics worker
+        // must persist into the same database the runtime authority resolves
+        // (the missing relative target), never into the absolute file that
+        // happens to share the suffix (br-z73au).
         let database_url = format!("sqlite://{}", relative_path.display());
-        let conn = open_metrics_connection(&database_url).expect("open metrics fallback db");
+        let conn = open_metrics_connection(&database_url).expect("open metrics db");
         conn.execute_raw("CREATE TABLE marker(id INTEGER PRIMARY KEY)")
-            .expect("create marker table through fallback connection");
+            .expect("create marker table through the metrics connection");
         drop(conn);
 
         assert!(
-            !relative_path.exists(),
-            "metrics fallback should not create a stray relative sqlite file"
+            relative_path.exists(),
+            "the metrics connection must create the configured relative target"
         );
 
         let verify_conn = DbConn::open_file(&absolute_db_str).expect("reopen absolute db");
@@ -848,7 +853,11 @@ mod tests {
                 &[],
             )
             .expect("query sqlite_master");
-        assert_eq!(rows[0].get_named::<i64>("count").unwrap_or(0), 1);
+        assert_eq!(
+            rows[0].get_named::<i64>("count").unwrap_or(0),
+            0,
+            "the absolute decoy must not receive the metrics write"
+        );
     }
 
     #[test]

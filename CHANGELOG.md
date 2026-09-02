@@ -92,6 +92,19 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ### Fixed
 
+- **`sqlite:` URL contract written down and the tool-metrics worker follows
+  it (br-z73au).** The three-slash form names an absolute path, the same as
+  four slashes; a working-directory-relative database must be spelled
+  `sqlite:///./x.sqlite3` or `sqlite://x.sqlite3`. A missing relative target
+  is never replaced by an absolute file that shares its suffix; only a
+  relative file that exists but is unhealthy next to a healthy `/<same>`
+  triggers the legacy absolute fallback. The contract is documented on the
+  parser and in the operator runbook. The tool-metrics persistence worker
+  used to be tested against the opposite expectation (adopt the absolute
+  file); it persists into the runtime's database, and its test now says so.
+  Seven fixtures that spelled relative targets with three slashes now use
+  the explicit form, and two search-side tests are renamed to describe the
+  behaviour they actually pin.
 - **Startup no longer pays the staged FrankenSQLite health check three times
   (br-eru3j).** Every staged health probe copies the SQLite family into a
   private tempdir and runs the FrankenSQLite quick check on the copy; on a

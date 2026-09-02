@@ -797,6 +797,21 @@ pub fn is_sqlite_memory_database_url(database_url: &str) -> bool {
     )
 }
 
+/// Turn a `sqlite:` database URL into the filesystem path it names.
+///
+/// Contract (br-z73au): the three-slash form is **absolute**, like the
+/// four-slash form. `sqlite:///var/lib/am/storage.sqlite3` and
+/// `sqlite:////var/lib/am/storage.sqlite3` both name `/var/lib/am/...`; this
+/// is what every documented example, `DbPoolConfig`'s error text, and the
+/// installed base rely on, and reinterpreting it as CWD-relative would
+/// silently retarget existing deployments to a fresh database. A path is
+/// relative to the current directory only when it is spelled that way:
+/// `sqlite:///./rel/db.sqlite3`, `sqlite:///../rel/db.sqlite3`, or the
+/// host-less two-slash form `sqlite://rel/db.sqlite3`. Downstream, a missing
+/// relative target is never replaced by an absolute file that happens to
+/// share the same suffix; only a relative file that exists but is unhealthy
+/// while `/<same path>` is healthy triggers the legacy absolute fallback
+/// (see `pool::resolve_sqlite_path_with_absolute_fallback`).
 #[must_use]
 pub fn sqlite_file_path_from_database_url(database_url: &str) -> Option<PathBuf> {
     let stripped = sqlite_path_component(database_url)?;
