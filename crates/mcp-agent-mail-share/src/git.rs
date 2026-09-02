@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 /// Try to extract the git remote URL for the directory.
 ///
-/// br-8ujfs.4.1 (D1): routes through GitCmd for per-repo locking.
+/// br-8ujfs.4.1 (D1): routes through `GitCmd` for per-repo locking.
+#[must_use]
 pub fn git_remote_url(dir: &Path) -> Option<String> {
     let output = mcp_agent_mail_core::git_cmd::GitCmd::new(dir)
         .args(["remote", "get-url", "origin"])
@@ -18,6 +19,7 @@ pub fn git_remote_url(dir: &Path) -> Option<String> {
 }
 
 /// Walk ancestor directories looking for a specific file/dir.
+#[must_use]
 pub fn find_ancestor_path(start: &Path, name: &str) -> Option<PathBuf> {
     let search_root = if crate::is_real_file(start) {
         start.parent()?

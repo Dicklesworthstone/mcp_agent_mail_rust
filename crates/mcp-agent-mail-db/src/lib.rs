@@ -12,6 +12,9 @@
 //! This matches `sqlmodel`'s convention. Helper functions are provided to convert
 //! to/from `chrono::NaiveDateTime` for API compatibility.
 
+// Raised for the trait solver: proving Send/CoerceUnsized for the boxed async blocks in
+// queries.rs overflows the default limit on newer rustc. Not a defect in the code.
+#![recursion_limit = "512"]
 #![forbid(unsafe_code)]
 #![allow(
     clippy::result_large_err,
@@ -268,6 +271,8 @@ pub use pool::{
     DeferralOutcome,
     DeferredWriteQueue,
     DeferredWriteQueueStatus,
+    GuardedReadOnlyConn,
+    GuardedReadOnlyEngine,
     MailboxDbInventory,
     MailboxRecoveryLockState,
     MailboxSidecarState,
@@ -312,14 +317,17 @@ pub use pool::{
     recovery_admission,
     resolve_mailbox_sqlite_path,
     sqlite_primary_read_path_is_healthy,
+    sqlite_recovery_candidate_is_standalone,
+    sqlite_recovery_candidate_passes_full_integrity_check,
 };
 pub use queries::{LeaseOutcome, MvccRetryMetrics, RollupSnapshot, mvcc_retry_metrics};
 pub use reconstruct::{
     ArchiveDriftReport, ArchiveDriftReportSchema, ArchiveMessageInventory, MailboxProjectIdentity,
     ProjectIdentityMismatch, ReconstructStats, archive_missing_project_identities,
     collect_db_message_ids, collect_db_project_identities, compute_archive_drift_report,
-    mailbox_project_identity_matches_db, reconstruct_from_archive,
-    reconstruct_from_archive_with_salvage, scan_archive_message_ids,
+    mailbox_project_identity_matches_db, neutralize_private_salvage_artifact,
+    reconstruct_from_archive, reconstruct_from_archive_with_live_salvage,
+    reconstruct_from_archive_with_private_salvage, scan_archive_message_ids,
     scan_archive_message_inventory,
 };
 pub use retry::{

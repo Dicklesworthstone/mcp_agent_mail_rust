@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
+use asupersync::channel::mpsc as control_mpsc;
 use asupersync::runtime::{Runtime, RuntimeBuilder};
 use fastmcp::prelude::McpContext;
 use mcp_agent_mail_core::atc_retention::{LearningArtifactKind, retention_rule};
@@ -26,7 +27,10 @@ use mcp_agent_mail_db::pool::get_or_create_pool;
 use mcp_agent_mail_db::queries::{fetch_message_sent_atc_experience, fetch_open_atc_experiences};
 use mcp_agent_mail_db::sqlmodel_core::Value as SqlValue;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig};
-use mcp_agent_mail_server::{atc, run_atc_resolution_sweep_for_integration_test, run_http};
+use mcp_agent_mail_server::tui_bridge::ServerControlMsg;
+use mcp_agent_mail_server::{
+    atc, run_atc_resolution_sweep_for_integration_test, run_http_with_control,
+};
 use serde_json::{Value, json};
 
 const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -36,6 +40,67 @@ const ACK_OVERDUE_URGENT_AGE_MICROS: i64 = 31 * 60 * 1_000_000;
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 
 static ATC_LEARNING_LOOP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// A headless HTTP server hosted on a test thread, stopped and joined on
+/// [`RunningServer::shutdown`] or on drop.
+///
+/// br-99aih: the server must never outlive the env-override scope that
+/// configured it. Background workers (`ack_ttl`, retention, ...) rehydrate
+/// `Config` from the ambient process env, so once the overrides are gone a
+/// still-running worker targets the operator's real archive — an ACK-TTL
+/// escalation once wrote a `file_reservations/` artifact into the live root
+/// this way. The `Drop` impl keeps the guarantee even when an assertion in
+/// the test body panics.
+struct RunningServer {
+    control_tx: Option<control_mpsc::Sender<ServerControlMsg>>,
+    thread: Option<thread::JoinHandle<()>>,
+    result_rx: Receiver<std::io::Result<()>>,
+}
+
+impl RunningServer {
+    fn spawn(config: Config) -> Self {
+        let (result_tx, result_rx) = mpsc::channel();
+        let (control_tx, control_rx) = control_mpsc::channel::<ServerControlMsg>(4);
+        let thread = thread::spawn(move || {
+            let result = run_http_with_control(&config, control_rx);
+            let _ = result_tx.send(result);
+        });
+        Self {
+            control_tx: Some(control_tx),
+            thread: Some(thread),
+            result_rx,
+        }
+    }
+
+    /// Orderly stop: deliver `Shutdown`, join the server thread (which runs
+    /// the full worker shutdown sequence before exiting), and return the
+    /// server's own exit result.
+    fn shutdown(mut self) -> std::io::Result<()> {
+        self.stop_and_join().expect("server thread must not panic");
+        self.result_rx
+            .try_recv()
+            .expect("server thread must report its exit result before exiting")
+    }
+
+    fn stop_and_join(&mut self) -> thread::Result<()> {
+        if let Some(control_tx) = self.control_tx.take() {
+            // The supervisor also treats a disconnected control channel as
+            // `Shutdown`, so dropping the sender is the fallback should the
+            // (otherwise idle) channel refuse the message.
+            let _ = control_tx.try_send(ServerControlMsg::Shutdown);
+            drop(control_tx);
+        }
+        self.thread.take().map_or(Ok(()), thread::JoinHandle::join)
+    }
+}
+
+impl Drop for RunningServer {
+    fn drop(&mut self) {
+        // Never panic here: drop runs during unwinding when the test body
+        // fails, and the join must still happen inside the override scope.
+        let _ = self.stop_and_join();
+    }
+}
 
 fn free_loopback_port() -> u16 {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral loopback port");
@@ -446,13 +511,9 @@ fn e2e_message_learning_loop_covers_ack_and_ack_overdue_branches() {
             let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
             let cx = Cx::for_testing();
             let server_config = Config::from_env();
-            let (server_result_tx, server_result_rx) = mpsc::channel();
-            thread::spawn(move || {
-                let result = run_http(&server_config);
-                let _ = server_result_tx.send(result);
-            });
+            let server = RunningServer::spawn(server_config);
 
-            wait_for_readiness(port, &server_result_rx);
+            wait_for_readiness(port, &server.result_rx);
             let db_pool = get_or_create_pool(&DbPoolConfig::from_env()).expect("shared test pool");
 
             let ensure_project = tool_payload(
@@ -832,6 +893,14 @@ fn e2e_message_learning_loop_covers_ack_and_ack_overdue_branches() {
                 2,
                 "replay should preserve both receiver-side open rows"
             );
+
+            // br-99aih: stop the server — and every background worker it
+            // started — while the env overrides are still in force, so nothing
+            // can rehydrate `Config` from the ambient env and reach the
+            // operator's real archive.
+            server
+                .shutdown()
+                .expect("server must exit cleanly after Shutdown");
         },
     );
 

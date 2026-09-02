@@ -1,76 +1,246 @@
 name: dist
 
 on:
-  workflow_dispatch:
   push:
     tags:
       - 'v*'
 
-jobs:
-  lint:
-    runs-on: ubuntu-latest
-    # Lint failures are reported but do not block the release build.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
+permissions:
+  contents: read
 
-      - name: Clone sibling dependencies
+concurrency:
+  group: dist-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Release sibling path dependencies are pinned so rerunning a tag resolves
+  # the same source bytes even after their default branches advance.
+  FRANKENSEARCH_COMMIT: 3bbfd8c664062f8304e7a790c51794671f9214dc
+  FAST_CMAES_COMMIT: 3bf11b7601b54a08ffabb55821289ecb235a504d
+  BEADS_RUST_COMMIT: ba6ff75da25529c8cad8395352f5c5fc2162ee95
+  CARGO_ZIGBUILD_VERSION: '0.23.3'
+  LINUX_GLIBC_FLOOR: '2.28'
+
+jobs:
+  release_contract:
+    name: Bind tag, version, and toolchain
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.contract.outputs.tag }}
+      version: ${{ steps.contract.outputs.version }}
+      revision: ${{ steps.contract.outputs.revision }}
+      prerelease: ${{ steps.contract.outputs.prerelease }}
+      toolchain: ${{ steps.contract.outputs.toolchain }}
+
+    steps:
+      - name: Checkout exact tag source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release identity
+        id: contract
+        env:
+          GITHUB_REF_VALUE: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          release_tag_pattern='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'
+          if [ "$GITHUB_REF_VALUE" != "refs/tags/${REF_NAME}" ] || [[ ! "$REF_NAME" =~ $release_tag_pattern ]]; then
+            echo "Release publication requires an exact refs/tags/vX.Y.Z or vX.Y.Z-prerelease ref" >&2
+            exit 1
+          fi
+
+          revision="$(git rev-parse HEAD)"
+          if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Checked-out release revision is not a full commit SHA: ${revision}" >&2
+            exit 1
+          fi
+
+          remote_revision="$(git ls-remote origin "refs/tags/${REF_NAME}^{}" | awk 'NR == 1 {print $1}')"
+          if [ -z "$remote_revision" ]; then
+            remote_revision="$(git ls-remote origin "refs/tags/${REF_NAME}" | awk 'NR == 1 {print $1}')"
+          fi
+          if [ "$remote_revision" != "$revision" ]; then
+            echo "Remote tag ${REF_NAME} resolves to ${remote_revision:-missing}, not checked-out ${revision}" >&2
+            exit 1
+          fi
+
+          mapfile -t release_metadata < <(python3 - <<'PY'
+          import pathlib
+          import tomllib
+
+          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          toolchain = tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text(encoding="utf-8"))
+          print(manifest["workspace"]["package"]["version"])
+          print(toolchain["toolchain"]["channel"])
+          PY
+          )
+          if [ "${#release_metadata[@]}" -ne 2 ]; then
+            echo "Could not read the workspace version and pinned Rust channel" >&2
+            exit 1
+          fi
+          manifest_version="${release_metadata[0]}"
+          toolchain="${release_metadata[1]}"
+          tag_version="${REF_NAME#v}"
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "Tag version ${tag_version} does not match workspace version ${manifest_version}" >&2
+            exit 1
+          fi
+          if [[ ! "$toolchain" =~ ^nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "rust-toolchain.toml must pin a dated nightly, found ${toolchain}" >&2
+            exit 1
+          fi
+
+          prerelease=false
+          if [[ "$tag_version" == *-* ]]; then
+            prerelease=true
+          fi
+          {
+            printf 'tag=%s\n' "$REF_NAME"
+            printf 'version=%s\n' "$manifest_version"
+            printf 'revision=%s\n' "$revision"
+            printf 'prerelease=%s\n' "$prerelease"
+            printf 'toolchain=%s\n' "$toolchain"
+          } >> "$GITHUB_OUTPUT"
+
+  lint:
+    needs: release_contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.release_contract.outputs.revision }}
+          persist-credentials: false
+
+      - name: Checkout pinned sibling dependencies
         shell: bash
         run: |
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          set -euo pipefail
+
+          checkout_pinned() {
+            local repo_url="$1"
+            local destination="$2"
+            local expected_commit="$3"
+            local actual_commit
+
+            git init --quiet "$destination"
+            git -C "$destination" remote add origin "$repo_url"
+            git -C "$destination" fetch --quiet --depth 1 origin "$expected_commit"
+            git -C "$destination" checkout --quiet --detach FETCH_HEAD
+            actual_commit="$(git -C "$destination" rev-parse HEAD)"
+            if [ "$actual_commit" != "$expected_commit" ]; then
+              echo "Expected $destination at $expected_commit, found $actual_commit" >&2
+              exit 1
+            fi
+          }
+
+          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch-rel-0332 "$FRANKENSEARCH_COMMIT"
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
-          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
+          # Cargo.lock resolves beads_rust 0.5.4, so the workspace patch
+          # requires this pinned sibling checkout to remain on version 0.5.4.
+          checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned 2026-08-05
         with:
+          toolchain: ${{ needs.release_contract.outputs.toolchain }}
           components: rustfmt, clippy
 
+      - name: Verify pinned Rust toolchain
+        env:
+          EXPECTED_TOOLCHAIN: ${{ needs.release_contract.outputs.toolchain }}
+        run: |
+          set -euo pipefail
+          active_toolchain="$(rustup show active-toolchain)"
+          [[ "$active_toolchain" == "${EXPECTED_TOOLCHAIN}-"* ]]
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Verify locked dependency graph
+        run: cargo metadata --locked --no-deps --format-version 1 >/dev/null
+
       - name: Check formatting
-        run: cargo fmt -- --check
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --locked --workspace --all-targets
 
       - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   test:
+    needs: release_contract
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.release_contract.outputs.revision }}
+          persist-credentials: false
 
-      - name: Clone sibling dependencies
+      - name: Checkout pinned sibling dependencies
         shell: bash
         run: |
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          set -euo pipefail
+
+          checkout_pinned() {
+            local repo_url="$1"
+            local destination="$2"
+            local expected_commit="$3"
+            local actual_commit
+
+            git init --quiet "$destination"
+            git -C "$destination" remote add origin "$repo_url"
+            git -C "$destination" fetch --quiet --depth 1 origin "$expected_commit"
+            git -C "$destination" checkout --quiet --detach FETCH_HEAD
+            actual_commit="$(git -C "$destination" rev-parse HEAD)"
+            if [ "$actual_commit" != "$expected_commit" ]; then
+              echo "Expected $destination at $expected_commit, found $actual_commit" >&2
+              exit 1
+            fi
+          }
+
+          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch-rel-0332 "$FRANKENSEARCH_COMMIT"
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
-          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
+          # Cargo.lock resolves beads_rust 0.5.4, so the workspace patch
+          # requires this pinned sibling checkout to remain on version 0.5.4.
+          checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned 2026-08-05
+        with:
+          toolchain: ${{ needs.release_contract.outputs.toolchain }}
+
+      - name: Verify pinned Rust toolchain
+        env:
+          EXPECTED_TOOLCHAIN: ${{ needs.release_contract.outputs.toolchain }}
+        run: |
+          set -euo pipefail
+          active_toolchain="$(rustup show active-toolchain)"
+          [[ "$active_toolchain" == "${EXPECTED_TOOLCHAIN}-"* ]]
+          rustc --version --verbose
+          cargo --version --verbose
 
       - name: Run tests
-        run: cargo test --lib
+        run: cargo test --locked --workspace
 
   build:
-    needs: test
-    # Test failures should not block release builds — tests use nightly
-    # Rust and may fail due to toolchain instability.
-    if: always() && !cancelled()
+    needs: [release_contract, lint, test]
     strategy:
       fail-fast: false
       matrix:
@@ -84,45 +254,90 @@ jobs:
             target: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          # x86_64-apple-darwin removed: ort-sys lacks prebuilt ONNX
-          # Runtime binaries for this target.  v0.2.20 never shipped it.
-          - os: macos-14
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.os }}
-    permissions:
-      contents: write
+    timeout-minutes: 180
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.release_contract.outputs.revision }}
+          persist-credentials: false
 
-      - name: Clone sibling dependencies
+      - name: Checkout pinned sibling dependencies
         shell: bash
         run: |
+          set -euo pipefail
+
           # Windows MAX_PATH (260 chars) trips on frankensqlite's perf-fixture
-          # paths; enable git's long-path support before cloning. No-op on
-          # Unix runners (the setting is harmless).
+          # paths; enable git's long-path support before creating sibling
+          # checkouts. No-op on Unix runners (the setting is harmless).
           git config --global core.longpaths true
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          checkout_pinned() {
+            local repo_url="$1"
+            local destination="$2"
+            local expected_commit="$3"
+            local actual_commit
+
+            git init --quiet "$destination"
+            git -C "$destination" remote add origin "$repo_url"
+            git -C "$destination" fetch --quiet --depth 1 origin "$expected_commit"
+            git -C "$destination" checkout --quiet --detach FETCH_HEAD
+            actual_commit="$(git -C "$destination" rev-parse HEAD)"
+            if [ "$actual_commit" != "$expected_commit" ]; then
+              echo "Expected $destination at $expected_commit, found $actual_commit" >&2
+              exit 1
+            fi
+          }
+
+          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch-rel-0332 "$FRANKENSEARCH_COMMIT"
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
-          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
+          # Cargo.lock resolves beads_rust 0.5.4, so the workspace patch
+          # requires this pinned sibling checkout to remain on version 0.5.4.
+          checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned 2026-08-05
         with:
+          toolchain: ${{ needs.release_contract.outputs.toolchain }}
           targets: ${{ matrix.target }}
 
-      - name: Install pinned Rust target
+      - name: Verify pinned Rust toolchain
         shell: bash
-        run: rustup target add "${{ matrix.target }}"
+        env:
+          EXPECTED_TOOLCHAIN: ${{ needs.release_contract.outputs.toolchain }}
+        run: |
+          set -euo pipefail
+          active_toolchain="$(rustup show active-toolchain)"
+          [[ "$active_toolchain" == "${EXPECTED_TOOLCHAIN}-"* ]]
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Install pinned Zig
+        if: contains(matrix.target, 'unknown-linux-gnu')
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.1
+
+      - name: Install pinned cargo-zigbuild
+        if: contains(matrix.target, 'unknown-linux-gnu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install --locked --version "$CARGO_ZIGBUILD_VERSION" cargo-zigbuild
+          actual_version="$(cargo zigbuild --version)"
+          if [ "$actual_version" != "cargo-zigbuild ${CARGO_ZIGBUILD_VERSION}" ]; then
+            echo "cargo-zigbuild version mismatch: ${actual_version}" >&2
+            exit 1
+          fi
 
       - name: Install musl toolchain
         if: contains(matrix.target, 'musl')
@@ -138,11 +353,21 @@ jobs:
           # x86_64 Linux regardless of host libc. Leaves other targets alone.
           RUSTFLAGS: ${{ contains(matrix.target, 'musl') && '-C target-feature=+crt-static' || '' }}
         run: |
-          cargo build --release --target ${{ matrix.target }} -p mcp-agent-mail -p mcp-agent-mail-cli --no-default-features --features portable
+          set -euo pipefail
+          target='${{ matrix.target }}'
+          if [[ "$target" == *-unknown-linux-gnu ]]; then
+            cargo zigbuild --locked --release --target "${target}.${LINUX_GLIBC_FLOOR}" -p mcp-agent-mail -p mcp-agent-mail-cli --no-default-features --features portable
+          else
+            cargo build --locked --release --target "$target" -p mcp-agent-mail -p mcp-agent-mail-cli --no-default-features --features portable
+          fi
 
       - name: Create tarball (Unix)
         if: runner.os != 'Windows'
+        env:
+          EXPECTED_VERSION: ${{ needs.release_contract.outputs.version }}
+          RELEASE_TARGET: ${{ matrix.target }}
         run: |
+          set -euo pipefail
           mkdir -p dist staging
           TARBALL="mcp-agent-mail-${{ matrix.target }}.tar.xz"
           # Copy raw binaries into a flat staging dir to guarantee no nested archives
@@ -156,9 +381,46 @@ jobs:
               *) echo "ERROR: $f has unexpected type '$mime' — refusing to package" >&2; exit 1 ;;
             esac
           done
+          if [[ "$RELEASE_TARGET" == *-unknown-linux-gnu ]]; then
+            assert_glibc_floor() {
+              local binary="$1"
+              local max_version
+              mapfile -t glibc_versions < <(
+                LANG=C readelf -W --version-info --dyn-syms "$binary" \
+                  | sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p' \
+                  | sort -Vu
+              )
+              if [ "${#glibc_versions[@]}" -eq 0 ]; then
+                echo "ERROR: $binary exposes no readable GLIBC symbol-version requirement" >&2
+                exit 1
+              fi
+              max_version="${glibc_versions[${#glibc_versions[@]} - 1]}"
+              if [[ ! "$max_version" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+                echo "ERROR: $binary produced malformed GLIBC version ${max_version}" >&2
+                exit 1
+              fi
+              if [ "$(printf '%s\n' "$max_version" "$LINUX_GLIBC_FLOOR" | sort -V | tail -n 1)" != "$LINUX_GLIBC_FLOOR" ]; then
+                echo "ERROR: $binary requires GLIBC_${max_version}, newer than GLIBC_${LINUX_GLIBC_FLOOR}" >&2
+                exit 1
+              fi
+              printf 'Verified %s maximum GLIBC requirement is %s\n' "$binary" "$max_version"
+            }
+            assert_glibc_floor staging/mcp-agent-mail
+            assert_glibc_floor staging/am
+          fi
           # Surface verification: fail fast if binaries are swapped/mispackaged.
           staging/am --help > staging/am.help.txt
           staging/mcp-agent-mail --help > staging/mcp-agent-mail.help.txt
+          cli_version="$(staging/am --version)"
+          server_version="$(staging/mcp-agent-mail --version)"
+          if [ "$cli_version" != "am ${EXPECTED_VERSION}" ]; then
+            echo "ERROR: staging/am reports ${cli_version}, expected am ${EXPECTED_VERSION}" >&2
+            exit 1
+          fi
+          if [ "$server_version" != "mcp-agent-mail ${EXPECTED_VERSION}" ]; then
+            echo "ERROR: staging/mcp-agent-mail reports ${server_version}, expected mcp-agent-mail ${EXPECTED_VERSION}" >&2
+            exit 1
+          fi
           grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)' staging/am.help.txt || {
             echo "ERROR: staging/am missing expected CLI command surface" >&2
             exit 1
@@ -178,9 +440,20 @@ jobs:
       - name: Create zip (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          EXPECTED_VERSION: ${{ needs.release_contract.outputs.version }}
         run: |
+          $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $zipName = "mcp-agent-mail-${{ matrix.target }}.zip"
+          $cliVersion = ((& "target/${{ matrix.target }}/release/am.exe" --version) | Out-String).Trim()
+          if ($cliVersion -ne "am $env:EXPECTED_VERSION") {
+            throw "target/${{ matrix.target }}/release/am.exe reports '$cliVersion', expected 'am $env:EXPECTED_VERSION'"
+          }
+          $serverVersion = ((& "target/${{ matrix.target }}/release/mcp-agent-mail.exe" --version) | Out-String).Trim()
+          if ($serverVersion -ne "mcp-agent-mail $env:EXPECTED_VERSION") {
+            throw "target/${{ matrix.target }}/release/mcp-agent-mail.exe reports '$serverVersion', expected 'mcp-agent-mail $env:EXPECTED_VERSION'"
+          }
           $cliHelp = & "target/${{ matrix.target }}/release/am.exe" --help | Out-String
           if ($cliHelp -notmatch '(^|\s)serve-http(\s|$)') {
             throw "target/${{ matrix.target }}/release/am.exe missing expected CLI command surface"
@@ -195,29 +468,122 @@ jobs:
           Compress-Archive -Path "target/${{ matrix.target }}/release/mcp-agent-mail.exe","target/${{ matrix.target }}/release/am.exe" -DestinationPath "dist/$zipName"
           cd dist
           $hash = (Get-FileHash -Algorithm SHA256 $zipName).Hash.ToLower()
-          "$hash  $zipName" | Out-File -Encoding ASCII "$zipName.sha256"
+          [System.IO.File]::WriteAllText(
+            "${zipName}.sha256",
+            "$hash  $zipName`n",
+            [System.Text.Encoding]::ASCII
+          )
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.target }}
           path: dist/*
 
-  release:
-    needs: build
-    # Run when all build matrix entries succeed, even if test/lint failed
-    # (build already gates on !cancelled via its own `if`).
-    if: always() && !cancelled() && needs.build.result == 'success'
+  linux_portability:
+    name: Run x86_64 Linux release archives on Ubuntu 22.04
+    needs: [release_contract, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Download x86_64 Linux artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: x86_64-unknown-linux-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify checksums, glibc floor, versions, and command surfaces
+        env:
+          EXPECTED_VERSION: ${{ needs.release_contract.outputs.version }}
+        run: |
+          set -euo pipefail
+          expected_entries=(
+            mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz
+            mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz.sha256
+            mcp-agent-mail-x86_64-unknown-linux-musl.tar.xz
+            mcp-agent-mail-x86_64-unknown-linux-musl.tar.xz.sha256
+          )
+          mapfile -t expected_entries < <(printf '%s\n' "${expected_entries[@]}" | sort)
+          mapfile -t actual_entries < <(find dist -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+          if [ "${actual_entries[*]}" != "${expected_entries[*]}" ]; then
+            echo "Downloaded x86_64 Linux artifacts contain missing or unexpected entries" >&2
+            printf 'Expected: %s\n' "${expected_entries[@]}" >&2
+            printf 'Actual: %s\n' "${actual_entries[@]}" >&2
+            exit 1
+          fi
+          (
+            cd dist
+            sha256sum --check mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz.sha256
+            sha256sum --check mcp-agent-mail-x86_64-unknown-linux-musl.tar.xz.sha256
+          )
+
+          mkdir -p staging/gnu staging/musl
+          tar -xJf dist/mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz -C staging/gnu
+          tar -xJf dist/mcp-agent-mail-x86_64-unknown-linux-musl.tar.xz -C staging/musl
+
+          assert_glibc_floor() {
+            local binary="$1"
+            local max_version
+            mapfile -t glibc_versions < <(
+              LANG=C readelf -W --version-info --dyn-syms "$binary" \
+                | sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p' \
+                | sort -Vu
+            )
+            if [ "${#glibc_versions[@]}" -eq 0 ]; then
+              echo "ERROR: $binary exposes no readable GLIBC symbol-version requirement" >&2
+              exit 1
+            fi
+            max_version="${glibc_versions[${#glibc_versions[@]} - 1]}"
+            if [[ ! "$max_version" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+              echo "ERROR: $binary produced malformed GLIBC version ${max_version}" >&2
+              exit 1
+            fi
+            if [ "$(printf '%s\n' "$max_version" "$LINUX_GLIBC_FLOOR" | sort -V | tail -n 1)" != "$LINUX_GLIBC_FLOOR" ]; then
+              echo "ERROR: $binary requires GLIBC_${max_version}, newer than GLIBC_${LINUX_GLIBC_FLOOR}" >&2
+              exit 1
+            fi
+          }
+          assert_glibc_floor staging/gnu/mcp-agent-mail
+          assert_glibc_floor staging/gnu/am
+
+          for flavor in gnu musl; do
+            cli_version="$("staging/${flavor}/am" --version)"
+            server_version="$("staging/${flavor}/mcp-agent-mail" --version)"
+            if [ "$cli_version" != "am ${EXPECTED_VERSION}" ]; then
+              echo "${flavor} am reports ${cli_version}, expected am ${EXPECTED_VERSION}" >&2
+              exit 1
+            fi
+            if [ "$server_version" != "mcp-agent-mail ${EXPECTED_VERSION}" ]; then
+              echo "${flavor} mcp-agent-mail reports ${server_version}, expected mcp-agent-mail ${EXPECTED_VERSION}" >&2
+              exit 1
+            fi
+            "staging/${flavor}/am" --help > "staging/${flavor}/am.help.txt"
+            "staging/${flavor}/mcp-agent-mail" --help > "staging/${flavor}/mcp-agent-mail.help.txt"
+            grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)' "staging/${flavor}/am.help.txt"
+            grep -qE '(^|[[:space:]])serve([[:space:]]|$)' "staging/${flavor}/mcp-agent-mail.help.txt"
+          done
+          getconf GNU_LIBC_VERSION
+
+  sign:
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [release_contract, lint, test, build, linux_portability]
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
-      contents: write
+      contents: read
       id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.release_contract.outputs.revision }}
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
@@ -225,69 +591,933 @@ jobs:
       - name: List artifacts
         run: ls -laR dist
 
-      - name: Install cosign
-        # SHA-pinned to the v4.0.0 commit so a tag re-push (malicious or
-        # accidental) cannot substitute a compromised action into the
-        # signing step — the entire sigstore integrity chain hinges on this
-        # action's code being the one we audited.
-        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
-
-      - name: Sign release artifacts (sigstore bundle)
+      - name: Install verified Cosign
+        env:
+          # v3.1.3 fixes GHSA-fx35-mq7g-6g98 in keyless blob verification.
+          COSIGN_VERSION: v3.1.3
+          # Official v3.1.3 cosign_checksums.txt entry for linux-amd64.
+          COSIGN_LINUX_AMD64_SHA256: 4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          cd dist
-          for f in mcp-agent-mail-*.tar.xz mcp-agent-mail-*.zip; do
-            cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f"
-          done
+          cosign_dir="${RUNNER_TEMP}/cosign-bin"
+          cosign_path="${cosign_dir}/cosign"
+          mkdir -p "$cosign_dir"
+          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors --output "$cosign_path" \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
 
-      - name: Generate consolidated SHA256SUMS
-        run: |
-          cd dist
-          shasum -a 256 mcp-agent-mail-*.tar.xz mcp-agent-mail-*.zip 2>/dev/null > SHA256SUMS || true
-          echo "=== SHA256SUMS ==="
-          cat SHA256SUMS
-
-      - name: Validate release bundle completeness
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          cd dist
-          archives=(mcp-agent-mail-*.tar.xz mcp-agent-mail-*.zip)
-          if [ "${#archives[@]}" -eq 0 ]; then
-            echo "No release archives found in dist/" >&2
+          actual_sha256="$(sha256sum "$cosign_path" | awk '{print $1}')"
+          if [ "$actual_sha256" != "$COSIGN_LINUX_AMD64_SHA256" ]; then
+            echo "Cosign checksum mismatch: expected ${COSIGN_LINUX_AMD64_SHA256}, got ${actual_sha256}" >&2
             exit 1
           fi
-          test -s SHA256SUMS
-          for artifact in "${archives[@]}"; do
-            test -s "$artifact"
-            test -s "${artifact}.sha256"
-            test -s "${artifact}.sigstore.json"
-            sidecar_hash="$(awk '{print $1; exit}' "${artifact}.sha256")"
-            sums_hash="$(awk -v artifact="$artifact" '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1; exit}' SHA256SUMS)"
-            if [ -z "$sums_hash" ]; then
-              echo "SHA256SUMS missing entry for ${artifact}" >&2
+          chmod 0755 "$cosign_path"
+
+          mapfile -t cosign_versions < <("$cosign_path" version | awk '$1 == "GitVersion:" {print $2}')
+          if [ "${#cosign_versions[@]}" -ne 1 ] || [ "${cosign_versions[0]}" != "$COSIGN_VERSION" ]; then
+            echo "Cosign version mismatch: expected ${COSIGN_VERSION}" >&2
+            exit 1
+          fi
+          printf 'COSIGN_BIN=%s\n' "$cosign_path" >> "$GITHUB_ENV"
+
+      - name: Assemble, sign, and verify release assets
+        env:
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_REVISION: ${{ needs.release_contract.outputs.revision }}
+          GITHUB_WORKFLOW_REF_VALUE: ${{ github.workflow_ref }}
+          RELEASE_TAG: ${{ needs.release_contract.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          expected_archives=(
+            mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz
+            mcp-agent-mail-x86_64-unknown-linux-musl.tar.xz
+            mcp-agent-mail-aarch64-unknown-linux-gnu.tar.xz
+            mcp-agent-mail-x86_64-apple-darwin.tar.xz
+            mcp-agent-mail-aarch64-apple-darwin.tar.xz
+            mcp-agent-mail-x86_64-pc-windows-msvc.zip
+          )
+
+          expected_download_entries=()
+          for artifact in "${expected_archives[@]}"; do
+            expected_download_entries+=("$artifact" "${artifact}.sha256")
+          done
+          mapfile -t expected_download_entries < <(printf '%s\n' "${expected_download_entries[@]}" | sort)
+          mapfile -t actual_download_entries < <(find dist -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+          if [ "${actual_download_entries[*]}" != "${expected_download_entries[*]}" ]; then
+            echo "Downloaded build artifacts contain missing or unexpected entries" >&2
+            printf 'Expected: %s\n' "${expected_download_entries[@]}" >&2
+            printf 'Actual: %s\n' "${actual_download_entries[@]}" >&2
+            exit 1
+          fi
+
+          mkdir -p publish
+          for artifact in "${expected_archives[@]}"; do
+            test -f "dist/$artifact"
+            test -s "dist/$artifact"
+            test -f "dist/${artifact}.sha256"
+            test -s "dist/${artifact}.sha256"
+
+            mapfile -t sidecar_lines < "dist/${artifact}.sha256"
+            if [ "${#sidecar_lines[@]}" -ne 1 ]; then
+              echo "${artifact}.sha256 must contain exactly one checksum line" >&2
               exit 1
             fi
-            if [ "$sidecar_hash" != "$sums_hash" ]; then
-              echo "Checksum mismatch between ${artifact}.sha256 and SHA256SUMS for ${artifact}" >&2
+            read -r sidecar_hash sidecar_name sidecar_extra <<< "${sidecar_lines[0]}"
+            if [[ ! "$sidecar_hash" =~ ^[0-9a-f]{64}$ ]] \
+                || [ "$sidecar_name" != "$artifact" ] || [ -n "$sidecar_extra" ]; then
+              echo "${artifact}.sha256 must name exactly ${artifact} with one SHA-256 digest" >&2
+              exit 1
+            fi
+            actual_hash="$(shasum -a 256 "dist/$artifact" | awk '{print $1}')"
+            if [ "$actual_hash" != "$sidecar_hash" ]; then
+              echo "Build sidecar disagrees with the bytes of ${artifact}" >&2
+              exit 1
+            fi
+
+            case "$artifact" in
+              *.tar.xz)
+                python3 - "dist/$artifact" <<'PY'
+          import sys
+          import tarfile
+
+          path = sys.argv[1]
+          with tarfile.open(path, mode="r:xz") as archive:
+              members = archive.getmembers()
+          names = sorted(member.name for member in members)
+          if names != ["am", "mcp-agent-mail"]:
+              raise SystemExit(f"{path} members are {names!r}, expected exactly flat am and mcp-agent-mail")
+          if any(not member.isfile() or member.size <= 0 for member in members):
+              raise SystemExit(f"{path} contains a non-regular or empty member")
+          PY
+                ;;
+              *.zip)
+                python3 - "dist/$artifact" <<'PY'
+          import stat
+          import sys
+          import zipfile
+
+          path = sys.argv[1]
+          with zipfile.ZipFile(path) as archive:
+              members = archive.infolist()
+          names = sorted(member.filename for member in members)
+          if names != ["am.exe", "mcp-agent-mail.exe"]:
+              raise SystemExit(f"{path} members are {names!r}, expected exactly flat am.exe and mcp-agent-mail.exe")
+          for member in members:
+              mode = (member.external_attr >> 16) & 0xFFFF
+              if member.is_dir() or member.file_size <= 0 or stat.S_IFMT(mode) not in (0, stat.S_IFREG):
+                  raise SystemExit(f"{path} contains a non-regular or empty member")
+          PY
+                ;;
+              *)
+                echo "Unexpected archive type: ${artifact}" >&2
+                exit 1
+                ;;
+            esac
+            cp -- "dist/$artifact" "dist/${artifact}.sha256" publish/
+          done
+
+          # Installer scripts are release payloads, so absence is fatal rather
+          # than a warning and they enter the same checksum/signature envelope.
+          cp -- install.sh install.ps1 publish/
+          cd publish
+          expected_payloads=(install.sh install.ps1)
+          for artifact in "${expected_archives[@]}"; do
+            expected_payloads+=("$artifact" "${artifact}.sha256")
+          done
+          for payload in "${expected_payloads[@]}"; do
+            test -f "$payload"
+            test -s "$payload"
+          done
+
+          shasum -a 256 "${expected_payloads[@]}" > SHA256SUMS
+          mapfile -t sums_lines < SHA256SUMS
+          if [ "${#sums_lines[@]}" -ne "${#expected_payloads[@]}" ]; then
+            echo "SHA256SUMS must contain exactly ${#expected_payloads[@]} lines" >&2
+            exit 1
+          fi
+          for payload in "${expected_payloads[@]}"; do
+            mapfile -t sums_hashes < <(
+              awk -v payload="$payload" '$2 == payload && NF == 2 {print $1}' SHA256SUMS
+            )
+            if [ "${#sums_hashes[@]}" -ne 1 ]; then
+              echo "SHA256SUMS must contain exactly one entry for ${payload}" >&2
+              exit 1
+            fi
+            actual_hash="$(shasum -a 256 "$payload" | awk '{print $1}')"
+            if [ "$actual_hash" != "${sums_hashes[0]}" ]; then
+              echo "SHA256SUMS disagrees with the bytes of ${payload}" >&2
               exit 1
             fi
           done
 
-      - name: Copy install scripts to dist
-        run: |
-          cp install.sh dist/ 2>/dev/null || echo "No install.sh found"
-          cp install.ps1 dist/ 2>/dev/null || echo "No install.ps1 found"
+          expected_workflow_ref="${EXPECTED_REPOSITORY}/.github/workflows/dist.yml@refs/tags/${RELEASE_TAG}"
+          if [ "$GITHUB_WORKFLOW_REF_VALUE" != "$expected_workflow_ref" ]; then
+            echo "Workflow identity ${GITHUB_WORKFLOW_REF_VALUE} does not match ${expected_workflow_ref}" >&2
+            exit 1
+          fi
+          expected_certificate_identity="https://github.com/${expected_workflow_ref}"
+          signed_subjects=("${expected_payloads[@]}" SHA256SUMS)
+          for subject in "${signed_subjects[@]}"; do
+            (
+              unset SIGSTORE_ROOT_FILE SIGSTORE_REKOR_PUBLIC_KEY SIGSTORE_CT_LOG_PUBLIC_KEY_FILE
+              "$COSIGN_BIN" sign-blob --yes --bundle "${subject}.sigstore.json" "$subject"
+              test -s "${subject}.sigstore.json"
+              "$COSIGN_BIN" verify-blob \
+                --new-bundle-format \
+                --bundle "${subject}.sigstore.json" \
+                --certificate-identity "$expected_certificate_identity" \
+                --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+                --certificate-github-workflow-repository "$EXPECTED_REPOSITORY" \
+                --certificate-github-workflow-ref "refs/tags/${RELEASE_TAG}" \
+                --certificate-github-workflow-sha "$EXPECTED_REVISION" \
+                --certificate-github-workflow-trigger "push" \
+                "$subject"
+            )
+          done
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: ${{ github.ref_name }}
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-          files: |
-            dist/*
+          # Bundles are verification material and are not recursively signed;
+          # each one authenticates a payload or the complete checksum manifest.
+          expected_release_assets=("${signed_subjects[@]}")
+          for subject in "${signed_subjects[@]}"; do
+            expected_release_assets+=("${subject}.sigstore.json")
+          done
+          mapfile -t expected_release_assets < <(printf '%s\n' "${expected_release_assets[@]}" | sort)
+          mapfile -t actual_release_assets < <(find . -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+          if [ "${actual_release_assets[*]}" != "${expected_release_assets[*]}" ]; then
+            echo "Release asset directory contains missing or unexpected entries" >&2
+            printf 'Expected:\n' >&2
+            printf '  %s\n' "${expected_release_assets[@]}" >&2
+            printf 'Actual:\n' >&2
+            printf '  %s\n' "${actual_release_assets[@]}" >&2
+            exit 1
+          fi
+          if [ "${#expected_release_assets[@]}" -ne 30 ]; then
+            echo "Release envelope must contain exactly 30 assets" >&2
+            exit 1
+          fi
+
+      - name: Revalidate release tag immediately before signed handoff
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_REVISION: ${{ needs.release_contract.outputs.revision }}
+          RELEASE_TAG: ${{ needs.release_contract.outputs.tag }}
+        run: |
+          set -euo pipefail
+          checked_out_revision="$(git rev-parse HEAD)"
+          remote_revision="$(git ls-remote origin "refs/tags/${RELEASE_TAG}^{}" | awk 'NR == 1 {print $1}')"
+          if [ -z "$remote_revision" ]; then
+            remote_revision="$(git ls-remote origin "refs/tags/${RELEASE_TAG}" | awk 'NR == 1 {print $1}')"
+          fi
+          if [ "$checked_out_revision" != "$EXPECTED_REVISION" ] || [ "$remote_revision" != "$EXPECTED_REVISION" ]; then
+            echo "Release tag moved after preflight; refusing publication" >&2
+            exit 1
+          fi
+
+      - name: Upload signed release envelope
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-release-${{ needs.release_contract.outputs.revision }}
+          path: publish/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  release:
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [release_contract, sign]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download signed release envelope
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: signed-release-${{ needs.release_contract.outputs.revision }}
+          path: publish
+
+      - name: Install verified Cosign
+        env:
+          COSIGN_VERSION: v3.1.3
+          COSIGN_LINUX_AMD64_SHA256: 4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71
+        run: |
+          set -euo pipefail
+          cosign_dir="${RUNNER_TEMP}/cosign-bin"
+          cosign_path="${cosign_dir}/cosign"
+          mkdir -p "$cosign_dir"
+          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors --output "$cosign_path" \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+
+          actual_sha256="$(sha256sum "$cosign_path" | awk '{print $1}')"
+          if [ "$actual_sha256" != "$COSIGN_LINUX_AMD64_SHA256" ]; then
+            echo "Cosign checksum mismatch: expected ${COSIGN_LINUX_AMD64_SHA256}, got ${actual_sha256}" >&2
+            exit 1
+          fi
+          chmod 0755 "$cosign_path"
+
+          mapfile -t cosign_versions < <("$cosign_path" version | awk '$1 == "GitVersion:" {print $2}')
+          if [ "${#cosign_versions[@]}" -ne 1 ] || [ "${cosign_versions[0]}" != "$COSIGN_VERSION" ]; then
+            echo "Cosign version mismatch: expected ${COSIGN_VERSION}" >&2
+            exit 1
+          fi
+          printf 'COSIGN_BIN=%s\n' "$cosign_path" >> "$GITHUB_ENV"
+
+      - name: Re-census and verify signed release envelope
+        env:
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_REVISION: ${{ needs.release_contract.outputs.revision }}
+          RELEASE_TAG: ${{ needs.release_contract.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          expected_archives=(
+            mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz
+            mcp-agent-mail-x86_64-unknown-linux-musl.tar.xz
+            mcp-agent-mail-aarch64-unknown-linux-gnu.tar.xz
+            mcp-agent-mail-x86_64-apple-darwin.tar.xz
+            mcp-agent-mail-aarch64-apple-darwin.tar.xz
+            mcp-agent-mail-x86_64-pc-windows-msvc.zip
+          )
+          expected_payloads=(install.sh install.ps1)
+          for artifact in "${expected_archives[@]}"; do
+            expected_payloads+=("$artifact" "${artifact}.sha256")
+          done
+          signed_subjects=("${expected_payloads[@]}" SHA256SUMS)
+          expected_release_assets=("${signed_subjects[@]}")
+          for subject in "${signed_subjects[@]}"; do
+            expected_release_assets+=("${subject}.sigstore.json")
+          done
+          mapfile -t expected_release_assets < <(printf '%s\n' "${expected_release_assets[@]}" | sort)
+          mapfile -t actual_release_assets < <(find publish -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+          if [ "${#expected_release_assets[@]}" -ne 30 ]; then
+            echo "Release envelope must contain exactly 30 assets" >&2
+            exit 1
+          fi
+          if [ "${actual_release_assets[*]}" != "${expected_release_assets[*]}" ]; then
+            echo "Downloaded signed envelope contains missing or unexpected entries" >&2
+            printf 'Expected: %s\n' "${expected_release_assets[@]}" >&2
+            printf 'Actual: %s\n' "${actual_release_assets[@]}" >&2
+            exit 1
+          fi
+          for asset in "${expected_release_assets[@]}"; do
+            if [ ! -f "publish/$asset" ] || [ -L "publish/$asset" ] || [ ! -s "publish/$asset" ]; then
+              echo "Release envelope entry is not a nonempty regular file: ${asset}" >&2
+              exit 1
+            fi
+          done
+
+          expected_certificate_identity="https://github.com/${EXPECTED_REPOSITORY}/.github/workflows/dist.yml@refs/tags/${RELEASE_TAG}"
+          cd publish
+          for subject in "${signed_subjects[@]}"; do
+            (
+              unset SIGSTORE_ROOT_FILE SIGSTORE_REKOR_PUBLIC_KEY SIGSTORE_CT_LOG_PUBLIC_KEY_FILE
+              "$COSIGN_BIN" verify-blob \
+                --new-bundle-format \
+                --bundle "${subject}.sigstore.json" \
+                --certificate-identity "$expected_certificate_identity" \
+                --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+                --certificate-github-workflow-repository "$EXPECTED_REPOSITORY" \
+                --certificate-github-workflow-ref "refs/tags/${RELEASE_TAG}" \
+                --certificate-github-workflow-sha "$EXPECTED_REVISION" \
+                --certificate-github-workflow-trigger "push" \
+                "$subject"
+            )
+          done
+
+      - name: Revalidate tag and prepare isolated draft
+        id: draft_preflight
+        env:
+          EXPECTED_PRERELEASE: ${{ needs.release_contract.outputs.prerelease }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_REVISION: ${{ needs.release_contract.outputs.revision }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release_contract.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          assert_tag_revision() {
+            local resolved_revision
+            resolved_revision="$(gh api "/repos/${EXPECTED_REPOSITORY}/commits/${RELEASE_TAG}" --jq '.sha')"
+            if [ "$resolved_revision" != "$EXPECTED_REVISION" ]; then
+              echo "Release tag ${RELEASE_TAG} resolves to ${resolved_revision:-missing}, expected ${EXPECTED_REVISION}" >&2
+              exit 1
+            fi
+          }
+
+          list_matching_releases() {
+            gh api --paginate "/repos/${EXPECTED_REPOSITORY}/releases?per_page=100" \
+              | jq -sc --arg tag "$RELEASE_TAG" '[.[][] | select(.tag_name == $tag)]'
+          }
+
+          verify_existing_assets_are_matching_subset() {
+            local release_id="$1"
+            local assets_json asset_count
+            local asset_id asset_name asset_size local_size local_hash remote_hash
+            local asset_is_duplicate asset_is_expected expected_name seen_name
+            local -a expected_names=() seen_names=()
+
+            mapfile -t expected_names < <(find publish -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+            if [ "${#expected_names[@]}" -ne 30 ]; then
+              echo "Local release envelope must contain exactly 30 assets" >&2
+              exit 1
+            fi
+
+            assets_json="$(gh api --paginate "/repos/${EXPECTED_REPOSITORY}/releases/${release_id}/assets?per_page=100" | jq -sc 'add // []')"
+            asset_count="$(jq -r 'length' <<< "$assets_json")"
+            if [ "$asset_count" -gt 30 ]; then
+              echo "Existing draft has too many assets: ${asset_count}" >&2
+              exit 1
+            fi
+            while IFS=$'\t' read -r asset_id asset_name asset_size; do
+              [ -n "$asset_id" ] || continue
+              if [[ ! "$asset_id" =~ ^[0-9]+$ ]] || [[ ! "$asset_size" =~ ^[0-9]+$ ]]; then
+                echo "Existing draft returned malformed asset metadata" >&2
+                exit 1
+              fi
+              asset_is_expected=false
+              for expected_name in "${expected_names[@]}"; do
+                if [ "$asset_name" = "$expected_name" ]; then
+                  asset_is_expected=true
+                  break
+                fi
+              done
+              asset_is_duplicate=false
+              for seen_name in "${seen_names[@]}"; do
+                if [ "$asset_name" = "$seen_name" ]; then
+                  asset_is_duplicate=true
+                  break
+                fi
+              done
+              if [ "$asset_is_expected" != true ] || [ "$asset_is_duplicate" = true ]; then
+                echo "Existing draft contains an unexpected or duplicate asset: ${asset_name}" >&2
+                exit 1
+              fi
+              seen_names+=("$asset_name")
+              local_size="$(stat --format='%s' "publish/$asset_name")"
+              if [ "$asset_size" != "$local_size" ]; then
+                echo "Existing draft asset size differs from local ${asset_name}" >&2
+                exit 1
+              fi
+              local_hash="$(sha256sum "publish/$asset_name" | awk '{print $1}')"
+              remote_hash="$(gh api \
+                -H 'Accept: application/octet-stream' \
+                -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "/repos/${EXPECTED_REPOSITORY}/releases/assets/${asset_id}" \
+                | sha256sum | awk '{print $1}')"
+              if [ "$remote_hash" != "$local_hash" ]; then
+                echo "Existing draft asset bytes differ from local ${asset_name}" >&2
+                exit 1
+              fi
+            done < <(jq -r '.[] | [.id, .name, .size] | @tsv' <<< "$assets_json")
+          }
+
+          assert_tag_revision
+          releases_json="$(list_matching_releases)"
+          release_count="$(jq -r 'length' <<< "$releases_json")"
+          case "$release_count" in
+            0)
+              create_payload="$(jq -n \
+                --arg tag "$RELEASE_TAG" \
+                --arg revision "$EXPECTED_REVISION" \
+                --argjson prerelease "$EXPECTED_PRERELEASE" \
+                '{tag_name: $tag, target_commitish: $revision, name: $tag, draft: true, prerelease: $prerelease, generate_release_notes: true}')"
+              created_release="$(gh api --method POST "/repos/${EXPECTED_REPOSITORY}/releases" --input - <<< "$create_payload")"
+              release_id="$(jq -r '.id' <<< "$created_release")"
+              ;;
+            1)
+              release_json="$(jq -c '.[0]' <<< "$releases_json")"
+              if ! jq -e \
+                  --arg tag "$RELEASE_TAG" \
+                  --argjson prerelease "$EXPECTED_PRERELEASE" \
+                  '.draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease' \
+                  >/dev/null <<< "$release_json"; then
+                echo "Refusing to mutate a published or metadata-mismatched release for ${RELEASE_TAG}" >&2
+                exit 1
+              fi
+              release_id="$(jq -r '.id' <<< "$release_json")"
+              ;;
+            *)
+              echo "Refusing ambiguous release state: ${release_count} releases match ${RELEASE_TAG}" >&2
+              exit 1
+              ;;
+          esac
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            echo "Draft release id is malformed: ${release_id}" >&2
+            exit 1
+          fi
+
+          releases_json="$(list_matching_releases)"
+          if [ "$(jq -r 'length' <<< "$releases_json")" -ne 1 ]; then
+            echo "Expected exactly one draft after preflight" >&2
+            exit 1
+          fi
+          release_json="$(jq -c '.[0]' <<< "$releases_json")"
+          if ! jq -e \
+              --argjson id "$release_id" \
+              --arg tag "$RELEASE_TAG" \
+              --argjson prerelease "$EXPECTED_PRERELEASE" \
+              '.id == $id and .draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease' \
+              >/dev/null <<< "$release_json"; then
+            echo "Draft state changed during preflight" >&2
+            exit 1
+          fi
+          direct_release="$(gh api "/repos/${EXPECTED_REPOSITORY}/releases/${release_id}")"
+          if ! jq -e \
+              --argjson id "$release_id" \
+              --arg tag "$RELEASE_TAG" \
+              --argjson prerelease "$EXPECTED_PRERELEASE" \
+              '.id == $id and .draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease' \
+              >/dev/null <<< "$direct_release"; then
+            echo "Draft id no longer resolves to the isolated release contract" >&2
+            exit 1
+          fi
+          verify_existing_assets_are_matching_subset "$release_id"
+          printf 'release_id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
+
+      - name: Upload missing exact assets to isolated draft
+        id: stage_release
+        env:
+          EXPECTED_PRERELEASE: ${{ needs.release_contract.outputs.prerelease }}
+          EXPECTED_RELEASE_ID: ${{ steps.draft_preflight.outputs.release_id }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_REVISION: ${{ needs.release_contract.outputs.revision }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release_contract.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$EXPECTED_RELEASE_ID" =~ ^[0-9]+$ ]]; then
+            echo "Isolated draft release id is malformed: ${EXPECTED_RELEASE_ID}" >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Repository name cannot be embedded safely in an upload URL" >&2
+            exit 1
+          fi
+
+          load_remote_assets() {
+            gh api --paginate "/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}/assets?per_page=100" \
+              | jq -sc 'add // []'
+          }
+
+          assert_isolated_draft() {
+            local release_json expected_upload_url
+            expected_upload_url="https://uploads.github.com/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}/assets{?name,label}"
+            release_json="$(gh api "/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}")"
+            if ! jq -e \
+                --argjson id "$EXPECTED_RELEASE_ID" \
+                --arg tag "$RELEASE_TAG" \
+                --arg upload_url "$expected_upload_url" \
+                --argjson prerelease "$EXPECTED_PRERELEASE" \
+                '.id == $id and .draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease and .upload_url == $upload_url' \
+                >/dev/null <<< "$release_json"; then
+              echo "Numeric release id no longer resolves to the isolated draft upload contract" >&2
+              exit 1
+            fi
+          }
+
+          validate_remote_subset() {
+            local assets_json="$1"
+            local verify_bytes="$2"
+            local asset_count asset_id asset_name asset_size asset_digest asset_state
+            local local_size local_hash remote_hash expected_digest expected_name seen_name
+            local asset_is_duplicate asset_is_expected
+            local -a seen_names=()
+
+            if [ "$verify_bytes" != true ] && [ "$verify_bytes" != false ]; then
+              echo "Internal error: remote asset byte-verification mode is invalid" >&2
+              exit 1
+            fi
+
+            asset_count="$(jq -r 'length' <<< "$assets_json")"
+            if [ "$asset_count" -gt 30 ]; then
+              echo "Isolated draft has too many assets: ${asset_count}" >&2
+              exit 1
+            fi
+            while IFS=$'\t' read -r asset_id asset_name asset_size asset_digest asset_state; do
+              [ -n "$asset_id" ] || continue
+              if [[ ! "$asset_id" =~ ^[0-9]+$ ]] || [[ ! "$asset_size" =~ ^[0-9]+$ ]]; then
+                echo "Isolated draft returned malformed asset metadata" >&2
+                exit 1
+              fi
+              asset_is_expected=false
+              for expected_name in "${local_assets[@]}"; do
+                if [ "$asset_name" = "$expected_name" ]; then
+                  asset_is_expected=true
+                  break
+                fi
+              done
+              asset_is_duplicate=false
+              for seen_name in "${seen_names[@]}"; do
+                if [ "$asset_name" = "$seen_name" ]; then
+                  asset_is_duplicate=true
+                  break
+                fi
+              done
+              if [ "$asset_is_expected" != true ] || [ "$asset_is_duplicate" = true ]; then
+                echo "Isolated draft contains an unexpected or duplicate asset: ${asset_name}" >&2
+                exit 1
+              fi
+              seen_names+=("$asset_name")
+              local_size="${local_sizes[$asset_name]}"
+              local_hash="${local_hashes[$asset_name]}"
+              expected_digest="sha256:${local_hash}"
+              if [ "$asset_size" != "$local_size" ] || [ "$asset_digest" != "$expected_digest" ] || [ "$asset_state" != uploaded ]; then
+                echo "Existing isolated-draft asset metadata differs from local ${asset_name}" >&2
+                exit 1
+              fi
+              if [ "$verify_bytes" = true ]; then
+                remote_hash="$(gh api \
+                  -H 'Accept: application/octet-stream' \
+                  -H 'X-GitHub-Api-Version: 2022-11-28' \
+                  "/repos/${EXPECTED_REPOSITORY}/releases/assets/${asset_id}" \
+                  | sha256sum | awk '{print $1}')"
+                if [ "$remote_hash" != "$local_hash" ]; then
+                  echo "Existing isolated-draft asset bytes differ from local ${asset_name}" >&2
+                  exit 1
+                fi
+              fi
+            done < <(jq -r '.[] | [.id, .name, .size, .digest, .state] | @tsv' <<< "$assets_json")
+          }
+
+          mapfile -t local_assets < <(find publish -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+          if [ "${#local_assets[@]}" -ne 30 ]; then
+            echo "Local release envelope must contain exactly 30 assets" >&2
+            exit 1
+          fi
+          declare -A local_sizes=() local_hashes=()
+          for asset_name in "${local_assets[@]}"; do
+            if [[ ! "$asset_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$ ]]; then
+              echo "Release asset name cannot be embedded safely in an upload URL: ${asset_name}" >&2
+              exit 1
+            fi
+            if [ ! -f "publish/$asset_name" ] || [ -L "publish/$asset_name" ] || [ ! -s "publish/$asset_name" ]; then
+              echo "Local release asset is not a nonempty regular file: ${asset_name}" >&2
+              exit 1
+            fi
+            local_sizes["$asset_name"]="$(stat --format='%s' "publish/$asset_name")"
+            local_hashes["$asset_name"]="$(sha256sum "publish/$asset_name" | awk '{print $1}')"
+          done
+
+          assert_isolated_draft
+          staged_assets="$(load_remote_assets)"
+          validate_remote_subset "$staged_assets" true
+          for asset_name in "${local_assets[@]}"; do
+            matching_count="$(jq -r --arg name "$asset_name" '[.[] | select(.name == $name)] | length' <<< "$staged_assets")"
+            if [ "$matching_count" -eq 1 ]; then
+              continue
+            fi
+            if [ "$matching_count" -ne 0 ]; then
+              echo "Refusing ambiguous existing asset state for ${asset_name}" >&2
+              exit 1
+            fi
+
+            assert_isolated_draft
+            local_size="${local_sizes[$asset_name]}"
+            local_hash="${local_hashes[$asset_name]}"
+            expected_digest="sha256:${local_hash}"
+            upload_response="$(curl \
+              --fail-with-body --silent --show-error \
+              --proto '=https' --tlsv1.2 \
+              --connect-timeout 30 --max-time 1800 \
+              --request POST \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              -H 'Content-Type: application/octet-stream' \
+              --data-binary "@publish/$asset_name" \
+              "https://uploads.github.com/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}/assets?name=${asset_name}")"
+            if ! jq -e \
+                  --arg name "$asset_name" \
+                  --arg digest "$expected_digest" \
+                  --argjson size "$local_size" \
+                  '(.id | type == "number") and .name == $name and .size == $size and .digest == $digest and .state == "uploaded"' \
+                  >/dev/null <<< "$upload_response"; then
+              echo "GitHub returned an invalid upload receipt for ${asset_name}" >&2
+              exit 1
+            fi
+            uploaded_asset_id="$(jq -r '.id' <<< "$upload_response")"
+            uploaded_hash="$(gh api \
+              -H 'Accept: application/octet-stream' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/${EXPECTED_REPOSITORY}/releases/assets/${uploaded_asset_id}" \
+              | sha256sum | awk '{print $1}')"
+            if [ "$uploaded_hash" != "$local_hash" ]; then
+              echo "Uploaded isolated-draft asset bytes differ from local ${asset_name}" >&2
+              exit 1
+            fi
+            staged_assets="$(load_remote_assets)"
+            validate_remote_subset "$staged_assets" false
+          done
+
+          assert_isolated_draft
+          staged_assets="$(load_remote_assets)"
+          validate_remote_subset "$staged_assets" false
+          if [ "$(jq -r 'length' <<< "$staged_assets")" -ne 30 ]; then
+            echo "Isolated draft must contain exactly 30 verified assets after upload" >&2
+            exit 1
+          fi
+          printf 'release_id=%s\n' "$EXPECTED_RELEASE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Verify draft bytes, finalize, and verify public census
+        env:
+          EXPECTED_PRERELEASE: ${{ needs.release_contract.outputs.prerelease }}
+          EXPECTED_RELEASE_ID: ${{ steps.draft_preflight.outputs.release_id }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_REVISION: ${{ needs.release_contract.outputs.revision }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release_contract.outputs.tag }}
+          STAGED_RELEASE_ID: ${{ steps.stage_release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+
+          assert_tag_revision() {
+            local resolved_revision
+            resolved_revision="$(gh api "/repos/${EXPECTED_REPOSITORY}/commits/${RELEASE_TAG}" --jq '.sha')"
+            if [ "$resolved_revision" != "$EXPECTED_REVISION" ]; then
+              echo "Release tag ${RELEASE_TAG} resolves to ${resolved_revision:-missing}, expected ${EXPECTED_REVISION}" >&2
+              exit 1
+            fi
+          }
+
+          load_remote_assets() {
+            gh api --paginate "/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}/assets?per_page=100" \
+              | jq -sc 'add // []'
+          }
+
+          assert_release_state_and_census() {
+            local expected_draft="$1"
+            local release_json assets_json
+            local expected_names actual_names
+
+            release_json="$(gh api "/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}")"
+            if ! jq -e \
+                --argjson id "$EXPECTED_RELEASE_ID" \
+                --arg tag "$RELEASE_TAG" \
+                --argjson draft "$expected_draft" \
+                --argjson prerelease "$EXPECTED_PRERELEASE" \
+                '.id == $id and .tag_name == $tag and .name == $tag and .draft == $draft and .prerelease == $prerelease' \
+                >/dev/null <<< "$release_json"; then
+              echo "Release state does not match the expected tag, id, draft, and prerelease contract" >&2
+              exit 1
+            fi
+            assets_json="$(load_remote_assets)"
+            if [ "$(jq -r 'length' <<< "$assets_json")" -ne 30 ]; then
+              echo "Remote release must contain exactly 30 assets" >&2
+              exit 1
+            fi
+            expected_names="$(find publish -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)"
+            actual_names="$(jq -r '.[].name' <<< "$assets_json" | sort)"
+            if [ "$actual_names" != "$expected_names" ]; then
+              echo "Remote release asset census differs from the local signed envelope" >&2
+              exit 1
+            fi
+            printf '%s' "$assets_json"
+          }
+
+          if [ "$STAGED_RELEASE_ID" != "$EXPECTED_RELEASE_ID" ]; then
+            echo "Release action selected ${STAGED_RELEASE_ID}, expected isolated draft ${EXPECTED_RELEASE_ID}" >&2
+            exit 1
+          fi
+          assert_tag_revision
+          draft_assets="$(assert_release_state_and_census true)"
+          while IFS=$'\t' read -r asset_id asset_name asset_size asset_digest asset_state; do
+            if [[ ! "$asset_id" =~ ^[0-9]+$ ]] || [[ ! "$asset_size" =~ ^[0-9]+$ ]]; then
+              echo "Draft returned malformed asset metadata" >&2
+              exit 1
+            fi
+            local_size="$(stat --format='%s' "publish/$asset_name")"
+            if [ "$asset_size" != "$local_size" ]; then
+              echo "Draft asset size differs from local ${asset_name}" >&2
+              exit 1
+            fi
+            local_hash="$(sha256sum "publish/$asset_name" | awk '{print $1}')"
+            expected_digest="sha256:${local_hash}"
+            if [ "$asset_digest" != "$expected_digest" ] || [ "$asset_state" != uploaded ]; then
+              echo "Draft asset digest or state differs from local ${asset_name}" >&2
+              exit 1
+            fi
+            remote_hash="$(gh api \
+              -H 'Accept: application/octet-stream' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/${EXPECTED_REPOSITORY}/releases/assets/${asset_id}" \
+              | sha256sum | awk '{print $1}')"
+            if [ "$remote_hash" != "$local_hash" ]; then
+              echo "Draft asset bytes differ from local ${asset_name}" >&2
+              exit 1
+            fi
+          done < <(jq -r '.[] | [.id, .name, .size, .digest, .state] | @tsv' <<< "$draft_assets")
+
+          resolve_acfs_public_main() {
+            local output revision ref_name extra
+            local -a refs=()
+
+            output="$(timeout 30 git ls-remote --refs \
+              https://github.com/Dicklesworthstone/agentic_coding_flywheel_setup.git \
+              refs/heads/main)"
+            if [ -z "$output" ]; then
+              echo "Could not resolve the public ACFS main branch" >&2
+              exit 1
+            fi
+            mapfile -t refs <<< "$output"
+            if [ "${#refs[@]}" -ne 1 ]; then
+              echo "Public ACFS main branch returned an ambiguous ref census" >&2
+              exit 1
+            fi
+            read -r revision ref_name extra <<< "${refs[0]}"
+            if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]] || [ "$ref_name" != refs/heads/main ] || [ -n "${extra:-}" ]; then
+              echo "Public ACFS main branch returned malformed ref metadata" >&2
+              exit 1
+            fi
+            printf '%s' "$revision"
+          }
+
+          resolve_mcp_public_main() {
+            local output revision ref_name extra
+            local -a refs=()
+
+            output="$(timeout 30 git ls-remote --refs \
+              https://github.com/Dicklesworthstone/mcp_agent_mail_rust.git \
+              refs/heads/main)"
+            if [ -z "$output" ]; then
+              echo "Could not resolve the public MCP Agent Mail main branch" >&2
+              exit 1
+            fi
+            mapfile -t refs <<< "$output"
+            if [ "${#refs[@]}" -ne 1 ]; then
+              echo "Public MCP Agent Mail main branch returned an ambiguous ref census" >&2
+              exit 1
+            fi
+            read -r revision ref_name extra <<< "${refs[0]}"
+            if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]] || [ "$ref_name" != refs/heads/main ] || [ -n "${extra:-}" ]; then
+              echo "Public MCP Agent Mail main branch returned malformed ref metadata" >&2
+              exit 1
+            fi
+            printf '%s' "$revision"
+          }
+
+          tag_installer="${RUNNER_TEMP}/tag-install-${EXPECTED_REVISION}.sh"
+          gh api \
+            -H 'Accept: application/vnd.github.raw+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "/repos/${EXPECTED_REPOSITORY}/contents/install.sh?ref=${EXPECTED_REVISION}" \
+            > "$tag_installer"
+          if ! cmp --silent "$tag_installer" publish/install.sh; then
+            echo "Signed installer differs from install.sh at the release revision" >&2
+            exit 1
+          fi
+          installer_hash="$(sha256sum "$tag_installer" | awk '{print $1}')"
+          mcp_main_revision="$(resolve_mcp_public_main)"
+          main_installer="${RUNNER_TEMP}/main-install-${mcp_main_revision}.sh"
+          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors --output "$main_installer" \
+            "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/${mcp_main_revision}/install.sh?cache_bust=${mcp_main_revision}"
+          if ! cmp --silent "$tag_installer" "$main_installer"; then
+            echo "Public MCP Agent Mail main does not serve the signed release installer" >&2
+            exit 1
+          fi
+          acfs_revision="$(resolve_acfs_public_main)"
+          acfs_checksums="${RUNNER_TEMP}/acfs-checksums-${EXPECTED_RELEASE_ID}.yaml"
+          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors --output "$acfs_checksums" \
+            "https://raw.githubusercontent.com/Dicklesworthstone/agentic_coding_flywheel_setup/${acfs_revision}/checksums.yaml?cache_bust=${acfs_revision}"
+          python3 - "$acfs_checksums" "$installer_hash" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          expected_hash = sys.argv[2]
+          if re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None:
+              raise SystemExit("release installer SHA-256 is malformed")
+
+          lines = path.read_text(encoding="utf-8").splitlines()
+          marker = "  mcp_agent_mail:"
+          if lines.count(marker) != 1:
+              raise SystemExit("ACFS checksums must contain exactly one mcp_agent_mail entry")
+          start = lines.index(marker) + 1
+          end = next(
+              (
+                  index
+                  for index in range(start, len(lines))
+                  if lines[index].startswith("  ")
+                  and not lines[index].startswith("    ")
+                  and lines[index].endswith(":")
+              ),
+              len(lines),
+          )
+          entry = [line for line in lines[start:end] if line]
+          expected_entry = [
+              '    url: "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/refs/heads/main/install.sh"',
+              f'    sha256: "{expected_hash}"',
+          ]
+          if entry != expected_entry:
+              raise SystemExit(
+                  "ACFS public main does not bind mcp_agent_mail to this release installer"
+              )
+          PY
+          acfs_revision_after="$(resolve_acfs_public_main)"
+          if [ "$acfs_revision_after" != "$acfs_revision" ]; then
+            echo "ACFS public main moved during checksum verification; refusing publication" >&2
+            exit 1
+          fi
+          mcp_main_revision_after="$(resolve_mcp_public_main)"
+          if [ "$mcp_main_revision_after" != "$mcp_main_revision" ]; then
+            echo "MCP Agent Mail public main moved during checksum verification; refusing publication" >&2
+            exit 1
+          fi
+          printf 'Verified MCP main %s and ACFS main %s bind mcp_agent_mail to %s\n' \
+            "$mcp_main_revision" "$acfs_revision" "$installer_hash"
+
+          assert_tag_revision
+          finalized_release="$(gh api --method PATCH \
+            "/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" \
+            -F draft=false)"
+          if [ "$(jq -r '.draft' <<< "$finalized_release")" != false ]; then
+            echo "GitHub did not finalize the verified draft" >&2
+            exit 1
+          fi
+          assert_tag_revision
+          published_assets="$(assert_release_state_and_census false)"
+          while IFS=$'\t' read -r asset_id asset_name asset_size asset_digest asset_state; do
+            if [[ ! "$asset_id" =~ ^[0-9]+$ ]] || [[ ! "$asset_size" =~ ^[0-9]+$ ]]; then
+              echo "Published release returned malformed asset metadata" >&2
+              exit 1
+            fi
+            local_size="$(stat --format='%s' "publish/$asset_name")"
+            if [ "$asset_size" != "$local_size" ]; then
+              echo "Published asset size differs from local ${asset_name}" >&2
+              exit 1
+            fi
+            local_hash="$(sha256sum "publish/$asset_name" | awk '{print $1}')"
+            expected_digest="sha256:${local_hash}"
+            if [ "$asset_digest" != "$expected_digest" ] || [ "$asset_state" != uploaded ]; then
+              echo "Published asset digest or state differs from local ${asset_name}" >&2
+              exit 1
+            fi
+            remote_hash="$(gh api \
+              -H 'Accept: application/octet-stream' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/${EXPECTED_REPOSITORY}/releases/assets/${asset_id}" \
+              | sha256sum | awk '{print $1}')"
+            if [ "$remote_hash" != "$local_hash" ]; then
+              echo "Published asset bytes differ from local ${asset_name}" >&2
+              exit 1
+            fi
+          done < <(jq -r '.[] | [.id, .name, .size, .digest, .state] | @tsv' <<< "$published_assets")
+
+          published_by_tag="$(gh api "/repos/${EXPECTED_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          if ! jq -e \
+              --argjson id "$EXPECTED_RELEASE_ID" \
+              --arg tag "$RELEASE_TAG" \
+              --argjson prerelease "$EXPECTED_PRERELEASE" \
+              '.id == $id and .draft == false and .tag_name == $tag and .name == $tag and .prerelease == $prerelease' \
+              >/dev/null <<< "$published_by_tag"; then
+            echo "Published release is not discoverable by the expected tag and metadata" >&2
+            exit 1
+          fi
+          assert_tag_revision

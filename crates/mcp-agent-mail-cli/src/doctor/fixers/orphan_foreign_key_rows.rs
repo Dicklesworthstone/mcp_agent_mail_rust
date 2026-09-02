@@ -29,9 +29,7 @@
 //!
 //! ## Detection (pure)
 //!
-//! Opens each candidate DB read-only with URI `?immutable=1`
-//! (matches the FM `integrity_page_malformed` pattern: no -shm
-//! creation, no locking) and runs:
+//! Queries the command's retained WAL-aware logical read source and runs:
 //!
 //! ```sql
 //! PRAGMA foreign_keys = ON;
@@ -66,7 +64,7 @@ use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
 use serde::Serialize;
 use sqlmodel_core::Row;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub const FM_ID: &str = "fm-db-state-files-orphan-foreign-key-rows";
 const FM_SEVERITY: &str = "P1";
@@ -164,25 +162,29 @@ impl OrphanForeignKeyRowsFinding {
 
 /// Detector. PURE w.r.t. caller-supplied DB paths.
 ///
-/// Reads each DB read-only via URI `?immutable=1` (no -shm
-/// creation, no locking). Runs `PRAGMA foreign_keys = ON` then
-/// `PRAGMA foreign_key_check`. Returns one finding per DB that
-/// has at least one orphan; healthy DBs are silently skipped.
+/// Runs `PRAGMA foreign_keys = ON` then `PRAGMA foreign_key_check` on an
+/// explicitly offline source. Production dispatch supplies retained logical
+/// snapshots for live FrankenSQLite families instead.
 pub fn detect(candidate_dbs: &[PathBuf]) -> Vec<OrphanForeignKeyRowsFinding> {
+    let read_candidates =
+        super::explicit_offline_db_read_candidates(candidate_dbs, "orphan foreign-key detection");
+    detect_prepared(&read_candidates)
+}
+
+pub(crate) fn detect_prepared(
+    read_candidates: &[super::DoctorDbReadCandidate],
+) -> Vec<OrphanForeignKeyRowsFinding> {
     let mut out = Vec::new();
-    for db in candidate_dbs {
-        if let Some(f) = detect_one(db) {
+    for candidate in read_candidates {
+        if let Some(f) = detect_one(candidate) {
             out.push(f);
         }
     }
     out
 }
 
-fn detect_one(db_path: &Path) -> Option<OrphanForeignKeyRowsFinding> {
-    if !db_path.exists() {
-        return None;
-    }
-    let conn = super::open_immutable_sqlite(db_path).ok()?;
+fn detect_one(candidate: &super::DoctorDbReadCandidate) -> Option<OrphanForeignKeyRowsFinding> {
+    let conn = candidate.connection()?;
     // foreign_keys must be ON for the check pragma to walk the
     // FK constraints. The pragma is per-connection, so this is
     // safe on a shared DB.
@@ -209,7 +211,7 @@ fn detect_one(db_path: &Path) -> Option<OrphanForeignKeyRowsFinding> {
         }
     }
     Some(OrphanForeignKeyRowsFinding {
-        db_path: db_path.to_path_buf(),
+        db_path: candidate.target_path().to_path_buf(),
         total_orphans: rows.len(),
         by_child_table,
         by_parent_table,
@@ -246,7 +248,30 @@ pub fn fix(
     ctx: &MutateContext,
     finding: &OrphanForeignKeyRowsFinding,
 ) -> Result<FixOutcome, MutateError> {
-    if !finding.has_auto_fixable_rows() {
+    let candidate = super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+        &finding.db_path,
+        "orphan foreign-key pre-fix source selection",
+    );
+    fix_prepared(ctx, finding, &candidate)
+}
+
+pub(crate) fn fix_prepared(
+    ctx: &MutateContext,
+    _finding: &OrphanForeignKeyRowsFinding,
+    candidate: &super::DoctorDbReadCandidate,
+) -> Result<FixOutcome, MutateError> {
+    let refreshed = candidate.refresh("orphan foreign-key pre-mutation revalidation");
+    let Some(fresh_finding) = detect_prepared(std::slice::from_ref(&refreshed))
+        .into_iter()
+        .next()
+    else {
+        return Ok(FixOutcome {
+            actions_taken: 0,
+            actions_skipped: 1,
+            quarantined_paths: Vec::new(),
+        });
+    };
+    if !fresh_finding.has_auto_fixable_rows() {
         return Ok(FixOutcome {
             actions_taken: 0,
             actions_skipped: 1,
@@ -255,7 +280,7 @@ pub fn fix(
     }
     let result = mutate(
         ctx,
-        &finding.db_path,
+        &fresh_finding.db_path,
         Op::DbExec {
             sql: orphan_file_reservations_quarantine_sql(),
         },
@@ -263,7 +288,8 @@ pub fn fix(
     let residual_auto_fixable = if ctx.dry_run || !result.ok {
         false
     } else {
-        detect(std::slice::from_ref(&finding.db_path))
+        let post_mutation = refreshed.refresh("orphan foreign-key post-mutation verification");
+        detect_prepared(std::slice::from_ref(&post_mutation))
             .iter()
             .any(OrphanForeignKeyRowsFinding::has_auto_fixable_rows)
     };

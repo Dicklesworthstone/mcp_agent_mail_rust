@@ -70,6 +70,7 @@
               "/health_level",
               "/recovery",
               "/semantic_readiness",
+              "/status",
               "/storage_root",
               "/timeout_diagnostics",
               "/two_tier_indexing",
@@ -2234,6 +2235,54 @@
           }
         }
       ]
+    },
+    "retire_agent": {
+      "cases": [
+        {
+          "name": "unknown_agent",
+          "input": {
+            "project_key": "abs-path-backend",
+            "agent_name": "MissingAgent"
+          },
+          "expect": {
+            "err": {
+              "message_contains": "not found"
+            }
+          }
+        }
+      ]
+    },
+    "unretire_agent": {
+      "cases": [
+        {
+          "name": "unknown_agent",
+          "input": {
+            "project_key": "abs-path-backend",
+            "agent_name": "MissingAgent"
+          },
+          "expect": {
+            "err": {
+              "message_contains": "not found"
+            }
+          }
+        }
+      ]
+    },
+    "deregister_agent": {
+      "cases": [
+        {
+          "name": "unknown_agent",
+          "input": {
+            "project_key": "abs-path-backend",
+            "agent_name": "MissingAgent"
+          },
+          "expect": {
+            "err": {
+              "message_contains": "not found"
+            }
+          }
+        }
+      ]
     }
   },
   "resources": {
@@ -2924,7 +2973,7 @@
                         "file_reservation_paths",
                         "uninstall_precommit_guard"
                       ],
-                      "expected_frequency": "Infrequent\u2014per repository setup.",
+                      "expected_frequency": "Infrequent—per repository setup.",
                       "required_capabilities": [
                         "infrastructure",
                         "repository"
@@ -3079,7 +3128,7 @@
                         "reply_message",
                         "request_contact"
                       ],
-                      "expected_frequency": "Frequent\u2014core write operation.",
+                      "expected_frequency": "Frequent—core write operation.",
                       "required_capabilities": [
                         "messaging",
                         "write"
@@ -3207,7 +3256,7 @@
                         "respond_contact",
                         "set_contact_policy"
                       ],
-                      "expected_frequency": "Occasional\u2014when new communication lines are needed.",
+                      "expected_frequency": "Occasional—when new communication lines are needed.",
                       "required_capabilities": [
                         "contact"
                       ],
@@ -3670,7 +3719,7 @@
                         "file_reservation_paths",
                         "uninstall_precommit_guard"
                       ],
-                      "expected_frequency": "Infrequent\u2014per repository setup.",
+                      "expected_frequency": "Infrequent—per repository setup.",
                       "required_capabilities": [
                         "infrastructure",
                         "repository"
@@ -3825,7 +3874,7 @@
                         "reply_message",
                         "request_contact"
                       ],
-                      "expected_frequency": "Frequent\u2014core write operation.",
+                      "expected_frequency": "Frequent—core write operation.",
                       "required_capabilities": [
                         "messaging",
                         "write"
@@ -3953,7 +4002,7 @@
                         "respond_contact",
                         "set_contact_policy"
                       ],
-                      "expected_frequency": "Occasional\u2014when new communication lines are needed.",
+                      "expected_frequency": "Occasional—when new communication lines are needed.",
                       "required_capabilities": [
                         "contact"
                       ],
@@ -4521,6 +4570,7 @@
                   "name": "acknowledge_message",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "messaging",
                   "capabilities": [
                     "ack",
@@ -4532,6 +4582,7 @@
                   "name": "acquire_build_slot",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "build_slots",
                   "capabilities": [
                     "build"
@@ -4542,6 +4593,7 @@
                   "name": "create_agent_identity",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "identity",
                   "capabilities": [
                     "identity"
@@ -4549,9 +4601,22 @@
                   "complexity": "medium"
                 },
                 {
+                  "name": "deregister_agent",
+                  "calls": 1,
+                  "errors": 0,
+                  "rejections": 1,
+                  "cluster": "identity",
+                  "capabilities": [
+                    "identity",
+                    "write"
+                  ],
+                  "complexity": "medium"
+                },
+                {
                   "name": "ensure_product",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "product_bus",
                   "capabilities": [
                     "product"
@@ -4561,7 +4626,8 @@
                 {
                   "name": "ensure_project",
                   "calls": 2,
-                  "errors": 1,
+                  "errors": 0,
+                  "rejections": 1,
                   "cluster": "infrastructure",
                   "capabilities": [
                     "infrastructure",
@@ -4573,6 +4639,7 @@
                   "name": "fetch_inbox",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "messaging",
                   "capabilities": [
                     "messaging",
@@ -4584,6 +4651,7 @@
                   "name": "fetch_inbox_product",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "product_bus",
                   "capabilities": [
                     "messaging",
@@ -4594,7 +4662,8 @@
                 {
                   "name": "file_reservation_paths",
                   "calls": 3,
-                  "errors": 1,
+                  "errors": 0,
+                  "rejections": 1,
                   "cluster": "file_reservations",
                   "capabilities": [
                     "file_reservations",
@@ -4605,7 +4674,8 @@
                 {
                   "name": "force_release_file_reservation",
                   "calls": 1,
-                  "errors": 1,
+                  "errors": 0,
+                  "rejections": 1,
                   "cluster": "file_reservations",
                   "capabilities": [
                     "file_reservations",
@@ -4617,6 +4687,7 @@
                   "name": "health_check",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "infrastructure",
                   "capabilities": [
                     "infrastructure"
@@ -4627,6 +4698,7 @@
                   "name": "install_precommit_guard",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "infrastructure",
                   "capabilities": [
                     "infrastructure",
@@ -4638,6 +4710,7 @@
                   "name": "list_contacts",
                   "calls": 2,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "contact",
                   "capabilities": [
                     "audit",
@@ -4649,6 +4722,7 @@
                   "name": "macro_contact_handshake",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "workflow_macros",
                   "capabilities": [
                     "contact",
@@ -4661,6 +4735,7 @@
                   "name": "macro_file_reservation_cycle",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "workflow_macros",
                   "capabilities": [
                     "file_reservations",
@@ -4673,6 +4748,7 @@
                   "name": "macro_prepare_thread",
                   "calls": 2,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "workflow_macros",
                   "capabilities": [
                     "messaging",
@@ -4685,6 +4761,7 @@
                   "name": "macro_start_session",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "workflow_macros",
                   "capabilities": [
                     "file_reservations",
@@ -4698,6 +4775,7 @@
                   "name": "mark_message_read",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "messaging",
                   "capabilities": [
                     "messaging",
@@ -4709,6 +4787,7 @@
                   "name": "products_link",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "product_bus",
                   "capabilities": [
                     "product"
@@ -4719,6 +4798,7 @@
                   "name": "register_agent",
                   "calls": 2,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "identity",
                   "capabilities": [
                     "identity"
@@ -4729,6 +4809,7 @@
                   "name": "release_build_slot",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "build_slots",
                   "capabilities": [
                     "build"
@@ -4739,6 +4820,7 @@
                   "name": "release_file_reservations",
                   "calls": 2,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "file_reservations",
                   "capabilities": [
                     "file_reservations"
@@ -4749,6 +4831,7 @@
                   "name": "renew_build_slot",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "build_slots",
                   "capabilities": [
                     "build"
@@ -4759,6 +4842,7 @@
                   "name": "renew_file_reservations",
                   "calls": 3,
                   "errors": 1,
+                  "rejections": 0,
                   "cluster": "file_reservations",
                   "capabilities": [
                     "file_reservations"
@@ -4769,6 +4853,7 @@
                   "name": "reply_message",
                   "calls": 3,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "messaging",
                   "capabilities": [
                     "messaging",
@@ -4780,6 +4865,7 @@
                   "name": "request_contact",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "contact",
                   "capabilities": [
                     "contact"
@@ -4790,6 +4876,7 @@
                   "name": "respond_contact",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "contact",
                   "capabilities": [
                     "contact"
@@ -4797,9 +4884,22 @@
                   "complexity": "medium"
                 },
                 {
+                  "name": "retire_agent",
+                  "calls": 1,
+                  "errors": 0,
+                  "rejections": 1,
+                  "cluster": "identity",
+                  "capabilities": [
+                    "identity",
+                    "write"
+                  ],
+                  "complexity": "medium"
+                },
+                {
                   "name": "search_messages",
                   "calls": 3,
-                  "errors": 1,
+                  "errors": 0,
+                  "rejections": 1,
                   "cluster": "search",
                   "capabilities": [
                     "search"
@@ -4810,6 +4910,7 @@
                   "name": "search_messages_product",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "product_bus",
                   "capabilities": [
                     "search"
@@ -4820,6 +4921,7 @@
                   "name": "send_message",
                   "calls": 4,
                   "errors": 1,
+                  "rejections": 0,
                   "cluster": "messaging",
                   "capabilities": [
                     "messaging",
@@ -4831,6 +4933,7 @@
                   "name": "set_contact_policy",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "contact",
                   "capabilities": [
                     "configure",
@@ -4841,7 +4944,8 @@
                 {
                   "name": "summarize_thread",
                   "calls": 5,
-                  "errors": 1,
+                  "errors": 0,
+                  "rejections": 1,
                   "cluster": "search",
                   "capabilities": [
                     "search",
@@ -4853,6 +4957,7 @@
                   "name": "summarize_thread_product",
                   "calls": 2,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "product_bus",
                   "capabilities": [
                     "search",
@@ -4864,6 +4969,7 @@
                   "name": "uninstall_precommit_guard",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "infrastructure",
                   "capabilities": [
                     "infrastructure",
@@ -4872,9 +4978,22 @@
                   "complexity": "medium"
                 },
                 {
+                  "name": "unretire_agent",
+                  "calls": 1,
+                  "errors": 0,
+                  "rejections": 1,
+                  "cluster": "identity",
+                  "capabilities": [
+                    "identity",
+                    "write"
+                  ],
+                  "complexity": "medium"
+                },
+                {
                   "name": "whois",
                   "calls": 2,
-                  "errors": 1,
+                  "errors": 0,
+                  "rejections": 1,
                   "cluster": "identity",
                   "capabilities": [
                     "audit",
@@ -4908,6 +5027,7 @@
                   "name": "acknowledge_message",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "messaging",
                   "capabilities": [
                     "ack",
@@ -4919,6 +5039,7 @@
                   "name": "acquire_build_slot",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "build_slots",
                   "capabilities": [
                     "build"
@@ -4929,6 +5050,7 @@
                   "name": "create_agent_identity",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "identity",
                   "capabilities": [
                     "identity"
@@ -4936,9 +5058,22 @@
                   "complexity": "medium"
                 },
                 {
+                  "name": "deregister_agent",
+                  "calls": 1,
+                  "errors": 0,
+                  "rejections": 1,
+                  "cluster": "identity",
+                  "capabilities": [
+                    "identity",
+                    "write"
+                  ],
+                  "complexity": "medium"
+                },
+                {
                   "name": "ensure_product",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "product_bus",
                   "capabilities": [
                     "product"
@@ -4948,7 +5083,8 @@
                 {
                   "name": "ensure_project",
                   "calls": 2,
-                  "errors": 1,
+                  "errors": 0,
+                  "rejections": 1,
                   "cluster": "infrastructure",
                   "capabilities": [
                     "infrastructure",
@@ -4960,6 +5096,7 @@
                   "name": "fetch_inbox",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "messaging",
                   "capabilities": [
                     "messaging",
@@ -4971,6 +5108,7 @@
                   "name": "fetch_inbox_product",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "product_bus",
                   "capabilities": [
                     "messaging",
@@ -4981,7 +5119,8 @@
                 {
                   "name": "file_reservation_paths",
                   "calls": 3,
-                  "errors": 1,
+                  "errors": 0,
+                  "rejections": 1,
                   "cluster": "file_reservations",
                   "capabilities": [
                     "file_reservations",
@@ -4992,7 +5131,8 @@
                 {
                   "name": "force_release_file_reservation",
                   "calls": 1,
-                  "errors": 1,
+                  "errors": 0,
+                  "rejections": 1,
                   "cluster": "file_reservations",
                   "capabilities": [
                     "file_reservations",
@@ -5004,6 +5144,7 @@
                   "name": "health_check",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "infrastructure",
                   "capabilities": [
                     "infrastructure"
@@ -5014,6 +5155,7 @@
                   "name": "install_precommit_guard",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "infrastructure",
                   "capabilities": [
                     "infrastructure",
@@ -5025,6 +5167,7 @@
                   "name": "list_contacts",
                   "calls": 2,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "contact",
                   "capabilities": [
                     "audit",
@@ -5036,6 +5179,7 @@
                   "name": "macro_contact_handshake",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "workflow_macros",
                   "capabilities": [
                     "contact",
@@ -5048,6 +5192,7 @@
                   "name": "macro_file_reservation_cycle",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "workflow_macros",
                   "capabilities": [
                     "file_reservations",
@@ -5060,6 +5205,7 @@
                   "name": "macro_prepare_thread",
                   "calls": 2,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "workflow_macros",
                   "capabilities": [
                     "messaging",
@@ -5072,6 +5218,7 @@
                   "name": "macro_start_session",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "workflow_macros",
                   "capabilities": [
                     "file_reservations",
@@ -5085,6 +5232,7 @@
                   "name": "mark_message_read",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "messaging",
                   "capabilities": [
                     "messaging",
@@ -5096,6 +5244,7 @@
                   "name": "products_link",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "product_bus",
                   "capabilities": [
                     "product"
@@ -5106,6 +5255,7 @@
                   "name": "register_agent",
                   "calls": 2,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "identity",
                   "capabilities": [
                     "identity"
@@ -5116,6 +5266,7 @@
                   "name": "release_build_slot",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "build_slots",
                   "capabilities": [
                     "build"
@@ -5126,6 +5277,7 @@
                   "name": "release_file_reservations",
                   "calls": 2,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "file_reservations",
                   "capabilities": [
                     "file_reservations"
@@ -5136,6 +5288,7 @@
                   "name": "renew_build_slot",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "build_slots",
                   "capabilities": [
                     "build"
@@ -5146,6 +5299,7 @@
                   "name": "renew_file_reservations",
                   "calls": 3,
                   "errors": 1,
+                  "rejections": 0,
                   "cluster": "file_reservations",
                   "capabilities": [
                     "file_reservations"
@@ -5156,6 +5310,7 @@
                   "name": "reply_message",
                   "calls": 3,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "messaging",
                   "capabilities": [
                     "messaging",
@@ -5167,6 +5322,7 @@
                   "name": "request_contact",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "contact",
                   "capabilities": [
                     "contact"
@@ -5177,6 +5333,7 @@
                   "name": "respond_contact",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "contact",
                   "capabilities": [
                     "contact"
@@ -5184,9 +5341,22 @@
                   "complexity": "medium"
                 },
                 {
+                  "name": "retire_agent",
+                  "calls": 1,
+                  "errors": 0,
+                  "rejections": 1,
+                  "cluster": "identity",
+                  "capabilities": [
+                    "identity",
+                    "write"
+                  ],
+                  "complexity": "medium"
+                },
+                {
                   "name": "search_messages",
                   "calls": 3,
-                  "errors": 1,
+                  "errors": 0,
+                  "rejections": 1,
                   "cluster": "search",
                   "capabilities": [
                     "search"
@@ -5197,6 +5367,7 @@
                   "name": "search_messages_product",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "product_bus",
                   "capabilities": [
                     "search"
@@ -5207,6 +5378,7 @@
                   "name": "send_message",
                   "calls": 4,
                   "errors": 1,
+                  "rejections": 0,
                   "cluster": "messaging",
                   "capabilities": [
                     "messaging",
@@ -5218,6 +5390,7 @@
                   "name": "set_contact_policy",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "contact",
                   "capabilities": [
                     "configure",
@@ -5228,7 +5401,8 @@
                 {
                   "name": "summarize_thread",
                   "calls": 5,
-                  "errors": 1,
+                  "errors": 0,
+                  "rejections": 1,
                   "cluster": "search",
                   "capabilities": [
                     "search",
@@ -5240,6 +5414,7 @@
                   "name": "summarize_thread_product",
                   "calls": 2,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "product_bus",
                   "capabilities": [
                     "search",
@@ -5251,6 +5426,7 @@
                   "name": "uninstall_precommit_guard",
                   "calls": 1,
                   "errors": 0,
+                  "rejections": 0,
                   "cluster": "infrastructure",
                   "capabilities": [
                     "infrastructure",
@@ -5259,9 +5435,22 @@
                   "complexity": "medium"
                 },
                 {
+                  "name": "unretire_agent",
+                  "calls": 1,
+                  "errors": 0,
+                  "rejections": 1,
+                  "cluster": "identity",
+                  "capabilities": [
+                    "identity",
+                    "write"
+                  ],
+                  "complexity": "medium"
+                },
+                {
                   "name": "whois",
                   "calls": 2,
-                  "errors": 1,
+                  "errors": 0,
+                  "rejections": 1,
                   "cluster": "identity",
                   "capabilities": [
                     "audit",
@@ -5345,10 +5534,10 @@
         }
       ]
     },
-    "resource://tooling/recent/60?agent=BlueLake&project=abs-path-backend": {
+    "resource://tooling/recent/60?agent=NoSuchAgent&project=abs-path-backend": {
       "cases": [
         {
-          "name": "tooling_recent",
+          "name": "tooling_recent_unknown_agent_is_empty",
           "input": {},
           "expect": {
             "ok": {
@@ -5434,7 +5623,7 @@
         }
       ]
     },
-    "resource://views/acks-stale/GreenCastle?project=abs-path-backend&ttl_seconds=60&limit=10": {
+    "resource://views/acks-stale/GreenCastle?project=abs-path-backend&ttl_seconds=86400&limit=10": {
       "cases": [
         {
           "name": "acks_stale",
@@ -5443,7 +5632,7 @@
             "ok": {
               "project": "/abs/path/backend",
               "agent": "GreenCastle",
-              "ttl_seconds": 60,
+              "ttl_seconds": 86400,
               "count": 0,
               "messages": []
             }
@@ -5451,7 +5640,7 @@
         }
       ]
     },
-    "resource://views/ack-overdue/GreenCastle?project=abs-path-backend&ttl_minutes=1&limit=10": {
+    "resource://views/ack-overdue/GreenCastle?project=abs-path-backend&ttl_minutes=1440&limit=10": {
       "cases": [
         {
           "name": "ack_overdue",

@@ -112,7 +112,12 @@ def _null_volatile_fields_inplace(value: Any) -> list[str]:
 
 
 def _rust_extension_ignore_pointers(tool_name: str, case_name: str, out: Any) -> list[str]:
-    """Return JSON Pointers for Rust-only response fields absent from Python."""
+    """Return JSON Pointers excluded from the supported legacy contract."""
+    if tool_name == "health_check" and case_name == "default" and isinstance(out, dict):
+        # Rust health is intentionally fail-closed when durable state is absent.
+        # The legacy fixture's unconditional status="ok" must not veto that
+        # reliability contract; native health tests assert the Rust verdict.
+        return ["/status"]
     if tool_name in {"fetch_inbox", "fetch_inbox_product"} and isinstance(out, list):
         return [
             f"/{idx}/{field}"
@@ -1088,7 +1093,10 @@ async def _generate() -> dict[str, Any]:
         resource_uris.append(("resource://tooling/locks", "tooling_locks"))
         resource_uris.append(("resource://tooling/locks?format=json", "tooling_locks_format_json"))
         resource_uris.append((f"resource://tooling/capabilities/BlueLake?project={project_slug}", "tooling_capabilities"))
-        resource_uris.append((f"resource://tooling/recent/60?agent=BlueLake&project={project_slug}", "tooling_recent"))
+        # tooling/recent reads the live server's in-memory ring of finished tool calls; the
+        # scenario above already made calls as BlueLake, so pin the filter semantics
+        # (an unknown agent yields no entries) rather than a timing-dependent list.
+        resource_uris.append((f"resource://tooling/recent/60?agent=NoSuchAgent&project={project_slug}", "tooling_recent_unknown_agent_is_empty"))
         resource_uris.append((f"resource://views/urgent-unread/GreenCastle?project={project_slug}&limit=10", "urgent_unread"))
         resource_uris.append((f"resource://views/ack-required/GreenCastle?project={project_slug}&limit=10", "ack_required"))
         resource_uris.append((f"resource://views/acks-stale/GreenCastle?project={project_slug}&ttl_seconds=60&limit=10", "acks_stale"))

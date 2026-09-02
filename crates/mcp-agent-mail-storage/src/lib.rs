@@ -256,7 +256,7 @@ struct CommitCoalescerHeartbeat {
 }
 
 impl CommitCoalescerHeartbeat {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             last_tick_micros: AtomicI64::new(0),
             last_tick_elapsed_micros: AtomicU64::new(0),
@@ -961,7 +961,7 @@ fn new_write_behind_queue() -> WriteBehindQueue {
 }
 
 fn wbq_start_inner(wbq: &WriteBehindQueue) {
-    let _lifecycle = wbq.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+    let _lifecycle = wbq.lifecycle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let should_spawn = {
         let handle = wbq.drain_handle.lock();
@@ -1054,12 +1054,12 @@ fn wbq_start_inner(wbq: &WriteBehindQueue) {
         })
         .unwrap_or_else(|error| panic!("failed to spawn wbq-drain thread: {error}"));
 
-    *wbq.sender.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    *wbq.sender.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
     *wbq.drain_handle.lock() = Some(handle);
 }
 
 fn wbq_sender_clone(wbq: &WriteBehindQueue) -> Option<std::sync::mpsc::SyncSender<WbqMsg>> {
-    wbq.sender.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    wbq.sender.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
 /// Spawn the WBQ drain thread. Safe to call multiple times.
@@ -1239,6 +1239,7 @@ pub enum DirectArchiveWrite {
 /// reservation's JSON files (a cheap, bounded, local filesystem write) and
 /// defers the git commit to the async commit coalescer, so a reservation grant
 /// can never be coupled to another agent's archive-drain latency.
+#[must_use]
 pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
     let metrics = mcp_agent_mail_core::global_metrics();
     let disk_pressure = metrics.system.disk_pressure_level.load();
@@ -1565,7 +1566,7 @@ enum ArchiveBacklogDrainStep {
 }
 
 impl ArchiveRetryBacklog {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
             drain_handle: Mutex::new(None),
@@ -1600,7 +1601,7 @@ impl ArchiveRetryBacklog {
         // Reserve a slot under the lock: count both live entries and in-flight
         // reservations against `cap` so parallel pushers serialize on the bound.
         {
-            let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let occupied = u64::try_from(queue.len())
                 .unwrap_or(u64::MAX)
                 .saturating_add(self.reserved.load(Ordering::Relaxed));
@@ -1622,7 +1623,7 @@ impl ArchiveRetryBacklog {
         let journal_path = archive_backlog_journal_write(&op);
         let durable = journal_path.is_some();
         {
-            let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             // Release the reservation and enqueue the real entry atomically.
             self.reserved.fetch_sub(1, Ordering::Relaxed);
             queue.push_back(ArchiveBacklogEntry {
@@ -1652,7 +1653,7 @@ impl ArchiveRetryBacklog {
 
     /// Enqueue an op recovered from its on-disk journal (already durable).
     fn push_recovered(&self, op: WriteOp, journal_path: PathBuf) {
-        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         queue.push_back(ArchiveBacklogEntry {
             op,
             journal_path: Some(journal_path),
@@ -1666,7 +1667,7 @@ impl ArchiveRetryBacklog {
 
     /// Current `(depth, oldest_age_us)` of the backlog.
     fn backlog_state(&self) -> (u64, u64) {
-        let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let depth = u64::try_from(queue.len()).unwrap_or(u64::MAX);
         let oldest = queue.front().map_or(0, |entry| {
             duration_as_micros_u64(entry.first_enqueued_at.elapsed())
@@ -1681,7 +1682,7 @@ impl ArchiveRetryBacklog {
     /// once the artifact is on disk.
     fn drain_step(&self) -> ArchiveBacklogDrainStep {
         let front = {
-            let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             queue
                 .front()
                 .map(|entry| (entry.op.clone(), entry.attempts, entry.journal_path.clone()))
@@ -1691,7 +1692,7 @@ impl ArchiveRetryBacklog {
         };
         match write_op_sync(&op) {
             Ok(()) => {
-                let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 queue.pop_front();
                 self.store_depth(&queue);
                 drop(queue);
@@ -1718,7 +1719,7 @@ impl ArchiveRetryBacklog {
                     "archive backlog: materialization failed; will retry (journal retained)"
                 );
                 {
-                    let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     if let Some(front) = queue.front_mut() {
                         front.attempts = next_attempts;
                     }
@@ -1742,7 +1743,7 @@ impl ArchiveRetryBacklog {
     fn dead_letter_front(&self, op: &WriteOp, attempts: u32, error: &StorageError) {
         archive_backlog_dead_letter_append(op, attempts, error);
         let journal_path = {
-            let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let entry = queue.pop_front();
             self.store_depth(&queue);
             entry.and_then(|entry| entry.journal_path)
@@ -1847,7 +1848,7 @@ fn archive_backlog_journal_dir_for(config: &Config) -> PathBuf {
 }
 
 /// Borrow the runtime `Config` carried by any `WriteOp` variant.
-fn write_op_config(op: &WriteOp) -> &Config {
+const fn write_op_config(op: &WriteOp) -> &Config {
     match op {
         WriteOp::MessageBundle { config, .. }
         | WriteOp::AgentProfile { config, .. }
@@ -1959,12 +1960,12 @@ fn archive_backlog_journal_resolve(path: &Path) {
 }
 
 fn archive_backlog_ensure_drain(backlog: &'static ArchiveRetryBacklog) {
-    let _lifecycle = backlog.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+    let _lifecycle = backlog.lifecycle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     {
         let handle = backlog
             .drain_handle
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if handle.as_ref().is_some_and(|h| !h.is_finished()) {
             return;
         }
@@ -1977,7 +1978,7 @@ fn archive_backlog_ensure_drain(backlog: &'static ArchiveRetryBacklog) {
     *backlog
         .drain_handle
         .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
 }
 
 /// Background drain loop. Single drainer, so the front entry is stable across
@@ -2016,6 +2017,7 @@ fn archive_backlog_drain_loop(backlog: &'static ArchiveRetryBacklog) {
 /// This is the ack-fast replacement for the inline `write_op_sync` fallback used
 /// when the write-behind queue is unavailable: the reply path incurs at most one
 /// small local-disk journal fsync (not a git commit), then returns.
+#[must_use]
 pub fn archive_backlog_push(op: WriteOp) -> ArchiveBacklogPush {
     let backlog = &*ARCHIVE_BACKLOG;
     let outcome = backlog.push(op, archive_backlog_cap());
@@ -2108,7 +2110,7 @@ pub fn archive_backlog_flush_blocking(timeout: Duration) -> bool {
         if backlog
             .queue
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty()
         {
             return true;
@@ -2194,7 +2196,7 @@ enum WbqControlSendError {
 /// Flush/Shutdown messages. When the drain thread is alive-but-wedged and the
 /// channel is full, that `send` blocks indefinitely *before* the caller's 30s
 /// `recv_timeout` is ever armed, so the documented budget was not real. Same
-/// try_send + bounded-backoff shape as `wbq_enqueue_with_sender`.
+/// `try_send` + bounded-backoff shape as `wbq_enqueue_with_sender`.
 fn wbq_send_control_with_deadline(
     sender: &std::sync::mpsc::SyncSender<WbqMsg>,
     msg: WbqMsg,
@@ -2307,7 +2309,7 @@ pub fn wbq_flush() {
 /// never dropped.
 pub fn wbq_shutdown() {
     if let Some(wbq) = WBQ.get() {
-        let _lifecycle = wbq.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        let _lifecycle = wbq.lifecycle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Join only when the drain thread demonstrably keeps consuming (flush
         // acknowledged and Shutdown delivered) or is already gone. A wedged
         // thread with a full channel must not hang shutdown forever (br-lrrry).
@@ -2361,7 +2363,7 @@ pub fn wbq_shutdown() {
         // Dropping the stored sender (and our clone above, at scope end) lets
         // the channel disconnect once in-flight clones die, which is a second
         // exit path for the drain loop even if Shutdown was never delivered.
-        *wbq.sender.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *wbq.sender.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let handle = {
             let mut guard = wbq.drain_handle.lock();
             guard.take()
@@ -2380,6 +2382,7 @@ pub fn wbq_shutdown() {
 }
 
 /// Snapshot of current WBQ statistics.
+#[must_use]
 pub fn wbq_stats() -> WbqStats {
     let snap = mcp_agent_mail_core::global_metrics().snapshot();
     WbqStats {
@@ -2463,7 +2466,7 @@ struct ArchiveFailureState {
 /// Returns the next state and whether the breaker should trip NOW. A trip
 /// fires only when `consecutive_failures` first reaches `threshold` AND the
 /// per-archive cooldown has elapsed since the last trip — never on success.
-fn circuit_breaker_decide(
+const fn circuit_breaker_decide(
     prev: ArchiveFailureState,
     failed: bool,
     threshold: u64,
@@ -2520,7 +2523,7 @@ impl WbqCircuitBreaker {
         now_micros: i64,
         cooldown_micros: i64,
     ) -> (bool, ArchiveFailureState) {
-        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut map = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = map.get(archive_key).copied().unwrap_or_default();
         let (next, trip) =
             circuit_breaker_decide(prev, failed, threshold, now_micros, cooldown_micros);
@@ -2534,7 +2537,7 @@ impl WbqCircuitBreaker {
     }
 
     fn snapshot(&self) -> Vec<WbqCircuitBreakerArchive> {
-        let map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let map = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut out: Vec<WbqCircuitBreakerArchive> = map
             .iter()
             .map(|(k, v)| WbqCircuitBreakerArchive {
@@ -3412,9 +3415,7 @@ fn startup_quarantine_path_with_nonce(
     nonce: u64,
 ) -> PathBuf {
     let mut name = path
-        .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_else(|| OsString::from(fallback_name));
+        .file_name().map_or_else(|| OsString::from(fallback_name), std::ffi::OsStr::to_os_string);
     name.push(format!(
         ".startup-quarantine-{timestamp}-{}-{nonce:06}",
         std::process::id()
@@ -3467,7 +3468,7 @@ fn quarantine_startup_artifact_if_exists(
 /// Mirrors the Python `AsyncFileLock` semantics:
 /// - Lock file at the given path (e.g. `<project>/.archive.lock`)
 /// - Owner metadata in `<lock_path>.owner.json` with `{pid, created_ts}`
-/// - Stale detection: owner PID dead, or lock age > stale_timeout
+/// - Stale detection: owner PID dead, or lock age > `stale_timeout`
 /// - Exponential backoff with jitter on contention
 pub struct FileLock {
     path: PathBuf,
@@ -3484,7 +3485,8 @@ pub struct FileLock {
 impl FileLock {
     /// Create a new advisory file lock.
     ///
-    /// Defaults match Python: timeout=60s, stale_timeout=180s, max_retries=5.
+    /// Defaults match Python: timeout=60s, `stale_timeout=180s`, `max_retries=5`.
+    #[must_use]
     pub fn new(path: PathBuf) -> Self {
         let metadata_path = {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -3502,19 +3504,22 @@ impl FileLock {
     }
 
     /// Configure timeout.
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+    #[must_use]
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
     /// Configure stale timeout.
-    pub fn with_stale_timeout(mut self, stale_timeout: Duration) -> Self {
+    #[must_use]
+    pub const fn with_stale_timeout(mut self, stale_timeout: Duration) -> Self {
         self.stale_timeout = stale_timeout;
         self
     }
 
     /// Configure max retries.
-    pub fn with_max_retries(mut self, max_retries: usize) -> Self {
+    #[must_use]
+    pub const fn with_max_retries(mut self, max_retries: usize) -> Self {
         self.max_retries = max_retries;
         self
     }
@@ -3571,52 +3576,49 @@ impl FileLock {
                 .truncate(false)
                 .open(&self.path)?;
 
-            match file.try_lock_exclusive() {
-                Ok(()) => {
-                    // Verify lock identity to prevent race with cleanup_if_stale
-                    if !self.verify_lock_identity(&file)? {
-                        let _ = file.unlock();
-                        attempts += 1;
-                        continue;
-                    }
-
-                    // Lock acquired - retain file handle to hold the OS-level flock
-                    self.write_metadata()?;
-                    self.lock_file = Some(file);
-                    self.held = true;
-                    return Ok(());
-                }
-                Err(_) => {
-                    // Lock held by another process - check for stale owner first.
-                    if self.cleanup_if_stale()? {
-                        // Stale lock quarantined; retry immediately without backoff.
-                        attempts += 1;
-                        continue;
-                    }
-
+            if let Ok(()) = file.try_lock_exclusive() {
+                // Verify lock identity to prevent race with cleanup_if_stale
+                if !self.verify_lock_identity(&file)? {
+                    let _ = file.unlock();
                     attempts += 1;
-
-                    // Exponential backoff with per-thread jitter, capped by
-                    // the remaining budget so one sleep cannot overshoot the
-                    // timeout by more than the floor tick.
-                    // Uses thread-local xorshift instead of PID so threads in
-                    // the same process don't synchronize their retry delays.
-                    let attempt = attempts.saturating_sub(1);
-                    let base_ms = if attempt == 0 {
-                        50
-                    } else {
-                        50 * (1u64 << attempt.min(4))
-                    };
-                    let jitter_range = base_ms / 2 + 1; // 50% range for ±25%
-                    let jitter = thread_jitter_ms(jitter_range);
-                    let sleep_ms = base_ms
-                        .saturating_sub(base_ms / 4)
-                        .saturating_add(jitter)
-                        .max(10);
-                    let remaining_ms =
-                        self.timeout.saturating_sub(start.elapsed()).as_millis() as u64;
-                    std::thread::sleep(Duration::from_millis(sleep_ms.min(remaining_ms)));
+                    continue;
                 }
+
+                // Lock acquired - retain file handle to hold the OS-level flock
+                self.write_metadata()?;
+                self.lock_file = Some(file);
+                self.held = true;
+                return Ok(());
+            } else {
+                // Lock held by another process - check for stale owner first.
+                if self.cleanup_if_stale()? {
+                    // Stale lock quarantined; retry immediately without backoff.
+                    attempts += 1;
+                    continue;
+                }
+
+                attempts += 1;
+
+                // Exponential backoff with per-thread jitter, capped by
+                // the remaining budget so one sleep cannot overshoot the
+                // timeout by more than the floor tick.
+                // Uses thread-local xorshift instead of PID so threads in
+                // the same process don't synchronize their retry delays.
+                let attempt = attempts.saturating_sub(1);
+                let base_ms = if attempt == 0 {
+                    50
+                } else {
+                    50 * (1u64 << attempt.min(4))
+                };
+                let jitter_range = base_ms / 2 + 1; // 50% range for ±25%
+                let jitter = thread_jitter_ms(jitter_range);
+                let sleep_ms = base_ms
+                    .saturating_sub(base_ms / 4)
+                    .saturating_add(jitter)
+                    .max(10);
+                let remaining_ms =
+                    self.timeout.saturating_sub(start.elapsed()).as_millis() as u64;
+                std::thread::sleep(Duration::from_millis(sleep_ms.min(remaining_ms)));
             }
         }
 
@@ -3726,7 +3728,7 @@ impl FileLock {
             Err(err) => return Err(err.into()),
         };
 
-        let owner_alive = meta.as_ref().map(|m| pid_alive(m.pid)).unwrap_or(false);
+        let owner_alive = meta.as_ref().is_some_and(|m| pid_alive(m.pid));
         let age = meta.as_ref().map(|m| now - m.created_ts).or_else(|| {
             fs::metadata(&self.path)
                 .ok()
@@ -3899,7 +3901,7 @@ fn record_batch_size_samples(
 /// to N recipients), individual commits can be merged into a single
 /// batch commit if they target the same repo and have no path conflicts.
 ///
-/// Default settings: max_batch_size=10, max_wait=50ms, max_queue_size=100.
+/// Default settings: `max_batch_size=10`, `max_wait=50ms`, `max_queue_size=100`.
 pub struct CommitQueue {
     queue: Mutex<VecDeque<CommitRequest>>,
     max_batch_size: usize,
@@ -3918,6 +3920,7 @@ impl Default for CommitQueue {
 
 impl CommitQueue {
     /// Create a new commit queue.
+    #[must_use]
     pub fn new(max_batch_size: usize, max_wait: Duration, max_queue_size: usize) -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
@@ -3944,11 +3947,11 @@ impl CommitQueue {
         let repo_root = normalize_repo_root_key(&repo_root);
 
         {
-            let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+            let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             stats.enqueued += 1;
         }
 
-        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if queue.len() >= self.max_queue_size {
             // Queue full - fall back to direct commit
             drop(queue);
@@ -3978,7 +3981,7 @@ impl CommitQueue {
         loop {
             // Collect a batch
             let batch = {
-                let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if queue.is_empty() {
                     break;
                 }
@@ -4005,8 +4008,8 @@ impl CommitQueue {
 
         // Update queue_size stat
         {
-            let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-            let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+            let queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             stats.queue_size = queue.len();
         }
 
@@ -4020,7 +4023,7 @@ impl CommitQueue {
         }
 
         {
-            let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+            let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             stats.batched += batch.len();
         }
 
@@ -4089,17 +4092,17 @@ impl CommitQueue {
     }
 
     fn record_commit(&self, batch_size: usize) {
-        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         stats.commits += 1;
 
-        let mut sizes = self.batch_sizes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sizes = self.batch_sizes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         record_batch_size_samples(&mut stats, &mut sizes, batch_size, 1);
     }
 
     /// Get queue statistics.
     pub fn stats(&self) -> CommitQueueStats {
-        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         stats.queue_size = queue.len();
         stats
     }
@@ -4208,7 +4211,7 @@ struct RepoQueue {
     metrics: RepoCommitMetrics,
 }
 
-/// Spill state for a single repo (replaces the per-shard HashMap<PathBuf, _>).
+/// Spill state for a single repo (replaces the per-shard `HashMap`<`PathBuf`, _>).
 #[derive(Default)]
 struct CoalescerSpillState {
     inner: Option<CoalescerSpillRepo>,
@@ -4301,7 +4304,7 @@ pub struct CommitCoalescer {
     /// Global stats (backward-compatible aggregate view).
     stats: Arc<Mutex<CommitQueueStats>>,
     pending_requests: Arc<AtomicU64>,
-    /// Rolling batch size window for avg_batch_size calculation.
+    /// Rolling batch size window for `avg_batch_size` calculation.
     _batch_sizes: Arc<Mutex<VecDeque<usize>>>,
     /// Number of worker threads spawned.
     worker_count: usize,
@@ -4353,13 +4356,12 @@ fn parse_archive_batch_u64(primary_key: &str, legacy_key: &str, default: u64) ->
 
 fn parse_archive_bool(key: &str, default: bool) -> bool {
     config::env_value(key)
-        .map(|value| {
+        .map_or(default, |value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             )
         })
-        .unwrap_or(default)
 }
 
 fn configured_coalescer_flush_interval() -> Duration {
@@ -4499,7 +4501,7 @@ fn coalescer_failure_backoff(streak: u64) -> Duration {
 }
 
 fn coalescer_retry_wait(rq: &RepoQueue) -> Option<Duration> {
-    let mut guard = rq.retry_after.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = rq.retry_after.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let retry_at = (*guard)?;
     let now = Instant::now();
     if retry_at > now {
@@ -4519,7 +4521,7 @@ fn coalescer_note_commit_failure(rq: &RepoQueue) {
 
     let delay = coalescer_failure_backoff(streak);
     let retry_at = Instant::now() + delay;
-    *rq.retry_after.lock().unwrap_or_else(|e| e.into_inner()) = Some(retry_at);
+    *rq.retry_after.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(retry_at);
 
     tracing::warn!(
         streak,
@@ -4530,7 +4532,7 @@ fn coalescer_note_commit_failure(rq: &RepoQueue) {
 
 fn coalescer_note_commit_success(rq: &RepoQueue) {
     rq.failure_streak.store(0, Ordering::Relaxed);
-    *rq.retry_after.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *rq.retry_after.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 /// Auto-detect worker count bounded by `Config::coalescer_max_workers`.
@@ -4543,8 +4545,7 @@ fn coalescer_worker_count() -> usize {
         return 1;
     }
     std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+        .map_or(4, std::num::NonZero::get)
         .clamp(2, max_workers)
 }
 
@@ -4618,9 +4619,9 @@ impl CommitCoalescer {
         }
     }
 
-    /// Get or create a per-repo queue for the given repo_root.
+    /// Get or create a per-repo queue for the given `repo_root`.
     fn get_or_create_repo(&self, repo_root: &Path) -> Arc<RepoQueue> {
-        let mut repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+        let mut repos = self.repos.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(rq) = repos.get(repo_root) {
             return Arc::clone(rq);
         }
@@ -4643,7 +4644,7 @@ impl CommitCoalescer {
             .take(COALESCER_SPILL_MESSAGE_LINE_MAX_CHARS)
             .collect();
 
-        let mut guard = rq.spill.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = rq.spill.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = guard.inner.get_or_insert_with(|| CoalescerSpillRepo {
             pending_requests: 0,
             earliest_enqueued_at: fields.enqueued_at,
@@ -4713,7 +4714,7 @@ impl CommitCoalescer {
         metrics.storage.commit_enqueued_total.inc();
 
         {
-            let mut s = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+            let mut s = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.enqueued += 1;
         }
 
@@ -4758,7 +4759,7 @@ impl CommitCoalescer {
         let repo_queue_cap = config.coalescer_queue_cap;
         let queue_depth = rq.depth.load(Ordering::Relaxed);
         if queue_depth < repo_queue_cap as u64 {
-            let mut q = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let mut q = rq.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             // Re-check under lock
             if q.len() < repo_queue_cap {
                 q.push_back(fields);
@@ -4775,7 +4776,7 @@ impl CommitCoalescer {
         // Wake a worker
         let (lock, cvar) = &*self.work_cv;
         {
-            let mut wake_tokens = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let mut wake_tokens = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             *wake_tokens = wake_tokens.saturating_add(1).min(self.worker_count as u64);
         }
         cvar.notify_one();
@@ -4793,7 +4794,7 @@ impl CommitCoalescer {
             // Wake all workers
             {
                 let (lock, cvar) = &*self.work_cv;
-                let mut wake_tokens = lock.lock().unwrap_or_else(|e| e.into_inner());
+                let mut wake_tokens = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 *wake_tokens = wake_tokens
                     .saturating_add(self.worker_count as u64)
                     .min(self.worker_count as u64);
@@ -4805,7 +4806,7 @@ impl CommitCoalescer {
                 if self.pending_requests.load(Ordering::Relaxed) > 0 {
                     false
                 } else {
-                    let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+                    let repos = self.repos.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     repos.values().all(|rq| {
                         rq.depth.load(Ordering::Relaxed) == 0
                             && !rq.processing.load(Ordering::Relaxed)
@@ -4839,17 +4840,17 @@ impl CommitCoalescer {
     /// archive age.
     #[must_use]
     pub fn oldest_pending_age_us(&self) -> u64 {
-        let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+        let repos = self.repos.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut oldest: Option<Instant> = None;
         for rq in repos.values() {
             {
-                let queue = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
+                let queue = rq.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(front) = queue.front() {
                     oldest = Some(oldest.map_or(front.enqueued_at, |o| o.min(front.enqueued_at)));
                 }
             }
             {
-                let spill = rq.spill.lock().unwrap_or_else(|e| e.into_inner());
+                let spill = rq.spill.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(repo) = spill.inner.as_ref() {
                     oldest = Some(oldest.map_or(repo.earliest_enqueued_at, |o| {
                         o.min(repo.earliest_enqueued_at)
@@ -4861,10 +4862,11 @@ impl CommitCoalescer {
     }
 
     /// Get coalescer statistics (aggregate across all repos).
+    #[must_use]
     pub fn stats(&self) -> CommitQueueStats {
-        let mut s = self.stats.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut s = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         // Sum queue depths across all repos
-        let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+        let repos = self.repos.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         s.queue_size = repos
             .values()
             .map(|rq| rq.depth.load(Ordering::Relaxed) as usize)
@@ -4873,8 +4875,9 @@ impl CommitCoalescer {
     }
 
     /// Get per-repo commit statistics for observability.
+    #[must_use]
     pub fn per_repo_stats(&self) -> HashMap<PathBuf, RepoCommitStats> {
-        let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+        let repos = self.repos.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         repos
             .iter()
             .map(|(path, rq)| {
@@ -4912,7 +4915,8 @@ impl CommitCoalescer {
     }
 
     /// Number of worker threads in the pool.
-    pub fn worker_count(&self) -> usize {
+    #[must_use]
+    pub const fn worker_count(&self) -> usize {
         self.worker_count
     }
 }
@@ -4958,7 +4962,7 @@ fn coalescer_repo_readiness(
 
     let mut earliest: Option<Instant> = None;
     {
-        let q = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let q = rq.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if q.len() >= max_batch_size {
             return CoalescerRepoReadiness::Ready;
         }
@@ -4968,7 +4972,7 @@ fn coalescer_repo_readiness(
     }
 
     {
-        let spill = rq.spill.lock().unwrap_or_else(|e| e.into_inner());
+        let spill = rq.spill.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(repo) = spill.inner.as_ref() {
             if repo.pending_requests >= u64::try_from(max_batch_size).unwrap_or(u64::MAX) {
                 return CoalescerRepoReadiness::Ready;
@@ -4988,7 +4992,7 @@ fn coalescer_repo_readiness(
     if elapsed >= flush_interval {
         CoalescerRepoReadiness::Ready
     } else {
-        CoalescerRepoReadiness::Waiting(flush_interval - elapsed)
+        CoalescerRepoReadiness::Waiting(flush_interval.checked_sub(elapsed).unwrap())
     }
 }
 
@@ -4998,11 +5002,11 @@ fn coalescer_wait_for_due_work(
     wait_for: Duration,
 ) {
     let (lock, cvar) = &**work_cv;
-    let mut wake_tokens = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut wake_tokens = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if *wake_tokens == 0 && !shutdown.load(Ordering::Relaxed) {
         let (guard, _) = cvar
             .wait_timeout(wake_tokens, wait_for)
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         wake_tokens = guard;
     }
     if *wake_tokens > 0 {
@@ -5048,7 +5052,7 @@ impl Drop for CoalescerHeartbeatCycle {
 ///
 /// Strategy:
 /// 1. Wait on condvar (with a bounded idle timeout as a safety probe)
-/// 2. Scan all repos; pick the one with lowest last_serviced_us that has depth > 0
+/// 2. Scan all repos; pick the one with lowest `last_serviced_us` that has depth > 0
 ///    and is not currently being processed by another worker (CAS lock)
 /// 3. Drain its queue + spill (up to batch size)
 /// 4. Commit batch for that single repo
@@ -5079,11 +5083,11 @@ fn coalescer_pool_worker(
         // Phase 1: Wait for work
         {
             let (lock, cvar) = &*work_cv;
-            let mut wake_tokens = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let mut wake_tokens = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             while *wake_tokens == 0 && !shutdown.load(Ordering::Relaxed) {
                 let (guard, _) = cvar
                     .wait_timeout(wake_tokens, idle_wait)
-                    .unwrap_or_else(|e| e.into_inner());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 wake_tokens = guard;
             }
             if *wake_tokens > 0 {
@@ -5109,7 +5113,7 @@ fn coalescer_pool_worker(
             let force_now = force_flush.load(Ordering::Acquire);
             let mut next_due: Option<Duration> = None;
             let chosen: Option<(PathBuf, Arc<RepoQueue>)> = {
-                let repos_guard = repos.lock().unwrap_or_else(|e| e.into_inner());
+                let repos_guard = repos.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut best: Option<(PathBuf, Arc<RepoQueue>, u64)> = None;
                 for (path, rq) in repos_guard.iter() {
                     // Skip repos already being processed by another worker
@@ -5212,7 +5216,7 @@ fn self_process_repo(
     struct ProcessingGuard<'a> {
         rq: &'a Arc<RepoQueue>,
     }
-    impl<'a> Drop for ProcessingGuard<'a> {
+    impl Drop for ProcessingGuard<'_> {
         fn drop(&mut self) {
             self.rq.processing.store(false, Ordering::Release);
         }
@@ -5222,7 +5226,7 @@ fn self_process_repo(
     // Phase 3: Drain queue + spill for this repo
     let mut batch: Vec<CoalescerCommitFields> = Vec::new();
     let queue_is_empty = {
-        let mut q = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = rq.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         while batch.len() < max_batch_size {
             let next = q.front();
             if let Some(next_fields) = next {
@@ -5263,7 +5267,7 @@ fn self_process_repo(
         pending_spilled: Option<CoalescerSpilledWork>,
         inflight_spilled: Option<CoalescerSpilledWork>,
     }
-    impl<'a> Drop for PanicGuard<'a> {
+    impl Drop for PanicGuard<'_> {
         fn drop(&mut self) {
             if std::thread::panicking() {
                 if coalescer_restore_drained_work_on_panic(
@@ -5427,7 +5431,7 @@ fn self_process_repo(
 
     // If any repo still has work, wake another worker
     let more_work = {
-        let repos_guard = repos.lock().unwrap_or_else(|e| e.into_inner());
+        let repos_guard = repos.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         repos_guard
             .values()
             .any(|r| r.depth.load(Ordering::Relaxed) > 0)
@@ -5439,7 +5443,7 @@ fn self_process_repo(
     had_failure
 }
 
-/// Update global pending_requests counter and 80% threshold metric.
+/// Update global `pending_requests` counter and 80% threshold metric.
 fn coalescer_update_pending(pending_requests: &Arc<AtomicU64>, drained: u64) {
     let metrics = mcp_agent_mail_core::global_metrics();
     let pending_after = pending_requests
@@ -5468,7 +5472,7 @@ fn coalescer_update_pending(pending_requests: &Arc<AtomicU64>, drained: u64) {
 fn coalescer_signal_worker(work_cv: &Arc<(Mutex<u64>, std::sync::Condvar)>, worker_count: usize) {
     let (lock, cvar) = &**work_cv;
     {
-        let mut wake_tokens = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut wake_tokens = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         *wake_tokens = wake_tokens.saturating_add(1).min(worker_count as u64);
     }
     cvar.notify_one();
@@ -5514,7 +5518,7 @@ fn coalescer_depth_decrement(depth: &AtomicU64, drained: u64) -> u64 {
 
 /// Drain a single repo's spill buffer into a `CoalescerSpilledWork`.
 fn coalescer_drain_repo_spill(rq: &RepoQueue, repo_root: &Path) -> Option<CoalescerSpilledWork> {
-    let mut guard = rq.spill.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = rq.spill.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let repo = guard.inner.take()?;
     if repo.pending_requests == 0 {
         return None;
@@ -5540,7 +5544,7 @@ fn coalescer_requeue_requests(rq: &RepoQueue, failed_requests: Vec<CoalescerComm
         return;
     }
     let requeued = u64::try_from(failed_requests.len()).unwrap_or(u64::MAX);
-    let mut queue = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
+    let mut queue = rq.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     for request in failed_requests.into_iter().rev() {
         queue.push_front(request);
     }
@@ -5552,7 +5556,7 @@ fn coalescer_restore_spilled_work(rq: &RepoQueue, work: CoalescerSpilledWork) {
         return;
     }
 
-    let mut spill = rq.spill.lock().unwrap_or_else(|e| e.into_inner());
+    let mut spill = rq.spill.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let repo = spill.inner.get_or_insert_with(|| CoalescerSpillRepo {
         pending_requests: 0,
         earliest_enqueued_at: work.earliest_enqueued_at,
@@ -5608,11 +5612,11 @@ fn coalescer_restore_spilled_work(rq: &RepoQueue, work: CoalescerSpilledWork) {
 /// Recompute and store the true per-repo queue depth.
 fn coalescer_reconcile_repo_depth(rq: &RepoQueue) -> u64 {
     let queue_depth = {
-        let queue = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let queue = rq.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         u64::try_from(queue.len()).unwrap_or(u64::MAX)
     };
     let spill_depth = {
-        let spill = rq.spill.lock().unwrap_or_else(|e| e.into_inner());
+        let spill = rq.spill.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         spill.inner.as_ref().map_or(0, |repo| repo.pending_requests)
     };
     let actual = queue_depth.saturating_add(spill_depth);
@@ -6013,10 +6017,10 @@ fn coalescer_commit_with_retry(
 
                 // Jittered exponential backoff: base * 2^attempt + random jitter
                 let base_ms = 50 * (1u64 << attempt.min(5)); // 50, 100, 200, 400, 800, 1600
-                let jitter = SystemTime::now()
+                let jitter = u64::from(SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
-                    .subsec_micros() as u64
+                    .subsec_micros())
                     % (base_ms / 2 + 1);
                 std::thread::sleep(Duration::from_millis(base_ms + jitter));
 
@@ -6085,10 +6089,10 @@ fn coalescer_commit_all_with_retry(repo_root: &Path, config: &Config, message: &
                 }
 
                 let base_ms = 50 * (1u64 << attempt.min(5));
-                let jitter = SystemTime::now()
+                let jitter = u64::from(SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
-                    .subsec_micros() as u64
+                    .subsec_micros())
                     % (base_ms / 2 + 1);
                 std::thread::sleep(Duration::from_millis(base_ms + jitter));
 
@@ -6149,7 +6153,8 @@ pub fn flush_async_commits() {
 // Git index.lock contention handling
 // ---------------------------------------------------------------------------
 
-/// Determine the commit lock path based on project-scoped rel_paths.
+/// Determine the commit lock path based on project-scoped `rel_paths`.
+#[must_use]
 pub fn commit_lock_path(repo_root: &Path, rel_paths: &[&str]) -> PathBuf {
     if rel_paths.is_empty() {
         return repo_root.join(".commit.lock");
@@ -6390,6 +6395,7 @@ fn lock_file_age_seconds(lock_path: &Path) -> Option<f64> {
 /// 3. If the PID is dead (or no owner file), use age-based threshold
 ///
 /// Returns `true` if a stale lock was removed.
+#[must_use]
 pub fn clean_stale_git_index_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
     try_clean_stale_git_lock(repo_root, max_age_seconds)
 }
@@ -6639,7 +6645,7 @@ fn head_update_refname(repo: &Repository) -> Result<String> {
 /// that same lock. Two racing processes therefore serialize their
 /// parent-read → ref-write pairs; the loser re-parents onto the winner's
 /// commit instead of orphaning either side's objects. Plain unwrapped `git`
-/// writers remain outside this protocol (the documented AM_GIT_BINARY /
+/// writers remain outside this protocol (the documented `AM_GIT_BINARY` /
 /// git-with-amlock mitigation covers those).
 ///
 /// `build_tree` must produce the FULL state tree (as both the treebuilder
@@ -7225,7 +7231,7 @@ fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
 fn ensure_dir(dir: &Path) -> std::io::Result<()> {
     let _mutation = ArchiveMutationGuard::begin_at(dir);
     {
-        let cache = DIR_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = DIR_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if cache.contains(dir) {
             return Ok(());
         }
@@ -7241,7 +7247,7 @@ fn ensure_dir(dir: &Path) -> std::io::Result<()> {
     }
     fs::create_dir_all(dir)?;
     {
-        let mut cache = DIR_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = DIR_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.insert(dir.to_path_buf());
     }
     Ok(())
@@ -7326,12 +7332,41 @@ const ARCHIVE_GITIGNORE_ENTRIES: &[&str] =
 /// Ensure the global archive root directory exists and is a git repository.
 ///
 /// Returns `(repo_root, was_freshly_initialized)`.
+///
+/// This is the single funnel every archive write passes through
+/// (`ensure_archive` and each `WriteOp`), so it is also where a test harness
+/// is refused the operator's real default archive (br-99aih): background
+/// workers rehydrate `Config` from the process env after a test's override
+/// scope ends and would otherwise initialize and write into the live
+/// `~/.mcp_agent_mail_git_mailbox_repo`.
 pub fn ensure_archive_root(config: &Config) -> Result<(PathBuf, bool)> {
     let root = archive_storage_root(config);
+    refuse_default_storage_root_under_test_harness(&root)?;
     ensure_dir(&root)?;
 
     let fresh = ensure_repo(&root, config)?;
     Ok((root, fresh))
+}
+
+/// Refuse to initialize the operator's real default archive from a
+/// cargo/nextest/insta test harness (br-99aih).
+///
+/// Same predicate as the `Config::from_env` guard; the only bypass is
+/// `AM_ALLOW_HOME_STORAGE_ROOT=1`, which
+/// `config::with_isolated_default_storage_root_for_test` sets because its
+/// "default" root is a private tempdir. Production processes never satisfy
+/// the harness predicate, so for them this costs a few env lookups.
+fn refuse_default_storage_root_under_test_harness(root: &Path) -> Result<()> {
+    if config::default_storage_root_refused_under_test_harness(root) {
+        return Err(StorageError::InvalidPath(format!(
+            "refusing to initialize the default user archive at {} from a cargo/nextest/insta \
+             test harness (br-99aih). Set STORAGE_ROOT to an isolated directory, redirect HOME \
+             and XDG_DATA_HOME into a tempdir (`with_isolated_default_storage_root_for_test`), \
+             or export AM_ALLOW_HOME_STORAGE_ROOT=1 for an intentional test",
+            root.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Open an existing per-project archive directory without creating it.
@@ -8830,7 +8865,7 @@ pub struct AttachmentMeta {
     /// Relative path to WebP file in archive (only for file type)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// Relative path to original file (if keep_original_images is enabled)
+    /// Relative path to original file (if `keep_original_images` is enabled)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub original_path: Option<String>,
 }
@@ -8869,6 +8904,7 @@ pub enum EmbedPolicy {
 }
 
 impl EmbedPolicy {
+    #[must_use]
     pub fn from_str_policy(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "inline" => Self::Inline,
@@ -8970,7 +9006,7 @@ fn store_attachment_from_cache(
             height: manifest.height,
             data_base64: Some(encoded),
             path: None,
-            original_path: original_rel.clone(),
+            original_path: original_rel,
         }
     } else {
         AttachmentMeta {
@@ -8982,7 +9018,7 @@ fn store_attachment_from_cache(
             height: manifest.height,
             data_base64: None,
             path: Some(webp_rel),
-            original_path: original_rel.clone(),
+            original_path: original_rel,
         }
     };
 
@@ -9500,6 +9536,7 @@ pub fn process_markdown_images(
 
 /// Return `true` when the Markdown body contains at least one local image
 /// reference that would be materialized into the archive.
+#[must_use]
 pub fn markdown_has_processable_local_images(
     config: &Config,
     base_dir: &Path,
@@ -9677,6 +9714,7 @@ fn signal_debounce_key(config: &Config, project_slug: &str, agent_name: &str) ->
 }
 
 /// Emit a notification signal file for a project/agent.
+#[must_use]
 pub fn emit_notification_signal(
     config: &Config,
     project_slug: &str,
@@ -9705,7 +9743,7 @@ pub fn emit_notification_signal(
         return SignalEmitOutcome::InvalidTarget;
     }
 
-    let debounce_ms = config.notifications_debounce_ms as u128;
+    let debounce_ms = u128::from(config.notifications_debounce_ms);
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -9757,19 +9795,17 @@ pub fn emit_notification_signal(
         });
     }
 
-    match write_json(&signal_path, &signal_data, false) {
-        Ok(()) => SignalEmitOutcome::Emitted,
-        Err(_) => {
-            let mut map = signal_debounce().lock();
-            if map.get(&key).copied() == Some(now_ms) {
-                map.remove(&key);
-            }
-            SignalEmitOutcome::WriteFailed
+    if let Ok(()) = write_json(&signal_path, &signal_data, false) { SignalEmitOutcome::Emitted } else {
+        let mut map = signal_debounce().lock();
+        if map.get(&key).copied() == Some(now_ms) {
+            map.remove(&key);
         }
+        SignalEmitOutcome::WriteFailed
     }
 }
 
 /// Clear notification signal for a project/agent.
+#[must_use]
 pub fn clear_notification_signal(
     config: &Config,
     project_slug: &str,
@@ -9830,6 +9866,7 @@ pub fn clear_notification_signal(
 }
 
 /// List pending notification signals.
+#[must_use]
 pub fn list_pending_signals(config: &Config, project_slug: Option<&str>) -> Vec<serde_json::Value> {
     if !config.notifications_enabled {
         return Vec::new();
@@ -9888,10 +9925,10 @@ pub fn list_pending_signals(config: &Config, project_slug: Option<&str>) -> Vec<
             continue;
         }
         let mut entries: Vec<_> = match fs::read_dir(&agents_dir) {
-            Ok(iter) => iter.filter_map(|entry| entry.ok()).collect(),
+            Ok(iter) => iter.filter_map(std::result::Result::ok).collect(),
             Err(_) => continue,
         };
-        entries.sort_by_key(|entry| entry.path());
+        entries.sort_by_key(std::fs::DirEntry::path);
         for entry in entries {
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
@@ -9905,20 +9942,17 @@ pub fn list_pending_signals(config: &Config, project_slug: Option<&str>) -> Vec<
                     Ok(c) => c,
                     Err(_) => continue,
                 };
-                match serde_json::from_str::<serde_json::Value>(&content) {
-                    Ok(val) => results.push(val),
-                    Err(_) => {
-                        let agent = entry
-                            .path()
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        results.push(serde_json::json!({
-                            "project": slug,
-                            "agent": agent,
-                            "error": "Failed to parse signal file",
-                        }));
-                    }
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) { results.push(val) } else {
+                    let agent = entry
+                        .path()
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    results.push(serde_json::json!({
+                        "project": slug,
+                        "agent": agent,
+                        "error": "Failed to parse signal file",
+                    }));
                 }
             }
         }
@@ -10209,9 +10243,7 @@ fn relative_date_from_secs(authored_secs: i64) -> String {
     let days = delta / 86400;
     if days > 30 {
         // Format as "Feb 08, 2026"
-        DateTime::from_timestamp(authored_secs, 0)
-            .map(|dt| dt.format("%b %d, %Y").to_string())
-            .unwrap_or_else(|| "unknown".to_string())
+        DateTime::from_timestamp(authored_secs, 0).map_or_else(|| "unknown".to_string(), |dt| dt.format("%b %d, %Y").to_string())
     } else if days > 0 {
         if days == 1 {
             "1 day ago".to_string()
@@ -10296,7 +10328,7 @@ pub fn get_recent_commits_extended(
     Ok(commits)
 }
 
-/// Compute diff stats (files_changed, insertions, deletions) for a commit.
+/// Compute diff stats (`files_changed`, insertions, deletions) for a commit.
 fn commit_diff_stats(repo: &Repository, commit: &git2::Commit<'_>) -> (usize, usize, usize) {
     let tree = match commit.tree() {
         Ok(t) => t,
@@ -10561,7 +10593,7 @@ pub fn get_archive_tree(archive: &ProjectArchive, path: &str) -> Result<Vec<Tree
     };
 
     let mut entries = Vec::new();
-    for item in tree.iter() {
+    for item in tree {
         let name = item.name().unwrap_or("").to_string();
         let entry_path = if safe_path.is_empty() {
             name.clone()
@@ -10574,8 +10606,7 @@ pub fn get_archive_tree(archive: &ProjectArchive, path: &str) -> Result<Vec<Tree
             Some(git2::ObjectType::Blob) => {
                 let sz = repo
                     .find_blob(item.id())
-                    .map(|b| b.size() as u64)
-                    .unwrap_or(0);
+                    .map_or(0, |b| b.size() as u64);
                 ("file".to_string(), sz)
             }
             _ => ("file".to_string(), 0),
@@ -12044,6 +12075,7 @@ fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
 }
 
 /// ISO 8601 timestamp for the current time.
+#[must_use]
 pub fn now_iso() -> String {
     Utc::now().to_rfc3339()
 }
@@ -12063,6 +12095,7 @@ pub use mcp_agent_mail_core::{ConsistencyMessageRef, ConsistencyReport};
 ///
 /// This is intentionally cheap (filesystem stat, no git open) and runs at
 /// startup or on-demand.
+#[must_use]
 pub fn check_archive_consistency(
     storage_root: &Path,
     messages: &[ConsistencyMessageRef],
@@ -12072,31 +12105,25 @@ pub fn check_archive_consistency(
     let mut missing_ids: Vec<i64> = Vec::new();
 
     for msg in messages {
-        let project_slug = match validate_archive_component("project slug", &msg.project_slug) {
-            Ok(project_slug) => project_slug,
-            Err(_) => {
-                missing += 1;
-                if missing_ids.len() < 20 {
-                    missing_ids.push(msg.message_id);
-                }
-                continue;
+        let project_slug = if let Ok(project_slug) = validate_archive_component("project slug", &msg.project_slug) { project_slug } else {
+            missing += 1;
+            if missing_ids.len() < 20 {
+                missing_ids.push(msg.message_id);
             }
+            continue;
         };
         // Build the expected canonical path:
         // {storage_root}/projects/{slug}/messages/{YYYY}/{MM}/{iso}__{slug}__{id}.md
         let project_dir = storage_root.join("projects").join(project_slug);
 
         // Parse the ISO timestamp to extract year/month
-        let (year, month) = match parse_year_month(&msg.created_ts_iso) {
-            Some(ym) => ym,
-            None => {
-                // Can't determine path; count as missing
-                missing += 1;
-                if missing_ids.len() < 20 {
-                    missing_ids.push(msg.message_id);
-                }
-                continue;
+        let (year, month) = if let Some(ym) = parse_year_month(&msg.created_ts_iso) { ym } else {
+            // Can't determine path; count as missing
+            missing += 1;
+            if missing_ids.len() < 20 {
+                missing_ids.push(msg.message_id);
             }
+            continue;
         };
 
         let iso_prefix = archive_filename_timestamp_prefix(&msg.created_ts_iso);
@@ -12661,6 +12688,131 @@ mod tests {
         // Second call should not re-initialize
         let (_root2, fresh2) = ensure_archive_root(&config).unwrap();
         assert!(!fresh2);
+    }
+
+    /// Redirected `HOME` / `XDG_DATA_HOME` values that move the *default*
+    /// storage root into a tempdir for the br-99aih funnel tests.
+    struct IsolatedDefaultRootEnv {
+        home: String,
+        xdg_data: String,
+    }
+
+    impl IsolatedDefaultRootEnv {
+        fn new(tmp: &Path) -> Self {
+            let home = tmp.join("home");
+            let xdg_data = tmp.join("xdg-data");
+            fs::create_dir_all(&home).expect("create isolated home");
+            fs::create_dir_all(&xdg_data).expect("create isolated xdg data dir");
+            Self {
+                home: home.to_string_lossy().into_owned(),
+                xdg_data: xdg_data.to_string_lossy().into_owned(),
+            }
+        }
+
+        /// Overrides for `config::with_process_env_overrides_for_test`: the
+        /// redirected home/XDG dirs plus a pinned harness marker so the guard
+        /// predicate is deterministic even when a remote runner relocates the
+        /// unit-test binary off `deps/`.
+        fn overrides<'a>(&'a self, allow_home_storage_root: &'a str) -> [(&'a str, &'a str); 5] {
+            [
+                ("HOME", self.home.as_str()),
+                ("USERPROFILE", self.home.as_str()),
+                ("XDG_DATA_HOME", self.xdg_data.as_str()),
+                ("NEXTEST_RUN_ID", "storage-default-root-guard"),
+                ("AM_ALLOW_HOME_STORAGE_ROOT", allow_home_storage_root),
+            ]
+        }
+    }
+
+    #[test]
+    fn ensure_archive_root_refuses_default_root_under_test_harness() {
+        // br-99aih: every archive write funnels through `ensure_archive_root`,
+        // so a background worker that rehydrates `Config` from the ambient env
+        // after a test's override scope ends must be refused the operator's
+        // real default archive. Redirect HOME/XDG into a tempdir so the
+        // "default root" is private, then prove the refusal happens before
+        // anything is created.
+        let tmp = TempDir::new().unwrap();
+        let env = IsolatedDefaultRootEnv::new(tmp.path());
+
+        config::with_process_env_overrides_for_test(&env.overrides(""), || {
+            let default_root = config::default_storage_root_path();
+            assert!(
+                default_root.starts_with(tmp.path()),
+                "redirected default root {} must live inside the tempdir",
+                default_root.display()
+            );
+            assert!(config::is_running_under_cargo_test_harness());
+
+            let refused = ensure_archive_root(&test_config(&default_root))
+                .expect_err("default root must be refused under a test harness");
+            assert!(
+                matches!(refused, StorageError::InvalidPath(_)),
+                "unexpected error variant: {refused:?}"
+            );
+            let message = refused.to_string();
+            assert!(message.contains("AM_ALLOW_HOME_STORAGE_ROOT"), "{message}");
+            assert!(message.contains("STORAGE_ROOT"), "{message}");
+            assert!(
+                !default_root.exists(),
+                "refusal must happen before the archive root is created"
+            );
+
+            // `ensure_archive` (and therefore every WriteOp) shares the funnel.
+            let refused_project = ensure_archive(&test_config(&default_root), "leak-probe")
+                .expect_err("ensure_archive must share the refusal");
+            assert!(
+                matches!(refused_project, StorageError::InvalidPath(_)),
+                "unexpected error variant: {refused_project:?}"
+            );
+            assert!(!default_root.join("projects").exists());
+
+            // An isolated (non-default) root is still accepted as usual.
+            let isolated = tmp.path().join("isolated-root");
+            let (root, fresh) = ensure_archive_root(&test_config(&isolated))
+                .expect("isolated root must be accepted");
+            assert!(fresh);
+            assert!(root.join(".git").exists());
+        });
+    }
+
+    #[test]
+    fn ensure_archive_root_accepts_default_root_with_explicit_escape_hatch() {
+        // Same harness setup, but AM_ALLOW_HOME_STORAGE_ROOT=1: the escape
+        // hatch used by `with_isolated_default_storage_root_for_test` must let
+        // a (private) default root initialize normally.
+        let tmp = TempDir::new().unwrap();
+        let env = IsolatedDefaultRootEnv::new(tmp.path());
+
+        config::with_process_env_overrides_for_test(&env.overrides("1"), || {
+            let default_root = config::default_storage_root_path();
+            assert!(default_root.starts_with(tmp.path()));
+            assert!(config::is_running_under_cargo_test_harness());
+
+            let (root, fresh) = ensure_archive_root(&test_config(&default_root))
+                .expect("escape hatch must admit the private default root");
+            assert!(fresh);
+            assert_eq!(root, default_root);
+            assert!(root.join(".git").exists());
+        });
+    }
+
+    #[test]
+    fn ensure_archive_accepts_isolated_default_root_helper() {
+        // The core helper redirects the default root and sets the escape
+        // hatch itself, so archive writes through the funnel just work.
+        let created = config::with_isolated_default_storage_root_for_test(|root| {
+            let archive = ensure_archive(&test_config(root), "helper-probe")
+                .expect("isolated default root must accept archive writes");
+            assert!(archive.root.starts_with(root));
+            assert!(root.join(".git").exists());
+            archive.root
+        });
+        assert!(
+            !created.exists(),
+            "helper must remove its tempdir after the closure returns: {}",
+            created.display()
+        );
     }
 
     #[test]

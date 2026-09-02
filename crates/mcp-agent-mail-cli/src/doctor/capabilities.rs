@@ -202,6 +202,28 @@ pub fn build_report(tool_version: String, write_scopes: Vec<PathBuf>) -> Capabil
     ] {
         env_vars.insert(k.to_string(), json!(v));
     }
+    // GH#290: surface the whole Air Traffic Control knob surface from the
+    // flag registry (single source of truth) so agents reading
+    // `capabilities --json` can discover every AM_ATC_* variable, its
+    // default, and what it does.
+    for flag in mcp_agent_mail_core::flags::flag_registry()
+        .iter()
+        .filter(|flag| flag.subsystem == "atc")
+    {
+        env_vars.insert(
+            flag.env_var.to_string(),
+            json!({
+                "subsystem": flag.subsystem,
+                "kind": flag.kind.label(),
+                "allowed_values": flag.kind.allowed_values(),
+                "default": flag.default_value,
+                "restart_required": flag.restart_required,
+                "doc": flag.doc,
+                "notes": flag.notes,
+                "inspect": "am config atc",
+            }),
+        );
+    }
 
     let fm_fixers = super::fixers::registry();
     let fm_fixer_count = fm_fixers.len();

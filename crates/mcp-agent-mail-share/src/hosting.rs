@@ -277,7 +277,7 @@ mod tests {
         let hints = detect_hosting_hints(dir.path());
         // May find nothing or env-based hints
         for hint in &hints {
-            assert!(!hint.signals.is_empty());
+            assert_ne!(hint.signals, [] as [std::string::String; 0]);
         }
     }
 

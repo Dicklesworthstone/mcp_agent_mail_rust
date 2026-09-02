@@ -370,10 +370,10 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
         #[cfg(windows)]
         {
             let with_ext = candidate.with_extension("exe");
-            if let Ok(meta) = fs::metadata(&with_ext) {
-                if meta.is_file() {
-                    return Some(with_ext);
-                }
+            if let Ok(meta) = fs::metadata(&with_ext)
+                && meta.is_file()
+            {
+                return Some(with_ext);
             }
         }
     }
@@ -393,7 +393,7 @@ fn is_executable(path: &Path, _meta: &fs::Metadata) -> bool {
         lower.insert(0, '.');
         lower
     });
-    matches!(ext.as_deref(), Some(".exe") | Some(".cmd") | Some(".bat"))
+    matches!(ext.as_deref(), Some(".exe" | ".cmd" | ".bat"))
 }
 
 /// Spawn `<path> --version` and read stdout with a wall-clock timeout.

@@ -153,7 +153,9 @@ impl<'a> GitCmd<'a> {
         self
     }
 
-    /// Skip the OS flock acquisition. Use for guard-hook callers only.
+    /// Skip the OS flock acquisition. Use only for guard-hook callers or
+    /// provably read-only probes whose contract forbids creating the flock
+    /// sentinel itself (for example a dry-run safety preflight).
     #[must_use]
     pub const fn skip_flock(mut self) -> Self {
         self.skip_flock = true;
@@ -396,7 +398,7 @@ fn classify_exit(status: std::process::ExitStatus) -> GitRunOutcome {
 fn classify_exit(status: std::process::ExitStatus) -> GitRunOutcome {
     // Windows STATUS_ACCESS_VIOLATION = 0xC0000005. Treat as segfault-like.
     if let Some(code) = status.code()
-        && code as u32 == 0xC000_0005
+        && code.cast_unsigned() == 0xC000_0005
     {
         return GitRunOutcome::SegfaultLike { signal: 11 };
     }

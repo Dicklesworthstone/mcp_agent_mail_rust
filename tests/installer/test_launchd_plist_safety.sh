@@ -46,10 +46,15 @@ extract_function() {
 {
     printf '%s\n' 'warn() { printf "%s\n" "$*" >&2; }'
     printf '%s\n' 'verbose() { printf "%s\n" "$*" >&2; }'
+    printf '%s\n' 'info() { :; }'
+    printf '%s\n' 'ok() { :; }'
+    printf '%s\n' 'err() { :; }'
     extract_function trim_ascii_whitespace
     extract_function strip_wrapping_quotes
     extract_function parse_env_assignment_rhs
     extract_function read_env_assignment_value
+    extract_function rust_config_env_path
+    extract_function generate_bearer_token
     extract_function desired_service_bind_host
     extract_function desired_service_bind_port
     extract_function plist_xml_escape
@@ -57,11 +62,24 @@ extract_function() {
     extract_function plist_env_entry
     extract_function ensure_real_directory_tree
     extract_function ensure_real_file_target_path
+    extract_function private_file_identity
+    extract_function private_file_link_count
+    extract_function private_file_security_identity
+    extract_function ensure_private_file_target_path
+    extract_function write_private_file_atomic
     extract_function write_launchd_service_plist
     extract_function repair_launchd_service_env_from_rust_config
+    extract_function trusted_system_directory_alias_target
+    extract_function detect_mcp_configs
+    extract_function remote_http_client_target_tools
+    extract_function has_remote_http_client_targets
+    extract_function probe_remote_http_endpoint
+    extract_function ensure_remote_http_client_readiness
+    extract_function configure_mcp_clients_for_install
+    sed -n '/^install_legacy_launcher_takeover_shims() {/,/^# T1\.5:/p' "$INSTALL_SH" | sed '$d'
 } >"$extract"
 
-for required in plist_xml_escape ensure_real_directory_tree ensure_real_file_target_path write_launchd_service_plist repair_launchd_service_env_from_rust_config; do
+for required in rust_config_env_path generate_bearer_token plist_xml_escape ensure_real_directory_tree ensure_real_file_target_path private_file_identity private_file_link_count private_file_security_identity ensure_private_file_target_path write_private_file_atomic write_launchd_service_plist repair_launchd_service_env_from_rust_config trusted_system_directory_alias_target detect_mcp_configs remote_http_client_target_tools has_remote_http_client_targets probe_remote_http_endpoint ensure_remote_http_client_readiness configure_mcp_clients_for_install install_legacy_launcher_takeover_shims; do
     if ! grep -q "^${required}()" "$extract"; then
         fail "could not extract ${required} from install.sh"
     fi
@@ -69,6 +87,63 @@ done
 
 # shellcheck source=/dev/null
 source "$extract"
+
+# The isolated repair scenarios intentionally exercise the writer even though
+# their temporary DEST is not the installer's default service destination.
+service_management_allowed() { return 0; }
+
+step "scenario 0A: config.env authority honors only an absolute XDG override"
+path_home="$tmp/path-home"
+path_xdg="$tmp/path-xdg"
+[ "$(HOME="$path_home" XDG_CONFIG_HOME="$path_xdg" rust_config_env_path)" = \
+    "$path_xdg/mcp-agent-mail/config.env" ] \
+    || fail "absolute XDG_CONFIG_HOME was not selected"
+[ "$(HOME="$path_home" XDG_CONFIG_HOME='' rust_config_env_path)" = \
+    "$path_home/.config/mcp-agent-mail/config.env" ] \
+    || fail "empty XDG_CONFIG_HOME did not fall back to HOME"
+[ "$(HOME="$path_home" XDG_CONFIG_HOME=relative-config rust_config_env_path)" = \
+    "$path_home/.config/mcp-agent-mail/config.env" ] \
+    || fail "relative XDG_CONFIG_HOME was not ignored"
+if HOME=relative-home XDG_CONFIG_HOME=relative-config rust_config_env_path >/dev/null; then
+    fail "relative HOME and XDG_CONFIG_HOME produced a credential path"
+fi
+
+step "scenario 0B: bearer generation rejects missing or malformed RNG output"
+empty_path="$tmp/empty-path"
+invalid_rng_path="$tmp/invalid-rng-path"
+mkdir -p "$empty_path" "$invalid_rng_path"
+cat >"$invalid_rng_path/openssl" <<'EOF'
+#!/bin/sh
+printf '%s' 'not-hex'
+EOF
+chmod 755 "$invalid_rng_path/openssl"
+if PATH="$empty_path" generate_bearer_token >/dev/null; then
+    fail "bearer generation succeeded without RNG tooling"
+fi
+if PATH="$invalid_rng_path" generate_bearer_token >/dev/null; then
+    fail "bearer generation accepted malformed OpenSSL output"
+fi
+
+step "scenario 0C: cryptographic bearer sources produce valid distinct tokens"
+if command -v openssl >/dev/null 2>&1; then
+    openssl_token_a="$(generate_bearer_token)" || fail "OpenSSL bearer generation failed"
+    openssl_token_b="$(generate_bearer_token)" || fail "second OpenSSL bearer generation failed"
+    [ "${#openssl_token_a}" -eq 64 ] || fail "OpenSSL bearer has the wrong length"
+    [ "$openssl_token_a" != "$openssl_token_b" ] || fail "OpenSSL bearers were not distinct"
+fi
+urandom_path="$tmp/urandom-path"
+mkdir -p "$urandom_path"
+for helper in head od tr; do
+    helper_path="$(command -v "$helper")"
+    [ -n "$helper_path" ] || fail "required urandom helper is unavailable: $helper"
+    ln -s "$helper_path" "$urandom_path/$helper"
+done
+urandom_token_a="$(PATH="$urandom_path" generate_bearer_token)" \
+    || fail "/dev/urandom bearer generation failed"
+urandom_token_b="$(PATH="$urandom_path" generate_bearer_token)" \
+    || fail "second /dev/urandom bearer generation failed"
+[ "${#urandom_token_a}" -eq 64 ] || fail "/dev/urandom bearer has the wrong length"
+[ "$urandom_token_a" != "$urandom_token_b" ] || fail "/dev/urandom bearers were not distinct"
 
 write_test_plist() {
     local plist_path="$1"
@@ -94,6 +169,12 @@ write_test_plist "$plist_a" "$home_a" "$storage_a" || fail "normal plist write f
 grep -q '<string>/opt/agent mail/bin/am</string>' "$plist_a" || fail "missing am binary argument"
 grep -q '<string>tok&amp;en</string>' "$plist_a" || fail "token was not XML-escaped"
 grep -q '<string>/mcp/?x=&lt;y&gt;</string>' "$plist_a" || fail "HTTP_PATH was not XML-escaped"
+if stat -f '%Lp' "$plist_a" >/dev/null 2>&1; then
+    plist_a_mode="$(stat -f '%Lp' "$plist_a")"
+else
+    plist_a_mode="$(stat -c '%a' "$plist_a")"
+fi
+[ "$plist_a_mode" = "600" ] || fail "credential-bearing plist mode was $plist_a_mode, expected 600"
 
 step "scenario B: symlinked plist target is rejected without mutating target"
 home_b="$tmp/home-b"
@@ -186,5 +267,416 @@ grep -Fq '<string>repair&amp;token</string>' "$plist_g" || fail "repair path did
 grep -Fq '<string>/mcp/repair</string>' "$plist_g" || fail "repair path did not use HTTP_PATH from config.env"
 grep -q "^bootout " "$launchctl_log" || fail "repair path did not restart existing launchd service"
 grep -q "^bootstrap " "$launchctl_log" || fail "repair path did not bootstrap launchd service"
+
+step "scenario H: plist rewrite failure propagates to the caller"
+if (
+    write_launchd_service_plist() { return 1; }
+    export OS=darwin
+    export HOME="$home_g"
+    export DEST="/opt/agent mail/bin"
+    export BIN_CLI="am"
+    export PATH="$fake_bin:$PATH"
+    unset RUST_STORAGE_ROOT
+    repair_launchd_service_env_from_rust_config
+); then
+    fail "plist rewrite failure was reported as successful"
+fi
+
+step "scenario I: launchctl bootstrap failure propagates to the caller"
+cat >"$fake_bin/launchctl" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$launchctl_log"
+if [ "\${1:-}" = "bootstrap" ]; then
+    exit 69
+fi
+exit 0
+EOF
+chmod 755 "$fake_bin/launchctl"
+if (
+    export OS=darwin
+    export HOME="$home_g"
+    export DEST="/opt/agent mail/bin"
+    export BIN_CLI="am"
+    export PATH="$fake_bin:$PATH"
+    unset RUST_STORAGE_ROOT
+    repair_launchd_service_env_from_rust_config
+); then
+    fail "launchctl bootstrap failure was reported as successful"
+fi
+
+step "scenario I2: production target discovery never resolves a relative HOME from cwd"
+relative_home_root="$tmp/relative-home-root"
+relative_home_path="$tmp/relative-home-empty-path"
+mkdir -p "$relative_home_root/relative-home/.omp/agent" "$relative_home_path"
+printf '%s\n' '{}' >"$relative_home_root/relative-home/.omp/agent/mcp.json"
+relative_home_targets="$(
+    cd "$relative_home_root"
+    unset APPDATA OMP_PROFILE PI_PROFILE PI_CONFIG_DIR PI_CODING_AGENT_DIR
+    HOME=relative-home PATH="$relative_home_path" remote_http_client_target_tools
+)"
+[ -z "$relative_home_targets" ] \
+    || fail "production detector accepted cwd-relative HOME authority"
+
+relative_agent_root="$tmp/relative-agent-root"
+relative_agent_home="$tmp/relative-agent-home"
+mkdir -p "$relative_agent_root/relative-agent" "$relative_agent_home"
+printf '%s\n' '{}' >"$relative_agent_root/relative-agent/mcp.json"
+set +e
+relative_agent_targets="$(
+    cd "$relative_agent_root"
+    unset APPDATA OMP_PROFILE PI_PROFILE PI_CONFIG_DIR
+    HOME="$relative_agent_home" PI_CODING_AGENT_DIR=relative-agent \
+        PATH="$relative_home_path" remote_http_client_target_tools
+)"
+relative_agent_rc=$?
+set -e
+[ "$relative_agent_rc" -eq 2 ] \
+    || fail "cwd-relative PI_CODING_AGENT_DIR returned $relative_agent_rc instead of 2"
+[ -z "$relative_agent_targets" ] \
+    || fail "production detector emitted a cwd-relative OMP target"
+
+absolute_agent_dir="$relative_agent_home/absolute-agent"
+mkdir -p "$absolute_agent_dir"
+printf '%s\n' '{}' >"$absolute_agent_dir/mcp.json"
+absolute_agent_targets="$(
+    cd "$relative_agent_root"
+    unset APPDATA OMP_PROFILE PI_PROFILE PI_CONFIG_DIR
+    HOME="$relative_agent_home" PI_CODING_AGENT_DIR="$absolute_agent_dir" \
+        PATH="$relative_home_path" remote_http_client_target_tools
+)"
+[ "$absolute_agent_targets" = "omp" ] \
+    || fail "production detector rejected an absolute PI_CODING_AGENT_DIR authority"
+
+trusted_alias_body="$(extract_function trusted_system_directory_alias_target)"
+for trusted_alias_mapping in \
+    '/var) expected="/private/var"' \
+    '/tmp) expected="/private/tmp"' \
+    '/etc) expected="/private/etc"'; do
+    printf '%s\n' "$trusted_alias_body" | grep -Fq "$trusted_alias_mapping" \
+        || fail "trusted system alias policy is missing exact mapping: $trusted_alias_mapping"
+done
+printf '%s\n' "$trusted_alias_body" \
+    | grep -Fq 'resolved=$(CDPATH= cd -P "$path" 2>/dev/null && pwd -P)' \
+    || fail "trusted system alias policy does not bind the physical destination"
+printf '%s\n' "$trusted_alias_body" \
+    | grep -Fq '[ "$resolved" = "$expected" ] || return 1' \
+    || fail "trusted system alias policy accepts a retargeted root alias"
+
+symlink_agent_root="$tmp/symlink-agent-root"
+symlink_agent_target="$tmp/symlink-agent-target"
+mkdir -p "$symlink_agent_root" "$symlink_agent_target/agent"
+printf '%s\n' '{}' >"$symlink_agent_target/agent/mcp.json"
+ln -s "$symlink_agent_target" "$symlink_agent_root/linked-parent"
+set +e
+symlink_agent_targets="$(
+    cd "$relative_agent_root"
+    unset APPDATA OMP_PROFILE PI_PROFILE PI_CONFIG_DIR
+    HOME="$relative_agent_home" \
+        PI_CODING_AGENT_DIR="$symlink_agent_root/linked-parent/agent" \
+        PATH="$relative_home_path" remote_http_client_target_tools
+)"
+symlink_agent_rc=$?
+set -e
+[ "$symlink_agent_rc" -eq 2 ] \
+    || fail "symlinked PI_CODING_AGENT_DIR ancestry returned $symlink_agent_rc instead of 2"
+[ -z "$symlink_agent_targets" ] \
+    || fail "production detector emitted an OMP target through symlinked PI_CODING_AGENT_DIR ancestry"
+
+non_directory_agent_root="$tmp/non-directory-agent-root"
+mkdir -p "$non_directory_agent_root"
+printf '%s\n' 'not a directory' >"$non_directory_agent_root/file-parent"
+set +e
+non_directory_agent_targets="$(
+    cd "$relative_agent_root"
+    unset APPDATA OMP_PROFILE PI_PROFILE PI_CONFIG_DIR
+    HOME="$relative_agent_home" \
+        PI_CODING_AGENT_DIR="$non_directory_agent_root/file-parent/agent" \
+        PATH="$relative_home_path" remote_http_client_target_tools
+)"
+non_directory_agent_rc=$?
+set -e
+[ "$non_directory_agent_rc" -eq 2 ] \
+    || fail "non-directory PI_CODING_AGENT_DIR ancestry returned $non_directory_agent_rc instead of 2"
+[ -z "$non_directory_agent_targets" ] \
+    || fail "production detector emitted an OMP target through non-directory PI_CODING_AGENT_DIR ancestry"
+
+symlink_config_home="$tmp/symlink-config-home"
+symlink_config_target="$tmp/symlink-config-target"
+mkdir -p "$symlink_config_home" "$symlink_config_target/nested/agent"
+printf '%s\n' '{}' >"$symlink_config_target/nested/agent/mcp.json"
+ln -s "$symlink_config_target" "$symlink_config_home/custom-root"
+set +e
+symlink_config_targets="$(
+    unset APPDATA OMP_PROFILE PI_PROFILE PI_CODING_AGENT_DIR
+    HOME="$symlink_config_home" PI_CONFIG_DIR=custom-root/nested \
+        PATH="$relative_home_path" remote_http_client_target_tools
+)"
+symlink_config_rc=$?
+set -e
+[ "$symlink_config_rc" -eq 2 ] \
+    || fail "symlinked PI_CONFIG_DIR ancestry returned $symlink_config_rc instead of 2"
+[ -z "$symlink_config_targets" ] \
+    || fail "production detector emitted an OMP target through symlinked PI_CONFIG_DIR ancestry"
+
+set +e
+traversal_config_targets="$(
+    unset APPDATA OMP_PROFILE PI_PROFILE PI_CODING_AGENT_DIR
+    HOME="$relative_agent_home" PI_CONFIG_DIR=../relative-agent-root/relative-agent \
+        PATH="$relative_home_path" remote_http_client_target_tools
+)"
+traversal_config_rc=$?
+set -e
+[ "$traversal_config_rc" -eq 2 ] \
+    || fail "parent-traversing PI_CONFIG_DIR returned $traversal_config_rc instead of 2"
+[ -z "$traversal_config_targets" ] \
+    || fail "production detector emitted an OMP target through PI_CONFIG_DIR traversal"
+
+safe_config_home="$tmp/safe-config-home"
+mkdir -p "$safe_config_home/custom-root/nested/agent"
+printf '%s\n' '{}' >"$safe_config_home/custom-root/nested/agent/mcp.json"
+safe_config_targets="$(
+    cd "$relative_agent_root"
+    unset APPDATA OMP_PROFILE PI_PROFILE PI_CODING_AGENT_DIR
+    HOME="$safe_config_home" PI_CONFIG_DIR=custom-root/nested \
+        PATH="$relative_home_path" remote_http_client_target_tools
+)"
+[ "$safe_config_targets" = "omp" ] \
+    || fail "production detector rejected a safe HOME-relative PI_CONFIG_DIR authority"
+
+active_profile_home="$tmp/active-profile-home"
+active_profile_path="$tmp/active-profile-path"
+mkdir -p "$active_profile_home/custom-omp/profiles/work/agent"
+mkdir -p "$active_profile_path"
+ln -s "$(command -v grep)" "$active_profile_path/grep"
+printf '%s\n' '{}' >"$active_profile_home/custom-omp/profiles/work/agent/mcp.json"
+set +e
+active_profile_targets="$(
+    cd "$active_profile_home"
+    unset APPDATA PI_PROFILE PI_CODING_AGENT_DIR
+    HOME="$active_profile_home" PI_CONFIG_DIR=custom-omp OMP_PROFILE=work \
+        PATH="$active_profile_path" remote_http_client_target_tools
+)"
+active_profile_rc=$?
+set -e
+[ "$active_profile_rc" -eq 0 ] \
+    || fail "custom active OMP profile authority returned $active_profile_rc"
+[ "$active_profile_targets" = "omp" ] \
+    || fail "production target discovery rejected a custom active OMP profile authority"
+
+step "scenario J: OMP-only targets activate healthy and unhealthy readiness lanes"
+omp_only_config="$tmp/omp-only-mcp.json"
+printf '%s\n' '{}' >"$omp_only_config"
+readiness_home="$tmp/readiness-home"
+readiness_path="$tmp/readiness-empty-path"
+readiness_dest="$tmp/readiness-bin"
+mkdir -p "$readiness_home" "$readiness_path" "$readiness_dest"
+
+production_probe_path="$tmp/production-probe-path"
+production_probe_marker="$tmp/production-probe-marker"
+mkdir -p "$production_probe_path"
+cat >"$production_probe_path/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+saw_auth=0
+url=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -H)
+            shift
+            [ "${1:-}" = 'Authorization: Bearer authenticated-probe-token' ] || exit 86
+            saw_auth=1
+            ;;
+        http://* | https://*) url="$1" ;;
+    esac
+    shift
+done
+[ "$saw_auth" -eq 1 ] || exit 87
+printf '%s\n' 'authenticated' >"$PRODUCTION_PROBE_MARKER"
+case "$url" in
+    */health/readiness) printf '%s\n' '{"status":"ready"}' ;;
+    *) exit 88 ;;
+esac
+EOF
+chmod 755 "$production_probe_path/curl"
+desired_mcp_http_base_url() { printf '%s' 'http://127.0.0.1:8765'; }
+resolve_setup_http_bearer_token() { printf '%s' 'authenticated-probe-token'; }
+export PRODUCTION_PROBE_MARKER="$production_probe_marker"
+production_probe_stdout="$(PATH="$production_probe_path:/usr/bin:/bin" probe_remote_http_endpoint)" \
+    || fail "production authenticated readiness probe failed"
+unset PRODUCTION_PROBE_MARKER
+[ -z "$production_probe_stdout" ] \
+    || fail "production authenticated readiness probe emitted credential-bearing output"
+[ "$(cat "$production_probe_marker")" = 'authenticated' ] \
+    || fail "production readiness probe omitted the bearer authorization header"
+
+remote_scan_mode=omp
+detect_mcp_configs() {
+    if [ "$remote_scan_mode" = "omp" ]; then
+        printf 'omp\t%s\t1\n' "$omp_only_config"
+    fi
+}
+desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+REMOTE_PROBE_CALLS=0
+probe_remote_http_endpoint() {
+    REMOTE_PROBE_CALLS=$((REMOTE_PROBE_CALLS + 1))
+    REMOTE_HTTP_PROBE_DETAIL="stub healthy"
+    return 0
+}
+HOME="$readiness_home" PATH="$readiness_path" ensure_remote_http_client_readiness \
+    || fail "healthy OMP-only readiness lane failed"
+[ "$REMOTE_PROBE_CALLS" -eq 1 ] || fail "OMP-only target did not run the healthy endpoint probe"
+
+cat >"$readiness_dest/am" <<'EOF'
+#!/bin/sh
+exit 64
+EOF
+chmod 755 "$readiness_dest/am"
+probe_remote_http_endpoint() {
+    REMOTE_PROBE_CALLS=$((REMOTE_PROBE_CALLS + 1))
+    REMOTE_HTTP_PROBE_DETAIL="stub unhealthy"
+    return 1
+}
+service_management_allowed() { return 0; }
+platform_supports_user_service_management() { return 0; }
+DEST="$readiness_dest"
+BIN_CLI=am
+if HOME="$readiness_home" PATH="$readiness_path" ensure_remote_http_client_readiness; then
+    fail "unhealthy OMP-only readiness lane was reported as successful"
+fi
+
+step "scenario K: readiness still skips when no remote HTTP client is present"
+remote_scan_mode=none
+REMOTE_PROBE_CALLS=0
+if ! HOME="$readiness_home" PATH="$readiness_path" ensure_remote_http_client_readiness; then
+    fail "no-client readiness skip returned failure"
+fi
+[ "$REMOTE_PROBE_CALLS" -eq 0 ] || fail "no-client readiness skip still probed the endpoint"
+
+step "scenario K2: invalid OMP authority is a hard readiness failure"
+detect_mcp_configs() { return 2; }
+if HOME="$readiness_home" PATH="$readiness_path" ensure_remote_http_client_readiness; then
+    fail "invalid OMP authority was treated as a no-client readiness skip"
+else
+    invalid_readiness_rc=$?
+fi
+[ "$invalid_readiness_rc" -eq 2 ] \
+    || fail "invalid OMP authority returned $invalid_readiness_rc instead of 2"
+
+step "scenario K3: production setup wrapper fails only for established client authority"
+configure_mcp_clients() { return 1; }
+remote_http_client_target_tools() { printf '%s\n' omp; }
+if AM_INSTALL_SKIP_REMOTE_HTTP_READINESS=1 \
+    configure_mcp_clients_for_install /unused/server /unused/am; then
+    fail "readiness override suppressed a detected OMP setup failure"
+fi
+remote_http_client_target_tools() { printf '%s\n' codex; }
+if configure_mcp_clients_for_install /unused/server /unused/am; then
+    fail "detected Codex setup failure was suppressed"
+fi
+remote_http_client_target_tools() { return 0; }
+configure_mcp_clients_for_install /unused/server /unused/am \
+    || fail "genuine no-client setup failure became fatal"
+
+configure_call_marker="$tmp/configure-call-marker"
+configure_mcp_clients() { printf '%s\n' invoked >"$configure_call_marker"; return 0; }
+remote_http_client_target_tools() { return 2; }
+if configure_mcp_clients_for_install /unused/server /unused/am; then
+    fail "invalid client authority was reported as successful"
+else
+    invalid_setup_rc=$?
+fi
+[ "$invalid_setup_rc" -eq 2 ] \
+    || fail "invalid client authority returned $invalid_setup_rc instead of 2"
+[ ! -e "$configure_call_marker" ] \
+    || fail "setup writer ran after invalid client authority"
+
+grep -Fq 'if ! configure_mcp_clients_for_install "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI"; then' \
+    "$INSTALL_SH" || fail "production installer does not call the failure-policy wrapper"
+if grep -Eq 'configure_mcp_clients(_for_install)? .*\|\| true' "$INSTALL_SH"; then
+    fail "production installer still suppresses MCP configuration failure"
+fi
+
+step "scenario K4: private atomic writer publishes one secure inode and refuses symlinks"
+private_writer_dir="$tmp/private-writer"
+private_writer_path="$private_writer_dir/config.env"
+private_writer_peer="$private_writer_dir/config.env.peer"
+private_writer_victim="$private_writer_dir/victim.env"
+private_writer_symlink="$private_writer_dir/symlink.env"
+mkdir -p "$private_writer_dir"
+printf '%s\n' 'OLD=preserved' >"$private_writer_path"
+chmod 600 "$private_writer_path"
+ln "$private_writer_path" "$private_writer_peer"
+printf '%s\n' 'NEW=private' \
+    | write_private_file_atomic "$private_writer_path" "private writer control" \
+    || fail "private writer ordinary hardlink-detaching replacement failed"
+[ "$(cat "$private_writer_path")" = 'NEW=private' ] \
+    || fail "private writer published the wrong content"
+[ "$(cat "$private_writer_peer")" = 'OLD=preserved' ] \
+    || fail "private writer modified the outside hardlink peer"
+private_file_security_identity "$private_writer_path" >/dev/null \
+    || fail "private writer did not publish a mode-600 single-link regular file"
+printf '%s\n' 'VICTIM=unchanged' >"$private_writer_victim"
+chmod 600 "$private_writer_victim"
+ln -s "$private_writer_victim" "$private_writer_symlink"
+if printf '%s\n' 'VICTIM=clobbered' \
+    | write_private_file_atomic "$private_writer_symlink" "private writer symlink control"; then
+    fail "private writer followed a symlink destination"
+fi
+[ "$(cat "$private_writer_victim")" = 'VICTIM=unchanged' ] \
+    || fail "private writer changed a symlink target"
+[ -L "$private_writer_symlink" ] \
+    || fail "private writer replaced the planted symlink"
+
+step "scenario K5: private atomic writer statically binds publication without path chmod"
+private_security_body="$(extract_function private_file_security_identity)"
+private_writer_body="$(extract_function write_private_file_atomic)"
+printf '%s\n' "$private_security_body" | grep -Fq "stat -f '%d:%i:%Lp:%l:%HT'" \
+    || fail "private writer lacks BSD no-follow type/mode/link identity"
+printf '%s\n' "$private_security_body" | grep -Fq "stat -c '%d:%i:%a:%h:%F'" \
+    || fail "private writer lacks GNU no-follow type/mode/link identity"
+printf '%s\n' "$private_writer_body" | grep -Fq \
+    "published_security_identity=\$(private_file_security_identity \"\$path\")" \
+    || fail "private writer does not validate the published path identity"
+printf '%s\n' "$private_writer_body" | grep -Fq \
+    "[ \"\$published_security_identity\" != \"\$tmp_security_identity\" ]" \
+    || fail "private writer does not bind publication to the validated tempfile"
+if printf '%s\n' "$private_writer_body" | grep -Fq "chmod 600 \"\$path\""; then
+    fail "private writer reopens a symlink-follow chmod race after publication"
+fi
+
+step "scenario L: generated legacy shim follows the absolute config.env authority contract"
+legacy_clone="$tmp/legacy-clone"
+legacy_rust_bin="$tmp/legacy-rust-bin"
+legacy_home="$tmp/legacy-home"
+legacy_xdg="$tmp/legacy-xdg"
+mkdir -p "$legacy_rust_bin" \
+    "$legacy_home/.config/mcp-agent-mail" \
+    "$legacy_xdg/mcp-agent-mail"
+cat >"$legacy_rust_bin/am" <<'EOF'
+#!/bin/sh
+printf '%s' "${HTTP_BEARER_TOKEN:-missing-token}"
+EOF
+chmod 755 "$legacy_rust_bin/am"
+printf '%s\n' 'HTTP_BEARER_TOKEN=home-fallback-token' \
+    >"$legacy_home/.config/mcp-agent-mail/config.env"
+printf '%s\n' 'HTTP_BEARER_TOKEN=custom-xdg-token' \
+    >"$legacy_xdg/mcp-agent-mail/config.env"
+PYTHON_CLONE_FOUND=1
+PYTHON_CLONE_PATH="$legacy_clone"
+DEST="$legacy_rust_bin"
+BIN_CLI=am
+install_legacy_launcher_takeover_shims \
+    || fail "could not generate isolated legacy takeover shim"
+legacy_shim="$legacy_clone/scripts/run_server_with_token.sh"
+[ -x "$legacy_shim" ] || fail "legacy takeover shim was not executable"
+[ "$(HOME="$legacy_home" XDG_CONFIG_HOME="$legacy_xdg" "$legacy_shim")" = \
+    "custom-xdg-token" ] || fail "legacy shim did not prefer custom XDG credential"
+[ "$(HOME="$legacy_home" XDG_CONFIG_HOME=relative-config "$legacy_shim")" = \
+    "home-fallback-token" ] || fail "legacy shim did not ignore relative XDG credential path"
+[ "$(unset HOME; XDG_CONFIG_HOME="$legacy_xdg" "$legacy_shim")" = \
+    "custom-xdg-token" ] || fail "legacy shim required HOME despite an absolute XDG authority"
+if HOME=relative-home XDG_CONFIG_HOME=relative-config "$legacy_shim" >/dev/null 2>&1; then
+    fail "legacy shim accepted relative HOME and XDG credential authorities"
+fi
 
 step "ALL SCENARIOS PASSED"

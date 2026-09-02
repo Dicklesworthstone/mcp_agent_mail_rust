@@ -810,11 +810,7 @@ fn check_filesystem_activity(
             ActivityProbeResult::Active | ActivityProbeResult::Truncated
         );
     }
-    if candidate.exists() && path_modified_within_grace(&candidate, now_us, grace_us) {
-        return true;
-    }
-
-    false
+    candidate.exists() && path_modified_within_grace(&candidate, now_us, grace_us)
 }
 
 /// Check if any matched files have recent git commit activity.

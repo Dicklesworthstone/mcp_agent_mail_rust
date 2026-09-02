@@ -200,15 +200,23 @@ impl HealthSignals {
         } else {
             wbq_backlog
         };
+        // GH#272: classify from the trailing-window percentiles, not the
+        // process-lifetime histograms. A lifetime p95 pushed past the red
+        // threshold by historical stalls would otherwise be "resurrected" by
+        // any later in-flight request (pending flips 0 -> 1) even though the
+        // current queue is healthy. The recent window decays within
+        // 2 x RECENT_WINDOW_SECS, so only genuinely recent slow samples can
+        // drive health yellow/red. The depth gates below remain as a fast
+        // disarm for provably idle queues.
         let wbq_queue_p95_us = if wbq_effective_depth == 0 {
             0
         } else {
-            snap.storage.wbq_queue_latency_us.p95
+            snap.storage.wbq_queue_latency_recent_us.p95
         };
         let commit_queue_p95_us = if snap.storage.commit_pending_requests == 0 {
             0
         } else {
-            snap.storage.commit_queue_latency_us.p95
+            snap.storage.commit_queue_latency_recent_us.p95
         };
         let (disk_pressure_level, disk_pressure_stale) = fresh_pressure_level(
             snap.system.disk_pressure_level,
@@ -982,6 +990,7 @@ mod tests {
                     p95: 0,
                     p99: 0,
                 },
+                wbq_queue_latency_recent_us: RecentHistogramSnapshot::default(),
                 wbq_last_unrecoverable_error_us: 0,
                 wbq_unrecoverable_errors_total: 0,
                 wbq_respawn_salvaged_total: 0,
@@ -1007,6 +1016,7 @@ mod tests {
                     p95: 0,
                     p99: 0,
                 },
+                commit_queue_latency_recent_us: RecentHistogramSnapshot::default(),
                 needs_reindex_total: 0,
                 archive_lock_wait_us: HistogramSnapshot {
                     count: 0,
@@ -1105,6 +1115,14 @@ mod tests {
             p95: 44_000,
             p99: 44_000,
         };
+        snap.storage.wbq_queue_latency_recent_us = RecentHistogramSnapshot {
+            window_secs: RECENT_WINDOW_SECS,
+            count: 1,
+            max: 44_000,
+            p50: 44_000,
+            p95: 44_000,
+            p99: 44_000,
+        };
         snap.storage.wbq_over_80_since_us = now_us - 5_000_000;
         snap.storage.commit_pending_requests = 45;
         snap.storage.commit_soft_cap = 90;
@@ -1112,6 +1130,14 @@ mod tests {
             count: 1,
             sum: 49_000,
             min: 49_000,
+            max: 49_000,
+            p50: 49_000,
+            p95: 49_000,
+            p99: 49_000,
+        };
+        snap.storage.commit_queue_latency_recent_us = RecentHistogramSnapshot {
+            window_secs: RECENT_WINDOW_SECS,
+            count: 1,
             max: 49_000,
             p50: 49_000,
             p95: 49_000,
@@ -1185,6 +1211,17 @@ mod tests {
             p95: red::QUEUE_WAIT_P95_US,
             p99: red::QUEUE_WAIT_P95_US,
         };
+        // Even a *recent* slow sample must be disarmed by a drained queue.
+        snap.storage.wbq_queue_latency_recent_us = RecentHistogramSnapshot {
+            window_secs: RECENT_WINDOW_SECS,
+            count: 1,
+            max: red::QUEUE_WAIT_P95_US,
+            p50: red::QUEUE_WAIT_P95_US,
+            p95: red::QUEUE_WAIT_P95_US,
+            p99: red::QUEUE_WAIT_P95_US,
+        };
+        snap.storage.commit_queue_latency_recent_us =
+            snap.storage.wbq_queue_latency_recent_us.clone();
 
         let signals = HealthSignals::from_snapshot(&snap, now_us);
 
@@ -1213,6 +1250,14 @@ mod tests {
             p95: 10_604_000, // ~10.6s, dominated by historical git commits
             p99: 10_604_000,
         };
+        snap.storage.wbq_queue_latency_recent_us = RecentHistogramSnapshot {
+            window_secs: RECENT_WINDOW_SECS,
+            count: 1,
+            max: 10_604_000,
+            p50: 10_604_000,
+            p95: 10_604_000,
+            p99: 10_604_000,
+        };
 
         let signals = HealthSignals::from_snapshot(&snap, now_us);
         assert_eq!(signals.wbq_queue_p95_us, 0);
@@ -1238,9 +1283,66 @@ mod tests {
             p95: 10_604_000,
             p99: 10_604_000,
         };
+        snap.storage.wbq_queue_latency_recent_us = RecentHistogramSnapshot {
+            window_secs: RECENT_WINDOW_SECS,
+            count: 3,
+            max: 10_604_000,
+            p50: 5_000,
+            p95: 10_604_000,
+            p99: 10_604_000,
+        };
 
         let signals = HealthSignals::from_snapshot(&snap, now_us);
         assert_eq!(signals.wbq_queue_p95_us, 10_604_000);
+        assert_eq!(signals.classify(), HealthLevel::Red);
+    }
+
+    #[test]
+    fn health_signals_pending_commit_does_not_resurrect_lifetime_p95() {
+        // GH#272: a lifetime commit-queue p95 above the red threshold must not
+        // flip health red just because one fresh commit is in flight. Only the
+        // trailing-window percentiles may arm the queue-wait signal.
+        let slow = red::QUEUE_WAIT_P95_US * 40; // ~10s historical stall
+        let lifetime = HistogramSnapshot {
+            count: 635,
+            sum: slow,
+            min: 1_000,
+            max: slow,
+            p50: 5_000,
+            p95: slow,
+            p99: slow,
+        };
+
+        // Leg 1: no pending commits -> green despite the poisoned lifetime p95.
+        let mut snap = GlobalMetrics::default().snapshot();
+        let now_us = 1_000_000_000;
+        snap.storage.commit_queue_latency_us = lifetime;
+        snap.storage.commit_pending_requests = 0;
+        let signals = HealthSignals::from_snapshot(&snap, now_us);
+        assert_eq!(signals.commit_queue_p95_us, 0);
+        assert_eq!(signals.classify(), HealthLevel::Green);
+
+        // Leg 2: one fresh in-flight commit with no recent slow samples stays
+        // green — pending flipping 0 -> 1 must not resurrect the lifetime p95.
+        snap.storage.commit_pending_requests = 1;
+        snap.storage.commit_soft_cap = 8192;
+        assert_eq!(snap.storage.commit_queue_latency_recent_us.count, 0);
+        let signals = HealthSignals::from_snapshot(&snap, now_us);
+        assert_eq!(signals.commit_queue_p95_us, 0);
+        assert_eq!(signals.classify(), HealthLevel::Green);
+
+        // Leg 3: a genuinely slow *recent* p95 above the threshold still
+        // produces red while a commit is pending.
+        snap.storage.commit_queue_latency_recent_us = RecentHistogramSnapshot {
+            window_secs: RECENT_WINDOW_SECS,
+            count: 2,
+            max: slow,
+            p50: slow,
+            p95: slow,
+            p99: slow,
+        };
+        let signals = HealthSignals::from_snapshot(&snap, now_us);
+        assert_eq!(signals.commit_queue_p95_us, slow);
         assert_eq!(signals.classify(), HealthLevel::Red);
     }
 

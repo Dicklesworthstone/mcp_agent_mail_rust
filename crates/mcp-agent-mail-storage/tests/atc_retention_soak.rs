@@ -71,7 +71,7 @@ fn expect_outcome<T>(outcome: Outcome<T, DbError>, context: &str) -> T {
     }
 }
 
-fn action_for(effect_kind: EffectKind) -> &'static str {
+const fn action_for(effect_kind: EffectKind) -> &'static str {
     match effect_kind {
         EffectKind::Advisory => "SendAdvisory",
         EffectKind::Probe => "ProbeAgent",

@@ -16,7 +16,7 @@
 //! are built on top of these two primitives.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::time::Instant;
@@ -3969,7 +3969,7 @@ pub struct AtcEngine {
     /// Incremental liveness review schedule.
     liveness_schedule: BinaryHeap<Reverse<ScheduledAgentReview>>,
     /// Agents that must be reevaluated immediately due to policy changes.
-    dirty_agents: HashSet<String>,
+    dirty_agents: BTreeSet<String>,
     /// Per-project conflict graphs.
     conflict_graphs: HashMap<String, ProjectConflictGraph>,
     /// Projects whose conflict state has changed since the last cached render.
@@ -4149,7 +4149,7 @@ impl AtcEngine {
             sorted_agent_names: Vec::new(),
             agent_order_dirty: false,
             liveness_schedule: BinaryHeap::new(),
-            dirty_agents: HashSet::new(),
+            dirty_agents: BTreeSet::new(),
             conflict_graphs: HashMap::new(),
             dirty_projects: HashSet::new(),
             session_summary: SessionSummary::default(),
@@ -4917,10 +4917,12 @@ impl AtcEngine {
         self.schedule_entry_for_push(agent, incumbent_review.min(candidate_review));
     }
 
-    fn pop_due_agents(&mut self, now_micros: i64) -> Vec<String> {
-        let mut due = Vec::new();
-        let mut seen = HashSet::new();
-        while let Some(Reverse(next)) = self.liveness_schedule.peek().cloned() {
+    fn pop_due_agents(&mut self, now_micros: i64, max_reviews: usize) -> Vec<String> {
+        let mut due = Vec::with_capacity(max_reviews);
+        let mut seen = HashSet::with_capacity(max_reviews);
+        while due.len() < max_reviews
+            && let Some(Reverse(next)) = self.liveness_schedule.peek().cloned()
+        {
             if next.review_at_micros > now_micros {
                 break;
             }
@@ -4934,10 +4936,18 @@ impl AtcEngine {
                 continue;
             }
             if seen.insert(next.agent.clone()) {
+                // A policy refresh can mark the same agent dirty while it is
+                // already due in the scheduler. Consume both representations
+                // together so the next batch cannot evaluate it twice.
+                self.dirty_agents.remove(&next.agent);
                 due.push(next.agent);
             }
         }
-        for agent in self.dirty_agents.drain() {
+        while due.len() < max_reviews {
+            let Some(agent) = self.dirty_agents.iter().next().cloned() else {
+                break;
+            };
+            self.dirty_agents.remove(&agent);
             if seen.insert(agent.clone()) {
                 due.push(agent);
             }
@@ -5138,7 +5148,7 @@ impl AtcEngine {
         let fallback_active = fallback_reason.is_some();
         let incumbent_policy = self.incumbent_policy.clone();
         let candidate_policy = self.shadow_policy.candidate.clone();
-        let due_agents = self.pop_due_agents(now_micros);
+        let due_agents = self.pop_due_agents(now_micros, MAX_LIVENESS_REVIEWS_PER_TICK);
         let mut evaluation = LivenessEvaluation {
             due_agents: due_agents.len(),
             ..LivenessEvaluation::default()
@@ -6160,7 +6170,16 @@ impl AtcEngine {
 
         let reported_mode = self.budget_mode();
         let reported_fallback_reason = self.current_release_guard_reason();
-        let next_due_micros = self.next_scheduled_review_micros();
+        // Policy refreshes enqueue agents in `dirty_agents` independently of
+        // their ordinary liveness deadlines. If a bounded tick leaves dirty
+        // work behind, publish an already-due deadline so the operator loop
+        // resumes at its 250ms floor instead of sleeping until the earliest
+        // (possibly hours-away) scheduled review.
+        let next_due_micros = if self.dirty_agents.is_empty() {
+            self.next_scheduled_review_micros()
+        } else {
+            Some(now_micros)
+        };
 
         let kernel = AtcKernelTelemetry {
             due_agents: liveness.due_agents,
@@ -9390,10 +9409,7 @@ impl AtcEngine {
     pub fn config_from_env(config: &mcp_agent_mail_core::Config) -> AtcConfig {
         AtcConfig {
             enabled: config.atc_enabled,
-            policy_bundle_path: std::env::var("AM_ATC_POLICY_BUNDLE_PATH")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
+            policy_bundle_path: mcp_agent_mail_core::config::atc_policy_bundle_path(),
             probe_interval_micros: i64::try_from(config.atc_probe_interval_secs)
                 .unwrap_or(120)
                 .saturating_mul(1_000_000),
@@ -9601,6 +9617,16 @@ pub struct AtcPopulationSyncStats {
     pub active_agents: usize,
 }
 
+/// Maximum number of overdue liveness reviews evaluated by one ATC tick.
+///
+/// Durable population hydration can legitimately seed thousands of agents at
+/// once. Draining every overdue scheduler entry in one tick turns that bounded
+/// snapshot into an unbounded burst of effects for the 512-entry executor
+/// queue. Eight reviews per tick clears a 940-agent cold start in under 30
+/// seconds at the operator's 250ms floor while leaving ample headroom for
+/// probes, deadlock advisories, and HTTP/MCP work.
+const MAX_LIVENESS_REVIEWS_PER_TICK: usize = 8;
+
 /// Hydrate the ATC engine from the durable DB snapshot.
 ///
 /// This seeds pre-existing agents on cold start and refreshes their latest
@@ -9614,31 +9640,15 @@ pub struct AtcPopulationSyncStats {
 pub fn atc_sync_population_from_db(
     pool: &mcp_agent_mail_db::DbPool,
 ) -> Result<AtcPopulationSyncStats, String> {
-    /// Default recency window: 7 days in microseconds.  Agents silent longer
-    /// than this are already effectively Dead; loading them generates a
-    /// cold-start effect burst without any coordination value.
-    const DEFAULT_RECENCY_MICROS: i64 = 7 * 24 * 3600 * 1_000_000;
-    /// Hard upper bound on one refresh's row materialization. This is far
-    /// above observed active populations while preventing a corrupt or very
-    /// long-lived mailbox from turning a periodic control-plane task into an
-    /// unbounded allocation.
-    const DEFAULT_POPULATION_LIMIT: usize = 4096;
-    const MAX_POPULATION_LIMIT: usize = 65_536;
-
-    let recency_micros =
-        mcp_agent_mail_core::config::full_env_value("AM_ATC_POPULATION_RECENCY_SECS")
-            .and_then(|v| v.trim().parse::<i64>().ok())
-            .filter(|secs| *secs >= 0)
-            .map(|secs| secs.saturating_mul(1_000_000))
-            .unwrap_or(DEFAULT_RECENCY_MICROS);
+    // Knob parsing (defaults, clamps, env layering) lives in core so the
+    // `am flags` registry and this hydration path cannot drift (GH#290).
+    let recency_micros = i64::try_from(mcp_agent_mail_core::config::atc_population_recency_secs())
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000_000);
 
     let now = mcp_agent_mail_core::timestamps::now_micros();
     let recency_cutoff = now.saturating_sub(recency_micros);
-    let population_limit = mcp_agent_mail_core::config::full_env_value("AM_ATC_POPULATION_LIMIT")
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|limit| *limit > 0)
-        .unwrap_or(DEFAULT_POPULATION_LIMIT)
-        .min(MAX_POPULATION_LIMIT);
+    let population_limit = mcp_agent_mail_core::config::atc_population_limit();
 
     let cx = asupersync::Cx::for_request_with_budget(asupersync::Budget::INFINITE);
     let agents =
@@ -11188,6 +11198,100 @@ mod alien_enhancement_tests {
         assert_eq!(after.schedule_version, schedule_version);
         assert_eq!(after.next_review_micros, next_review_micros);
         assert_eq!(engine.liveness_schedule.len(), heap_len);
+    }
+
+    #[test]
+    fn overdue_population_reviews_are_bounded_and_make_fair_progress() {
+        const POPULATION: usize = 940;
+        let mut engine = AtcEngine::new_for_testing();
+        let observed_at = 1_000_000_i64;
+        let review_at = observed_at.saturating_add(30 * 24 * 60 * 60 * 1_000_000);
+
+        for index in 0..POPULATION {
+            let agent = format!("HydratedAgent{index:04}");
+            engine.register_agent(&agent, "codex-cli", Some("/tmp/hydration"));
+            engine.observe_activity(&agent, Some("/tmp/hydration"), observed_at);
+        }
+
+        let mut reviewed = HashSet::with_capacity(POPULATION);
+        let mut batches = 0_usize;
+        loop {
+            let due = engine.pop_due_agents(review_at, MAX_LIVENESS_REVIEWS_PER_TICK);
+            if due.is_empty() {
+                break;
+            }
+            assert!(
+                due.len() <= MAX_LIVENESS_REVIEWS_PER_TICK,
+                "one tick exceeded its liveness review budget"
+            );
+            for agent in due {
+                assert!(
+                    reviewed.insert(agent),
+                    "an overdue agent was reviewed twice"
+                );
+            }
+            batches = batches.saturating_add(1);
+        }
+
+        assert_eq!(reviewed.len(), POPULATION);
+        assert_eq!(batches, POPULATION.div_ceil(MAX_LIVENESS_REVIEWS_PER_TICK));
+    }
+
+    #[test]
+    fn dirty_population_reviews_remain_bounded_without_losing_agents() {
+        const POPULATION: usize = 940;
+        let mut engine = AtcEngine::new_for_testing();
+        for index in 0..POPULATION {
+            let agent = format!("DirtyAgent{index:04}");
+            engine.register_agent(&agent, "codex-cli", Some("/tmp/dirty"));
+        }
+        engine.liveness_schedule.clear();
+        engine.mark_agents_dirty();
+
+        let mut reviewed = HashSet::with_capacity(POPULATION);
+        let first_batch = engine.pop_due_agents(i64::MAX, MAX_LIVENESS_REVIEWS_PER_TICK);
+        assert_eq!(
+            first_batch,
+            (0..MAX_LIVENESS_REVIEWS_PER_TICK)
+                .map(|index| format!("DirtyAgent{index:04}"))
+                .collect::<Vec<_>>(),
+            "dirty hydration order must be stable across processes and restarts"
+        );
+        reviewed.extend(first_batch);
+        while !engine.dirty_agents.is_empty() {
+            let due = engine.pop_due_agents(i64::MAX, MAX_LIVENESS_REVIEWS_PER_TICK);
+            assert!(
+                !due.is_empty(),
+                "dirty review batching stopped making progress"
+            );
+            assert!(due.len() <= MAX_LIVENESS_REVIEWS_PER_TICK);
+            reviewed.extend(due);
+        }
+
+        assert_eq!(reviewed.len(), POPULATION);
+    }
+
+    #[test]
+    fn dirty_backlog_publishes_an_immediate_resume_deadline() {
+        let mut engine = AtcEngine::new_for_testing();
+        for index in 0..=MAX_LIVENESS_REVIEWS_PER_TICK {
+            engine.register_agent(&format!("ResumeAgent{index:04}"), "codex-cli", None);
+        }
+        engine.liveness_schedule.clear();
+        engine.mark_agents_dirty();
+
+        let now_micros = 42_000_000;
+        let report = engine.run_tick(now_micros);
+        assert_eq!(
+            report.summary.kernel.due_agents,
+            MAX_LIVENESS_REVIEWS_PER_TICK
+        );
+        assert_eq!(report.summary.kernel.dirty_agents, 1);
+        assert_eq!(
+            report.summary.kernel.next_due_micros,
+            Some(now_micros),
+            "remaining dirty work must keep the operator loop at its bounded tick floor"
+        );
     }
 
     #[test]

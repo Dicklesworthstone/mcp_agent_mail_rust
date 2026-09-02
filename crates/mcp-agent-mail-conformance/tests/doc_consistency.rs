@@ -22,6 +22,9 @@ struct LiveCounts {
     tools: usize,
     resources: usize,
     screens: usize,
+    doctor_verbs: usize,
+    robot_subcommands: usize,
+    themes: usize,
 }
 
 #[derive(Debug)]
@@ -76,11 +79,29 @@ fn collect_runtime_resources() -> BTreeSet<String> {
     resources
 }
 
+/// Count the user-facing subcommands of one `am <family>` from the live clap
+/// tree (the implicit `help` subcommand is not a verb).
+fn live_cli_subcommand_count(family: &str) -> usize {
+    use clap::CommandFactory;
+    let root = mcp_agent_mail_cli::Cli::command();
+    let family_cmd = root
+        .get_subcommands()
+        .find(|cmd| cmd.get_name() == family)
+        .unwrap_or_else(|| panic!("`am {family}` is missing from the clap tree"));
+    family_cmd
+        .get_subcommands()
+        .filter(|cmd| cmd.get_name() != "help")
+        .count()
+}
+
 fn live_counts() -> LiveCounts {
     LiveCounts {
         tools: mcp_agent_mail_tools::TOOL_CLUSTER_MAP.len(),
         resources: collect_runtime_resources().len(),
         screens: mcp_agent_mail_server::tui_screens::ALL_SCREEN_IDS.len(),
+        doctor_verbs: live_cli_subcommand_count("doctor"),
+        robot_subcommands: live_cli_subcommand_count("robot"),
+        themes: mcp_agent_mail_server::tui_theme::NAMED_THEME_COUNT,
     }
 }
 
@@ -90,9 +111,8 @@ fn compile(pattern: &str) -> Regex {
 
 fn find_count_match(doc: &str, regex: &Regex) -> Option<CountMatch> {
     for (idx, line) in doc.lines().enumerate() {
-        let captures = match regex.captures(line) {
-            Some(captures) => captures,
-            None => continue,
+        let Some(captures) = regex.captures(line) else {
+            continue;
         };
         let found = captures["count"].parse::<usize>().unwrap_or_else(|e| {
             panic!(
@@ -236,6 +256,38 @@ fn validate_readme(doc: &str, counts: LiveCounts) -> Result<(), String> {
                 expected: counts.screens,
                 source_of_truth: "mcp_agent_mail_server::tui_screens::ALL_SCREEN_IDS",
             },
+            ClaimPattern {
+                label: "README feature table robot subcommand count",
+                regex: compile(
+                    r"\|\s+\*\*Robot Mode\*\*\s+\|\s+(?P<count>\d+) agent-optimized CLI subcommands",
+                ),
+                expected: counts.robot_subcommands,
+                source_of_truth: "clap tree: mcp_agent_mail_cli::Cli::command() -> `robot` subcommands",
+            },
+            ClaimPattern {
+                label: "README robot section heading",
+                regex: compile(r"^### (?P<count>\d+) Subcommands$"),
+                expected: counts.robot_subcommands,
+                source_of_truth: "clap tree: mcp_agent_mail_cli::Cli::command() -> `robot` subcommands",
+            },
+            ClaimPattern {
+                label: "README family detail doctor verb count",
+                regex: compile(r"^\| `doctor` \((?P<count>\d+) verbs\) \|"),
+                expected: counts.doctor_verbs,
+                source_of_truth: "clap tree: mcp_agent_mail_cli::Cli::command() -> `doctor` subcommands",
+            },
+            ClaimPattern {
+                label: "README command families doctor verb count",
+                regex: compile(r"`doctor \.\.\.` \((?P<count>\d+) verbs:"),
+                expected: counts.doctor_verbs,
+                source_of_truth: "clap tree: mcp_agent_mail_cli::Cli::command() -> `doctor` subcommands",
+            },
+            ClaimPattern {
+                label: "README TUI theme count",
+                regex: compile(r"\*\*Themes:\*\* (?P<count>\d+) named palettes"),
+                expected: counts.themes,
+                source_of_truth: "mcp_agent_mail_server::tui_theme::NAMED_THEME_COUNT",
+            },
         ],
     )
 }
@@ -273,15 +325,13 @@ fn validate_agents_md(doc: &str, counts: LiveCounts) -> Result<(), String> {
             },
             ClaimPattern {
                 label: "AGENTS conformance category resource count",
-                regex: compile(
-                    r"34 Python-parity tools \+ 6 Rust-native, (?P<count>\d+) resources",
-                ),
+                regex: compile(r"38 tools\) plus 7 Rust-native tools and (?P<count>\d+) resources"),
                 expected: counts.resources,
                 source_of_truth: "mcp_agent_mail_server::build_server(...).into_router() resource/template inventory",
             },
             ClaimPattern {
                 label: "AGENTS conformance fixture paragraph resource count",
-                regex: compile(r"across 34 Python-parity tools and (?P<count>\d+) resources"),
+                regex: compile(r"across 37 captured behavior tools and (?P<count>\d+) resources"),
                 expected: counts.resources,
                 source_of_truth: "mcp_agent_mail_server::build_server(...).into_router() resource/template inventory",
             },
@@ -296,6 +346,18 @@ fn validate_agents_md(doc: &str, counts: LiveCounts) -> Result<(), String> {
                 regex: compile(r"^### (?P<count>\d+)-Screen TUI$"),
                 expected: counts.screens,
                 source_of_truth: "mcp_agent_mail_server::tui_screens::ALL_SCREEN_IDS",
+            },
+            ClaimPattern {
+                label: "AGENTS doctor verbs heading",
+                regex: compile(r"^### Verbs \((?P<count>\d+) verbs;"),
+                expected: counts.doctor_verbs,
+                source_of_truth: "clap tree: mcp_agent_mail_cli::Cli::command() -> `doctor` subcommands",
+            },
+            ClaimPattern {
+                label: "AGENTS robot command reference heading",
+                regex: compile(r"^#### Command Reference \((?P<count>\d+) subcommands\)$"),
+                expected: counts.robot_subcommands,
+                source_of_truth: "clap tree: mcp_agent_mail_cli::Cli::command() -> `robot` subcommands",
             },
         ],
     )

@@ -174,6 +174,8 @@ Replaces the legacy 4,000-line bash installer entirely. Built into `am` binary.
 
 **Current state:** `DbConn` and canonical verification/recovery paths now use `sqlmodel-frankensqlite`, and the Rust binaries no longer link `libsqlite3`.
 
+> **Reality note (2026-09-01):** the runtime mailbox path is FrankenSQLite only (`DbConn`, test-enforced), but the binaries still statically bundle C SQLite through `sqlmodel-sqlite` (a non-optional dependency of the db and cli crates) for verification and recovery cross-checks (`CanonicalDbConn`: doctor double-probe, reconstruct, legacy import). `BEGIN CONCURRENT` is implemented but opt-in (`FSQLITE_CONCURRENT_MODE`, default off; 85 `BEGIN IMMEDIATE` sites remain) pending the upstream MVCC snapshot-drift fix, and the `fsqlite_raptorq_enabled` config flag has no readers yet.
+
 **Next hardening work:**
 - Keep closing any remaining engine feature gaps directly in FrankenSQLite rather than reintroducing C SQLite
 - Replace all `BEGIN IMMEDIATE` with `BEGIN CONCURRENT` for page-level MVCC (128 concurrent writers)
@@ -193,6 +195,8 @@ Zero tokio in source code. All async via `Cx` + structured concurrency. HTTP via
 > "The documentation for each MCP tool, the way that incorrect tool calls are handled, etc. from the original Python project are MASTERPIECES OF ENGINEERING AND THE RESULT OF MONTHS OF WORK AND RESEARCH. EVERY SINGLE ELEMENT OF THEM — LITERALLY TO THE LAST PUNCTUATION MARKS — MUST BE PRESERVED EXACTLY IN THIS RUST VERSION."
 
 This is absolute. Tool descriptions, parameter names, error messages, help text — byte-for-byte parity with Python. Conformance tests enforce this.
+
+> **Reality note (2026-09-01):** what the conformance suite actually enforces today is the tool inventory (38 compatibility + 7 Rust-native), parameter names and input-schema compatibility (required arguments may relax but never tighten), error-code envelopes, and resource coverage. Tool prose is Rust-owned: `crates/mcp-agent-mail-conformance/tests/tool_description_parity.rs` compares descriptions to the Python fixture but records a mismatch as `PASS (Rust wording revised)`. Byte-for-byte prose parity is therefore a policy statement, not a gate.
 
 ---
 

@@ -65,8 +65,41 @@ mitigations — lives in [`docs/SPEC-threat-model.md`](docs/SPEC-threat-model.md
 - Bearer-token comparison is constant-time.
 - `cargo audit` + `cargo deny` run weekly in CI
   ([`.github/workflows/supply-chain-audit.yml`](.github/workflows/supply-chain-audit.yml)),
-  and release binaries are checksummed (`SHA256SUMS`) with optional Sigstore
-  cosign verification (`install.sh --verify`).
+  and release verification in the installers is mandatory by default
+  (bypassable only with an explicit `--no-verify`).
+
+## Release trust model
+
+- **Releases v0.3.31 and later** are built and published by the maintainer's
+  own release infrastructure, not GitHub Actions. Each release ships a
+  `SHA256SUMS` manifest and a detached **minisign** signature
+  (`SHA256SUMS.minisig`) made with the maintainer-held release key
+  (id `1BBD79B28BF718D0`; the public key is pinned inside `install.sh` and
+  `install.ps1`). The installers verify the signature over the exact manifest
+  bytes, then verify each archive's SHA-256 against the authenticated
+  manifest, before extraction. A missing `minisign` binary, manifest,
+  signature, or checksum entry aborts the install.
+- **`am self-update` enforces the same model** with a built-in pure-Rust
+  minisign verifier (no `minisign` executable needed): it downloads
+  `SHA256SUMS` and `SHA256SUMS.minisig`, verifies the signature over the exact
+  manifest bytes against the release keys embedded in the binary, and only
+  then trusts the archive digest. The signature's key id selects the trusted
+  key, so rotating the release key means shipping a release that trusts both
+  keys before signing with the new one. An unsigned, tampered, or
+  unknown-key manifest aborts the update before any binary is replaced; the
+  updater cannot install pre-v0.3.31 releases (use the installer for those).
+- **Releases before v0.3.31** were built by GitHub Actions and are verified
+  with the original Sigstore/cosign keyless path: a per-archive
+  `.sigstore.json` bundle validated against the literal
+  `dist.yml@refs/tags/<tag>` workflow identity and the GitHub Actions OIDC
+  issuer. The installers keep this path intact for installing old versions.
+- **Why the change**: releases are no longer produced by GitHub Actions, so
+  no new release can carry a certificate for the Actions workflow identity —
+  the old requirement had become unsatisfiable (v0.3.30 shipped without
+  bundles and the installer failed closed everywhere). The trust anchor moved
+  from "GitHub's CI identity for this repository" to "a signing key the
+  maintainer controls", the same model used across the maintainer's other
+  released tools. Verification remains fail-closed in both models.
 
 ## Hardening for deployments beyond loopback
 

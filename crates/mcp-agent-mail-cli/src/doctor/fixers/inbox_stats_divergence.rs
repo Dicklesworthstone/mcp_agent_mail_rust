@@ -24,10 +24,9 @@
 //!
 //! ## Detection (pure function)
 //!
-//! Open the DB read-only (URI `?immutable=1` so a WAL probe
-//! cannot create `-shm`). Run a single JOIN comparing stored
-//! vs ground-truth unread counts. Surface up to 100 divergent
-//! agents in the finding evidence.
+//! Query the command's retained WAL-aware logical read source. Run a single
+//! JOIN comparing stored vs ground-truth unread counts. Surface up to 100
+//! divergent agents in the finding evidence.
 //!
 //! ## Fix (`Op::DbExec`)
 //!
@@ -155,18 +154,27 @@ impl InboxStatsDivergenceFinding {
 
 /// Detector. PURE w.r.t. caller-supplied DB paths.
 pub fn detect(candidate_dbs: &[PathBuf]) -> Vec<InboxStatsDivergenceFinding> {
+    let read_candidates = super::explicit_offline_db_read_candidates(
+        candidate_dbs,
+        "inbox-stats divergence detection",
+    );
+    detect_prepared(&read_candidates)
+}
+
+pub(crate) fn detect_prepared(
+    read_candidates: &[super::DoctorDbReadCandidate],
+) -> Vec<InboxStatsDivergenceFinding> {
     let mut out = Vec::new();
-    for db in candidate_dbs {
-        if let Some(f) = detect_one(db) {
+    for candidate in read_candidates {
+        if let Some(f) = detect_one(candidate) {
             out.push(f);
         }
     }
     out
 }
 
-fn detect_one(db_path: &std::path::Path) -> Option<InboxStatsDivergenceFinding> {
-    // URI + immutable=1 — read-only, no -shm creation.
-    let conn = super::open_immutable_sqlite(db_path).ok()?;
+fn detect_one(candidate: &super::DoctorDbReadCandidate) -> Option<InboxStatsDivergenceFinding> {
+    let conn = candidate.connection()?;
 
     // Pass-35L review (Codex F1 + Gemini F1 P0): the pre-fix
     // detector drove from `inbox_stats LEFT JOIN aggregate`,
@@ -230,7 +238,7 @@ fn detect_one(db_path: &std::path::Path) -> Option<InboxStatsDivergenceFinding> 
         });
     }
     Some(InboxStatsDivergenceFinding {
-        db_path: db_path.to_path_buf(),
+        db_path: candidate.target_path().to_path_buf(),
         divergent_agents: divergent,
         more_truncated,
     })
@@ -245,9 +253,32 @@ pub fn fix(
     ctx: &MutateContext,
     finding: &InboxStatsDivergenceFinding,
 ) -> Result<FixOutcome, MutateError> {
+    let candidate = super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+        &finding.db_path,
+        "inbox-stats divergence pre-fix source selection",
+    );
+    fix_prepared(ctx, finding, &candidate)
+}
+
+pub(crate) fn fix_prepared(
+    ctx: &MutateContext,
+    _finding: &InboxStatsDivergenceFinding,
+    candidate: &super::DoctorDbReadCandidate,
+) -> Result<FixOutcome, MutateError> {
+    let refreshed = candidate.refresh("inbox-stats divergence pre-mutation revalidation");
+    let Some(fresh_finding) = detect_prepared(std::slice::from_ref(&refreshed))
+        .into_iter()
+        .next()
+    else {
+        return Ok(FixOutcome {
+            actions_taken: 0,
+            actions_skipped: 1,
+            quarantined_paths: Vec::new(),
+        });
+    };
     let result = mutate(
         ctx,
-        &finding.db_path,
+        &fresh_finding.db_path,
         Op::DbExec {
             sql: REBUILD_SQL.to_string(),
         },

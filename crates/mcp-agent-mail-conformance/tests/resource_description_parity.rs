@@ -1,10 +1,12 @@
 // Note: unsafe required for env::set_var in Rust 2024
 #![allow(unsafe_code)]
 
-//! Conformance tests verifying Rust resource descriptions match the Python reference.
-//! Each Python resource docstring becomes the MCP resource description.
+//! Supported resource-inventory and Rust-owned description checks.
+//!
+//! Historical Python resource prose is not a product contract. Rust may improve
+//! wording freely, while these tests keep the supported resource inventory and
+//! important operator guidance from disappearing accidentally.
 
-use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 /// A unified (uri, description) from both resources and resource templates.
@@ -54,7 +56,7 @@ impl Drop for EnvVarGuard {
 }
 
 fn collect_all_resources() -> Vec<ResourceEntry> {
-    let _lock = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let _guard = EnvVarGuard::set(&[
         ("WORKTREES_ENABLED", "true"),
         ("TOOL_FILTER_PROFILE", "full"),
@@ -83,92 +85,57 @@ fn collect_all_resources() -> Vec<ResourceEntry> {
     entries
 }
 
-/// Expected description prefixes for key Python-matching resources.
-fn expected_description_prefixes() -> HashMap<&'static str, &'static str> {
-    [
-        ("resource://config/environment", "Inspect the server's current environment and HTTP settings."),
-        ("resource://identity/{project}", "Inspect identity resolution for a given project path."),
-        (
-            "resource://tooling/directory",
-            "Provide a clustered view of exposed MCP tools to combat option overload.",
-        ),
-        (
-            "resource://tooling/schemas",
-            "Expose JSON-like parameter schemas for tools/macros to prevent drift.",
-        ),
-        ("resource://tooling/metrics", "Expose aggregated tool call/error counts for analysis."),
-        ("resource://tooling/locks", "Return lock metadata from the shared archive storage."),
-        ("resource://projects", "List all projects known to the server in creation order."),
-        ("resource://project/{slug}", "Fetch a project and its agents by project slug or human key."),
-        ("resource://agents/{project_key}", "List all registered agents in a project for easy agent discovery."),
-        (
-            "resource://file_reservations/{slug}",
-            "List file_reservations for a project, optionally filtering to active-only.",
-        ),
-        ("resource://message/{message_id}", "Read a single message by id within a project."),
-        ("resource://thread/{thread_id}", "List messages for a thread within a project."),
-        ("resource://inbox/{agent}", "Read an agent's inbox for a project."),
-        (
-            "resource://views/urgent-unread/{agent}",
-            "Convenience view listing urgent and high-importance messages that are unread",
-        ),
-        (
-            "resource://views/ack-required/{agent}",
-            "Convenience view listing messages requiring acknowledgement",
-        ),
-        ("resource://views/acks-stale/{agent}", "List ack-required messages older than a TTL"),
-        (
-            "resource://views/ack-overdue/{agent}",
-            "List messages requiring acknowledgement older than ttl_minutes",
-        ),
-        ("resource://mailbox/{agent}", "List recent messages in an agent's mailbox with commit metadata fields."),
-        (
-            "resource://mailbox-with-commits/{agent}",
-            "List recent messages in an agent's mailbox with commit metadata fields, including explicit unavailable markers",
-        ),
-        ("resource://outbox/{agent}", "List messages sent by the agent with commit metadata fields."),
-        ("resource://product/{key}", "Inspect product and list linked projects."),
-    ]
-    .into_iter()
-    .collect()
-}
+const SUPPORTED_RESOURCE_URIS: &[&str] = &[
+    "resource://config/environment",
+    "resource://identity/{project}",
+    "resource://tooling/directory",
+    "resource://tooling/schemas",
+    "resource://tooling/metrics",
+    "resource://tooling/locks",
+    "resource://projects",
+    "resource://project/{slug}",
+    "resource://agents/{project_key}",
+    "resource://file_reservations/{slug}",
+    "resource://message/{message_id}",
+    "resource://thread/{thread_id}",
+    "resource://inbox/{agent}",
+    "resource://views/urgent-unread/{agent}",
+    "resource://views/ack-required/{agent}",
+    "resource://views/acks-stale/{agent}",
+    "resource://views/ack-overdue/{agent}",
+    "resource://mailbox/{agent}",
+    "resource://mailbox-with-commits/{agent}",
+    "resource://outbox/{agent}",
+    "resource://product/{key}",
+];
 
 #[test]
-fn resource_descriptions_match_python_prefixes() {
+fn supported_resources_have_rust_owned_descriptions() {
     let all = collect_all_resources();
-    let expected = expected_description_prefixes();
 
     eprintln!(
-        "Checking {} resource description prefixes against {} entries (resources + templates)",
-        expected.len(),
+        "Checking {} supported resources against {} entries (resources + templates)",
+        SUPPORTED_RESOURCE_URIS.len(),
         all.len()
     );
 
     let mut matched = 0;
     let mut mismatches: Vec<String> = Vec::new();
 
-    for (uri_pattern, expected_prefix) in &expected {
+    for uri_pattern in SUPPORTED_RESOURCE_URIS {
         // Find entry by exact URI or URI template match (skip query variants)
         let entry = all.iter().find(|e| {
             let uri = &e.uri;
-            uri == uri_pattern && !uri.contains('?')
+            uri == *uri_pattern && !uri.contains('?')
         });
 
         match entry {
             Some(e) => {
                 let desc = e.description.as_deref().unwrap_or("");
-                if desc.starts_with(expected_prefix) {
-                    matched += 1;
+                if desc.trim().is_empty() {
+                    mismatches.push(format!("{uri_pattern}: Rust description is empty"));
                 } else {
-                    let mismatch_idx = desc
-                        .chars()
-                        .zip(expected_prefix.chars())
-                        .position(|(a, b)| a != b)
-                        .unwrap_or(desc.len().min(expected_prefix.len()));
-                    mismatches.push(format!(
-                        "{uri_pattern}: description mismatch at char {mismatch_idx}\n  expected start: {expected_prefix}\n  actual start:   {}",
-                        &desc[..desc.len().min(120)]
-                    ));
+                    matched += 1;
                 }
             }
             None => {
@@ -177,18 +144,16 @@ fn resource_descriptions_match_python_prefixes() {
         }
     }
 
-    if !mismatches.is_empty() {
-        panic!(
-            "Resource description parity failures ({}/{}):\n{}",
-            mismatches.len(),
-            expected.len(),
-            mismatches.join("\n\n")
-        );
-    }
+    assert!(mismatches.is_empty(), 
+        "Supported resource description failures ({}/{}):\n{}",
+        mismatches.len(),
+        SUPPORTED_RESOURCE_URIS.len(),
+        mismatches.join("\n\n")
+    );
 
     eprintln!(
-        "All {matched}/{} resource description prefixes match Python",
-        expected.len()
+        "All {matched}/{} supported resources have Rust-owned descriptions",
+        SUPPORTED_RESOURCE_URIS.len()
     );
 }
 

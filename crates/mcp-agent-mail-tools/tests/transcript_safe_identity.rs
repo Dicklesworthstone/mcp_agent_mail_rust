@@ -7,13 +7,12 @@
 //!    omit the registration token from the tool result, mark the omission with
 //!    `registration_token_returned: false`, and still persist the token
 //!    server-side (the identity remains fully functional).
-//! 2. `send_message` with `auto_contact_if_blocked` *omitted* takes the
-//!    server-default path (Python-parity), while an explicit JSON `null` is
-//!    rejected with a loud, typed `InvalidParams` error naming the field —
-//!    never a silent behavior change. Full `null` acceptance requires the
-//!    fastmcp schema generator to emit nullable types for `Option<T>` params
-//!    (tracked upstream); when that lands, the explicit-null assertion below
-//!    should be flipped to assert success.
+//! 2. `send_message` with `auto_contact_if_blocked` *omitted* or set to an
+//!    explicit JSON `null` takes the server-default path (Python-parity).
+//!    fastmcp 0.7.1 emits nullable `["<T>", "null"]` schemas for `Option<T>`
+//!    params and treats explicit `null` as omitted at extraction, so both
+//!    spellings are equivalent end-to-end — completing the parity this suite
+//!    originally pinned as a loud rejection.
 
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
@@ -216,10 +215,9 @@ fn dispatch_accepts_return_registration_token_false() {
     });
 }
 
-/// Omitted `auto_contact_if_blocked` succeeds (server-default path), and an
-/// explicit JSON `null` fails loudly with a typed error naming the field
-/// (current fastmcp 0.7.0 contract — see module docs; flip to success once
-/// fastmcp emits nullable schemas for `Option<T>`).
+/// Omitted `auto_contact_if_blocked` and an explicit JSON `null` both succeed
+/// through the same server-default path (Python parity, fastmcp >= 0.7.1
+/// nullable `Option<T>` schemas — see module docs).
 #[test]
 #[allow(clippy::too_many_lines)]
 fn send_message_null_auto_contact_contract() {
@@ -264,17 +262,19 @@ fn send_message_null_auto_contact_contract() {
             meta: None,
         };
         let request_ctx = McpContext::new(cx.clone(), 2);
-        let result =
-            router.handle_tools_call(&request_ctx, params, SessionState::new(), None, None);
-        let err = result.expect_err(
-            "explicit null is currently rejected at dispatch; if this now succeeds, \
-             fastmcp has gained nullable Option<T> schemas — update this test to \
-             assert Python-parity success instead",
-        );
-        assert!(
-            err.message.contains("auto_contact_if_blocked"),
-            "rejection must name the offending field loudly: {}",
-            err.message
+        let call_result = router
+            .handle_tools_call(&request_ctx, params, SessionState::new(), None, None)
+            .expect(
+                "explicit null auto_contact_if_blocked must be accepted: fastmcp \
+                 0.7.1 publishes nullable Option<T> schemas and treats null as \
+                 omitted (Python parity)",
+            );
+        let text = tool_result_text(&call_result.content);
+        let payload = parse(&text);
+        assert_eq!(
+            payload["count"].as_i64(),
+            Some(1),
+            "explicit null must take the server-default path and deliver: {payload}"
         );
 
         // Omitting the field entirely is the supported Python-parity spelling

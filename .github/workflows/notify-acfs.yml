@@ -1,7 +1,8 @@
 # .github/workflows/notify-acfs.yml
 #
-# Notifies ACFS when installer scripts change, triggering checksum updates.
-# This eliminates the 15-minute polling window — ACFS updates within seconds.
+# Notifies ACFS when the installer identity may change. This workflow is deliberately
+# fail-closed: the release workflow independently refuses to publish until
+# ACFS main contains the exact checksum computed here.
 #
 name: Notify ACFS of Installer Changes
 
@@ -10,60 +11,94 @@ on:
     branches: [main]
     paths:
       - 'install.sh'
-  release:
-    types: [published]
-  workflow_dispatch:  # Manual trigger for testing
+      # A version change must refresh/reconfirm the ACFS pin even when the
+      # installer bytes happen to remain unchanged.
+      - 'Cargo.toml'
+  workflow_dispatch:
 
 env:
   # Must match the installer key in ACFS checksums.yaml
   TOOL_NAME: "mcp_agent_mail"
+  ACFS_REPOSITORY: "Dicklesworthstone/agentic_coding_flywheel_setup"
+  EXPECTED_SOURCE_REPOSITORY: "Dicklesworthstone/mcp_agent_mail_rust"
+
+concurrency:
+  group: notify-acfs-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   notify-acfs:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      # The dispatch is an *optimisation* over ACFS's periodic checksum-drift
-      # poller (systemd timer `acfs-manifest-drift.timer`, every 2h). If the
-      # cross-repo PAT secret is not configured on this repo, fall through to
-      # the poller rather than failing the workflow — a hard fail here used
-      # to red-flag every release without changing user-visible behaviour
-      # (ACFS still picked up the new checksum within the polling window).
-      - name: Preflight — is dispatch secret configured?
-        id: secret_probe
+      - name: Checkout the exact source revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Bind notification to the exact installer bytes
+        id: installer
+        run: |
+          set -euo pipefail
+          if [[ ! -f install.sh || -L install.sh ]]; then
+            echo "::error::install.sh must be a non-symlink regular file"
+            exit 1
+          fi
+          installer_sha256="$(sha256sum install.sh | awk '{print $1}')"
+          if ! [[ "$installer_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not compute an exact SHA-256 for install.sh"
+            exit 1
+          fi
+          echo "sha256=$installer_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch the exact checksum to ACFS
         env:
           ACFS_TOKEN: ${{ secrets.ACFS_REPO_DISPATCH_TOKEN }}
+          INSTALLER_SHA256: ${{ steps.installer.outputs.sha256 }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_REVISION: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
         run: |
-          if [[ -n "${ACFS_TOKEN:-}" ]]; then
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::ACFS_REPO_DISPATCH_TOKEN is not configured on this repo; ACFS will pick up the new checksum via its periodic poller (acfs-manifest-drift.timer) instead of an immediate dispatch."
+          set -euo pipefail
+          if [[ -z "${ACFS_TOKEN:-}" ]]; then
+            echo "::error::ACFS_REPO_DISPATCH_TOKEN is required; refusing to defer checksum authority to a poller"
+            exit 1
           fi
+          if [[ "$SOURCE_REF" != refs/heads/main ]]; then
+            echo "::error::ACFS tracks the public main installer; refusing notification from ${SOURCE_REF}"
+            exit 1
+          fi
+          if [[ "$SOURCE_REPOSITORY" != "$EXPECTED_SOURCE_REPOSITORY" ]]; then
+            echo "::error::Refusing ACFS notification from unexpected repository ${SOURCE_REPOSITORY}"
+            exit 1
+          fi
+          payload="$(jq -cn \
+            --arg tool "$TOOL_NAME" \
+            --arg source_repo "$SOURCE_REPOSITORY" \
+            --arg ref "$SOURCE_REF" \
+            --arg sha "$SOURCE_REVISION" \
+            --arg new_sha256 "$INSTALLER_SHA256" \
+            '{event_type: "upstream-changed", client_payload: {tool: $tool, source_repo: $source_repo, ref: $ref, sha: $sha, new_sha256: $new_sha256}}')"
+          curl --fail-with-body --silent --show-error \
+            --connect-timeout 10 --max-time 30 \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${ACFS_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${ACFS_REPOSITORY}/dispatches" \
+            --data "$payload"
 
-      - name: Trigger ACFS checksum update
-        if: steps.secret_probe.outputs.configured == 'true'
-        uses: peter-evans/repository-dispatch@v3
-        with:
-          token: ${{ secrets.ACFS_REPO_DISPATCH_TOKEN }}
-          repository: Dicklesworthstone/agentic_coding_flywheel_setup
-          event-type: upstream-changed
-          client-payload: |
-            {
-              "tool": "${{ env.TOOL_NAME }}",
-              "source_repo": "${{ github.repository }}",
-              "ref": "${{ github.ref }}",
-              "sha": "${{ github.sha }}",
-              "actor": "${{ github.actor }}",
-              "timestamp": "${{ github.event.head_commit.timestamp || github.event.release.published_at }}"
-            }
-
-      - name: Log dispatch
+      - name: Record the release-blocking checksum authority
         run: |
-          if [[ "${{ steps.secret_probe.outputs.configured }}" == "true" ]]; then
-            echo "Dispatched upstream-changed event to ACFS"
-          else
-            echo "Skipped dispatch — ACFS_REPO_DISPATCH_TOKEN not configured; relying on ACFS periodic poller."
-          fi
-          echo "  Tool: ${{ env.TOOL_NAME }}"
-          echo "  SHA: ${{ github.sha }}"
-          echo "  Triggered by: ${{ github.actor }}"
+          set -euo pipefail
+          {
+            echo "## ACFS checksum dispatch"
+            echo
+            echo "- Tool: \`${TOOL_NAME}\`"
+            echo "- Source revision: \`${{ github.sha }}\`"
+            echo "- Installer SHA-256: \`${{ steps.installer.outputs.sha256 }}\`"
+            echo
+            echo "Publication remains blocked until ACFS \`main\` records this exact digest."
+          } >> "$GITHUB_STEP_SUMMARY"

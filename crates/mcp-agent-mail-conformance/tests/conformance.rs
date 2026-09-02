@@ -1,3 +1,7 @@
+// Integration scenarios are long and quote user-facing strings by design;
+// these pedantic style lints add nothing in a test harness.
+#![allow(clippy::too_many_lines, clippy::similar_names, clippy::case_sensitive_file_extension_comparisons, clippy::match_wildcard_for_single_variants, clippy::literal_string_with_formatting_args)]
+
 // Note: unsafe required for env::set_var in Rust 2024
 #![allow(unsafe_code)]
 
@@ -32,6 +36,7 @@ const AUTO_INCREMENT_ID_KEYS: &[&str] = &["id", "message_id", "reply_to", "sende
 const TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS: &str = "3600";
 const TEST_SEARCH_ENGINE: &str = "legacy";
 const RUST_NATIVE_FIXTURE_DIR: &str = "tests/conformance/fixtures/rust_native";
+const SUPPLEMENTAL_COMPATIBILITY_TOOLS: &[&str] = &["fetch_topic"];
 const LEGACY_FIXTURE_REPO_INSTALL_PATH: &str = "/tmp/agent-mail-fixtures/repo_install";
 const LEGACY_FIXTURE_REPO_UNINSTALL_PATH: &str = "/tmp/agent-mail-fixtures/repo_uninstall";
 
@@ -248,6 +253,59 @@ fn normalize_pair(mut actual: Value, mut expected: Value, norm: &Normalize) -> (
     (actual, expected)
 }
 
+/// Check the supported legacy JSON contract without making an obsolete
+/// implementation the authority over additive Rust fields.
+///
+/// Objects are compared as contracts: every field recorded by the legacy
+/// fixture must still exist and match recursively, while additional fields in
+/// the Rust response are allowed. Arrays retain exact length and order because
+/// adding or removing an item can change client-visible pagination or routing
+/// semantics. Rust-native golden fixtures continue to use exact equality.
+fn supported_compatibility_mismatch(
+    actual: &Value,
+    expected: &Value,
+    path: &str,
+) -> Option<String> {
+    match (actual, expected) {
+        (Value::Object(actual), Value::Object(expected)) => {
+            for (key, expected_value) in expected {
+                let field_path = format!("{path}.{key}");
+                let Some(actual_value) = actual.get(key) else {
+                    return Some(format!("missing required field {field_path}"));
+                };
+                if let Some(mismatch) =
+                    supported_compatibility_mismatch(actual_value, expected_value, &field_path)
+                {
+                    return Some(mismatch);
+                }
+            }
+            None
+        }
+        (Value::Array(actual), Value::Array(expected)) => {
+            if actual.len() != expected.len() {
+                return Some(format!(
+                    "array length mismatch at {path}: actual={}, expected={}",
+                    actual.len(),
+                    expected.len()
+                ));
+            }
+            for (index, (actual_value, expected_value)) in actual.iter().zip(expected).enumerate() {
+                let item_path = format!("{path}[{index}]");
+                if let Some(mismatch) =
+                    supported_compatibility_mismatch(actual_value, expected_value, &item_path)
+                {
+                    return Some(mismatch);
+                }
+            }
+            None
+        }
+        _ if actual == expected => None,
+        _ => Some(format!(
+            "value mismatch at {path}: actual={actual}, expected={expected}"
+        )),
+    }
+}
+
 fn decode_json_from_tool_content(content: &[LegacyContent]) -> Result<Value, String> {
     if content.len() != 1 {
         return Err(format!(
@@ -257,20 +315,16 @@ fn decode_json_from_tool_content(content: &[LegacyContent]) -> Result<Value, Str
     }
 
     match &content[0] {
-        LegacyContent::Text { text, .. } => match serde_json::from_str(text) {
-            Ok(v) => Ok(v),
-            Err(_) => Ok(Value::String(text.clone())),
-        },
+        LegacyContent::Text { text, .. } => {
+            Ok(serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.clone())))
+        }
         LegacyContent::Resource { resource, .. } => {
             let text = match resource {
                 LegacyResourceContent::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             }
             .ok_or_else(|| "tool returned Resource content without text".to_string())?;
-            match serde_json::from_str(text) {
-                Ok(v) => Ok(v),
-                Err(_) => Ok(Value::String(text.to_string())),
-            }
+            Ok(serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string())))
         }
         LegacyContent::Image { mime_type, .. } => Err(format!(
             "tool returned Image content (mime_type={mime_type}); JSON decode not supported yet"
@@ -294,10 +348,7 @@ fn decode_json_from_resource_contents(
         _ => None,
     }
     .ok_or_else(|| format!("resource {uri} returned no text"))?;
-    match serde_json::from_str(text) {
-        Ok(v) => Ok(v),
-        Err(_) => Ok(Value::String(text.to_string())),
-    }
+    Ok(serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string())))
 }
 
 fn assert_expected_error(got: &str, expect: &ExpectedError) {
@@ -456,16 +507,14 @@ impl ToolFilterEnvGuard {
             if key == "AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS" {
                 let value = case_env
                     .get(key)
-                    .map(String::as_str)
-                    .unwrap_or(TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS);
+                    .map_or(TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS, String::as_str);
                 unsafe {
                     std::env::set_var(key, value);
                 }
             } else if key == "AM_SEARCH_ENGINE" {
                 let value = case_env
                     .get(key)
-                    .map(String::as_str)
-                    .unwrap_or(TEST_SEARCH_ENGINE);
+                    .map_or(TEST_SEARCH_ENGINE, String::as_str);
                 unsafe {
                     std::env::set_var(key, value);
                 }
@@ -710,7 +759,7 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
             case_name: "project_not_found_error",
             input: serde_json::json!({
                 "project_key": "missing-project",
-                "message_id": 999999,
+                "message_id": 999_999,
                 "sender_name": "BlueLake",
                 "body_md": "Reply"
             }),
@@ -727,12 +776,21 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
             expected_err: expected_error_containing("limit must be at least 1"),
         },
         HandwrittenToolFailureCase {
+            tool_name: "fetch_topic",
+            case_name: "invalid_topic_error",
+            input: serde_json::json!({
+                "project_key": "missing-project",
+                "topic_name": "../never-stored"
+            }),
+            expected_err: expected_error_containing("INVALID_TOPIC"),
+        },
+        HandwrittenToolFailureCase {
             tool_name: "mark_message_read",
             case_name: "project_not_found_error",
             input: serde_json::json!({
                 "project_key": "missing-project",
                 "agent_name": "BlueLake",
-                "message_id": 999999
+                "message_id": 999_999
             }),
             expected_err: expected_error_containing("not found"),
         },
@@ -742,7 +800,7 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
             input: serde_json::json!({
                 "project_key": "missing-project",
                 "agent_name": "BlueLake",
-                "message_id": 999999
+                "message_id": 999_999
             }),
             expected_err: expected_error_containing("not found"),
         },
@@ -896,7 +954,13 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
 }
 
 fn handwritten_tool_happy_case_tools() -> BTreeSet<&'static str> {
-    BTreeSet::from(["force_release_file_reservation"])
+    BTreeSet::from([
+        "deregister_agent",
+        "fetch_topic",
+        "force_release_file_reservation",
+        "retire_agent",
+        "unretire_agent",
+    ])
 }
 
 fn rust_native_tool_case_shapes() -> BTreeMap<String, (bool, bool)> {
@@ -994,10 +1058,10 @@ fn resolved_value(value: &Value, tokens: &BTreeMap<String, String>) -> Value {
 fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     match payload.downcast::<String>() {
         Ok(message) => *message,
-        Err(payload) => match payload.downcast::<&'static str>() {
-            Ok(message) => (*message).to_string(),
-            Err(_) => "non-string panic payload".to_string(),
-        },
+        Err(payload) => payload.downcast::<&'static str>().map_or_else(
+            |_| "non-string panic payload".to_string(),
+            |message| (*message).to_string(),
+        ),
     }
 }
 
@@ -1218,7 +1282,7 @@ fn insert_test_message(
     let message_id = next_test_message_id();
     let created_ts = mcp_agent_mail_db::now_micros();
     let recipients_json = serde_json::json!({
-        "to": [recipient.name.clone()],
+        "to": [recipient.name],
         "cc": [],
         "bcc": [],
     })
@@ -1381,6 +1445,74 @@ fn null_auto_increment_ids_nulls_sender_id_but_keeps_attribution() {
 }
 
 #[test]
+/// The compatibility lane protects supported clients without giving the frozen
+/// legacy implementation authority over additive Rust response evolution.
+fn supported_legacy_contract_allows_additive_fields_but_not_semantic_drift() {
+    let expected = serde_json::json!({
+        "status": "ok",
+        "items": [{"id": null, "subject": "hello"}]
+    });
+    let additive = serde_json::json!({
+        "status": "ok",
+        "health_level": "green",
+        "items": [{"id": null, "subject": "hello", "topic": "br-123"}]
+    });
+    assert_eq!(
+        supported_compatibility_mismatch(&additive, &expected, "$"),
+        None,
+        "additive Rust object fields are backwards-compatible"
+    );
+
+    let missing = serde_json::json!({"items": [{"id": null, "subject": "hello"}]});
+    assert!(
+        supported_compatibility_mismatch(&missing, &expected, "$")
+            .is_some_and(|mismatch| mismatch.contains("$.status")),
+        "removing a supported legacy field must fail"
+    );
+
+    let changed = serde_json::json!({
+        "status": "degraded",
+        "items": [{"id": null, "subject": "hello"}]
+    });
+    assert!(
+        supported_compatibility_mismatch(&changed, &expected, "$")
+            .is_some_and(|mismatch| mismatch.contains("$.status")),
+        "changing a supported legacy value must fail"
+    );
+
+    let extra_item = serde_json::json!({
+        "status": "ok",
+        "items": [
+            {"id": null, "subject": "hello"},
+            {"id": null, "subject": "unexpected"}
+        ]
+    });
+    assert!(
+        supported_compatibility_mismatch(&extra_item, &expected, "$")
+            .is_some_and(|mismatch| mismatch.contains("array length mismatch")),
+        "array cardinality remains an exact compatibility contract"
+    );
+
+    let actual_health = serde_json::json!({"status": "error", "health_level": "red"});
+    let legacy_health = serde_json::json!({"status": "ok"});
+    assert!(
+        supported_compatibility_mismatch(&actual_health, &legacy_health, "$").is_some(),
+        "semantic divergence must be explicit"
+    );
+    let normalization = Normalize {
+        ignore_json_pointers: vec!["/status".to_string()],
+        replace: BTreeMap::new(),
+    };
+    let (actual_health, legacy_health) =
+        normalize_pair(actual_health, legacy_health, &normalization);
+    assert_eq!(
+        supported_compatibility_mismatch(&actual_health, &legacy_health, "$"),
+        None,
+        "a documented normalization transfers authority for that field to Rust-native tests"
+    );
+}
+
+#[test]
 fn resolved_value_rewrites_legacy_fixture_repo_paths() {
     let value = serde_json::json!({
         "install": LEGACY_FIXTURE_REPO_INSTALL_PATH,
@@ -1406,7 +1538,7 @@ fn resolved_value_rewrites_legacy_fixture_repo_paths() {
 
 #[test]
 fn run_fixtures_against_rust_server_router() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let env = setup_fixture_env();
     let storage_root = env.tmp.path().join("archive");
     let fixtures = &env.fixtures;
@@ -1479,11 +1611,14 @@ fn run_fixtures_against_rust_server_router() {
                         .unwrap_or_else(|e| panic!("tool {tool_name} case {}: {e}", case.name));
                     let (actual, expected) =
                         normalize_pair(actual, expected_ok.clone(), &case.normalize);
-                    assert_eq!(
-                        actual, expected,
-                        "tool {tool_name} case {}: output mismatch",
-                        case.name
-                    );
+                    if let Some(mismatch) =
+                        supported_compatibility_mismatch(&actual, &expected, "$")
+                    {
+                        panic!(
+                            "tool {tool_name} case {}: supported compatibility mismatch: {mismatch}",
+                            case.name
+                        );
+                    }
                 }
                 (None, Some(expected_err)) => match result {
                     Ok(call_result) => {
@@ -1537,11 +1672,14 @@ fn run_fixtures_against_rust_server_router() {
                         .unwrap_or_else(|e| panic!("resource {uri} case {}: {e}", case.name));
                     let (actual, expected) =
                         normalize_pair(actual, expected_ok.clone(), &case.normalize);
-                    assert_eq!(
-                        actual, expected,
-                        "resource {uri} case {}: output mismatch",
-                        case.name
-                    );
+                    if let Some(mismatch) =
+                        supported_compatibility_mismatch(&actual, &expected, "$")
+                    {
+                        panic!(
+                            "resource {uri} case {}: supported compatibility mismatch: {mismatch}",
+                            case.name
+                        );
+                    }
                 }
                 (None, Some(expected_err)) => match result {
                     Ok(read_result) => {
@@ -1969,10 +2107,9 @@ fn run_fixtures_against_rust_server_router() {
             continue;
         }
         // Compute SHA1 of path_pattern and verify the SHA1 file exists
-        use sha1::Digest;
-        let mut hasher = sha1::Sha1::new();
-        hasher.update(path_pattern.as_bytes());
-        let digest = hasher.finalize();
+        let mut hasher = <sha1::Sha1 as sha1::Digest>::new();
+        sha1::Digest::update(&mut hasher, path_pattern.as_bytes());
+        let digest = sha1::Digest::finalize(hasher);
         let digest_bytes: &[u8] = digest.as_ref();
         let mut sha1_hex = String::with_capacity(digest.len() * 2);
         for &byte in digest_bytes {
@@ -2071,7 +2208,7 @@ fn run_fixtures_against_rust_server_router() {
 
     let ensure_params = CallToolParams {
         name: "ensure_project".to_string(),
-        arguments: Some(serde_json::json!({ "human_key": project_key.clone() })),
+        arguments: Some(serde_json::json!({ "human_key": project_key })),
         meta: None,
     };
     let ensure_result = router
@@ -2117,7 +2254,7 @@ fn run_fixtures_against_rust_server_router() {
     let send_params = CallToolParams {
         name: "send_message".to_string(),
         arguments: Some(serde_json::json!({
-            "project_key": project_key.clone(),
+            "project_key": project_key,
             "sender_name": "BoldCastle",
             "to": ["CalmRiver"],
             "cc": ["QuietMeadow"],
@@ -2183,14 +2320,14 @@ fn run_fixtures_against_rust_server_router() {
     let fetch_params = CallToolParams {
         name: "fetch_inbox".to_string(),
         arguments: Some(serde_json::json!({
-            "project_key": project_key.clone(),
+            "project_key": project_key,
             "agent_name": "CalmRiver",
         })),
         meta: None,
     };
     let fetch_result = router
         .handle_tools_call(
-            &McpContext::new(cx.clone(), req_id),
+            &McpContext::new(cx, req_id),
             fetch_params,
             SessionState::new(),
             None,
@@ -2208,7 +2345,7 @@ fn run_fixtures_against_rust_server_router() {
 
 #[test]
 fn tool_filter_profiles_match_fixtures() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let fixtures = load_tool_filter_fixtures();
 
     for case in fixtures.cases {
@@ -2275,6 +2412,7 @@ fn rust_native_fixture_coverage_matches_classification() {
         "fetch_inbox_events",
         "get_message_delivery_receipt",
         "list_agents",
+        "mark_all_read",
         "resolve_pane_identity",
     ]
     .into_iter()
@@ -2289,7 +2427,7 @@ fn rust_native_fixture_coverage_matches_classification() {
 
 #[test]
 fn run_rust_native_fixtures_against_rust_server_router() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let env = setup_fixture_env();
     let fixtures = load_rust_native_tool_fixtures();
     let router = &env.router;
@@ -2484,10 +2622,7 @@ fn run_rust_native_fixtures_against_rust_server_router() {
                             "rust-native tool {} case {} expected error, got ok: {value}",
                             fixture.tool, case.name
                         ),
-                        Ok(Err(err_text)) => {
-                            assert_expected_error(&err_text, expected_err);
-                        }
-                        Err(err_text) => {
+                        Ok(Err(err_text)) | Err(err_text) => {
                             assert_expected_error(&err_text, expected_err);
                         }
                     }
@@ -2499,8 +2634,315 @@ fn run_rust_native_fixtures_against_rust_server_router() {
 }
 
 #[test]
+fn lifecycle_tools_preserve_authorization_roster_and_permanent_deregistration_contract() {
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let env = setup_fixture_env();
+    let project_path = env.tmp.path().join("lifecycle-project");
+    std::fs::create_dir_all(&project_path).expect("create lifecycle fixture project");
+    let project_key = project_path.to_string_lossy().into_owned();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id = 10_000;
+
+    let invoke = |tool: &str, input: Value, req_id: &mut u64| {
+        execute_tool(
+            &env.router,
+            &cx,
+            &budget,
+            req_id,
+            tool,
+            args_from_value(&input),
+        )
+        .unwrap_or_else(|error| panic!("{tool} router failure: {error}"))
+    };
+
+    invoke(
+        "ensure_project",
+        serde_json::json!({ "human_key": &project_key }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("ensure_project failed: {error}"));
+    let registered = invoke(
+        "register_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "program": "codex-cli",
+            "model": "gpt-5",
+            "name": "SilverLake",
+            "task_description": "lifecycle conformance"
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("register_agent failed: {error}"));
+    let token = registered
+        .get("registration_token")
+        .and_then(Value::as_str)
+        .expect("registration returns authorization token")
+        .to_string();
+
+    let retire = invoke(
+        "retire_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "agent_name": "SilverLake",
+            "registration_token": &token
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("retire_agent failed: {error}"));
+    assert_eq!(retire["status"], "retired");
+    assert!(retire["retired_at"].is_string());
+
+    let retired_roster = invoke(
+        "list_agents",
+        serde_json::json!({ "project_key": &project_key }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("list_agents after retire failed: {error}"));
+    assert!(
+        retired_roster
+            .as_array()
+            .is_some_and(|agents| agents.iter().all(|agent| agent["name"] != "SilverLake")),
+        "retired identity must be absent from the active roster: {retired_roster}"
+    );
+
+    let unretire = invoke(
+        "unretire_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "agent_name": "SilverLake",
+            "registration_token": &token
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("unretire_agent failed: {error}"));
+    assert_eq!(unretire["status"], "active");
+
+    let active_roster = invoke(
+        "list_agents",
+        serde_json::json!({ "project_key": &project_key }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("list_agents after unretire failed: {error}"));
+    assert!(
+        active_roster
+            .as_array()
+            .is_some_and(|agents| agents.iter().any(|agent| agent["name"] == "SilverLake")),
+        "unretired identity must return to the active roster: {active_roster}"
+    );
+
+    let deregistered = invoke(
+        "deregister_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "agent_name": "SilverLake",
+            "registration_token": &token
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("deregister_agent failed: {error}"));
+    assert_eq!(deregistered["status"], "deregistered");
+    let first_deregistered_at = deregistered["deregistered_at"].clone();
+    assert!(first_deregistered_at.is_string());
+
+    let retry = invoke(
+        "deregister_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "agent_name": "SilverLake",
+            "registration_token": &token
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("deregister_agent retry failed: {error}"));
+    assert_eq!(
+        retry["deregistered_at"], first_deregistered_at,
+        "idempotent retry must retain the first durable event timestamp"
+    );
+
+    let unretire_error = invoke(
+        "unretire_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "agent_name": "SilverLake",
+            "registration_token": &token
+        }),
+        &mut req_id,
+    )
+    .expect_err("deregistered identity cannot be unretired");
+    assert!(
+        unretire_error.contains("AGENT_DEREGISTERED"),
+        "expected typed permanent-lifecycle error, got: {unretire_error}"
+    );
+}
+
+#[test]
+fn topic_tools_persist_filter_and_inherit_topics_through_the_router() {
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let env = setup_fixture_env();
+    let project_path = env.tmp.path().join("topic-project");
+    std::fs::create_dir_all(&project_path).expect("create topic fixture project");
+    let project_key = project_path.to_string_lossy().into_owned();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id = 20_000;
+
+    let invoke = |tool: &str, input: Value, req_id: &mut u64| {
+        execute_tool(
+            &env.router,
+            &cx,
+            &budget,
+            req_id,
+            tool,
+            args_from_value(&input),
+        )
+        .unwrap_or_else(|error| panic!("{tool} router failure: {error}"))
+    };
+
+    invoke(
+        "ensure_project",
+        serde_json::json!({ "human_key": &project_key }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("ensure_project failed: {error}"));
+    let sender = invoke(
+        "register_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "program": "codex-cli",
+            "model": "gpt-5",
+            "name": "GreenStone",
+            "task_description": "topic sender"
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("register sender failed: {error}"));
+    let sender_token = sender["registration_token"]
+        .as_str()
+        .expect("sender registration token")
+        .to_string();
+    let recipient = invoke(
+        "register_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "program": "codex-cli",
+            "model": "gpt-5",
+            "name": "BlueLake",
+            "task_description": "topic recipient"
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("register recipient failed: {error}"));
+    let recipient_token = recipient["registration_token"]
+        .as_str()
+        .expect("recipient registration token")
+        .to_string();
+
+    let sent = invoke(
+        "send_message",
+        serde_json::json!({
+            "project_key": &project_key,
+            "sender_name": "GreenStone",
+            "sender_token": &sender_token,
+            "to": ["BlueLake"],
+            "subject": "Topic witness",
+            "body_md": "topic body",
+            "topic": "release.v31"
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("send_message failed: {error}"));
+    let message_id = sent["deliveries"][0]["payload"]["id"]
+        .as_i64()
+        .expect("sent message id");
+    assert_eq!(sent["deliveries"][0]["payload"]["topic"], "release.v31");
+
+    let inbox = invoke(
+        "fetch_inbox",
+        serde_json::json!({
+            "project_key": &project_key,
+            "agent_name": "BlueLake",
+            "topic": "RELEASE.V31",
+            "include_bodies": true,
+            "mark_read": false
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("fetch_inbox topic filter failed: {error}"));
+    assert_eq!(inbox.as_array().map(Vec::len), Some(1));
+    assert_eq!(inbox[0]["id"].as_i64(), Some(message_id));
+    assert_eq!(inbox[0]["body_md"], "topic body");
+
+    let reply = invoke(
+        "reply_message",
+        serde_json::json!({
+            "project_key": &project_key,
+            "message_id": message_id,
+            "sender_name": "BlueLake",
+            "sender_token": &recipient_token,
+            "body_md": "topic reply"
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("reply_message failed: {error}"));
+    assert_eq!(reply["topic"], "release.v31");
+
+    let topic_messages = invoke(
+        "fetch_topic",
+        serde_json::json!({
+            "project_key": &project_key,
+            "topic_name": "Release.V31",
+            "include_bodies": true,
+            "limit": 10
+        }),
+        &mut req_id,
+    )
+    .unwrap_or_else(|error| panic!("fetch_topic failed: {error}"));
+    let topic_messages = topic_messages.as_array().expect("fetch_topic array");
+    assert_eq!(topic_messages.len(), 2);
+    assert!(
+        topic_messages
+            .iter()
+            .all(|message| message["topic"] == "release.v31")
+    );
+    assert!(
+        topic_messages
+            .iter()
+            .any(|message| message["body_md"] == "topic reply")
+    );
+
+    let invalid_topic = invoke(
+        "fetch_topic",
+        serde_json::json!({
+            "project_key": &project_key,
+            "topic_name": "../never-stored"
+        }),
+        &mut req_id,
+    )
+    .expect_err("invalid topic lookup must fail before querying");
+    assert!(
+        invalid_topic.contains("INVALID_TOPIC"),
+        "expected typed invalid-topic error, got: {invalid_topic}"
+    );
+
+    let blank_topic = invoke(
+        "fetch_topic",
+        serde_json::json!({
+            "project_key": &project_key,
+            "topic_name": "   "
+        }),
+        &mut req_id,
+    )
+    .expect_err("blank required topic lookup must fail");
+    assert!(
+        blank_topic.contains("INVALID_ARGUMENT"),
+        "expected typed blank-topic error, got: {blank_topic}"
+    );
+}
+
+#[test]
 fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("backpressure-shedding.sqlite3");
@@ -2593,7 +3035,7 @@ fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
     };
     let critical_result = router
         .handle_tools_call(
-            &McpContext::new(cx.clone(), req_id),
+            &McpContext::new(cx, req_id),
             critical_params,
             SessionState::new(),
             None,
@@ -2615,7 +3057,7 @@ fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
 
 #[test]
 fn product_bus_tools_end_to_end_across_linked_projects() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("product-bus-e2e.sqlite3");
@@ -2918,18 +3360,19 @@ fn fixture_schema_drift_guard() {
     let fixtures = Fixtures::load_default().expect("failed to load fixtures");
     let rust_native_tools = rust_native_tool_names();
 
-    // Every registered tool must be covered by either Python-parity fixtures or
-    // a rust-native fixture file when parity is intentionally deferred.
+    // Every registered tool must be covered by the captured Python fixture, a
+    // focused supplemental compatibility test, or an exact Rust-native golden.
     let tool_names: BTreeSet<&str> = mcp_agent_mail_tools::TOOL_CLUSTER_MAP
         .iter()
         .map(|(name, _)| *name)
         .collect();
     for tool_name in &tool_names {
         let python_fixture = fixtures.tools.get(*tool_name);
+        let supplemental_fixture = SUPPLEMENTAL_COMPATIBILITY_TOOLS.contains(tool_name);
         let rust_native_fixture = rust_native_tools.contains(*tool_name);
         assert!(
-            python_fixture.is_some() || rust_native_fixture,
-            "tool {tool_name} is registered in TOOL_CLUSTER_MAP but has no Python-parity or rust-native fixture"
+            python_fixture.is_some() || supplemental_fixture || rust_native_fixture,
+            "tool {tool_name} is registered in TOOL_CLUSTER_MAP but has no captured, supplemental-compatibility, or Rust-native fixture"
         );
         if let Some(fixture) = python_fixture {
             assert!(
@@ -2950,6 +3393,16 @@ fn fixture_schema_drift_guard() {
         assert!(
             tool_names.contains(tool_name.as_str()),
             "rust-native fixture tool {tool_name} is not in TOOL_CLUSTER_MAP (stale fixture?)"
+        );
+    }
+    for tool_name in SUPPLEMENTAL_COMPATIBILITY_TOOLS {
+        assert!(
+            tool_names.contains(tool_name),
+            "supplemental compatibility tool {tool_name} is not in TOOL_CLUSTER_MAP (stale classification?)"
+        );
+        assert!(
+            !fixtures.tools.contains_key(*tool_name) && !rust_native_tools.contains(*tool_name),
+            "supplemental compatibility tool {tool_name} must have exactly one conformance classification"
         );
     }
 
@@ -3044,7 +3497,7 @@ fn fixture_tool_happy_and_failure_shape_coverage() {
 
 #[test]
 fn handwritten_tool_failure_cases_match_rust_router() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let env = setup_fixture_env();
     let cx = Cx::for_testing();
     let budget = Budget::INFINITE;
@@ -3072,7 +3525,7 @@ fn handwritten_tool_failure_cases_match_rust_router() {
 
 #[test]
 fn force_release_file_reservation_happy_path_is_covered() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("force-release-happy.sqlite3");
@@ -3179,7 +3632,7 @@ fn force_release_file_reservation_happy_path_is_covered() {
 
 #[test]
 fn generated_non_object_arguments_are_rejected_for_every_tool() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let env = setup_fixture_env();
     let cx = Cx::for_testing();
     let budget = Budget::INFINITE;
@@ -3249,7 +3702,7 @@ fn fixture_resource_identity_coverage() {
 
 #[test]
 fn resource_query_router_projects_limit_and_contains_are_honored() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("projects-query-routing.sqlite3");
@@ -3335,7 +3788,7 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
     };
     let zero_result = router
         .handle_resources_read(
-            &McpContext::new(cx.clone(), 1),
+            &McpContext::new(cx, 1),
             &zero_params,
             SessionState::new(),
             None,
@@ -3355,7 +3808,7 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
 
 #[test]
 fn resource_query_router_projects_invalid_query_values_surface_errors() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("projects-query-errors.sqlite3");
@@ -3414,10 +3867,7 @@ fn resource_query_router_projects_invalid_query_values_surface_errors() {
                     .unwrap_or("<non-text>");
                 assert!(
                     text.contains(expected_substr),
-                    "expected query validation error containing {:?}, got successful content {:?} for URI {}",
-                    expected_substr,
-                    text,
-                    uri
+                    "expected query validation error containing {expected_substr:?}, got successful content {text:?} for URI {uri}"
                 );
             }
         }
@@ -3426,7 +3876,7 @@ fn resource_query_router_projects_invalid_query_values_surface_errors() {
 
 #[test]
 fn resource_router_error_cases_missing_projects_invalid_uris_and_bad_params() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("resource-error-cases.sqlite3");
@@ -3503,10 +3953,7 @@ fn resource_router_error_cases_missing_projects_invalid_uris_and_bad_params() {
                     .unwrap_or("<non-text>");
                 assert!(
                     contains_any(text),
-                    "expected one of {:?}, got successful content {:?} for URI {}",
-                    expected_any,
-                    text,
-                    uri
+                    "expected one of {expected_any:?}, got successful content {text:?} for URI {uri}"
                 );
             }
         }
@@ -3521,7 +3968,7 @@ fn resource_router_error_cases_missing_projects_invalid_uris_and_bad_params() {
 fn toon_format_resolution_json_fallback() {
     // When TOON_BIN is empty (no encoder available), format requests should
     // resolve to JSON or produce a TOON envelope with fallback data.
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("toon-test.sqlite3");
@@ -3554,7 +4001,7 @@ fn toon_format_resolution_json_fallback() {
         meta: None,
     };
     let result = router.handle_tools_call(
-        &McpContext::new(cx.clone(), 1),
+        &McpContext::new(cx, 1),
         params,
         SessionState::new(),
         None,
@@ -3579,7 +4026,7 @@ fn toon_format_resolution_json_fallback() {
 #[test]
 fn llm_mode_parameter_accepted_by_tools() {
     // Verify that tools accepting llm_mode parameter don't reject it.
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("llm-test.sqlite3");
@@ -3705,7 +4152,7 @@ fn llm_mode_parameter_accepted_by_tools() {
         meta: None,
     };
     let result = router.handle_tools_call(
-        &McpContext::new(cx.clone(), req_id),
+        &McpContext::new(cx, req_id),
         params,
         SessionState::new(),
         None,

@@ -209,7 +209,7 @@ impl Default for VerifyConfig {
     }
 }
 
-/// Full verify-live report (SPEC-verify-live-contract.md schema_version 1.0.0).
+/// Full verify-live report (SPEC-verify-live-contract.md `schema_version` 1.0.0).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyLiveReport {
     pub schema_version: String,
@@ -302,7 +302,7 @@ impl VerifyLiveReport {
 
     /// Determine exit code per SPEC-verify-live-contract.md.
     #[must_use]
-    pub fn exit_code(&self) -> i32 {
+    pub const fn exit_code(&self) -> i32 {
         match self.verdict {
             VerifyVerdict::Fail => 1,
             VerifyVerdict::Warn if self.config.strict => 1,
@@ -1762,7 +1762,7 @@ fn validate_database_artifacts(
 
     let chunked = database
         .and_then(|value| value.get("chunked"))
-        .and_then(|value| value.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     if chunked {
         let manifest_chunk = database
@@ -1938,15 +1938,7 @@ fn validate_chunk_artifacts(
 
     let config_path = bundle_dir.join("mailbox.sqlite3.config.json");
     let mut expected_chunk_count = manifest_chunk.map(|manifest| manifest.chunk_count);
-    let config_chunk = if !is_real_file(&config_path) {
-        checks.push(DeployCheck {
-            name: "database_chunk_config_valid".to_string(),
-            passed: false,
-            message: "mailbox.sqlite3.config.json is missing".to_string(),
-            severity: CheckSeverity::Error,
-        });
-        None
-    } else {
+    let config_chunk = if is_real_file(&config_path) {
         match std::fs::read_to_string(&config_path) {
             Ok(text) => match serde_json::from_str::<crate::ChunkManifest>(&text) {
                 Ok(config) => {
@@ -1982,6 +1974,14 @@ fn validate_chunk_artifacts(
                 None
             }
         }
+    } else {
+        checks.push(DeployCheck {
+            name: "database_chunk_config_valid".to_string(),
+            passed: false,
+            message: "mailbox.sqlite3.config.json is missing".to_string(),
+            severity: CheckSeverity::Error,
+        });
+        None
     };
 
     if let (Some(manifest), Some(config)) = (manifest_chunk, config_chunk.as_ref()) {
@@ -2286,7 +2286,7 @@ fn walk_dir_inner(
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let size = entry.metadata().map_or(0, |m| m.len());
             entries.push(FileEntry { path: rel, size });
         }
     }
@@ -2299,11 +2299,10 @@ fn build_security_expectations(bundle_dir: &Path, stats: &BundleStats) -> Securi
     let headers_path = bundle_dir.join("_headers");
     let cross_origin = if is_real_file(&headers_path) {
         std::fs::read_to_string(&headers_path)
-            .map(|c| {
+            .is_ok_and(|c| {
                 c.contains("Cross-Origin-Opener-Policy")
                     && c.contains("Cross-Origin-Embedder-Policy")
             })
-            .unwrap_or(false)
     } else {
         false
     };
@@ -2316,11 +2315,11 @@ fn build_security_expectations(bundle_dir: &Path, stats: &BundleStats) -> Securi
             .and_then(|m| {
                 m.get("scrub")
                     .and_then(|s| s.get("preset"))
-                    .and_then(|p| p.as_str().map(|s| s.to_string()))
+                    .and_then(|p| p.as_str().map(std::string::ToString::to_string))
                     .or_else(|| {
                         m.get("export_config")
                             .and_then(|e| e.get("scrub_preset"))
-                            .and_then(|p| p.as_str().map(|s| s.to_string()))
+                            .and_then(|p| p.as_str().map(std::string::ToString::to_string))
                     })
             })
     } else {
@@ -2442,7 +2441,7 @@ fn shell_quote_bundle_path(path: &Path) -> String {
     format!("'{}'", path.replace('\'', "'\"'\"'"))
 }
 
-fn is_safe_bundle_tooling_char(ch: char) -> bool {
+const fn is_safe_bundle_tooling_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/' | ' ')
 }
 
@@ -2720,6 +2719,7 @@ pub fn record_deploy(bundle_dir: &Path, entry: DeployHistoryEntry) -> ShareResul
 /// Build a verification plan for a deployed URL (returns the list of checks
 /// that *would* be performed). Actual HTTP checks require a runtime client,
 /// so this produces the check descriptions and expected status codes.
+#[must_use]
 pub fn build_verify_plan(deployed_url: &str) -> VerifyResult {
     let url = deployed_url.trim_end_matches('/');
     let mut checks = Vec::new();
@@ -3223,8 +3223,7 @@ mod tests {
     ) {
         let db_path = bundle_dir.join("mailbox.sqlite3");
         let db_size = std::fs::metadata(&db_path)
-            .map(|meta| meta.len())
-            .unwrap_or(0);
+            .map_or(0, |meta| meta.len());
         let manifest = serde_json::json!({
             "schema_version": "0.1.0",
             "generated_at": "2024-01-01T00:00:00Z",
@@ -3732,7 +3731,7 @@ mod tests {
         let report_json = std::fs::read_to_string(bundle.join("deploy_report.json")).unwrap();
         let report: DeployReport = serde_json::from_str(&report_json).unwrap();
         assert!(report.ready);
-        assert!(!report.generated_at.is_empty());
+        assert_ne!(report.generated_at, "");
         assert!(!report.rollback.steps.is_empty());
     }
 
@@ -4189,7 +4188,7 @@ mod tests {
         create_minimal_bundle(&bundle);
 
         let report = validate_bundle(&bundle).unwrap();
-        assert!(!report.generated_at.is_empty());
+        assert_ne!(report.generated_at, "");
         assert!(report.security.cross_origin_isolation);
         assert!(!report.security.contains_database);
         assert!(report.rollback.steps.len() >= 3);
@@ -4607,7 +4606,7 @@ mod tests {
     #[test]
     fn verify_live_options_default() {
         let opts = VerifyLiveOptions::default();
-        assert!(opts.url.is_empty());
+        assert_eq!(opts.url, "");
         assert!(opts.bundle_path.is_none());
         assert!(!opts.security_audit);
         assert!(!opts.strict);

@@ -297,7 +297,7 @@ pub fn verify_bundle(
                 let embedded = sig_json
                     .get("public_key")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+                    .map(std::string::ToString::to_string);
                 let source = embedded.as_ref().map(|_| "embedded".to_string());
                 (embedded, source)
             };
@@ -562,9 +562,7 @@ pub fn encrypt_with_age(input: &Path, recipients: &[String]) -> ShareResult<std:
 
     let output = input.with_extension(
         input
-            .extension()
-            .map(|e| format!("{}.age", e.to_string_lossy()))
-            .unwrap_or_else(|| "age".to_string()),
+            .extension().map_or_else(|| "age".to_string(), |e| format!("{}.age", e.to_string_lossy())),
     );
 
     validate_crypto_output_path(&output, "encrypted output")?;
@@ -905,7 +903,7 @@ mod tests {
             .lines()
             .find(|line| line.to_ascii_lowercase().contains("public key:"))
             .and_then(|line| line.split_whitespace().last())
-            .map(|s| s.to_string())?;
+            .map(std::string::ToString::to_string)?;
         Some((identity_path, recipient))
     }
 
@@ -1777,7 +1775,7 @@ mod tests {
 
         // Corrupt the signature by flipping bits
         let sig_bytes = base64_decode(&sig.signature).unwrap();
-        let mut corrupted = sig_bytes.clone();
+        let mut corrupted = sig_bytes;
         corrupted[0] ^= 0xFF;
         corrupted[31] ^= 0xAA;
 
@@ -1869,8 +1867,8 @@ mod tests {
         let sig = sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
 
         // Verification will fail at manifest parse stage, but signing should work
-        assert!(!sig.signature.is_empty());
-        assert!(!sig.manifest_sha256.is_empty());
+        assert_ne!(sig.signature, "");
+        assert_ne!(sig.manifest_sha256, "");
     }
 
     // --- Large payload roundtrip ---
@@ -2277,7 +2275,7 @@ mod tests {
         let ciphertext = std::fs::read(&encrypted).unwrap();
         assert_bytes_omit_privacy_markers("privacy proof age payload", &ciphertext);
         for public_marker in [
-            "br-lmcob.13".as_bytes(),
+            b"br-lmcob.13",
             b"prod-public".as_slice(),
             b"[project path redacted: acme-client]".as_slice(),
         ] {
@@ -2659,7 +2657,7 @@ mod tests {
     fn base64_roundtrip_empty() {
         let encoded = base64_encode(b"");
         let decoded = base64_decode(&encoded).unwrap();
-        assert!(decoded.is_empty());
+        assert_eq!(decoded, [] as [u8; 0]);
     }
 
     #[test]
@@ -2691,10 +2689,10 @@ mod tests {
         let sig = sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
 
         assert_eq!(sig.algorithm, "ed25519");
-        assert!(!sig.signature.is_empty());
-        assert!(!sig.manifest_sha256.is_empty());
-        assert!(!sig.public_key.is_empty());
-        assert!(!sig.generated_at.is_empty());
+        assert_ne!(sig.signature, "");
+        assert_ne!(sig.manifest_sha256, "");
+        assert_ne!(sig.public_key, "");
+        assert_ne!(sig.generated_at, "");
 
         // Signature should be valid base64 decoding to 64 bytes
         let sig_bytes = base64_decode(&sig.signature).unwrap();

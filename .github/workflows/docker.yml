@@ -1,18 +1,20 @@
-# Build + publish a multi-arch container image to ghcr.io.
+# Publish a multi-arch container image to ghcr.io.
 #
 # Triggers
 # --------
-#   push tag v*          — tagged releases (matches dist.yml). Publishes
-#                          :<tag>, :latest, and the SemVer aliases.
-#   workflow_dispatch    — manual builds (e.g. between releases). The
-#                          dispatch form accepts inputs.am_ref and
-#                          inputs.sibling_ref so users can rebuild from any
-#                          commit without cutting a release.
+#   push tag v*          — canonical release path. Waits for dist.yml to
+#                          publish the matching GitHub Release, verifies its
+#                          Linux binaries, and packages them with
+#                          Dockerfile.release. Publishes :<tag>, :latest, and
+#                          the SemVer aliases.
+#   workflow_dispatch    — non-release source build. Accepts inputs.am_ref and
+#                          inputs.sibling_ref and publishes only source-*
+#                          tags, which cannot overwrite release tags.
 #
-# The Dockerfile clones the source tree itself (via the AM_REF build arg),
-# so the workflow does not need to checkout the repo for the image to match
-# a specific commit. We still run a checkout step so docker/build-push-action
-# can find the Dockerfile in the workspace.
+# The tag path never recompiles the project. The binaries in the container are
+# the checksum-verified bytes from the public GitHub Release for that exact
+# tag. Dockerfile remains available only to workflow_dispatch for explicitly
+# non-release source builds.
 name: docker
 # Fork canary builds use workflow_dispatch with a pinned upstream release tag.
 
@@ -31,7 +33,7 @@ on:
         required: false
         default: 'main'
       tag_suffix:
-        description: 'Extra image tag to push (in addition to :sha-<short>).'
+        description: 'Source-build tag component; always namespaced and suffixed with the resolved AM_REF commit SHA.'
         required: false
         default: 'manual'
 
@@ -55,21 +57,30 @@ env:
 
 jobs:
   prepare:
-    name: Prepare image metadata
+    name: Bind release inputs and image metadata
     runs-on: ubuntu-latest
+    timeout-minutes: 110
     outputs:
       image: ${{ steps.image.outputs.image }}
+      mode: ${{ steps.refs.outputs.mode }}
+      dockerfile: ${{ steps.refs.outputs.dockerfile }}
+      version: ${{ steps.refs.outputs.version }}
+      revision: ${{ steps.refs.outputs.revision }}
+      release_tag: ${{ steps.refs.outputs.release_tag }}
       am_ref: ${{ steps.refs.outputs.am_ref }}
       sibling_ref: ${{ steps.refs.outputs.sibling_ref }}
       sibling_fallback_ref: ${{ steps.refs.outputs.sibling_fallback_ref }}
+      tag_suffix: ${{ steps.refs.outputs.tag_suffix }}
       tags: ${{ steps.meta.outputs.tags }}
       labels: ${{ steps.meta.outputs.labels }}
     permissions:
       contents: read
 
     steps:
-      - name: Checkout (Dockerfile + workflow only)
+      - name: Checkout triggering source revision
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
 
       - name: Lowercase image name
         id: image
@@ -80,29 +91,304 @@ jobs:
           lowered="${RAW_IMAGE,,}"
           printf 'image=%s\n' "$lowered" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve build refs
+      - name: Resolve and verify build contract
         id: refs
         env:
           EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_VALUE: ${{ github.ref }}
           INPUT_AM_REF: ${{ inputs.am_ref }}
           INPUT_SIBLING_REF: ${{ inputs.sibling_ref }}
+          INPUT_TAG_SUFFIX: ${{ inputs.tag_suffix }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          # Tag pushes build the project tag and first try matching sibling tags.
-          # The Dockerfile falls back per sibling when that repo has no such tag.
+
           if [ "$EVENT_NAME" = "push" ]; then
-            am_ref="$REF_NAME"
-            sibling_ref="$REF_NAME"
+            release_tag_pattern='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'
+            if [ "$GITHUB_REF_VALUE" != "refs/tags/${REF_NAME}" ] || [[ ! "$REF_NAME" =~ $release_tag_pattern ]]; then
+              echo "Release containers require an exact vX.Y.Z or vX.Y.Z-prerelease tag" >&2
+              exit 1
+            fi
+
+            mode="release"
+            dockerfile="./Dockerfile.release"
+            release_tag="$REF_NAME"
+            version="${REF_NAME#v}"
+            revision="$(git rev-parse HEAD)"
+            if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Checked-out release revision is not a full commit SHA: ${revision}" >&2
+              exit 1
+            fi
+
+            # Bind the checked-out commit to the tag as it exists on origin.
+            # Annotated tags have a peeled ^{} ref; lightweight tags do not.
+            remote_revision="$(git ls-remote origin "refs/tags/${REF_NAME}^{}" | awk 'NR == 1 {print $1}')"
+            if [ -z "$remote_revision" ]; then
+              remote_revision="$(git ls-remote origin "refs/tags/${REF_NAME}" | awk 'NR == 1 {print $1}')"
+            fi
+            if [ "$remote_revision" != "$revision" ]; then
+              echo "Tag ${REF_NAME} resolves to ${remote_revision:-missing}, not checked-out ${revision}" >&2
+              exit 1
+            fi
+
+            manifest_version="$(python3 - <<'PY'
+          import pathlib
+          import tomllib
+
+          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          print(manifest["workspace"]["package"]["version"])
+          PY
+            )"
+            if [ "$manifest_version" != "$version" ]; then
+              echo "Tag version ${version} does not match workspace version ${manifest_version}" >&2
+              exit 1
+            fi
+
+            # The release lane consumes published binaries; these source-build
+            # refs are intentionally inert in Dockerfile.release.
+            am_ref="$revision"
+            sibling_ref="$revision"
+            tag_suffix=""
           else
-            am_ref="${INPUT_AM_REF:-main}"
+            mode="source"
+            dockerfile="./Dockerfile"
+            release_tag=""
+            version="manual"
+            requested_am_ref="${INPUT_AM_REF:-main}"
             sibling_ref="${INPUT_SIBLING_REF:-main}"
+            tag_suffix="${INPUT_TAG_SUFFIX:-manual}"
+            for input_ref in "$requested_am_ref" "$sibling_ref" "$tag_suffix"; do
+              if [[ "$input_ref" == *$'\n'* || "$input_ref" == *$'\r'* ]]; then
+                echo "Manual source inputs must be single-line values" >&2
+                exit 1
+              fi
+            done
+            if [[ ! "$tag_suffix" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]; then
+              echo "Manual tag suffix must be 1-64 lowercase tag-safe characters" >&2
+              exit 1
+            fi
+
+            # Resolve the user-facing branch/tag once, then pass only the
+            # immutable commit to Docker. A hexadecimal value shorter than a
+            # full object ID is deliberately not reinterpreted as a branch.
+            if [[ "$requested_am_ref" =~ ^[0-9a-f]{40}$ ]]; then
+              fetch_ref="$requested_am_ref"
+              expected_revision="$requested_am_ref"
+            elif [[ "$requested_am_ref" =~ ^[0-9A-Fa-f]{1,40}$ ]]; then
+              echo "Manual AM_REF must not be a short or non-canonical commit SHA" >&2
+              exit 1
+            else
+              git check-ref-format "refs/heads/${requested_am_ref}" >/dev/null || {
+                echo "Manual AM_REF is not a valid branch or tag name" >&2
+                exit 1
+              }
+              remote_refs="$(git ls-remote --heads --tags origin)"
+              head_revision="$(awk -v target="refs/heads/${requested_am_ref}" '$2 == target {print $1}' <<< "$remote_refs")"
+              tag_revision="$(awk -v target="refs/tags/${requested_am_ref}" '$2 == target {print $1}' <<< "$remote_refs")"
+              peeled_revision="$(awk -v target="refs/tags/${requested_am_ref}^{}" '$2 == target {print $1}' <<< "$remote_refs")"
+
+              if [ -n "$head_revision" ] && [ -n "$tag_revision" ]; then
+                echo "Manual AM_REF is ambiguous: both a branch and tag use that name" >&2
+                exit 1
+              elif [ -n "$head_revision" ]; then
+                fetch_ref="refs/heads/${requested_am_ref}"
+                expected_revision="$head_revision"
+              elif [ -n "$tag_revision" ]; then
+                fetch_ref="refs/tags/${requested_am_ref}"
+                expected_revision="${peeled_revision:-$tag_revision}"
+              else
+                echo "Manual AM_REF does not name a remote branch, tag, or full commit" >&2
+                exit 1
+              fi
+            fi
+
+            git fetch --no-tags --depth=1 origin "$fetch_ref"
+            revision="$(git rev-parse --verify 'FETCH_HEAD^{commit}')"
+            if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]] || [ "$revision" != "$expected_revision" ]; then
+              echo "Fetched AM_REF resolved to ${revision:-missing}, expected ${expected_revision}" >&2
+              exit 1
+            fi
+
+            # Dockerfile's full-SHA lane fetches this exact object and checks
+            # out FETCH_HEAD. Never pass the original moving ref to the build.
+            am_ref="$revision"
           fi
           {
+            printf 'mode=%s\n' "$mode"
+            printf 'dockerfile=%s\n' "$dockerfile"
+            printf 'version=%s\n' "$version"
+            printf 'revision=%s\n' "$revision"
+            printf 'release_tag=%s\n' "$release_tag"
             printf 'am_ref=%s\n' "$am_ref"
             printf 'sibling_ref=%s\n' "$sibling_ref"
             printf 'sibling_fallback_ref=%s\n' "main"
+            printf 'tag_suffix=%s\n' "$tag_suffix"
           } >> "$GITHUB_OUTPUT"
+          {
+            printf '### Container build contract\n\n'
+            printf -- '- Mode: `%s`\n' "$mode"
+            printf -- '- Source revision: `%s`\n' "$revision"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download and verify published release binaries
+        if: ${{ steps.refs.outputs.mode == 'release' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.refs.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          amd64_archive="mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz"
+          arm64_archive="mcp-agent-mail-aarch64-unknown-linux-gnu.tar.xz"
+          required_assets=(
+            "$amd64_archive"
+            "${amd64_archive}.sha256"
+            "$arm64_archive"
+            "${arm64_archive}.sha256"
+            "SHA256SUMS"
+          )
+
+          release_ready() {
+            local json="$1"
+            local asset count state size digest
+
+            [ "$(jq -r '.tag_name // empty' <<< "$json")" = "$RELEASE_TAG" ] || return 1
+            [ "$(jq -r '.draft // true' <<< "$json")" = "false" ] || return 1
+            for asset in "${required_assets[@]}"; do
+              count="$(jq -r --arg name "$asset" '[.assets[] | select(.name == $name)] | length' <<< "$json")"
+              [ "$count" = "1" ] || return 1
+              state="$(jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .state' <<< "$json")"
+              size="$(jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .size' <<< "$json")"
+              digest="$(jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .digest // empty' <<< "$json")"
+              [ "$state" = "uploaded" ] || return 1
+              [ "$size" -gt 0 ] || return 1
+              [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+            done
+          }
+
+          release_json=""
+          for attempt in $(seq 1 180); do
+            if release_json="$(gh api -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "/repos/${GH_REPO}/releases/tags/${RELEASE_TAG}" 2>/dev/null)" \
+                && release_ready "$release_json"; then
+              break
+            fi
+            if [ "$attempt" -eq 180 ]; then
+              echo "Timed out waiting for the verified public ${RELEASE_TAG} release bundle" >&2
+              exit 1
+            fi
+            printf 'Release assets not complete yet (attempt %s/180); retrying in 30s\n' "$attempt"
+            sleep 30
+          done
+
+          asset_fingerprint() {
+            local json="$1"
+            local asset
+            for asset in "${required_assets[@]}"; do
+              jq -r --arg name "$asset" \
+                '.assets[] | select(.name == $name) | [.id, .name, .size, .digest, .state] | @tsv' \
+                <<< "$json"
+            done
+          }
+          before_fingerprint="$(asset_fingerprint "$release_json")"
+
+          mkdir -p release-assets dist/amd64 dist/arm64
+          download_args=()
+          for asset in "${required_assets[@]}"; do
+            download_args+=(--pattern "$asset")
+          done
+          gh release download "$RELEASE_TAG" --repo "$GH_REPO" \
+            --dir release-assets "${download_args[@]}"
+
+          asset_count="$(find release-assets -maxdepth 1 -type f | wc -l | tr -d '[:space:]')"
+          if [ "$asset_count" -ne "${#required_assets[@]}" ]; then
+            echo "Expected ${#required_assets[@]} downloaded release assets, found ${asset_count}" >&2
+            exit 1
+          fi
+
+          after_json="$(gh api -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "/repos/${GH_REPO}/releases/tags/${RELEASE_TAG}")"
+          release_ready "$after_json" || {
+            echo "Release asset set became incomplete during download" >&2
+            exit 1
+          }
+          after_fingerprint="$(asset_fingerprint "$after_json")"
+          if [ "$before_fingerprint" != "$after_fingerprint" ]; then
+            echo "Release asset identity changed during download" >&2
+            exit 1
+          fi
+
+          # GitHub's asset digest, the per-archive sidecar, and the consolidated
+          # SHA256SUMS must all agree with the downloaded bytes.
+          for asset in "${required_assets[@]}"; do
+            actual_api_digest="sha256:$(sha256sum "release-assets/${asset}" | awk '{print $1}')"
+            expected_api_digest="$(jq -r --arg name "$asset" \
+              '.assets[] | select(.name == $name) | .digest' <<< "$after_json")"
+            if [ "$actual_api_digest" != "$expected_api_digest" ]; then
+              echo "GitHub asset digest mismatch for ${asset}" >&2
+              exit 1
+            fi
+          done
+
+          for archive in "$amd64_archive" "$arm64_archive"; do
+            actual_hash="$(sha256sum "release-assets/${archive}" | awk '{print $1}')"
+            sidecar_hash="$(awk 'NR == 1 {print $1}' "release-assets/${archive}.sha256")"
+            sidecar_name="$(awk 'NR == 1 {print $2}' "release-assets/${archive}.sha256")"
+            sidecar_name="${sidecar_name#\*}"
+            mapfile -t sums_hashes < <(
+              awk -v artifact="$archive" \
+                '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1}' \
+                release-assets/SHA256SUMS
+            )
+            if [ "$sidecar_name" != "$archive" ] || [ "${#sums_hashes[@]}" -ne 1 ] \
+                || [ "$actual_hash" != "$sidecar_hash" ] \
+                || [ "$actual_hash" != "${sums_hashes[0]:-}" ]; then
+              echo "Published checksum witnesses disagree for ${archive}" >&2
+              exit 1
+            fi
+          done
+
+          extract_release_archive() {
+            local archive="$1"
+            local destination="$2"
+            local members verbose_members
+
+            mapfile -t members < <(tar -tJf "release-assets/${archive}" | sed 's#^\./##' | sort)
+            mapfile -t verbose_members < <(tar -tvJf "release-assets/${archive}")
+            if [ "${members[*]}" != "am mcp-agent-mail" ] || [ "${#verbose_members[@]}" -ne 2 ]; then
+              echo "${archive} must contain exactly the two flat release binaries" >&2
+              exit 1
+            fi
+            for member_line in "${verbose_members[@]}"; do
+              if [ "${member_line:0:1}" != "-" ]; then
+                echo "${archive} contains a non-regular entry" >&2
+                exit 1
+              fi
+            done
+            tar --extract --xz --file="release-assets/${archive}" \
+              --directory="$destination" --no-same-owner --no-same-permissions
+            for binary in am mcp-agent-mail; do
+              if [ ! -f "${destination}/${binary}" ] || [ -L "${destination}/${binary}" ]; then
+                echo "${archive} did not extract a regular ${binary} binary" >&2
+                exit 1
+              fi
+            done
+          }
+
+          extract_release_archive "$amd64_archive" dist/amd64
+          extract_release_archive "$arm64_archive" dist/arm64
+
+      - name: Upload verified release-binary context
+        if: ${{ steps.refs.outputs.mode == 'release' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: release-binaries-${{ github.run_id }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Compute image tags
         id: meta
@@ -114,14 +400,71 @@ jobs:
           #   pre-release (vX.Y.Z-rc1, -beta, ...) → :v0.3.6-rc1, :0.3.6-rc1
           #     (NO :latest, NO :{major.minor} — those should only ever point
           #      at stable releases to avoid surprising `:latest` consumers.)
-          #   manual run → :manual-<short>, :sha-<short>
+          #   manual source run → :source-<suffix>-<full-sha>,
+          #                       :source-sha-<full-sha>
           tags: |
             type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
             type=raw,value=${{ github.ref_name }},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
-            type=raw,value=${{ inputs.tag_suffix }}-${{ github.sha }},enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=sha,format=short,prefix=sha-
+            type=raw,value=source-${{ steps.refs.outputs.tag_suffix }}-${{ steps.refs.outputs.revision }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=source-sha-${{ steps.refs.outputs.revision }},enable=${{ github.event_name == 'workflow_dispatch' }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.refs.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.refs.outputs.revision }}
+
+      - name: Validate publication tag policy
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          MODE: ${{ steps.refs.outputs.mode }}
+          RELEASE_TAG: ${{ steps.refs.outputs.release_tag }}
+          VERSION: ${{ steps.refs.outputs.version }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          SOURCE_REVISION: ${{ steps.refs.outputs.revision }}
+          TAG_SUFFIX: ${{ steps.refs.outputs.tag_suffix }}
+        run: |
+          set -euo pipefail
+          mapfile -t published_tags < <(printf '%s\n' "$TAGS" | sed '/^$/d' | sort -u)
+          if [ "${#published_tags[@]}" -eq 0 ]; then
+            echo "metadata-action produced no image tags" >&2
+            exit 1
+          fi
+
+          if [ "$MODE" = "release" ]; then
+            expected_tags=("${IMAGE}:${VERSION}" "${IMAGE}:${RELEASE_TAG}")
+            if [[ "$VERSION" != *-* ]]; then
+              expected_tags+=("${IMAGE}:${VERSION%.*}" "${IMAGE}:latest")
+            fi
+            if [ "${#published_tags[@]}" -ne "${#expected_tags[@]}" ]; then
+              echo "Release tag set has unexpected aliases" >&2
+              printf 'Actual: %s\n' "${published_tags[@]}" >&2
+              exit 1
+            fi
+            for expected_tag in "${expected_tags[@]}"; do
+              printf '%s\n' "${published_tags[@]}" | grep -qxF "$expected_tag" || {
+                echo "Missing required release image tag ${expected_tag}" >&2
+                exit 1
+              }
+            done
+          else
+            [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+            expected_tags=(
+              "${IMAGE}:source-${TAG_SUFFIX}-${SOURCE_REVISION}"
+              "${IMAGE}:source-sha-${SOURCE_REVISION}"
+            )
+            mapfile -t expected_tags < <(printf '%s\n' "${expected_tags[@]}" | sort -u)
+            if [ "${#published_tags[@]}" -ne "${#expected_tags[@]}" ]; then
+              echo "Manual source tag set has an unexpected size" >&2
+              printf 'Actual: %s\n' "${published_tags[@]}" >&2
+              exit 1
+            fi
+            for expected_tag in "${expected_tags[@]}"; do
+              printf '%s\n' "${published_tags[@]}" | grep -qxF "$expected_tag" || {
+                echo "Missing source-commit-bound image tag ${expected_tag}" >&2
+                exit 1
+              }
+            done
+          fi
 
   build:
     name: Build ${{ matrix.platform }}
@@ -148,6 +491,38 @@ jobs:
       - name: Checkout (Dockerfile + workflow only)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
+      - name: Download verified release binaries
+        if: ${{ needs.prepare.outputs.mode == 'release' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: release-binaries-${{ github.run_id }}
+          path: dist
+
+      - name: Assert canonical build path
+        env:
+          MODE: ${{ needs.prepare.outputs.mode }}
+          DOCKERFILE: ${{ needs.prepare.outputs.dockerfile }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          REVISION: ${{ needs.prepare.outputs.revision }}
+          AM_REF: ${{ needs.prepare.outputs.am_ref }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = "release" ]; then
+            [ "$DOCKERFILE" = "./Dockerfile.release" ]
+            [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]
+            [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]]
+            for arch in amd64 arm64; do
+              test -s "dist/${arch}/mcp-agent-mail"
+              test -s "dist/${arch}/am"
+            done
+          else
+            [ "$DOCKERFILE" = "./Dockerfile" ]
+            [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]]
+            [ "$AM_REF" = "$REVISION" ]
+            grep -Fq 'git fetch --depth 1 origin "${AM_REF}"' "$DOCKERFILE"
+            grep -Fq 'git checkout -q FETCH_HEAD' "$DOCKERFILE"
+          fi
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
 
@@ -163,35 +538,44 @@ jobs:
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
         with:
           context: .
-          file: ./Dockerfile
+          file: ${{ needs.prepare.outputs.dockerfile }}
           platforms: ${{ matrix.platform }}
-          labels: ${{ needs.prepare.outputs.labels }}
+          labels: |
+            ${{ needs.prepare.outputs.labels }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.revision }}
           outputs: type=image,name=${{ needs.prepare.outputs.image }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=docker-${{ github.workflow }}-${{ matrix.cache_scope }}
-          cache-to: type=gha,mode=max,scope=docker-${{ github.workflow }}-${{ matrix.cache_scope }}
+          cache-from: type=gha,scope=docker-${{ github.workflow }}-${{ needs.prepare.outputs.mode }}-${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=docker-${{ github.workflow }}-${{ needs.prepare.outputs.mode }}-${{ matrix.cache_scope }}
           build-args: |
+            AM_VERSION=${{ needs.prepare.outputs.version }}
+            AM_REVISION=${{ needs.prepare.outputs.revision }}
             AM_REF=${{ needs.prepare.outputs.am_ref }}
             SIBLING_REF=${{ needs.prepare.outputs.sibling_ref }}
             SIBLING_FALLBACK_REF=${{ needs.prepare.outputs.sibling_fallback_ref }}
-          provenance: true
+          # Max provenance records the immutable AM_REF build argument rather
+          # than leaving a manual source build identified only by github.sha.
+          provenance: mode=max
           sbom: true
 
       - name: Export digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM_ARTIFACT: ${{ matrix.artifact }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/digests"
-          # shellcheck disable=SC2153
-          digest="${DIGEST#sha256:}"
-          test -n "$digest"
-          touch "$RUNNER_TEMP/digests/$digest"
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Build returned an invalid ${PLATFORM_ARTIFACT} digest: ${DIGEST}" >&2
+            exit 1
+          fi
+          printf '%s\n' "$DIGEST" > "$RUNNER_TEMP/digests/${PLATFORM_ARTIFACT}.digest"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: digests-${{ matrix.artifact }}
-          path: ${{ runner.temp }}/digests/*
+          path: ${{ runner.temp }}/digests/*.digest
           if-no-files-found: error
           retention-days: 1
 
@@ -218,7 +602,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           path: ${{ runner.temp }}/digests
           pattern: digests-*
@@ -242,21 +626,53 @@ jobs:
             exit 1
           fi
 
-          sources=()
-          while IFS= read -r digest_file; do
-            digest="$(basename "$digest_file")"
-            sources+=("$IMAGE@sha256:$digest")
-          done < <(find "$DIGEST_DIR" -type f | sort)
-          if [ "${#sources[@]}" -eq 0 ]; then
-            echo "no platform digests downloaded" >&2
+          expected_digest_files=(linux-amd64.digest linux-arm64.digest)
+          mapfile -t actual_digest_files < <(
+            find "$DIGEST_DIR" -maxdepth 1 -type f -printf '%f\n' | sort
+          )
+          if [ "${actual_digest_files[*]}" != "${expected_digest_files[*]}" ]; then
+            echo "Expected exactly amd64 and arm64 digest witnesses" >&2
+            printf 'Found: %s\n' "${actual_digest_files[@]}" >&2
             exit 1
           fi
+
+          sources=()
+          for digest_file in "${expected_digest_files[@]}"; do
+            digest="$(<"${DIGEST_DIR}/${digest_file}")"
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "Invalid digest in ${digest_file}: ${digest}" >&2
+              exit 1
+            fi
+            sources+=("$IMAGE@$digest")
+          done
 
           metadata_file="${RUNNER_TEMP:?}/imagetools-metadata.json"
           docker buildx imagetools create --metadata-file "$metadata_file" "${tag_args[@]}" "${sources[@]}"
           first_tag="${tag_args[1]}"
           digest="$(jq -r '."containerimage.descriptor".digest // empty' "$metadata_file")"
-          test -n "$digest"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "imagetools did not return a valid index digest" >&2
+            exit 1
+          fi
+
+          manifest_json="$(docker buildx imagetools inspect --raw "$IMAGE@$digest")"
+          jq -e '
+            (.mediaType == "application/vnd.oci.image.index.v1+json"
+              or .mediaType == "application/vnd.docker.distribution.manifest.list.v2+json")
+            and ([.manifests[].platform
+                  | select(.os == "linux" and (.architecture == "amd64" or .architecture == "arm64"))
+                  | (.os + "/" + .architecture)] | sort | unique
+                 == ["linux/amd64", "linux/arm64"])
+            and ([.manifests[].platform
+                  | select(.os == "linux")
+                  | (.os + "/" + .architecture)] | length == 2)
+            and all(.manifests[].platform;
+                    (.os == "linux" and (.architecture == "amd64" or .architecture == "arm64"))
+                    or (.os == "unknown" and .architecture == "unknown"))
+          ' <<< "$manifest_json" >/dev/null || {
+            echo "Published index does not contain exactly one runnable amd64 and arm64 manifest" >&2
+            exit 1
+          }
           printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
           printf 'first_tag=%s\n' "$first_tag" >> "$GITHUB_OUTPUT"
 
@@ -273,7 +689,17 @@ jobs:
           IMAGE: ${{ needs.prepare.outputs.image }}
           DIGEST: ${{ steps.manifest.outputs.digest }}
           TAGS: ${{ needs.prepare.outputs.tags }}
+          MODE: ${{ needs.prepare.outputs.mode }}
+          SOURCE_REVISION: ${{ needs.prepare.outputs.revision }}
         run: |
           set -euo pipefail
           printf 'Published image: %s@%s\n' "$IMAGE" "$DIGEST"
+          printf 'Mode: %s\nSource revision: %s\n' "$MODE" "$SOURCE_REVISION"
           printf 'Tags:\n%s\n' "$TAGS"
+          {
+            printf '### Published container\n\n'
+            printf -- '- Digest: `%s@%s`\n' "$IMAGE" "$DIGEST"
+            printf -- '- Mode: `%s`\n' "$MODE"
+            printf -- '- Source revision: `%s`\n' "$SOURCE_REVISION"
+            printf '\nTags:\n```text\n%s\n```\n' "$TAGS"
+          } >> "$GITHUB_STEP_SUMMARY"

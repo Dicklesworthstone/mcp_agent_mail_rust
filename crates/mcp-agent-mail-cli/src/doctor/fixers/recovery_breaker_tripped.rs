@@ -48,14 +48,25 @@ pub struct RecoveryBreakerTrippedFinding {
     pub consecutive_failures: u32,
     pub last_failure_unix: i64,
     pub last_failure_reason: String,
+    pub authority_error: Option<String>,
 }
 
 impl RecoveryBreakerTrippedFinding {
     pub fn to_finding(&self) -> super::Finding {
-        let title = format!(
-            "automatic recovery for {} is circuit-broken after {} consecutive failures on the same database content",
-            self.db_path.display(),
-            self.consecutive_failures,
+        let title = self.authority_error.as_ref().map_or_else(
+            || {
+                format!(
+                    "automatic recovery for {} is circuit-broken after {} consecutive failures on the same database content",
+                    self.db_path.display(),
+                    self.consecutive_failures,
+                )
+            },
+            |error| {
+                format!(
+                    "automatic recovery for {} is fail-closed because breaker authority is invalid: {error}",
+                    self.db_path.display()
+                )
+            },
         );
         super::Finding {
             id: FM_ID,
@@ -69,6 +80,7 @@ impl RecoveryBreakerTrippedFinding {
                 "consecutive_failures": self.consecutive_failures,
                 "last_failure_unix": self.last_failure_unix,
                 "last_failure_reason": self.last_failure_reason,
+                "authority_error": self.authority_error,
                 "operator_remediation": [
                     "am doctor repair       # bypasses the breaker; clears it on success",
                     "am doctor reconstruct  # archive-first rebuild; bypasses the breaker",
@@ -99,7 +111,20 @@ pub fn detect(db_file_candidates: &[PathBuf]) -> Vec<RecoveryBreakerTrippedFindi
 }
 
 fn detect_one(db_path: &Path) -> Option<RecoveryBreakerTrippedFinding> {
-    let state = mcp_agent_mail_db::recovery_breaker::load(db_path)?;
+    let state = match mcp_agent_mail_db::recovery_breaker::load(db_path) {
+        Ok(Some(state)) => state,
+        Ok(None) => return None,
+        Err(error) => {
+            return Some(RecoveryBreakerTrippedFinding {
+                db_path: db_path.to_path_buf(),
+                sidecar_path: mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(db_path),
+                consecutive_failures: 0,
+                last_failure_unix: 0,
+                last_failure_reason: "durable breaker authority could not be trusted".to_string(),
+                authority_error: Some(error.to_string()),
+            });
+        }
+    };
     if !state.tripped {
         return None;
     }
@@ -114,6 +139,7 @@ fn detect_one(db_path: &Path) -> Option<RecoveryBreakerTrippedFinding> {
         consecutive_failures: state.consecutive_failures,
         last_failure_unix: state.last_failure_unix,
         last_failure_reason: state.last_failure_reason,
+        authority_error: None,
     })
 }
 
@@ -150,7 +176,7 @@ mod tests {
         state = record_failure(Some(&state), &fingerprint, "boom", CFG, 20);
         state = record_failure(Some(&state), &fingerprint, "boom again", CFG, 30);
         assert!(state.tripped);
-        store(&db, &state);
+        store(&db, &state).unwrap();
         db
     }
 
@@ -164,7 +190,7 @@ mod tests {
             "no sidecar → no finding"
         );
 
-        store(&db, &cleared_state(&fingerprint_db(&db)));
+        store(&db, &cleared_state(&fingerprint_db(&db))).unwrap();
         assert!(
             detect(&[db]).is_empty(),
             "an un-tripped sidecar must not flag"
@@ -180,6 +206,25 @@ mod tests {
         assert_eq!(findings[0].db_path, db);
         assert_eq!(findings[0].consecutive_failures, 3);
         assert_eq!(findings[0].last_failure_reason, "boom again");
+        assert!(findings[0].authority_error.is_none());
+    }
+
+    #[test]
+    fn detector_surfaces_malformed_breaker_authority() {
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("storage.sqlite3");
+        std::fs::write(&db, b"content").unwrap();
+        std::fs::write(
+            mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db),
+            b"not valid JSON",
+        )
+        .unwrap();
+
+        let findings = detect(std::slice::from_ref(&db));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].consecutive_failures, 0);
+        assert!(findings[0].authority_error.is_some());
+        assert!(findings[0].to_finding().title.contains("fail-closed"));
     }
 
     #[test]
@@ -201,6 +246,7 @@ mod tests {
             consecutive_failures: 4,
             last_failure_unix: 99,
             last_failure_reason: "reconstruct failed".to_string(),
+            authority_error: None,
         };
         let generic = finding.to_finding();
         assert_eq!(generic.id, FM_ID);

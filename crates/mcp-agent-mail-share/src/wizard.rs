@@ -30,7 +30,7 @@ pub enum HostingProvider {
     CloudflarePages,
     /// Netlify
     Netlify,
-    /// Amazon S3 + CloudFront
+    /// Amazon S3 + `CloudFront`
     S3,
     /// Custom/manual deployment
     Custom,
@@ -74,6 +74,7 @@ impl HostingProvider {
     }
 
     /// Parse from string (case-insensitive, handles aliases).
+    #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "github" | "github_pages" | "github-pages" | "ghpages" | "gh" => {
@@ -117,7 +118,7 @@ pub struct WizardInputs {
     pub netlify_site: Option<String>,
     /// S3 bucket name.
     pub s3_bucket: Option<String>,
-    /// CloudFront distribution ID.
+    /// `CloudFront` distribution ID.
     pub cloudfront_id: Option<String>,
     /// Custom base URL for the deployed site.
     pub base_url: Option<String>,
@@ -163,7 +164,7 @@ pub enum DetectionConfidence {
 /// A single detected environment signal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedSignal {
-    /// Source of the signal (e.g., "git_remote", "env_var", "config_file").
+    /// Source of the signal (e.g., "`git_remote`", "`env_var`", "`config_file`").
     pub source: String,
     /// Description of what was found.
     pub detail: String,
@@ -479,7 +480,7 @@ impl std::fmt::Display for WizardError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.code, self.message)?;
         if let Some(ref ctx) = self.context {
-            write!(f, " ({})", ctx)?;
+            write!(f, " ({ctx})")?;
         }
         Ok(())
     }
@@ -724,7 +725,7 @@ mod tests {
         let error = WizardError::new(WizardErrorCode::CommandFailed, "deploy failed");
         let output = WizardJsonOutput::failure(error, Some(PathBuf::from("/tmp/bundle")));
         assert!(!output.success);
-        assert!(output.provider.is_empty());
+        assert_eq!(output.provider, "");
         assert_eq!(output.bundle_path, "/tmp/bundle");
         assert_eq!(output.error.as_deref(), Some("deploy failed"));
         assert_eq!(output.error_code.as_deref(), Some("COMMAND_FAILED"));

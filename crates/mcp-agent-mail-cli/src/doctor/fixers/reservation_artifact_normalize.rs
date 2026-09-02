@@ -10,7 +10,7 @@
 //! ## Fix
 //!
 //! This fixer only acts when it can establish the artifact's identity from its
-//! filename and JSON plus the current immutable SQLite database:
+//! filename and JSON plus a freshly revalidated WAL-aware logical DB source:
 //!
 //! - A legacy artifact is stamped and renamed only when its `(project, id)` has
 //!   a live DB reservation in the current generation.
@@ -121,12 +121,23 @@ struct QuarantineArtifact {
     reason: QuarantineReason,
 }
 
-/// Detect reservation artifacts that can be safely normalized for each
-/// immutable DB candidate. A DB without a seeded generation identity is left
+/// Detect reservation artifacts that can be safely normalized for each stable
+/// DB read candidate. A DB without a seeded generation identity is left
 /// alone: this read-only detector must never mint an identity token itself.
 pub fn detect(
     storage_root: Option<&Path>,
     candidate_dbs: &[PathBuf],
+) -> Vec<ReservationArtifactNormalizeFinding> {
+    let read_candidates = super::explicit_offline_db_read_candidates(
+        candidate_dbs,
+        "reservation artifact normalization detection",
+    );
+    detect_prepared(storage_root, &read_candidates)
+}
+
+pub(crate) fn detect_prepared(
+    storage_root: Option<&Path>,
+    read_candidates: &[super::DoctorDbReadCandidate],
 ) -> Vec<ReservationArtifactNormalizeFinding> {
     let Some(storage_root) = storage_root else {
         return Vec::new();
@@ -136,14 +147,14 @@ pub fn detect(
     }
 
     let mut findings = Vec::new();
-    for db_path in candidate_dbs {
-        let Ok(conn) = super::open_immutable_sqlite(db_path) else {
+    for candidate in read_candidates {
+        let Some(conn) = candidate.connection() else {
             continue;
         };
-        let Some(current_generation) = read_current_generation(&conn) else {
+        let Some(current_generation) = read_current_generation(conn) else {
             continue;
         };
-        let Some(live_reservations) = read_live_reservations(&conn) else {
+        let Some(live_reservations) = read_live_reservations(conn) else {
             continue;
         };
         let (legacy_migrations, quarantines) =
@@ -152,7 +163,7 @@ pub fn detect(
             continue;
         }
         findings.push(ReservationArtifactNormalizeFinding {
-            db_path: db_path.clone(),
+            db_path: candidate.target_path().to_path_buf(),
             storage_root: storage_root.to_path_buf(),
             current_generation,
             legacy_migrations,
@@ -169,9 +180,35 @@ pub fn fix(
     ctx: &crate::doctor::mutate::MutateContext,
     finding: &ReservationArtifactNormalizeFinding,
 ) -> Result<FixOutcome, crate::doctor::mutate::MutateError> {
+    let candidate = super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+        &finding.db_path,
+        "reservation artifact normalization pre-fix source selection",
+    );
+    fix_prepared(ctx, finding, &candidate)
+}
+
+pub(crate) fn fix_prepared(
+    ctx: &crate::doctor::mutate::MutateContext,
+    finding: &ReservationArtifactNormalizeFinding,
+    candidate: &super::DoctorDbReadCandidate,
+) -> Result<FixOutcome, crate::doctor::mutate::MutateError> {
+    let refreshed = candidate.refresh("reservation artifact pre-mutation revalidation");
+    let Some(fresh_finding) = detect_prepared(
+        Some(&finding.storage_root),
+        std::slice::from_ref(&refreshed),
+    )
+    .into_iter()
+    .next() else {
+        return Ok(FixOutcome {
+            actions_taken: 0,
+            actions_skipped: 1,
+            quarantined_paths: Vec::new(),
+        });
+    };
+
     let mut outcome = FixOutcome::default();
 
-    for migration in &finding.legacy_migrations {
+    for migration in &fresh_finding.legacy_migrations {
         if !is_regular_file(&migration.source) || migration.destination.exists() {
             outcome.actions_skipped += 1;
             continue;
@@ -208,7 +245,7 @@ pub fn fix(
         }
     }
 
-    for artifact in &finding.quarantines {
+    for artifact in &fresh_finding.quarantines {
         if !is_regular_file(&artifact.source) {
             outcome.actions_skipped += 1;
             continue;
@@ -457,6 +494,11 @@ mod tests {
 
     const CURRENT_GENERATION: &str = "aa11bb22";
     const FOREIGN_GENERATION: &str = "cc33dd44";
+    const WAL_WRITER_PATH_ENV: &str = "AM_DOCTOR_GENERATION_WAL_WRITER_PATH";
+    const WAL_WRITER_READY_ENV: &str = "AM_DOCTOR_GENERATION_WAL_WRITER_READY";
+    const WAL_WRITER_RELEASE_ENV: &str = "AM_DOCTOR_GENERATION_WAL_WRITER_RELEASE";
+    const WAL_WRITER_TEST: &str = "doctor::fixers::reservation_artifact_normalize::tests::wal_generation_truth_replaces_stale_quarantine_plan_before_mutation";
+    const WAL_WRITER_WITNESS: &str = "GENERATION_WAL_WRITER_CHILD_RAN";
 
     fn fixture() -> (TempDir, PathBuf, PathBuf) {
         let td = TempDir::new().expect("tempdir");
@@ -537,6 +579,141 @@ mod tests {
         let rendered = finding.to_finding();
         assert!(rendered.remediation.auto_fixable);
         assert_eq!(rendered.remediation.estimated_actions, 3);
+    }
+
+    #[test]
+    fn wal_generation_truth_replaces_stale_quarantine_plan_before_mutation() {
+        if let Ok(db_path) = std::env::var(WAL_WRITER_PATH_ENV) {
+            let ready_path = PathBuf::from(
+                std::env::var(WAL_WRITER_READY_ENV).expect("generation WAL writer ready path"),
+            );
+            let release_path = PathBuf::from(
+                std::env::var(WAL_WRITER_RELEASE_ENV).expect("generation WAL writer release path"),
+            );
+            let writer = mcp_agent_mail_db::DbConn::open_file(db_path)
+                .expect("open cross-process generation WAL writer");
+            writer
+                .execute_raw(&format!(
+                    "PRAGMA wal_autocheckpoint = 0;
+                     UPDATE db_identity SET generation_id = '{FOREIGN_GENERATION}'
+                     WHERE singleton = 0;"
+                ))
+                .expect("commit current generation only to WAL");
+            std::fs::write(&ready_path, b"ready").expect("publish generation WAL writer readiness");
+            println!("{WAL_WRITER_WITNESS}");
+            assert!(
+                super::super::wait_for_cross_process_release(&release_path),
+                "parent did not release generation WAL writer in time"
+            );
+            drop(writer);
+            return;
+        }
+
+        let (td, db_path, reservation_dir) = fixture();
+        let admitted = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("admit generation fixture through FrankenSQLite");
+        admitted
+            .execute_raw(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .expect("settle generation baseline");
+        mcp_agent_mail_db::close_db_conn(admitted, "settle generation WAL baseline");
+
+        let stale_candidate = super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+            &db_path,
+            "stale generation plan test",
+        );
+        let stale_finding =
+            detect_prepared(Some(td.path()), std::slice::from_ref(&stale_candidate))
+                .pop()
+                .expect("initial generation should produce a plan");
+        assert!(stale_finding.quarantines.iter().any(|artifact| {
+            artifact.source == reservation_dir.join(format!("id-8-g{FOREIGN_GENERATION}.json"))
+        }));
+
+        let main_before = std::fs::read(&db_path).expect("read settled generation main");
+        let ready_path = td.path().join("generation-wal-writer.ready");
+        let release_path = td.path().join("generation-wal-writer.release");
+        let child = std::process::Command::new(
+            std::env::current_exe().expect("resolve generation test executable"),
+        )
+        .arg(WAL_WRITER_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(WAL_WRITER_PATH_ENV, &db_path)
+        .env(WAL_WRITER_READY_ENV, &ready_path)
+        .env(WAL_WRITER_RELEASE_ENV, &release_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn cross-process generation WAL writer");
+        let child = super::super::CrossProcessTestChild::new(child, release_path);
+        if !super::super::wait_for_cross_process_signal(&ready_path) {
+            let output = child
+                .release_and_wait()
+                .expect("collect unready generation WAL writer");
+            panic!(
+                "generation WAL writer never became ready: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let main_after = std::fs::read(&db_path);
+        let wal_len = std::fs::metadata(PathBuf::from(format!("{}-wal", db_path.display())))
+            .map(|metadata| metadata.len());
+
+        let foreign_artifact = reservation_dir.join(format!("id-8-g{FOREIGN_GENERATION}.json"));
+        let foreign_before = std::fs::read(&foreign_artifact).expect("read generation artifact");
+        let outcome = fix_prepared(&ctx(&td), &stale_finding, &stale_candidate)
+            .expect("refresh generation immediately before mutation");
+
+        let output = child
+            .release_and_wait()
+            .expect("collect generation WAL writer");
+        assert!(
+            output.status.success(),
+            "generation WAL writer failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(WAL_WRITER_WITNESS),
+            "generation WAL writer filter was vacuous: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            main_after.expect("read WAL-only generation main"),
+            main_before,
+            "fixture must keep the new generation out of the main image"
+        );
+        assert!(
+            wal_len.is_ok_and(|len| len > 32),
+            "fixture must retain committed generation WAL frames"
+        );
+        assert!(
+            outcome.quarantined_paths.is_empty(),
+            "an artifact matching the current WAL generation must not be quarantined"
+        );
+        assert_eq!(
+            std::fs::read(&foreign_artifact).expect("read retained current artifact"),
+            foreign_before
+        );
+        assert!(
+            reservation_dir
+                .join(format!("id-7-g{FOREIGN_GENERATION}.json"))
+                .exists(),
+            "the fresh generation should drive the still-valid legacy migration"
+        );
+        assert!(
+            !reservation_dir
+                .join(format!("id-7-g{CURRENT_GENERATION}.json"))
+                .exists(),
+            "the stale generation must not be stamped into a filename"
+        );
     }
 
     #[test]

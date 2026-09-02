@@ -153,9 +153,9 @@ use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{DecodingKey, Validation};
 use mcp_agent_mail_core::config::{ConsoleSplitMode, ConsoleUiAnchor};
 use mcp_agent_mail_core::{
-    EffectKind, ExperienceBuilder, ExperienceOutcome, ExperienceRow, ExperienceState,
-    ExperienceSubsystem, FeatureExtension, FeatureVector, NonExecutionReason, loss_to_bp,
-    prob_to_bp, saturating_u8,
+    AtcExecutorMode, EffectKind, ExperienceBuilder, ExperienceOutcome, ExperienceRow,
+    ExperienceState, ExperienceSubsystem, FeatureExtension, FeatureVector, NonExecutionReason,
+    loss_to_bp, prob_to_bp, saturating_u8,
 };
 use mcp_agent_mail_db::{
     DbConn, DbPoolConfig, QueryTracker, active_tracker, create_pool, set_active_tracker,
@@ -163,23 +163,24 @@ use mcp_agent_mail_db::{
 use mcp_agent_mail_tools::{
     AcknowledgeMessage, AcquireBuildSlot, AgentsListResource, CheckFileReservationConflicts,
     CleanupPaneIdentities, ConfigEnvironmentQueryResource, ConfigEnvironmentResource,
-    CreateAgentIdentity, EnsureProduct, EnsureProject, FetchInbox, FetchInboxEvents,
-    FetchInboxProduct, FileReservationPaths, FileReservationsResource, ForceReleaseFileReservation,
-    GetMessageDeliveryReceipt, HealthCheck, IdentityProjectResource, InboxResource,
-    InstallPrecommitGuard, ListAgents, ListContacts, MacroContactHandshake,
-    MacroFileReservationCycle, MacroPrepareThread, MacroStartSession, MailboxResource,
-    MailboxWithCommitsResource, MarkMessageRead, MessageDetailsResource, OutboxResource,
-    ProductDetailsResource, ProductsLink, ProjectDetailsResource, ProjectsListQueryResource,
-    ProjectsListResource, RegisterAgent, ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot,
-    RenewFileReservations, ReplyMessage, RequestContact, ResolvePaneIdentity, RespondContact,
-    SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy, SummarizeThread,
-    SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
-    ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource, ToolingDirectoryQueryResource,
-    ToolingDirectoryResource, ToolingLocksQueryResource, ToolingLocksResource,
-    ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource, ToolingMetricsQueryResource,
-    ToolingMetricsResource, ToolingRecentResource, ToolingSchemasQueryResource,
-    ToolingSchemasResource, UninstallPrecommitGuard, ViewsAckOverdueResource,
-    ViewsAckRequiredResource, ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
+    CreateAgentIdentity, DeregisterAgent, EnsureProduct, EnsureProject, FetchInbox,
+    FetchInboxEvents, FetchInboxProduct, FetchTopic, FileReservationPaths,
+    FileReservationsResource, ForceReleaseFileReservation, GetMessageDeliveryReceipt, HealthCheck,
+    IdentityProjectResource, InboxResource, InstallPrecommitGuard, ListAgents, ListContacts,
+    MacroContactHandshake, MacroFileReservationCycle, MacroPrepareThread, MacroStartSession,
+    MailboxResource, MailboxWithCommitsResource, MarkAllRead, MarkMessageRead,
+    MessageDetailsResource, OutboxResource, ProductDetailsResource, ProductsLink,
+    ProjectDetailsResource, ProjectsListQueryResource, ProjectsListResource, RegisterAgent,
+    ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot, RenewFileReservations, ReplyMessage,
+    RequestContact, ResolvePaneIdentity, RespondContact, RetireAgent, SearchMessages,
+    SearchMessagesProduct, SendMessage, SetContactPolicy, SummarizeThread, SummarizeThreadProduct,
+    ThreadDetailsResource, ToolingCapabilitiesResource, ToolingDiagnosticsQueryResource,
+    ToolingDiagnosticsResource, ToolingDirectoryQueryResource, ToolingDirectoryResource,
+    ToolingLocksQueryResource, ToolingLocksResource, ToolingMetricsCoreQueryResource,
+    ToolingMetricsCoreResource, ToolingMetricsQueryResource, ToolingMetricsResource,
+    ToolingRecentResource, ToolingSchemasQueryResource, ToolingSchemasResource,
+    UninstallPrecommitGuard, UnretireAgent, ViewsAckOverdueResource, ViewsAckRequiredResource,
+    ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -198,6 +199,25 @@ struct InstrumentedTool<T> {
     tool_index: usize,
     tool_name: &'static str,
     inner: T,
+}
+
+/// Preserve Agent Mail's client-facing legacy error envelope across the MCP
+/// tool-result boundary.
+///
+/// FastMCP correctly converts handler `ToolExecutionError`s into an
+/// `isError=true` result, but the legacy result shape only carries text and
+/// therefore otherwise drops `McpError::data`. Agent Mail's tools deliberately
+/// put their stable error type and recovery metadata in that data field. Only
+/// recognized Agent Mail envelopes are serialized here; framework and opaque
+/// errors retain their original messages and sanitization behavior.
+fn preserve_legacy_tool_error_payload(mut error: McpError) -> McpError {
+    if mcp_agent_mail_tools::tool_error_code(&error).is_some()
+        && let Some(data) = error.data.as_ref()
+        && let Ok(serialized) = serde_json::to_string(data)
+    {
+        error.message = serialized;
+    }
+    error
 }
 
 struct InflightGuard {
@@ -309,6 +329,14 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
             .tools
             .record_call(latency_us, is_error);
         mcp_agent_mail_tools::record_latency_idx(self.tool_index, latency_us);
+        mcp_agent_mail_tools::record_recent_call(mcp_agent_mail_tools::RecentToolCall {
+            finished_at_micros: mcp_agent_mail_core::now_micros(),
+            tool: self.tool_name.to_string(),
+            project: project.clone(),
+            agent: agent.clone(),
+            latency_us,
+            outcome: recent_call_outcome(is_error, is_client_refusal),
+        });
 
         // Emit ToolCallEnd with duration and query delta
         let qt_after = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
@@ -359,7 +387,7 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
             agent,
         ));
 
-        out
+        out.map_err(preserve_legacy_tool_error_payload)
     }
 
     fn call_async<'a>(
@@ -436,6 +464,14 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
                 .tools
                 .record_call(latency_us, is_error);
             mcp_agent_mail_tools::record_latency_idx(self.tool_index, latency_us);
+            mcp_agent_mail_tools::record_recent_call(mcp_agent_mail_tools::RecentToolCall {
+                finished_at_micros: mcp_agent_mail_core::now_micros(),
+                tool: self.tool_name.to_string(),
+                project: project.clone(),
+                agent: agent.clone(),
+                latency_us,
+                outcome: recent_call_outcome(is_error, is_client_refusal),
+            });
 
             // Emit ToolCallEnd with duration and query delta
             let qt_after = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
@@ -486,12 +522,31 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
                 agent,
             ));
 
-            out
+            match out {
+                fastmcp_core::Outcome::Err(error) => {
+                    fastmcp_core::Outcome::Err(preserve_legacy_tool_error_payload(error))
+                }
+                other => other,
+            }
         })
     }
 }
 
 /// Extract `project_key` and agent name from tool arguments for event tagging.
+/// Classify a finished tool call for the `resource://tooling/recent` ring.
+const fn recent_call_outcome(
+    is_error: bool,
+    is_client_refusal: bool,
+) -> mcp_agent_mail_tools::RecentToolCallOutcome {
+    if is_client_refusal {
+        mcp_agent_mail_tools::RecentToolCallOutcome::Rejected
+    } else if is_error {
+        mcp_agent_mail_tools::RecentToolCallOutcome::Error
+    } else {
+        mcp_agent_mail_tools::RecentToolCallOutcome::Ok
+    }
+}
+
 fn extract_project_agent(args: &serde_json::Value) -> (Option<String>, Option<String>) {
     let obj = args.as_object();
     let project = obj
@@ -646,6 +701,27 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
         clusters::IDENTITY,
         CreateAgentIdentity,
     );
+    let server = add_tool(
+        server,
+        config,
+        "retire_agent",
+        clusters::IDENTITY,
+        RetireAgent,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "unretire_agent",
+        clusters::IDENTITY,
+        UnretireAgent,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "deregister_agent",
+        clusters::IDENTITY,
+        DeregisterAgent,
+    );
     let server = add_tool(server, config, "whois", clusters::IDENTITY, Whois);
     let server = add_tool(
         server,
@@ -692,6 +768,13 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
     let server = add_tool(
         server,
         config,
+        "fetch_topic",
+        clusters::MESSAGING,
+        FetchTopic,
+    );
+    let server = add_tool(
+        server,
+        config,
         "fetch_inbox_events",
         clusters::MESSAGING,
         FetchInboxEvents,
@@ -702,6 +785,13 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
         "mark_message_read",
         clusters::MESSAGING,
         MarkMessageRead,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "mark_all_read",
+        clusters::MESSAGING,
+        MarkAllRead,
     );
     let server = add_tool(
         server,
@@ -944,35 +1034,40 @@ fn shutdown_runtime_services(config: &mcp_agent_mail_core::Config) {
 }
 
 fn cleanup_shutdown_sqlite_sidecars(config: &mcp_agent_mail_core::Config) {
+    cleanup_shutdown_sqlite_sidecars_with_resolver(config, resolve_server_database_url_sqlite_path);
+}
+
+fn cleanup_shutdown_sqlite_sidecars_with_resolver<F>(
+    config: &mcp_agent_mail_core::Config,
+    resolve_database_url: F,
+) where
+    F: FnOnce(&str) -> Option<std::path::PathBuf>,
+{
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
         return;
     }
 
-    let db_path = match (DbPoolConfig {
-        database_url: config.database_url.clone(),
-        ..Default::default()
-    })
-    .sqlite_path()
-    {
-        Ok(path) if path != ":memory:" => PathBuf::from(path),
-        Ok(_) => return,
-        Err(error) => {
+    let Some(db_path) = resolve_database_url(&config.database_url) else {
+        if !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
             tracing::warn!(
-                error = %error,
                 "skipping shutdown WAL cleanup because database URL could not be resolved"
             );
-            return;
         }
+        return;
     };
 
-    if let Err(error) = mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path) {
+    // Do not checkpoint here before durable recovery admission: checkpointing
+    // mutates the SQLite family and would destroy the exact WAL/SHM evidence
+    // that a tripped or malformed breaker is meant to preserve. The central DB
+    // helper classifies the family, wins durable admission before any needed
+    // quarantine, then reclassifies under the gate to close the race window.
+    if let Err(error) = mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path) {
         tracing::warn!(
             path = %db_path.display(),
             error = %error,
-            "shutdown SQLite WAL checkpoint failed; continuing with frame-free sidecar cleanup"
+            "shutdown SQLite sidecar cleanup was refused; preserving the exact database family"
         );
     }
-    mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path);
 }
 
 static STARTUP_SEARCH_BACKFILL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -987,6 +1082,42 @@ impl Drop for StartupSearchBackfillResetGuard {
 }
 
 fn record_startup_search_backfill_completion(config: &mcp_agent_mail_core::Config) {
+    // GH#261: record completion under the SAME identity the health probe and
+    // query gate compare against — the live pool's `sqlite_identity_key()`
+    // ("path@generation"). Recording the bare URL-derived path marked the
+    // daemon's own (and only) database as "active for a different database"
+    // forever, permanently degrading every search to the plain-SQL fallback
+    // whenever the startup backfill completed before the first search (the
+    // common boot order for an always-on daemon). Resolve — or create — the
+    // same env-shaped pool the request handlers use so the recorded key
+    // carries the matching cache generation.
+    if !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+        let mut db_config = DbPoolConfig::from_env();
+        db_config.database_url = config.database_url.clone();
+        db_config.storage_root = Some(config.storage_root.clone());
+        match mcp_agent_mail_db::pool::get_or_reuse_compatible_memory_pool(&db_config) {
+            Ok(pool) => {
+                if let Err(error) =
+                    mcp_agent_mail_db::search_service::note_startup_lexical_backfill_completed_for_pool(
+                        &pool,
+                    )
+                {
+                    tracing::warn!(
+                        error = %error,
+                        "[startup-search] failed to record lexical bootstrap completion"
+                    );
+                }
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "[startup-search] could not resolve the live pool for lexical bootstrap \
+                     completion; falling back to database-url identity"
+                );
+            }
+        }
+    }
     if let Err(error) = mcp_agent_mail_db::search_service::note_startup_lexical_backfill_completed(
         &config.database_url,
     ) {
@@ -1688,6 +1819,7 @@ fn ensure_stdio_startup_probes_pass(report: &startup_checks::StartupReport) -> s
 }
 
 pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    config.validate_user_env_authority()?;
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
     // Pre-intern well-known strings to avoid first-request contention.
@@ -2390,7 +2522,10 @@ fn reset_probe_state(config: &mcp_agent_mail_core::Config) -> (u32, Instant, Ins
 }
 
 #[allow(clippy::too_many_lines)]
-fn run_http_headless_supervisor(config: mcp_agent_mail_core::Config) -> std::io::Result<()> {
+fn run_http_headless_supervisor(
+    config: mcp_agent_mail_core::Config,
+    control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
+) -> std::io::Result<()> {
     tracing::info!(
         host = %config.http_host,
         port = config.http_port,
@@ -2398,10 +2533,11 @@ fn run_http_headless_supervisor(config: mcp_agent_mail_core::Config) -> std::io:
         "HTTP server supervisor started"
     );
     let runtime = build_http_runtime()?;
-    let result_rx = spawn_http_supervisor_task(runtime.handle(), config, None, None, None)?;
-    // Unbounded by design: with no TUI there is no shutdown flag or control
-    // channel — this park is what keeps the headless process serving until
-    // the supervisor exits on its own (error) or the process is signalled.
+    let result_rx = spawn_http_supervisor_task(runtime.handle(), config, None, control_rx, None)?;
+    // Unbounded by design: with no TUI there is no shutdown flag — this park
+    // is what keeps the headless process serving until the supervisor exits on
+    // its own (error), the process is signalled, or an embedder's control
+    // channel (`run_http_with_control`) delivers `Shutdown` / disconnects.
     let result = recv_http_supervisor_result(result_rx);
     drop(runtime);
     result
@@ -2561,45 +2697,87 @@ pub(crate) fn resolve_server_database_url_sqlite_path(
         return None;
     }
 
-    let sqlite_path = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url)?;
-    Some(std::path::PathBuf::from(resolve_server_sync_sqlite_path(
-        sqlite_path.to_string_lossy().as_ref(),
-    )))
+    let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(database_url).ok()?;
+    Some(std::path::PathBuf::from(resolved.canonical_path))
 }
 
 pub(crate) fn resolve_server_sync_sqlite_path(path: &str) -> String {
-    if path == ":memory:" {
-        return path.to_string();
-    }
-
-    let resolved = mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(path);
-    if resolved != path {
-        return resolved;
-    }
-
-    let relative_path = std::path::Path::new(path);
-    if relative_path.is_absolute() || path.starts_with("./") || path.starts_with("../") {
-        return path.to_string();
-    }
-
-    if !relative_path.exists() {
-        let absolute_candidate = std::path::Path::new("/").join(relative_path);
-        if absolute_candidate.exists() {
-            return absolute_candidate.to_string_lossy().into_owned();
-        }
-    }
-
-    resolved
+    mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(path)
 }
 
-fn open_sync_db_connection_with_busy_timeout(
+/// Refuse a raw live-engine open when durable recovery authority or a pure
+/// sidecar classification says the exact SQLite family still needs the pool's
+/// recovery-admission path.
+///
+/// Pool acquisitions pass through the database crate's startup-init gate, but
+/// the health and TUI observability connections intentionally bypass the pool.
+/// Opening SQLite is not a passive operation: it may replay or rewrite WAL/SHM
+/// state before the caller can enable `query_only`. When breaker authority is
+/// unreadable, records failures for these exact primary bytes, or a WAL/SHM is
+/// structurally damaged even before the first breaker record exists, prove a
+/// private copy of the complete family can open without cleanup. A suspect
+/// family is refused here, before the live engine sees it. A healthy exact
+/// family remains readable, matching the pool startup policy, and this read
+/// path never consumes a half-open recovery attempt or clears breaker history.
+fn guard_raw_live_sqlite_engine_open(path: &Path, context: &str) -> std::io::Result<()> {
+    let nonclean_authority = match mcp_agent_mail_db::recovery_breaker::load(path) {
+        Ok(Some(state)) if state.tripped || state.consecutive_failures > 0 => {
+            let fingerprint = mcp_agent_mail_db::recovery_breaker::fingerprint_db(path);
+            (state.db_fingerprint == fingerprint).then(|| {
+                format!(
+                    "durable recovery-breaker state records {} failed attempt(s) for these exact primary bytes{}",
+                    state.consecutive_failures,
+                    if state.tripped { " and is tripped" } else { "" }
+                )
+            })
+        }
+        Ok(_) => None,
+        Err(error) => Some(format!(
+            "durable recovery-breaker authority could not be trusted: {error}"
+        )),
+    };
+    let sidecar_classification = mcp_agent_mail_db::wal_classify::classify_wal_sidecar(path);
+    let suspicious_family = sidecar_classification.state.is_damaged().then(|| {
+        format!(
+            "the source-neutral sidecar classifier reported {:?}: {}",
+            sidecar_classification.state, sidecar_classification.detail
+        )
+    });
+    let Some(preopen_proof_reason) = nonclean_authority.or(suspicious_family) else {
+        return Ok(());
+    };
+
+    match mcp_agent_mail_db::pool::sqlite_file_is_healthy_without_family_cleanup(path) {
+        Ok(true) => {
+            tracing::warn!(
+                operation = context,
+                path = %path.display(),
+                reason = %preopen_proof_reason,
+                "raw live SQLite open is proceeding only after a source-neutral exact-family proof"
+            );
+            Ok(())
+        }
+        Ok(false) => Err(std::io::Error::other(format!(
+            "{context}: refusing raw live SQLite engine open for {} because {preopen_proof_reason}, and the exact family is not healthy without recovery cleanup",
+            path.display()
+        ))),
+        Err(error) => Err(std::io::Error::other(format!(
+            "{context}: refusing raw live SQLite engine open for {} because {preopen_proof_reason}, and a source-neutral exact-family proof failed: {error}",
+            path.display()
+        ))),
+    }
+}
+
+pub(crate) fn open_sync_db_connection_with_busy_timeout(
     path: &str,
     busy_timeout_ms: u32,
+    context: &str,
 ) -> std::io::Result<DbConn> {
     let path = resolve_server_sync_sqlite_path(path);
     let conn = if path == ":memory:" {
         DbConn::open_memory()
     } else {
+        guard_raw_live_sqlite_engine_open(Path::new(path.as_str()), context)?;
         DbConn::open_file(&path)
     }
     .map_err(|err| std::io::Error::other(format!("open sqlite file {path}: {err}")))?;
@@ -2612,23 +2790,68 @@ fn open_sync_db_connection_with_busy_timeout(
     Ok(conn)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn open_server_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
-    open_sync_db_connection_with_busy_timeout(path, SERVER_SYNC_DB_BUSY_TIMEOUT_MS)
-}
-
-pub(crate) fn open_interactive_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
-    open_sync_db_connection_with_busy_timeout(path, INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS)
-}
-
-pub(crate) fn open_health_probe_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
-    let conn = open_sync_db_connection_with_busy_timeout(path, HEALTH_SYNC_DB_BUSY_TIMEOUT_MS)?;
+pub(crate) fn open_read_only_sync_db_connection_with_busy_timeout(
+    path: &str,
+    busy_timeout_ms: u32,
+    context: &str,
+) -> std::io::Result<mcp_agent_mail_db::GuardedReadOnlyConn> {
+    let path = resolve_server_sync_sqlite_path(path);
+    let conn = if path == ":memory:" {
+        DbConn::open_memory().map(mcp_agent_mail_db::GuardedReadOnlyConn::Franken)
+    } else {
+        // Engine-dispatching: the readiness probe runs right after startup
+        // recovery, when the primary may be a reconstructed or restored
+        // family without a FrankenSQLite namespace pair. Such a family is
+        // read through canonical SQLite; a Franken-admitted one keeps the
+        // bound same-engine opener.
+        mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(
+            Path::new(path.as_str()),
+            context,
+        )
+    }
+    .map_err(|err| std::io::Error::other(format!("open read-only sqlite file {path}: {err}")))?;
+    conn.execute_raw(&format!("PRAGMA busy_timeout = {busy_timeout_ms};"))
+        .map_err(|err| {
+            std::io::Error::other(format!(
+                "configure read-only sqlite busy_timeout={busy_timeout_ms} on {path}: {err}"
+            ))
+        })?;
+    // The guarded disk opener already enables engine-enforced read-only and
+    // query-only modes. The memory branch has no read-only open mode, so apply
+    // the same connection-local contract after the busy-timeout setup.
     conn.execute_raw("PRAGMA query_only = ON;").map_err(|err| {
         std::io::Error::other(format!(
-            "configure sqlite query_only health probe on {path}: {err}"
+            "configure sqlite query_only read-only connection on {path}: {err}"
         ))
     })?;
     Ok(conn)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn open_server_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
+    open_sync_db_connection_with_busy_timeout(
+        path,
+        SERVER_SYNC_DB_BUSY_TIMEOUT_MS,
+        "server synchronous database connection",
+    )
+}
+
+pub(crate) fn open_interactive_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
+    open_sync_db_connection_with_busy_timeout(
+        path,
+        INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS,
+        "interactive synchronous database connection",
+    )
+}
+
+pub(crate) fn open_health_probe_sync_db_connection(
+    path: &str,
+) -> std::io::Result<mcp_agent_mail_db::GuardedReadOnlyConn> {
+    open_read_only_sync_db_connection_with_busy_timeout(
+        path,
+        HEALTH_SYNC_DB_BUSY_TIMEOUT_MS,
+        "HTTP readiness health probe",
+    )
 }
 
 pub(crate) fn open_live_metadata_sync_db_connection(database_url: &str) -> Option<DbConn> {
@@ -2640,8 +2863,17 @@ pub(crate) fn open_live_metadata_sync_db_connection(database_url: &str) -> Optio
 }
 
 pub(crate) fn open_best_effort_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
-    let conn =
-        open_sync_db_connection_with_busy_timeout(path, BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS)?;
+    // Although every downstream user treats this as an observability
+    // connection, a genuinely fresh zero-object database may need the base
+    // schema bootstrap below. Hold the promotion lease before opening the fd
+    // so that bootstrap can never land on a generation concurrently renamed
+    // into recovery quarantine.
+    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+    let conn = open_sync_db_connection_with_busy_timeout(
+        path,
+        BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS,
+        "TUI and dashboard observability",
+    )?;
     ensure_base_schema_on_sync_connection(&conn)?;
     Ok(conn)
 }
@@ -2745,7 +2977,7 @@ fn archive_storage_root_is_authoritative_for_sqlite_path(
 fn inspect_archive_db_drift(
     storage_root: &Path,
     sqlite_path: &Path,
-    conn: &DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
 ) -> Result<Option<ArchiveDbDriftSummary>, String> {
     if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, sqlite_path) {
         return Ok(None);
@@ -3038,19 +3270,19 @@ impl ObservabilitySyncDb {
 
     fn archive_snapshot(
         storage_root: &Path,
-        salvage_db_path: Option<&Path>,
+        live_salvage_db_path: Option<&Path>,
         context: &str,
     ) -> Result<Self, String> {
         let snapshot_dir = SnapshotDirGuard::new("server-observability-mailbox-")
             .map_err(|error| format!("failed to allocate observability snapshot dir: {error}"))?;
         let sqlite_path = snapshot_dir.path().join("mailbox.sqlite3");
-        let reconstruct = salvage_db_path.map_or_else(
+        let reconstruct = live_salvage_db_path.map_or_else(
             || mcp_agent_mail_db::reconstruct_from_archive(&sqlite_path, storage_root),
-            |salvage_db_path| {
-                mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
+            |live_salvage_db_path| {
+                mcp_agent_mail_db::reconstruct_from_archive_with_live_salvage(
                     &sqlite_path,
                     storage_root,
-                    Some(salvage_db_path),
+                    live_salvage_db_path,
                 )
             },
         );
@@ -3059,7 +3291,7 @@ impl ObservabilitySyncDb {
             tracing::warn!(
                 operation = context,
                 storage_root = %storage_root.display(),
-                salvage = ?salvage_db_path.map(|path| path.display().to_string()),
+                salvage = ?live_salvage_db_path.map(|path| path.display().to_string()),
                 error = %error,
                 "failed to build archive-backed observability snapshot"
             );
@@ -3179,6 +3411,17 @@ pub(crate) fn open_observability_sync_db_connection(
     let archive_has_state =
         archive_storage_root_is_authoritative_for_sqlite_path(storage_root, &resolved_path)
             && archive_inventory_has_state(storage_root);
+
+    // Observability must not initialize a configured fresh-start target merely
+    // to render counts. If durable archive state exists, derive a private
+    // snapshot from it; otherwise report that no read source is available.
+    if !resolved_path.exists() {
+        return if archive_has_state {
+            ObservabilitySyncDb::archive_snapshot(storage_root, None, context).map(Some)
+        } else {
+            Ok(None)
+        };
+    }
 
     match open_best_effort_sync_db_connection(&sqlite_path) {
         Ok(conn) => match inspect_archive_db_drift(storage_root, &resolved_path, &conn) {
@@ -3738,6 +3981,33 @@ fn write_crash_marker(storage_root: &Path, info: &std::panic::PanicHookInfo<'_>,
 }
 
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    run_http_supervised(config, None)
+}
+
+/// Run the headless HTTP server exactly like [`run_http`], but stoppable by
+/// the caller.
+///
+/// A [`tui_bridge::ServerControlMsg::Shutdown`] on `control_rx` (or dropping
+/// every sender) stops the listener and then runs the same worker shutdown
+/// sequence a signalled headless process would, before returning.
+///
+/// Embedders that host the server on a thread — integration tests in
+/// particular — use this so every background worker is stopped and joined
+/// before the caller's environment scope ends. A worker that outlived a
+/// test's env-override scope rehydrated `Config` from the ambient env and
+/// wrote into the operator's live archive (br-99aih).
+pub fn run_http_with_control(
+    config: &mcp_agent_mail_core::Config,
+    control_rx: mpsc::Receiver<tui_bridge::ServerControlMsg>,
+) -> std::io::Result<()> {
+    run_http_supervised(config, Some(control_rx))
+}
+
+fn run_http_supervised(
+    config: &mcp_agent_mail_core::Config,
+    control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
+) -> std::io::Result<()> {
+    config.validate_user_env_authority()?;
     install_crash_marker_panic_hook(config.storage_root.clone());
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
@@ -3788,7 +4058,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     // Keep headless HTTP (`serve --no-tui`) under the same supervised restart
     // policy as the TUI path so long-lived operator sessions self-heal from
     // transport starvation or listener crashes.
-    let result = run_http_headless_supervisor(config.clone());
+    let result = run_http_headless_supervisor(config.clone(), control_rx);
     clear_startup_readiness_fast_path();
 
     retention::shutdown();
@@ -3814,6 +4084,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
 /// When `tui_enabled` is false (e.g. non-TTY environments or `--no-tui`),
 /// this falls back to [`run_http`].
 pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    config.validate_user_env_authority()?;
     install_crash_marker_panic_hook(config.storage_root.clone());
     // Fall back to headless mode when not a TTY or TUI is disabled
     if !std::io::stdout().is_terminal() || !config.tui_enabled {
@@ -5193,7 +5464,12 @@ fn dispatch_compose_envelope(
     tui_state: &tui_bridge::TuiSharedState,
     envelope: &tui_compose::ComposeEnvelope,
 ) {
-    let Some(conn) = tui_poller::open_sync_connection_pub(database_url) else {
+    // A recovery promotion replaces the live primary by rename. Acquire the
+    // write lease before opening the raw fd and retain it through transaction
+    // completion/error, otherwise compose can write into the quarantined old
+    // generation after a promotion races the open.
+    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+    let Some(conn) = tui_poller::open_sync_write_connection_pub(database_url) else {
         tracing::warn!("compose: cannot open DB for send");
         tui_state.push_console_log(
             "\u{274c} Compose: could not open database — message not sent".to_string(),
@@ -6096,54 +6372,8 @@ pub(crate) struct AtcOperatorExecutionSnapshot {
     pub(crate) message: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AtcExecutorMode {
-    Shadow,
-    DryRun,
-    Canary,
-    Live,
-}
-
-impl AtcExecutorMode {
-    fn from_env() -> Self {
-        match mcp_agent_mail_core::config::full_env_value("AM_ATC_EXECUTOR_MODE")
-            .as_deref()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("shadow") => Self::Shadow,
-            Some("dry-run" | "dry_run" | "dryrun") => Self::DryRun,
-            Some("canary") => Self::Canary,
-            Some("live") => Self::Live,
-            _ => Self::Live,
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Shadow => "shadow",
-            Self::DryRun => "dry_run",
-            Self::Canary => "canary",
-            Self::Live => "live",
-        }
-    }
-
-    const fn requires_runtime(self) -> bool {
-        matches!(self, Self::Canary | Self::Live)
-    }
-
-    const fn executes_advisories(self) -> bool {
-        matches!(self, Self::Canary | Self::Live)
-    }
-
-    const fn executes_probes(self) -> bool {
-        matches!(self, Self::Canary | Self::Live)
-    }
-
-    const fn executes_releases(self) -> bool {
-        matches!(self, Self::Live)
-    }
-}
+// `AtcExecutorMode` (parsing, default, predicates) lives in core so the
+// `am flags` registry, docs, and this runtime share one definition (GH#290).
 
 fn atc_durable_experience_store_writable(pool: &mcp_agent_mail_db::DbPool) -> bool {
     // Whether the backing store can physically take durable ATC rows (a real
@@ -6156,19 +6386,21 @@ fn atc_durable_experience_store_writable(pool: &mcp_agent_mail_db::DbPool) -> bo
 /// Whether the ATC operator may persist durable experience rows this run.
 ///
 /// Requires BOTH (a) an executing executor mode (Live/Canary — Shadow/DryRun
-/// suppress real actions and durable rows) AND (b) a non-Off write mode. Write
-/// mode Off — the default, or via `AM_ATC_WRITE_MODE=off`, `ATC_LEARNING_DISABLED`,
-/// or the runtime kill switch — means the learning ledger is NOT written,
-/// regardless of executor mode. This makes durable writes off-by-default: prior
-/// to this gate the Live operator (AM_ATC_EXECUTOR_MODE defaults to Live) churned
-/// the `atc_experiences` ledger regardless of AM_ATC_WRITE_MODE, and under load
-/// its index B-tree corrupts, causing a corrupt→reconstruct→corrupt loop.
+/// suppress real actions and durable rows) AND (b) Live write mode. Shadow write
+/// mode is trace-only; Off — the default, or via `AM_ATC_WRITE_MODE=off` —
+/// suppresses experience-ledger activity. `ATC_LEARNING_DISABLED` also disables
+/// the operator runtime entirely. The executor independently defaults to Shadow,
+/// so effect execution and experience persistence each require explicit opt-in.
+/// The file-backed runtime kill switch overrides an otherwise-live combination.
 fn atc_durable_writes_enabled(
     write_mode: mcp_agent_mail_core::AtcWriteMode,
     executor_mode: AtcExecutorMode,
     atc_db_pool: Option<&mcp_agent_mail_db::DbPool>,
+    kill_switch_active: bool,
 ) -> bool {
-    !write_mode.is_off() && atc_durable_experience_store_enabled(executor_mode, atc_db_pool)
+    !kill_switch_active
+        && write_mode.is_live()
+        && atc_durable_experience_store_enabled(executor_mode, atc_db_pool)
 }
 
 fn atc_durable_experience_store_enabled(
@@ -8131,8 +8363,6 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     if atc_db_pool.is_none() {
         tracing::warn!("ATC durable experience append disabled: failed to acquire DB pool");
     }
-    let durable_writes_enabled =
-        atc_durable_writes_enabled(config.atc_write_mode, executor_mode, atc_db_pool.as_ref());
     let mut recent_actions = VecDeque::with_capacity(ATC_OPERATOR_ACTION_CAPACITY);
     let mut recent_executions = VecDeque::with_capacity(ATC_OPERATOR_EXECUTION_CAPACITY);
     let mut last_action_by_key: HashMap<String, i64> = HashMap::new();
@@ -8158,6 +8388,12 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
 
     while !stop.load(Ordering::Relaxed) {
         atc::refresh_kill_switch();
+        let durable_writes_enabled = atc_durable_writes_enabled(
+            config.atc_write_mode,
+            executor_mode,
+            atc_db_pool.as_ref(),
+            atc::atc_kill_switch_active(),
+        );
         let started_at = Instant::now();
         let sync_check_micros = mcp_agent_mail_core::timestamps::now_micros();
         if let Some(pool) = atc_db_pool.as_ref()
@@ -8242,7 +8478,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                     if let Some(dropped) = pending_effects.pop_front() {
                         let dropped_key = atc_effect_semantic_key(&dropped);
                         pending_effect_keys.remove(&dropped_key);
-                        if let Some(pool) = atc_db_pool.as_ref() {
+                        if durable_writes_enabled && let Some(pool) = atc_db_pool.as_ref() {
                             capture_atc_execution_result(
                                 pool,
                                 dropped.experience_id,
@@ -8294,7 +8530,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 };
                 pending_effect_keys.remove(&cooldown_key);
                 let status = format!("throttled:{}", effect.semantics.family);
-                if let Some(pool) = atc_db_pool.as_ref() {
+                if durable_writes_enabled && let Some(pool) = atc_db_pool.as_ref() {
                     capture_atc_execution_result(
                         pool,
                         effect.experience_id,
@@ -8330,7 +8566,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 last_action_by_key.insert(cooldown_key, now_micros);
             }
             // Capture execution result into durable experience store (br-0qt6e.2.2).
-            if let Some(pool) = atc_db_pool.as_ref() {
+            if durable_writes_enabled && let Some(pool) = atc_db_pool.as_ref() {
                 capture_atc_execution_result(
                     pool,
                     effect.experience_id,
@@ -8359,7 +8595,8 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 sweep_open_experiences_for_resolution(pool, now_micros, 600_000_000);
             }
         }
-        if let Some(pool) = atc_db_pool.as_ref()
+        if durable_writes_enabled
+            && let Some(pool) = atc_db_pool.as_ref()
             && now_micros >= next_rollup_refresh_micros
         {
             let cx = Cx::for_request_with_budget(Budget::INFINITE);
@@ -10669,6 +10906,10 @@ fn fetch_dashboard_db_stats_from_conn(conn: &DbConn) -> DashboardDbStats {
     let agents_list = conn
         .query_sync(
             "SELECT id, name, program, last_active_ts FROM agents \
+             WHERE retired_at IS NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM agent_deregistrations d WHERE d.agent_id = agents.id \
+               ) \
              ORDER BY last_active_ts DESC LIMIT 10",
             &[],
         )
@@ -11567,6 +11808,16 @@ impl HttpState {
     }
 
     fn handle_mail_dispatch(&self, req: &Http1Request, path: &str) -> Http1Response {
+        let cx = self.request_cx();
+        self.handle_mail_dispatch_with_cx(req, path, &cx)
+    }
+
+    fn handle_mail_dispatch_with_cx(
+        &self,
+        req: &Http1Request,
+        path: &str,
+        cx: &Cx,
+    ) -> Http1Response {
         if !matches!(req.method, Http1Method::Get | Http1Method::Post) {
             return self.error_response(req, 405, "Method Not Allowed");
         }
@@ -11582,7 +11833,7 @@ impl HttpState {
         };
         let body_str = std::str::from_utf8(&req.body).unwrap_or("");
         let is_api = Self::is_mail_json_route(path, method_str);
-        match mail_ui::dispatch(path, query_str, method_str, body_str) {
+        match mail_ui::dispatch_with_cx(path, query_str, method_str, body_str, cx) {
             Ok(Some(body)) => {
                 let content_type = if is_api {
                     "application/json"
@@ -11614,9 +11865,9 @@ impl HttpState {
         }
     }
 
-    /// GH#184: run [`Self::handle_mail_dispatch`] on the bounded, cancellable
-    /// blocking-dispatch pool with the request timeout, keeping async workers
-    /// free.
+    /// GH#184: run [`Self::handle_mail_dispatch_with_cx`] on the bounded,
+    /// cancellable blocking-dispatch pool with the request timeout, keeping
+    /// async workers free.
     ///
     /// The mail UI layer is synchronous (per-request pool access, DB queries,
     /// template rendering) and — on a large, long-lived mailbox — its pool
@@ -11651,6 +11902,7 @@ impl HttpState {
         let cors_origin = self.cors_origin(&req);
         let dispatch_timeout_secs = self.request_timeout_secs;
         let dispatch_cx = self.request_cx();
+        let worker_cx = dispatch_cx.clone();
         let method_label = format!("mail-ui:{path}");
         let result = run_cancellable_blocking_dispatch(
             method_label,
@@ -11658,7 +11910,7 @@ impl HttpState {
             dispatch_cx,
             DispatchCancel::new(),
             Arc::new(Mutex::new(Some(permit))),
-            move |_cancel| Ok(arc_self.handle_mail_dispatch(&req, &path)),
+            move |_cancel| Ok(arc_self.handle_mail_dispatch_with_cx(&req, &path, &worker_cx)),
         )
         .await;
 
@@ -15795,7 +16047,9 @@ fn readiness_check_quick(config: &mcp_agent_mail_core::Config) -> Result<(), Str
     };
 
     let conn = if is_memory {
-        DbConn::open_memory().map_err(|e| e.to_string())?
+        mcp_agent_mail_db::GuardedReadOnlyConn::Franken(
+            DbConn::open_memory().map_err(|e| e.to_string())?,
+        )
     } else {
         let sqlite_path = sqlite_path
             .as_ref()
@@ -15842,7 +16096,9 @@ fn readiness_check_request_path(config: &mcp_agent_mail_core::Config) -> Result<
     };
 
     let conn = if is_memory {
-        DbConn::open_memory().map_err(|e| e.to_string())?
+        mcp_agent_mail_db::GuardedReadOnlyConn::Franken(
+            DbConn::open_memory().map_err(|e| e.to_string())?,
+        )
     } else {
         let sqlite_path = sqlite_path
             .as_ref()
@@ -15912,7 +16168,7 @@ fn readiness_check_with_archive_reconcile(
 #[cfg(test)]
 fn readiness_check_cached_semantic_status(
     config: &mcp_agent_mail_core::Config,
-    conn: &DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
 ) -> Result<(), String> {
     {
         let guard = lock_mutex(&READINESS_SEMANTIC_CACHE);
@@ -15941,7 +16197,7 @@ fn readiness_check_cached_semantic_status(
 #[cfg(test)]
 fn readiness_check_semantic_status(
     config: &mcp_agent_mail_core::Config,
-    conn: &DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
 ) -> Result<(), String> {
     readiness_check_schema_status(conn)?;
 
@@ -15954,7 +16210,9 @@ fn readiness_check_semantic_status(
     Ok(())
 }
 
-fn readiness_check_schema_status(conn: &DbConn) -> Result<(), String> {
+fn readiness_check_schema_status(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+) -> Result<(), String> {
     let rows = conn
         .query_sync(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -16063,11 +16321,14 @@ fn fetch_health_live_counts(database_url: &str) -> Option<(u64, u64)> {
     let projects = health_count(&conn, "SELECT COUNT(*) AS c FROM projects");
     let messages = health_count(&conn, "SELECT COUNT(*) AS c FROM messages");
     let counts = projects.zip(messages);
-    mcp_agent_mail_db::close_db_conn(conn, "health count probe");
+    // The guarded read-only opener retains FrankenSQLite's namespace binding
+    // through connection teardown. Let its ordinary Drop path release that
+    // binding; the writable close helper is intentionally not used here.
+    drop(conn);
     counts
 }
 
-fn health_count(conn: &DbConn, sql: &str) -> Option<u64> {
+fn health_count(conn: &impl mcp_agent_mail_db::pool::SyncQuery, sql: &str) -> Option<u64> {
     conn.query_sync(sql, &[])
         .ok()
         .and_then(|rows| rows.into_iter().next())
@@ -16406,6 +16667,9 @@ fn accepts_pane_id_header(tool_name: &str) -> bool {
         tool_name,
         "register_agent"
             | "create_agent_identity"
+            | "retire_agent"
+            | "unretire_agent"
+            | "deregister_agent"
             | "macro_start_session"
             | "resolve_pane_identity"
     )
@@ -17384,6 +17648,7 @@ mod tests {
     use super::*;
     use asupersync::http::h1::types::Version as Http1Version;
     use chrono::Utc;
+    use fastmcp_protocol::{CallToolParams, LegacyContent};
     use ftui_runtime::stdio_capture::StdioCapture;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -17394,7 +17659,306 @@ mod tests {
     static HEALTH_ROUTE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static HEALTH_COUNT_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static DISPATCH_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static COMPOSE_WRITE_BARRIER_TEST_LOCK: Mutex<()> = Mutex::new(());
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn shutdown_cleanup_preserves_sqlite_family_when_recovery_breaker_is_tripped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("shutdown-breaker.sqlite3");
+        let wal_path = db_path.with_file_name("shutdown-breaker.sqlite3-wal");
+        let shm_path = db_path.with_file_name("shutdown-breaker.sqlite3-shm");
+        let db_bytes = b"database-family-primary";
+        let wal_bytes = vec![0_u8; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize];
+        let shm_bytes = b"database-family-shm";
+        std::fs::write(&db_path, db_bytes).expect("write primary");
+        std::fs::write(&wal_path, &wal_bytes).expect("write truncated WAL");
+        std::fs::write(&shm_path, shm_bytes).expect("write SHM");
+
+        let breaker_state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(&db_path),
+            consecutive_failures:
+                mcp_agent_mail_db::recovery_breaker::DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            // A future timestamp is valid control state and evaluates as zero
+            // elapsed, making this refusal independent of test duration.
+            last_failure_unix: i64::MAX,
+            last_failure_reason: "synthetic repeated recovery failure".to_string(),
+            tripped: true,
+        };
+        mcp_agent_mail_db::recovery_breaker::store(&db_path, &breaker_state)
+            .expect("store tripped breaker");
+        let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker before cleanup");
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        cleanup_shutdown_sqlite_sidecars(&config);
+
+        assert_eq!(
+            std::fs::read(&db_path).expect("read primary after cleanup refusal"),
+            db_bytes.to_vec(),
+            "tripped breaker must preserve primary bytes"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read WAL after cleanup refusal"),
+            wal_bytes,
+            "tripped breaker must preserve the exact WAL bytes and name"
+        );
+        assert_eq!(
+            std::fs::read(&shm_path).expect("read SHM after cleanup refusal"),
+            shm_bytes.to_vec(),
+            "tripped breaker must preserve the exact SHM bytes and name"
+        );
+        assert_eq!(
+            std::fs::read(&breaker_path).expect("read breaker after cleanup refusal"),
+            breaker_bytes,
+            "shutdown cleanup must not rewrite tripped breaker authority"
+        );
+
+        let renamed_family_members = std::fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| {
+                name.starts_with("shutdown-breaker.sqlite3.corrupt-")
+                    || name.starts_with("shutdown-breaker.sqlite3-wal.")
+                    || name.starts_with("shutdown-breaker.sqlite3-shm.")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            renamed_family_members.is_empty(),
+            "tripped breaker must not create renamed family members: {renamed_family_members:?}"
+        );
+    }
+
+    #[test]
+    fn shutdown_cleanup_does_not_checkpoint_framed_wal_before_recovery_admission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("shutdown-framed-wal.sqlite3");
+        let sqlite_path = db_path.to_string_lossy();
+        let conn = mcp_agent_mail_db::DbConn::open_file(sqlite_path.as_ref())
+            .expect("open sqlite database");
+        conn.execute_raw(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; \
+             CREATE TABLE checkpoint_probe(value TEXT); \
+             INSERT INTO checkpoint_probe(value) VALUES ('committed-in-wal');",
+        )
+        .expect("seed committed WAL frames");
+
+        let wal_path = db_path.with_file_name("shutdown-framed-wal.sqlite3-wal");
+        let shm_path = db_path.with_file_name("shutdown-framed-wal.sqlite3-shm");
+        let db_before = std::fs::read(&db_path).expect("read primary before shutdown cleanup");
+        let wal_before = std::fs::read(&wal_path).expect("read framed WAL before shutdown cleanup");
+        let shm_before = std::fs::read(&shm_path).expect("read SHM before shutdown cleanup");
+        assert!(
+            wal_before.len() > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize,
+            "test setup must retain at least one committed WAL frame"
+        );
+
+        let breaker_state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(&db_path),
+            consecutive_failures:
+                mcp_agent_mail_db::recovery_breaker::DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            last_failure_unix: i64::MAX,
+            last_failure_reason: "synthetic repeated recovery failure".to_string(),
+            tripped: true,
+        };
+        mcp_agent_mail_db::recovery_breaker::store(&db_path, &breaker_state)
+            .expect("store tripped breaker");
+        let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_before = std::fs::read(&breaker_path).expect("read breaker before cleanup");
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        cleanup_shutdown_sqlite_sidecars(&config);
+
+        assert_eq!(
+            std::fs::read(&db_path).expect("read primary after shutdown cleanup"),
+            db_before,
+            "shutdown cleanup must not checkpoint framed WAL bytes into the primary before admission"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read framed WAL after shutdown cleanup"),
+            wal_before,
+            "shutdown cleanup must not truncate or rewrite framed WAL before admission"
+        );
+        assert_eq!(
+            std::fs::read(&shm_path).expect("read SHM after shutdown cleanup"),
+            shm_before,
+            "shutdown cleanup must preserve the exact SHM bytes"
+        );
+        assert_eq!(
+            std::fs::read(&breaker_path).expect("read breaker after shutdown cleanup"),
+            breaker_before,
+            "shutdown cleanup must not rewrite tripped breaker authority"
+        );
+
+        drop(conn);
+    }
+
+    #[test]
+    fn shutdown_cleanup_targets_resolved_authority_not_raw_relative_shadow() {
+        let current_dir = std::env::current_dir().expect("current working directory");
+        let relative_root = tempfile::tempdir_in(&current_dir).expect("relative-family tempdir");
+        let relative_db_absolute = relative_root.path().join("mailbox.sqlite3");
+        let relative_db = relative_db_absolute
+            .strip_prefix(&current_dir)
+            .expect("tempdir must be beneath current directory")
+            .to_path_buf();
+        assert!(
+            relative_db.is_relative(),
+            "fixture must expose a genuinely relative database URL"
+        );
+
+        let authoritative_root = tempfile::tempdir().expect("authoritative-family tempdir");
+        let authoritative_db = authoritative_root.path().join("mailbox.sqlite3");
+        let authoritative_wal = authoritative_db.with_file_name("mailbox.sqlite3-wal");
+        let authoritative_shm = authoritative_db.with_file_name("mailbox.sqlite3-shm");
+        let authoritative_primary_bytes = b"authoritative primary bytes";
+        let authoritative_wal_bytes = b"truncated-authority-wal";
+        let authoritative_shm_bytes = b"authoritative-shm-bytes";
+        std::fs::write(&authoritative_db, authoritative_primary_bytes)
+            .expect("write authoritative primary");
+        std::fs::write(&authoritative_wal, authoritative_wal_bytes)
+            .expect("write authoritative truncated WAL");
+        std::fs::write(&authoritative_shm, authoritative_shm_bytes)
+            .expect("write authoritative SHM");
+        assert!(
+            authoritative_wal_bytes.len()
+                < mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize,
+            "authoritative WAL fixture must require cleanup"
+        );
+
+        let relative_wal = relative_db_absolute.with_file_name("mailbox.sqlite3-wal");
+        let relative_shm = relative_db_absolute.with_file_name("mailbox.sqlite3-shm");
+        let relative_primary_bytes = b"relative shadow primary bytes";
+        let relative_wal_bytes = b"relative-shadow-wal";
+        let relative_shm_bytes = b"relative-shadow-shm";
+        std::fs::write(&relative_db_absolute, relative_primary_bytes)
+            .expect("write relative shadow primary");
+        std::fs::write(&relative_wal, relative_wal_bytes).expect("write relative shadow WAL");
+        std::fs::write(&relative_shm, relative_shm_bytes).expect("write relative shadow SHM");
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite://{}", relative_db.display());
+        cleanup_shutdown_sqlite_sidecars_with_resolver(&config, |database_url| {
+            assert_eq!(database_url, config.database_url.as_str());
+            Some(authoritative_db.clone())
+        });
+
+        assert_eq!(
+            std::fs::read(&authoritative_db).expect("read authoritative primary after cleanup"),
+            authoritative_primary_bytes,
+            "sidecar cleanup must preserve exact authoritative primary bytes"
+        );
+        assert!(
+            !authoritative_wal.exists() && !authoritative_shm.exists(),
+            "the resolved authoritative sidecars must leave the live family"
+        );
+
+        let mut quarantined_wal = Vec::new();
+        let mut quarantined_shm = Vec::new();
+        for entry in std::fs::read_dir(authoritative_root.path())
+            .expect("list authoritative family after cleanup")
+        {
+            let entry = entry.expect("read authoritative family entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("mailbox.sqlite3-wal.cleanup-quarantine-") {
+                quarantined_wal.push(entry.path());
+            } else if name.starts_with("mailbox.sqlite3-shm.cleanup-quarantine-") {
+                quarantined_shm.push(entry.path());
+            }
+        }
+        assert_eq!(quarantined_wal.len(), 1, "one WAL quarantine expected");
+        assert_eq!(quarantined_shm.len(), 1, "one SHM quarantine expected");
+        assert_eq!(
+            std::fs::read(&quarantined_wal[0]).expect("read quarantined authoritative WAL"),
+            authoritative_wal_bytes,
+            "WAL quarantine must retain the exact authoritative bytes"
+        );
+        assert_eq!(
+            std::fs::read(&quarantined_shm[0]).expect("read quarantined authoritative SHM"),
+            authoritative_shm_bytes,
+            "SHM quarantine must retain the exact authoritative bytes"
+        );
+
+        assert_eq!(
+            std::fs::read(&relative_db_absolute).expect("read relative shadow primary"),
+            relative_primary_bytes,
+            "cleanup must not rewrite the raw relative primary"
+        );
+        assert_eq!(
+            std::fs::read(&relative_wal).expect("read relative shadow WAL"),
+            relative_wal_bytes,
+            "cleanup must not move or rewrite the raw relative WAL"
+        );
+        assert_eq!(
+            std::fs::read(&relative_shm).expect("read relative shadow SHM"),
+            relative_shm_bytes,
+            "cleanup must not move or rewrite the raw relative SHM"
+        );
+        let relative_quarantines = std::fs::read_dir(relative_root.path())
+            .expect("list relative shadow family")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.contains(".cleanup-quarantine-"))
+            .collect::<Vec<_>>();
+        assert!(
+            relative_quarantines.is_empty(),
+            "raw relative family must not gain cleanup artifacts: {relative_quarantines:?}"
+        );
+    }
+
+    #[test]
+    fn shutdown_cleanup_production_resolver_preserves_absolute_decoy_for_missing_relative_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = dir.path().join("shutdown-absolute-decoy.sqlite3");
+        let absolute_wal = absolute_db.with_file_name("shutdown-absolute-decoy.sqlite3-wal");
+        let absolute_shm = absolute_db.with_file_name("shutdown-absolute-decoy.sqlite3-shm");
+        let primary_bytes = b"absolute decoy primary";
+        let wal_bytes = b"truncated-decoy-wal";
+        let shm_bytes = b"absolute decoy shm";
+        std::fs::write(&absolute_db, primary_bytes).expect("write absolute decoy primary");
+        std::fs::write(&absolute_wal, wal_bytes).expect("write absolute decoy WAL");
+        std::fs::write(&absolute_shm, shm_bytes).expect("write absolute decoy SHM");
+
+        let relative_db = PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
+        assert!(
+            !relative_db.exists(),
+            "fixture requires a missing configured relative target"
+        );
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", relative_db.display());
+        let runtime_authority =
+            mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
+                .expect("resolve DB runtime authority");
+        assert_eq!(
+            runtime_authority.canonical_path,
+            relative_db.to_string_lossy()
+        );
+        assert_eq!(
+            resolve_server_database_url_sqlite_path(&config.database_url),
+            Some(relative_db)
+        );
+
+        cleanup_shutdown_sqlite_sidecars(&config);
+
+        assert_eq!(std::fs::read(&absolute_db).unwrap(), primary_bytes);
+        assert_eq!(std::fs::read(&absolute_wal).unwrap(), wal_bytes);
+        assert_eq!(std::fs::read(&absolute_shm).unwrap(), shm_bytes);
+        let decoy_quarantines = std::fs::read_dir(dir.path())
+            .expect("list absolute decoy family")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.contains(".cleanup-quarantine-"))
+            .collect::<Vec<_>>();
+        assert!(
+            decoy_quarantines.is_empty(),
+            "cleanup must not quarantine an unrelated absolute family: {decoy_quarantines:?}"
+        );
+    }
 
     struct NoopTool;
 
@@ -17452,6 +18016,70 @@ mod tests {
                 serde_json::json!({}),
             ))
         }
+    }
+
+    #[test]
+    fn fetch_topic_is_admitted_through_the_instrumented_router_boundary() {
+        let tool_index = mcp_agent_mail_tools::tool_index("fetch_topic")
+            .expect("fetch_topic must have a metrics index");
+        let mut router = fastmcp::Router::new();
+        router
+            .add_tool(InstrumentedTool {
+                tool_index,
+                tool_name: "fetch_topic",
+                inner: FetchTopic,
+            })
+            .expect("fetch_topic must satisfy both legacy and final tool admission");
+
+        assert_eq!(
+            router
+                .tools()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>(),
+            vec!["fetch_topic"]
+        );
+    }
+
+    #[test]
+    fn legacy_tool_error_payload_survives_the_router_result_boundary() {
+        let tool_index = mcp_agent_mail_tools::tool_index("acquire_build_slot")
+            .expect("acquire_build_slot must have a metrics index");
+        let mut router = fastmcp::Router::new();
+        router
+            .add_tool(InstrumentedTool {
+                tool_index,
+                tool_name: "acquire_build_slot",
+                inner: FailingTool {
+                    code: "CONTACT_REQUIRED",
+                },
+            })
+            .expect("failing test tool must be admitted");
+
+        let cx = Cx::for_testing();
+        let result = router
+            .handle_tools_call(
+                &McpContext::new(cx, 1),
+                CallToolParams {
+                    name: "failing".to_string(),
+                    arguments: Some(serde_json::json!({})),
+                    meta: None,
+                },
+                SessionState::new(),
+                None,
+                None,
+            )
+            .expect("tool-level failure must remain a successful JSON-RPC tools/call result");
+
+        assert!(result.is_error);
+        let LegacyContent::Text { text, .. } = &result.content[0] else {
+            panic!("tool error must use text content");
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(text).expect("tool error text must retain its JSON envelope");
+        assert_eq!(payload["error"]["type"], "CONTACT_REQUIRED");
+        assert_eq!(payload["error"]["message"], "synthetic failure");
+        assert_eq!(payload["error"]["recoverable"], true);
     }
 
     /// Fetch `(calls, errors, rejections)` for a tool from the full snapshot.
@@ -18596,39 +19224,31 @@ mod tests {
     }
 
     #[test]
-    fn readiness_check_uses_absolute_candidate_for_mailbox_activity_lock() {
+    fn readiness_path_matches_runtime_for_missing_relative_target() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let storage_root = temp.path().join("storage");
-        std::fs::create_dir_all(&storage_root).expect("create storage root");
         let absolute_db = temp.path().join("readiness-absolute.sqlite3");
-        std::fs::write(&absolute_db, b"placeholder").expect("create absolute db");
+        let decoy_bytes = b"absolute readiness decoy";
+        std::fs::write(&absolute_db, decoy_bytes).expect("create absolute decoy");
 
         let relative_path =
             std::path::PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
         assert!(
             !relative_path.exists(),
-            "relative shadow path should be absent so absolute candidate fallback is exercised"
+            "fixture requires a missing configured relative target"
         );
 
-        let config = mcp_agent_mail_core::Config {
-            database_url: format!("sqlite:///{}", relative_path.display()),
-            storage_root,
-            integrity_check_on_startup: false,
-            ..mcp_agent_mail_core::Config::default()
-        };
+        let database_url = format!("sqlite:///{}", relative_path.display());
+        let server_path = resolve_server_database_url_sqlite_path(&database_url)
+            .expect("resolve server runtime authority");
+        let runtime_path = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&database_url)
+            .expect("resolve DB runtime authority");
 
-        let _sqlite_lock = acquire_mailbox_activity_lock_for_sqlite_path(
-            &absolute_db,
-            MailboxActivityLockMode::Exclusive,
-        )
-        .expect("acquire exclusive sqlite mailbox lock on absolute candidate");
-
-        let error = readiness_check_quick(&config)
-            .expect_err("resolved absolute candidate lock should block readiness");
-        assert!(
-            error.contains("mailbox activity lock is busy") || error.contains("temporarily busy"),
-            "busy readiness error should mention mailbox contention on the resolved absolute candidate: {error}"
+        assert_eq!(server_path, PathBuf::from(&runtime_path.canonical_path));
+        assert_eq!(
+            server_path, relative_path,
+            "readiness locks must retain the same missing relative authority that DbPool will initialize"
         );
+        assert_eq!(std::fs::read(&absolute_db).unwrap(), decoy_bytes);
     }
 
     #[test]
@@ -18725,16 +19345,12 @@ first body
         *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
 
         let temp = tempfile::tempdir().expect("tempdir");
-        let xdg_data_root = temp.path().join("xdg-data");
-        std::fs::create_dir_all(&xdg_data_root).expect("create xdg data root");
-        let xdg_data_root_str = xdg_data_root
-            .to_str()
-            .expect("xdg data root utf-8")
-            .to_string();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("XDG_DATA_HOME", xdg_data_root_str.as_str())],
-            || {
+        // br-99aih: redirect the *default* storage root into a private tempdir
+        // (HOME + XDG_DATA_HOME); an XDG-only override still resolved to the
+        // operator's live archive on any host that had run the daemon.
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(
+            |_isolated_default_root| {
                 let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
                 assert!(
                     mcp_agent_mail_core::config::is_default_storage_root(&storage_root),
@@ -20771,17 +21387,17 @@ first body
     }
 
     #[test]
-    fn atc_executor_mode_defaults_to_live_for_unknown_values() {
+    fn atc_executor_mode_defaults_to_shadow_for_missing_or_unknown_values() {
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("AM_ATC_EXECUTOR_MODE", "")],
             || {
-                assert_eq!(AtcExecutorMode::from_env(), AtcExecutorMode::Live);
+                assert_eq!(AtcExecutorMode::from_env(), AtcExecutorMode::Shadow);
             },
         );
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("AM_ATC_EXECUTOR_MODE", "mystery-mode")],
             || {
-                assert_eq!(AtcExecutorMode::from_env(), AtcExecutorMode::Live);
+                assert_eq!(AtcExecutorMode::from_env(), AtcExecutorMode::Shadow);
             },
         );
     }
@@ -20792,6 +21408,22 @@ first body
             &[("AM_ATC_EXECUTOR_MODE", "shadow")],
             || {
                 assert_eq!(AtcExecutorMode::from_env(), AtcExecutorMode::Shadow);
+            },
+        );
+    }
+
+    #[test]
+    fn atc_executor_mode_requires_explicit_opt_in_for_live_execution() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_EXECUTOR_MODE", "live")],
+            || {
+                assert_eq!(AtcExecutorMode::from_env(), AtcExecutorMode::Live);
+            },
+        );
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_EXECUTOR_MODE", "canary")],
+            || {
+                assert_eq!(AtcExecutorMode::from_env(), AtcExecutorMode::Canary);
             },
         );
     }
@@ -20851,7 +21483,7 @@ first body
     }
 
     #[test]
-    fn atc_durable_writes_require_non_off_write_mode_and_executing_executor() {
+    fn atc_durable_writes_require_live_write_mode_and_executing_executor() {
         use mcp_agent_mail_core::AtcWriteMode;
         let pool = create_pool(&DbPoolConfig {
             database_url: "sqlite:///:memory:".to_string(),
@@ -20868,36 +21500,51 @@ first body
         assert!(!atc_durable_writes_enabled(
             AtcWriteMode::Off,
             AtcExecutorMode::Live,
-            Some(&pool)
+            Some(&pool),
+            false
         ));
         assert!(!atc_durable_writes_enabled(
             AtcWriteMode::Off,
             AtcExecutorMode::Canary,
-            Some(&pool)
+            Some(&pool),
+            false
         ));
-        // Shadow/Live write mode + an executing executor allows durable writes.
-        assert!(atc_durable_writes_enabled(
+        // Shadow write mode is trace-only even with an executing executor.
+        assert!(!atc_durable_writes_enabled(
             AtcWriteMode::Shadow,
             AtcExecutorMode::Live,
-            Some(&pool)
+            Some(&pool),
+            false
         ));
+        // Live write mode + an executing executor allows durable writes.
         assert!(atc_durable_writes_enabled(
             AtcWriteMode::Live,
             AtcExecutorMode::Live,
-            Some(&pool)
+            Some(&pool),
+            false
         ));
         // A non-executing executor (Shadow/DryRun) still suppresses durable rows
         // even with a writing write mode.
         assert!(!atc_durable_writes_enabled(
             AtcWriteMode::Live,
             AtcExecutorMode::Shadow,
-            Some(&pool)
+            Some(&pool),
+            false
         ));
         // No pool → never writable.
         assert!(!atc_durable_writes_enabled(
             AtcWriteMode::Live,
             AtcExecutorMode::Live,
-            None
+            None,
+            false
+        ));
+        // The file-backed runtime kill switch is re-read every operator tick
+        // and overrides an otherwise fully-live configuration immediately.
+        assert!(!atc_durable_writes_enabled(
+            AtcWriteMode::Live,
+            AtcExecutorMode::Live,
+            Some(&pool),
+            true
         ));
     }
 
@@ -28336,13 +28983,223 @@ first body
     }
 
     #[test]
+    fn read_only_sync_db_connection_enforces_query_only_for_memory_database() {
+        let conn = open_read_only_sync_db_connection_with_busy_timeout(
+            ":memory:",
+            BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS,
+            "read-only memory contract test",
+        )
+        .expect("open read-only memory connection");
+
+        let query_only = conn
+            .query_sync("PRAGMA query_only", &[])
+            .expect("query query_only pragma")
+            .into_iter()
+            .next()
+            .and_then(|row| {
+                row.get_named::<i64>("query_only")
+                    .ok()
+                    .or_else(|| row.get_as(0).ok())
+            })
+            .unwrap_or_default();
+        assert_eq!(query_only, 1);
+        assert!(
+            conn.execute_raw("CREATE TABLE forbidden_write(id INTEGER)")
+                .is_err(),
+            "the generic read-only helper must remain read-only for its in-memory branch"
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    fn server_namespace_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+        db_path.with_file_name(format!(
+            "{}{suffix}",
+            db_path.file_name().unwrap_or_default().to_string_lossy()
+        ))
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    fn exact_server_sqlite_parent_snapshot(
+        directory: &Path,
+    ) -> std::collections::BTreeMap<std::ffi::OsString, (bool, Vec<u8>)> {
+        std::fs::read_dir(directory)
+            .expect("read server SQLite fixture directory")
+            .map(|entry| {
+                let entry = entry.expect("read server SQLite fixture entry");
+                let path = entry.path();
+                let metadata =
+                    std::fs::symlink_metadata(&path).expect("inspect server SQLite fixture entry");
+                let bytes = if metadata.file_type().is_file() {
+                    std::fs::read(&path).expect("read server SQLite fixture file")
+                } else {
+                    Vec::new()
+                };
+                (entry.file_name(), (metadata.file_type().is_file(), bytes))
+            })
+            .collect()
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    fn seed_server_franken_namespace_database(db_path: &Path, value: i64) {
+        let canonical =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open canonical server namespace fixture");
+        canonical
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("settle canonical server namespace fixture");
+        canonical
+            .execute_raw("CREATE TABLE server_namespace_fixture(value INTEGER NOT NULL);")
+            .expect("create server namespace fixture table");
+        canonical
+            .execute_raw(&format!(
+                "INSERT INTO server_namespace_fixture(value) VALUES ({value});"
+            ))
+            .expect("populate server namespace fixture table");
+        drop(canonical);
+
+        let admitted = DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("admit server namespace fixture through FrankenSQLite");
+        admitted
+            .query_sync("SELECT value FROM server_namespace_fixture", &[])
+            .expect("query admitted server namespace fixture");
+        mcp_agent_mail_db::close_db_conn(admitted, "seed server namespace fixture");
+
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            assert!(
+                server_namespace_sidecar_path(db_path, suffix).is_file(),
+                "FrankenSQLite admission must publish regular {suffix} authority"
+            );
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    fn read_only_sync_db_connection_refuses_copied_and_stale_namespace_without_rewriting() {
+        for namespace_kind in ["copied-family", "replaced-primary"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir.path().join(format!("{namespace_kind}.sqlite3"));
+
+            if namespace_kind == "copied-family" {
+                let source_path = dir.path().join("source.sqlite3");
+                seed_server_franken_namespace_database(&source_path, 7);
+                std::fs::copy(&source_path, &db_path).expect("copy namespace fixture primary");
+                for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+                    std::fs::copy(
+                        server_namespace_sidecar_path(&source_path, suffix),
+                        server_namespace_sidecar_path(&db_path, suffix),
+                    )
+                    .expect("copy namespace fixture authority");
+                }
+            } else {
+                seed_server_franken_namespace_database(&db_path, 11);
+                std::fs::rename(&db_path, dir.path().join("displaced-primary.sqlite3"))
+                    .expect("displace namespace-recorded primary");
+                let replacement = mcp_agent_mail_db::CanonicalDbConn::open_file(
+                    db_path.to_string_lossy().as_ref(),
+                )
+                .expect("create replacement primary generation");
+                replacement
+                    .execute_raw("PRAGMA journal_mode = DELETE;")
+                    .expect("settle replacement primary generation");
+                replacement
+                    .execute_raw("CREATE TABLE server_namespace_fixture(value INTEGER NOT NULL);")
+                    .expect("create replacement primary schema");
+                replacement
+                    .execute_raw("INSERT INTO server_namespace_fixture(value) VALUES (13);")
+                    .expect("populate replacement primary generation");
+                drop(replacement);
+            }
+
+            let namespace_use_path = server_namespace_sidecar_path(&db_path, "-fsqlite-ns-use");
+            let sentinel =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+            std::fs::File::options()
+                .write(true)
+                .open(&namespace_use_path)
+                .expect("open namespace use authority for timestamp sentinel")
+                .set_times(std::fs::FileTimes::new().set_modified(sentinel))
+                .expect("set namespace use timestamp sentinel");
+            let namespace_use_modified_before = std::fs::metadata(&namespace_use_path)
+                .expect("inspect namespace use authority before refusal")
+                .modified()
+                .ok();
+            let family_before = exact_server_sqlite_parent_snapshot(dir.path());
+
+            let error = match open_read_only_sync_db_connection_with_busy_timeout(
+                db_path.to_string_lossy().as_ref(),
+                HEALTH_SYNC_DB_BUSY_TIMEOUT_MS,
+                "server stale namespace refusal test",
+            ) {
+                Ok(conn) => {
+                    drop(conn);
+                    panic!("copied or stale namespace authority must be refused");
+                }
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("namespace"),
+                "unexpected {namespace_kind} refusal: {error}"
+            );
+            assert_eq!(
+                exact_server_sqlite_parent_snapshot(dir.path()),
+                family_before,
+                "{namespace_kind} refusal must preserve every family name and byte"
+            );
+            assert_eq!(
+                std::fs::metadata(&namespace_use_path)
+                    .expect("inspect namespace use authority after refusal")
+                    .modified()
+                    .ok(),
+                namespace_use_modified_before,
+                "{namespace_kind} refusal must not rewrite namespace metadata"
+            );
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    fn read_only_sync_db_connection_accepts_healthy_admitted_namespace_without_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("healthy-admitted.sqlite3");
+        seed_server_franken_namespace_database(&db_path, 17);
+        let family_before = exact_server_sqlite_parent_snapshot(dir.path());
+
+        let conn = open_read_only_sync_db_connection_with_busy_timeout(
+            db_path.to_string_lossy().as_ref(),
+            BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS,
+            "server healthy namespace admission test",
+        )
+        .expect("healthy admitted namespace must remain readable");
+        assert_eq!(
+            conn.query_sync("SELECT value FROM server_namespace_fixture", &[])
+                .expect("query healthy admitted namespace")[0]
+                .get_named::<i64>("value")
+                .expect("decode healthy admitted namespace value"),
+            17
+        );
+        let configured = conn
+            .query_sync("PRAGMA busy_timeout", &[])
+            .expect("query healthy read-only busy timeout")[0]
+            .get_as::<i64>(0)
+            .expect("decode healthy read-only busy timeout");
+        assert_eq!(configured, i64::from(BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS));
+        drop(conn);
+
+        assert_eq!(
+            exact_server_sqlite_parent_snapshot(dir.path()),
+            family_before,
+            "healthy read-only admission must preserve every family name and byte"
+        );
+    }
+
+    #[test]
     fn open_health_probe_sync_db_connection_uses_short_busy_timeout_and_query_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("health-busy-timeout.db");
         let seed = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open seed db");
         seed.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init schema");
-        drop(seed);
+        mcp_agent_mail_db::close_db_conn(seed, "seed health busy-timeout fixture");
 
         let conn =
             open_health_probe_sync_db_connection(db_path.to_string_lossy().as_ref()).expect("open");
@@ -28372,6 +29229,293 @@ first body
             })
             .unwrap_or_default();
         assert_eq!(query_only, 1);
+
+        conn.execute_raw("PRAGMA query_only = OFF;")
+            .expect("disable connection-local query_only for engine-level proof");
+        assert!(
+            conn.execute_raw("CREATE TABLE forbidden_health_write(id INTEGER)")
+                .is_err(),
+            "health probes must be engine-opened read-only, not merely switched to query_only after a writable live-family open"
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    fn health_count_read_only_drop_does_not_checkpoint_live_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("health-count-read-only-drop.sqlite3");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open health-count WAL fixture");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize health-count WAL fixture");
+        conn.execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable health-count fixture WAL mode");
+        conn.execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable health-count fixture autocheckpoint");
+        conn.execute_raw(
+            "INSERT INTO projects(slug, human_key, created_at) \
+             VALUES ('health-drop', '/health-drop', 1);",
+        )
+        .expect("write health-count checkpoint sentinel");
+        // Ordinary writer Drop deliberately leaves the counted row in WAL for
+        // the health observer teardown below to preserve.
+        drop(conn);
+
+        let wal_path = db_path.with_file_name(format!(
+            "{}-wal",
+            db_path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let primary_before = std::fs::read(&db_path).expect("snapshot health-count primary");
+        let wal_before = std::fs::read(&wal_path).expect("snapshot health-count WAL");
+        assert!(
+            wal_before.len() > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize,
+            "fixture must retain committed frames that a checkpointing close would consume"
+        );
+
+        assert_eq!(
+            fetch_health_live_counts(&database_url),
+            Some((1, 0)),
+            "health counts must observe the committed WAL row"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read health-count primary after observer"),
+            primary_before,
+            "health-count teardown must not checkpoint frames into the primary"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read health-count WAL after observer"),
+            wal_before,
+            "health-count teardown must not checkpoint or truncate the WAL"
+        );
+    }
+
+    fn install_live_open_breaker_fixture(db_path: &Path, breaker_kind: &str) -> PathBuf {
+        let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(db_path);
+        match breaker_kind {
+            "absent" => {}
+            "malformed" => {
+                std::fs::write(&breaker_path, b"malformed breaker authority")
+                    .expect("write malformed breaker authority");
+            }
+            "tripped" => {
+                let state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(db_path),
+                    consecutive_failures:
+                        mcp_agent_mail_db::recovery_breaker::DEFAULT_MAX_CONSECUTIVE_FAILURES,
+                    last_failure_unix: i64::MAX,
+                    last_failure_reason: "live-open fixture is circuit-broken".to_string(),
+                    tripped: true,
+                };
+                mcp_agent_mail_db::recovery_breaker::store(db_path, &state)
+                    .expect("store tripped breaker authority");
+            }
+            other => panic!("unknown live-open breaker fixture kind: {other}"),
+        }
+        breaker_path
+    }
+
+    fn assert_live_open_guards_preserve_suspect_family(
+        surface: &str,
+        mut open: impl FnMut(&Path, &Path) -> Result<(), String>,
+    ) {
+        for family_kind in ["damaged-wal", "corrupt-primary"] {
+            let breaker_kinds: &[&str] = if family_kind == "damaged-wal" {
+                &["absent", "malformed", "tripped"]
+            } else {
+                &["malformed", "tripped"]
+            };
+            for &breaker_kind in breaker_kinds {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let storage_root = dir.path().join("storage");
+                std::fs::create_dir_all(&storage_root).expect("create empty storage root");
+                let db_path = dir
+                    .path()
+                    .join(format!("{surface}-{family_kind}-{breaker_kind}.sqlite3"));
+                let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+                    db_path.to_string_lossy().as_ref(),
+                )
+                .expect("create healthy live-open primary fixture");
+                conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                    .expect("detach live-open fixture WAL mode");
+                conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                    .expect("initialize live-open fixture schema");
+                drop(conn);
+                let admitted = DbConn::open_file(db_path.to_string_lossy().as_ref())
+                    .expect("admit live-open fixture through FrankenSQLite");
+                admitted
+                    .query_sync("SELECT 1", &[])
+                    .expect("query admitted live-open fixture");
+                mcp_agent_mail_db::close_db_conn(admitted, "seed suspect live-open fixture");
+
+                if family_kind == "damaged-wal" {
+                    std::fs::write(
+                        db_path.with_file_name(format!(
+                            "{}-wal",
+                            db_path.file_name().unwrap_or_default().to_string_lossy()
+                        )),
+                        b"truncated-wal",
+                    )
+                    .expect("write damaged WAL");
+                    std::fs::write(
+                        db_path.with_file_name(format!(
+                            "{}-shm",
+                            db_path.file_name().unwrap_or_default().to_string_lossy()
+                        )),
+                        b"coordination-shm",
+                    )
+                    .expect("write SHM fixture");
+                } else {
+                    std::fs::write(&db_path, b"corrupt raw-open primary")
+                        .expect("write corrupt primary fixture");
+                }
+
+                let wal_path = db_path.with_file_name(format!(
+                    "{}-wal",
+                    db_path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+                let shm_path = db_path.with_file_name(format!(
+                    "{}-shm",
+                    db_path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+                let breaker_path = install_live_open_breaker_fixture(&db_path, breaker_kind);
+                let family_paths = [db_path.clone(), wal_path, shm_path, breaker_path];
+                drop(
+                    acquire_mailbox_activity_lock_for_sqlite_path(
+                        &db_path,
+                        MailboxActivityLockMode::Shared,
+                    )
+                    .expect("materialize the normal readiness activity-lock inode"),
+                );
+                let family_bytes_before =
+                    family_paths.each_ref().map(|path| std::fs::read(path).ok());
+                let names_before = std::fs::read_dir(dir.path())
+                    .expect("list live-open fixture before refusal")
+                    .map(|entry| entry.expect("read live-open fixture entry").file_name())
+                    .collect::<std::collections::BTreeSet<_>>();
+
+                let error = open(&db_path, &storage_root)
+                    .expect_err("pre-open guard must refuse the suspect live open");
+                assert!(
+                    error.contains("refusing raw live SQLite engine open")
+                        || error.contains("refusing live read-only SQLite engine open")
+                        || error.contains("refusing live read-only FrankenSQLite open")
+                        || error.contains("strict query-only open refused"),
+                    "unexpected {surface}/{family_kind}/{breaker_kind} refusal: {error}"
+                );
+                assert_eq!(
+                    family_paths.each_ref().map(|path| std::fs::read(path).ok()),
+                    family_bytes_before,
+                    "{surface} refusal must preserve every SQLite-family byte"
+                );
+                let names_after = std::fs::read_dir(dir.path())
+                    .expect("list live-open fixture after refusal")
+                    .map(|entry| entry.expect("read live-open fixture entry").file_name())
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    names_after, names_before,
+                    "{surface} refusal must not create election, cleanup, recovery, or forensic artifacts"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn health_guarded_read_only_open_refuses_suspect_family_before_live_engine_open() {
+        assert_live_open_guards_preserve_suspect_family("health", |db_path, storage_root| {
+            let mut config = mcp_agent_mail_core::Config::default();
+            config.database_url = format!("sqlite:///{}", db_path.display());
+            config.storage_root = storage_root.to_path_buf();
+            readiness_check_request_path(&config)
+        });
+    }
+
+    #[test]
+    fn tui_observability_raw_open_refuses_suspect_family_before_live_engine_open() {
+        assert_live_open_guards_preserve_suspect_family(
+            "tui-observability",
+            |db_path, storage_root| {
+                open_observability_sync_db_connection(
+                    &format!("sqlite:///{}", db_path.display()),
+                    storage_root,
+                    "TUI db poller test",
+                )
+                .and_then(|opened| {
+                    opened.ok_or_else(|| "observability connection was absent".to_string())
+                })
+                .map(drop)
+            },
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    fn live_open_guards_apply_nonclean_breaker_policy_without_mutation() {
+        for breaker_kind in ["malformed", "tripped"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage_root = dir.path().join("storage");
+            std::fs::create_dir_all(&storage_root).expect("create empty storage root");
+            let db_path = dir
+                .path()
+                .join(format!("healthy-live-open-{breaker_kind}.sqlite3"));
+            let conn =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                    .expect("create healthy live-open fixture");
+            conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                .expect("detach fixture WAL mode");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("initialize healthy fixture schema");
+            drop(conn);
+            let admitted = DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("admit healthy live-open fixture through FrankenSQLite");
+            admitted
+                .query_sync("SELECT 1", &[])
+                .expect("query healthy admitted live-open fixture");
+            mcp_agent_mail_db::close_db_conn(admitted, "seed healthy live-open fixture");
+            let breaker_path = install_live_open_breaker_fixture(&db_path, breaker_kind);
+            let breaker_bytes =
+                std::fs::read(&breaker_path).expect("read nonclean breaker fixture");
+            let family_before = exact_server_sqlite_parent_snapshot(dir.path());
+
+            let health_error =
+                match open_health_probe_sync_db_connection(db_path.to_string_lossy().as_ref()) {
+                    Ok(conn) => {
+                        drop(conn);
+                        panic!("guarded health read must refuse nonclean breaker authority");
+                    }
+                    Err(error) => error,
+                };
+            assert!(
+                health_error
+                    .to_string()
+                    .contains("durable recovery authority"),
+                "unexpected health refusal for {breaker_kind}: {health_error}"
+            );
+            assert_eq!(
+                exact_server_sqlite_parent_snapshot(dir.path()),
+                family_before,
+                "guarded health refusal must preserve the exact admitted family"
+            );
+
+            // The writable observability surface retains its source-neutral
+            // exact-family proof and may admit this independently healthy
+            // family without consuming durable breaker authority.
+            let observed = open_observability_sync_db_connection(
+                &format!("sqlite:///{}", db_path.display()),
+                &storage_root,
+                "healthy TUI db poller test",
+            )
+            .expect("healthy exact family remains available to observability reads")
+            .expect("healthy observability source should exist");
+            drop(observed);
+
+            assert_eq!(
+                std::fs::read(&breaker_path).expect("read breaker after healthy opens"),
+                breaker_bytes,
+                "live reads must not consume or clear durable recovery authority"
+            );
+        }
     }
 
     #[test]
@@ -28397,7 +29541,7 @@ first body
     }
 
     #[test]
-    fn dashboard_open_connection_uses_absolute_candidate_for_missing_relative_database_url() {
+    fn dashboard_does_not_hijack_absolute_candidate_for_missing_relative_database_url() {
         let dir = tempfile::tempdir().expect("tempdir");
         let absolute_db = dir.path().join("dashboard-fallback.sqlite3");
         let absolute_db_str = absolute_db.to_string_lossy().into_owned();
@@ -28413,26 +29557,28 @@ first body
         }
         assert!(
             !relative_path.exists(),
-            "relative fallback fixture should be absent so dashboard opens the absolute candidate"
+            "fixture requires a missing configured relative target"
         );
 
         let database_url = format!("sqlite://{}", relative_path.display());
-        let conn = dashboard_open_connection(&database_url, dir.path())
-            .expect("open dashboard fallback db");
+        let conn = dashboard_open_connection(&database_url, dir.path());
+        assert!(
+            conn.is_none(),
+            "observability must not open an unrelated absolute decoy or initialize a missing runtime target"
+        );
+
+        assert!(
+            !relative_path.exists(),
+            "dashboard observation must not create the missing relative SQLite target"
+        );
+        let conn = DbConn::open_file(&absolute_db_str).expect("reopen absolute decoy");
         let rows = conn
-            .conn()
             .query_sync(
                 "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'marker'",
                 &[],
             )
-            .expect("query sqlite_master");
+            .expect("query untouched absolute decoy");
         assert_eq!(rows[0].get_named::<i64>("count").unwrap_or(0), 1);
-        drop(conn);
-
-        assert!(
-            !relative_path.exists(),
-            "dashboard fallback should not create a stray relative sqlite file"
-        );
     }
 
     #[test]
@@ -28496,16 +29642,12 @@ first body
     fn open_observability_sync_db_connection_ignores_unrelated_default_archive_overlap() {
         let _env_lock = lock_mutex(&TOOL_DISPATCH_ENV_TEST_LOCK);
         let dir = tempfile::tempdir().expect("tempdir");
-        let xdg_data_root = dir.path().join("xdg-data");
-        std::fs::create_dir_all(&xdg_data_root).expect("create xdg data root");
-        let xdg_data_root_str = xdg_data_root
-            .to_str()
-            .expect("xdg data root utf-8")
-            .to_string();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("XDG_DATA_HOME", xdg_data_root_str.as_str())],
-            || {
+        // br-99aih: redirect the *default* storage root into a private tempdir
+        // (HOME + XDG_DATA_HOME); an XDG-only override still resolved to the
+        // operator's live archive on any host that had run the daemon.
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(
+            |_isolated_default_root| {
                 let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
                 assert!(
                     mcp_agent_mail_core::config::is_default_storage_root(&storage_root),
@@ -31817,6 +32959,110 @@ first body
             .and_then(|row| row.get_named::<i64>("c").ok())
             .unwrap_or_default();
         assert_eq!(new_recips, 1, "compose should add exactly one recipient");
+    }
+
+    #[test]
+    fn dispatch_compose_envelope_holds_write_lease_through_transaction_completion() {
+        let _serial = COMPOSE_WRITE_BARRIER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("compose_dispatch_write_lease.sqlite3");
+        setup_compose_dispatch_test_db(&db_path);
+
+        // Keep the actual compose transaction parked after it acquires the
+        // process write lease. This makes the lease observable at the real
+        // dispatch boundary without a test-only production hook.
+        let lock_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open compose lock connection");
+        lock_conn
+            .execute_sync("BEGIN EXCLUSIVE", &[])
+            .expect("hold compose fixture write lock");
+
+        let config = mcp_agent_mail_core::Config::default();
+        let tui_state = tui_bridge::TuiSharedState::new(&config);
+        let envelope = tui_compose::ComposeEnvelope {
+            sender_name: tui_compose::OVERSEER_AGENT_NAME.to_string(),
+            to: vec!["BlueLake".to_string()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "compose write lease".to_string(),
+            body_md: "compose write lease body".to_string(),
+            importance: "normal".to_string(),
+            thread_id: Some("compose-write-lease".to_string()),
+        };
+        let database_url = format!("sqlite://{}", db_path.display());
+        let baseline_writers = mcp_agent_mail_db::write_barrier::active_writer_count();
+        let dispatch = std::thread::spawn(move || {
+            dispatch_compose_envelope(&database_url, &tui_state, &envelope);
+        });
+
+        let wait_deadline = Instant::now() + Duration::from_secs(2);
+        while mcp_agent_mail_db::write_barrier::active_writer_count() <= baseline_writers {
+            assert!(
+                !dispatch.is_finished(),
+                "compose returned before its write lease became observable"
+            );
+            assert!(
+                Instant::now() < wait_deadline,
+                "compose did not acquire its write lease before the test deadline"
+            );
+            std::thread::yield_now();
+        }
+
+        let (barrier, outcome) =
+            mcp_agent_mail_db::write_barrier::acquire_promotion_barrier_draining(Duration::ZERO);
+        assert!(
+            matches!(
+                outcome,
+                mcp_agent_mail_db::write_barrier::DrainOutcome::TimedOut {
+                    remaining_writers
+                } if remaining_writers > 0
+            ),
+            "promotion must time out while the actual compose dispatch owns its lease: {outcome:?}"
+        );
+        let messages_before_release = lock_conn
+            .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
+            .expect("count messages while compose is parked")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or_default();
+        assert_eq!(
+            messages_before_release, 0,
+            "the blocked compose transaction must not have committed early"
+        );
+
+        lock_conn
+            .execute_sync("ROLLBACK", &[])
+            .expect("release compose fixture write lock");
+        dispatch.join().expect("compose dispatch thread");
+        let messages_after_release = lock_conn
+            .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
+            .expect("count messages after compose completes")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or_default();
+        assert_eq!(
+            messages_after_release, 1,
+            "compose must commit after the database lock is released"
+        );
+        drop(barrier);
+
+        let (post_dispatch_barrier, post_dispatch_outcome) =
+            mcp_agent_mail_db::write_barrier::acquire_promotion_barrier_draining(
+                Duration::from_secs(5),
+            );
+        assert!(
+            matches!(
+                post_dispatch_outcome,
+                mcp_agent_mail_db::write_barrier::DrainOutcome::Idle
+                    | mcp_agent_mail_db::write_barrier::DrainOutcome::Drained { .. }
+            ),
+            "promotion must become admissible after compose drops its lease: {post_dispatch_outcome:?}"
+        );
+        drop(post_dispatch_barrier);
     }
 
     #[test]

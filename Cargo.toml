@@ -17,7 +17,7 @@ members = [
 exclude = ["experimental/*", "crates/mcp-agent-mail-dashboard-wasm"]
 
 [workspace.package]
-version = "0.3.30"
+version = "0.3.32"
 edition = "2024"
 license = "LicenseRef-MIT-Rider"
 license-file = "LICENSE"
@@ -27,18 +27,19 @@ authors = ["Jeff Emanuel"]
 
 [workspace.dependencies]
 # Required internal dependencies (local projects)
-fastmcp = { version = "0.7.0", package = "fastmcp-rust" }
-fastmcp-core = "0.7.0"
-fastmcp-server = "0.7.0"
-fastmcp-transport = "0.7.0"
-fastmcp-protocol = "0.7.0"
+fastmcp = { version = "0.7.1", package = "fastmcp-rust" }
+fastmcp-core = "0.7.1"
+fastmcp-server = "0.7.1"
+fastmcp-transport = "0.7.1"
+fastmcp-protocol = "0.7.1"
 
 # br-ba1ui: exact pins keep the shared Asupersync type universe coherent.
-# 2026-08-22: =0.4.9, lockstep with fastmcp 0.7.0 (which pins =0.4.9),
-# sqlmodel 0.4.0 (^0.4.9), and the fsqlite 0.3.8 registry baseline.
+# 2026-08-24: =0.4.9, lockstep with fastmcp 0.7.1 (which pins =0.4.9),
+# sqlmodel 0.4.0 (^0.4.9), and the fsqlite 0.3.14 registry baseline.
 # 0.4.9 is additive on the v0.4.3 public compatibility floor (RuntimeHandle
 # request-Cx / blocking-pool APIs, SQLite cancel correctness, owned-OTLP).
 asupersync = { version = "=0.4.9", features = ["tls-webpki-roots"] }
+fsqlite = "=0.3.14"
 
 sqlmodel = "=0.4.0"
 sqlmodel-core = "=0.4.0"
@@ -56,7 +57,7 @@ ftui-widgets = { version = "0.5.0", features = ["debug-overlay", "regex-search"]
 ftui-tty = "0.5.0"
 ftui-harness = "0.5.0"
 ftui-render = "0.5.0"
-beads_rust = { version = "0.4.0", default-features = false }
+beads_rust = { version = "=0.5.4", default-features = false }
 toon = { version = "0.2.3", package = "tru" }
 # GH#161: global allocator for the long-running serve-http daemon to avoid
 # glibc per-thread arena fragmentation (multi-GB retained RSS under load).
@@ -76,9 +77,12 @@ mcp-agent-mail-search-core = { path = "crates/mcp-agent-mail-search-core" }
 mcp-agent-mail-test-helpers = { path = "crates/mcp-agent-mail-test-helpers" }
 
 # Core ecosystem deps
-franken-agent-detection = "0.2.1"
+franken-agent-detection = "0.2.2"
+cap-fs-ext = "=4.0.3"
+cap-std = "=4.0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+serde_norway = "0.9.42"
 toml = "1.1.2"
 toml_edit = "0.25"
 json5 = "1.3.1"
@@ -105,6 +109,7 @@ sha2 = "0.11.0"
 hex = "0.4"
 base64 = "0.23"
 ed25519-dalek = "3"
+blake2 = "0.10"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 loom = "0.7"
@@ -117,18 +122,32 @@ walkdir = "2"
 tantivy = { git = "https://github.com/quickwit-oss/tantivy", rev = "1f32c1a8af0eb9d68bd3f5576caf20941364b657" }
 indexmap = "2"
 nix = "0.31.3"
+rustix = { version = "1.1.4", features = ["fs"] }
+url = "2.5.8"
 signal-hook = "0.4.4"
+winsafe = { version = "=0.0.28", features = ["kernel"] }
 
 # frankensearch: two-tier hybrid search engine + optional cross-encoder rerank.
 #
 # Do not enable frankensearch's aggregate `hybrid`/`semantic` features here:
 # those currently include FastEmbed, which pulls hf-hub/reqwest/hyper/tokio.
 # Downstream crates opt into the exact no-Tokio subfeatures they need.
-frankensearch = { version = "0.3.2", path = "../frankensearch/frankensearch", default-features = false, features = ["lexical-tantivy"] }
-frankensearch-core = { version = "0.2.1", path = "../frankensearch/crates/frankensearch-core" }
-frankensearch-embed = { version = "0.2.1", path = "../frankensearch/crates/frankensearch-embed", default-features = false }
-frankensearch-index = { version = "0.2.1", path = "../frankensearch/crates/frankensearch-index" }
-frankensearch-fusion = { version = "0.2.1", path = "../frankensearch/crates/frankensearch-fusion" }
+#
+# 2026-09-01: the sibling is a GATED CLONE at the v0.3.32 release pin
+# (dist.yml `FRANKENSEARCH_COMMIT` = 3bbfd8c6), not the live `../frankensearch`
+# checkout. The live tree moved to asupersync 0.4.10 (`Cx::is_cancelled` in
+# frankensearch-quill, commit 29d88ae6) while fastmcp — even 0.8.1 — still
+# pins asupersync =0.4.9, so building against the live sibling stopped
+# compiling for every agent on the host. dist.yml, Dockerfile, and
+# install.sh --from-source check the pinned commit out under the same name.
+# Cleanup trigger: fastmcp publishes a release on asupersync >=0.4.10 (then
+# retarget the live sibling or adopt registry frankensearch), or frankensearch
+# ships a tagged release that this workspace can pin from crates.io.
+frankensearch = { version = "0.4.0", path = "../frankensearch-rel-0332/frankensearch", default-features = false, features = ["lexical-tantivy"] }
+frankensearch-core = { version = "0.2.2", path = "../frankensearch-rel-0332/crates/frankensearch-core" }
+frankensearch-embed = { version = "0.2.2", path = "../frankensearch-rel-0332/crates/frankensearch-embed", default-features = false }
+frankensearch-index = { version = "0.2.2", path = "../frankensearch-rel-0332/crates/frankensearch-index" }
+frankensearch-fusion = { version = "0.2.2", path = "../frankensearch-rel-0332/crates/frankensearch-fusion" }
 
 # Two-tier search dependencies (legacy, being replaced by frankensearch)
 half = "2"
@@ -143,7 +162,16 @@ smallvec = { version = "1", features = ["serde"] }
 serde-wasm-bindgen = "0.6"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Every crate root still carries `#![forbid(unsafe_code)]`, which is what keeps
+# library and binary code unsafe-free. The workspace table says `deny` rather
+# than `forbid` so that integration-test files which must mutate the process
+# environment (Rust 2024 makes `std::env::set_var` unsafe) can opt in with an
+# explicit `#![allow(unsafe_code)]` while still inheriting the shared lints;
+# `forbid` cannot be overridden and would make those crates unable to inherit
+# this table at all (br-sox5q).
+unsafe_code = "deny"
+# guard and storage carry cfg(fuzzing)-gated hooks; declare the cfg once here.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
@@ -171,28 +199,26 @@ inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
 # 2026-08-22 registry adoption (asupersync =0.4.9 universe):
-# - asupersync resolves from crates.io (=0.4.9; fastmcp 0.7.0 pins =0.4.9).
-# - fsqlite family resolves from crates.io (0.3.8) — the machine-specific
+# - asupersync resolves from crates.io (=0.4.9; fastmcp 0.7.1 pins =0.4.9).
+# - fsqlite family resolves from crates.io (0.3.14) — the machine-specific
 #   /data/projects/frankensqlite path patches are GONE (they broke source
 #   builds on any host without that mount).
 # - sqlmodel family resolves from crates.io (=0.4.0, published 2026-08-21,
 #   accepting asupersync ^0.4.9 + fsqlite ^0.3.7) — the ../sqlmodel-rel-0327
 #   cleanup trigger fired, so those eight patch lines are gone too.
-# - fastmcp family resolves from crates.io (0.7.0, published 2026-08-20).
+# - fastmcp family resolves from crates.io (0.7.1).
 #
-# beads_rust: registry 0.3.2 still pins asupersync =0.4.4, unsatisfiable in
-# the =0.4.9 universe, so it stays path-patched to the ../beads_rust checkout
-# on main (0.4.0, asupersync =0.4.9 — not yet on crates.io; the 0.4.0 req in
-# [workspace.dependencies] is satisfied ONLY through this patch).
-# Cleanup trigger: beads_rust 0.4.x published to crates.io.
+# beads_rust 0.5.4 stays path-patched to the ../beads_rust checkout because
+# that release is not published yet. Keep the requirement, lockfile, sibling
+# checkout, and dist workflow's exact source commit in lockstep; Cargo ignores
+# a patch whose package version does not satisfy the declared requirement.
+# Cleanup trigger: beads_rust 0.5.x published to crates.io.
 beads_rust = { path = "../beads_rust" }
-# ftui 0.5.0, franken-agent-detection 0.2.1, and tru 0.2.3 resolve from
-# crates.io as of 2026-08-22 — the ../frankentui, ../franken_agent_detection,
-# and ../toon_rust path patches are gone. Path patches made builds depend on
-# whatever state each machine's sibling checkout happened to be in (a broken
-# frankentui HEAD was failing local builds outright).
+# ftui 0.5.0, franken-agent-detection 0.2.2, and tru 0.2.3 resolve from
+# crates.io. Their former path patches made builds depend on whatever state
+# each machine's sibling checkout happened to be in.
 # rich_rust resolves from the registry (0.2.3) as of 2026-08-20 —
-# fastmcp-console 0.6.0 pins =0.2.3 and registry 0.2.3 carries the
+# fastmcp-console 0.7.1 pins =0.2.3 and registry 0.2.3 carries the
 # time ^0.3.54 req, so the 0.2.2 gated-clone patch is gone.
 
 # --- rch OOM mitigation (2026-07-23) ---------------------------------------

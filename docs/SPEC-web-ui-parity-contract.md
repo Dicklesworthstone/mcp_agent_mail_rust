@@ -146,11 +146,13 @@ CI parses the JSON block below and fails if any row:
       "rust_path": "/mail/api/projects/{project_id}/siblings/{other_id}",
       "policy": "must_match",
       "status": "implemented",
-      "owner_beads": ["br-3vwi.13.2"],
+      "owner_beads": ["br-3vwi.13.2", "br-d48ow"],
       "evidence": [
-        "crates/mcp-agent-mail-server/src/mail_ui.rs (handle_sibling_update)"
+        "crates/mcp-agent-mail-db/src/queries.rs (update_project_sibling_status)",
+        "crates/mcp-agent-mail-server/src/mail_ui.rs (handle_sibling_update and sibling_update_route_persists_and_index_renders_both_orientations)",
+        "scripts/e2e_http.sh (Run 7 persisted project-sibling transitions)"
       ],
-      "notes": "POST endpoint accepts confirm/dismiss/reset action. Stub returns status JSON (full sibling state persistence deferred to sibling subsystem)."
+      "notes": "POST confirm/dismiss/reset transitions the existing canonical suggestion row atomically, returns the committed joined state, preserves idempotent decision timestamps, and clears mutually exclusive timestamps on every state change. Both project orientations render the same persisted relation and HTTP auth/CSRF gates run before mutation. Intentional Rust differences: the transition requires an existing suggestion instead of invoking discovery, timestamps are native INTEGER microseconds, and reset repairs stale legacy decision timestamps."
     },
     {
       "id": "mail_project_agents_api_get",

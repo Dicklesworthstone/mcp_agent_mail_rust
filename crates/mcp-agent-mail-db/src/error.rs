@@ -1095,6 +1095,11 @@ fn contains_main_db_corruption(msg: &str) -> bool {
     lower.contains("database disk image is malformed")
         || lower.contains("file is not a database")
         || lower.contains("database file too small for header")
+        // The strict canonical read-only precheck's phrasing for a main file
+        // shorter than the 100-byte header; the same evidence as "too small
+        // for header", so a salvage source in this state degrades to an
+        // archive-only rebuild instead of blocking recovery.
+        || lower.contains("truncated sqlite database header")
         || lower.contains("invalid database header")
         || lower.contains("invalid database header magic")
         || lower.contains("invalid page size")
@@ -1753,6 +1758,11 @@ mod tests {
         assert!(is_corruption_error("file is not a database"));
         assert!(is_corruption_error(
             "database file too small for header: 14 bytes (< 100)"
+        ));
+        // The strict canonical read-only precheck's wording for the same
+        // evidence (a main file shorter than the 100-byte header).
+        assert!(is_corruption_error(
+            "strict query-only open refused: /tmp/x/storage.sqlite3 has a truncated SQLite database header"
         ));
         assert!(is_corruption_error("invalid database header: bad magic"));
         assert!(is_corruption_error("page 12: xxh3 page checksum mismatch"));

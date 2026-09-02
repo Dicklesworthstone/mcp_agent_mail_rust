@@ -139,6 +139,17 @@ pub fn detect(
     storage_root: Option<&Path>,
     candidate_dbs: &[PathBuf],
 ) -> Vec<ReservationDbArchiveParityFinding> {
+    let read_candidates = super::explicit_offline_db_read_candidates(
+        candidate_dbs,
+        "reservation DB/archive parity detection",
+    );
+    detect_prepared(storage_root, &read_candidates)
+}
+
+pub(crate) fn detect_prepared(
+    storage_root: Option<&Path>,
+    read_candidates: &[super::DoctorDbReadCandidate],
+) -> Vec<ReservationDbArchiveParityFinding> {
     let Some(storage_root) = storage_root else {
         return Vec::new();
     };
@@ -147,18 +158,18 @@ pub fn detect(
     }
 
     let mut findings = Vec::new();
-    for db_path in candidate_dbs {
-        let Ok(conn) = super::open_immutable_sqlite(db_path) else {
+    for candidate in read_candidates {
+        let Some(conn) = candidate.connection() else {
             continue;
         };
-        let Ok(report) = check_reservation_parity_with_canonical_conn(&conn, storage_root) else {
+        let Ok(report) = check_reservation_parity_with_canonical_conn(conn, storage_root) else {
             continue;
         };
         if report.ok {
             continue;
         }
         findings.push(ReservationDbArchiveParityFinding {
-            db_path: db_path.clone(),
+            db_path: candidate.target_path().to_path_buf(),
             storage_root: storage_root.to_path_buf(),
             report,
         });
@@ -284,16 +295,13 @@ fn build_archive_release_rewrite(
     })
 }
 
-/// Fold the parity report's typed examples plus a live DB/archive read into a
-/// pure reconcile plan. Opens the DB read-only; the connection is dropped before
-/// `fix` issues any writable `Op::DbExec`.
-fn build_reconcile_plan(finding: &ReservationDbArchiveParityFinding) -> ReconcilePlan {
+/// Fold a freshly revalidated parity report plus its retained logical-snapshot
+/// connection into a pure reconcile plan.
+fn build_reconcile_plan(
+    finding: &ReservationDbArchiveParityFinding,
+    conn: &SqliteConnection,
+) -> ReconcilePlan {
     let mut plan = ReconcilePlan::default();
-    let Ok(conn) = super::open_immutable_sqlite(&finding.db_path) else {
-        // Can't read the DB → reconcile nothing. The collision quarantine path in
-        // `fix` is archive-only and still runs.
-        return plan;
-    };
 
     use std::collections::BTreeMap;
     let mut by_reservation: BTreeMap<(String, i64), ReservationDrift> = BTreeMap::new();
@@ -361,7 +369,7 @@ fn build_reconcile_plan(finding: &ReservationDbArchiveParityFinding) -> Reconcil
         //    for a row we are concurrently reconciling to released; correcting a
         //    released row's holder is audit-only (it no longer blocks). ──
         if let Some(archive_agent) = drift.agent_archive {
-            if let Some(agent_id) = resolve_agent_id(&conn, &project_slug, &archive_agent) {
+            if let Some(agent_id) = resolve_agent_id(conn, &project_slug, &archive_agent) {
                 plan.db_statements.push(format!(
                     "UPDATE file_reservations SET agent_id = {agent_id} WHERE id = {reservation_id} AND agent_id <> {agent_id};"
                 ));
@@ -380,17 +388,50 @@ pub fn fix(
     ctx: &crate::doctor::mutate::MutateContext,
     finding: &ReservationDbArchiveParityFinding,
 ) -> Result<FixOutcome, crate::doctor::mutate::MutateError> {
+    let candidate = super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+        &finding.db_path,
+        "reservation DB/archive parity pre-fix source selection",
+    );
+    fix_prepared(ctx, finding, &candidate)
+}
+
+pub(crate) fn fix_prepared(
+    ctx: &crate::doctor::mutate::MutateContext,
+    finding: &ReservationDbArchiveParityFinding,
+    candidate: &super::DoctorDbReadCandidate,
+) -> Result<FixOutcome, crate::doctor::mutate::MutateError> {
+    let refreshed = candidate.refresh("reservation DB/archive parity pre-mutation revalidation");
+    let Some(fresh_finding) = detect_prepared(
+        Some(&finding.storage_root),
+        std::slice::from_ref(&refreshed),
+    )
+    .into_iter()
+    .next() else {
+        return Ok(FixOutcome {
+            actions_taken: 0,
+            actions_skipped: 1,
+            quarantined_paths: Vec::new(),
+        });
+    };
+    let Some(conn) = refreshed.connection() else {
+        return Ok(FixOutcome {
+            actions_taken: 0,
+            actions_skipped: 1,
+            quarantined_paths: Vec::new(),
+        });
+    };
+
     let mut actions_taken = 0;
     let mut actions_skipped = 0;
     let mut quarantined_paths = Vec::new();
 
     // ── 1. Principled reconcile of the two #112 drift classes. ──────────────
-    let plan = build_reconcile_plan(finding);
+    let plan = build_reconcile_plan(&fresh_finding, conn);
     // Batch every integer-only DB statement into ONE hash-witnessed Op::DbExec
     // (a single verbatim DB backup, reversible via `am doctor undo`).
     if !plan.db_statements.is_empty() {
         let sql = plan.db_statements.join("\n");
-        let result = mutate(ctx, &finding.db_path, Op::DbExec { sql })?;
+        let result = mutate(ctx, &fresh_finding.db_path, Op::DbExec { sql })?;
         if result.ok {
             actions_taken += 1;
         } else {
@@ -424,13 +465,13 @@ pub fn fix(
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let mut quarantine_index: u128 = 0;
-    for example in &finding.report.examples {
+    for example in &fresh_finding.report.examples {
         if example.field != "archive_id_collision" {
             continue;
         }
         // Locate the stale duplicate artifact (generation-stamped or legacy,
         // br-n8qh6) under the project slug it lives beneath, by reservation id.
-        let reservation_dir = finding
+        let reservation_dir = fresh_finding
             .storage_root
             .join("projects")
             .join(&example.project_slug)
@@ -505,6 +546,11 @@ mod tests {
     const ARCHIVE_ACTIVE_JSON: &str = include_str!(
         "../../../../../tests/fixtures/reservation_regression/recipes/db_archive_active_state_mismatch_archive_id_301.json"
     );
+    const WAL_WRITER_PATH_ENV: &str = "AM_DOCTOR_RESERVATION_WAL_WRITER_PATH";
+    const WAL_WRITER_READY_ENV: &str = "AM_DOCTOR_RESERVATION_WAL_WRITER_READY";
+    const WAL_WRITER_RELEASE_ENV: &str = "AM_DOCTOR_RESERVATION_WAL_WRITER_RELEASE";
+    const WAL_WRITER_TEST: &str = "doctor::fixers::reservation_db_archive_parity::tests::live_wal_holder_and_release_truth_is_seen_and_revalidated_before_fix";
+    const WAL_WRITER_WITNESS: &str = "RESERVATION_WAL_WRITER_CHILD_RAN";
 
     fn materialize_fixture(
         sql: &str,
@@ -578,6 +624,165 @@ mod tests {
                 && example.detail.contains("db_released_ts=1700003010000000")
                 && example.detail.contains("archive_released_ts=NULL")
         }));
+    }
+
+    #[test]
+    fn live_wal_holder_and_release_truth_is_seen_and_revalidated_before_fix() {
+        if let Ok(db_path) = std::env::var(WAL_WRITER_PATH_ENV) {
+            let ready_path = PathBuf::from(
+                std::env::var(WAL_WRITER_READY_ENV).expect("reservation WAL writer ready path"),
+            );
+            let release_path = PathBuf::from(
+                std::env::var(WAL_WRITER_RELEASE_ENV).expect("reservation WAL writer release path"),
+            );
+            let writer = mcp_agent_mail_db::DbConn::open_file(db_path)
+                .expect("open cross-process reservation WAL writer");
+            writer
+                .execute_raw(
+                    "PRAGMA wal_autocheckpoint = 0;
+                     UPDATE file_reservations
+                     SET agent_id = 2, released_ts = 1700001015000000
+                     WHERE id = 101;
+                     INSERT OR REPLACE INTO file_reservation_releases
+                     (reservation_id, released_ts) VALUES (101, 1700001015000000);",
+                )
+                .expect("commit WAL-only holder and release drift");
+            std::fs::write(&ready_path, b"ready")
+                .expect("publish reservation WAL writer readiness");
+            println!("{WAL_WRITER_WITNESS}");
+            assert!(
+                super::super::wait_for_cross_process_release(&release_path),
+                "parent did not release reservation WAL writer in time"
+            );
+            drop(writer);
+            return;
+        }
+
+        let (storage_root, db_path) = materialize_fixture(STALE_AGENT_SQL, STALE_AGENT_JSON, 101);
+
+        // Align the settled main image with the archive, then admit the family
+        // through FrankenSQLite and checkpoint that clean baseline.
+        let admitted = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("admit live reservation fixture");
+        admitted
+            .execute_raw(
+                "UPDATE file_reservations SET agent_id = 1, released_ts = NULL WHERE id = 101;
+                 DELETE FROM file_reservation_releases WHERE reservation_id = 101;
+                 PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .expect("settle aligned live reservation baseline");
+        mcp_agent_mail_db::close_db_conn(admitted, "settle reservation WAL baseline");
+        let main_before = std::fs::read(&db_path).expect("read settled main");
+
+        // Commit both decisive drifts only to WAL. An immutable main-file read
+        // sees the aligned holder/active state and therefore false-greens.
+        let ready_path = storage_root.path().join("reservation-wal-writer.ready");
+        let release_path = storage_root.path().join("reservation-wal-writer.release");
+        let child = std::process::Command::new(
+            std::env::current_exe().expect("resolve reservation test executable"),
+        )
+        .arg(WAL_WRITER_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(WAL_WRITER_PATH_ENV, &db_path)
+        .env(WAL_WRITER_READY_ENV, &ready_path)
+        .env(WAL_WRITER_RELEASE_ENV, &release_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn cross-process reservation WAL writer");
+        let child = super::super::CrossProcessTestChild::new(child, release_path);
+        if !super::super::wait_for_cross_process_signal(&ready_path) {
+            let output = child
+                .release_and_wait()
+                .expect("collect unready reservation WAL writer");
+            panic!(
+                "reservation WAL writer never became ready: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let main_after = std::fs::read(&db_path);
+        let wal_len = std::fs::metadata(PathBuf::from(format!("{}-wal", db_path.display())))
+            .map(|metadata| metadata.len());
+
+        let candidate = super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+            &db_path,
+            "cross-process reservation WAL truth test",
+        );
+        let finding = detect_prepared(Some(storage_root.path()), std::slice::from_ref(&candidate))
+            .pop()
+            .expect("WAL-only reservation drift must be visible");
+
+        let output = child
+            .release_and_wait()
+            .expect("collect reservation WAL writer");
+        assert!(
+            output.status.success(),
+            "reservation WAL writer failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(WAL_WRITER_WITNESS),
+            "reservation WAL writer filter was vacuous: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            main_after.expect("read WAL-only main"),
+            main_before,
+            "fixture must keep holder and release drift out of the main image"
+        );
+        assert!(
+            wal_len.is_ok_and(|len| len > 32),
+            "fixture must retain committed WAL frames"
+        );
+        assert_eq!(finding.report.drift.agent_id_mismatches, 1);
+        assert_eq!(finding.report.drift.released_ts_mismatches, 1);
+        assert_eq!(finding.report.drift.active_status_mismatches, 1);
+
+        // Make the live truth clean again while the candidate deliberately
+        // retains the old private snapshot. The fixer must refresh under the
+        // caller's exclusive authority and skip the now-stale plan.
+        let cleaner = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("reopen live reservation cleaner");
+        cleaner
+            .execute_raw(
+                "PRAGMA wal_autocheckpoint = 0;
+                 UPDATE file_reservations SET agent_id = 1, released_ts = NULL WHERE id = 101;
+                 DELETE FROM file_reservation_releases WHERE reservation_id = 101;",
+            )
+            .expect("commit clean current reservation truth");
+        drop(cleaner);
+        let archive_path = storage_root
+            .path()
+            .join("projects/reservation-regression/file_reservations/id-101.json");
+        let archive_before = std::fs::read(&archive_path).expect("read archive witness");
+        let outcome = fix_prepared(
+            &collision_ctx(&storage_root, "reservation-wal-revalidation"),
+            &finding,
+            &candidate,
+        )
+        .expect("revalidate stale WAL finding");
+        assert_eq!(outcome.actions_taken, 0);
+        assert!(outcome.actions_skipped >= 1);
+        assert_eq!(
+            std::fs::read(&archive_path).expect("read archive after skip"),
+            archive_before,
+            "stale release evidence must not rewrite the archive"
+        );
+        let current = super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+            &db_path,
+            "reservation WAL post-fix verification",
+        );
+        assert!(
+            detect_prepared(Some(storage_root.path()), std::slice::from_ref(&current)).is_empty(),
+            "fresh live truth is already aligned"
+        );
     }
 
     #[test]

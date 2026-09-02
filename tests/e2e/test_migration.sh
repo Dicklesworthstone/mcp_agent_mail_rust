@@ -945,7 +945,24 @@ else
     e2e_fail "doctor check emits valid JSON"
 fi
 
-BACKUP_PATH="$(find "${STORAGE_ROOT}" -maxdepth 1 -type f \( -name 'storage.sqlite3.bak.*' -o -name 'storage.sqlite3.backup-*' \) | sort | head -1 || true)"
+BACKUP_PATH="$(find "${STORAGE_ROOT}" -maxdepth 1 -type f -name 'storage.sqlite3.bak.*' -print | python3 -c '
+import datetime
+import os
+import re
+import sys
+
+pattern = re.compile(r"^storage\.sqlite3\.bak\.(\d{8}_\d{6})(?:-(0[1-9]|[1-9]\d+))?$")
+for path in sorted(line.rstrip("\n") for line in sys.stdin if line.rstrip("\n")):
+    match = pattern.fullmatch(os.path.basename(path))
+    if match is None:
+        continue
+    try:
+        datetime.datetime.strptime(match.group(1), "%Y%m%d_%H%M%S")
+    except ValueError:
+        continue
+    print(path)
+    break
+' || true)"
 if [ -n "${BACKUP_PATH}" ] && [ -f "${BACKUP_PATH}" ]; then
     e2e_pass "timestamp migration backup artifact created"
 else

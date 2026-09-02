@@ -162,6 +162,16 @@ fn web_ui_parity_contract_has_owners_and_known_status() {
             row.id
         );
 
+        if row.policy == "must_match" && row.status == "implemented" {
+            let normalized_notes = row.notes.to_ascii_lowercase();
+            assert!(
+                !normalized_notes.contains("stub returns")
+                    && !normalized_notes.contains("not implemented"),
+                "row {}: implemented must-match behavior cannot be described as a stub or unimplemented",
+                row.id
+            );
+        }
+
         // rust_path may be null for gaps, but if present it should not be empty.
         if let Some(rust_path) = row.rust_path.as_deref() {
             assert!(
@@ -171,4 +181,47 @@ fn web_ui_parity_contract_has_owners_and_known_status() {
             );
         }
     }
+}
+
+#[test]
+fn project_sibling_must_match_row_cannot_regress_to_route_stub() {
+    let repo_root = repo_root_from_manifest_dir();
+    let contract_path = repo_root.join("docs/SPEC-web-ui-parity-contract.md");
+    let markdown = fs::read_to_string(&contract_path).expect("read parity contract markdown");
+    let contract: WebUiParityContract =
+        serde_json::from_str(&extract_json_block(&markdown)).expect("parse parity contract JSON");
+    let row = contract
+        .rows
+        .iter()
+        .find(|row| row.id == "mail_projects_siblings_post")
+        .expect("project-sibling parity row");
+    assert_eq!(row.policy, "must_match");
+    assert_eq!(row.status, "implemented");
+
+    let source_path = repo_root.join("crates/mcp-agent-mail-server/src/mail_ui.rs");
+    let source = fs::read_to_string(&source_path).expect("read mail UI source");
+    let handler_start = source
+        .find("fn handle_sibling_update(")
+        .expect("project-sibling handler");
+    let handler_tail = &source[handler_start..];
+    let handler_end = handler_tail
+        .find("/// Render an error page.")
+        .expect("project-sibling handler end marker");
+    let handler = &handler_tail[..handler_end];
+
+    assert!(
+        handler.contains("queries::update_project_sibling_status"),
+        "implemented project-sibling parity must call the persisted DB transition"
+    );
+    let normalized_handler = handler.to_ascii_lowercase();
+    assert!(
+        !handler.contains("501") && !normalized_handler.contains("not implemented"),
+        "implemented project-sibling parity cannot return a route-shaped stub"
+    );
+    assert!(
+        row.evidence
+            .iter()
+            .any(|entry| entry.contains("scripts/e2e_http.sh")),
+        "the parity row must retain real HTTP/restart evidence"
+    );
 }

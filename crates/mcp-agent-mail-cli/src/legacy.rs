@@ -12,6 +12,7 @@ use crate::{CliError, CliResult, SetupCommand, handle_setup, output};
 use chrono::Utc;
 use clap::{Args, Subcommand};
 use mcp_agent_mail_core::Config;
+use mcp_agent_mail_core::config::{read_env_authority_text, user_env_authority_candidates};
 use mcp_agent_mail_core::disk::{
     is_sqlite_memory_database_url, sqlite_file_path_from_database_url,
 };
@@ -179,6 +180,25 @@ struct ResolvedPath {
     raw_value: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct EnvAuthoritySnapshot {
+    path: PathBuf,
+    values: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LegacyEnvSnapshot {
+    project: Option<EnvAuthoritySnapshot>,
+    user: Option<EnvAuthoritySnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedLegacyAuthorities {
+    database: ResolvedPath,
+    storage: ResolvedPath,
+    env: LegacyEnvSnapshot,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LegacyDbSignature {
     open_ok: bool,
@@ -210,15 +230,45 @@ enum ImportMode {
     Copy,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ImportPlan {
     mode: ImportMode,
     search_root: PathBuf,
     source_db: PathBuf,
+    source_snapshot: Option<LegacySourceSnapshot>,
     source_storage_root: PathBuf,
     target_db: PathBuf,
     target_storage_root: PathBuf,
     operations: Vec<String>,
+}
+
+#[derive(Debug)]
+struct LegacySourceSnapshot {
+    original_path: PathBuf,
+    snapshot_path: PathBuf,
+    _snapshot_dir: tempfile::TempDir,
+}
+
+impl LegacySourceSnapshot {
+    fn capture(original_path: &Path) -> CliResult<Self> {
+        let snapshot_dir =
+            crate::canonical_snapshot_tempdir("legacy-source-snapshot-", "legacy source capture")?;
+        let snapshot_path = snapshot_dir.path().join("source.sqlite3");
+        materialize_legacy_source_snapshot(original_path, &snapshot_path)?;
+        Ok(Self {
+            original_path: original_path.to_path_buf(),
+            snapshot_path,
+            _snapshot_dir: snapshot_dir,
+        })
+    }
+
+    fn original_path(&self) -> &Path {
+        &self.original_path
+    }
+
+    fn snapshot_path(&self) -> &Path {
+        &self.snapshot_path
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -695,16 +745,10 @@ fn run_legacy_import(opts: ImportOptions, fmt: output::CliOutputFormat) -> CliRe
 
 fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
     let root = resolve_search_root(opts.search_root.clone());
-    let detect = build_detect_report(&root, opts.db.as_deref(), opts.storage_root.as_deref())?;
-    if opts.auto && !detect.detected {
-        return Err(CliError::InvalidArgument(
-            "no legacy installation detected; run `am legacy detect` to inspect details"
-                .to_string(),
-        ));
-    }
-
-    let source_db = PathBuf::from(&detect.database.path);
-    let source_storage = PathBuf::from(&detect.storage_root.path);
+    let resolved =
+        resolve_legacy_authorities(&root, opts.db.as_deref(), opts.storage_root.as_deref())?;
+    let source_db = resolved.database.path.clone();
+    let source_storage = resolved.storage.path.clone();
     if !source_db.exists() {
         return Err(CliError::InvalidArgument(format!(
             "source DB missing: {}",
@@ -717,18 +761,7 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
             source_db.display()
         )));
     }
-    if !source_storage.exists() {
-        return Err(CliError::InvalidArgument(format!(
-            "source storage root missing: {}",
-            source_storage.display()
-        )));
-    }
-    if !source_storage.is_dir() {
-        return Err(CliError::InvalidArgument(format!(
-            "source storage root must be a directory: {}",
-            source_storage.display()
-        )));
-    }
+    require_storage_directory(&source_storage, "source storage root", false)?;
 
     let mode = ImportMode::Copy;
     let target_db = opts
@@ -759,15 +792,28 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
                 .to_string(),
         ));
     }
-    if target_storage.exists() && !target_storage.is_dir() {
-        return Err(CliError::InvalidArgument(format!(
-            "legacy import requires target storage root to be a directory path: {}",
-            target_storage.display()
-        )));
-    }
+    require_storage_directory(&target_storage, "target storage root", true)?;
     if paths_overlap(&source_storage, &target_storage) {
         return Err(CliError::InvalidArgument(
             "legacy import requires target storage root to be outside source storage root"
+                .to_string(),
+        ));
+    }
+
+    // A real import captures one coherent source generation before the prompt
+    // or any target mutation. Detection, both source checks, and the target
+    // backup all consume this retained private image. Dry-run remains a pure
+    // plan: its detector may inspect a short-lived snapshot, but the plan does
+    // not retain or claim an executable source generation.
+    let source_snapshot = if opts.dry_run {
+        None
+    } else {
+        Some(LegacySourceSnapshot::capture(&source_db)?)
+    };
+    let detect = build_detect_report_from_resolved(&root, &resolved, source_snapshot.as_ref())?;
+    if opts.auto && !detect.detected {
+        return Err(CliError::InvalidArgument(
+            "no legacy installation detected; run `am legacy detect` to inspect details"
                 .to_string(),
         ));
     }
@@ -779,8 +825,8 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
         source_storage.display()
     ));
     operations.push(
-        "verify source DB through canonical SQLite read-only immutable access before copying \
-         (never creates/touches source -wal/-shm sidecars)"
+        "capture one WAL-aware, transactionally coherent private source snapshot and use it for \
+         legacy signature detection, both source checks, and target backup"
             .to_string(),
     );
     operations.push(format!(
@@ -801,6 +847,7 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
         mode,
         search_root: root,
         source_db,
+        source_snapshot,
         source_storage_root: source_storage,
         target_db,
         target_storage_root: target_storage,
@@ -814,11 +861,17 @@ fn execute_import(plan: ImportPlan, should_refresh_setup: bool) -> CliResult<Leg
     let _mailbox_locks = acquire_legacy_import_mailbox_locks(&plan)?;
     let now = Utc::now();
     let timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let source_snapshot = plan.source_snapshot.as_ref().ok_or_else(|| {
+        CliError::Other(
+            "legacy import execution requires the retained source snapshot omitted by dry-run"
+                .to_string(),
+        )
+    })?;
 
     // Preflight before any target artifact exists: failures here return the
     // error unchanged (there is nothing to stage aside and no target storage
     // root that this run owns to hold a failure receipt).
-    verify_source_canonical_sqlite_readable(&plan.source_db)?;
+    verify_source_canonical_sqlite_readable(source_snapshot)?;
     ensure_target_storage_root_usable(&plan.target_storage_root)?;
 
     match execute_import_body(&plan, should_refresh_setup, &now) {
@@ -839,8 +892,11 @@ fn execute_import_body(
     now: &chrono::DateTime<Utc>,
 ) -> CliResult<LegacyImportReceipt> {
     let mut warnings = Vec::new();
+    let source_snapshot = plan.source_snapshot.as_ref().ok_or_else(|| {
+        CliError::Other("legacy import body lost its retained source snapshot".to_string())
+    })?;
 
-    copy_db_via_sqlite_backup(&plan.source_db, &plan.target_db)?;
+    copy_db_via_sqlite_backup(source_snapshot, &plan.target_db)?;
     copy_dir_recursive(&plan.source_storage_root, &plan.target_storage_root)?;
 
     let migrated_ids = migrate_sqlite_db(&plan.target_db)?;
@@ -852,7 +908,7 @@ fn execute_import_body(
         )));
     }
     let core_counts = query_core_table_counts(&plan.target_db)?;
-    verify_source_canonical_sqlite_readable(&plan.source_db)?;
+    verify_source_canonical_sqlite_readable(source_snapshot)?;
     verify_canonical_sqlite_readable(&plan.target_db, "target DB")?;
     verify_runtime_sqlite_readable(&plan.target_db, "target DB")?;
 
@@ -892,7 +948,7 @@ fn execute_import_body(
 /// attempt whose partial artifacts were staged aside). Anything else is
 /// refused so an unrelated directory is never merged into.
 fn ensure_target_storage_root_usable(target_storage_root: &Path) -> CliResult<()> {
-    if !target_storage_root.exists() {
+    if !require_storage_directory(target_storage_root, "target storage root", true)? {
         return Ok(());
     }
     for entry in fs::read_dir(target_storage_root)? {
@@ -1048,6 +1104,7 @@ fn migrate_sqlite_db(path: &Path) -> CliResult<Vec<String>> {
         .map_err(|e| CliError::Other(format!("failed to build runtime: {e}")))?;
     match rt.block_on(async { schema::migrate_to_latest_base(&cx, &conn).await }) {
         asupersync::Outcome::Ok(ids) => {
+            normalize_legacy_agent_lifecycle_timestamps(&conn)?;
             schema::enforce_runtime_fts_cleanup(&conn)
                 .map_err(|e| CliError::Other(format!("runtime FTS cleanup failed: {e}")))?;
             let _ = conn.execute_raw("PRAGMA journal_mode = WAL;");
@@ -1061,6 +1118,64 @@ fn migrate_sqlite_db(path: &Path) -> CliResult<Vec<String>> {
             Err(CliError::Other(format!("migration panicked: {p}")))
         }
     }
+}
+
+/// Convert Python DATETIME text in `agents.retired_at` to the Rust runtime's
+/// canonical UTC-microsecond integer. A duplicate-column migration correctly
+/// preserves an existing Python column, but without this value conversion a
+/// fresh Rust process would decode a retired agent as active.
+fn normalize_legacy_agent_lifecycle_timestamps(conn: &DbConn) -> CliResult<()> {
+    use mcp_agent_mail_db::sqlmodel_core::Value;
+
+    let rows = conn
+        .query_sync(
+            "SELECT id, CAST(retired_at AS TEXT) AS retired_at_text \
+             FROM agents \
+             WHERE retired_at IS NOT NULL AND typeof(retired_at) != 'integer'",
+            &[],
+        )
+        .map_err(|error| {
+            CliError::Other(format!(
+                "failed to inspect legacy agent retirement timestamps: {error}"
+            ))
+        })?;
+    for row in rows {
+        let agent_id = row.get_named::<i64>("id").map_err(|error| {
+            CliError::Other(format!(
+                "legacy retired agent row has no numeric id: {error}"
+            ))
+        })?;
+        let raw = row
+            .get_named::<String>("retired_at_text")
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "legacy retired_at for agent {agent_id} is not text-decodable: {error}"
+                ))
+            })?;
+        let micros = raw
+            .parse::<i64>()
+            .ok()
+            .or_else(|| mcp_agent_mail_db::iso_to_micros(raw.trim()))
+            .or_else(|| {
+                let normalized = raw.trim().replacen(' ', "T", 1);
+                mcp_agent_mail_db::iso_to_micros(&normalized)
+            })
+            .ok_or_else(|| {
+                CliError::Other(format!(
+                    "cannot convert legacy retired_at {raw:?} for agent {agent_id}; refusing to publish a target that would reactivate the agent"
+                ))
+            })?;
+        conn.execute_sync(
+            "UPDATE agents SET retired_at = ? WHERE id = ?",
+            &[Value::BigInt(micros), Value::BigInt(agent_id)],
+        )
+        .map_err(|error| {
+            CliError::Other(format!(
+                "failed to normalize retired_at for agent {agent_id}: {error}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 fn integrity_check_ok(path: &Path) -> CliResult<bool> {
@@ -1173,8 +1288,17 @@ fn build_detect_report(
     explicit_db: Option<&Path>,
     explicit_storage_root: Option<&Path>,
 ) -> CliResult<LegacyDetectReport> {
-    let db_resolved = resolve_database_path(search_root, explicit_db)?;
-    let storage_resolved = resolve_storage_root(search_root, explicit_storage_root)?;
+    let resolved = resolve_legacy_authorities(search_root, explicit_db, explicit_storage_root)?;
+    build_detect_report_from_resolved(search_root, &resolved, None)
+}
+
+fn build_detect_report_from_resolved(
+    search_root: &Path,
+    resolved: &ResolvedLegacyAuthorities,
+    source_snapshot: Option<&LegacySourceSnapshot>,
+) -> CliResult<LegacyDetectReport> {
+    let db_resolved = &resolved.database;
+    let storage_resolved = &resolved.storage;
 
     let mut markers = Vec::new();
     if let Some(marker) = detect_pyproject_marker(search_root) {
@@ -1199,7 +1323,7 @@ fn build_detect_report(
             path: Some(search_root.join(".venv").display().to_string()),
         });
     }
-    if let Some(marker) = detect_env_marker(search_root) {
+    if let Some(marker) = detect_env_marker(&resolved.env) {
         markers.push(marker);
     }
     if db_resolved.exists {
@@ -1219,7 +1343,30 @@ fn build_detect_report(
         });
     }
 
-    let db_signature = inspect_db_signature(&db_resolved.path);
+    let db_signature = if !db_resolved.exists {
+        None
+    } else if let Some(snapshot) = source_snapshot {
+        if snapshot.original_path() != db_resolved.path.as_path() {
+            return Err(CliError::Other(format!(
+                "legacy detector snapshot source {} does not match resolved database {}",
+                snapshot.original_path().display(),
+                db_resolved.path.display()
+            )));
+        }
+        Some(inspect_db_signature(snapshot))
+    } else {
+        match LegacySourceSnapshot::capture(&db_resolved.path) {
+            Ok(snapshot) => Some(inspect_db_signature(&snapshot)),
+            Err(error) => Some(LegacyDbSignature {
+                open_ok: false,
+                core_tables_present: false,
+                legacy_trigger_count: 0,
+                datetime_like_column_count: 0,
+                migrations_table_present: false,
+                notes: vec![format!("failed to capture coherent sqlite source: {error}")],
+            }),
+        }
+    };
     if let Some(sig) = &db_signature {
         if sig.legacy_trigger_count > 0 {
             markers.push(LegacyMarker {
@@ -1308,14 +1455,14 @@ fn build_detect_report(
             path: db_resolved.path.display().to_string(),
             source: db_resolved.source,
             exists: db_resolved.exists,
-            raw_value: db_resolved.raw_value,
+            raw_value: db_resolved.raw_value.clone(),
             error: None,
         },
         storage_root: ResolvedPathInfo {
             path: storage_resolved.path.display().to_string(),
             source: storage_resolved.source,
             exists: storage_resolved.exists,
-            raw_value: storage_resolved.raw_value,
+            raw_value: storage_resolved.raw_value.clone(),
             error: None,
         },
         markers,
@@ -1447,12 +1594,9 @@ fn detect_legacy_script_marker(search_root: &Path) -> Option<LegacyMarker> {
     None
 }
 
-fn detect_env_marker(search_root: &Path) -> Option<LegacyMarker> {
-    let env_file = search_root.join(".env");
-    if !env_file.exists() {
-        return None;
-    }
-    let map = read_env_file_map(&env_file);
+fn detect_env_marker(snapshot: &LegacyEnvSnapshot) -> Option<LegacyMarker> {
+    let project = snapshot.project.as_ref()?;
+    let map = &project.values;
     let legacy_db = map
         .get("DATABASE_URL")
         .is_some_and(|value| value.contains("sqlite+aiosqlite:///"));
@@ -1466,31 +1610,27 @@ fn detect_env_marker(search_root: &Path) -> Option<LegacyMarker> {
             severity: MarkerSeverity::High,
             detail: "project .env contains legacy Python DATABASE_URL/STORAGE_ROOT markers"
                 .to_string(),
-            path: Some(env_file.display().to_string()),
+            path: Some(project.path.display().to_string()),
         });
     }
     None
 }
 
-fn inspect_db_signature(path: &Path) -> Option<LegacyDbSignature> {
-    if !path.exists() {
-        return None;
-    }
-    // Detection is part of the source-import path. Do not let the writable
-    // runtime engine establish namespace metadata or attempt schema repair on
-    // a legacy source simply to identify it. The immutable open also keeps a
-    // WAL-mode source's -wal/-shm sidecars untouched (no reader-side creation).
-    let conn = match open_source_canonical_read_only_immutable(path) {
-        Ok(v) => v,
-        Err(_) => {
-            return Some(LegacyDbSignature {
+fn inspect_db_signature(snapshot: &LegacySourceSnapshot) -> LegacyDbSignature {
+    // Immutable SQLite is safe only because the type retains a private,
+    // transactionally materialized source generation. It must never accept an
+    // arbitrary live pathname, where immutable mode would ignore the WAL.
+    let conn = match open_private_immutable_source_snapshot(snapshot) {
+        Ok(conn) => conn,
+        Err(error) => {
+            return LegacyDbSignature {
                 open_ok: false,
                 core_tables_present: false,
                 legacy_trigger_count: 0,
                 datetime_like_column_count: 0,
                 migrations_table_present: false,
-                notes: vec!["failed to open sqlite database".to_string()],
-            });
+                notes: vec![format!("failed to open retained source snapshot: {error}")],
+            };
         }
     };
 
@@ -1570,19 +1710,38 @@ fn inspect_db_signature(path: &Path) -> Option<LegacyDbSignature> {
         notes.push("legacy DATETIME/TEXT timestamp columns present".to_string());
     }
 
-    Some(LegacyDbSignature {
+    LegacyDbSignature {
         open_ok: true,
         core_tables_present,
         legacy_trigger_count,
         datetime_like_column_count,
         migrations_table_present,
         notes,
-    })
+    }
 }
 
+#[cfg(test)]
 fn resolve_database_path(search_root: &Path, explicit: Option<&Path>) -> CliResult<ResolvedPath> {
+    let process_value = if explicit.is_none() {
+        process_env_value_for_legacy("DATABASE_URL")?
+    } else {
+        None
+    };
+    let needs_database_authority = explicit.is_none() && process_value.is_none();
+    let snapshot = capture_legacy_env_snapshot(search_root, needs_database_authority, false)?;
+    resolve_database_path_from_snapshot(search_root, explicit, process_value.as_deref(), &snapshot)
+}
+
+fn resolve_database_path_from_snapshot(
+    search_root: &Path,
+    explicit: Option<&Path>,
+    process_value: Option<&str>,
+    snapshot: &LegacyEnvSnapshot,
+) -> CliResult<ResolvedPath> {
     if let Some(path) = explicit {
-        let normalized = normalize_input_path(&path.to_string_lossy(), search_root);
+        let raw = path.to_string_lossy();
+        require_nonblank_legacy_authority("DATABASE_URL", &raw)?;
+        let normalized = normalize_input_path(&raw, search_root);
         return Ok(ResolvedPath {
             exists: normalized.exists(),
             path: normalized,
@@ -1591,21 +1750,24 @@ fn resolve_database_path(search_root: &Path, explicit: Option<&Path>) -> CliResu
         });
     }
 
-    if let Ok(v) = std::env::var("DATABASE_URL") {
-        return parse_database_value(&v, search_root, ResolvedSource::ProcessEnv);
+    if let Some(value) = process_value {
+        return parse_database_value(value, search_root, ResolvedSource::ProcessEnv);
     }
 
-    let project_env = search_root.join(".env");
-    let map = read_env_file_map(&project_env);
-    if let Some(v) = map.get("DATABASE_URL") {
-        return parse_database_value(v, search_root, ResolvedSource::ProjectEnv);
+    if let Some(value) = snapshot
+        .project
+        .as_ref()
+        .and_then(|authority| authority.values.get("DATABASE_URL"))
+    {
+        return parse_database_value(value, search_root, ResolvedSource::ProjectEnv);
     }
 
-    if let Some(user_env) = discover_user_env_file() {
-        let map = read_env_file_map(&user_env);
-        if let Some(v) = map.get("DATABASE_URL") {
-            return parse_database_value(v, search_root, ResolvedSource::UserEnv);
-        }
+    if let Some(value) = snapshot
+        .user
+        .as_ref()
+        .and_then(|authority| authority.values.get("DATABASE_URL"))
+    {
+        return parse_database_value(value, search_root, ResolvedSource::UserEnv);
     }
 
     parse_database_value(
@@ -1616,8 +1778,26 @@ fn resolve_database_path(search_root: &Path, explicit: Option<&Path>) -> CliResu
 }
 
 fn resolve_storage_root(search_root: &Path, explicit: Option<&Path>) -> CliResult<ResolvedPath> {
+    let process_value = if explicit.is_none() {
+        process_env_value_for_legacy("STORAGE_ROOT")?
+    } else {
+        None
+    };
+    let needs_storage_authority = explicit.is_none() && process_value.is_none();
+    let snapshot = capture_legacy_env_snapshot(search_root, false, needs_storage_authority)?;
+    resolve_storage_root_from_snapshot(search_root, explicit, process_value.as_deref(), &snapshot)
+}
+
+fn resolve_storage_root_from_snapshot(
+    search_root: &Path,
+    explicit: Option<&Path>,
+    process_value: Option<&str>,
+    snapshot: &LegacyEnvSnapshot,
+) -> CliResult<ResolvedPath> {
     if let Some(path) = explicit {
-        let normalized = normalize_input_path(&path.to_string_lossy(), search_root);
+        let raw = path.to_string_lossy();
+        require_nonblank_legacy_authority("STORAGE_ROOT", &raw)?;
+        let normalized = normalize_input_path(&raw, search_root);
         return Ok(ResolvedPath {
             exists: normalized.exists(),
             path: normalized,
@@ -1626,49 +1806,79 @@ fn resolve_storage_root(search_root: &Path, explicit: Option<&Path>) -> CliResul
         });
     }
 
-    if let Ok(v) = std::env::var("STORAGE_ROOT") {
-        let path = normalize_input_path(&v, search_root);
-        return Ok(ResolvedPath {
-            exists: path.exists(),
-            path,
-            source: ResolvedSource::ProcessEnv,
-            raw_value: Some(v),
-        });
+    if let Some(value) = process_value {
+        return parse_storage_value(value, search_root, ResolvedSource::ProcessEnv);
     }
 
-    let project_env = search_root.join(".env");
-    let map = read_env_file_map(&project_env);
-    if let Some(v) = map.get("STORAGE_ROOT") {
-        let path = normalize_input_path(v, search_root);
-        return Ok(ResolvedPath {
-            exists: path.exists(),
-            path,
-            source: ResolvedSource::ProjectEnv,
-            raw_value: Some(v.clone()),
-        });
+    if let Some(value) = snapshot
+        .project
+        .as_ref()
+        .and_then(|authority| authority.values.get("STORAGE_ROOT"))
+    {
+        return parse_storage_value(value, search_root, ResolvedSource::ProjectEnv);
     }
 
-    if let Some(user_env) = discover_user_env_file() {
-        let map = read_env_file_map(&user_env);
-        if let Some(v) = map.get("STORAGE_ROOT") {
-            let path = normalize_input_path(v, search_root);
-            return Ok(ResolvedPath {
-                exists: path.exists(),
-                path,
-                source: ResolvedSource::UserEnv,
-                raw_value: Some(v.clone()),
-            });
-        }
+    if let Some(value) = snapshot
+        .user
+        .as_ref()
+        .and_then(|authority| authority.values.get("STORAGE_ROOT"))
+    {
+        return parse_storage_value(value, search_root, ResolvedSource::UserEnv);
     }
 
     let value = "~/.mcp_agent_mail_git_mailbox_repo";
-    let path = normalize_input_path(value, search_root);
-    Ok(ResolvedPath {
-        exists: path.exists(),
-        path,
-        source: ResolvedSource::Default,
-        raw_value: Some(value.to_string()),
+    parse_storage_value(value, search_root, ResolvedSource::Default)
+}
+
+fn resolve_legacy_authorities(
+    search_root: &Path,
+    explicit_database: Option<&Path>,
+    explicit_storage: Option<&Path>,
+) -> CliResult<ResolvedLegacyAuthorities> {
+    let process_database = if explicit_database.is_none() {
+        process_env_value_for_legacy("DATABASE_URL")?
+    } else {
+        None
+    };
+    let process_storage = if explicit_storage.is_none() {
+        process_env_value_for_legacy("STORAGE_ROOT")?
+    } else {
+        None
+    };
+    let needs_database_authority = explicit_database.is_none() && process_database.is_none();
+    let needs_storage_authority = explicit_storage.is_none() && process_storage.is_none();
+    let env = capture_legacy_env_snapshot(
+        search_root,
+        needs_database_authority,
+        needs_storage_authority,
+    )?;
+    let database = resolve_database_path_from_snapshot(
+        search_root,
+        explicit_database,
+        process_database.as_deref(),
+        &env,
+    )?;
+    let storage = resolve_storage_root_from_snapshot(
+        search_root,
+        explicit_storage,
+        process_storage.as_deref(),
+        &env,
+    )?;
+    Ok(ResolvedLegacyAuthorities {
+        database,
+        storage,
+        env,
     })
+}
+
+fn process_env_value_for_legacy(key: &str) -> CliResult<Option<String>> {
+    match std::env::var(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(CliError::InvalidArgument(format!(
+            "process environment authority {key} is not valid UTF-8"
+        ))),
+    }
 }
 
 fn resolve_legacy_database_url_path(db_path: &Path, search_root: &Path) -> PathBuf {
@@ -1698,6 +1908,7 @@ fn parse_database_value(
     search_root: &Path,
     source: ResolvedSource,
 ) -> CliResult<ResolvedPath> {
+    require_nonblank_legacy_authority("DATABASE_URL", value)?;
     if is_sqlite_memory_database_url(value) {
         return Err(CliError::InvalidArgument(
             "in-memory DATABASE_URL is not supported for legacy import".to_string(),
@@ -1722,12 +1933,32 @@ fn parse_database_value(
     })
 }
 
-fn read_env_file_map(path: &Path) -> BTreeMap<String, String> {
+fn parse_storage_value(
+    value: &str,
+    search_root: &Path,
+    source: ResolvedSource,
+) -> CliResult<ResolvedPath> {
+    require_nonblank_legacy_authority("STORAGE_ROOT", value)?;
+    let path = normalize_input_path(value, search_root);
+    Ok(ResolvedPath {
+        exists: path.exists(),
+        path,
+        source,
+        raw_value: Some(value.to_string()),
+    })
+}
+
+fn require_nonblank_legacy_authority(key: &str, value: &str) -> CliResult<()> {
+    if value.trim().is_empty() {
+        return Err(CliError::InvalidArgument(format!(
+            "legacy {key} authority must not be empty or whitespace"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_env_file_map(text: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    let text = match fs::read_to_string(path) {
-        Ok(v) => v,
-        Err(_) => return out,
-    };
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -1757,30 +1988,110 @@ fn read_env_file_map(path: &Path) -> BTreeMap<String, String> {
     out
 }
 
-fn discover_user_env_file_from(home: &Path, native_config_dir: Option<&Path>) -> Option<PathBuf> {
-    let mut candidates = Vec::with_capacity(6);
-    for dir in [
-        Some(home.join(".config").join("mcp-agent-mail")),
-        native_config_dir.map(Path::to_path_buf),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        for file_name in ["config.env", ".env"] {
-            let candidate = dir.join(file_name);
-            if !candidates.iter().any(|existing| existing == &candidate) {
-                candidates.push(candidate);
+fn capture_legacy_env_snapshot(
+    search_root: &Path,
+    needs_database_authority: bool,
+    needs_storage_authority: bool,
+) -> CliResult<LegacyEnvSnapshot> {
+    if !needs_database_authority && !needs_storage_authority {
+        return Ok(LegacyEnvSnapshot::default());
+    }
+    let user_candidates = user_env_authority_candidates();
+    capture_legacy_env_snapshot_with_reader(
+        search_root,
+        &user_candidates,
+        needs_database_authority,
+        needs_storage_authority,
+        read_env_authority_text,
+    )
+}
+
+fn capture_legacy_env_snapshot_with_reader(
+    search_root: &Path,
+    user_candidates: &[PathBuf],
+    needs_database_authority: bool,
+    needs_storage_authority: bool,
+    mut read_authority: impl FnMut(&Path) -> std::io::Result<Option<String>>,
+) -> CliResult<LegacyEnvSnapshot> {
+    if !needs_database_authority && !needs_storage_authority {
+        return Ok(LegacyEnvSnapshot::default());
+    }
+    let project_path = search_root.join(".env");
+    let project_text = read_legacy_env_authority(&project_path, &mut read_authority)?;
+    let project_values = project_text
+        .as_deref()
+        .map(parse_env_file_map)
+        .unwrap_or_default();
+    let include_user_authority = (needs_database_authority
+        && !project_values.contains_key("DATABASE_URL"))
+        || (needs_storage_authority && !project_values.contains_key("STORAGE_ROOT"));
+
+    let mut selected_user: Option<(usize, String)> = None;
+    if include_user_authority {
+        for (index, path) in user_candidates.iter().enumerate() {
+            if let Some(text) = read_legacy_env_authority(path, &mut read_authority)? {
+                selected_user = Some((index, text));
+                break;
             }
         }
     }
-    candidates.push(home.join(".mcp_agent_mail").join(".env"));
-    candidates.push(home.join("mcp_agent_mail").join(".env"));
-    candidates.into_iter().find(|path| path.is_file())
+
+    // A single import plan must never combine values obtained on separate,
+    // drifting path lookups. Re-probe every authority that influenced
+    // precedence before returning the parsed snapshot. The low-level reader
+    // independently binds each present file and its parent while reading it.
+    require_unchanged_env_authority(&project_path, project_text.as_deref(), &mut read_authority)?;
+    let user_probe_len = if include_user_authority {
+        selected_user
+            .as_ref()
+            .map_or(user_candidates.len(), |(index, _)| index + 1)
+    } else {
+        0
+    };
+    for (index, path) in user_candidates.iter().take(user_probe_len).enumerate() {
+        let expected = selected_user
+            .as_ref()
+            .filter(|(selected_index, _)| *selected_index == index)
+            .map(|(_, text)| text.as_str());
+        require_unchanged_env_authority(path, expected, &mut read_authority)?;
+    }
+
+    let project = project_text.map(|_| EnvAuthoritySnapshot {
+        path: project_path,
+        values: project_values,
+    });
+    let user = selected_user.map(|(index, text)| EnvAuthoritySnapshot {
+        path: user_candidates[index].clone(),
+        values: parse_env_file_map(&text),
+    });
+    Ok(LegacyEnvSnapshot { project, user })
 }
 
-fn discover_user_env_file() -> Option<PathBuf> {
-    let home = home_dir()?;
-    discover_user_env_file_from(&home, None)
+fn read_legacy_env_authority(
+    path: &Path,
+    read_authority: &mut impl FnMut(&Path) -> std::io::Result<Option<String>>,
+) -> CliResult<Option<String>> {
+    read_authority(path).map_err(|error| {
+        CliError::InvalidArgument(format!(
+            "refusing unsafe legacy environment authority {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn require_unchanged_env_authority(
+    path: &Path,
+    expected: Option<&str>,
+    read_authority: &mut impl FnMut(&Path) -> std::io::Result<Option<String>>,
+) -> CliResult<()> {
+    let observed = read_legacy_env_authority(path, read_authority)?;
+    if observed.as_deref() != expected {
+        return Err(CliError::InvalidArgument(format!(
+            "legacy environment authority {} changed while capturing one import snapshot",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn resolve_search_root(search_root: Option<PathBuf>) -> PathBuf {
@@ -1798,7 +2109,7 @@ fn normalize_input_path(raw: &str, base: &Path) -> PathBuf {
 }
 
 fn normalize_path_for_overlap(path: &Path) -> PathBuf {
-    crate::canonicalize_existing_prefix(&normalize_lexical_path(path))
+    normalize_lexical_path(&crate::canonicalize_existing_prefix(path))
 }
 
 fn normalize_lexical_path(path: &Path) -> PathBuf {
@@ -1838,7 +2149,14 @@ fn expand_tilde(raw: &str) -> PathBuf {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    #[cfg(windows)]
+    {
+        dirs::home_dir()
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
 }
 
 fn default_copy_target_db(source_db: &Path) -> PathBuf {
@@ -1887,21 +2205,82 @@ fn sqlite_uri_encode_path(path: &Path) -> String {
     encoded
 }
 
-/// Open a SOURCE database read-only in SQLite immutable mode.
+fn legacy_source_has_franken_namespace_artifact(path: &Path) -> CliResult<bool> {
+    for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+        let sidecar = mcp_agent_mail_core::disk::sqlite_sidecar_path(path, suffix);
+        match fs::symlink_metadata(&sidecar) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CliError::Other(format!(
+                    "cannot inspect legacy source namespace artifact {}: {error}",
+                    sidecar.display()
+                )));
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn backup_guarded_offline_canonical_source_into_snapshot(
+    source: &Path,
+    destination: &Path,
+) -> CliResult<()> {
+    let context = "legacy offline source capture";
+    let destination_text = crate::sqlite_snapshot_path_text(destination, context, "destination")?;
+    crate::prepare_sqlite_snapshot_destination(destination, context)?;
+    let conn =
+        mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(source, context)
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "cannot open offline legacy source {} with guarded canonical SQLite: {error}",
+                    source.display()
+                ))
+            })?;
+    // The online backup API reads through this one guarded read transaction,
+    // including committed WAL frames, and creates only the private destination.
+    // The source connection remains engine-enforced read-only throughout.
+    conn.backup_to_path(destination_text).map_err(|error| {
+        CliError::Other(format!(
+            "cannot materialize WAL-aware legacy snapshot from {} to {}: {error}",
+            source.display(),
+            destination.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn materialize_legacy_source_snapshot(source: &Path, destination: &Path) -> CliResult<()> {
+    if legacy_source_has_franken_namespace_artifact(source)? {
+        // Any namespace occupant makes canonical access ambiguous. The guarded
+        // same-engine path either binds the complete current generation or
+        // fails closed; it never falls back across engines.
+        crate::vacuum_live_franken_sqlite_into_snapshot(
+            source,
+            destination,
+            "legacy live Franken source capture",
+        )
+    } else {
+        // Namespace absence selects the explicit offline/canonical authority.
+        // The guarded true-read-only connection sees a complete WAL generation
+        // when one is available and fails closed on unstable/suspect families.
+        backup_guarded_offline_canonical_source_into_snapshot(source, destination)
+    }
+}
+
+/// Open only a retained private source snapshot in SQLite immutable mode.
 ///
-/// A plain read-only open of a WAL-mode database still creates/touches the
-/// `-wal`/`-shm` sidecars (readers need the wal-index). When the legacy Python
-/// server is still live next to the source, that is a write side effect on a
-/// path this command promises never to modify. `immutable=1` (via a URI
-/// filename, which `OpenFlags::uri` enables) makes SQLite treat the file as
-/// unchangeable: no locks, no journal/WAL access, no sidecar creation.
-///
-/// Trade-off: an immutable connection ignores any `-wal` content entirely, so
-/// this open is only used for inspection/verification. The backup path in
-/// [`copy_db_via_sqlite_backup`] detects a non-empty source `-wal` and copies
-/// through a private staging copy instead, so WAL-resident rows are never lost.
-fn open_source_canonical_read_only_immutable(path: &Path) -> CliResult<CanonicalDbConn> {
-    let uri = format!("file:{}?immutable=1", sqlite_uri_encode_path(path));
+/// The typed argument prevents production callers from applying immutable mode
+/// to a live database pathname. SQLite immutable mode intentionally ignores
+/// WAL state; that is correct here because capture already folded one coherent
+/// source transaction into this private standalone image.
+fn open_private_immutable_source_snapshot(
+    snapshot: &LegacySourceSnapshot,
+) -> CliResult<CanonicalDbConn> {
+    let uri = format!(
+        "file:{}?immutable=1",
+        sqlite_uri_encode_path(snapshot.snapshot_path())
+    );
     let flags = {
         let mut flags = mcp_agent_mail_db::sqlmodel_sqlite::OpenFlags::read_only();
         flags.uri = true;
@@ -1910,8 +2289,8 @@ fn open_source_canonical_read_only_immutable(path: &Path) -> CliResult<Canonical
     let config = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConfig::file(uri).flags(flags);
     CanonicalDbConn::open(&config).map_err(|error| {
         CliError::Other(format!(
-            "cannot open SQLite DB read-only (immutable) {}: {error}",
-            path.display()
+            "cannot open retained legacy source snapshot {} read-only: {error}",
+            snapshot.snapshot_path().display()
         ))
     })
 }
@@ -1946,11 +2325,10 @@ fn verify_canonical_sqlite_readable(path: &Path, label: &str) -> CliResult<()> {
     verify_canonical_quick_check(&conn, path, label)
 }
 
-/// Verify the SOURCE database is readable without any filesystem side effects
-/// (immutable open — see [`open_source_canonical_read_only_immutable`]).
-fn verify_source_canonical_sqlite_readable(path: &Path) -> CliResult<()> {
-    let conn = open_source_canonical_read_only_immutable(path)?;
-    verify_canonical_quick_check(&conn, path, "source DB")
+/// Verify the one retained SOURCE generation used by this import.
+fn verify_source_canonical_sqlite_readable(snapshot: &LegacySourceSnapshot) -> CliResult<()> {
+    let conn = open_private_immutable_source_snapshot(snapshot)?;
+    verify_canonical_quick_check(&conn, snapshot.original_path(), "source DB snapshot")
 }
 
 fn verify_runtime_sqlite_readable(path: &Path, label: &str) -> CliResult<()> {
@@ -1970,14 +2348,10 @@ fn verify_runtime_sqlite_readable(path: &Path, label: &str) -> CliResult<()> {
     Ok(())
 }
 
-fn copy_db_via_sqlite_backup(source_db: &Path, target_db: &Path) -> CliResult<()> {
-    if !source_db.exists() {
-        return Err(CliError::Other(format!(
-            "source database does not exist: {}",
-            source_db.display()
-        )));
-    }
-
+fn copy_db_via_sqlite_backup(
+    source_snapshot: &LegacySourceSnapshot,
+    target_db: &Path,
+) -> CliResult<()> {
     if fs::symlink_metadata(target_db).is_ok() {
         return Err(CliError::InvalidArgument(format!(
             "target database path must not already exist: {}",
@@ -1989,57 +2363,16 @@ fn copy_db_via_sqlite_backup(source_db: &Path, target_db: &Path) -> CliResult<()
         fs::create_dir_all(parent)?;
     }
 
-    // Source opens are immutable so a WAL-mode source next to a live legacy
-    // server never has its -wal/-shm sidecars created or touched by us. An
-    // immutable connection cannot see WAL-resident rows, though, so when the
-    // source has a non-empty -wal we back up from a private byte-level staging
-    // copy (main DB + wal): SQLite then performs WAL recovery on OUR staging
-    // copy, never on the source. The -shm file is deliberately not copied —
-    // it is a transient wal-index that SQLite rebuilds.
-    let source_wal = PathBuf::from(format!("{}-wal", source_db.display()));
-    let wal_len = fs::metadata(&source_wal).map(|m| m.len()).unwrap_or(0);
-
-    if wal_len > 0 {
-        let staging_dir = tempfile::Builder::new()
-            .prefix("am-legacy-import-staging-")
-            .tempdir()
-            .map_err(|error| {
-                CliError::Other(format!(
-                    "cannot create staging directory for WAL-mode source copy: {error}"
-                ))
-            })?;
-        let staging_db = staging_dir.path().join("staging.sqlite3");
-        let staging_wal = staging_dir.path().join("staging.sqlite3-wal");
-        fs::copy(source_db, &staging_db)?;
-        fs::copy(&source_wal, &staging_wal)?;
-
-        let staging =
-            CanonicalDbConn::open_file(staging_db.display().to_string()).map_err(|error| {
-                CliError::Other(format!(
-                    "cannot open staging copy of WAL-mode source {}: {error}",
-                    source_db.display()
-                ))
-            })?;
-        staging
-            .backup_to_path(target_db.to_string_lossy().as_ref())
-            .map_err(|error| {
-                CliError::Other(format!(
-                    "canonical SQLite backup from staged WAL-mode copy of {} to {} failed: {error}",
-                    source_db.display(),
-                    target_db.display()
-                ))
-            })?;
-        // staging_dir (our own temp artifact) is removed on drop.
-        return Ok(());
-    }
-
-    let source = open_source_canonical_read_only_immutable(source_db)?;
+    // All live/offline authority decisions and WAL observation happened once
+    // during capture. Canonical SQLite now sees only the retained private inode,
+    // so no source-side TOCTOU or mixed-engine descriptor close remains.
+    let source = open_private_immutable_source_snapshot(source_snapshot)?;
     source
         .backup_to_path(target_db.to_string_lossy().as_ref())
         .map_err(|error| {
             CliError::Other(format!(
                 "canonical SQLite backup from {} to {} failed: {error}",
-                source_db.display(),
+                source_snapshot.original_path().display(),
                 target_db.display()
             ))
         })?;
@@ -2047,46 +2380,84 @@ fn copy_db_via_sqlite_backup(source_db: &Path, target_db: &Path) -> CliResult<()
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> CliResult<()> {
-    if !src.exists() {
-        return Err(CliError::InvalidArgument(format!(
-            "source directory does not exist: {}",
-            src.display()
-        )));
+    require_storage_directory(src, "source storage directory", false)?;
+    if !require_storage_directory(dst, "target storage directory", true)? {
+        fs::create_dir_all(dst)?;
+        // Revalidate the created path before placing any source entry under
+        // it. This catches an immediately substituted symlink/reparse point;
+        // descriptor-relative copying remains part of the open capability-VFS
+        // redesign rather than being implied by this path-based guard.
+        require_storage_directory(dst, "target storage directory", false)?;
     }
-    fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let path = entry.path();
         let target = dst.join(entry.file_name());
         let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() {
-            if path.is_dir() {
-                return Err(CliError::InvalidArgument(format!(
-                    "symlinked directories are not supported during recursive copy: {}",
-                    path.display()
-                )));
-            }
-            if path.is_file() {
-                return Err(CliError::InvalidArgument(format!(
-                    "symlinked files are not supported during recursive copy: {}",
-                    path.display()
-                )));
-            }
+        if storage_metadata_is_link_like(&metadata) {
             return Err(CliError::InvalidArgument(format!(
-                "broken symlink encountered during recursive copy: {}",
+                "symlink or reparse-point entry is not supported during recursive copy: {}",
                 path.display()
             )));
         }
-        if path.is_dir() {
+        if metadata.file_type().is_dir() {
             copy_dir_recursive(&path, &target)?;
-        } else if path.is_file() {
+        } else if metadata.file_type().is_file() {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
             fs::copy(&path, &target)?;
+        } else {
+            return Err(CliError::InvalidArgument(format!(
+                "unsupported special file encountered during recursive copy: {}",
+                path.display()
+            )));
         }
     }
     Ok(())
+}
+
+fn require_storage_directory(path: &Path, label: &str, allow_missing: bool) -> CliResult<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CliError::InvalidArgument(format!(
+                "{label} missing: {}",
+                path.display()
+            )));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if storage_metadata_is_link_like(&metadata) {
+        return Err(CliError::InvalidArgument(format!(
+            "{label} must not be a symlink or reparse point: {}",
+            path.display()
+        )));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(CliError::InvalidArgument(format!(
+            "{label} must be a directory: {}",
+            path.display()
+        )));
+    }
+    Ok(true)
+}
+
+fn storage_metadata_is_link_like(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
 }
 
 fn confirm_with_prompt(prompt: &str, default: bool) -> CliResult<bool> {
@@ -2112,6 +2483,200 @@ fn confirm_with_prompt(prompt: &str, default: bool) -> CliResult<bool> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    const LEGACY_IMPORT_REOPEN_DB_ENV: &str = "AM_TEST_LEGACY_IMPORT_REOPEN_DB";
+
+    #[cfg(target_os = "linux")]
+    fn assert_target_reopens_in_fresh_process(target_db: &Path) {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg("legacy::tests::legacy_import_target_cross_process_reopen_helper")
+        .arg("--exact")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(LEGACY_IMPORT_REOPEN_DB_ENV, target_db)
+        .output()
+        .expect("spawn fresh-process runtime reopen probe");
+        assert!(
+            output.status.success(),
+            "fresh-process runtime reopen failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("fresh-process imported target reopen succeeded"),
+            "fresh-process runtime reopen ran no causal probe: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    const LEGACY_IMPORT_PROBE_DB_ENV: &str = "AM_TEST_LEGACY_IMPORT_PROBE_DB";
+    #[cfg(target_os = "linux")]
+    const LEGACY_IMPORT_PROBE_STORAGE_ENV: &str = "AM_TEST_LEGACY_IMPORT_PROBE_STORAGE_ROOT";
+
+    /// GH#268: a freshly imported target must pass the server's startup
+    /// integrity probe from a fresh process, the way `am serve-http` sees it
+    /// after `am legacy import` exits. The importer's own reopen checks run
+    /// in the importing process and cannot observe a namespace-sidecar
+    /// refusal that only a new process hits.
+    #[cfg(target_os = "linux")]
+    fn assert_target_passes_startup_probe_in_fresh_process(
+        target_db: &Path,
+        target_storage: &Path,
+    ) {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg("legacy::tests::legacy_import_target_cross_process_startup_probe_helper")
+        .arg("--exact")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(LEGACY_IMPORT_PROBE_DB_ENV, target_db)
+        .env(LEGACY_IMPORT_PROBE_STORAGE_ENV, target_storage)
+        .output()
+        .expect("spawn fresh-process startup probe");
+        assert!(
+            output.status.success(),
+            "fresh-process startup integrity probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("fresh-process startup integrity probe passed"),
+            "fresh-process startup probe ran no causal probe: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "fresh-process helper invoked by the legacy import regression"]
+    fn legacy_import_target_cross_process_startup_probe_helper() {
+        let target_db = std::env::var_os(LEGACY_IMPORT_PROBE_DB_ENV)
+            .map(PathBuf::from)
+            .expect("fresh-process probe helper requires the target DB path");
+        let target_storage = std::env::var_os(LEGACY_IMPORT_PROBE_STORAGE_ENV)
+            .map(PathBuf::from)
+            .expect("fresh-process probe helper requires the target storage root");
+        let config = Config {
+            database_url: format!("sqlite:///{}", target_db.display()),
+            storage_root: target_storage,
+            integrity_check_on_startup: true,
+            ..Config::default()
+        };
+        match mcp_agent_mail_server::startup_checks::probe_integrity(&config) {
+            mcp_agent_mail_server::startup_checks::ProbeResult::Ok { .. } => {
+                println!("fresh-process startup integrity probe passed");
+            }
+            other => {
+                panic!("startup integrity probe must pass on a freshly imported target: {other:?}")
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "fresh-process helper invoked by the legacy import regression"]
+    fn legacy_import_target_cross_process_reopen_helper() {
+        let target_db = std::env::var_os(LEGACY_IMPORT_REOPEN_DB_ENV)
+            .map(PathBuf::from)
+            .expect("fresh-process reopen helper requires target DB path");
+        let conn = DbConn::open_file(target_db.display().to_string())
+            .expect("fresh process must acquire the imported target namespace");
+        conn.query_sync("SELECT COUNT(*) AS c FROM sqlite_master", &[])
+            .expect("fresh process must read the imported target");
+        drop(conn);
+        println!("fresh-process imported target reopen succeeded");
+    }
+
+    #[cfg(target_os = "linux")]
+    struct LegacyTestChild {
+        child: Option<std::process::Child>,
+        stop_path: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl LegacyTestChild {
+        fn spawn(test_name: &str, env_key: &str, root: &Path) -> Self {
+            let child = std::process::Command::new(
+                std::env::current_exe().expect("resolve current test executable"),
+            )
+            .arg(test_name)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(env_key, root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn legacy source child fixture");
+            Self {
+                child: Some(child),
+                stop_path: root.join("stop"),
+            }
+        }
+
+        fn wait_for_marker(&mut self, marker: &Path, label: &str) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                if marker.exists() {
+                    return;
+                }
+                if let Some(status) = self
+                    .child
+                    .as_mut()
+                    .expect("child still present")
+                    .try_wait()
+                    .expect("probe child status")
+                {
+                    panic!("legacy source child exited before {label}: {status}");
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for legacy source child {label}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        fn finish(mut self, witness: &str) {
+            fs::write(&self.stop_path, b"stop").expect("signal legacy source child to stop");
+            let output = self
+                .child
+                .take()
+                .expect("child still present")
+                .wait_with_output()
+                .expect("wait for legacy source child");
+            assert!(
+                output.status.success(),
+                "legacy source child failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(witness),
+                "legacy source child filter ran no causal fixture: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for LegacyTestChild {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.stop_path, b"stop");
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.wait();
+            }
+        }
+    }
+
     fn sample_receipt(created_at: &str, target_db: &str) -> LegacyImportReceipt {
         let mut counts = BTreeMap::new();
         counts.insert("messages".to_string(), 1);
@@ -2135,15 +2700,10 @@ mod tests {
     }
 
     #[test]
-    fn read_env_file_map_parses_key_values() {
-        let tmp = tempfile::tempdir().unwrap();
-        let env = tmp.path().join(".env");
-        fs::write(
-            &env,
+    fn parse_env_file_map_parses_key_values() {
+        let map = parse_env_file_map(
             "DATABASE_URL=sqlite+aiosqlite:///./storage.sqlite3\nSTORAGE_ROOT=~/.mcp_agent_mail_git_mailbox_repo\n",
-        )
-        .unwrap();
-        let map = read_env_file_map(&env);
+        );
         assert_eq!(
             map.get("DATABASE_URL").unwrap(),
             "sqlite+aiosqlite:///./storage.sqlite3"
@@ -2155,16 +2715,10 @@ mod tests {
     }
 
     #[test]
-    fn read_env_file_map_parses_export_prefix() {
-        let tmp = tempfile::tempdir().unwrap();
-        let env = tmp.path().join(".env");
-        fs::write(
-            &env,
+    fn parse_env_file_map_parses_export_prefix() {
+        let map = parse_env_file_map(
             "export DATABASE_URL=sqlite+aiosqlite:///./storage.sqlite3\nexport STORAGE_ROOT=~/mailbox\n",
-        )
-        .unwrap();
-
-        let map = read_env_file_map(&env);
+        );
         assert_eq!(
             map.get("DATABASE_URL").unwrap(),
             "sqlite+aiosqlite:///./storage.sqlite3"
@@ -2173,19 +2727,304 @@ mod tests {
     }
 
     #[test]
-    fn read_env_file_map_parses_export_with_tabs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let env = tmp.path().join(".env");
-        fs::write(
-            &env,
-            "export\tDATABASE_URL=sqlite+aiosqlite:///./tabbed.sqlite3\n",
-        )
-        .unwrap();
-
-        let map = read_env_file_map(&env);
+    fn parse_env_file_map_parses_export_with_tabs() {
+        let map = parse_env_file_map("export\tDATABASE_URL=sqlite+aiosqlite:///./tabbed.sqlite3\n");
         assert_eq!(
             map.get("DATABASE_URL").unwrap(),
             "sqlite+aiosqlite:///./tabbed.sqlite3"
+        );
+    }
+
+    #[test]
+    fn resolved_legacy_paths_consume_one_retained_project_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_env = tmp.path().join(".env");
+        fs::write(
+            &project_env,
+            "DATABASE_URL=sqlite+aiosqlite:///./original.sqlite3\nSTORAGE_ROOT=./original-storage\n",
+        )
+        .unwrap();
+
+        let snapshot = capture_legacy_env_snapshot_with_reader(
+            tmp.path(),
+            &[],
+            true,
+            true,
+            read_env_authority_text,
+        )
+        .expect("capture one project env snapshot");
+        fs::write(
+            &project_env,
+            "DATABASE_URL=sqlite+aiosqlite:///./changed.sqlite3\nSTORAGE_ROOT=./changed-storage\n",
+        )
+        .unwrap();
+
+        let database =
+            resolve_database_path_from_snapshot(tmp.path(), None, None, &snapshot).unwrap();
+        let storage =
+            resolve_storage_root_from_snapshot(tmp.path(), None, None, &snapshot).unwrap();
+        assert_eq!(database.source, ResolvedSource::ProjectEnv);
+        assert_eq!(database.path, tmp.path().join("original.sqlite3"));
+        assert_eq!(storage.source, ResolvedSource::ProjectEnv);
+        assert_eq!(storage.path, tmp.path().join("original-storage"));
+    }
+
+    #[test]
+    fn explicit_and_process_values_remain_above_env_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = LegacyEnvSnapshot {
+            project: Some(EnvAuthoritySnapshot {
+                path: tmp.path().join(".env"),
+                values: parse_env_file_map(
+                    "DATABASE_URL=sqlite:///project.sqlite3\nSTORAGE_ROOT=./project-storage\n",
+                ),
+            }),
+            user: None,
+        };
+        let explicit_db = tmp.path().join("explicit.sqlite3");
+
+        let database = resolve_database_path_from_snapshot(
+            tmp.path(),
+            Some(&explicit_db),
+            Some("sqlite:///process.sqlite3"),
+            &snapshot,
+        )
+        .unwrap();
+        let storage = resolve_storage_root_from_snapshot(
+            tmp.path(),
+            None,
+            Some("./process-storage"),
+            &snapshot,
+        )
+        .unwrap();
+        assert_eq!(database.source, ResolvedSource::Explicit);
+        assert_eq!(database.path, explicit_db);
+        assert_eq!(storage.source, ResolvedSource::ProcessEnv);
+        assert_eq!(storage.path, tmp.path().join("process-storage"));
+    }
+
+    #[test]
+    fn legacy_hardening_blank_project_authority_fails_closed_without_user_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = LegacyEnvSnapshot {
+            project: Some(EnvAuthoritySnapshot {
+                path: tmp.path().join(".env"),
+                values: parse_env_file_map("DATABASE_URL=\nSTORAGE_ROOT='   '\n"),
+            }),
+            user: Some(EnvAuthoritySnapshot {
+                path: tmp.path().join("user.env"),
+                values: parse_env_file_map(
+                    "DATABASE_URL=sqlite:///fallback.sqlite3\nSTORAGE_ROOT=./fallback-storage\n",
+                ),
+            }),
+        };
+
+        let database_error = resolve_database_path_from_snapshot(tmp.path(), None, None, &snapshot)
+            .expect_err("blank project DATABASE_URL must not fall through");
+        let storage_error = resolve_storage_root_from_snapshot(tmp.path(), None, None, &snapshot)
+            .expect_err("blank project STORAGE_ROOT must not fall through");
+        assert!(
+            database_error
+                .to_string()
+                .contains("DATABASE_URL authority")
+        );
+        assert!(storage_error.to_string().contains("STORAGE_ROOT authority"));
+    }
+
+    #[test]
+    fn legacy_env_snapshot_rejects_project_leaf_content_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_env = tmp.path().join(".env");
+        fs::write(&project_env, "DATABASE_URL=sqlite:///first.sqlite3\n").unwrap();
+        let changed = std::cell::Cell::new(false);
+
+        let error = capture_legacy_env_snapshot_with_reader(tmp.path(), &[], true, false, |path| {
+            let observed = read_env_authority_text(path)?;
+            if path == project_env && observed.is_some() && !changed.replace(true) {
+                fs::write(path, "DATABASE_URL=sqlite:///second.sqlite3\n")?;
+            }
+            Ok(observed)
+        })
+        .expect_err("a drifting project authority must be rejected");
+        assert!(error.to_string().contains("changed while capturing"));
+    }
+
+    #[test]
+    fn legacy_env_snapshot_rejects_invalid_utf8_and_oversized_project_authorities() {
+        let invalid_root = tempfile::tempdir().unwrap();
+        fs::write(invalid_root.path().join(".env"), [0xff, 0xfe]).unwrap();
+        let invalid_error = capture_legacy_env_snapshot_with_reader(
+            invalid_root.path(),
+            &[],
+            true,
+            false,
+            read_env_authority_text,
+        )
+        .expect_err("invalid UTF-8 must be rejected");
+        assert!(invalid_error.to_string().contains("valid UTF-8"));
+
+        let oversized_root = tempfile::tempdir().unwrap();
+        let oversized_len =
+            usize::try_from(mcp_agent_mail_core::config::ENV_AUTHORITY_FILE_MAX_BYTES + 1).unwrap();
+        fs::write(
+            oversized_root.path().join(".env"),
+            vec![b'x'; oversized_len],
+        )
+        .unwrap();
+        let oversized_error = capture_legacy_env_snapshot_with_reader(
+            oversized_root.path(),
+            &[],
+            true,
+            false,
+            read_env_authority_text,
+        )
+        .expect_err("oversized env authority must be rejected");
+        assert!(oversized_error.to_string().contains("exceeding"));
+    }
+
+    #[test]
+    fn legacy_env_snapshot_rejects_higher_user_authority_appearing_during_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user_dir = tmp.path().join("user-config");
+        fs::create_dir(&user_dir).unwrap();
+        let primary = user_dir.join("config.env");
+        let fallback = user_dir.join("fallback.env");
+        fs::write(&fallback, "STORAGE_ROOT=./fallback\n").unwrap();
+        let appeared = std::cell::Cell::new(false);
+
+        let error = capture_legacy_env_snapshot_with_reader(
+            tmp.path(),
+            &[primary.clone(), fallback.clone()],
+            false,
+            true,
+            |path| {
+                let observed = read_env_authority_text(path)?;
+                if path == fallback && observed.is_some() && !appeared.replace(true) {
+                    fs::write(&primary, "STORAGE_ROOT=./higher\n")?;
+                }
+                Ok(observed)
+            },
+        )
+        .expect_err("an appearing higher-priority authority must stop fallback");
+        assert!(error.to_string().contains("changed while capturing"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_env_snapshot_rejects_project_leaf_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("real-project.env");
+        fs::write(&target, "DATABASE_URL=sqlite:///redirected.sqlite3\n").unwrap();
+        symlink(&target, tmp.path().join(".env")).unwrap();
+
+        let error = capture_legacy_env_snapshot_with_reader(
+            tmp.path(),
+            &[],
+            true,
+            false,
+            read_env_authority_text,
+        )
+        .expect_err("a symlinked project authority must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("unsafe legacy environment authority")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_env_snapshot_rejects_project_parent_swap() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let moved_project = tmp.path().join("project-bound");
+        fs::create_dir(&project).unwrap();
+        let project_env = project.join(".env");
+        fs::write(&project_env, "DATABASE_URL=sqlite:///source.sqlite3\n").unwrap();
+        let swapped = std::cell::Cell::new(false);
+
+        let error = capture_legacy_env_snapshot_with_reader(&project, &[], true, false, |path| {
+            let observed = read_env_authority_text(path)?;
+            if path == project_env && observed.is_some() && !swapped.replace(true) {
+                fs::rename(&project, &moved_project)?;
+                symlink(&moved_project, &project)?;
+            }
+            Ok(observed)
+        })
+        .expect_err("a swapped project parent must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("unsafe legacy environment authority")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_env_snapshot_rejects_user_leaf_symlink_without_fallback() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let user_dir = tmp.path().join("user-config");
+        fs::create_dir(&user_dir).unwrap();
+        let target = user_dir.join("real.env");
+        let primary = user_dir.join("config.env");
+        let fallback = user_dir.join("fallback.env");
+        fs::write(&target, "STORAGE_ROOT=./redirected\n").unwrap();
+        fs::write(&fallback, "STORAGE_ROOT=./fallback\n").unwrap();
+        symlink(&target, &primary).unwrap();
+
+        let error = capture_legacy_env_snapshot_with_reader(
+            tmp.path(),
+            &[primary, fallback],
+            false,
+            true,
+            read_env_authority_text,
+        )
+        .expect_err("an unsafe higher-priority user authority must stop fallback");
+        assert!(
+            error
+                .to_string()
+                .contains("unsafe legacy environment authority")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_env_snapshot_rejects_user_parent_swap() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let user_dir = tmp.path().join("user-config");
+        let moved_user_dir = tmp.path().join("user-config-bound");
+        fs::create_dir(&user_dir).unwrap();
+        let user_env = user_dir.join("config.env");
+        fs::write(&user_env, "STORAGE_ROOT=./source-storage\n").unwrap();
+        let swapped = std::cell::Cell::new(false);
+
+        let error = capture_legacy_env_snapshot_with_reader(
+            tmp.path(),
+            std::slice::from_ref(&user_env),
+            false,
+            true,
+            |path| {
+                let observed = read_env_authority_text(path)?;
+                if path == user_env && observed.is_some() && !swapped.replace(true) {
+                    fs::rename(&user_dir, &moved_user_dir)?;
+                    symlink(&moved_user_dir, &user_dir)?;
+                }
+                Ok(observed)
+            },
+        )
+        .expect_err("a swapped user authority parent must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("unsafe legacy environment authority")
         );
     }
 
@@ -2199,6 +3038,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.path, tmp.path().join("legacy.db"));
+    }
+
+    #[test]
+    fn legacy_hardening_database_authorities_reject_empty_or_whitespace_values() {
+        let root = tempfile::tempdir().unwrap();
+        for value in ["", " ", "\t\r\n"] {
+            let error = parse_database_value(value, root.path(), ResolvedSource::ProcessEnv)
+                .expect_err("blank DATABASE_URL authority must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("DATABASE_URL authority must not be empty"),
+                "{error}"
+            );
+        }
+
+        let error = resolve_database_path_from_snapshot(
+            root.path(),
+            Some(Path::new("   ")),
+            None,
+            &LegacyEnvSnapshot::default(),
+        )
+        .expect_err("blank explicit database authority must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("DATABASE_URL authority must not be empty")
+        );
+    }
+
+    #[test]
+    fn legacy_hardening_storage_authorities_reject_empty_or_whitespace_values() {
+        let root = tempfile::tempdir().unwrap();
+        for source in [
+            ResolvedSource::ProcessEnv,
+            ResolvedSource::ProjectEnv,
+            ResolvedSource::UserEnv,
+        ] {
+            for value in ["", " ", "\t\r\n"] {
+                let error = parse_storage_value(value, root.path(), source)
+                    .expect_err("blank STORAGE_ROOT authority must fail closed");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("STORAGE_ROOT authority must not be empty"),
+                    "{error}"
+                );
+            }
+        }
+
+        let error = resolve_storage_root_from_snapshot(
+            root.path(),
+            Some(Path::new("   ")),
+            None,
+            &LegacyEnvSnapshot::default(),
+        )
+        .expect_err("blank explicit storage authority must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("STORAGE_ROOT authority must not be empty")
+        );
     }
 
     #[test]
@@ -2270,7 +3171,7 @@ mod tests {
     }
 
     #[test]
-    fn discover_user_env_file_prefers_portable_installer_path_on_macos() {
+    fn legacy_env_snapshot_prefers_first_user_authority_candidate() {
         let tmp = tempfile::tempdir().unwrap();
         let portable = tmp.path().join(".config/mcp-agent-mail");
         let native = tmp
@@ -2290,9 +3191,28 @@ mod tests {
         )
         .unwrap();
 
-        let selected =
-            discover_user_env_file_from(tmp.path(), Some(&native)).expect("selected env file");
-        assert_eq!(selected, portable.join("config.env"));
+        let portable_env = portable.join("config.env");
+        let native_env = native.join("config.env");
+        let snapshot = capture_legacy_env_snapshot_with_reader(
+            tmp.path(),
+            &[portable_env.clone(), native_env],
+            true,
+            false,
+            read_env_authority_text,
+        )
+        .expect("capture env snapshot");
+        assert_eq!(
+            snapshot.user.as_ref().map(|authority| &authority.path),
+            Some(&portable_env)
+        );
+        assert_eq!(
+            snapshot
+                .user
+                .as_ref()
+                .and_then(|authority| authority.values.get("DATABASE_URL"))
+                .map(String::as_str),
+            Some("sqlite:////portable.sqlite3")
+        );
     }
 
     #[test]
@@ -2467,7 +3387,7 @@ mod tests {
 
         match err {
             CliError::InvalidArgument(msg) => {
-                assert!(msg.contains("target storage root to be a directory path"));
+                assert!(msg.contains("target storage root must be a directory"));
                 assert!(msg.contains(&target_storage_file.display().to_string()));
             }
             other => panic!("expected invalid argument, got {other:?}"),
@@ -2674,6 +3594,25 @@ mod tests {
         assert!(!paths_overlap(&source, &sibling_via_parent));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn paths_overlap_resolves_symlink_before_parent_segments() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = tmp.path().join("source");
+        let nested = source.join("nested");
+        let link = tmp.path().join("nested-link");
+        fs::create_dir_all(&nested).expect("create nested source");
+        symlink(&nested, &link).expect("create nested symlink");
+
+        let disguised_child = link.join("..").join("not-created-yet");
+        assert!(
+            paths_overlap(&source, &disguised_child),
+            "symlink resolution must happen before lexical '..' normalization"
+        );
+    }
+
     fn seed_v20_agents_fixture(path: &Path) {
         use mcp_agent_mail_db::sqlmodel_core::Value;
 
@@ -2718,8 +3657,8 @@ mod tests {
         .expect("insert v20 project");
         conn.execute_sync(
             "INSERT INTO agents (\
-                 id, project_id, name, program, model, task_description, inception_ts, last_active_ts\
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 id, project_id, name, program, model, task_description, inception_ts, last_active_ts, retired_at\
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 Value::BigInt(1),
                 Value::BigInt(1),
@@ -2729,6 +3668,7 @@ mod tests {
                 Value::Text("v20 source fixture".to_string()),
                 Value::BigInt(1),
                 Value::BigInt(1),
+                Value::Text("2026-08-24 03:22:36.123456".to_string()),
             ],
         )
         .expect("insert v20 agent");
@@ -2760,7 +3700,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_import_v20_autoindex_fixture_preserves_source_and_migrates_copy() {
+    fn legacy_import_v20_autoindex_fixture_preserves_source_and_reopens_copy() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let source_db = tmp.path().join("legacy-v20.sqlite3");
         let source_storage = tmp.path().join("legacy-storage");
@@ -2818,6 +3758,29 @@ mod tests {
             .expect("target remains readable after import");
         verify_runtime_sqlite_readable(&target_db, "target DB")
             .expect("target remains runtime-readable after import");
+        let target_conn = DbConn::open_file(target_db.display().to_string())
+            .expect("open normalized lifecycle target");
+        let retired = target_conn
+            .query_sync(
+                "SELECT retired_at, typeof(retired_at) AS retired_at_type \
+                 FROM agents WHERE id = 1",
+                &[],
+            )
+            .expect("read normalized lifecycle target");
+        assert_eq!(retired.len(), 1);
+        assert_eq!(
+            retired[0].get_named::<String>("retired_at_type").unwrap(),
+            "integer"
+        );
+        assert_eq!(
+            retired[0].get_named::<i64>("retired_at").unwrap(),
+            mcp_agent_mail_db::iso_to_micros("2026-08-24T03:22:36.123456").unwrap()
+        );
+        drop(target_conn);
+        #[cfg(target_os = "linux")]
+        assert_target_reopens_in_fresh_process(&target_db);
+        #[cfg(target_os = "linux")]
+        assert_target_passes_startup_probe_in_fresh_process(&target_db, &target_storage);
         assert!(
             target_storage.join("legacy_import_receipts").exists(),
             "successful copy import must write its receipt under target storage"
@@ -2826,7 +3789,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn copy_dir_recursive_rejects_symlinked_directories() {
+    fn legacy_hardening_copy_rejects_symlinked_directories() {
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -2840,7 +3803,7 @@ mod tests {
         let err = copy_dir_recursive(&src, &dst).unwrap_err();
         match err {
             CliError::InvalidArgument(msg) => {
-                assert!(msg.contains("symlinked directories are not supported"));
+                assert!(msg.contains("symlink or reparse-point entry"));
             }
             other => panic!("expected invalid argument, got {other:?}"),
         }
@@ -2848,7 +3811,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn copy_dir_recursive_rejects_broken_symlinks() {
+    fn legacy_hardening_copy_rejects_broken_symlinks() {
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -2860,10 +3823,81 @@ mod tests {
         let err = copy_dir_recursive(&src, &dst).unwrap_err();
         match err {
             CliError::InvalidArgument(msg) => {
-                assert!(msg.contains("broken symlink encountered"));
+                assert!(msg.contains("symlink or reparse-point entry"));
             }
             other => panic!("expected invalid argument, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_hardening_copy_rejects_symlinked_source_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real_source = tmp.path().join("real-source");
+        let linked_source = tmp.path().join("linked-source");
+        let destination = tmp.path().join("destination");
+        fs::create_dir(&real_source).unwrap();
+        fs::write(real_source.join("message.txt"), "payload").unwrap();
+        symlink(&real_source, &linked_source).unwrap();
+
+        let error = copy_dir_recursive(&linked_source, &destination)
+            .expect_err("source storage root symlink must not be followed");
+        assert!(
+            error.to_string().contains("must not be a symlink"),
+            "{error}"
+        );
+        assert!(
+            fs::symlink_metadata(&destination).is_err(),
+            "rejected source authority must not create a destination"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_hardening_copy_rejects_symlinked_target_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let outside = tmp.path().join("outside");
+        let linked_destination = tmp.path().join("linked-destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(source.join("message.txt"), "payload").unwrap();
+        symlink(&outside, &linked_destination).unwrap();
+
+        let error = copy_dir_recursive(&source, &linked_destination)
+            .expect_err("target storage root symlink must not be followed");
+        assert!(
+            error.to_string().contains("must not be a symlink"),
+            "{error}"
+        );
+        assert!(
+            !outside.join("message.txt").exists(),
+            "rejected target authority must not receive source bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_hardening_copy_rejects_unix_socket_entries() {
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        let socket_path = source.join("agent.sock");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+
+        let error = copy_dir_recursive(&source, &destination)
+            .expect_err("socket entries must not be silently skipped");
+        assert!(
+            error.to_string().contains("unsupported special file"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
@@ -2908,8 +3942,8 @@ mod tests {
             "error should be annotated: {message}"
         );
         assert!(
-            message.contains("broken symlink"),
-            "original failure must be preserved: {message}"
+            message.contains("symlink or reparse-point entry"),
+            "original link-like-entry failure must be preserved: {message}"
         );
         assert!(
             message.contains(".failed-"),
@@ -2952,8 +3986,8 @@ mod tests {
             latest
                 .failure_reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("broken symlink")),
-            "failure_reason should carry the original error: {:?}",
+                .is_some_and(|reason| reason.contains("symlink or reparse-point entry")),
+            "failure_reason should carry the original link-like-entry error: {:?}",
             latest.failure_reason
         );
         assert!(!latest.integrity_check_ok);
@@ -2986,9 +4020,11 @@ mod tests {
         writer
             .execute_raw(
                 "INSERT INTO projects (id, slug, human_key, created_at) \
-                 VALUES (2, 'wal-live', '/tmp/wal-live', 1)",
+                 VALUES (2, 'wal-live', '/tmp/wal-live', 1); \
+                 CREATE TRIGGER fts_messages_ai AFTER INSERT ON messages \
+                 BEGIN SELECT 1; END;",
             )
-            .expect("insert WAL-resident project row");
+            .expect("insert WAL-resident project row and legacy signature");
 
         let wal_path = PathBuf::from(format!("{}-wal", source_db.display()));
         let shm_path = PathBuf::from(format!("{}-shm", source_db.display()));
@@ -3016,7 +4052,14 @@ mod tests {
         .expect("detect report");
         assert!(
             report.db_signature.as_ref().is_some_and(|sig| sig.open_ok),
-            "immutable read-only open must succeed on a WAL-mode source"
+            "coherent private source capture must succeed on a WAL-mode source"
+        );
+        assert!(
+            report
+                .db_signature
+                .as_ref()
+                .is_some_and(|sig| sig.legacy_trigger_count == 1),
+            "signature detection must observe legacy DDL committed only in WAL"
         );
 
         // Import (verification + backup + migration of the copy) likewise.
@@ -3039,10 +4082,27 @@ mod tests {
             wal_bytes_before,
             "source -wal bytes must be unchanged by detect+import"
         );
+        // The WAL-index is transient shared memory: SQLite's reader protocol
+        // records the snapshot a read-only connection uses in the
+        // checkpoint-info block (nBackfill + aReadMark[5], header bytes
+        // 96..116), and detect+import open the source read-only. That block
+        // may move; every other byte of the shm must be untouched (br-00gl8).
+        let shm_bytes_after = fs::read(&shm_path).expect("reread shm bytes");
         assert_eq!(
-            fs::read(&shm_path).expect("reread shm bytes"),
-            shm_bytes_before,
-            "source -shm bytes must be unchanged by detect+import"
+            shm_bytes_after.len(),
+            shm_bytes_before.len(),
+            "source -shm must keep its size across detect+import"
+        );
+        let shm_changed: Vec<usize> = shm_bytes_before
+            .iter()
+            .zip(shm_bytes_after.iter())
+            .enumerate()
+            .filter(|(_, (before, after))| before != after)
+            .map(|(offset, _)| offset)
+            .collect();
+        assert!(
+            shm_changed.iter().all(|offset| (96..116).contains(offset)),
+            "source -shm may only change inside the reader checkpoint-info block 96..116; changed offsets: {shm_changed:?}"
         );
         assert_eq!(
             fs::read(&source_db).expect("reread source db bytes"),
@@ -3089,9 +4149,433 @@ mod tests {
         drop(writer);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_source_snapshot_is_coherent_during_cross_process_wal_family_races() {
+        const CHILD_ROOT_ENV: &str = "MCP_AGENT_MAIL_LEGACY_WAL_RACE_ROOT";
+        const CHILD_TEST_NAME: &str = "legacy::tests::legacy_source_snapshot_is_coherent_during_cross_process_wal_family_races";
+        const CHILD_WITNESS: &str = "legacy-wal-race-child-completed";
+
+        if let Some(root) = std::env::var_os(CHILD_ROOT_ENV) {
+            let root = PathBuf::from(root);
+            let source_db = root.join("source.sqlite3");
+            let writer = CanonicalDbConn::open_file(source_db.display().to_string())
+                .expect("open cross-process WAL writer");
+            writer
+                .query_sync("PRAGMA journal_mode=WAL", &[])
+                .expect("enable WAL mode in child");
+            writer
+                .execute_raw(
+                    "PRAGMA wal_autocheckpoint=0; \
+                     CREATE TABLE snapshot_generation(generation INTEGER NOT NULL); \
+                     CREATE TABLE snapshot_rows( \
+                         generation INTEGER PRIMARY KEY NOT NULL, \
+                         payload BLOB NOT NULL \
+                     ); \
+                     INSERT INTO snapshot_generation(generation) VALUES (128); \
+                     WITH RECURSIVE seq(value) AS ( \
+                         SELECT 1 UNION ALL SELECT value + 1 FROM seq WHERE value < 128 \
+                     ) \
+                     INSERT INTO snapshot_rows(generation, payload) \
+                     SELECT value, zeroblob(65536) FROM seq;",
+                )
+                .expect("seed WAL-only schema and rows");
+            fs::write(root.join("progress"), b"128").expect("publish initial generation");
+            fs::write(root.join("ready"), b"ready").expect("publish child readiness");
+
+            while !root.join("start").exists() {
+                if root.join("stop").exists() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+
+            let mut generation = 128_u64;
+            while !root.join("stop").exists() {
+                generation = generation
+                    .checked_add(1)
+                    .expect("generation remains bounded");
+                writer
+                    .execute_raw(&format!(
+                        "BEGIN IMMEDIATE; \
+                         UPDATE snapshot_generation SET generation = {generation}; \
+                         INSERT INTO snapshot_rows(generation, payload) \
+                         VALUES ({generation}, zeroblob(65536)); \
+                         COMMIT;"
+                    ))
+                    .expect("commit one complete WAL generation");
+                fs::write(root.join("progress"), generation.to_string())
+                    .expect("publish child generation");
+                fs::write(root.join("grew"), b"grew").expect("publish WAL growth witness");
+
+                writer
+                    .query_sync("PRAGMA wal_checkpoint(PASSIVE)", &[])
+                    .expect("run concurrent passive checkpoint");
+                fs::write(root.join("checkpointed"), b"checkpointed")
+                    .expect("publish checkpoint witness");
+
+                let rows = writer
+                    .query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+                    .expect("attempt concurrent WAL reset");
+                let reset_completed = rows.first().is_some_and(|row| {
+                    row.get_named::<i64>("busy").ok() == Some(0)
+                        && row.get_named::<i64>("log").ok() == Some(0)
+                });
+                if reset_completed {
+                    fs::write(root.join("reset"), b"reset").expect("publish WAL reset witness");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        fn published_generation(path: &Path) -> Option<u64> {
+            fs::read_to_string(path).ok()?.parse().ok()
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let source_db = root.join("source.sqlite3");
+        let mut child = LegacyTestChild::spawn(CHILD_TEST_NAME, CHILD_ROOT_ENV, root);
+        child.wait_for_marker(&root.join("ready"), "WAL fixture readiness");
+
+        let wal_path = mcp_agent_mail_core::disk::sqlite_sidecar_path(&source_db, "-wal");
+        let shm_path = mcp_agent_mail_core::disk::sqlite_sidecar_path(&source_db, "-shm");
+        assert!(wal_path.exists(), "child must create a WAL sidecar");
+        assert!(shm_path.exists(), "child must create an SHM sidecar");
+        assert!(
+            fs::metadata(&wal_path).expect("inspect WAL").len() > 32,
+            "child must place committed content beyond the WAL header"
+        );
+
+        // An immutable main-only view deliberately ignores WAL. Its inability
+        // to see the fixture proves that the schema and rows exercised below
+        // are WAL-resident rather than accidentally checkpointed setup data.
+        let main_only_uri = format!(
+            "file:{}?immutable=1",
+            sqlite_uri_encode_path(source_db.as_path())
+        );
+        let main_only_flags = {
+            let mut flags = mcp_agent_mail_db::sqlmodel_sqlite::OpenFlags::read_only();
+            flags.uri = true;
+            flags
+        };
+        let main_only = CanonicalDbConn::open(
+            &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConfig::file(main_only_uri)
+                .flags(main_only_flags),
+        )
+        .expect("open main-only WAL control");
+        let rows = main_only
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM sqlite_master \
+                 WHERE type='table' AND name='snapshot_rows'",
+                &[],
+            )
+            .expect("query main-only schema control");
+        assert_eq!(
+            rows.first().and_then(|row| row.get_named::<i64>("c").ok()),
+            Some(0),
+            "main-only control must not see the WAL-resident schema"
+        );
+        drop(main_only);
+
+        fs::write(root.join("start"), b"start").expect("start WAL race");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let progress_path = root.join("progress");
+        let mut coherent_snapshots = 0_u32;
+        let mut freshness_checked_snapshots = 0_u32;
+        let mut observed_commit_during_capture = false;
+        let mut fail_closed_errors = Vec::new();
+
+        while std::time::Instant::now() < deadline {
+            let before = published_generation(&progress_path);
+            match LegacySourceSnapshot::capture(&source_db) {
+                Ok(snapshot) => {
+                    let conn = open_private_immutable_source_snapshot(&snapshot)
+                        .expect("open coherent retained snapshot");
+                    verify_canonical_quick_check(
+                        &conn,
+                        snapshot.snapshot_path(),
+                        "racing retained snapshot",
+                    )
+                    .expect("racing snapshot quick_check");
+                    let rows = conn
+                        .query_sync(
+                            "SELECT \
+                                 (SELECT generation FROM snapshot_generation) AS generation, \
+                                 COUNT(*) AS row_count, \
+                                 COALESCE(MAX(generation), 0) AS max_generation \
+                             FROM snapshot_rows",
+                            &[],
+                        )
+                        .expect("query cross-table generation invariant");
+                    let row = rows.first().expect("generation invariant row");
+                    let generation = row
+                        .get_named::<i64>("generation")
+                        .expect("snapshot generation");
+                    let row_count = row
+                        .get_named::<i64>("row_count")
+                        .expect("snapshot row count");
+                    let max_generation = row
+                        .get_named::<i64>("max_generation")
+                        .expect("snapshot max generation");
+                    assert_eq!(
+                        row_count, generation,
+                        "snapshot must not mix the generation row with a different WAL generation"
+                    );
+                    assert_eq!(
+                        max_generation, generation,
+                        "snapshot must contain every row committed through its generation"
+                    );
+                    if let Some(committed_before_capture) = before {
+                        assert!(
+                            generation
+                                >= i64::try_from(committed_before_capture)
+                                    .expect("published generation fits SQLite INTEGER"),
+                            "snapshot must not fall back behind the last generation committed before capture"
+                        );
+                        freshness_checked_snapshots = freshness_checked_snapshots.saturating_add(1);
+                    }
+                    coherent_snapshots = coherent_snapshots.saturating_add(1);
+                }
+                Err(error) => fail_closed_errors.push(error.to_string()),
+            }
+            let after = published_generation(&progress_path);
+            observed_commit_during_capture |= before
+                .zip(after)
+                .is_some_and(|(before, after)| after > before);
+
+            let exercised_family_races = root.join("grew").exists()
+                && root.join("checkpointed").exists()
+                && root.join("reset").exists();
+            if coherent_snapshots >= 2
+                && freshness_checked_snapshots >= 2
+                && observed_commit_during_capture
+                && exercised_family_races
+            {
+                break;
+            }
+        }
+
+        assert!(
+            coherent_snapshots >= 2,
+            "expected at least two coherent snapshots while racing; fail-closed errors={fail_closed_errors:?}"
+        );
+        assert!(
+            freshness_checked_snapshots >= 2,
+            "expected at least two successful snapshots with a published pre-capture freshness bound; observed {freshness_checked_snapshots}"
+        );
+        assert!(
+            observed_commit_during_capture,
+            "child must commit a new generation during at least one capture"
+        );
+        assert!(
+            root.join("grew").exists(),
+            "WAL growth branch not exercised"
+        );
+        assert!(
+            root.join("checkpointed").exists(),
+            "WAL checkpoint branch not exercised"
+        );
+        assert!(
+            root.join("reset").exists(),
+            "WAL reset branch not exercised"
+        );
+        child.finish(CHILD_WITNESS);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_import_fails_closed_on_wal_only_corruption_without_target_publication() {
+        const CHILD_ROOT_ENV: &str = "MCP_AGENT_MAIL_LEGACY_WAL_CORRUPTION_ROOT";
+        const CHILD_TEST_NAME: &str = "legacy::tests::legacy_import_fails_closed_on_wal_only_corruption_without_target_publication";
+        const CHILD_WITNESS: &str = "legacy-wal-corruption-child-completed";
+
+        if let Some(root) = std::env::var_os(CHILD_ROOT_ENV) {
+            let root = PathBuf::from(root);
+            let source_db = root.join("source.sqlite3");
+            let writer = CanonicalDbConn::open_file(source_db.display().to_string())
+                .expect("open WAL corruption fixture writer");
+            writer
+                .query_sync("PRAGMA journal_mode=WAL", &[])
+                .expect("enable WAL mode in corruption child");
+            writer
+                .execute_raw(
+                    "PRAGMA wal_autocheckpoint=0; \
+                     CREATE TABLE wal_only_corruption_witness(value INTEGER NOT NULL); \
+                     INSERT INTO wal_only_corruption_witness(value) VALUES (73);",
+                )
+                .expect("commit WAL-only corruption fixture");
+            fs::write(root.join("ready"), b"ready").expect("publish corruption readiness");
+            while !root.join("stop").exists() {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            drop(writer);
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        use std::io::{Seek, SeekFrom};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let source_db = root.join("source.sqlite3");
+        let source_storage = root.join("source-storage");
+        let target_db = root.join("target.sqlite3");
+        let target_storage = root.join("target-storage");
+        fs::create_dir_all(&source_storage).expect("create source storage");
+
+        let mut child = LegacyTestChild::spawn(CHILD_TEST_NAME, CHILD_ROOT_ENV, root);
+        child.wait_for_marker(&root.join("ready"), "WAL corruption fixture readiness");
+        let wal_path = mcp_agent_mail_core::disk::sqlite_sidecar_path(&source_db, "-wal");
+        let main_before = fs::read(&source_db).expect("read pristine main database");
+        let wal_before = fs::read(&wal_path).expect("read pristine WAL");
+        assert!(
+            wal_before.len() > 32,
+            "corruption fixture must contain committed WAL frames"
+        );
+
+        let mut wal = fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .expect("open WAL fixture for corruption plant");
+        wal.seek(SeekFrom::Start(0)).expect("seek WAL magic");
+        wal.write_all(&[wal_before[0] ^ 0xff])
+            .expect("corrupt WAL magic only");
+        wal.sync_all().expect("durably plant WAL corruption");
+        drop(wal);
+
+        assert_eq!(
+            fs::read(&source_db).expect("reread main database"),
+            main_before,
+            "WAL corruption plant must not modify the main database"
+        );
+        assert_ne!(
+            fs::read(&wal_path).expect("reread corrupted WAL"),
+            wal_before,
+            "WAL corruption plant must be mutation-sensitive"
+        );
+
+        let error = build_import_plan(&ImportOptions {
+            auto: false,
+            search_root: Some(root.to_path_buf()),
+            db: Some(source_db.clone()),
+            storage_root: Some(source_storage),
+            target_db: Some(target_db.clone()),
+            target_storage_root: Some(target_storage.clone()),
+            dry_run: false,
+            yes: true,
+        })
+        .expect_err("WAL-only corruption must fail before import execution");
+        let error = error.to_string().to_ascii_lowercase();
+        assert!(
+            error.contains("wal") || error.contains("coherent") || error.contains("healthy"),
+            "failure must identify the refused source-family proof: {error}"
+        );
+        assert!(
+            !target_db.exists(),
+            "failed source capture must not publish a target database"
+        );
+        assert!(
+            !target_storage.exists(),
+            "failed source capture must not publish target storage"
+        );
+        child.finish(CHILD_WITNESS);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_source_snapshot_preserves_same_process_franken_writer_lock() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_LEGACY_LOCK_PATH";
+        const CHILD_TEST_NAME: &str =
+            "legacy::tests::legacy_source_snapshot_preserves_same_process_franken_writer_lock";
+        const CHILD_WITNESS: &str = "legacy-source-snapshot-child-observed-busy";
+
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            let config = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConfig::file(
+                PathBuf::from(path).to_string_lossy().into_owned(),
+            )
+            .flags(mcp_agent_mail_db::sqlmodel_sqlite::OpenFlags::read_write())
+            .busy_timeout(10);
+            let contender =
+                CanonicalDbConn::open(&config).expect("child opens competing canonical connection");
+            let error = contender
+                .execute_raw("BEGIN IMMEDIATE")
+                .expect_err("child must not acquire the parent writer lock");
+            let error = error.to_string().to_ascii_lowercase();
+            assert!(
+                error.contains("busy") || error.contains("locked"),
+                "child observed an unrelated failure instead of lock contention: {error}"
+            );
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        fn assert_child_observes_busy(path: &Path) {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("resolve current test executable"),
+            )
+            .arg(CHILD_TEST_NAME)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_PATH_ENV, path)
+            .output()
+            .expect("run competing child lock probe");
+            assert!(
+                output.status.success(),
+                "child lock probe failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(CHILD_WITNESS),
+                "child filter ran no causal probe: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_db = temp.path().join("legacy-live-franken.sqlite3");
+        let writer =
+            DbConn::open_file(source_db.display().to_string()).expect("open live Franken source");
+        writer
+            .execute_raw(
+                "PRAGMA journal_mode = DELETE; \
+                 PRAGMA autocommit_retain = OFF; \
+                 CREATE TABLE legacy_lock_witness(value INTEGER NOT NULL); \
+                 INSERT INTO legacy_lock_witness(value) VALUES (41);",
+            )
+            .expect("seed legacy lock fixture");
+        writer
+            .execute_raw("BEGIN IMMEDIATE")
+            .expect("hold live Franken writer lock");
+        assert_child_observes_busy(&source_db);
+
+        let snapshot = LegacySourceSnapshot::capture(&source_db)
+            .expect("capture live Franken source without a cross-engine open");
+        let snapshot_conn = open_private_immutable_source_snapshot(&snapshot)
+            .expect("open retained private snapshot");
+        let rows = snapshot_conn
+            .query_sync("SELECT value FROM legacy_lock_witness", &[])
+            .expect("query retained snapshot witness");
+        assert_eq!(
+            rows.first()
+                .and_then(|row| row.get_named::<i64>("value").ok()),
+            Some(41)
+        );
+        assert_child_observes_busy(&source_db);
+
+        writer
+            .execute_raw("ROLLBACK")
+            .expect("release live Franken writer lock");
+    }
+
     #[cfg(unix)]
     #[test]
-    fn copy_dir_recursive_rejects_symlinked_files() {
+    fn legacy_hardening_copy_rejects_symlinked_files() {
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -3105,7 +4589,7 @@ mod tests {
         let err = copy_dir_recursive(&src, &dst).unwrap_err();
         match err {
             CliError::InvalidArgument(msg) => {
-                assert!(msg.contains("symlinked files are not supported"));
+                assert!(msg.contains("symlink or reparse-point entry"));
             }
             other => panic!("expected invalid argument, got {other:?}"),
         }

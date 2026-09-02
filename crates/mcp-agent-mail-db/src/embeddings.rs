@@ -486,7 +486,14 @@ mod tests {
         assert!(batch.is_empty());
         assert_eq!(batch.len(), 0);
 
-        batch.push(EmbeddingRow::new(1, "message", None, "model", "hash", &[1.0]));
+        batch.push(EmbeddingRow::new(
+            1,
+            "message",
+            None,
+            "model",
+            "hash",
+            &[1.0],
+        ));
         assert!(!batch.is_empty());
         assert_eq!(batch.len(), 1);
     }

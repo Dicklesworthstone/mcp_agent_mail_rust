@@ -20,7 +20,7 @@ use mcp_agent_mail_db::forensics::{
 };
 use mcp_agent_mail_db::reconstruct::{
     ReconstructStats, compute_archive_drift_report, reconstruct_from_archive,
-    reconstruct_from_archive_with_salvage, scan_archive_message_inventory,
+    reconstruct_from_archive_with_private_salvage, scan_archive_message_inventory,
 };
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -744,8 +744,8 @@ fn replay_salvage_merge_reconstruction() {
 
     // Replay: reconstruct with salvage
     let stats =
-        reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
-            .expect("salvage merge reconstruct should succeed");
+        reconstruct_from_archive_with_private_salvage(&db_path, &storage_root, &salvage_db_path)
+            .expect("private salvage merge reconstruct should succeed");
 
     let mut report = ReplayDiffReport::new("salvage-merge");
     report.stats = Some(stats.clone());
@@ -1097,8 +1097,8 @@ fn replay_corrupt_salvage_refuses_archive_only_candidate() {
     // loud warning and an archive-only candidate is rebuilt so the doctor's
     // promotion guard — not reconstruct — decides whether the heal is safe.
     let stats =
-        reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
-            .expect("corrupt salvage must not wedge archive reconstruction");
+        reconstruct_from_archive_with_private_salvage(&db_path, &storage_root, &salvage_db_path)
+            .expect("corrupt private salvage must not wedge archive reconstruction");
 
     assert_eq!(stats.messages, 1, "archive content must survive");
     assert_eq!(
@@ -1154,8 +1154,8 @@ fn replay_no_salvage_path_is_clean_reconstruct() {
         "Body.",
     );
 
-    let stats = reconstruct_from_archive_with_salvage(&db_path, &storage_root, None)
-        .expect("should succeed with no salvage");
+    let stats =
+        reconstruct_from_archive(&db_path, &storage_root).expect("should succeed with no salvage");
 
     assert_eq!(stats.projects, 1);
     assert_eq!(stats.agents, 1);

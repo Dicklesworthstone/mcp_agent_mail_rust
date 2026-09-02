@@ -14,6 +14,7 @@
 //! And 25 MCP resources for read-only data access.
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 #![allow(
     clippy::needless_pass_by_value,
     clippy::needless_borrows_for_generic_args,
@@ -49,10 +50,11 @@ pub use identity::*;
 pub use macros::*;
 pub use messaging::*;
 pub use metrics::{
-    LatencySnapshot, MetricsSnapshotEntry, record_call, record_call_idx, record_error,
-    record_error_idx, record_latency, record_latency_idx, record_rejection, record_rejection_idx,
-    reset_tool_latencies, reset_tool_metrics, slow_tools, tool_index, tool_meta,
-    tool_metrics_snapshot, tool_metrics_snapshot_full,
+    LatencySnapshot, MetricsSnapshotEntry, RECENT_TOOL_CALL_CAPACITY, RecentToolCall,
+    RecentToolCallOutcome, recent_call_count, recent_calls_since, record_call, record_call_idx,
+    record_error, record_error_idx, record_latency, record_latency_idx, record_recent_call,
+    record_rejection, record_rejection_idx, reset_tool_latencies, reset_tool_metrics, slow_tools,
+    tool_index, tool_meta, tool_metrics_snapshot, tool_metrics_snapshot_full,
 };
 pub use products::*;
 pub use reservation_parity::*;
@@ -459,6 +461,38 @@ pub mod tool_util {
                     _ => db_error_to_mcp_error(*inner),
                 }
             }
+            DbError::InvalidArgument {
+                field: "agent_retired",
+                message,
+            } => legacy_tool_error(
+                "AGENT_RETIRED",
+                message.clone(),
+                true,
+                db_error_data(
+                    classification,
+                    &failure_envelope,
+                    json!({
+                        "state": "retired",
+                        "error_detail": message,
+                    }),
+                ),
+            ),
+            DbError::InvalidArgument {
+                field: "agent_deregistered",
+                message,
+            } => legacy_tool_error(
+                "AGENT_DEREGISTERED",
+                message.clone(),
+                false,
+                db_error_data(
+                    classification,
+                    &failure_envelope,
+                    json!({
+                        "state": "deregistered",
+                        "error_detail": message,
+                    }),
+                ),
+            ),
             DbError::InvalidArgument { field, message } => legacy_tool_error(
                 "INVALID_ARGUMENT",
                 format!(
@@ -780,6 +814,34 @@ pub mod tool_util {
         }
     }
 
+    fn bootstrap_db_pool_with_barrier_handoff(
+        cfg: &DbPoolConfig,
+        storage_root: &Path,
+        sqlite_path: Option<&Path>,
+    ) -> McpResult<(DbPool, crate::archive_read::WriteGuard)> {
+        let (barrier, outcome) =
+            mcp_agent_mail_db::write_barrier::acquire_promotion_barrier_draining(
+                mcp_agent_mail_db::write_barrier::writer_drain_timeout(),
+            );
+        if let mcp_agent_mail_db::write_barrier::DrainOutcome::TimedOut { remaining_writers } =
+            outcome
+        {
+            drop(barrier);
+            return Err(McpError::internal_error(format!(
+                "database pool bootstrap deferred because {remaining_writers} writer(s) did not drain before the recovery barrier timeout"
+            )));
+        }
+        let pool =
+            get_or_create_pool(cfg).map_err(|error| McpError::internal_error(error.to_string()))?;
+        // Atomic handoff: register the caller as a writer while the promotion
+        // barrier is still closed, then release the barrier. No promotion can
+        // enter between cold bootstrap/recovery and the operation using this
+        // pool.
+        let guard = crate::archive_read::WriteGuard::begin(storage_root, sqlite_path);
+        drop(barrier);
+        Ok((pool, guard))
+    }
+
     pub fn get_db_pool() -> McpResult<WriteDbPool> {
         let cfg = DbPoolConfig::from_env();
         let sqlite_path =
@@ -800,8 +862,21 @@ pub mod tool_util {
             &storage_root,
             sqlite_path.as_deref().map(Path::new),
         );
-        let pool = get_or_create_pool(&cfg)
-            .map_err(|error| McpError::internal_error(error.to_string()))?;
+        if let Some(pool) = mcp_agent_mail_db::get_cached_pool(&cfg) {
+            return Ok(WriteDbPool {
+                pool,
+                _guard: guard,
+            });
+        }
+        // A cold pool may migrate or recover, which requires the promotion
+        // barrier. Relinquish this provisional writer first, then perform an
+        // explicit barrier-to-writer handoff in the helper.
+        drop(guard);
+        let (pool, guard) = bootstrap_db_pool_with_barrier_handoff(
+            &cfg,
+            &storage_root,
+            sqlite_path.as_deref().map(Path::new),
+        )?;
         Ok(WriteDbPool {
             pool,
             _guard: guard,
@@ -864,12 +939,11 @@ pub mod tool_util {
             .storage_root
             .clone()
             .unwrap_or_else(|| Config::from_env().storage_root);
-        let guard = crate::archive_read::WriteGuard::begin(
+        let (pool, guard) = bootstrap_db_pool_with_barrier_handoff(
+            &cfg,
             &storage_root,
             sqlite_path.as_deref().map(Path::new),
-        );
-        let pool = get_or_create_pool(&cfg)
-            .map_err(|error| McpError::internal_error(error.to_string()))?;
+        )?;
         drop(guard);
         Ok(pool)
     }
@@ -1081,7 +1155,7 @@ pub mod tool_util {
     }
 
     fn query_read_db_inventory(
-        conn: &mcp_agent_mail_db::DbConn,
+        conn: &impl mcp_agent_mail_db::pool::SyncQuery,
     ) -> Result<ReadReconcileInventory, String> {
         let tables = conn
             .query_sync(
@@ -1168,7 +1242,7 @@ pub mod tool_util {
     pub(crate) fn read_archive_is_ahead(
         storage_root: &Path,
         sqlite_path: &Path,
-        conn: &mcp_agent_mail_db::DbConn,
+        conn: &impl mcp_agent_mail_db::pool::SyncQuery,
         archive: &mcp_agent_mail_db::ArchiveMessageInventory,
     ) -> Result<bool, String> {
         if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, sqlite_path) {
@@ -2219,15 +2293,14 @@ body
             let temp = tempfile::tempdir().expect("tempdir");
             let db_path = temp.path().join("custom.sqlite3");
             let database_url = format!("sqlite:///{}", db_path.display());
-            let xdg_data_home = temp.path().join("xdg");
-            let xdg_data_home_text = xdg_data_home.to_string_lossy().into_owned();
 
-            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-                &[
-                    ("DATABASE_URL", database_url.as_str()),
-                    ("XDG_DATA_HOME", xdg_data_home_text.as_str()),
-                ],
-                || {
+            // br-99aih: redirect the *default* storage root into a private
+            // tempdir (HOME + XDG_DATA_HOME); an XDG-only override still
+            // resolved to the operator's live archive on any host that had run
+            // the daemon.
+            mcp_agent_mail_core::config::with_isolated_default_storage_root_and_env_overrides_for_test(
+                &[("DATABASE_URL", database_url.as_str())],
+                |_isolated_default_root| {
                     Config::reset_cached();
                     let storage_root = Config::from_env().storage_root;
                     let project_dir = storage_root.join("projects").join("ahead-project");
@@ -2826,6 +2899,9 @@ pub const TOOL_CLUSTER_MAP: &[(&str, &str)] = &[
     // Identity
     ("register_agent", clusters::IDENTITY),
     ("create_agent_identity", clusters::IDENTITY),
+    ("retire_agent", clusters::IDENTITY),
+    ("unretire_agent", clusters::IDENTITY),
+    ("deregister_agent", clusters::IDENTITY),
     ("whois", clusters::IDENTITY),
     ("resolve_pane_identity", clusters::IDENTITY),
     ("cleanup_pane_identities", clusters::IDENTITY),
@@ -2834,8 +2910,10 @@ pub const TOOL_CLUSTER_MAP: &[(&str, &str)] = &[
     ("send_message", clusters::MESSAGING),
     ("reply_message", clusters::MESSAGING),
     ("fetch_inbox", clusters::MESSAGING),
+    ("fetch_topic", clusters::MESSAGING),
     ("fetch_inbox_events", clusters::MESSAGING),
     ("mark_message_read", clusters::MESSAGING),
+    ("mark_all_read", clusters::MESSAGING),
     ("acknowledge_message", clusters::MESSAGING),
     ("get_message_delivery_receipt", clusters::MESSAGING),
     // Contact

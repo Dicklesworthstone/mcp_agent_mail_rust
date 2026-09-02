@@ -60,8 +60,13 @@ pub fn handle_capabilities(format: Option<CliOutputFormat>) -> CliResult<()> {
 }
 
 /// Print `robot-docs` to stdout. Markdown.
+///
+/// The static handbook is followed by the Air Traffic Control configuration
+/// section, generated from the flag registry so it can never drift from the
+/// knobs the binary actually reads (GH#290).
 pub fn handle_robot_docs() -> CliResult<()> {
     println!("{}", robot_docs::handbook());
+    println!("{}", robot_docs::atc_configuration_section());
     Ok(())
 }
 
@@ -180,21 +185,117 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
                 })),
                 Some("am doctor repair --dry-run".to_string()),
             ),
-            Ok(crate::DoctorDatabaseFixStrategy::Reconstruct(detail)) => (
-                serde_json::json!({
-                    "status": "fail",
-                    "detail": detail,
-                    "probe_target": probe_source,
-                }),
-                Some(serde_json::json!({
-                    "id": "live-mailbox-needs-reconstruct",
-                    "severity": "P0",
-                    "source": "live_probe",
-                    "summary": format!("live mailbox needs reconstruct: {detail}"),
-                    "remediation": "am doctor reconstruct --dry-run",
-                })),
-                Some("am doctor reconstruct --dry-run".to_string()),
-            ),
+            Ok(crate::DoctorDatabaseFixStrategy::Reconstruct(detail)) => {
+                // GH#286: one P0 "needs reconstruct" covered both
+                // leaked-pages-only (space accounting waste, every row
+                // readable) and genuine structural damage. Classify so the
+                // finding id/severity — and any alert rule built on them —
+                // can tell the two apart.
+                let classification = if crate::doctor_detail_is_integrity_verdict(&detail) {
+                    crate::doctor_live_integrity_classification(&probe_target.database_url)
+                } else {
+                    // Archive drift / missing tables / open failures keep the
+                    // reconstruct verdict regardless of page accounting.
+                    None
+                };
+                let leaked_only = classification.as_ref().is_some_and(|c| {
+                    c.class == mcp_agent_mail_db::integrity::IntegrityClass::LeakedPagesOnly
+                });
+                if leaked_only {
+                    let leaked = classification.as_ref().map_or(0, |c| c.leaked_pages);
+                    (
+                        serde_json::json!({
+                            "status": "degraded",
+                            "detail": format!(
+                                "{detail}; integrity class leaked_pages_only: {leaked} orphaned \
+                                 page(s), 0 structural errors — all rows readable, reclaim \
+                                 recommended"
+                            ),
+                            "probe_target": probe_source,
+                            "integrity_class": "leaked_pages_only",
+                            "leaked_pages": leaked,
+                            "structural_errors": 0,
+                        }),
+                        Some(serde_json::json!({
+                            "id": "live-mailbox-leaked-pages",
+                            "severity": "P2",
+                            "source": "live_probe",
+                            "summary": format!(
+                                "live mailbox has {leaked} orphaned page(s) (space accounting \
+                                 only; every b-tree/index intact and all rows readable): {detail}"
+                            ),
+                            "remediation": "am doctor vacuum",
+                            "integrity_class": "leaked_pages_only",
+                            "leaked_pages": leaked,
+                            "structural_errors": 0,
+                            "first_structural_error": serde_json::Value::Null,
+                        })),
+                        Some("am doctor vacuum".to_string()),
+                    )
+                } else {
+                    let mut finding = serde_json::json!({
+                        "id": "live-mailbox-needs-reconstruct",
+                        "severity": "P0",
+                        "source": "live_probe",
+                        "summary": format!("live mailbox needs reconstruct: {detail}"),
+                        "remediation": "am doctor reconstruct --dry-run",
+                    });
+                    if let (Some(c), Some(obj)) = (classification.as_ref(), finding.as_object_mut())
+                    {
+                        obj.insert(
+                            "integrity_class".to_string(),
+                            serde_json::json!(c.class.as_str()),
+                        );
+                        obj.insert(
+                            "leaked_pages".to_string(),
+                            serde_json::json!(c.leaked_pages),
+                        );
+                        obj.insert(
+                            "structural_errors".to_string(),
+                            serde_json::json!(c.structural_errors),
+                        );
+                        obj.insert(
+                            "first_structural_error".to_string(),
+                            serde_json::json!(c.first_structural_error),
+                        );
+                    }
+                    // GH#287: the recovery breaker beside the DB may already
+                    // record that reconstruct fails deterministically here.
+                    // Keep the remediation visible but annotate it as blocked
+                    // so operators/agents do not loop on a known-failing
+                    // command.
+                    if let Some(note) =
+                        crate::doctor_recovery_breaker_note(&probe_target.database_url)
+                        && let Some(obj) = finding.as_object_mut()
+                    {
+                        obj.insert("blocked".to_string(), serde_json::json!(true));
+                        obj.insert("blocked_reason".to_string(), serde_json::json!(note.reason));
+                        obj.insert(
+                            "blocked_since".to_string(),
+                            serde_json::json!(doctor_unix_seconds_to_rfc3339(
+                                note.last_failure_unix
+                            )),
+                        );
+                        obj.insert(
+                            "blocked_tripped".to_string(),
+                            serde_json::json!(note.tripped),
+                        );
+                        obj.insert(
+                            "blocked_consecutive_failures".to_string(),
+                            serde_json::json!(note.consecutive_failures),
+                        );
+                    }
+                    (
+                        serde_json::json!({
+                            "status": "fail",
+                            "detail": detail,
+                            "probe_target": probe_source,
+                        }),
+                        Some(finding),
+                        Some("am doctor reconstruct --dry-run".to_string()),
+                    )
+                }
+            }
             Err(error) => (
                 serde_json::json!({
                     "status": "error",
@@ -258,12 +359,24 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
                             .get("remediation")
                             .and_then(|r| r.as_str())
                             .unwrap_or("am doctor health");
-                        return Some(serde_json::json!({
+                        let mut action = serde_json::json!({
                             "id": id,
                             "severity": severity,
                             "fix_command": remediation,
                             "explain_command": "am doctor health",
-                        }));
+                        });
+                        // GH#287: carry the breaker-blocked annotation onto the
+                        // planned action, so an agent branching on
+                        // `actions_planned` sees the block without re-joining
+                        // against `findings`.
+                        if let Some(obj) = action.as_object_mut() {
+                            for key in ["blocked", "blocked_reason", "blocked_since"] {
+                                if let Some(value) = f.get(key) {
+                                    obj.insert(key.to_string(), value.clone());
+                                }
+                            }
+                        }
+                        return Some(action);
                     }
                     Some(serde_json::json!({
                         "id": id,
@@ -385,6 +498,15 @@ fn historical_report_has_only_cosmetic_reservation_parity(report: &serde_json::V
         semantic_is_clean
             && (1..=COSMETIC_RESERVATION_PARITY_DRIFT_THRESHOLD).contains(&allowed_total)
     })
+}
+
+/// GH#287: render a breaker `last_failure_unix` for the blocked annotation.
+/// Falls back to the raw number when the timestamp is out of chrono's range.
+fn doctor_unix_seconds_to_rfc3339(unix_seconds: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(unix_seconds, 0).map_or_else(
+        || unix_seconds.to_string(),
+        |ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -690,6 +812,24 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
     let config = Config::from_env();
     let storage_root = config.storage_root.clone();
     let canonical_mcp_url = canonical_mcp_url_for_config(&config);
+    // Every auto-fixable detector in the retained logical-read family must
+    // revalidate and mutate while mailbox DB/archive authority is exclusive.
+    let _db_mutation_locks = if !dry_run
+        && matches!(
+            fm_id,
+            fixers::inbox_stats_divergence::FM_ID
+                | fixers::legacy_fts_residue::FM_ID
+                | fixers::orphan_foreign_key_rows::FM_ID
+                | fixers::reservation_db_archive_parity::FM_ID
+                | fixers::reservation_artifact_normalize::FM_ID
+        ) {
+        Some(crate::acquire_cli_mailbox_mutation_locks(
+            &config.database_url,
+            Some(&storage_root),
+        )?)
+    } else {
+        None
+    };
 
     let inputs = fixers::DispatchInputs {
         repo_root: repo_root.clone(),
@@ -922,7 +1062,16 @@ pub(crate) fn detect_archive_normalize_reservation_artifacts(
     database_path: Option<&Path>,
 ) -> Vec<fixers::reservation_artifact_normalize::ReservationArtifactNormalizeFinding> {
     let candidates = database_path.map_or_else(Vec::new, |path| vec![path.to_path_buf()]);
-    fixers::reservation_artifact_normalize::detect(Some(storage_root), &candidates)
+    let read_candidates: Vec<_> = candidates
+        .iter()
+        .map(|path| {
+            fixers::DoctorDbReadCandidate::open_live_or_explicit_offline(
+                path,
+                "archive-normalize reservation artifact detection",
+            )
+        })
+        .collect();
+    fixers::reservation_artifact_normalize::detect_prepared(Some(storage_root), &read_candidates)
 }
 
 /// Apply a pre-confirmed `archive-normalize` reservation artifact plan.
@@ -941,6 +1090,30 @@ pub(crate) fn apply_archive_normalize_reservation_artifacts(
     if findings.is_empty() {
         return Ok(ArchiveNormalizeReservationArtifactOutcome::default());
     }
+
+    let mut database_paths: Vec<PathBuf> = findings
+        .iter()
+        .map(|finding| finding.db_path.clone())
+        .collect();
+    database_paths.sort();
+    database_paths.dedup();
+    let _database_mutation_locks: Vec<_> = if dry_run {
+        Vec::new()
+    } else {
+        database_paths
+            .iter()
+            .map(|path| crate::acquire_doctor_mailbox_activity_lock_for_sqlite_path(path, false))
+            .collect::<CliResult<Vec<_>>>()?
+    };
+    let read_candidates: Vec<_> = database_paths
+        .iter()
+        .map(|path| {
+            fixers::DoctorDbReadCandidate::open_live_or_explicit_offline(
+                path,
+                "archive-normalize reservation artifact pre-fix source",
+            )
+        })
+        .collect();
 
     let started_at = Instant::now();
     let repo_root =
@@ -986,8 +1159,15 @@ pub(crate) fn apply_archive_normalize_reservation_artifacts(
         ..ArchiveNormalizeReservationArtifactOutcome::default()
     };
     for finding in findings {
-        let result =
-            fixers::reservation_artifact_normalize::fix(&ctx, finding).map_err(|error| {
+        let Some(candidate) = read_candidates
+            .iter()
+            .find(|candidate| candidate.target_path() == finding.db_path)
+        else {
+            outcome.actions_skipped += 1;
+            continue;
+        };
+        let result = fixers::reservation_artifact_normalize::fix_prepared(&ctx, finding, candidate)
+            .map_err(|error| {
                 CliError::Other(format!(
                     "archive-normalize reservation artifact mutation failed: {error}"
                 ))
@@ -1381,7 +1561,7 @@ fn default_mcp_config_candidates() -> Vec<PathBuf> {
         v.push(home.join(".cline.mcp.json"));
     }
     v.extend(
-        mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default()
+        mcp_agent_mail_core::mcp_config::detect_mcp_config_mutation_locations_default()
             .into_iter()
             .filter(|location| location.tool == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp)
             .map(|location| location.config_path),
@@ -2744,6 +2924,7 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
             "database_target: local_config_unattested (live server config unavailable)"
         );
     }
+    let mut live_mailbox_degraded = false;
     match crate::doctor_database_fix_strategy_read_only(
         &probe_target.database_url,
         &probe_target.storage_root,
@@ -2756,10 +2937,58 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
             return Err(CliError::ExitCode(1));
         }
         Ok(crate::DoctorDatabaseFixStrategy::Reconstruct(detail)) => {
-            ftui_runtime::ftui_println!(
-                "fail: live mailbox needs reconstruct: {detail}; next: am doctor reconstruct --dry-run"
-            );
-            return Err(CliError::ExitCode(1));
+            // GH#286: leaked-pages-only is space accounting waste (every
+            // b-tree/index intact, all rows readable), not damage — report it
+            // as a distinct degraded class with a reclaim remediation instead
+            // of the same P0 line as structural corruption, so alert rules can
+            // page on damage without drowning in a standing benign condition.
+            let classification = if crate::doctor_detail_is_integrity_verdict(&detail) {
+                crate::doctor_live_integrity_classification(&probe_target.database_url)
+            } else {
+                // Archive drift / missing tables / open failures keep the
+                // reconstruct verdict regardless of page accounting.
+                None
+            };
+            if let Some(c) = classification.as_ref()
+                && c.class == mcp_agent_mail_db::integrity::IntegrityClass::LeakedPagesOnly
+            {
+                ftui_runtime::ftui_println!(
+                    "degraded: live mailbox has {} orphaned page(s) (integrity_class=leaked_pages_only; space accounting only, all rows readable); next: am doctor vacuum",
+                    c.leaked_pages
+                );
+                live_mailbox_degraded = true;
+            } else {
+                if let Some(c) = classification.as_ref() {
+                    ftui_runtime::ftui_println!(
+                        "integrity_class: {} ({} structural error(s), {} leaked page(s){})",
+                        c.class.as_str(),
+                        c.structural_errors,
+                        c.leaked_pages,
+                        c.first_structural_error
+                            .as_deref()
+                            .map(|e| format!("; first: {e}"))
+                            .unwrap_or_default()
+                    );
+                }
+                ftui_runtime::ftui_println!(
+                    "fail: live mailbox needs reconstruct: {detail}; next: am doctor reconstruct --dry-run"
+                );
+                // GH#287: if the recovery breaker beside the DB records that
+                // reconstruct already fails here, say so next to the advice
+                // instead of letting the operator loop on a known-failing
+                // command.
+                if let Some(note) = crate::doctor_recovery_breaker_note(&probe_target.database_url)
+                {
+                    ftui_runtime::ftui_println!(
+                        "note: recovery breaker records {} prior reconstruct failure(s) (tripped={}) at {}: {}",
+                        note.consecutive_failures,
+                        note.tripped,
+                        doctor_unix_seconds_to_rfc3339(note.last_failure_unix),
+                        note.reason
+                    );
+                }
+                return Err(CliError::ExitCode(1));
+            }
         }
         Err(error) => {
             ftui_runtime::ftui_println!("fail: live mailbox health probe failed: {error}");
@@ -2916,7 +3145,13 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
     if path_absent_without_following_symlink(&latest)
         && path_absent_without_following_symlink(&runs_dir)
     {
-        ftui_runtime::ftui_println!("ok: live mailbox healthy; no prior runs");
+        if live_mailbox_degraded {
+            ftui_runtime::ftui_println!(
+                "ok: live mailbox degraded (leaked pages only, reclaimable); no prior runs"
+            );
+        } else {
+            ftui_runtime::ftui_println!("ok: live mailbox healthy; no prior runs");
+        }
         return Ok(());
     }
 
@@ -3122,6 +3357,16 @@ mod tests {
     static DOCTOR_HEALTH_STDIO_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
+    const FIX_ONLY_LOCK_DB_ENV: &str = "AM_DOCTOR_FIX_ONLY_LOCK_DB";
+    const FIX_ONLY_LOCK_READY_ENV: &str = "AM_DOCTOR_FIX_ONLY_LOCK_READY";
+    const FIX_ONLY_LOCK_RELEASE_ENV: &str = "AM_DOCTOR_FIX_ONLY_LOCK_RELEASE";
+    const FIX_ONLY_LOCK_FM_ENV: &str = "AM_DOCTOR_FIX_ONLY_LOCK_FM";
+    const FIX_ONLY_LOCK_HOLDER_TEST: &str =
+        "doctor::tests::fix_only_shared_sqlite_lock_holder_child";
+    const FIX_ONLY_LOCK_INVOKER_TEST: &str = "doctor::tests::fix_only_exclusive_lock_invoker_child";
+    const FIX_ONLY_LOCK_HOLDER_WITNESS: &str = "FIX_ONLY_SHARED_LOCK_HOLDER_RAN";
+    const FIX_ONLY_LOCK_REFUSAL_WITNESS: &str = "FIX_ONLY_EXCLUSIVE_LOCK_REFUSED";
+
     fn seed_healthy_live_mailbox(db_path: &std::path::Path) {
         let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string())
             .expect("open live db");
@@ -3160,6 +3405,135 @@ mod tests {
                 .any(|path| path.ends_with(".omp/mcp.json")),
             "doctor MCP failure modes must inspect OMP's project-native config"
         );
+    }
+
+    #[test]
+    fn fix_only_shared_sqlite_lock_holder_child() {
+        let Ok(db_path) = std::env::var(FIX_ONLY_LOCK_DB_ENV) else {
+            return;
+        };
+        let ready_path = PathBuf::from(
+            std::env::var(FIX_ONLY_LOCK_READY_ENV).expect("fix-only lock ready path"),
+        );
+        let release_path = PathBuf::from(
+            std::env::var(FIX_ONLY_LOCK_RELEASE_ENV).expect("fix-only lock release path"),
+        );
+        let _shared = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
+            Path::new(&db_path),
+            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+        )
+        .expect("acquire cross-process shared SQLite activity lock")
+        .expect("file-backed SQLite lock guard");
+        std::fs::write(&ready_path, b"ready").expect("publish shared-lock readiness");
+        assert!(
+            fixers::wait_for_cross_process_release(&release_path),
+            "parent did not release shared-lock child in time"
+        );
+        println!("{FIX_ONLY_LOCK_HOLDER_WITNESS}");
+    }
+
+    #[test]
+    fn fix_only_exclusive_lock_invoker_child() {
+        let Ok(fm_id) = std::env::var(FIX_ONLY_LOCK_FM_ENV) else {
+            return;
+        };
+        let error = handle_fix_only(&fm_id, false, true, true)
+            .expect_err("mutating fixer must refuse shared SQLite authority");
+        let detail = error.to_string();
+        assert!(
+            detail.contains("Resource is temporarily busy")
+                && detail.contains("mailbox activity lock is busy"),
+            "mutating fixer {fm_id} failed for an unexpected reason: {detail}"
+        );
+        println!("{FIX_ONLY_LOCK_REFUSAL_WITNESS}:{fm_id}");
+    }
+
+    #[test]
+    fn every_logical_db_auto_fixer_refuses_cross_process_shared_authority() {
+        let td = tempfile::tempdir().expect("fix-only exclusive-lock tempdir");
+        let repo_root = td.path().join("repo");
+        let storage_root = td.path().join("storage");
+        std::fs::create_dir_all(&repo_root).expect("create isolated repo root");
+        std::fs::create_dir_all(&storage_root).expect("create isolated storage root");
+        let db_path = storage_root.join("storage.sqlite3");
+        seed_healthy_live_mailbox(&db_path);
+        let ready_path = td.path().join("holder.ready");
+        let release_path = td.path().join("holder.release");
+        let test_exe = std::env::current_exe().expect("resolve doctor test executable");
+
+        let holder = std::process::Command::new(&test_exe)
+            .arg(FIX_ONLY_LOCK_HOLDER_TEST)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(FIX_ONLY_LOCK_DB_ENV, &db_path)
+            .env(FIX_ONLY_LOCK_READY_ENV, &ready_path)
+            .env(FIX_ONLY_LOCK_RELEASE_ENV, &release_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn shared SQLite lock holder");
+        let holder = fixers::CrossProcessTestChild::new(holder, release_path);
+        if !fixers::wait_for_cross_process_signal(&ready_path) {
+            let output = holder.release_and_wait().expect("collect unready holder");
+            panic!(
+                "shared-lock holder never became ready: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let mut invocations = Vec::new();
+        for fm_id in [
+            fixers::inbox_stats_divergence::FM_ID,
+            fixers::legacy_fts_residue::FM_ID,
+            fixers::orphan_foreign_key_rows::FM_ID,
+            fixers::reservation_db_archive_parity::FM_ID,
+            fixers::reservation_artifact_normalize::FM_ID,
+        ] {
+            let output = std::process::Command::new(&test_exe)
+                .arg(FIX_ONLY_LOCK_INVOKER_TEST)
+                .arg("--exact")
+                .arg("--nocapture")
+                .current_dir(&repo_root)
+                .env(FIX_ONLY_LOCK_FM_ENV, fm_id)
+                .env("DATABASE_URL", &database_url)
+                .env("STORAGE_ROOT", &storage_root)
+                .output()
+                .expect("run fix-only exclusive-lock invoker");
+            invocations.push((fm_id, output));
+        }
+
+        let holder_output = holder
+            .release_and_wait()
+            .expect("collect shared-lock holder");
+        assert!(
+            holder_output.status.success(),
+            "shared-lock holder failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&holder_output.stdout),
+            String::from_utf8_lossy(&holder_output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&holder_output.stdout).contains(FIX_ONLY_LOCK_HOLDER_WITNESS),
+            "shared-lock holder filter was vacuous: stdout={} stderr={}",
+            String::from_utf8_lossy(&holder_output.stdout),
+            String::from_utf8_lossy(&holder_output.stderr)
+        );
+        for (fm_id, output) in invocations {
+            assert!(
+                output.status.success(),
+                "fix-only invoker failed for {fm_id}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains(&format!("{FIX_ONLY_LOCK_REFUSAL_WITNESS}:{fm_id}")),
+                "fix-only invoker filter was vacuous for {fm_id}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

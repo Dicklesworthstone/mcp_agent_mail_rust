@@ -1071,13 +1071,36 @@ fn reservation_snapshot_gap_requires_refresh(
         >= i64::try_from(RESERVATION_SNAPSHOT_GAP_REFRESH_INTERVAL.as_micros()).unwrap_or(i64::MAX)
 }
 
-/// Open a sync `SQLite` connection from a database URL (public for compose dispatch).
+/// Open a sync live-write `SQLite` connection from a database URL.
+///
+/// The compose dispatcher holds the process write-activity lease before it
+/// calls this function and through transaction completion. Keep this path
+/// separate from the best-effort observability opener: that reader may run a
+/// guarded fresh-schema bootstrap, which would otherwise nest a second writer
+/// acquisition after recovery has started draining the outer compose lease.
 #[must_use]
-pub fn open_sync_connection_pub(database_url: &str) -> Option<DbConn> {
-    open_sync_connection(database_url)
+pub fn open_sync_write_connection_pub(database_url: &str) -> Option<DbConn> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return None;
+    }
+    let cfg = DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let path = crate::resolve_server_sync_sqlite_path(&cfg.sqlite_path().ok()?);
+    if path == ":memory:" {
+        return None;
+    }
+    crate::open_sync_db_connection_with_busy_timeout(
+        &path,
+        crate::BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS,
+        "TUI compose dispatch",
+    )
+    .ok()
 }
 
 /// Open a sync `SQLite` connection from a database URL.
+#[cfg(test)]
 fn open_sync_connection(database_url: &str) -> Option<DbConn> {
     open_sync_connection_with_path(database_url).map(|(conn, _)| conn)
 }
@@ -1101,6 +1124,7 @@ fn open_sync_connection_with_path_and_storage_root(
     }
 }
 
+#[cfg(test)]
 fn open_sync_connection_with_path(database_url: &str) -> Option<(DbConn, String)> {
     // `:memory:` URLs would create a brand-new private DB per poll cycle,
     // which diverges from the server pool and yields misleading empty
@@ -1600,6 +1624,9 @@ fn fetch_agent_list_rows(conn: &DbConn) -> Vec<AgentListRow> {
     let has_program = available_columns.contains("program");
     let has_model = available_columns.contains("model");
     let has_last_active = available_columns.contains("last_active_ts");
+    let has_retired_at = available_columns.contains("retired_at");
+    let has_deregistration_ledger =
+        table_has_required_columns(conn, "agent_deregistrations", &["agent_id"]).unwrap_or(false);
 
     let raw_project_id_select = if has_project_id {
         "a.project_id AS raw_project_id"
@@ -1637,6 +1664,19 @@ fn fetch_agent_list_rows(conn: &DbConn) -> Vec<AgentListRow> {
     } else {
         "0".to_string()
     };
+    let mut lifecycle_predicates = Vec::with_capacity(2);
+    if has_retired_at {
+        lifecycle_predicates.push("a.retired_at IS NULL");
+    }
+    if has_deregistration_ledger {
+        lifecycle_predicates
+            .push("NOT EXISTS (SELECT 1 FROM agent_deregistrations d WHERE d.agent_id = a.id)");
+    }
+    let lifecycle_where = if lifecycle_predicates.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", lifecycle_predicates.join(" AND "))
+    };
     conn.query_sync(
         &format!(
             "SELECT \
@@ -1649,6 +1689,7 @@ fn fetch_agent_list_rows(conn: &DbConn) -> Vec<AgentListRow> {
                 {last_active_select} \
              FROM agents a \
              {project_join} \
+             {lifecycle_where} \
              ORDER BY {last_active_sort} DESC, a.id DESC \
              LIMIT {MAX_AGENTS}"
         ),
@@ -2597,80 +2638,100 @@ fn has_file_reservation_release_ledger(conn: &DbConn) -> bool {
     .is_ok_and(|rows| !rows.is_empty())
 }
 
-fn active_reservation_release_join_sql(
-    has_release_ledger: bool,
+/// GH#274/GH#180: SQL-side *candidate* predicate for active reservations —
+/// the cheap `released_ts`-only check with no release-ledger anti-join. The
+/// ledger anti-join (`LEFT JOIN file_reservation_releases … IS NULL`)
+/// degrades to O(N·M) under sqlmodel-frankensqlite join execution, so
+/// callers fetch candidate rows with this predicate and subtract the
+/// ledger's reservation IDs in Rust via [`ReleaseLedgerIndex`].
+fn active_reservation_candidate_sql(
+    has_legacy_released_ts_column: bool,
     table_ref: &str,
-    release_alias: &str,
 ) -> String {
-    if has_release_ledger {
-        format!(
-            " LEFT JOIN file_reservation_releases {release_alias} ON {release_alias}.reservation_id = {table_ref}.id"
-        )
+    if has_legacy_released_ts_column {
+        mcp_agent_mail_db::queries::active_reservation_candidate_predicate_for(table_ref)
     } else {
-        String::new()
+        "1 = 1".to_string()
     }
 }
 
-fn legacy_active_reservation_predicate_sql(
-    table_ref: &str,
-    has_legacy_released_ts_column: bool,
-) -> String {
-    if !has_legacy_released_ts_column {
-        return "1 = 1".to_string();
-    }
-    let table_ref = table_ref.trim().trim_end_matches('.');
-    let predicate = mcp_agent_mail_db::queries::ACTIVE_RESERVATION_LEGACY_PREDICATE;
-    if table_ref.is_empty() || table_ref == "file_reservations" {
-        predicate.to_string()
+/// Select expression for the legacy `released_ts` column, or SQL `NULL` on
+/// schemas that dropped it. Ledger release timestamps are merged in Rust via
+/// [`ReleaseLedgerIndex`], mirroring the former SQL
+/// `COALESCE(ledger.released_ts, fr.released_ts)`.
+fn legacy_released_ts_select_sql(has_legacy_released_ts_column: bool, table_ref: &str) -> String {
+    if has_legacy_released_ts_column {
+        format!("{table_ref}.released_ts")
     } else {
-        predicate.replace("released_ts", &format!("{table_ref}.released_ts"))
+        "NULL".to_string()
     }
 }
 
-fn active_reservation_filter_sql(
-    has_release_ledger: bool,
-    has_legacy_released_ts_column: bool,
-    table_ref: &str,
-    release_alias: &str,
-) -> String {
-    let legacy = legacy_active_reservation_predicate_sql(table_ref, has_legacy_released_ts_column);
-    match (has_release_ledger, has_legacy_released_ts_column) {
-        (true, true) => format!("({legacy}) AND {release_alias}.reservation_id IS NULL"),
-        (true, false) => format!("{release_alias}.reservation_id IS NULL"),
-        (false, _) => legacy,
-    }
+/// In-memory image of the `file_reservation_releases` sidecar ledger
+/// (GH#274): fetched once per poll (a two-column scan, cheap in any engine)
+/// so reservation queries can subtract released rows in Rust instead of via
+/// the O(N·M) SQL anti-join. Ledger membership marks a reservation released
+/// regardless of the stored timestamp, matching the former
+/// `release.reservation_id IS NULL` filter.
+#[derive(Debug, Default)]
+struct ReleaseLedgerIndex {
+    released_ts_by_id: HashMap<i64, Value>,
 }
 
-fn reservation_released_ts_sql(
-    has_release_ledger: bool,
-    has_legacy_released_ts_column: bool,
-    table_ref: &str,
-    release_alias: &str,
-) -> String {
-    let table_ref = table_ref.trim().trim_end_matches('.');
-    let legacy_release_expr =
-        has_legacy_released_ts_column.then(|| format!("{table_ref}.released_ts"));
-    match (has_release_ledger, legacy_release_expr) {
-        (true, Some(legacy_release_expr)) => {
-            format!("COALESCE({release_alias}.released_ts, {legacy_release_expr})")
+impl ReleaseLedgerIndex {
+    fn fetch(conn: &DbConn, has_release_ledger: bool) -> Option<Self> {
+        if !has_release_ledger {
+            return Some(Self::default());
         }
-        (true, None) => format!("{release_alias}.released_ts"),
-        (false, Some(legacy_release_expr)) => legacy_release_expr,
-        (false, None) => "NULL".to_string(),
+        let rows = match conn.query_sync(
+            "SELECT reservation_id, released_ts FROM file_reservation_releases",
+            &[],
+        ) {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::debug!(
+                    error = ?err,
+                    "tui_poller release ledger query failed"
+                );
+                return None;
+            }
+        };
+        let mut released_ts_by_id = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let Some(id) = parse_raw_i64(row, "reservation_id") else {
+                continue;
+            };
+            let value = row
+                .get_by_name("released_ts")
+                .cloned()
+                .unwrap_or(Value::Null);
+            released_ts_by_id.insert(id, value);
+        }
+        Some(Self { released_ts_by_id })
+    }
+
+    fn contains(&self, reservation_id: i64) -> bool {
+        self.released_ts_by_id.contains_key(&reservation_id)
+    }
+
+    /// Row-level released check equivalent to the former SQL
+    /// `COALESCE(ledger.released_ts, fr.released_ts)` feeding
+    /// [`released_ts_is_active`]: a non-NULL ledger value wins, a NULL (or
+    /// absent) ledger value falls back to the row's legacy column.
+    fn row_released_value_is_active(
+        &self,
+        reservation_id: Option<i64>,
+        legacy_raw: Option<&Value>,
+    ) -> bool {
+        match reservation_id.and_then(|id| self.released_ts_by_id.get(&id)) {
+            Some(Value::Null) | None => released_ts_is_active(legacy_raw),
+            Some(ledger_value) => released_ts_is_active(Some(ledger_value)),
+        }
     }
 }
 
-fn reservation_legacy_scan_sql(
-    has_release_ledger: bool,
-    has_legacy_released_ts_column: bool,
-) -> String {
-    let release_join = active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let released_ts_sql = reservation_released_ts_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        "rr",
-    );
+fn reservation_legacy_scan_sql(has_legacy_released_ts_column: bool) -> String {
+    let released_ts_sql = legacy_released_ts_select_sql(has_legacy_released_ts_column, "fr");
     format!(
         "SELECT \
            fr.id, \
@@ -2682,23 +2743,14 @@ fn reservation_legacy_scan_sql(
            fr.created_ts AS raw_created_ts, \
            fr.expires_ts AS raw_expires_ts, \
            {released_ts_sql} AS raw_released_ts \
-         FROM file_reservations fr{release_join} \
+         FROM file_reservations fr \
          LEFT JOIN projects p ON p.id = fr.project_id \
          LEFT JOIN agents a ON a.id = fr.agent_id"
     )
 }
 
-fn reservation_legacy_scan_minimal_sql(
-    has_release_ledger: bool,
-    has_legacy_released_ts_column: bool,
-) -> String {
-    let release_join = active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let released_ts_sql = reservation_released_ts_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        "rr",
-    );
+fn reservation_legacy_scan_minimal_sql(has_legacy_released_ts_column: bool) -> String {
+    let released_ts_sql = legacy_released_ts_select_sql(has_legacy_released_ts_column, "fr");
     format!(
         "SELECT \
            fr.id, \
@@ -2708,27 +2760,17 @@ fn reservation_legacy_scan_minimal_sql(
            fr.created_ts AS raw_created_ts, \
            fr.expires_ts AS raw_expires_ts, \
            {released_ts_sql} AS raw_released_ts \
-         FROM file_reservations fr{release_join}"
+         FROM file_reservations fr"
     )
 }
 
-fn reservation_active_fast_snapshots_sql(
-    has_release_ledger: bool,
-    has_legacy_released_ts_column: bool,
-) -> String {
-    let release_join = active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let active_reservation_predicate = active_reservation_filter_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        "rr",
-    );
-    let released_ts_sql = reservation_released_ts_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        "rr",
-    );
+// GH#274: the fast-path queries fetch *candidate* rows (released_ts-only
+// predicate, no ledger anti-join); callers subtract ledger-released rows in
+// Rust. The former SQL `LIMIT {MAX_RESERVATIONS}` moved to Rust for the same
+// reason — a SQL limit over candidates could under-fill after subtraction.
+fn reservation_active_fast_snapshots_sql(has_legacy_released_ts_column: bool) -> String {
+    let active_reservation_predicate =
+        active_reservation_candidate_sql(has_legacy_released_ts_column, "fr");
     format!(
         "SELECT \
            fr.id, \
@@ -2738,34 +2780,18 @@ fn reservation_active_fast_snapshots_sql(
            fr.path_pattern, \
            fr.\"exclusive\", \
            fr.created_ts AS raw_created_ts, \
-           fr.expires_ts AS raw_expires_ts, \
-           {released_ts_sql} AS raw_released_ts \
-         FROM file_reservations fr{release_join} \
+           fr.expires_ts AS raw_expires_ts \
+         FROM file_reservations fr \
          LEFT JOIN projects p ON p.id = fr.project_id \
          LEFT JOIN agents a ON a.id = fr.agent_id \
          WHERE ({active_reservation_predicate}) AND expires_ts > ? \
-         ORDER BY fr.expires_ts ASC, fr.id ASC \
-         LIMIT {MAX_RESERVATIONS}"
+         ORDER BY fr.expires_ts ASC, fr.id ASC"
     )
 }
 
-fn reservation_active_fast_snapshots_minimal_sql(
-    has_release_ledger: bool,
-    has_legacy_released_ts_column: bool,
-) -> String {
-    let release_join = active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let active_reservation_predicate = active_reservation_filter_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        "rr",
-    );
-    let released_ts_sql = reservation_released_ts_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        "rr",
-    );
+fn reservation_active_fast_snapshots_minimal_sql(has_legacy_released_ts_column: bool) -> String {
+    let active_reservation_predicate =
+        active_reservation_candidate_sql(has_legacy_released_ts_column, "fr");
     format!(
         "SELECT \
            fr.id, \
@@ -2773,33 +2799,22 @@ fn reservation_active_fast_snapshots_minimal_sql(
            fr.path_pattern, \
            fr.\"exclusive\", \
            fr.created_ts AS raw_created_ts, \
-           fr.expires_ts AS raw_expires_ts, \
-           {released_ts_sql} AS raw_released_ts \
-         FROM file_reservations fr{release_join} \
+           fr.expires_ts AS raw_expires_ts \
+         FROM file_reservations fr \
          WHERE ({active_reservation_predicate}) AND expires_ts > ? \
-         ORDER BY fr.expires_ts ASC, fr.id ASC \
-         LIMIT {MAX_RESERVATIONS}"
+         ORDER BY fr.expires_ts ASC, fr.id ASC"
     )
 }
 
-fn reservation_active_fast_counts_sql(
-    has_release_ledger: bool,
-    has_legacy_released_ts_column: bool,
-) -> String {
-    let release_join = active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let active_reservation_predicate = active_reservation_filter_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        "rr",
-    );
+fn reservation_active_fast_counts_sql(has_legacy_released_ts_column: bool) -> String {
+    let active_reservation_predicate =
+        active_reservation_candidate_sql(has_legacy_released_ts_column, "fr");
     format!(
         "SELECT \
            fr.project_id AS raw_project_id, \
-           COUNT(*) AS active_count \
-         FROM file_reservations fr{release_join} \
-         WHERE ({active_reservation_predicate}) AND expires_ts > ? \
-         GROUP BY fr.project_id"
+           fr.id AS id \
+         FROM file_reservations fr \
+         WHERE ({active_reservation_predicate}) AND expires_ts > ?"
     )
 }
 
@@ -2971,19 +2986,20 @@ fn try_fetch_reservation_snapshot_bundle(
 ) -> Option<ReservationSnapshotBundle> {
     let has_release_ledger = has_file_reservation_release_ledger(conn);
     let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
+    let release_ledger = ReleaseLedgerIndex::fetch(conn, has_release_ledger)?;
     let scan_mode = reservation_scan_mode(conn, sqlite_path);
     if scan_mode == ReservationScanMode::ActiveFast {
         return try_fetch_reservation_snapshot_bundle_fast(
             conn,
             now,
-            has_release_ledger,
+            &release_ledger,
             has_legacy_released_ts_column,
         );
     }
     let rows = match scan_mode {
         ReservationScanMode::ActiveFast => unreachable!("handled by fast-path early return"),
         ReservationScanMode::FullLegacy => conn.query_sync(
-            &reservation_legacy_scan_sql(has_release_ledger, has_legacy_released_ts_column),
+            &reservation_legacy_scan_sql(has_legacy_released_ts_column),
             &[],
         ),
     };
@@ -2996,10 +3012,7 @@ fn try_fetch_reservation_snapshot_bundle(
                 "tui_poller.fetch_reservation_snapshots query failed; falling back to minimal reservation rows"
             );
             match conn.query_sync(
-                &reservation_legacy_scan_minimal_sql(
-                    has_release_ledger,
-                    has_legacy_released_ts_column,
-                ),
+                &reservation_legacy_scan_minimal_sql(has_legacy_released_ts_column),
                 &[],
             ) {
                 Ok(rows) => rows,
@@ -3024,7 +3037,14 @@ fn try_fetch_reservation_snapshot_bundle(
     let mut snapshots = BinaryHeap::new();
 
     for row in rows {
-        if !is_active_reservation_row(&row, now, "raw_expires_ts", "raw_released_ts") {
+        // Former SQL COALESCE(ledger.released_ts, fr.released_ts) merge, now
+        // in Rust: a non-NULL ledger entry for this row wins over the legacy
+        // column (GH#274).
+        let row_id = parse_raw_i64(&row, "id");
+        let row_is_active = parse_raw_ts(&row, "raw_expires_ts") > now
+            && release_ledger
+                .row_released_value_is_active(row_id, row.get_by_name("raw_released_ts"));
+        if !row_is_active {
             continue;
         }
 
@@ -3100,11 +3120,11 @@ fn try_fetch_reservation_snapshot_bundle(
 fn try_fetch_reservation_snapshot_bundle_fast(
     conn: &DbConn,
     now: i64,
-    has_release_ledger: bool,
+    release_ledger: &ReleaseLedgerIndex,
     has_legacy_released_ts_column: bool,
 ) -> Option<ReservationSnapshotBundle> {
     let count_rows = match conn.query_sync(
-        &reservation_active_fast_counts_sql(has_release_ledger, has_legacy_released_ts_column),
+        &reservation_active_fast_counts_sql(has_legacy_released_ts_column),
         &[Value::BigInt(now)],
     ) {
         Ok(rows) => rows,
@@ -3121,19 +3141,17 @@ fn try_fetch_reservation_snapshot_bundle_fast(
     let mut active_count = 0_u64;
     let mut active_counts_by_project: HashMap<i64, u64> = HashMap::new();
     for row in count_rows {
+        // Candidate rows: subtract ledger-released reservations in Rust
+        // (GH#274).
+        if parse_raw_i64(&row, "id").is_some_and(|id| release_ledger.contains(id)) {
+            continue;
+        }
         let Some(project_id) = parse_raw_i64(&row, "raw_project_id") else {
             continue;
         };
-        let count = row
-            .get_named::<i64>("active_count")
-            .ok()
-            .and_then(|value| u64::try_from(value.max(0)).ok())
-            .unwrap_or(0);
-        if count == 0 {
-            continue;
-        }
-        active_counts_by_project.insert(project_id, count);
-        active_count = active_count.saturating_add(count);
+        let count = active_counts_by_project.entry(project_id).or_insert(0_u64);
+        *count = (*count).saturating_add(1);
+        active_count = active_count.saturating_add(1);
     }
 
     if MAX_RESERVATIONS == 0 || active_count == 0 {
@@ -3145,7 +3163,7 @@ fn try_fetch_reservation_snapshot_bundle_fast(
     }
 
     let snapshot_rows = match conn.query_sync(
-        &reservation_active_fast_snapshots_sql(has_release_ledger, has_legacy_released_ts_column),
+        &reservation_active_fast_snapshots_sql(has_legacy_released_ts_column),
         &[Value::BigInt(now)],
     ) {
         Ok(rows) => rows,
@@ -3156,10 +3174,7 @@ fn try_fetch_reservation_snapshot_bundle_fast(
                 "tui_poller.fetch_reservation_snapshots snapshot query failed; falling back to minimal reservation rows"
             );
             match conn.query_sync(
-                &reservation_active_fast_snapshots_minimal_sql(
-                    has_release_ledger,
-                    has_legacy_released_ts_column,
-                ),
+                &reservation_active_fast_snapshots_minimal_sql(has_legacy_released_ts_column),
                 &[Value::BigInt(now)],
             ) {
                 Ok(rows) => rows,
@@ -3181,9 +3196,17 @@ fn try_fetch_reservation_snapshot_bundle_fast(
 
     let mut snapshots = Vec::with_capacity(snapshot_rows.len().min(MAX_RESERVATIONS));
     for row in snapshot_rows {
+        // Rust-side replacements for the former SQL ledger anti-join and
+        // LIMIT (GH#274): skip ledger-released candidates, stop at the cap.
+        if snapshots.len() >= MAX_RESERVATIONS {
+            break;
+        }
         let Some(id) = parse_raw_i64(&row, "id") else {
             continue;
         };
+        if release_ledger.contains(id) {
+            continue;
+        }
         let path_pattern = row
             .get_named::<String>("path_pattern")
             .ok()
@@ -5533,6 +5556,26 @@ first body
     }
 
     #[test]
+    fn reservation_scan_sql_never_reintroduces_release_ledger_anti_join() {
+        // GH#274/GH#180: the ledger anti-join degrades to O(N·M) under
+        // sqlmodel-frankensqlite; the ledger subtraction lives in Rust now.
+        for has_legacy in [true, false] {
+            for sql in [
+                reservation_legacy_scan_sql(has_legacy),
+                reservation_legacy_scan_minimal_sql(has_legacy),
+                reservation_active_fast_snapshots_sql(has_legacy),
+                reservation_active_fast_snapshots_minimal_sql(has_legacy),
+                reservation_active_fast_counts_sql(has_legacy),
+            ] {
+                assert!(
+                    !sql.contains("file_reservation_releases"),
+                    "ledger anti-join reintroduced in: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn max_constants_are_positive() {
         const {
             assert!(MAX_AGENTS > 0);
@@ -5964,6 +6007,50 @@ first body
         assert_eq!(agents[0].name, "NewAgent");
         assert_eq!(agents[1].name, "MidAgent");
         assert_eq!(agents[2].name, "OldAgent");
+    }
+
+    #[test]
+    fn fetch_agents_list_excludes_retired_and_deregistered_identities() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_agents_lifecycle_filter.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                program TEXT,
+                last_active_ts INTEGER,
+                retired_at INTEGER
+            )",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE agent_deregistrations (
+                agent_id INTEGER PRIMARY KEY,
+                deregistered_at INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .expect("create lifecycle ledger");
+        conn.execute_sync(
+            "INSERT INTO agents (id, name, program, last_active_ts, retired_at) VALUES
+             (1, 'ActiveAgent', 'codex', 100, NULL),
+             (2, 'RetiredAgent', 'codex', 300, 200),
+             (3, 'GoneAgent', 'codex', 400, NULL)",
+            &[],
+        )
+        .expect("insert agents");
+        conn.execute_sync(
+            "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (3, 250)",
+            &[],
+        )
+        .expect("insert deregistration");
+
+        let agents = fetch_agents_list(&conn);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "ActiveAgent");
     }
 
     #[test]

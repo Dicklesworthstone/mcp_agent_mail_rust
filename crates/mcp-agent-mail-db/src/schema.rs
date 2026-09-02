@@ -57,10 +57,19 @@ CREATE TABLE IF NOT EXISTS agents (
     contact_policy TEXT NOT NULL DEFAULT 'auto',
     reaper_exempt INTEGER NOT NULL DEFAULT 0,
     registration_token TEXT,
+    retired_at INTEGER,
     UNIQUE(project_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_agents_project_name ON agents(project_id, name);
 CREATE INDEX IF NOT EXISTS idx_agents_last_active_id_desc ON agents(last_active_ts DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_agents_project_active ON agents(project_id, retired_at, last_active_ts DESC);
+
+-- Explicit deregistration ledger. Agent rows and all message history remain intact.
+CREATE TABLE IF NOT EXISTS agent_deregistrations (
+    agent_id INTEGER PRIMARY KEY REFERENCES agents(id),
+    deregistered_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_deregistrations_ts ON agent_deregistrations(deregistered_at);
 
 -- Messages table
 CREATE TABLE IF NOT EXISTS messages (
@@ -68,6 +77,7 @@ CREATE TABLE IF NOT EXISTS messages (
     project_id INTEGER NOT NULL REFERENCES projects(id),
     sender_id INTEGER NOT NULL REFERENCES agents(id),
     thread_id TEXT,
+    topic TEXT COLLATE NOCASE,
     subject TEXT NOT NULL,
     body_md TEXT NOT NULL,
     importance TEXT NOT NULL DEFAULT 'normal',
@@ -79,6 +89,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_project_created ON messages(project_id, created_ts);
 CREATE INDEX IF NOT EXISTS idx_messages_project_sender_created ON messages(project_id, sender_id, created_ts);
 CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id);
+CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages(project_id, topic);
 CREATE INDEX IF NOT EXISTS idx_messages_importance ON messages(importance);
 CREATE INDEX IF NOT EXISTS idx_messages_created_ts ON messages(created_ts);
 CREATE INDEX IF NOT EXISTS idx_msg_thread_created ON messages(thread_id, created_ts);
@@ -540,6 +551,7 @@ const TRG_INBOX_DELIVERY_EVENTS_RECIPIENT_INSERT_SQL: &str = "CREATE TRIGGER IF 
 #[allow(clippy::too_many_lines)]
 pub fn schema_migrations() -> Vec<Migration> {
     let mut migrations: Vec<Migration> = Vec::new();
+    let mut deferred_column_dependent_indexes: Vec<Migration> = Vec::new();
 
     for chunk in CREATE_TABLES_SQL.split(';') {
         let stmt = chunk.trim();
@@ -551,7 +563,16 @@ pub fn schema_migrations() -> Vec<Migration> {
             continue;
         };
 
-        migrations.push(Migration::new(id, desc, stmt.to_string(), String::new()));
+        let migration = Migration::new(id, desc, stmt.to_string(), String::new());
+        if matches!(
+            migration.id.as_str(),
+            "v1_create_index_idx_agents_project_active"
+                | "v1_create_index_idx_messages_project_topic"
+        ) {
+            deferred_column_dependent_indexes.push(migration);
+        } else {
+            migrations.push(migration);
+        }
     }
 
     // Drop legacy Python FTS triggers that conflict with the Rust triggers below.
@@ -582,19 +603,7 @@ pub fn schema_migrations() -> Vec<Migration> {
     // The Python schema used SQLAlchemy DATETIME columns that store ISO-8601 strings
     // like "2026-02-04 22:13:11.079199", but the Rust port expects i64 microseconds.
     // The conversion: strftime('%s', text) * 1000000 + fractional_micros
-    let ts_conversion = |col: &str| -> String {
-        format!(
-            "CASE \
-                 WHEN trim({col}) <> '' AND trim({col}) NOT GLOB '*[^0-9]*' \
-                 THEN CAST(trim({col}) AS INTEGER) \
-                 ELSE CAST(strftime('%s', {col}) AS INTEGER) * 1000000 + \
-                      CASE WHEN instr({col}, '.') > 0 \
-                           THEN CAST(substr({col} || '000000', instr({col}, '.') + 1, 6) AS INTEGER) \
-                           ELSE 0 \
-                      END \
-             END"
-        )
-    };
+    let ts_conversion = legacy_text_timestamp_to_micros_sql;
 
     // projects.created_at
     migrations.push(Migration::new(
@@ -2274,6 +2283,76 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // ── v27: durable message topics (GH#259) ──────────────────────────
+    //
+    // Topics are optional, case-insensitive tags. They are stored directly on
+    // the canonical message row so inbox filtering, replies, archive rebuilds,
+    // and cross-process readers all observe the same value.
+    migrations.push(Migration::new(
+        "v27_add_topic_to_messages".to_string(),
+        "GH#259: add optional case-insensitive topic tag to messages".to_string(),
+        "ALTER TABLE messages ADD COLUMN topic TEXT COLLATE NOCASE".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v27_idx_messages_project_topic".to_string(),
+        "GH#259: index case-insensitive message topic lookups by project".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_messages_project_topic \
+         ON messages(project_id, topic)"
+            .to_string(),
+        String::new(),
+    ));
+
+    // ── v28: durable agent lifecycle state (GH#255) ───────────────
+    migrations.push(Migration::new(
+        "v28_add_retired_at_to_agents".to_string(),
+        "GH#255: add reversible agent retirement timestamp".to_string(),
+        "ALTER TABLE agents ADD COLUMN retired_at INTEGER".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v28_create_agent_deregistrations".to_string(),
+        "GH#255: create explicit history-preserving deregistration ledger".to_string(),
+        "CREATE TABLE IF NOT EXISTS agent_deregistrations (\
+            agent_id INTEGER PRIMARY KEY REFERENCES agents(id),\
+            deregistered_at INTEGER NOT NULL\
+        )"
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v28_idx_agents_project_active".to_string(),
+        "GH#255: index active roster filtering".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_agents_project_active \
+         ON agents(project_id, retired_at, last_active_ts DESC)"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v28_idx_agent_deregistrations_ts".to_string(),
+        "GH#255: index deregistration audit chronology".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_agent_deregistrations_ts \
+         ON agent_deregistrations(deregistered_at)"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v28_backfill_agent_deregistrations".to_string(),
+        "GH#255: recognize Python deregistration tombstones during upgrade".to_string(),
+        "INSERT OR IGNORE INTO agent_deregistrations (agent_id, deregistered_at) \
+         SELECT id, last_active_ts FROM agents \
+         WHERE task_description LIKE '[DEREGISTERED %'"
+            .to_string(),
+        String::new(),
+    ));
+
+    // These indexes are also present in the latest static DDL, which gives
+    // them generated v1 migration IDs. On an existing pre-v27/v28 database,
+    // however, their columns do not exist until the explicit evolution
+    // migrations above run. Keep the generated IDs, but record them only after
+    // the column migrations and their canonical indexes are satisfied.
+    migrations.extend(deferred_column_dependent_indexes);
+
     migrations
 }
 
@@ -2530,6 +2609,23 @@ pub fn enforce_runtime_fts_cleanup(conn: &DbConn) -> std::result::Result<(), Sql
         conn.execute_raw(&migration.up)?;
     }
     // Also drop fts_messages table itself
+    conn.execute_raw("DROP TABLE IF EXISTS fts_messages")?;
+    Ok(())
+}
+
+/// Canonical-SQLite variant of [`enforce_runtime_fts_cleanup`].
+///
+/// Recovery staging paths must never be opened through FrankenSQLite because
+/// its persistent namespace records make a subsequently renamed candidate
+/// ambiguous. Archive restore uses this variant while converting a private
+/// staged legacy database to the runtime's FTS-free schema.
+#[allow(clippy::result_large_err)]
+pub fn enforce_runtime_fts_cleanup_canonical(
+    conn: &crate::CanonicalDbConn,
+) -> std::result::Result<(), SqlError> {
+    for migration in base_trigger_cleanup_migrations() {
+        conn.execute_raw(&migration.up)?;
+    }
     conn.execute_raw("DROP TABLE IF EXISTS fts_messages")?;
     Ok(())
 }
@@ -4045,6 +4141,86 @@ pub async fn migration_status<C: Connection>(
     migration_runner().status(cx, conn).await
 }
 
+/// SQL expression converting one legacy TEXT timestamp column to i64
+/// microseconds.
+///
+/// Handles both numeric strings (returned verbatim as integers) and ISO-8601
+/// datetime strings ("2026-02-04 22:13:11.079199"), preserving fractional
+/// microseconds. Shared by the one-shot v3 text-timestamp migrations and the
+/// per-boot `file_reservations` repair (GH#265).
+#[must_use]
+pub fn legacy_text_timestamp_to_micros_sql(col: &str) -> String {
+    format!(
+        "CASE \
+             WHEN trim({col}) <> '' AND trim({col}) NOT GLOB '*[^0-9]*' \
+             THEN CAST(trim({col}) AS INTEGER) \
+             ELSE CAST(strftime('%s', {col}) AS INTEGER) * 1000000 + \
+                  CASE WHEN instr({col}, '.') > 0 \
+                       THEN CAST(substr({col} || '000000', instr({col}, '.') + 1, 6) AS INTEGER) \
+                       ELSE 0 \
+                  END \
+         END"
+    )
+}
+
+/// GH#265: normalize TEXT timestamps in `file_reservations` on every startup,
+/// not only in the one-shot `v3_fix_file_reservations_text_timestamps`
+/// migration.
+///
+/// The one-shot migration repairs contamination that exists when it first
+/// runs, but it is recorded as applied and never runs again — so TEXT
+/// timestamps introduced *after* that point (e.g. a legacy import into an
+/// already-migrated database) survive indefinitely. A TEXT `expires_ts` in the
+/// INTEGER-affinity column numerically coerces to its leading digits
+/// ("2026-08-…" -> 2026) under `expires_ts > <now_micros>`, so `active`/`list`
+/// reads silently hide a still-held reservation while `release` (which does
+/// not apply that predicate) still finds it.
+///
+/// The probe is a read-only scan of the small `file_reservations` table; the
+/// UPDATE only runs when contamination is actually present, so clean databases
+/// pay one cheap SELECT per startup and no write.
+///
+/// Returns the number of repaired rows.
+pub async fn repair_file_reservation_text_timestamps<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<u64, SqlError> {
+    const PROBE_SQL: &str = "SELECT COUNT(*) AS contaminated FROM file_reservations \
+         WHERE typeof(created_ts) = 'text' \
+            OR typeof(expires_ts) = 'text' \
+            OR typeof(released_ts) = 'text'";
+    let contaminated = match conn.query(cx, PROBE_SQL, &[]).await {
+        Outcome::Ok(rows) => rows
+            .first()
+            .and_then(|row| row.get_named::<i64>("contaminated").ok())
+            .unwrap_or(0),
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    if contaminated <= 0 {
+        return Outcome::Ok(0);
+    }
+    let update_sql = format!(
+        "UPDATE file_reservations SET \
+         created_ts = CASE WHEN typeof(created_ts) = 'text' THEN ({}) ELSE created_ts END, \
+         expires_ts = CASE WHEN typeof(expires_ts) = 'text' THEN ({}) ELSE expires_ts END, \
+         released_ts = CASE WHEN typeof(released_ts) = 'text' THEN ({}) ELSE released_ts END \
+         WHERE typeof(created_ts) = 'text' \
+            OR typeof(expires_ts) = 'text' \
+            OR typeof(released_ts) = 'text'",
+        legacy_text_timestamp_to_micros_sql("created_ts"),
+        legacy_text_timestamp_to_micros_sql("expires_ts"),
+        legacy_text_timestamp_to_micros_sql("released_ts")
+    );
+    match conn.execute(cx, &update_sql, &[]).await {
+        Outcome::Ok(affected) => Outcome::Ok(affected),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
 pub async fn migrate_to_latest<C: Connection>(cx: &Cx, conn: &C) -> Outcome<Vec<String>, SqlError> {
     match init_migrations_table(cx, conn).await {
         Outcome::Ok(()) => {}
@@ -4069,6 +4245,22 @@ pub async fn migrate_to_latest<C: Connection>(cx: &Cx, conn: &C) -> Outcome<Vec<
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         }
     };
+    // GH#265: runs every startup (idempotent, cheap read-only probe on clean
+    // databases) so TEXT-timestamp contamination introduced after the one-shot
+    // v3 migration cannot silently hide still-held reservations from
+    // `active`/`list` reads.
+    match repair_file_reservation_text_timestamps(cx, conn).await {
+        Outcome::Ok(0) => {}
+        Outcome::Ok(repaired) => {
+            tracing::info!(
+                repaired,
+                "normalized legacy TEXT timestamps in file_reservations at startup (GH#265)"
+            );
+        }
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
     match ensure_inbox_stats_insert_trigger_compat(cx, conn).await {
         Outcome::Ok(()) => Outcome::Ok(applied),
         Outcome::Err(e) => Outcome::Err(e),
@@ -4112,6 +4304,22 @@ pub async fn migrate_to_latest_base<C: Connection>(
 
     match enforce_base_mode_cleanup_async(cx, conn).await {
         Outcome::Ok(()) => {}
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
+    // GH#265: runs every startup (idempotent, cheap read-only probe on clean
+    // databases) so TEXT-timestamp contamination introduced after the one-shot
+    // v3 migration cannot silently hide still-held reservations from
+    // `active`/`list` reads.
+    match repair_file_reservation_text_timestamps(cx, conn).await {
+        Outcome::Ok(0) => {}
+        Outcome::Ok(repaired) => {
+            tracing::info!(
+                repaired,
+                "normalized legacy TEXT timestamps in file_reservations at startup (GH#265)"
+            );
+        }
         Outcome::Err(e) => return Outcome::Err(e),
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
@@ -4419,6 +4627,126 @@ mod tests {
     }
 
     #[test]
+    fn repair_normalizes_text_file_reservation_timestamps_every_boot() {
+        // GH#265: TEXT timestamps introduced AFTER the one-shot v3 migration
+        // ran (e.g. by a legacy import into an already-migrated database) must
+        // be normalized on the next startup, restoring the schema's INTEGER
+        // invariant that the `active`/`list` predicates rely on.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("gh265_text_expires_repair.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        conn.execute_raw(PRAGMA_SETTINGS_SQL)
+            .expect("apply PRAGMAs");
+
+        // First boot: full schema + migrations. The one-shot text-timestamp
+        // migration is recorded as applied from here on.
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap()
+            }
+        });
+
+        conn.execute_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
+            &[
+                Value::Text("gh265-proj".to_string()),
+                Value::Text("/tmp/gh265-proj".to_string()),
+                Value::BigInt(1),
+            ],
+        )
+        .expect("insert project");
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, program, model, task_description, \
+             inception_ts, last_active_ts, attachments_policy, contact_policy) \
+             VALUES (1, 'CoralMarsh', 'test', 'test', '', 1, 1, 'auto', 'auto')",
+            &[],
+        )
+        .expect("insert agent");
+        // Contaminated row: ISO-8601 TEXT in the INTEGER-affinity columns.
+        conn.execute_raw(
+            "INSERT INTO file_reservations \
+             (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
+             VALUES (1, 1, 'src/**', 1, 'gh265', '2026-02-24 15:33:00', '2027-12-24 15:33:00.500000', NULL)",
+        )
+        .expect("insert contaminated reservation");
+
+        // The row is stored as TEXT — the contamination GH#265 reports.
+        // Engines differ on how an INTEGER-affinity comparison treats a
+        // non-numeric TEXT value (canonical SQLite orders TEXT above every
+        // INTEGER, while numeric coercion hides the row), and typed i64
+        // decodes of the row are broken either way — so the repaired
+        // invariant, not any one comparison outcome, is the contract here.
+        let contaminated = conn
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM file_reservations WHERE typeof(expires_ts) = 'text'",
+                &[],
+            )
+            .expect("probe contaminated reservation");
+        assert_eq!(
+            contaminated[0].get_named::<i64>("c").unwrap_or(-1),
+            1,
+            "fixture must store a TEXT expires_ts before repair"
+        );
+
+        // Second boot: the migration set is already complete, but the per-boot
+        // repair must still normalize the contaminated row.
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap()
+            }
+        });
+
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(created_ts) AS t_created, typeof(expires_ts) AS t_expires, \
+                 expires_ts FROM file_reservations",
+                &[],
+            )
+            .expect("query repaired reservation");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get_named::<String>("t_created").unwrap_or_default(),
+            "integer"
+        );
+        assert_eq!(
+            rows[0].get_named::<String>("t_expires").unwrap_or_default(),
+            "integer"
+        );
+        let expires = rows[0].get_named::<i64>("expires_ts").unwrap_or(0);
+        assert!(
+            (1_820_000_000_000_000..1_860_000_000_000_000).contains(&expires),
+            "repaired expires_ts should be 2027-12-24 in epoch micros, got {expires}"
+        );
+        assert_eq!(
+            expires % 1_000_000,
+            500_000,
+            "fractional microseconds must be preserved, got {expires}"
+        );
+
+        // The active-reservation read predicate now sees the held reservation.
+        let visible = conn
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM file_reservations WHERE expires_ts > ?",
+                &[Value::BigInt(1_700_000_000_000_000)],
+            )
+            .expect("probe repaired reservation");
+        assert_eq!(
+            visible[0].get_named::<i64>("c").unwrap_or(-1),
+            1,
+            "repaired reservation must be visible to the active predicate"
+        );
+    }
+
+    #[test]
     fn add_column_migration_records_when_column_already_exists() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrations_duplicate_column_reconcile.db");
@@ -4466,6 +4794,200 @@ mod tests {
             )
             .expect("query migration row");
         assert_eq!(rows.len(), 1, "expected migration row to be recorded");
+    }
+
+    #[test]
+    fn topic_migrations_upgrade_legacy_messages_and_filter_case_insensitively() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("topic_migration.db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open connection");
+
+        conn.execute_raw(
+            "CREATE TABLE messages (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                project_id INTEGER NOT NULL,\
+                subject TEXT NOT NULL\
+            )",
+        )
+        .expect("create legacy messages table");
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init migrations table");
+                for migration in [
+                    Migration::new(
+                        "v27_add_topic_to_messages".to_string(),
+                        "add optional topic tag to messages".to_string(),
+                        "ALTER TABLE messages ADD COLUMN topic TEXT COLLATE NOCASE".to_string(),
+                        String::new(),
+                    ),
+                    Migration::new(
+                        "v27_idx_messages_project_topic".to_string(),
+                        "index message topics by project".to_string(),
+                        "CREATE INDEX IF NOT EXISTS idx_messages_project_topic \
+                         ON messages(project_id, topic)"
+                            .to_string(),
+                        String::new(),
+                    ),
+                ] {
+                    run_single_migration_with_lock_retry(&cx, conn, &migration)
+                        .await
+                        .into_result()
+                        .expect("apply topic migration");
+                }
+            }
+        });
+
+        conn.execute_raw(
+            "INSERT INTO messages (project_id, subject, topic) \
+             VALUES (7, 'migration witness', 'Br-Abc.1')",
+        )
+        .expect("insert topic witness");
+
+        let topic_columns = conn
+            .query_sync("PRAGMA table_info(messages)", &[])
+            .expect("inspect message columns");
+        assert!(
+            topic_columns
+                .iter()
+                .any(|row| { row.get_named::<String>("name").ok().as_deref() == Some("topic") }),
+            "topic column should exist after migration"
+        );
+
+        let indexes = conn
+            .query_sync("PRAGMA index_list(messages)", &[])
+            .expect("inspect message indexes");
+        assert!(
+            indexes.iter().any(|row| {
+                row.get_named::<String>("name").ok().as_deref()
+                    == Some("idx_messages_project_topic")
+            }),
+            "topic lookup index should exist after migration"
+        );
+
+        let matching = conn
+            .query_sync(
+                "SELECT id FROM messages \
+                 WHERE project_id = $1 AND topic = $2 COLLATE NOCASE",
+                &[Value::BigInt(7), Value::Text("br-abc.1".to_string())],
+            )
+            .expect("query topic case-insensitively");
+        assert_eq!(matching.len(), 1, "topic lookup should ignore ASCII case");
+    }
+
+    #[test]
+    fn column_dependent_generated_indexes_follow_column_migrations() {
+        let ordered_ids: Vec<String> = schema_migrations()
+            .into_iter()
+            .map(|migration| migration.id)
+            .collect();
+
+        for (column_migration_id, index_migration_id) in [
+            (
+                "v27_add_topic_to_messages",
+                "v27_idx_messages_project_topic",
+            ),
+            (
+                "v27_add_topic_to_messages",
+                "v1_create_index_idx_messages_project_topic",
+            ),
+            (
+                "v28_add_retired_at_to_agents",
+                "v28_idx_agents_project_active",
+            ),
+            (
+                "v28_add_retired_at_to_agents",
+                "v1_create_index_idx_agents_project_active",
+            ),
+        ] {
+            let column_position = ordered_ids
+                .iter()
+                .position(|id| id == column_migration_id)
+                .unwrap_or_else(|| panic!("missing column migration {column_migration_id}"));
+            let index_position = ordered_ids
+                .iter()
+                .position(|id| id == index_migration_id)
+                .unwrap_or_else(|| panic!("missing index migration {index_migration_id}"));
+            assert!(
+                column_position < index_position,
+                "{column_migration_id} must precede {index_migration_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_migrations_preserve_legacy_tombstones_and_add_active_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("lifecycle_migration.db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open connection");
+        conn.execute_raw(
+            "CREATE TABLE agents (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                project_id INTEGER NOT NULL,\
+                name TEXT NOT NULL,\
+                task_description TEXT NOT NULL,\
+                last_active_ts INTEGER NOT NULL\
+            )",
+        )
+        .expect("create legacy agents table");
+        conn.execute_raw(
+            "INSERT INTO agents \
+             (project_id, name, task_description, last_active_ts) VALUES \
+             (7, 'BlueLake', '[DEREGISTERED 2026-08-24T03:22:36Z] completed', 424242),\
+             (7, 'GreenCastle', 'active', 434343)",
+        )
+        .expect("insert legacy lifecycle witnesses");
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init migrations table");
+                for migration in schema_migrations_base()
+                    .into_iter()
+                    .filter(|migration| migration.id.starts_with("v28_"))
+                {
+                    run_single_migration_with_lock_retry(&cx, conn, &migration)
+                        .await
+                        .into_result()
+                        .expect("apply lifecycle migration");
+                }
+            }
+        });
+
+        let columns = conn
+            .query_sync("PRAGMA table_info(agents)", &[])
+            .expect("inspect agent columns");
+        assert!(
+            columns.iter().any(|row| {
+                row.get_named::<String>("name").ok().as_deref() == Some("retired_at")
+            })
+        );
+        let ledger = conn
+            .query_sync(
+                "SELECT d.deregistered_at \
+                 FROM agent_deregistrations d JOIN agents a ON a.id = d.agent_id \
+                 WHERE a.name = 'BlueLake'",
+                &[],
+            )
+            .expect("read lifecycle ledger");
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(
+            ledger[0].get_named::<i64>("deregistered_at").unwrap(),
+            424_242
+        );
+        let indexes = conn
+            .query_sync("PRAGMA index_list(agents)", &[])
+            .expect("inspect agent indexes");
+        assert!(indexes.iter().any(|row| {
+            row.get_named::<String>("name").ok().as_deref() == Some("idx_agents_project_active")
+        }));
     }
 
     #[test]
@@ -5852,6 +6374,98 @@ VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00'
                 .expect("projects.created_at type"),
             "integer"
         );
+
+        for (table, column) in [("messages", "topic"), ("agents", "retired_at")] {
+            let columns = conn
+                .query_sync(&format!("PRAGMA table_info({table})"), &[])
+                .unwrap_or_else(|error| panic!("inspect {table} columns: {error}"));
+            assert!(
+                columns
+                    .iter()
+                    .any(|row| { row.get_named::<String>("name").ok().as_deref() == Some(column) }),
+                "{table}.{column} must exist after the full legacy upgrade"
+            );
+        }
+
+        for (table, index) in [
+            ("messages", "idx_messages_project_topic"),
+            ("agents", "idx_agents_project_active"),
+            ("agent_deregistrations", "idx_agent_deregistrations_ts"),
+        ] {
+            let indexes = conn
+                .query_sync(&format!("PRAGMA index_list({table})"), &[])
+                .unwrap_or_else(|error| panic!("inspect {table} indexes: {error}"));
+            assert!(
+                indexes
+                    .iter()
+                    .any(|row| { row.get_named::<String>("name").ok().as_deref() == Some(index) }),
+                "{index} must exist after the full legacy upgrade"
+            );
+        }
+
+        let lifecycle_table = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'agent_deregistrations'",
+                &[],
+            )
+            .expect("inspect lifecycle table");
+        assert_eq!(
+            lifecycle_table.len(),
+            1,
+            "agent_deregistrations must exist after the full legacy upgrade"
+        );
+
+        let ledger_rows = conn
+            .query_sync(&format!("SELECT id FROM {MIGRATIONS_TABLE_NAME}"), &[])
+            .expect("read migration ledger");
+        let ledger_ids: std::collections::HashSet<String> = ledger_rows
+            .iter()
+            .filter_map(|row| row.get_named::<String>("id").ok())
+            .collect();
+        for required_id in [
+            "v1_create_index_idx_agents_project_active",
+            "v1_create_table_agent_deregistrations",
+            "v1_create_index_idx_agent_deregistrations_ts",
+            "v1_create_index_idx_messages_project_topic",
+            "v27_add_topic_to_messages",
+            "v27_idx_messages_project_topic",
+            "v28_add_retired_at_to_agents",
+            "v28_create_agent_deregistrations",
+            "v28_idx_agents_project_active",
+            "v28_idx_agent_deregistrations_ts",
+            "v28_backfill_agent_deregistrations",
+        ] {
+            assert!(
+                ledger_ids.contains(required_id),
+                "migration ledger must contain {required_id}"
+            );
+        }
+
+        for (table, expected_count) in [
+            ("agents", 2_i64),
+            ("messages", 1_i64),
+            ("message_recipients", 1_i64),
+            ("file_reservations", 1_i64),
+        ] {
+            let rows = conn
+                .query_sync(&format!("SELECT COUNT(*) AS n FROM {table}"), &[])
+                .unwrap_or_else(|error| panic!("count {table}: {error}"));
+            assert_eq!(
+                rows[0].get_named::<i64>("n").expect("row count"),
+                expected_count,
+                "legacy rows in {table} must survive the upgrade"
+            );
+        }
+
+        let integrity = conn
+            .query_sync("PRAGMA integrity_check", &[])
+            .expect("integrity_check");
+        let verdicts: Vec<String> = integrity
+            .iter()
+            .filter_map(|row| row.get_as::<String>(0).ok())
+            .collect();
+        assert_eq!(verdicts, vec!["ok".to_string()]);
     }
 
     #[test]

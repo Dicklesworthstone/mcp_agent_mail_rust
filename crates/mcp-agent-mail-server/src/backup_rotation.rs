@@ -156,6 +156,15 @@ pub fn rotate_storage_backups(
 ) -> std::io::Result<RotateReport> {
     let keep = keep_per_kind.max(MIN_KEEP_PER_KIND);
     let delete_opted_in = rotation_delete_opted_in();
+    let snapshot_primary = storage_root.join("storage.sqlite3");
+    let snapshot_metadata = mcp_agent_mail_db::snapshot::snapshot_meta_path(&snapshot_primary);
+    let snapshot_authority_occupied = match fs::symlink_metadata(&snapshot_metadata) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    };
+    let pinned_verified_snapshot = snapshot_authority_occupied
+        .then(|| mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&snapshot_primary))
+        .flatten();
 
     let mut report = RotateReport::default();
     let entries = match fs::read_dir(storage_root) {
@@ -206,16 +215,44 @@ pub fn rotate_storage_backups(
     let mut quarantine_dir = None;
 
     for (kind, mut files) in by_kind {
+        if kind == BackupKind::ManualBackup
+            && snapshot_authority_occupied
+            && pinned_verified_snapshot.is_none()
+        {
+            let summary = RotateKindSummary {
+                kept: files.len(),
+                ..Default::default()
+            };
+            warn!(
+                metadata = %snapshot_metadata.display(),
+                kept = files.len(),
+                "verified-snapshot metadata is occupied but no authoritative backup generation can be resolved; refusing manual-backup rotation"
+            );
+            report.kept = report.kept.saturating_add(summary.kept);
+            report.per_kind.insert(kind.label(), summary);
+            continue;
+        }
         // Sort descending by mtime — oldest tail will be evicted.
         files.sort_by_key(|file| std::cmp::Reverse(file.1));
-        let (to_keep, to_evict) = if files.len() > keep {
-            files.split_at(keep)
-        } else {
-            (&files[..], &[][..])
-        };
+        let to_evict = files
+            .iter()
+            .enumerate()
+            .filter(|(index, (path, _, _))| {
+                if *index < keep {
+                    return false;
+                }
+                let is_pinned = kind == BackupKind::ManualBackup
+                    && pinned_verified_snapshot.as_ref().is_some_and(|pinned| {
+                        fs::canonicalize(path)
+                            .is_ok_and(|canonical| canonical.as_path() == pinned.as_path())
+                    });
+                !is_pinned
+            })
+            .map(|(_, file)| file)
+            .collect::<Vec<_>>();
 
         let mut summary = RotateKindSummary {
-            kept: to_keep.len(),
+            kept: files.len().saturating_sub(to_evict.len()),
             ..Default::default()
         };
         for (path, _mtime, size) in to_evict {
@@ -406,19 +443,42 @@ mod tests {
     }
 
     #[test]
-    fn classify_backup_file_matches_legacy_bak_variants_but_not_lookalikes() {
-        // Actual bak backups created by prior versions / ad-hoc tooling.
+    fn classify_backup_file_matches_strict_bak_families_but_not_lookalikes() {
+        // Published backup generations for the main database and its WAL/SHM
+        // forensic families are recognized through the shared strict grammar.
+        for name in [
+            "storage.sqlite3.bak",
+            "storage.sqlite3.bak.20260326_153504",
+            "storage.sqlite3-wal.bak",
+            "storage.sqlite3-wal.bak.20260326_153504",
+            "storage.sqlite3-shm.bak",
+            "storage.sqlite3-shm.bak.20260326_153504",
+        ] {
+            assert_eq!(
+                classify_backup_file(name),
+                Some(BackupKind::ManualBackup),
+                "strict backup family should classify: {name}"
+            );
+        }
         assert_eq!(
-            classify_backup_file("storage.sqlite3.bak"),
-            Some(BackupKind::ManualBackup)
+            classify_backup_file("storage.sqlite3.bak.meta.json"),
+            None,
+            "the canonical verified-snapshot authority is active control state, not disposable backup material"
         );
         assert_eq!(
-            classify_backup_file("storage.sqlite3.bak.20260326_153504"),
-            Some(BackupKind::ManualBackup)
+            classify_backup_file("storage.sqlite3.bak.20260326_153504.meta.json"),
+            None,
+            "metadata-like companions must never be rotated independently of a generation"
+        );
+        assert_eq!(
+            classify_backup_file("storage.sqlite3.bak.stage.tmp"),
+            None,
+            "malformed backup lookalikes are not retention-owned"
         );
         assert_eq!(
             classify_backup_file("storage.sqlite3.bak-something"),
-            Some(BackupKind::ManualBackup)
+            None,
+            "unpublished bak-prefix lookalikes are not owned backup generations"
         );
         assert_eq!(
             classify_backup_file("storage.sqlite3.manual-backup-20260402_232941"),
@@ -502,6 +562,77 @@ mod tests {
             .collect();
         remaining_corrupt.sort();
         assert_eq!(remaining_corrupt.len(), 3);
+    }
+
+    #[test]
+    fn rotation_pins_the_metadata_authorized_backup_generation() {
+        let tmp = TempDir::new().unwrap();
+        let primary = tmp.path().join("storage.sqlite3");
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(primary.to_str().unwrap())
+            .expect("open mailbox fixture");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize mailbox schema");
+        conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+            .expect("checkpoint mailbox fixture");
+        drop(conn);
+        let exact = mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary);
+        fs::copy(&primary, &exact).expect("copy verified exact backup");
+        mcp_agent_mail_db::snapshot::record_snapshot_metadata(&primary, 42)
+            .expect("record verified authority");
+        let pinned = tmp.path().join("storage.sqlite3.bak.20260101_000000");
+        fs::rename(&exact, &pinned).expect("rotate verified bytes");
+        sleep(Duration::from_millis(5));
+        touch(&tmp.path().join("storage.sqlite3.bak.20260102_000000"), 13);
+        sleep(Duration::from_millis(5));
+        touch(&tmp.path().join("storage.sqlite3.bak.20260103_000000"), 17);
+
+        let report = rotate_with_delete_off(tmp.path(), 1);
+
+        assert!(
+            pinned.is_file(),
+            "the verified hash source must remain live"
+        );
+        assert!(
+            mcp_agent_mail_db::snapshot::snapshot_meta_path(&primary).is_file(),
+            "canonical snapshot authority must never enter rotation"
+        );
+        assert_eq!(report.staged, 1);
+        assert_eq!(report.kept, 2, "newest plus verified generation are kept");
+        assert_eq!(
+            mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).as_deref(),
+            Some(pinned.as_path())
+        );
+    }
+
+    #[test]
+    fn occupied_unresolvable_snapshot_metadata_parks_manual_backup_rotation() {
+        let tmp = TempDir::new().unwrap();
+        let primary = tmp.path().join("storage.sqlite3");
+        touch(&primary, 32);
+        let metadata = mcp_agent_mail_db::snapshot::snapshot_meta_path(&primary);
+        fs::write(&metadata, b"untrusted snapshot authority").unwrap();
+        let backups = [
+            tmp.path().join("storage.sqlite3.bak.20260101_000000"),
+            tmp.path().join("storage.sqlite3.bak.20260102_000000"),
+            tmp.path().join("storage.sqlite3.bak.20260103_000000"),
+        ];
+        for path in &backups {
+            touch(path, 11);
+            sleep(Duration::from_millis(5));
+        }
+
+        let report = rotate_with_delete_off(tmp.path(), 1);
+
+        assert_eq!(report.staged, 0);
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.kept, backups.len());
+        assert_eq!(
+            fs::read(&metadata).unwrap(),
+            b"untrusted snapshot authority"
+        );
+        for path in backups {
+            assert!(path.is_file());
+        }
     }
 
     #[test]

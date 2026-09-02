@@ -952,6 +952,8 @@ mod tests {
                     .map(|s| (*s).to_string())
                     .collect(),
                 registration_token: None,
+                retired_at: None,
+                deregistered_at: None,
             },
             file_reservations: ReservationResponse {
                 granted: Vec::new(),
@@ -1096,6 +1098,8 @@ mod tests {
                     .map(|s| (*s).to_string())
                     .collect(),
                 registration_token: None,
+                retired_at: None,
+                deregistered_at: None,
             },
             thread: PreparedThread {
                 thread_id: "br-1".into(),
@@ -1282,6 +1286,8 @@ mod tests {
                     .map(|s| (*s).to_string())
                     .collect(),
                 registration_token: None,
+                retired_at: None,
+                deregistered_at: None,
             },
             file_reservations: ReservationResponse {
                 granted: vec![GrantedReservation {
@@ -1327,6 +1333,8 @@ mod tests {
                     .map(|s| (*s).to_string())
                     .collect(),
                 registration_token: None,
+                retired_at: None,
+                deregistered_at: None,
             },
             file_reservations: ReservationResponse {
                 granted: Vec::new(),
@@ -1337,6 +1345,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 2,
                 thread_id: Some("br-1".into()),
+                topic: Some("br-1".into()),
                 subject: "Hello".into(),
                 importance: "high".into(),
                 ack_required: true,
@@ -1388,6 +1397,8 @@ mod tests {
                     .map(|s| (*s).to_string())
                     .collect(),
                 registration_token: None,
+                retired_at: None,
+                deregistered_at: None,
             },
             thread: PreparedThread {
                 thread_id: "nonexistent".into(),

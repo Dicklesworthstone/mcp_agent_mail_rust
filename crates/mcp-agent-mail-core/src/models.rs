@@ -119,6 +119,8 @@ pub struct Message {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    /// Optional case-insensitive topic tag (1-64 safe ASCII characters).
+    pub topic: Option<String>,
     pub subject: String,
     pub body_md: String,
     /// Importance: "low" | "normal" | "high" | "urgent"
@@ -136,6 +138,7 @@ impl Default for Message {
             project_id: 0,
             sender_id: 0,
             thread_id: None,
+            topic: None,
             subject: String::new(),
             body_md: String::new(),
             importance: "normal".to_string(),

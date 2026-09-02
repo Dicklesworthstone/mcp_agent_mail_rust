@@ -287,6 +287,7 @@ pub fn fetch_inbox_rows_from_conn(
             unread_only,
             ack_required_only,
             ack_overdue_before: None,
+            topic: None,
             body_policy: InboxBodyPolicy::Full,
         },
     )
@@ -314,6 +315,7 @@ pub fn fetch_inbox_metadata_rows_from_conn(
             unread_only,
             ack_required_only,
             ack_overdue_before: None,
+            topic: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
@@ -340,6 +342,7 @@ pub fn fetch_inbox_ack_overdue_rows_from_conn(
             unread_only: false,
             ack_required_only: false,
             ack_overdue_before: Some(ack_overdue_before),
+            topic: None,
             body_policy: InboxBodyPolicy::Full,
         },
     )
@@ -366,24 +369,40 @@ pub fn fetch_inbox_ack_overdue_metadata_rows_from_conn(
             unread_only: false,
             ack_required_only: false,
             ack_overdue_before: Some(ack_overdue_before),
+            topic: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
 }
 
+/// Whether inbox rows materialize `body_md` or metadata only.
 #[derive(Clone, Copy)]
-enum InboxBodyPolicy {
+pub enum InboxBodyPolicy {
     Full,
     MetadataOnly,
 }
 
+/// Filter set for [`fetch_inbox_filtered_rows_from_conn`].
 #[derive(Clone, Copy)]
-struct InboxFetchOptions {
-    urgent_only: bool,
-    unread_only: bool,
-    ack_required_only: bool,
-    ack_overdue_before: Option<i64>,
-    body_policy: InboxBodyPolicy,
+pub struct InboxFetchOptions<'a> {
+    pub urgent_only: bool,
+    pub unread_only: bool,
+    pub ack_required_only: bool,
+    pub ack_overdue_before: Option<i64>,
+    pub topic: Option<&'a str>,
+    pub body_policy: InboxBodyPolicy,
+}
+
+/// Fetch inbox rows with the complete filter set used by the MCP tool.
+pub fn fetch_inbox_filtered_rows_from_conn(
+    conn: &DbConn,
+    project_id: i64,
+    agent_id: i64,
+    since_ts: Option<i64>,
+    limit: usize,
+    options: InboxFetchOptions<'_>,
+) -> Result<Vec<InboxRow>, DbError> {
+    fetch_inbox_rows_from_conn_impl(conn, project_id, agent_id, since_ts, limit, options)
 }
 
 fn fetch_inbox_rows_from_conn_impl(
@@ -392,7 +411,7 @@ fn fetch_inbox_rows_from_conn_impl(
     agent_id: i64,
     since_ts: Option<i64>,
     limit: usize,
-    options: InboxFetchOptions,
+    options: InboxFetchOptions<'_>,
 ) -> Result<Vec<InboxRow>, DbError> {
     let _ = conn.execute_raw("PRAGMA busy_timeout = 250");
     let body_select = match options.body_policy {
@@ -401,7 +420,7 @@ fn fetch_inbox_rows_from_conn_impl(
     };
 
     let mut sql = format!(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, {body_select}, \
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, {body_select}, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
                 r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts, r.ack_ts \
          FROM message_recipients r \
@@ -428,6 +447,10 @@ fn fetch_inbox_rows_from_conn_impl(
         sql.push_str(" AND m.created_ts > ?");
         params.push(Value::BigInt(ts));
     }
+    if let Some(topic) = options.topic {
+        sql.push_str(" AND m.topic = ? COLLATE NOCASE");
+        params.push(Value::Text(topic.to_string()));
+    }
 
     let limit_i64 =
         i64::try_from(limit).map_err(|_| DbError::invalid("limit", "limit exceeds i64::MAX"))?;
@@ -451,6 +474,9 @@ fn fetch_inbox_rows_from_conn_impl(
             .map_err(|e| DbError::Sqlite(e.to_string()))?;
         let thread_id: Option<String> = row
             .get_named("thread_id")
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
+        let topic: Option<String> = row
+            .get_named("topic")
             .map_err(|e| DbError::Sqlite(e.to_string()))?;
         let subject: String = row
             .get_named("subject")
@@ -492,6 +518,7 @@ fn fetch_inbox_rows_from_conn_impl(
                 project_id,
                 sender_id,
                 thread_id,
+                topic,
                 subject,
                 body_md,
                 importance,

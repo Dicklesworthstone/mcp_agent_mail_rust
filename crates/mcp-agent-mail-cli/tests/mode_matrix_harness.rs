@@ -331,6 +331,7 @@ const CLI_ALLOW_COMMANDS: &[&[&str]] = &[
     &["guard", "--help"],
     &["acks", "--help"],
     &["list-acks", "--help"],
+    &["mark-all-read", "--help"],
     &["migrate", "--help"],
     &["list-projects", "--help"],
     &["clear-and-reset-everything", "--help"],

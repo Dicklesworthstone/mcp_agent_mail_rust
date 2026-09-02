@@ -12,21 +12,24 @@ use mcp_agent_mail_core::{
     ConsistencyMessageRef, LockLevel, OrderedRwLock,
     config::{env_value, infra_env_value},
     disk::{
-        is_sqlite_memory_database_url, sqlite_file_path_from_database_url, sqlite_sidecar_path,
-        sqlite_url_from_path,
+        SqliteRecoveryCandidateKind, SqliteRecoveryCandidateName,
+        classify_sqlite_recovery_candidate_name, is_sqlite_memory_database_url,
+        sqlite_file_path_from_database_url, sqlite_sidecar_path, sqlite_url_from_path,
     },
 };
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Error as SqlError, Value};
 use sqlmodel_pool::{Pool, PoolConfig, PooledConnection};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -87,6 +90,12 @@ pub struct MailboxOwnershipProcess {
     pub executable_deleted: bool,
     pub holds_storage_root_lock: bool,
     pub holds_sqlite_lock: bool,
+    /// The process holds at least one mailbox activity lock in exclusive
+    /// (`flock` `WRITE`) mode. A live server always does; a shared-mode
+    /// observer or a plain database-file reader never does. On platforms
+    /// without `/proc/locks` every lock-file holder is reported exclusive
+    /// (fail-closed).
+    pub holds_exclusive_lock: bool,
     pub holds_database_file: bool,
 }
 
@@ -96,7 +105,15 @@ pub struct MailboxOwnershipState {
     pub storage_lock_path: String,
     pub sqlite_lock_path: String,
     pub processes: Vec<MailboxOwnershipProcess>,
+    /// Live Agent Mail processes that count as mailbox *owners*: exclusive
+    /// activity-lock holders and server command lines (including a legacy
+    /// Python shadow server).
     pub competing_pids: Vec<u32>,
+    /// Live Agent Mail processes that merely read the mailbox (a transient
+    /// `am inbox` / `am robot handoff` with the database file open, or a
+    /// shared-mode lock observer). Reported for operators, never counted as
+    /// owners, so they can no longer produce a false split-brain verdict.
+    pub readers: Vec<u32>,
     pub supervised_restart_required: bool,
     pub detail: String,
 }
@@ -828,28 +845,49 @@ pub fn recovery_admission() -> &'static RecoveryAdmissionController {
 }
 
 std::thread_local! {
-    static RECOVERY_ADMISSION_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static RECOVERY_ADMISSION_PATHS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
 }
 
-struct RecoveryAdmissionDepthGuard;
+struct RecoveryAdmissionDepthGuard {
+    path: PathBuf,
+}
 
 impl RecoveryAdmissionDepthGuard {
-    fn enter() -> Self {
-        RECOVERY_ADMISSION_DEPTH.with(|depth| {
-            depth.set(depth.get().saturating_add(1));
-        });
-        Self
+    fn enter(path: PathBuf) -> Self {
+        RECOVERY_ADMISSION_PATHS.with(|paths| paths.borrow_mut().push(path.clone()));
+        Self { path }
     }
 
-    fn is_active() -> bool {
-        RECOVERY_ADMISSION_DEPTH.with(|depth| depth.get() > 0)
+    fn active_path() -> Option<PathBuf> {
+        RECOVERY_ADMISSION_PATHS.with(|paths| paths.borrow().last().cloned())
+    }
+
+    /// Whether the current thread is inside an admitted recovery attempt for
+    /// `stable_path` (a canonicalized primary path).
+    ///
+    /// Recovery admission arms the durable recovery breaker with a
+    /// provisional failure record *before* running the attempt so a crash
+    /// mid-attempt still starts a cooldown. Read-only opens performed by that
+    /// same attempt (live-salvage materialization, archive-ahead inventory)
+    /// must not treat their own arming as evidence against the file: the
+    /// admission decision already weighed the breaker history.
+    fn active_for(stable_path: &Path) -> bool {
+        RECOVERY_ADMISSION_PATHS.with(|paths| {
+            paths.borrow().iter().any(|active| {
+                active == stable_path
+                    || std::fs::canonicalize(active).is_ok_and(|resolved| resolved == stable_path)
+                    || normalize_sqlite_identity_path_lossless(active)
+                        == normalize_sqlite_identity_path_lossless(stable_path)
+            })
+        })
     }
 }
 
 impl Drop for RecoveryAdmissionDepthGuard {
     fn drop(&mut self) {
-        RECOVERY_ADMISSION_DEPTH.with(|depth| {
-            depth.set(depth.get().saturating_sub(1));
+        RECOVERY_ADMISSION_PATHS.with(|paths| {
+            let popped = paths.borrow_mut().pop();
+            debug_assert_eq!(popped.as_deref(), Some(self.path.as_path()));
         });
     }
 }
@@ -898,6 +936,47 @@ fn recovery_admission_blocked_error(primary_path: &Path, action: &str) -> SqlErr
     SqlError::Custom(detail)
 }
 
+/// Why an end-to-end automatic recovery envelope refused before or after the
+/// caller's operation.
+///
+/// `CircuitOpen` is kept distinct so startup can park an automatic repair
+/// while still serving an existing live database, without confusing the
+/// refusal with an operation that actually ran and failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutomaticRecoveryAdmissionFailureKind {
+    CircuitOpen,
+    Other,
+}
+
+/// Typed result from the end-to-end automatic recovery admission envelope.
+///
+/// Keeping admission failures separate from operation failures prevents a
+/// circuit-open message that quotes an earlier promotion error from being
+/// mistaken for a newly attempted promotion.
+#[derive(Debug)]
+pub enum AutomaticRecoveryRunError<E> {
+    Admission {
+        kind: AutomaticRecoveryAdmissionFailureKind,
+        error: SqlError,
+    },
+    Operation(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for AutomaticRecoveryRunError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admission { error, .. } => error.fmt(formatter),
+            Self::Operation(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl<E> AutomaticRecoveryRunError<E> {
+    fn admission(kind: AutomaticRecoveryAdmissionFailureKind, error: SqlError) -> Self {
+        Self::Admission { kind, error }
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn with_recovery_admission<T, F>(
     primary_path: &Path,
@@ -907,9 +986,402 @@ fn with_recovery_admission<T, F>(
 where
     F: FnOnce() -> Result<T, SqlError>,
 {
-    if RecoveryAdmissionDepthGuard::is_active() {
-        return operation();
+    flatten_automatic_recovery_result(with_automatic_recovery_admission(
+        primary_path,
+        action,
+        operation,
+    ))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryAdmissionOutcomePolicy {
+    RecordRecoveryOutcome,
+    GuardMutationOnly,
+}
+
+#[allow(clippy::result_large_err)]
+fn with_recovery_mutation_admission<T, F>(
+    primary_path: &Path,
+    action: &'static str,
+    operation: F,
+) -> Result<T, SqlError>
+where
+    F: FnOnce() -> Result<T, SqlError>,
+{
+    flatten_automatic_recovery_result(with_automatic_recovery_admission_using_clock(
+        primary_path,
+        action,
+        operation,
+        recovery_breaker_now_unix,
+        RecoveryAdmissionOutcomePolicy::GuardMutationOnly,
+    ))
+}
+
+/// Wrap an entire automatic recovery attempt in the durable breaker election.
+///
+/// The envelope covers any forensic capture or candidate construction
+/// performed by `operation`. Nested recovery primitives on the same thread
+/// pass through via `RecoveryAdmissionDepthGuard` and cannot self-contend on
+/// the file lock.
+#[allow(clippy::result_large_err)]
+pub fn with_automatic_recovery_admission<T, E, F>(
+    primary_path: &Path,
+    action: &'static str,
+    operation: F,
+) -> Result<T, AutomaticRecoveryRunError<E>>
+where
+    E: std::fmt::Display,
+    F: FnOnce() -> Result<T, E>,
+{
+    with_automatic_recovery_admission_using_clock(
+        primary_path,
+        action,
+        operation,
+        recovery_breaker_now_unix,
+        RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome,
+    )
+}
+
+fn flatten_automatic_recovery_result<T>(
+    result: Result<T, AutomaticRecoveryRunError<SqlError>>,
+) -> Result<T, SqlError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(
+            AutomaticRecoveryRunError::Admission { error, .. }
+            | AutomaticRecoveryRunError::Operation(error),
+        ) => Err(error),
     }
+}
+
+fn recovery_breaker_now_unix() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs()),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+fn automatic_recovery_breaker_refusal<E>(
+    primary_path: &Path,
+    action: &str,
+    verdict: &crate::recovery_breaker::BreakerVerdict,
+) -> Option<AutomaticRecoveryRunError<E>> {
+    let crate::recovery_breaker::BreakerVerdict::Refuse {
+        consecutive_failures,
+        retry_after_secs,
+        last_failure_reason,
+    } = verdict
+    else {
+        return None;
+    };
+    Some(AutomaticRecoveryRunError::admission(
+        AutomaticRecoveryAdmissionFailureKind::CircuitOpen,
+        SqlError::Custom(format!(
+            "{action} for {} is circuit-broken: {consecutive_failures} consecutive automatic \
+             recovery attempts failed on this same database content (last error: \
+             {last_failure_reason}). Refusing to re-attempt (and re-capture forensics) for \
+             another {retry_after_secs}s. Operator paths are exempt: run `am doctor repair` \
+             or `am doctor reconstruct` to intervene now, or quarantine the file (move \
+             {}* aside) to rebuild from the Git archive.",
+            primary_path.display(),
+            primary_path.display(),
+        )),
+    ))
+}
+
+// Fingerprints produced without opening the live database inode reserve this
+// prefix inside the otherwise opaque 64-hex-digit breaker hash.  Old breaker
+// records contain a raw SHA-256 and therefore have no reliable algorithm tag;
+// a non-clean old record is kept fail-closed until an operator bypasses it or
+// a successful recovery rewrites it with the lock-neutral format.
+const LOCK_NEUTRAL_BREAKER_FINGERPRINT_PREFIX: &str = "fdc10ce1";
+
+#[must_use]
+fn breaker_fingerprint_is_lock_neutral(fingerprint: &str) -> bool {
+    fingerprint
+        .split_once(':')
+        .is_some_and(|(_, hash)| hash.starts_with(LOCK_NEUTRAL_BREAKER_FINGERPRINT_PREFIX))
+}
+
+#[must_use]
+fn sqlite_path_requires_lock_neutral_fingerprint(path: &Path) -> bool {
+    if FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES
+        .iter()
+        .any(|suffix| path_is_occupied(&sqlite_sidecar_path(path, suffix)))
+    {
+        return true;
+    }
+
+    // A namespace-less hard-link alias may still name a Franken-managed inode
+    // whose namespace records sit beside another pathname.  Opening the alias
+    // would be enough to erase this process's classic POSIX locks.
+    #[cfg(unix)]
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.nlink() != 1) {
+        return true;
+    }
+
+    false
+}
+
+/// Identify a live SQLite generation without opening its main inode.
+///
+/// Classic POSIX record locks belong to the process, not an individual file
+/// descriptor: closing an ad-hoc raw descriptor can release locks held by an
+/// unrelated live FrankenSQLite connection.  Metadata lookup (`stat`) is
+/// descriptor-neutral.  The fingerprint covers the main file plus durable
+/// journal/WAL certification members, so an ordinary main-file rewrite, WAL
+/// commit, or generation replacement changes it without sacrificing locks.
+#[must_use]
+fn lock_neutral_sqlite_generation_fingerprint(path: &Path) -> String {
+    use sha2::Digest as _;
+
+    fn hash_metadata(
+        hasher: &mut sha2::Sha256,
+        label: &[u8],
+        path: &Path,
+    ) -> Result<Option<u64>, ()> {
+        hasher.update(u64::try_from(label.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(label);
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                hasher.update([0]);
+                return Ok(None);
+            }
+            Err(_) => return Err(()),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(());
+        }
+        hasher.update([1]);
+        hasher.update(metadata.len().to_le_bytes());
+        hasher.update([u8::from(metadata.permissions().readonly())]);
+
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok());
+        hasher.update(modified.map_or(0, |value| value.as_secs()).to_le_bytes());
+        hasher.update(
+            modified
+                .map_or(0, |value| value.subsec_nanos())
+                .to_le_bytes(),
+        );
+
+        #[cfg(unix)]
+        {
+            hasher.update(metadata.dev().to_le_bytes());
+            hasher.update(metadata.ino().to_le_bytes());
+            hasher.update(metadata.mode().to_le_bytes());
+            hasher.update(metadata.nlink().to_le_bytes());
+            hasher.update(metadata.mtime().to_le_bytes());
+            hasher.update(metadata.mtime_nsec().to_le_bytes());
+            hasher.update(metadata.ctime().to_le_bytes());
+            hasher.update(metadata.ctime_nsec().to_le_bytes());
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+
+            // volume_serial_number()/file_index() are still unstable
+            // (windows_by_handle) and cannot be used without a feature gate,
+            // so the generation witness hashes only the stable metadata
+            // fields; the length and modification timestamps hashed above
+            // already capture content-change signals.
+            hasher.update(metadata.file_attributes().to_le_bytes());
+            hasher.update(metadata.creation_time().to_le_bytes());
+            hasher.update(metadata.last_write_time().to_le_bytes());
+        }
+
+        Ok(Some(metadata.len()))
+    }
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"mcp-agent-mail-lock-neutral-sqlite-generation-v1\0");
+    let main_len = match hash_metadata(&mut hasher, b"main", path) {
+        Ok(Some(len)) => len,
+        Ok(None) => return "missing".to_string(),
+        Err(()) => return "unreadable".to_string(),
+    };
+    for suffix in ["-journal", "-wal", "-wal-cert", "-wal-cert-head"] {
+        if hash_metadata(
+            &mut hasher,
+            suffix.as_bytes(),
+            &sqlite_sidecar_path(path, suffix),
+        )
+        .is_err()
+        {
+            return "unreadable".to_string();
+        }
+    }
+    let digest = hex::encode(hasher.finalize());
+    format!(
+        "{main_len}:{LOCK_NEUTRAL_BREAKER_FINGERPRINT_PREFIX}{}",
+        &digest[LOCK_NEUTRAL_BREAKER_FINGERPRINT_PREFIX.len()..]
+    )
+}
+
+/// Recovery-breaker fingerprint that never independently opens a live
+/// FrankenSQLite main inode.
+#[must_use]
+fn recovery_breaker_fingerprint(
+    primary_path: &Path,
+    prior: Option<&crate::recovery_breaker::RecoveryBreakerState>,
+) -> String {
+    if !sqlite_path_requires_lock_neutral_fingerprint(primary_path) {
+        return crate::recovery_breaker::fingerprint_db(primary_path);
+    }
+
+    if let Some(prior) = prior
+        && (prior.tripped || prior.consecutive_failures > 0)
+        && !breaker_fingerprint_is_lock_neutral(&prior.db_fingerprint)
+    {
+        // There is no safe way to compare a legacy raw-content fingerprint
+        // while this generation is live.  Preserve its authority instead of
+        // accidentally resetting a tripped breaker.  Operator recovery remains
+        // the explicit escape hatch and rewrites the successful terminal state.
+        return prior.db_fingerprint.clone();
+    }
+
+    lock_neutral_sqlite_generation_fingerprint(primary_path)
+}
+
+/// Fail closed on existing durable breaker authority before pool bootstrap can
+/// create a missing primary or inspect an authoritative archive.
+///
+/// This is deliberately a pure preflight: malformed/tripped authority must be
+/// able to refuse startup without creating the persistent breaker-election
+/// file or any SQLite/forensic artifact. Actual recovery paths still enter the
+/// full election and re-evaluate under its lock before mutating.
+#[allow(clippy::result_large_err)]
+fn preflight_missing_primary_pool_breaker_authority(primary_path: &Path) -> Result<(), SqlError> {
+    validate_sqlite_target_path(primary_path, "pool initialization target")?;
+    if crate::recovery_breaker::RecoveryBreakerBypassGuard::is_active() {
+        return Ok(());
+    }
+
+    let action = "pool initialization";
+    let prior = crate::recovery_breaker::load(primary_path).map_err(|error| {
+        SqlError::Custom(format!(
+            "{action} for {} was refused because durable recovery-breaker state could not be trusted: {error}. Run `am doctor repair` or `am doctor reconstruct` for an operator-supervised bypass",
+            primary_path.display()
+        ))
+    })?;
+    let fingerprint = recovery_breaker_fingerprint(primary_path, prior.as_ref());
+    let verdict = crate::recovery_breaker::evaluate(
+        prior.as_ref(),
+        &fingerprint,
+        crate::recovery_breaker::config_from_env(),
+        recovery_breaker_now_unix(),
+    );
+    if let Some(refusal) =
+        automatic_recovery_breaker_refusal::<SqlError>(primary_path, action, &verdict)
+    {
+        return flatten_automatic_recovery_result(Err(refusal));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+#[cfg(test)]
+fn with_recovery_admission_using_clock<T, F, C>(
+    primary_path: &Path,
+    action: &'static str,
+    operation: F,
+    now_unix: C,
+) -> Result<T, SqlError>
+where
+    F: FnOnce() -> Result<T, SqlError>,
+    C: FnMut() -> i64,
+{
+    flatten_automatic_recovery_result(with_automatic_recovery_admission_using_clock(
+        primary_path,
+        action,
+        operation,
+        now_unix,
+        RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome,
+    ))
+}
+
+#[allow(clippy::result_large_err)]
+fn with_automatic_recovery_admission_using_clock<T, E, F, C>(
+    primary_path: &Path,
+    action: &'static str,
+    operation: F,
+    mut now_unix: C,
+    outcome_policy: RecoveryAdmissionOutcomePolicy,
+) -> Result<T, AutomaticRecoveryRunError<E>>
+where
+    E: std::fmt::Display,
+    F: FnOnce() -> Result<T, E>,
+    C: FnMut() -> i64,
+{
+    validate_sqlite_target_path(primary_path, "recovery admission target").map_err(|error| {
+        AutomaticRecoveryRunError::admission(AutomaticRecoveryAdmissionFailureKind::Other, error)
+    })?;
+    let normalized_primary = normalize_sqlite_identity_path_lossless(primary_path);
+    if let Some(active_path) = RecoveryAdmissionDepthGuard::active_path() {
+        if active_path == normalized_primary {
+            return operation().map_err(AutomaticRecoveryRunError::Operation);
+        }
+        return Err(AutomaticRecoveryRunError::admission(
+            AutomaticRecoveryAdmissionFailureKind::Other,
+            SqlError::Custom(format!(
+                "{action} for {} was refused because this thread already holds recovery admission for {}; nested recovery may only target the same normalized SQLite path",
+                primary_path.display(),
+                active_path.display()
+            )),
+        ));
+    }
+
+    // Refusing already-malformed or currently tripped authority is a pure
+    // read decision. Do it before opening the persistent election file so a
+    // rejected attempt leaves the directory namespace exactly unchanged.
+    // Every allowed path still locks and reloads/re-evaluates below, closing
+    // the preflight-to-lock race before any operation can run.
+    let breaker_config = crate::recovery_breaker::config_from_env();
+    let breaker_bypass = crate::recovery_breaker::RecoveryBreakerBypassGuard::is_active();
+    let preflight_attempt_started_unix = if breaker_bypass {
+        None
+    } else {
+        let preflight_prior = crate::recovery_breaker::load(primary_path).map_err(|error| {
+            AutomaticRecoveryRunError::admission(
+                AutomaticRecoveryAdmissionFailureKind::Other,
+                SqlError::Custom(format!(
+                    "{action} for {} was refused because durable recovery-breaker state could not be trusted: {error}. Run `am doctor repair` or `am doctor reconstruct` for an operator-supervised bypass",
+                    primary_path.display()
+                )),
+            )
+        })?;
+        let preflight_fingerprint =
+            recovery_breaker_fingerprint(primary_path, preflight_prior.as_ref());
+        let attempt_started_unix = now_unix();
+        let preflight_verdict = crate::recovery_breaker::evaluate(
+            preflight_prior.as_ref(),
+            &preflight_fingerprint,
+            breaker_config,
+            attempt_started_unix,
+        );
+        if let Some(error) =
+            automatic_recovery_breaker_refusal(primary_path, action, &preflight_verdict)
+        {
+            return Err(error);
+        }
+        Some(attempt_started_unix)
+    };
+    let _breaker_file_lock = crate::recovery_breaker::try_acquire_file_lock(primary_path)
+        .map_err(|error| {
+            AutomaticRecoveryRunError::admission(
+                AutomaticRecoveryAdmissionFailureKind::Other,
+                SqlError::Custom(format!(
+                    "{action} for {} was deferred because another process owns the durable recovery-breaker election lock: {error}",
+                    primary_path.display()
+                )),
+            )
+        })?;
 
     // br-acusl: durable non-convergence circuit breaker. The in-process
     // admission below (single-flight + backoff + window suppression) is
@@ -919,44 +1391,50 @@ where
     // failures for the SAME database content in a sidecar and refuses HERE,
     // before any capture, until the cooldown elapses, the content changes,
     // or an operator path runs under RecoveryBreakerBypassGuard.
-    let breaker_config = crate::recovery_breaker::config_from_env();
-    let breaker_fingerprint = crate::recovery_breaker::fingerprint_db(primary_path);
-    let breaker_prior = crate::recovery_breaker::load(primary_path);
-    let now_unix = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_secs()),
-    )
-    .unwrap_or(i64::MAX);
+    let breaker_prior = match crate::recovery_breaker::load(primary_path) {
+        Ok(state) => state,
+        Err(error) if breaker_bypass => {
+            tracing::warn!(
+                path = %primary_path.display(),
+                %error,
+                "operator recovery bypass is ignoring unreadable durable breaker state"
+            );
+            None
+        }
+        Err(error) => {
+            return Err(AutomaticRecoveryRunError::admission(
+                AutomaticRecoveryAdmissionFailureKind::Other,
+                SqlError::Custom(format!(
+                    "{action} for {} was refused because durable recovery-breaker state could not be trusted: {error}. Run `am doctor repair` or `am doctor reconstruct` for an operator-supervised bypass",
+                    primary_path.display()
+                )),
+            ));
+        }
+    };
+    let breaker_fingerprint = recovery_breaker_fingerprint(primary_path, breaker_prior.as_ref());
+    let attempt_started_unix = preflight_attempt_started_unix.unwrap_or_else(&mut now_unix);
     let breaker_verdict = crate::recovery_breaker::evaluate(
         breaker_prior.as_ref(),
         &breaker_fingerprint,
         breaker_config,
-        now_unix,
+        attempt_started_unix,
     );
     if let crate::recovery_breaker::BreakerVerdict::Refuse {
         consecutive_failures,
-        retry_after_secs,
-        last_failure_reason,
+        ..
     } = &breaker_verdict
     {
-        if crate::recovery_breaker::RecoveryBreakerBypassGuard::is_active() {
+        if breaker_bypass {
             tracing::warn!(
                 path = %primary_path.display(),
                 consecutive_failures,
                 "recovery breaker is tripped, but an operator-invoked path holds the bypass; attempting"
             );
         } else {
-            return Err(SqlError::Custom(format!(
-                "{action} for {} is circuit-broken: {consecutive_failures} consecutive automatic \
-                 recovery attempts failed on this same database content (last error: \
-                 {last_failure_reason}). Refusing to re-attempt (and re-capture forensics) for \
-                 another {retry_after_secs}s. Operator paths are exempt: run `am doctor repair` \
-                 or `am doctor reconstruct` to intervene now, or quarantine the file (move \
-                 {}* aside) to rebuild from the Git archive.",
-                primary_path.display(),
-                primary_path.display(),
-            )));
+            return Err(
+                automatic_recovery_breaker_refusal(primary_path, action, &breaker_verdict)
+                    .expect("refusal verdict must produce an admission error"),
+            );
         }
     }
     if matches!(
@@ -970,28 +1448,88 @@ where
     }
 
     let Some(_guard) = recovery_admission().try_acquire(primary_path) else {
-        return Err(recovery_admission_blocked_error(primary_path, action));
+        return Err(AutomaticRecoveryRunError::admission(
+            AutomaticRecoveryAdmissionFailureKind::Other,
+            recovery_admission_blocked_error(primary_path, action),
+        ));
     };
-    let _depth_guard = RecoveryAdmissionDepthGuard::enter();
-    let result = operation();
-    match &result {
-        Ok(_) => {
-            recovery_admission().report_success(primary_path);
-            crate::recovery_breaker::store(
-                primary_path,
-                &crate::recovery_breaker::cleared_state(&crate::recovery_breaker::fingerprint_db(
-                    primary_path,
+    let _depth_guard = RecoveryAdmissionDepthGuard::enter(normalized_primary);
+    if !breaker_bypass && outcome_policy == RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome {
+        // Arm the durable state before entering code that may panic, abort, or
+        // lose power. The terminal write below replaces this provisional
+        // reason without incrementing the attempt twice. A crashed half-open
+        // probe therefore starts a fresh cooldown instead of immediately
+        // admitting another process after restart.
+        let armed = crate::recovery_breaker::record_failure(
+            breaker_prior.as_ref(),
+            &breaker_fingerprint,
+            "automatic recovery attempt did not complete",
+            breaker_config,
+            attempt_started_unix,
+        );
+        crate::recovery_breaker::store(primary_path, &armed).map_err(|error| {
+            AutomaticRecoveryRunError::admission(
+                AutomaticRecoveryAdmissionFailureKind::Other,
+                SqlError::Custom(format!(
+                    "{action} for {} was refused before execution because its durable recovery-breaker attempt marker could not be persisted: {error}",
+                    primary_path.display()
                 )),
-            );
+            )
+        })?;
+    }
+
+    let operation_result = operation();
+    if outcome_policy == RecoveryAdmissionOutcomePolicy::GuardMutationOnly {
+        return operation_result.map_err(AutomaticRecoveryRunError::Operation);
+    }
+    match operation_result {
+        Ok(value) => {
+            recovery_admission().report_success(primary_path);
+            let cleared = crate::recovery_breaker::cleared_state(&recovery_breaker_fingerprint(
+                primary_path,
+                None,
+            ));
+            if let Err(error) = crate::recovery_breaker::store(primary_path, &cleared) {
+                if breaker_bypass {
+                    tracing::warn!(
+                        path = %primary_path.display(),
+                        %error,
+                        "operator recovery succeeded, but cleared breaker state could not be persisted"
+                    );
+                    return Ok(value);
+                }
+                return Err(AutomaticRecoveryRunError::admission(
+                    AutomaticRecoveryAdmissionFailureKind::Other,
+                    SqlError::Custom(format!(
+                        "{action} for {} completed, but readiness remains fail-closed because cleared durable recovery-breaker state could not be persisted: {error}",
+                        primary_path.display()
+                    )),
+                ));
+            }
+            Ok(value)
         }
         Err(error) => {
             recovery_admission().report_failure(primary_path, &error.to_string());
+            let failure_unix = now_unix();
+            let terminal_fingerprint = recovery_breaker_fingerprint(primary_path, None);
+            // A failed recovery may itself mutate the primary before returning
+            // (for example, an in-place repair whose final verification fails).
+            // Carry forward only history that matched the admitted pre-image,
+            // then retarget that lineage to the terminal bytes so the next
+            // restart cannot treat our own failed mutation as operator-supplied
+            // new authority and reset the breaker count.
+            let mut lineage_prior = breaker_prior
+                .clone()
+                .filter(|prior| prior.db_fingerprint == breaker_fingerprint);
+            if let Some(prior) = &mut lineage_prior {
+                prior.db_fingerprint.clone_from(&terminal_fingerprint);
+            }
             let failed = crate::recovery_breaker::record_failure(
-                breaker_prior.as_ref(),
-                &breaker_fingerprint,
+                lineage_prior.as_ref(),
+                &terminal_fingerprint,
                 &error.to_string(),
                 breaker_config,
-                now_unix,
+                failure_unix,
             );
             if failed.tripped {
                 tracing::error!(
@@ -1000,13 +1538,29 @@ where
                     cooldown_secs = breaker_config.cooldown_secs,
                     "automatic recovery keeps failing on the same database content; circuit \
                      breaker TRIPPED — further automatic attempts (and forensic captures) are \
-                     parked. Intervene with `am doctor repair` / `am doctor reconstruct`."
+                    parked. Intervene with `am doctor repair` / `am doctor reconstruct`."
                 );
             }
-            crate::recovery_breaker::store(primary_path, &failed);
+            if let Err(store_error) = crate::recovery_breaker::store(primary_path, &failed) {
+                if breaker_bypass {
+                    tracing::warn!(
+                        path = %primary_path.display(),
+                        error = %store_error,
+                        "operator recovery failed and its breaker record could not be persisted"
+                    );
+                    return Err(AutomaticRecoveryRunError::Operation(error));
+                }
+                return Err(AutomaticRecoveryRunError::admission(
+                    AutomaticRecoveryAdmissionFailureKind::Other,
+                    SqlError::Custom(format!(
+                        "{error}; additionally, durable recovery-breaker failure state for {} could not be persisted: {store_error}",
+                        primary_path.display()
+                    )),
+                ));
+            }
+            Err(AutomaticRecoveryRunError::Operation(error))
         }
     }
-    result
 }
 
 // ============================================================================
@@ -2318,6 +2872,13 @@ pub struct DbPool {
     /// dropped. Read/search cache scopes include it so a replacement pool for
     /// the same on-disk path cannot inherit pre-recovery numeric identities.
     cache_generation: u64,
+    /// Frozen, lossless identity of the file-backed SQLite authority.
+    ///
+    /// This is resolved exactly once when the pool wrapper is constructed and
+    /// is then shared by pool-cache selection, init gates, message-id
+    /// allocation, connection opens, cache namespaces, and recovery
+    /// retirement. `None` is the `:memory:` sentinel.
+    sqlite_identity: Option<PathBuf>,
     sqlite_path: String,
     storage_root: PathBuf,
     /// Per-transaction ceiling for raw ATC experience rows in the isolated
@@ -2325,15 +2886,36 @@ pub struct DbPool {
     /// path does not reparse process configuration for every experience.
     atc_experience_max_rows: i64,
     init_sql: Arc<String>,
+    /// Desired connection-local `journal_size_limit` for this shared pool.
+    ///
+    /// FrankenSQLite implements this PRAGMA per connection. The value is
+    /// therefore installed in `init_sql` for the normal case and shared
+    /// atomically so an explicit runtime retune reaches newly opened and
+    /// subsequently checked-out pooled connections.
+    journal_size_limit_state: Arc<AtomicU64>,
     run_migrations: bool,
     skip_startup_init: bool,
     open_mode: DbPoolOpenMode,
     stats_sampler: Arc<DbPoolStatsSampler>,
     /// Shared, process-wide monotonic message-id allocator for this database
-    /// (mcp_agent_mail#176). Resolved once at construction so all `DbPool`
-    /// wrappers of the same underlying connection pool share one high-water
-    /// mark; see [`shared_message_id_allocator`].
+    /// (mcp_agent_mail#176). File-backed pools resolve by normalized SQLite
+    /// identity; `:memory:` pools resolve by their underlying pool `Arc`. See
+    /// [`shared_message_id_allocator`].
     message_id_allocator: Arc<crate::id_floor::MessageIdAllocator>,
+}
+
+/// One immutable filesystem authority for a `DbPool` wrapper.
+///
+/// Filesystem resolution depends on ambient process state (`cwd`) and the
+/// current symlink graph. Resolving these paths independently at each cache or
+/// open boundary can therefore bind one logical pool to different physical
+/// files. Construct this value once and pass it through every authority
+/// decision instead.
+#[derive(Clone, Debug)]
+struct DbPoolAuthority {
+    sqlite_identity: Option<PathBuf>,
+    sqlite_path: String,
+    storage_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2342,48 +2924,232 @@ enum DbPoolOpenMode {
     QueryOnlyStrict,
 }
 
-/// Registry of per-database message-id allocators, keyed by the shared
-/// connection pool's `Arc` pointer identity (mcp_agent_mail#176).
+/// Registry of pool generations and their resolved message-id allocators,
+/// keyed by the shared connection pool's `Arc` pointer identity
+/// (mcp_agent_mail#176).
 ///
-/// All `DbPool` wrappers of the same underlying `Arc<Pool<DbConn>>` resolve to
-/// the same allocator, so the in-process high-water mark is shared "across
-/// pool connections". Independent pools — including each fresh `:memory:` test
-/// pool — get their own. Entries are pruned by `Weak` liveness on every
-/// resolve, so a pointer address reused by a *new* pool after the old one is
-/// dropped never inherits a stale high-water mark.
+/// Pool generation remains scoped to the underlying `Arc`: read-cache
+/// invalidation must never bleed across a replacement pool. The allocator is
+/// selected separately below so independent file-backed pools for one
+/// normalized SQLite identity share a high-water mark, while each fresh
+/// `:memory:` pool remains isolated.
 /// Registry value: a weak handle to the shared pool (for liveness pruning),
 /// that pool's message-id allocator, and its process-unique cache generation.
-type MessageIdAllocatorEntry = (
-    Weak<Pool<DbConn>>,
-    Arc<crate::id_floor::MessageIdAllocator>,
-    u64,
-);
+struct MessageIdAllocatorEntry {
+    pool: Weak<Pool<DbConn>>,
+    allocator: Arc<crate::id_floor::MessageIdAllocator>,
+    cache_generation: u64,
+    storage_root_identity: PathBuf,
+}
+
+struct FileMessageIdAllocatorEntry {
+    allocator: Weak<crate::id_floor::MessageIdAllocator>,
+    storage_root_identity: PathBuf,
+}
 
 static MESSAGE_ID_ALLOCATORS: OnceLock<Mutex<HashMap<usize, MessageIdAllocatorEntry>>> =
     OnceLock::new();
+/// Logical file-backed allocator registry. Each live database identity binds
+/// exactly one archive-root authority; a conflicting root fails closed rather
+/// than reusing a floor scanned from the wrong archive. Weak allocator values
+/// disappear once no pool wrapper retains them. Recovery retires the old
+/// allocator and removes the identity before a replacement pool opens, so
+/// surviving old wrappers cannot diverge from the new generation.
+static FILE_MESSAGE_ID_ALLOCATORS: OnceLock<Mutex<HashMap<PathBuf, FileMessageIdAllocatorEntry>>> =
+    OnceLock::new();
 static NEXT_POOL_CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+type JournalSizeLimitEntry = (Weak<Pool<DbConn>>, Arc<AtomicU64>);
+
+static JOURNAL_SIZE_LIMITS: OnceLock<Mutex<HashMap<usize, JournalSizeLimitEntry>>> =
+    OnceLock::new();
+
+const JOURNAL_SIZE_LIMIT_RUNTIME_OVERRIDE: u64 = 1 << 63;
 
 fn shared_message_id_allocator(
     pool: &Arc<Pool<DbConn>>,
-) -> (Arc<crate::id_floor::MessageIdAllocator>, u64) {
-    let registry = MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = registry.lock().unwrap_or_else(PoisonError::into_inner);
+    sqlite_identity: Option<&Path>,
+    storage_root_identity: &Path,
+) -> DbResult<(Arc<crate::id_floor::MessageIdAllocator>, u64)> {
+    let per_pool_registry = MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut per_pool_entries = per_pool_registry
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     // Drop entries whose pool has been freed so a reused address cannot
     // resurrect a stale allocator.
-    guard.retain(|_, (weak, _, _)| weak.strong_count() > 0);
+    per_pool_entries.retain(|_, entry| entry.pool.strong_count() > 0);
     let key = Arc::as_ptr(pool) as usize;
-    if let Some((_, allocator, generation)) = guard.get(&key) {
-        return (allocator.clone(), *generation);
+    if let Some(entry) = per_pool_entries.get(&key) {
+        if entry.storage_root_identity != storage_root_identity {
+            return Err(message_id_storage_root_conflict(
+                sqlite_identity,
+                entry.storage_root_identity.as_path(),
+                storage_root_identity,
+            ));
+        }
+        return Ok((entry.allocator.clone(), entry.cache_generation));
     }
-    let allocator = Arc::new(crate::id_floor::MessageIdAllocator::new());
+    let allocator = match sqlite_identity {
+        None => Arc::new(crate::id_floor::MessageIdAllocator::new()),
+        Some(identity) => {
+            let logical_registry =
+                FILE_MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
+            let mut logical_entries = logical_registry
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            logical_entries.retain(|_, entry| entry.allocator.strong_count() > 0);
+            let existing = logical_entries
+                .get(identity)
+                .map(|entry| (entry.storage_root_identity.clone(), entry.allocator.clone()));
+            if let Some((established_root, weak_allocator)) = existing {
+                if established_root != storage_root_identity {
+                    return Err(message_id_storage_root_conflict(
+                        Some(identity),
+                        established_root.as_path(),
+                        storage_root_identity,
+                    ));
+                }
+                if let Some(allocator) = weak_allocator.upgrade() {
+                    allocator
+                } else {
+                    let allocator = Arc::new(crate::id_floor::MessageIdAllocator::new());
+                    logical_entries.insert(
+                        identity.to_path_buf(),
+                        FileMessageIdAllocatorEntry {
+                            allocator: Arc::downgrade(&allocator),
+                            storage_root_identity: storage_root_identity.to_path_buf(),
+                        },
+                    );
+                    allocator
+                }
+            } else {
+                let allocator = Arc::new(crate::id_floor::MessageIdAllocator::new());
+                logical_entries.insert(
+                    identity.to_path_buf(),
+                    FileMessageIdAllocatorEntry {
+                        allocator: Arc::downgrade(&allocator),
+                        storage_root_identity: storage_root_identity.to_path_buf(),
+                    },
+                );
+                allocator
+            }
+        }
+    };
     let generation = NEXT_POOL_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
-    guard.insert(key, (Arc::downgrade(pool), allocator.clone(), generation));
+    per_pool_entries.insert(
+        key,
+        MessageIdAllocatorEntry {
+            pool: Arc::downgrade(pool),
+            allocator: allocator.clone(),
+            cache_generation: generation,
+            storage_root_identity: storage_root_identity.to_path_buf(),
+        },
+    );
+    drop(per_pool_entries);
+    Ok((allocator, generation))
+}
+
+fn message_id_storage_root_conflict(
+    sqlite_identity: Option<&Path>,
+    established_root: &Path,
+    requested_root: &Path,
+) -> DbError {
+    let sqlite_identity = sqlite_identity.map_or_else(
+        || ":memory:".to_string(),
+        |identity| identity.display().to_string(),
+    );
+    DbError::InvalidArgument {
+        field: "storage_root",
+        message: format!(
+            "SQLite identity {sqlite_identity} already has live message-id authority at {}; \
+             refusing conflicting authority at {}",
+            established_root.display(),
+            requested_root.display()
+        ),
+    }
+}
+
+fn invalidate_file_message_id_allocator(normalized_identity: &Path) -> bool {
+    let registry = FILE_MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
+    let entry = registry
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(normalized_identity);
+    let Some(entry) = entry else {
+        return false;
+    };
+    if let Some(allocator) = entry.allocator.upgrade() {
+        allocator.retire();
+    }
+    true
+}
+
+fn shared_journal_size_limit(pool: &Arc<Pool<DbConn>>, configured_bytes: u64) -> Arc<AtomicU64> {
+    let registry = JOURNAL_SIZE_LIMITS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = registry.lock().unwrap_or_else(PoisonError::into_inner);
+    guard.retain(|_, (weak, _)| weak.strong_count() > 0);
+    let key = Arc::as_ptr(pool) as usize;
+    if let Some((_, state)) = guard.get(&key) {
+        return state.clone();
+    }
+    let state = Arc::new(AtomicU64::new(configured_bytes));
+    guard.insert(key, (Arc::downgrade(pool), state.clone()));
     drop(guard);
-    (allocator, generation)
+    state
+}
+
+const fn journal_size_limit_bytes(state: u64) -> u64 {
+    state & !JOURNAL_SIZE_LIMIT_RUNTIME_OVERRIDE
+}
+
+const fn journal_size_limit_has_runtime_override(state: u64) -> bool {
+    state & JOURNAL_SIZE_LIMIT_RUNTIME_OVERRIDE != 0
+}
+
+fn checked_journal_size_limit(bytes: u64) -> DbResult<i64> {
+    i64::try_from(bytes).map_err(|_| DbError::InvalidArgument {
+        field: "journal_size_limit_bytes",
+        message: format!("{bytes} exceeds SQLite's signed 64-bit PRAGMA range"),
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn apply_journal_size_limit(conn: &DbConn, bytes: u64) -> Result<(), SqlError> {
+    let value = i64::try_from(bytes).map_err(|_| {
+        SqlError::Custom(format!(
+            "journal_size_limit value {bytes} exceeds SQLite's signed 64-bit PRAGMA range"
+        ))
+    })?;
+    conn.execute_raw(&format!("PRAGMA journal_size_limit = {value};"))
 }
 
 impl DbPool {
-    fn connection_init_sql(config: &DbPoolConfig, query_only: bool) -> Arc<String> {
+    fn live_maintenance_connection(
+        &self,
+        context: &'static str,
+        busy_timeout_ms: u64,
+    ) -> DbResult<crate::DbConnGuard> {
+        self.validated_sqlite_path(context)?;
+        let conn = crate::guard_db_conn(
+            open_sqlite_file_with_lock_retry(&self.sqlite_path)
+                .map_err(|error| DbError::Sqlite(format!("{context}: open failed: {error}")))?,
+            context,
+        );
+        conn.execute_raw(&format!("PRAGMA busy_timeout = {busy_timeout_ms};"))
+            .map_err(|error| DbError::Sqlite(format!("{context}: busy_timeout: {error}")))?;
+        let state = self.journal_size_limit_state.load(Ordering::Acquire);
+        apply_journal_size_limit(&conn, journal_size_limit_bytes(state))
+            .map_err(|error| DbError::Sqlite(format!("{context}: journal_size_limit: {error}")))?;
+        Ok(conn)
+    }
+
+    fn connection_init_sql(
+        config: &DbPoolConfig,
+        query_only: bool,
+        journal_size_limit_bytes: i64,
+    ) -> Arc<String> {
+        use std::fmt::Write as _;
+
         let mut sql = String::new();
         if query_only {
             sql.push_str("PRAGMA query_only = ON;\n");
@@ -2392,29 +3158,51 @@ impl DbPool {
             config.max_connections,
             config.cache_budget_kb,
         ));
+        // `build_conn_pragmas` carries the historical default. Append the
+        // operator value so the last assignment is authoritative without
+        // widening this pool-only change into schema helpers used elsewhere.
+        writeln!(
+            sql,
+            "PRAGMA journal_size_limit = {journal_size_limit_bytes};"
+        )
+        .expect("writing connection initialization SQL to a String cannot fail");
         Arc::new(sql)
     }
 
-    fn from_shared_pool_with_options(
+    fn from_shared_pool_with_authority(
         config: &DbPoolConfig,
         pool: Arc<Pool<DbConn>>,
         skip_startup_init: bool,
+        authority: DbPoolAuthority,
     ) -> DbResult<Self> {
-        let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
-        let storage_root = config.resolved_storage_root();
-        let atc_experience_max_rows =
-            mcp_agent_mail_core::Config::from_env().atc_experience_max_rows;
-        let init_sql = Self::connection_init_sql(config, false);
+        let core_config = mcp_agent_mail_core::Config::from_env();
+        let atc_experience_max_rows = core_config.atc_experience_max_rows;
+        checked_journal_size_limit(core_config.db_journal_size_limit_bytes)?;
+        let journal_size_limit_state =
+            shared_journal_size_limit(&pool, core_config.db_journal_size_limit_bytes);
+        let journal_size_limit =
+            journal_size_limit_bytes(journal_size_limit_state.load(Ordering::Acquire));
+        let init_sql = Self::connection_init_sql(
+            config,
+            false,
+            checked_journal_size_limit(journal_size_limit)?,
+        );
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
-        let (message_id_allocator, cache_generation) = shared_message_id_allocator(&pool);
+        let (message_id_allocator, cache_generation) = shared_message_id_allocator(
+            &pool,
+            authority.sqlite_identity.as_deref(),
+            &authority.storage_root,
+        )?;
 
         Ok(Self {
             pool,
             cache_generation,
-            sqlite_path,
-            storage_root,
+            sqlite_identity: authority.sqlite_identity,
+            sqlite_path: authority.sqlite_path,
+            storage_root: authority.storage_root,
             atc_experience_max_rows,
             init_sql,
+            journal_size_limit_state,
             run_migrations: config.run_migrations,
             skip_startup_init,
             open_mode: DbPoolOpenMode::Recovering,
@@ -2423,20 +3211,25 @@ impl DbPool {
         })
     }
 
-    fn from_shared_pool(config: &DbPoolConfig, pool: Arc<Pool<DbConn>>) -> DbResult<Self> {
-        Self::from_shared_pool_with_options(config, pool, false)
-    }
-
     fn new_with_options(
         config: &DbPoolConfig,
         skip_startup_init: bool,
         query_only: bool,
     ) -> DbResult<Self> {
-        let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
-        let storage_root = config.resolved_storage_root();
-        let atc_experience_max_rows =
-            mcp_agent_mail_core::Config::from_env().atc_experience_max_rows;
-        let init_sql = Self::connection_init_sql(config, query_only);
+        let authority = DbPoolAuthority::resolve(config)?;
+        Self::new_with_authority(config, skip_startup_init, query_only, authority)
+    }
+
+    fn new_with_authority(
+        config: &DbPoolConfig,
+        skip_startup_init: bool,
+        query_only: bool,
+        authority: DbPoolAuthority,
+    ) -> DbResult<Self> {
+        let core_config = mcp_agent_mail_core::Config::from_env();
+        let atc_experience_max_rows = core_config.atc_experience_max_rows;
+        let configured_journal_size_limit =
+            checked_journal_size_limit(core_config.db_journal_size_limit_bytes)?;
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
 
         let pool_config = PoolConfig::new(config.max_connections)
@@ -2448,15 +3241,24 @@ impl DbPool {
             .test_on_return(false);
 
         let pool = Arc::new(Pool::new(pool_config));
-        let (message_id_allocator, cache_generation) = shared_message_id_allocator(&pool);
+        let journal_size_limit_state =
+            shared_journal_size_limit(&pool, core_config.db_journal_size_limit_bytes);
+        let init_sql = Self::connection_init_sql(config, query_only, configured_journal_size_limit);
+        let (message_id_allocator, cache_generation) = shared_message_id_allocator(
+            &pool,
+            authority.sqlite_identity.as_deref(),
+            &authority.storage_root,
+        )?;
 
         Ok(Self {
             pool,
             cache_generation,
-            sqlite_path,
-            storage_root,
+            sqlite_identity: authority.sqlite_identity,
+            sqlite_path: authority.sqlite_path,
+            storage_root: authority.storage_root,
             atc_experience_max_rows,
             init_sql,
+            journal_size_limit_state,
             run_migrations: config.run_migrations,
             skip_startup_init,
             open_mode: if query_only {
@@ -2529,6 +3331,71 @@ impl DbPool {
         &self.storage_root
     }
 
+    /// Return the frozen SQLite authority after proving its path has not
+    /// become an alias for a different filesystem identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::InvalidArgument`] when the path now resolves through
+    /// a different authority than the one frozen at pool construction.
+    pub(crate) fn validated_sqlite_path(&self, context: &'static str) -> DbResult<&Path> {
+        validate_frozen_sqlite_open_authority(
+            &self.sqlite_path,
+            self.sqlite_identity.as_deref(),
+            context,
+        )
+        .map_err(|error| DbError::InvalidArgument {
+            field: "database_url",
+            message: error.to_string(),
+        })?;
+        Ok(Path::new(&self.sqlite_path))
+    }
+
+    /// Return the derived ATC sidecar path after validating both its mailbox
+    /// parent authority and the sidecar leaf itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::InvalidArgument`] when either path now resolves
+    /// through a different filesystem authority.
+    pub(crate) fn validated_atc_sqlite_path(
+        &self,
+        context: &'static str,
+    ) -> DbResult<Option<String>> {
+        self.validated_sqlite_path(context)?;
+        let Some(atc_path) = self.atc_sqlite_path() else {
+            return Ok(None);
+        };
+        validate_frozen_sqlite_open_authority(&atc_path, Some(Path::new(&atc_path)), context)
+            .map_err(|error| DbError::InvalidArgument {
+                field: "database_url",
+                message: error.to_string(),
+            })?;
+        Ok(Some(atc_path))
+    }
+
+    /// Return the frozen archive authority after proving its path has not
+    /// become a symlink to a different filesystem identity.
+    ///
+    /// `storage_root()` remains available for diagnostics that only render or
+    /// hash the frozen path. Every caller that performs archive or index I/O
+    /// must use this fallible accessor instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::InvalidArgument`] when the frozen path now resolves
+    /// through a different filesystem authority (for example, because a
+    /// missing leaf was replaced with a symlink after pool construction).
+    pub(crate) fn validated_storage_root(&self, context: &'static str) -> DbResult<&Path> {
+        validate_frozen_storage_root_authority(&self.storage_root, context).map_err(|error| {
+            DbError::InvalidArgument {
+                field: "storage_root",
+                message: error.to_string(),
+            }
+        })?;
+        Ok(&self.storage_root)
+    }
+
     #[must_use]
     pub fn sqlite_identity_key(&self) -> String {
         // A recovery may replace the database file at this same path while
@@ -2538,7 +3405,11 @@ impl DbPool {
         // cached before the replacement. Clones and separately constructed
         // wrappers of the same underlying pool intentionally share one
         // generation.
-        format!("{}@{}", self.sqlite_path, self.cache_generation)
+        let identity = self.sqlite_identity.as_ref().map_or_else(
+            || ":memory:".to_string(),
+            |path| sqlite_identity_cache_namespace(path),
+        );
+        format!("{identity}@{}", self.cache_generation)
     }
 
     pub fn sample_pool_stats_now(&self) {
@@ -2546,7 +3417,9 @@ impl DbPool {
     }
 
     fn retire_runtime_state_after_recovery(&self, trigger_error: &str) {
-        retire_cached_runtime_state_after_recovery(Path::new(&self.sqlite_path), trigger_error);
+        if let Some(identity) = self.sqlite_identity.as_deref() {
+            retire_cached_runtime_state_after_recovery(identity, trigger_error);
+        }
         // The registry-wide retirement derives canonical scopes from cache
         // keys. Also invalidate this exact wrapper scope so unusual relative
         // path spellings cannot retain a stale identity row.
@@ -2604,7 +3477,21 @@ impl DbPool {
     /// Single acquire attempt: creates and initializes a new connection if needed.
     #[allow(clippy::too_many_lines)]
     async fn acquire_once(&self, cx: &Cx) -> Outcome<PooledConnection<DbConn>, SqlError> {
+        let start = Instant::now();
+        if let Err(error) =
+            validate_frozen_storage_root_authority(&self.storage_root, "pooled connection checkout")
+        {
+            let dur_us = u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX)))
+                .unwrap_or(u64::MAX);
+            let metrics = mcp_agent_mail_core::global_metrics();
+            metrics.db.pool_acquires_total.inc();
+            metrics.db.pool_acquire_latency_us.record(dur_us);
+            metrics.db.pool_acquire_errors_total.inc();
+            self.stats_sampler.maybe_sample(&self.pool);
+            return Outcome::Err(error);
+        }
         let sqlite_path = self.sqlite_path.clone();
+        let sqlite_identity = self.sqlite_identity.clone();
         let storage_root = self.storage_root.clone();
         let init_sql = self.init_sql.clone();
         let run_migrations = self.run_migrations;
@@ -2612,11 +3499,11 @@ impl DbPool {
         let open_mode = self.open_mode;
         let cx2 = cx.clone();
 
-        let start = Instant::now();
         let out = self
             .pool
             .acquire(cx, || {
                 let sqlite_path = sqlite_path.clone();
+                let sqlite_identity = sqlite_identity.clone();
                 let storage_root = storage_root.clone();
                 // Owned copy for the per-connection recovery path below; the primary
                 // `storage_root` binding is moved into the one-time init-gate closure.
@@ -2624,6 +3511,13 @@ impl DbPool {
                 let init_sql = init_sql.clone();
                 let cx2 = cx2.clone();
                 async move {
+                    if let Err(error) = validate_frozen_sqlite_open_authority(
+                        &sqlite_path,
+                        sqlite_identity.as_deref(),
+                        "pooled connection open",
+                    ) {
+                        return Outcome::Err(error);
+                    }
                     // Ensure parent directory exists for file-backed DBs.
                     if sqlite_path != ":memory:"
                         && open_mode == DbPoolOpenMode::Recovering
@@ -2637,7 +3531,8 @@ impl DbPool {
                     // Run one-time DB initialization (schema + migrations) via a separate
                     // connection to ensure atomic setup before pool connections open.
                     if sqlite_path != ":memory:" && !skip_startup_init {
-                        let init_gate = sqlite_init_gate(&sqlite_path, &storage_root);
+                        let init_gate =
+                            sqlite_init_gate(sqlite_identity.as_deref(), &storage_root);
                         let run_migrations = run_migrations;
 
                         // GH#245 / F1: only the initializer runs unboundedly;
@@ -2680,6 +3575,18 @@ impl DbPool {
                         }
                     }
 
+                    // Initialization can create or durably replace the SQLite
+                    // leaf. Revalidate immediately before the engine open so
+                    // an independently inserted symlink cannot inherit this
+                    // pool's frozen authority between init and checkout.
+                    if let Err(error) = validate_frozen_sqlite_open_authority(
+                        &sqlite_path,
+                        sqlite_identity.as_deref(),
+                        "pooled connection post-init open",
+                    ) {
+                        return Outcome::Err(error);
+                    }
+
                     // Now open pool connection (migrations are complete).
                     let mut conn = if sqlite_path == ":memory:" {
                         match DbConn::open_memory() {
@@ -2687,22 +3594,18 @@ impl DbPool {
                             Err(e) => return Outcome::Err(e),
                         }
                     } else if open_mode == DbPoolOpenMode::QueryOnlyStrict {
-                        // br-uflow: refuse obviously unopenable targets BEFORE
-                        // FrankenSQLite sees the pathname. Its open can mint
-                        // persistent namespace sidecars (-fsqlite-ns-gate /
-                        // -fsqlite-ns-use) even when the open fails, and those
-                        // records must never be unlinked outside FrankenSQLite's
-                        // own cleanup protocol — while the strict query-only
-                        // contract promises zero filesystem footprint.
-                        if let Err(e) = strict_target_precheck(&sqlite_path) {
-                            return Outcome::Err(e);
-                        }
-                        match DbConn::open_file_read_only(&sqlite_path) {
+                        match open_guarded_read_only_franken_existing_file(
+                            Path::new(&sqlite_path),
+                            "strict query-only pool connection",
+                        ) {
                             Ok(c) => c,
                             Err(e) => return Outcome::Err(e),
                         }
                     } else {
-                        match open_sqlite_file_with_recovery(&sqlite_path) {
+                        match open_sqlite_file_with_recovery_and_storage_root(
+                            &sqlite_path,
+                            &storage_root_for_recovery,
+                        ) {
                             Ok(c) => c,
                             Err(e) => return Outcome::Err(e),
                         }
@@ -2740,7 +3643,18 @@ impl DbPool {
                             || open_mode == DbPoolOpenMode::QueryOnlyStrict
                             || !is_sqlite_recovery_error_message(&first_init_err.to_string())
                         {
-                            crate::close_db_conn(conn, "pool connection init failed (non-recoverable)");
+                            if open_mode == DbPoolOpenMode::QueryOnlyStrict {
+                                // `close_db_conn` checkpoints. A genuinely
+                                // read-only handle must take the engine's
+                                // checkpoint-free Drop path even when its
+                                // connection-local PRAGMA setup fails.
+                                drop(conn);
+                            } else {
+                                crate::close_db_conn(
+                                    conn,
+                                    "pool connection init failed (non-recoverable)",
+                                );
+                            }
                             return Outcome::Err(first_init_err);
                         }
 
@@ -2763,7 +3677,17 @@ impl DbPool {
                             return Outcome::Err(recovery_err);
                         }
 
-                        conn = match open_sqlite_file_with_recovery(&sqlite_path) {
+                        if let Err(error) = validate_frozen_sqlite_open_authority(
+                            &sqlite_path,
+                            sqlite_identity.as_deref(),
+                            "pooled connection post-recovery open",
+                        ) {
+                            return Outcome::Err(error);
+                        }
+                        conn = match open_sqlite_file_with_recovery_and_storage_root(
+                            &sqlite_path,
+                            &storage_root_for_recovery,
+                        ) {
                             Ok(c) => c,
                             Err(e) => return Outcome::Err(e),
                         };
@@ -2782,6 +3706,26 @@ impl DbPool {
                 }
             })
             .await;
+
+        let journal_size_limit_state = self.journal_size_limit_state.load(Ordering::Acquire);
+        let out = match out {
+            Outcome::Ok(conn)
+                if journal_size_limit_has_runtime_override(journal_size_limit_state) =>
+            {
+                let bytes = journal_size_limit_bytes(journal_size_limit_state);
+                match apply_journal_size_limit(&conn, bytes) {
+                    Ok(()) => Outcome::Ok(conn),
+                    Err(error) => {
+                        crate::close_db_conn(
+                            conn.detach(),
+                            "pool journal_size_limit retune failed",
+                        );
+                        Outcome::Err(error)
+                    }
+                }
+            }
+            other => other,
+        };
 
         let dur_us = u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX)))
             .unwrap_or(u64::MAX);
@@ -2832,14 +3776,76 @@ impl DbPool {
     /// "Healthy" includes the GH#114 case where the bespoke probe rejects
     /// the file but canonical SQLite accepts it; in that case the returned
     /// `IntegrityCheckResult` has `details = ["ok (canonical fallback)"]`
-    /// (see [`Self::quick_check_with_canonical_fallback`]). This is also
-    /// invoked by the periodic 5-minute `run_quick_cycle` in the integrity
-    /// guard, so the canonical fallback applies to both startup and steady
-    /// state.
+    /// (see [`Self::quick_check_with_canonical_fallback`]). The periodic
+    /// 5-minute guard uses [`Self::run_periodic_integrity_check`], which shares
+    /// that same canonical-fallback implementation.
     ///
     /// This opens a dedicated connection (outside the pool) so the check
     /// doesn't consume a pooled slot.
     pub fn run_startup_integrity_check(&self) -> DbResult<integrity::IntegrityCheckResult> {
+        self.run_integrity_check(true)
+    }
+
+    /// Run the quick integrity cycle after the runtime has already opened this
+    /// database generation.
+    ///
+    /// Cold startup uses [`Self::run_startup_integrity_check`] and proves a
+    /// private copy of the exact SQLite family before the first live engine
+    /// open. Repeating that full-family copy on every periodic guard cycle
+    /// would make steady-state integrity cost proportional to database size.
+    /// The live cycle may therefore skip that cold-open proof when there is no
+    /// relevant durable recovery history; every cleanup and recovery mutation
+    /// remains admission-controlled.
+    pub fn run_periodic_integrity_check(&self) -> DbResult<integrity::IntegrityCheckResult> {
+        self.run_integrity_check(false)
+    }
+
+    /// Classify whether opening the live SQLite family for an integrity cycle
+    /// must first pass through durable recovery admission.
+    ///
+    /// Damaged WAL/SHM cleanup is itself admission-controlled. A private copy
+    /// of the exact family is additionally required on cold startup and when
+    /// durable breaker history is unreadable or applies to these primary
+    /// bytes. Returning `true` means the live engine must not be opened until
+    /// the caller has entered an admission envelope.
+    fn integrity_family_requires_preopen_admission(
+        &self,
+        require_source_neutral_preopen_proof: bool,
+        cycle: &str,
+    ) -> DbResult<bool> {
+        let sqlite_path = self.validated_sqlite_path("integrity pre-open classification")?;
+        cleanup_truncated_wal_sidecar(sqlite_path).map_err(|error| {
+            DbError::Sqlite(format!(
+                "{cycle}: pre-open SQLite-family cleanup failed: {error}"
+            ))
+        })?;
+
+        let breaker_requires_source_neutral_proof = match crate::recovery_breaker::load(sqlite_path)
+        {
+            Err(_) => true,
+            Ok(Some(state)) => {
+                let fingerprint = recovery_breaker_fingerprint(sqlite_path, Some(&state));
+                state.consecutive_failures > 0 && state.db_fingerprint == fingerprint
+            }
+            Ok(None) => false,
+        };
+        if !require_source_neutral_preopen_proof && !breaker_requires_source_neutral_proof {
+            return Ok(false);
+        }
+
+        sqlite_file_is_healthy_without_family_cleanup(sqlite_path)
+            .map(|healthy| !healthy)
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "{cycle}: source-neutral pre-open probe failed: {error}"
+                ))
+            })
+    }
+
+    fn run_integrity_check(
+        &self,
+        require_source_neutral_preopen_proof: bool,
+    ) -> DbResult<integrity::IntegrityCheckResult> {
         if self.sqlite_path == ":memory:" {
             // In-memory databases cannot be corrupt on startup.
             return Ok(integrity::IntegrityCheckResult {
@@ -2849,121 +3855,160 @@ impl DbPool {
                 kind: integrity::CheckKind::Quick,
             });
         }
+        let sqlite_path = self.validated_sqlite_path("startup/periodic integrity check")?;
+        let storage_root =
+            self.validated_storage_root("startup/periodic integrity archive recovery")?;
 
         // Check if the file exists first. If missing, it requires recovery (e.g. from archive or backup).
-        if !Path::new(&self.sqlite_path).exists() {
+        if !sqlite_path.exists() {
             return Err(DbError::IntegrityCorruption {
                 message: "Database file is missing".to_string(),
                 details: vec!["File not found on disk".to_string()],
             });
         }
 
-        let conn = crate::guard_db_conn(
-            match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
-                Ok(conn) => conn,
-                Err(e) => {
-                    if !is_corruption_error_message(&e.to_string()) {
-                        return Err(DbError::Sqlite(format!(
-                            "startup integrity check: open failed: {e}"
-                        )));
+        // A malformed/header-only WAL can make the first SQLite engine open
+        // consume or rewrite live family state. Classify and, when necessary,
+        // clean the family through the durable recovery-admission boundary
+        // before that open. In particular, malformed or tripped breaker
+        // authority must refuse here while the primary/WAL/SHM namespace is
+        // still byte-for-byte untouched.
+        // A cold startup must prove a private copy of the exact family before
+        // any live engine open: merely opening SQLite can replay or rewrite
+        // WAL/SHM state. Once the runtime is already live, periodic cycles may
+        // avoid that O(database-size) copy unless durable failure history for
+        // these exact primary bytes requires the same fail-closed proof.
+        // Unreadable breaker authority also requires this proof: a healthy
+        // exact family may continue serving without recovery, while an
+        // unhealthy family flows into admission and refuses before opening
+        // either the election file or SQLite itself.
+        let requires_preopen_admission = self.integrity_family_requires_preopen_admission(
+            require_source_neutral_preopen_proof,
+            "startup integrity check",
+        )?;
+        let run_live_check = || -> DbResult<integrity::IntegrityCheckResult> {
+            self.validated_sqlite_path("startup integrity live open")?;
+            let conn = crate::guard_db_conn(
+                match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        if !is_corruption_error_message(&e.to_string()) {
+                            return Err(DbError::Sqlite(format!(
+                                "startup integrity check: open failed: {e}"
+                            )));
+                        }
+                        tracing::warn!(
+                            path = %self.sqlite_path,
+                            error = %e,
+                            "startup integrity check failed to open sqlite file; attempting auto-recovery"
+                        );
+                        recover_sqlite_file_with_storage_root(sqlite_path, storage_root).map_err(
+                            |re| DbError::Sqlite(format!("startup recovery failed: {re}")),
+                        )?;
+                        self.validated_sqlite_path("startup integrity post-recovery open")?;
+                        open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
+                            DbError::Sqlite(format!(
+                                "startup integrity check: open failed after recovery: {reopen}"
+                            ))
+                        })?
                     }
+                },
+                "startup integrity check connection",
+            );
+
+            // GH#114: route through the canonical-fallback helper instead of
+            // calling `integrity::quick_check` directly. If the bespoke probe
+            // false-positives (e.g. on a NOCASE-collation index it dislikes) but
+            // canonical SQLite accepts the file, we return Ok and skip recovery
+            // entirely — preventing the runtime verdict pipeline from wedging
+            // `recovery.mode = degraded_read_only` on every 5-min quick-cycle.
+            match self.quick_check_with_canonical_fallback(&conn, "initial") {
+                Ok(res) => Ok(res),
+                Err(DbError::IntegrityCorruption { .. }) => {
+                    // The helper already logged the rejection verdict (primary +
+                    // canonical). This warn marks the recovery action taken in
+                    // response, so an operator following the log can correlate
+                    // verdict → action without scanning code.
+                    tracing::warn!(
+                        path = %self.sqlite_path,
+                        "attempting auto-recovery from backup"
+                    );
+
+                    // Close connection before attempting restore (Windows/locking safety)
+                    drop(conn);
+
+                    if let Err(e) = recover_sqlite_file_with_storage_root(sqlite_path, storage_root)
+                    {
+                        return Err(DbError::Sqlite(format!("startup recovery failed: {e}")));
+                    }
+                    self.validated_sqlite_path("startup integrity post-recovery open")?;
+
+                    // Re-open and re-verify. Route post-recovery through the same
+                    // canonical fallback: if the bespoke probe's false-positive was
+                    // index-shape-related (e.g. GH#114's NOCASE-collation idx_agents
+                    // entries-out-of-order verdict on a perfectly valid index), the
+                    // restored file will reproduce the same schema and trip the same
+                    // false positive. Without the fallback we'd return Err here and
+                    // re-wedge recovery.mode despite canonical accepting the file.
+                    let conn = crate::guard_db_conn(
+                        open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|e| {
+                            DbError::Sqlite(format!(
+                                "startup integrity check (post-recovery): open failed: {e}"
+                            ))
+                        })?,
+                        "startup integrity check post-recovery connection",
+                    );
+                    self.quick_check_with_canonical_fallback(&conn, "post-recovery")
+                }
+                Err(e)
+                    if is_sqlite_recovery_error_message(&e.to_string())
+                        || is_corruption_error_message(&e.to_string()) =>
+                {
                     tracing::warn!(
                         path = %self.sqlite_path,
                         error = %e,
-                        "startup integrity check failed to open sqlite file; attempting auto-recovery"
+                        "startup integrity probe hit sqlite recovery error; attempting auto-recovery"
                     );
-                    recover_sqlite_file_with_storage_root(
-                        Path::new(&self.sqlite_path),
-                        &self.storage_root,
-                    )
-                    .map_err(|re| DbError::Sqlite(format!("startup recovery failed: {re}")))?;
-                    open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
-                        DbError::Sqlite(format!(
-                            "startup integrity check: open failed after recovery: {reopen}"
-                        ))
-                    })?
+
+                    drop(conn);
+
+                    if let Err(recovery_error) =
+                        recover_sqlite_file_with_storage_root(sqlite_path, storage_root)
+                    {
+                        return Err(DbError::Sqlite(format!(
+                            "startup recovery failed: {recovery_error}"
+                        )));
+                    }
+                    self.validated_sqlite_path("startup integrity post-recovery open")?;
+
+                    let conn = crate::guard_db_conn(
+                        open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
+                            DbError::Sqlite(format!(
+                                "startup integrity check (post-recovery): open failed: {reopen}"
+                            ))
+                        })?,
+                        "startup integrity check post-recovery connection",
+                    );
+                    self.quick_check_with_canonical_fallback(&conn, "post-recovery")
                 }
-            },
-            "startup integrity check connection",
-        );
-
-        // GH#114: route through the canonical-fallback helper instead of
-        // calling `integrity::quick_check` directly. If the bespoke probe
-        // false-positives (e.g. on a NOCASE-collation index it dislikes) but
-        // canonical SQLite accepts the file, we return Ok and skip recovery
-        // entirely — preventing the runtime verdict pipeline from wedging
-        // `recovery.mode = degraded_read_only` on every 5-min quick-cycle.
-        match self.quick_check_with_canonical_fallback(&conn, "initial") {
-            Ok(res) => Ok(res),
-            Err(DbError::IntegrityCorruption { .. }) => {
-                // The helper already logged the rejection verdict (primary +
-                // canonical). This warn marks the recovery action taken in
-                // response, so an operator following the log can correlate
-                // verdict → action without scanning code.
-                tracing::warn!(
-                    path = %self.sqlite_path,
-                    "attempting auto-recovery from backup"
-                );
-
-                // Close connection before attempting restore (Windows/locking safety)
-                drop(conn);
-
-                if let Err(e) = recover_sqlite_file_with_storage_root(
-                    Path::new(&self.sqlite_path),
-                    &self.storage_root,
-                ) {
-                    return Err(DbError::Sqlite(format!("startup recovery failed: {e}")));
-                }
-
-                // Re-open and re-verify. Route post-recovery through the same
-                // canonical fallback: if the bespoke probe's false-positive was
-                // index-shape-related (e.g. GH#114's NOCASE-collation idx_agents
-                // entries-out-of-order verdict on a perfectly valid index), the
-                // restored file will reproduce the same schema and trip the same
-                // false positive. Without the fallback we'd return Err here and
-                // re-wedge recovery.mode despite canonical accepting the file.
-                let conn = crate::guard_db_conn(
-                    open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|e| {
-                        DbError::Sqlite(format!(
-                            "startup integrity check (post-recovery): open failed: {e}"
-                        ))
-                    })?,
-                    "startup integrity check post-recovery connection",
-                );
-                self.quick_check_with_canonical_fallback(&conn, "post-recovery")
+                Err(e) => Err(e),
             }
-            Err(e)
-                if is_sqlite_recovery_error_message(&e.to_string())
-                    || is_corruption_error_message(&e.to_string()) =>
-            {
-                tracing::warn!(
-                    path = %self.sqlite_path,
-                    error = %e,
-                    "startup integrity probe hit sqlite recovery error; attempting auto-recovery"
-                );
+        };
 
-                drop(conn);
+        if !requires_preopen_admission {
+            return run_live_check();
+        }
 
-                if let Err(recovery_error) = recover_sqlite_file_with_storage_root(
-                    Path::new(&self.sqlite_path),
-                    &self.storage_root,
-                ) {
-                    return Err(DbError::Sqlite(format!(
-                        "startup recovery failed: {recovery_error}"
-                    )));
-                }
-
-                let conn = crate::guard_db_conn(
-                    open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
-                        DbError::Sqlite(format!(
-                            "startup integrity check (post-recovery): open failed: {reopen}"
-                        ))
-                    })?,
-                    "startup integrity check post-recovery connection",
-                );
-                self.quick_check_with_canonical_fallback(&conn, "post-recovery")
-            }
-            Err(e) => Err(e),
+        match with_automatic_recovery_admission(
+            sqlite_path,
+            "startup integrity pre-open recovery",
+            run_live_check,
+        ) {
+            Ok(result) => Ok(result),
+            Err(AutomaticRecoveryRunError::Admission { error, .. }) => Err(DbError::Sqlite(
+                format!("startup integrity check: recovery admission failed: {error}"),
+            )),
+            Err(AutomaticRecoveryRunError::Operation(error)) => Err(error),
         }
     }
 
@@ -2987,31 +4032,29 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(None);
         }
-        if !Path::new(&self.sqlite_path).exists() {
+        let sqlite_path = self.validated_sqlite_path("message-id floor database authority")?;
+        if !sqlite_path.exists() {
             return Ok(None);
         }
-        let archive_max = crate::id_floor::max_message_id_in_archive(&self.storage_root);
+        let storage_root = self.validated_storage_root("message-id floor archive scan")?;
+        let archive_max = crate::id_floor::max_message_id_in_archive(storage_root)?;
         if archive_max.is_none() {
             return Ok(None);
         }
 
-        let conn = open_sqlite_file_with_lock_retry_canonical(&self.sqlite_path).map_err(|e| {
-            DbError::Sqlite(format!("id_floor: open sqlite for floor advance: {e}"))
-        })?;
-        crate::id_floor::advance_messages_id_floor(&conn, archive_max)
+        let conn = self.live_maintenance_connection("id_floor archive advance", 20_000)?;
+        crate::id_floor::advance_messages_id_floor_franken(&conn, archive_max)
     }
 
     /// The shared, process-wide monotonic message-id allocator for this
     /// database (mcp_agent_mail#176).
     ///
-    /// Keyed by the shared connection pool's `Arc` identity so that every
-    /// `DbPool` wrapper of the same underlying pool resolves to one allocator
-    /// — guaranteeing that consecutive message creations can never be handed
-    /// the same id even when the live SQLite's durable `AUTOINCREMENT` state
-    /// fails to advance (the suspect / canonical-fallback mode that defeats
-    /// the startup-only `id_floor` advance). Independent pools, including each
-    /// fresh `:memory:` test pool, get their own isolated allocator. Resolved
-    /// once at construction (see [`shared_message_id_allocator`]); this
+    /// File-backed pools are keyed by normalized SQLite identity, so even
+    /// independent pool `Arc`s for the same live file resolve to one allocator.
+    /// This guarantees consecutive message creations cannot receive the same
+    /// id when durable `AUTOINCREMENT` state fails to advance. Each fresh
+    /// `:memory:` pool remains isolated by underlying pool `Arc`. Resolution
+    /// happens once at construction (see [`shared_message_id_allocator`]); this
     /// accessor is a cheap clone with no locking on the message hot path.
     #[must_use]
     pub fn message_id_allocator(&self) -> Arc<crate::id_floor::MessageIdAllocator> {
@@ -3021,8 +4064,8 @@ impl DbPool {
     /// Run `integrity::quick_check` on `conn` and, on `IntegrityCorruption`,
     /// consult canonical SQLite as a second opinion (mirroring
     /// `sqlite_primary_check_is_ok_with_canonical_fallback` from the runtime
-    /// health-verdict path). Used by `run_startup_integrity_check` for both
-    /// the initial probe and the post-recovery re-verification so a
+    /// health-verdict path). Used by `run_integrity_check` for both the
+    /// initial probe and the post-recovery re-verification so a
     /// bespoke-only false positive does not wedge `recovery.mode` (GH#114).
     ///
     /// `phase` is folded into log lines so the operator can tell whether a
@@ -3032,7 +4075,7 @@ impl DbPool {
     /// `self.sqlite_path` — the canonical fallback opens a fresh canonical
     /// connection against `self.sqlite_path` and the two probes only agree
     /// when they're inspecting the same file. The function is private and
-    /// has exactly two call sites in `run_startup_integrity_check`, both of
+    /// has exactly two call sites in `run_integrity_check`, both of
     /// which open `conn` from `self.sqlite_path` immediately before passing
     /// it in; do not call from anywhere that violates this.
     fn quick_check_with_canonical_fallback(
@@ -3040,6 +4083,7 @@ impl DbPool {
         conn: &DbConn,
         phase: &str,
     ) -> DbResult<integrity::IntegrityCheckResult> {
+        self.validated_sqlite_path("quick integrity canonical fallback")?;
         reconcile_with_canonical(
             integrity::quick_check(conn),
             integrity::CheckKind::Quick,
@@ -3077,15 +4121,35 @@ impl DbPool {
                 kind: integrity::CheckKind::Full,
             });
         }
+        let sqlite_path = self.validated_sqlite_path("full integrity check")?;
+        let storage_root = self.validated_storage_root("full integrity archive recovery")?;
 
-        if !Path::new(&self.sqlite_path).exists() {
+        if !sqlite_path.exists() {
             return Err(DbError::IntegrityCorruption {
                 message: "Database file is missing".to_string(),
                 details: vec!["File not found on disk".to_string()],
             });
         }
 
-        let conn = crate::guard_db_conn(
+        // The periodic quick cycle normally runs immediately before this
+        // hourly full check, but a failed quick cycle must not make the full
+        // path a second, unguarded way to open the same suspect family. Reuse
+        // the exact pre-open classifier here. When the family requires
+        // admission, guard only the live engine open; any resulting integrity
+        // error is returned to the integrity guard, whose recovery handler
+        // enters the outcome-recording recovery envelope exactly once.
+        let requires_preopen_admission =
+            self.integrity_family_requires_preopen_admission(false, "full integrity check")?;
+        let raw_conn = if requires_preopen_admission {
+            with_recovery_mutation_admission(sqlite_path, "full integrity pre-open", || {
+                open_sqlite_file_with_lock_retry(&self.sqlite_path)
+            })
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "full integrity check: admitted pre-open failed: {error}"
+                ))
+            })?
+        } else {
             match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
                 Ok(conn) => conn,
                 Err(e) => {
@@ -3099,22 +4163,20 @@ impl DbPool {
                         error = %e,
                         "full integrity check failed to open sqlite file; attempting auto-recovery"
                     );
-                    recover_sqlite_file_with_storage_root(
-                        Path::new(&self.sqlite_path),
-                        &self.storage_root,
-                    )
-                    .map_err(|re| {
-                        DbError::Sqlite(format!("full integrity recovery failed: {re}"))
-                    })?;
+                    recover_sqlite_file_with_storage_root(sqlite_path, storage_root).map_err(
+                        |re| DbError::Sqlite(format!("full integrity recovery failed: {re}")),
+                    )?;
+                    self.validated_sqlite_path("full integrity post-recovery open")?;
                     open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
                         DbError::Sqlite(format!(
                             "full integrity check: open failed after recovery: {reopen}"
                         ))
                     })?
                 }
-            },
-            "full integrity check connection",
-        );
+            }
+        };
+        let conn = crate::guard_db_conn(raw_conn, "full integrity check connection");
+        self.validated_sqlite_path("full integrity canonical fallback")?;
 
         reconcile_with_canonical(
             integrity::full_check(&conn),
@@ -3141,18 +4203,16 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(Vec::new());
         }
-        if !Path::new(&self.sqlite_path).exists() {
+        let sqlite_path = self.validated_sqlite_path("consistency probe")?;
+        if !sqlite_path.exists() {
             return Ok(Vec::new());
         }
 
-        // Keep consistency sampling on FrankenSQLite and avoid JOIN-heavy scans:
+        // Keep consistency sampling read-only and avoid JOIN-heavy scans:
         // 1) fetch recent envelopes
         // 2) resolve slugs/names via batched point lookups
-        let conn = crate::guard_db_conn(
-            open_sqlite_file_with_lock_retry(&self.sqlite_path)
-                .map_err(|e| DbError::Sqlite(format!("consistency probe: open failed: {e}")))?,
-            "consistency probe connection",
-        );
+        let conn = open_guarded_read_only_sqlite_file(sqlite_path, "consistency probe")
+            .map_err(|e| DbError::Sqlite(format!("consistency probe: open failed: {e}")))?;
         // This two-phase strategy is materially faster than a three-way JOIN on
         // large mailboxes and reduces startup probe lock contention.
         let message_rows = conn
@@ -3308,7 +4368,14 @@ impl DbPool {
     /// SQLite reports that the TRUNCATE checkpoint was busy or incomplete.
     /// No-ops silently for `:memory:` databases.
     pub fn wal_checkpoint(&self) -> DbResult<u64> {
-        wal_checkpoint_truncate_path(Path::new(&self.sqlite_path))
+        if self.sqlite_path == ":memory:" {
+            return Ok(0);
+        }
+        let conn = self.live_maintenance_connection("live wal checkpoint", 60_000)?;
+        let rows = conn
+            .query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+            .map_err(|error| DbError::Sqlite(format!("live wal checkpoint: {error}")))?;
+        parse_wal_checkpoint_rows(&rows, "live wal checkpoint", true)
     }
 
     /// Run a **passive** WAL checkpoint that never blocks writers.
@@ -3325,6 +4392,7 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(0);
         }
+        self.validated_sqlite_path("passive wal checkpoint")?;
         let conn = crate::guard_db_conn(
             open_sqlite_file_with_lock_retry(&self.sqlite_path)
                 .map_err(|e| DbError::Sqlite(format!("passive checkpoint: open failed: {e}")))?,
@@ -3343,8 +4411,11 @@ impl DbPool {
     /// Create (or refresh) a `.bak` backup of the database file.
     ///
     /// Skips silently for `:memory:` databases or when the primary file
-    /// doesn't exist. Performs a WAL checkpoint first to ensure the backup
-    /// is self-contained.
+    /// doesn't exist. Materializes the backup through a guarded FrankenSQLite
+    /// `VACUUM INTO`, then canonical SQLite's online backup API against that
+    /// private logical image. Canonical SQLite never opens the live primary
+    /// inode, so publishing a backup cannot release process-wide locks held by
+    /// other FrankenSQLite connections.
     ///
     /// Returns `Ok(Some(path))` with the backup path on success, `Ok(None)`
     /// if the operation was skipped (memory DB, missing file, or the existing
@@ -3356,12 +4427,18 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(None);
         }
-        let primary = Path::new(&self.sqlite_path);
+        let primary = self.validated_sqlite_path("proactive backup")?;
         if !primary.exists() {
             return Ok(None);
         }
 
         let bak_path = sqlite_path_with_file_name_suffix(primary, ".bak", "storage.sqlite3.bak");
+        if !sqlite_recovery_candidate_is_standalone(&bak_path) {
+            return Err(DbError::Sqlite(format!(
+                "proactive backup destination {} has companion SQLite or FrankenSQLite state; refusing to treat one file from a multi-file generation as a published backup",
+                bak_path.display()
+            )));
+        }
         let backup_exists = match std::fs::symlink_metadata(&bak_path) {
             Ok(metadata) if metadata.file_type().is_file() => {
                 if let Ok(modified) = metadata.modified()
@@ -3376,6 +4453,12 @@ impl DbPool {
                     // refreshes. Verification therefore runs only when the
                     // backup is actually (re)created, i.e. at most once per
                     // `max_age` refresh interval.
+                    if !sqlite_recovery_candidate_is_standalone(&bak_path) {
+                        return Err(DbError::Sqlite(format!(
+                            "fresh proactive backup {} gained companion state during inspection; refusing to classify it as self-contained",
+                            bak_path.display()
+                        )));
+                    }
                     return Ok(None);
                 }
                 true
@@ -3400,8 +4483,13 @@ impl DbPool {
                 )));
             }
         };
+        if !sqlite_recovery_candidate_is_standalone(&bak_path) {
+            return Err(DbError::Sqlite(format!(
+                "proactive backup destination {} gained companion state during inspection; refusing to replace one file from a multi-file generation",
+                bak_path.display()
+            )));
+        }
 
-        ensure_proactive_backup_source_is_safe(primary, &bak_path)?;
         let source_bytes = std::fs::metadata(primary)
             .map_err(|error| {
                 DbError::Sqlite(format!(
@@ -3410,27 +4498,116 @@ impl DbPool {
                 ))
             })?
             .len();
-        ensure_recovery_disk_headroom(primary, source_bytes, "proactive backup")
+        let wal_path = sqlite_sidecar_path(primary, "-wal");
+        let wal_bytes = match std::fs::symlink_metadata(&wal_path) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata.len(),
+            Ok(_) => {
+                return Err(DbError::Sqlite(format!(
+                    "proactive backup aborted: WAL companion {} is not a regular file",
+                    wal_path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => {
+                return Err(DbError::Sqlite(format!(
+                    "proactive backup aborted: failed to stat WAL companion {}: {error}",
+                    wal_path.display()
+                )));
+            }
+        };
+        let expected_write_bytes = proactive_backup_expected_write_bytes(source_bytes, wal_bytes);
+        ensure_recovery_disk_headroom(primary, expected_write_bytes, "proactive backup")
             .map_err(|error| DbError::Sqlite(error.to_string()))?;
 
-        // Checkpoint WAL so the backup is self-contained.
-        if let Err(e) = self.wal_checkpoint() {
-            return Err(DbError::Sqlite(format!(
-                "proactive backup aborted: WAL checkpoint failed for {}: {e}",
-                primary.display()
-            )));
-        }
-
-        let staged_backup = create_proactive_backup_stage(primary, &bak_path)?;
+        let (staged_directory, staged_backup) = create_proactive_backup_stage(primary, &bak_path)?;
         if let Err(error) = validate_proactive_backup_stage(primary, &staged_backup) {
-            cleanup_sqlite_candidate_artifact(&staged_backup);
+            let preserved = staged_directory.preserve();
+            tracing::warn!(
+                path = %preserved.display(),
+                "preserved failed proactive-backup staging directory for inspection"
+            );
             return Err(error);
         }
-        std::fs::rename(&staged_backup, &bak_path).map_err(|e| {
-            cleanup_sqlite_candidate_artifact(&staged_backup);
+        if !sqlite_recovery_candidate_is_standalone(&bak_path) {
+            let preserved = staged_directory.preserve();
+            return Err(DbError::Sqlite(format!(
+                "proactive backup destination {} gained companion state before publish; existing backup is untouched and staged directory {} was preserved",
+                bak_path.display(),
+                preserved.display()
+            )));
+        }
+        let rotated_backup = if backup_exists {
+            match rotate_existing_proactive_backup(&bak_path) {
+                Ok(rotated) => Some(rotated),
+                Err(error) => {
+                    let preserved = staged_directory.preserve();
+                    return Err(DbError::Sqlite(format!(
+                        "{error}; staged backup directory {} was preserved for inspection",
+                        preserved.display()
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+        if !sqlite_recovery_candidate_is_standalone(&bak_path) {
+            let preserved_stage = staged_directory.preserve();
+            return Err(DbError::Sqlite(format!(
+                "proactive backup destination {} gained companion state after the previous backup was rotated to {}; staged backup directory {} was preserved without publishing",
+                bak_path.display(),
+                rotated_backup
+                    .as_ref()
+                    .map_or_else(|| "<none>".to_string(), |path| path.display().to_string()),
+                preserved_stage.display()
+            )));
+        }
+        if let Err(error) = rename_noreplace_preserving_source(&staged_backup, &bak_path) {
+            let rollback = rollback_rotated_proactive_backup_with(
+                rotated_backup.as_deref(),
+                &bak_path,
+                sync_recovery_parent,
+            );
+            let preserved_stage = staged_directory.preserve();
+            return Err(DbError::Sqlite(match rollback {
+                ProactiveBackupRollbackOutcome::RestoredDurably => format!(
+                    "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup was restored",
+                    preserved_stage.display(),
+                    bak_path.display()
+                ),
+                ProactiveBackupRollbackOutcome::RestoreMoveFailed(rollback_error) => format!(
+                    "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup remains at {} because its rollback move failed: {rollback_error}",
+                    preserved_stage.display(),
+                    bak_path.display(),
+                    rotated_backup.as_ref().map_or_else(
+                        || "<unknown>".to_string(),
+                        |rotated| rotated.display().to_string()
+                    )
+                ),
+                ProactiveBackupRollbackOutcome::RestoredButParentSyncFailed(sync_error) => format!(
+                    "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup was restored at {}, but crash durability is uncertain because the parent sync failed: {sync_error}",
+                    preserved_stage.display(),
+                    bak_path.display(),
+                    bak_path.display()
+                ),
+                ProactiveBackupRollbackOutcome::NotNeeded => format!(
+                    "proactive backup failed to publish staged backup from {} to unused destination {} without replacement: {error}; no prior backup existed",
+                    preserved_stage.display(),
+                    bak_path.display()
+                ),
+            }));
+        }
+        if !sqlite_recovery_candidate_is_standalone(&bak_path) {
+            return Err(DbError::Sqlite(format!(
+                "proactive backup {} was published but gained companion state concurrently; the prior verified generation remains preserved at {}",
+                bak_path.display(),
+                rotated_backup
+                    .as_ref()
+                    .map_or_else(|| "<none>".to_string(), |path| path.display().to_string())
+            )));
+        }
+        sync_recovery_parent(&bak_path).map_err(|error| {
             DbError::Sqlite(format!(
-                "proactive backup failed to publish staged backup {} to {}: {e}",
-                staged_backup.display(),
+                "proactive backup {} was published but its parent directory could not be synced: {error}",
                 bak_path.display()
             ))
         })?;
@@ -3448,20 +4625,17 @@ impl DbPool {
     /// Run `ANALYZE` to refresh the query planner's table/index statistics.
     ///
     /// Intended for the periodic maintenance worker (bead K4) running off the
-    /// latency-sensitive request path. Uses the canonical SQLite engine — the
-    /// same path `am doctor repair` uses for VACUUM/ANALYZE — and a bounded
-    /// `busy_timeout` so it backs off under write contention instead of erroring
-    /// immediately. No-ops for `:memory:` databases.
+    /// latency-sensitive request path. Uses a FrankenSQLite connection so the
+    /// live mailbox stays inside the runtime engine's transaction/maintenance
+    /// fence. A bounded `busy_timeout` makes it back off under write contention.
+    /// No-ops for `:memory:` databases.
     pub fn analyze(&self) -> DbResult<()> {
         if self.sqlite_path == ":memory:" {
             return Ok(());
         }
-        let conn = open_sqlite_file_with_lock_retry_canonical(&self.sqlite_path)
-            .map_err(|e| DbError::Sqlite(format!("analyze: open failed: {e}")))?;
-        conn.execute_raw("PRAGMA busy_timeout = 5000;")
-            .map_err(|e| DbError::Sqlite(format!("analyze: busy_timeout: {e}")))?;
+        let conn = self.live_maintenance_connection("analyze", 5_000)?;
         conn.execute_raw("ANALYZE;")
-            .map_err(|e| DbError::Sqlite(format!("analyze: {e}")))?;
+            .map_err(|error| DbError::Sqlite(format!("analyze: {error}")))?;
         Ok(())
     }
 
@@ -3469,19 +4643,17 @@ impl DbPool {
     ///
     /// This rewrites the whole database, so it is a scheduled, infrequent,
     /// off-hot-path operation (see the integrity guard's maintenance cycle, bead
-    /// K4). Uses the canonical SQLite engine and a generous `busy_timeout` so a
-    /// busy period defers the vacuum rather than failing the file. No-ops for
-    /// `:memory:` databases.
+    /// K4). Uses a FrankenSQLite connection so the live mailbox stays inside
+    /// the runtime engine's exclusive-maintenance fence. A generous
+    /// `busy_timeout` lets a busy period defer the vacuum. No-ops for `:memory:`
+    /// databases.
     pub fn vacuum(&self) -> DbResult<()> {
         if self.sqlite_path == ":memory:" {
             return Ok(());
         }
-        let conn = open_sqlite_file_with_lock_retry_canonical(&self.sqlite_path)
-            .map_err(|e| DbError::Sqlite(format!("vacuum: open failed: {e}")))?;
-        conn.execute_raw("PRAGMA busy_timeout = 30000;")
-            .map_err(|e| DbError::Sqlite(format!("vacuum: busy_timeout: {e}")))?;
+        let conn = self.live_maintenance_connection("vacuum", 30_000)?;
         conn.execute_raw("VACUUM;")
-            .map_err(|e| DbError::Sqlite(format!("vacuum: {e}")))?;
+            .map_err(|error| DbError::Sqlite(format!("vacuum: {error}")))?;
         Ok(())
     }
 
@@ -3496,7 +4668,7 @@ impl DbPool {
     /// so it defers under contention rather than failing. No-ops for `:memory:`
     /// pools and when the sidecar file does not exist (ATC never wrote).
     pub fn vacuum_atc_sidecar(&self) -> DbResult<()> {
-        let Some(atc_path) = self.atc_sqlite_path() else {
+        let Some(atc_path) = self.validated_atc_sqlite_path("ATC sidecar vacuum")? else {
             return Ok(());
         };
         if !std::path::Path::new(&atc_path).exists() {
@@ -3514,19 +4686,27 @@ impl DbPool {
     /// Apply a `journal_size_limit` (bytes) so the WAL is truncated back to the
     /// configured cap after a checkpoint, bounding unbounded WAL growth.
     ///
-    /// The schema already applies a default limit to every pooled connection;
-    /// the maintenance worker re-applies the operator-configured value on its
-    /// own connection each cycle (bead K4) so the cap is tunable via config
-    /// without threading it through the hot per-connection init path. No-ops for
-    /// `:memory:` databases.
+    /// FrankenSQLite implements this PRAGMA per connection. The configured
+    /// value is part of new-connection initialization; a runtime change clears
+    /// idle handles and is re-applied on every later checkout so handles that
+    /// were active during the change cannot silently retain the old value.
+    /// No-ops for `:memory:` databases.
     pub fn set_journal_size_limit(&self, bytes: u64) -> DbResult<()> {
         if self.sqlite_path == ":memory:" {
             return Ok(());
         }
-        let conn = open_sqlite_file_with_lock_retry_canonical(&self.sqlite_path)
-            .map_err(|e| DbError::Sqlite(format!("journal_size_limit: open failed: {e}")))?;
-        conn.execute_raw(&format!("PRAGMA journal_size_limit = {bytes};"))
-            .map_err(|e| DbError::Sqlite(format!("journal_size_limit: {e}")))?;
+        checked_journal_size_limit(bytes)?;
+        let current_state = self.journal_size_limit_state.load(Ordering::Acquire);
+        if journal_size_limit_bytes(current_state) == bytes {
+            return Ok(());
+        }
+        self.journal_size_limit_state.store(
+            bytes | JOURNAL_SIZE_LIMIT_RUNTIME_OVERRIDE,
+            Ordering::Release,
+        );
+        // Idle connections still carry the old connection-local value. Retire
+        // them now; checked-out handles are corrected on their next checkout.
+        self.pool.clear_idle();
         Ok(())
     }
 
@@ -3545,7 +4725,7 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(None);
         }
-        let primary = Path::new(&self.sqlite_path);
+        let primary = self.validated_sqlite_path("verified snapshot")?;
         let db = &mcp_agent_mail_core::global_metrics().db;
 
         // Verify the live DB is fully clean before trusting it as a snapshot.
@@ -3611,6 +4791,8 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(false);
         }
+        let primary_path = self.validated_sqlite_path("runtime corruption recovery")?;
+        let storage_root = self.validated_storage_root("runtime corruption archive recovery")?;
 
         if RECOVERY_IN_PROGRESS
             .compare_exchange(
@@ -3635,7 +4817,6 @@ impl DbPool {
             "runtime corruption detected; attempting automatic recovery"
         );
 
-        let primary_path = Path::new(&self.sqlite_path);
         let on_disk_healthy = match sqlite_file_is_healthy(primary_path) {
             Ok(true) => {
                 // The query that triggered this recovery failed with a
@@ -3698,7 +4879,7 @@ impl DbPool {
         // does not retry the same parser-only-rejected query.
         let bespoke_parser_only_trigger = on_disk_healthy;
 
-        match recover_sqlite_file_with_storage_root(primary_path, &self.storage_root) {
+        match recover_sqlite_file_with_storage_root(primary_path, storage_root) {
             Ok(()) => {
                 self.retire_runtime_state_after_recovery(trigger_error);
                 if bespoke_parser_only_trigger {
@@ -3750,61 +4931,26 @@ impl DbPool {
     }
 }
 
-static SQLITE_INIT_GATES: OnceLock<OrderedRwLock<HashMap<String, Arc<SqliteInitGate>>>> =
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PoolCacheKey {
+    sqlite_identity: Option<PathBuf>,
+    storage_root_identity: PathBuf,
+    min_connections: usize,
+    max_connections: usize,
+    acquire_timeout_ms: u64,
+    max_lifetime_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SqliteInitGateKey {
+    sqlite_identity: Option<PathBuf>,
+    storage_root_identity: PathBuf,
+}
+
+static SQLITE_INIT_GATES: OnceLock<OrderedRwLock<HashMap<SqliteInitGateKey, Arc<SqliteInitGate>>>> =
     OnceLock::new();
-static POOL_CACHE: OnceLock<OrderedRwLock<HashMap<String, Weak<Pool<DbConn>>>>> = OnceLock::new();
-static SQLITE_IDENTITY_PATH_CACHE: OnceLock<Mutex<HashMap<String, SqliteIdentityPathCacheEntry>>> =
+static POOL_CACHE: OnceLock<OrderedRwLock<HashMap<PoolCacheKey, Weak<Pool<DbConn>>>>> =
     OnceLock::new();
-
-#[derive(Clone, Debug)]
-struct SqliteIdentityPathCacheEntry {
-    normalized: String,
-    validated_at: Instant,
-}
-
-const SQLITE_IDENTITY_PATH_CACHE_MAX_ENTRIES: usize = 256;
-#[cfg(test)]
-const SQLITE_IDENTITY_PATH_CACHE_FRESHNESS: Duration = Duration::from_millis(25);
-#[cfg(not(test))]
-const SQLITE_IDENTITY_PATH_CACHE_FRESHNESS: Duration = Duration::from_secs(2);
-
-fn sqlite_identity_path_cache() -> &'static Mutex<HashMap<String, SqliteIdentityPathCacheEntry>> {
-    SQLITE_IDENTITY_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn sqlite_identity_path_cache_get(path: &str) -> Option<String> {
-    let mut cache = sqlite_identity_path_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let entry = cache.get(path)?;
-    if entry.validated_at.elapsed() <= SQLITE_IDENTITY_PATH_CACHE_FRESHNESS {
-        return Some(entry.normalized.clone());
-    }
-    cache.remove(path);
-    None
-}
-
-fn sqlite_identity_path_cache_insert(path: &str, normalized: &str) {
-    let mut cache = sqlite_identity_path_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !cache.contains_key(path)
-        && cache.len() >= SQLITE_IDENTITY_PATH_CACHE_MAX_ENTRIES
-        && let Some(victim) = cache
-            .iter()
-            .min_by_key(|(_, entry)| entry.validated_at)
-            .map(|(k, _)| k.clone())
-    {
-        cache.remove(&victim);
-    }
-    cache.insert(
-        path.to_string(),
-        SqliteIdentityPathCacheEntry {
-            normalized: normalized.to_string(),
-            validated_at: Instant::now(),
-        },
-    );
-}
 
 /// Retire every in-process handle and identity cache for a replaced SQLite
 /// generation, regardless of which pool configuration created it.
@@ -3814,16 +4960,14 @@ fn sqlite_identity_path_cache_insert(path: &str, normalized: &str) {
 /// (rather than one `DbPool.cache_key`) is essential: several differently
 /// sized pools may point at the same file, and any surviving file descriptor
 /// could keep serving pre-recovery numeric ids.
-fn retire_cached_runtime_state_after_recovery(primary_path: &Path, trigger: &str) {
-    let identity = normalize_sqlite_identity_path(&primary_path.to_string_lossy());
-    let cache_prefix = format!("{identity}|");
+fn retire_cached_runtime_state_after_recovery(identity: &Path, trigger: &str) {
     let retired_pools = {
         let cache =
             POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
         let mut guard = cache.write();
         let matching_keys = guard
             .keys()
-            .filter(|key| key.starts_with(&cache_prefix))
+            .filter(|key| key.sqlite_identity.as_deref() == Some(identity))
             .cloned()
             .collect::<Vec<_>>();
         let mut pools = Vec::new();
@@ -3846,117 +4990,383 @@ fn retire_cached_runtime_state_after_recovery(primary_path: &Path, trigger: &str
             .iter()
             .filter_map(|pool| {
                 let key = Arc::as_ptr(pool) as usize;
-                guard.get(&key).map(|(_, _, generation)| *generation)
+                guard.get(&key).map(|entry| entry.cache_generation)
             })
             .collect::<Vec<_>>()
     };
+    let message_id_allocator_invalidated = invalidate_file_message_id_allocator(identity);
 
     for pool in &retired_pools {
         pool.close();
     }
+    let namespace = sqlite_identity_cache_namespace(identity);
     for generation in &retired_generations {
-        crate::cache::read_cache().invalidate_scope(&format!("{identity}@{generation}"));
+        crate::cache::read_cache().invalidate_scope(&format!("{namespace}@{generation}"));
     }
 
-    let gate_prefix = format!("{identity}|storage_root=");
     let init_gates_cleared = {
         let gates = SQLITE_INIT_GATES
             .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
         let mut guard = gates.write();
         let before = guard.len();
-        guard.retain(|key, _| !key.starts_with(&gate_prefix));
+        guard.retain(|key, _| key.sqlite_identity.as_deref() != Some(identity));
         before.saturating_sub(guard.len())
     };
 
     if let Some(cache) = RECENT_RECONSTRUCT_CACHE.get() {
         let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
-        guard.remove(primary_path);
-        guard.remove(Path::new(&identity));
+        guard.remove(identity);
     }
     // #219: feed the archive-drift reconcile cooldown. Clearing the init
     // gates above re-arms the drift predicate on the very next pool
     // bootstrap; the recency record keeps that from cascading into
     // back-to-back rebuilds.
-    crate::write_barrier::record_promotion(primary_path);
-    crate::write_barrier::record_promotion(Path::new(&identity));
+    crate::write_barrier::record_promotion(identity);
     crate::search_service::invalidate_search_cache(
         crate::search_cache::InvalidationTrigger::IndexRebuild,
     );
 
     tracing::warn!(
-        path = %identity,
+        path = %identity.display(),
         trigger,
         retired_pools = retired_pools.len(),
         retired_generations = retired_generations.len(),
+        message_id_allocator_invalidated,
         init_gates_cleared,
         "retired all cached SQLite generations after durable database promotion"
     );
 }
 
+#[cfg(test)]
 #[must_use]
 fn normalize_sqlite_identity_path(path: &str) -> String {
     if path == ":memory:" {
         return path.to_string();
     }
-    if let Some(cached) = sqlite_identity_path_cache_get(path) {
-        return cached;
+    normalize_sqlite_identity_path_buf(Path::new(path))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Return the lossless normalized identity for a file-backed SQLite path.
+/// `None` is the in-memory sentinel, which must remain isolated by underlying
+/// pool identity rather than entering any file-backed registry.
+#[cfg(test)]
+fn normalize_file_sqlite_identity(path: &str) -> Option<PathBuf> {
+    (path != ":memory:").then(|| normalize_sqlite_identity_path_buf(Path::new(path)))
+}
+
+/// Resolve aliases even before the SQLite leaf exists. Canonicalize the
+/// deepest existing prefix from the original absolute spelling first, then
+/// normalize only its unresolved suffix. Resolving `..` before the existing
+/// prefix would change kernel semantics when the prefix contains a symlink
+/// (for example, `link/../missing.db`).
+fn normalize_sqlite_identity_path_buf(path: &Path) -> PathBuf {
+    normalize_sqlite_identity_path_buf_uncached(path)
+}
+
+fn normalize_sqlite_identity_path_buf_uncached(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    };
+    let mut existing_prefix = absolute.as_path();
+    loop {
+        if let Ok(canonical_prefix) = std::fs::canonicalize(existing_prefix) {
+            let unresolved_suffix = absolute
+                .strip_prefix(existing_prefix)
+                .unwrap_or_else(|_| Path::new(""));
+            let canonical_prefix =
+                mcp_agent_mail_core::disk::simplify_verbatim_path(&canonical_prefix);
+            return normalize_lexical_path(
+                &canonical_prefix.join(normalize_lexical_path(unresolved_suffix)),
+            );
+        }
+        match existing_prefix.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => existing_prefix = parent,
+            _ => return normalize_lexical_path(&absolute),
+        }
     }
-    let as_path = Path::new(path);
-    let normalized = std::fs::canonicalize(as_path).map_or_else(
-        |_| {
-            if as_path.is_absolute() {
-                as_path.to_string_lossy().into_owned()
-            } else if let Ok(cwd) = std::env::current_dir() {
-                cwd.join(as_path).to_string_lossy().into_owned()
-            } else {
-                path.to_string()
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else if !normalized.has_root() {
+                    normalized.push(component.as_os_str());
+                }
             }
-        },
-        |canonical| canonical.to_string_lossy().into_owned(),
-    );
-    sqlite_identity_path_cache_insert(path, &normalized);
+            Component::Normal(segment) => normalized.push(segment),
+        }
+    }
     normalized
 }
 
+/// Render a pool identity key (`sqlite_identity_key()`) for operator-facing
+/// output.
+///
+/// The cache key carries an encoding discriminator (`utf8:` / `unix-hex:` /
+/// `windows-hex:`) so byte-distinct paths never collide inside process-global
+/// caches. That discriminator is an internal detail: surfaces such as
+/// `search_index_generation.db_identity` must show `<path>@<generation>`,
+/// not the namespaced spelling. Only the lossless UTF-8 form is stripped;
+/// hex-encoded non-UTF-8 paths keep their prefix so they stay unambiguous.
 #[must_use]
-fn pool_cache_key(config: &DbPoolConfig) -> String {
-    let sqlite_path = config.sqlite_path().map_or_else(
-        |_| config.database_url.clone(),
-        |parsed| resolve_sqlite_path_with_absolute_fallback(&parsed),
-    );
-    pool_cache_key_from_parts(
-        &sqlite_path,
-        &config.resolved_storage_root(),
+pub fn display_sqlite_identity_key(key: &str) -> String {
+    key.strip_prefix("utf8:")
+        .map_or_else(|| key.to_string(), str::to_string)
+}
+
+#[cfg(test)]
+mod display_sqlite_identity_key_tests {
+    use super::display_sqlite_identity_key;
+
+    #[test]
+    fn strips_only_the_utf8_namespace_prefix() {
+        assert_eq!(
+            display_sqlite_identity_key("utf8:/tmp/mailbox.sqlite3@1"),
+            "/tmp/mailbox.sqlite3@1"
+        );
+        assert_eq!(display_sqlite_identity_key(":memory:@3"), ":memory:@3");
+        assert_eq!(
+            display_sqlite_identity_key("unix-hex:2f746d70@1"),
+            "unix-hex:2f746d70@1",
+            "non-UTF-8 paths must keep their encoding discriminator"
+        );
+    }
+}
+
+fn sqlite_identity_cache_namespace(path: &Path) -> String {
+    if let Some(path) = path.to_str() {
+        return format!("utf8:{path}");
+    }
+
+    #[cfg(unix)]
+    {
+        format!("unix-hex:{}", hex::encode(path.as_os_str().as_bytes()))
+    }
+
+    #[cfg(windows)]
+    {
+        let bytes = path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        format!("windows-utf16le-hex:{}", hex::encode(bytes))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        format!("platform-lossy:{}", path.to_string_lossy())
+    }
+}
+
+fn absolute_lexical_authority_path(path: &Path, field: &'static str) -> DbResult<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| DbError::InvalidArgument {
+                field,
+                message: format!(
+                    "cannot freeze relative filesystem authority {} because the current directory is unavailable: {error}",
+                    path.display()
+                ),
+            })?
+            .join(path)
+    };
+    Ok(normalize_lexical_path(&absolute))
+}
+
+fn sqlite_open_path_for_identity(absolute_alias: &Path, identity: &Path) -> DbResult<String> {
+    if let Some(path) = identity.to_str() {
+        return Ok(path.to_string());
+    }
+
+    // `sqlmodel` currently accepts SQLite paths as `String`. A UTF-8 alias
+    // may resolve to a target containing native non-UTF-8 bytes, so retain the
+    // frozen absolute alias for the final string-only API boundary. Connection
+    // admission revalidates that alias against `identity` before every open;
+    // a retargeted alias therefore fails closed instead of crossing authority.
+    absolute_alias
+        .to_path_buf()
+        .into_os_string()
+        .into_string()
+        .map_err(|_| DbError::InvalidArgument {
+            field: "database_url",
+            message: format!(
+                "SQLite authority {} and its absolute configured alias are not valid UTF-8; the current database engine string API cannot open this path safely",
+                identity.display()
+            ),
+        })
+}
+
+impl DbPoolAuthority {
+    fn resolve(config: &DbPoolConfig) -> DbResult<Self> {
+        let configured_sqlite_path = config.sqlite_path()?;
+        let selected_sqlite_path =
+            resolve_sqlite_path_with_absolute_fallback(&configured_sqlite_path);
+        let (sqlite_identity, sqlite_path) = if selected_sqlite_path == ":memory:" {
+            (None, ":memory:".to_string())
+        } else {
+            let absolute_alias =
+                absolute_lexical_authority_path(Path::new(&selected_sqlite_path), "database_url")?;
+            let identity = normalize_sqlite_identity_path_buf(&absolute_alias);
+            let open_path = sqlite_open_path_for_identity(&absolute_alias, &identity)?;
+            (Some(identity), open_path)
+        };
+        let storage_root_alias =
+            absolute_lexical_authority_path(&config.resolved_storage_root(), "storage_root")?;
+        let storage_root = normalize_sqlite_identity_path_buf(&storage_root_alias);
+
+        Ok(Self {
+            sqlite_identity,
+            sqlite_path,
+            storage_root,
+        })
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_frozen_sqlite_open_authority(
+    sqlite_path: &str,
+    sqlite_identity: Option<&Path>,
+    context: &'static str,
+) -> Result<(), SqlError> {
+    let Some(expected) = sqlite_identity else {
+        return Ok(());
+    };
+    let open_path = Path::new(sqlite_path);
+    // A UTF-8 alias can be the only string API route to an already-frozen
+    // non-UTF-8 target. Such an unchanged alias is validated by the identity
+    // comparison below. Reject a leaf symlink here only when the frozen
+    // identity is the lexical leaf itself: that is the missing/regular-leaf
+    // case where a newly inserted dangling symlink would otherwise look
+    // indistinguishable from the still-missing path.
+    if expected == open_path {
+        validate_frozen_authority_leaf_not_symlink(open_path, context, "database")?;
+    }
+    let observed = normalize_sqlite_identity_path_buf(open_path);
+    if observed == expected {
+        return Ok(());
+    }
+    Err(SqlError::Custom(format!(
+        "{context}: frozen SQLite alias {} now resolves to {}, but this pool is bound to {}; refusing to cross database authority",
+        open_path.display(),
+        observed.display(),
+        expected.display()
+    )))
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_frozen_storage_root_authority(
+    storage_root: &Path,
+    context: &'static str,
+) -> Result<(), SqlError> {
+    validate_frozen_authority_leaf_not_symlink(storage_root, context, "archive")?;
+    let observed = normalize_sqlite_identity_path_buf(storage_root);
+    if observed == storage_root {
+        return Ok(());
+    }
+    Err(SqlError::Custom(format!(
+        "{context}: frozen storage-root path {} now resolves to {}; refusing to cross archive authority",
+        storage_root.display(),
+        observed.display(),
+    )))
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_frozen_authority_leaf_not_symlink(
+    path: &Path,
+    context: &'static str,
+    authority_name: &'static str,
+) -> Result<(), SqlError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(SqlError::Custom(format!(
+            "{context}: frozen {authority_name} path {} is now a symbolic link; refusing to cross {authority_name} authority",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(SqlError::Custom(format!(
+            "{context}: cannot inspect frozen {authority_name} path {}: {error}; refusing to cross {authority_name} authority",
+            path.display()
+        ))),
+    }
+}
+
+/// Normalize a filesystem identity without converting its platform-native
+/// name through UTF-8. Recovery admission uses this lossless form because two
+/// distinct Unix paths containing different invalid bytes can have the same
+/// `to_string_lossy()` rendering; treating them as one path would let a nested
+/// operation bypass the second database's durable breaker election.
+#[must_use]
+fn normalize_sqlite_identity_path_lossless(path: &Path) -> PathBuf {
+    if path == Path::new(":memory:") {
+        return path.to_path_buf();
+    }
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+        }
+    })
+}
+
+#[cfg(test)]
+fn pool_cache_key(config: &DbPoolConfig) -> DbResult<PoolCacheKey> {
+    let authority = DbPoolAuthority::resolve(config)?;
+    Ok(pool_cache_key_from_authority(
+        &authority,
         config.min_connections,
         config.max_connections,
         config.acquire_timeout_ms,
         config.max_lifetime_ms,
-    )
+    ))
 }
 
 #[must_use]
-fn pool_cache_key_from_parts(
-    sqlite_path: &str,
-    storage_root: &Path,
+fn pool_cache_key_from_authority(
+    authority: &DbPoolAuthority,
     min_connections: usize,
     max_connections: usize,
     acquire_timeout_ms: u64,
     max_lifetime_ms: u64,
-) -> String {
-    let identity = normalize_sqlite_identity_path(sqlite_path);
-    let storage_root_identity = normalize_sqlite_identity_path(&storage_root.to_string_lossy());
-    format!(
-        "{identity}|storage_root={storage_root_identity}|min={min_connections}|max={max_connections}|acquire_ms={acquire_timeout_ms}|lifetime_ms={max_lifetime_ms}"
-    )
+) -> PoolCacheKey {
+    PoolCacheKey {
+        sqlite_identity: authority.sqlite_identity.clone(),
+        storage_root_identity: authority.storage_root.clone(),
+        min_connections,
+        max_connections,
+        acquire_timeout_ms,
+        max_lifetime_ms,
+    }
 }
 
 #[must_use]
-fn sqlite_init_gate_key(sqlite_path: &str, storage_root: &Path) -> String {
-    format!(
-        "{}|storage_root={}",
-        normalize_sqlite_identity_path(sqlite_path),
-        normalize_sqlite_identity_path(&storage_root.to_string_lossy())
-    )
+fn sqlite_init_gate_key(
+    sqlite_identity: Option<&Path>,
+    storage_root_identity: &Path,
+) -> SqliteInitGateKey {
+    SqliteInitGateKey {
+        sqlite_identity: sqlite_identity.map(Path::to_path_buf),
+        storage_root_identity: storage_root_identity.to_path_buf(),
+    }
 }
 
 /// How long a NON-initializing pool acquire may wait for another task's
@@ -4076,8 +5486,11 @@ impl Drop for SqliteInitGateCompletion<'_> {
     }
 }
 
-fn sqlite_init_gate(sqlite_path: &str, storage_root: &Path) -> Arc<SqliteInitGate> {
-    let gate_key = sqlite_init_gate_key(sqlite_path, storage_root);
+fn sqlite_init_gate(
+    sqlite_identity: Option<&Path>,
+    storage_root_identity: &Path,
+) -> Arc<SqliteInitGate> {
+    let gate_key = sqlite_init_gate_key(sqlite_identity, storage_root_identity);
     let gates = SQLITE_INIT_GATES
         .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
 
@@ -4142,12 +5555,7 @@ async fn run_sqlite_init_once(
     sqlite_path: &str,
     run_migrations: bool,
 ) -> Outcome<(), SqlError> {
-    // Clean up corrupt WAL sidecars before opening any connections. A non-empty
-    // WAL with no committed frames (1..=32 bytes) can trigger "WAL file too
-    // small for header during rebuild"; a 0-byte WAL is a valid idle/checkpoint
-    // state and is left attached.
     if sqlite_path != ":memory:" {
-        cleanup_empty_wal_sidecar(sqlite_path);
         let version_conn = match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
             Ok(conn) => conn,
             Err(err) => {
@@ -4614,7 +6022,10 @@ pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInve
         )));
     }
 
-    let conn = open_sqlite_file_with_lock_retry(primary_path.to_string_lossy().as_ref())?;
+    // Engine-dispatching: an inventory must read a canonical-written,
+    // restored, or reconstructed family (no namespace pair) as readily as a
+    // live Franken-admitted one.
+    let conn = open_guarded_read_only_sqlite_file(primary_path, "mailbox database inventory")?;
     let present = conn
         .query_sync(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -4687,6 +6098,15 @@ pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInve
 }
 
 fn archive_has_real_projects(storage_root: &Path) -> bool {
+    // A symlinked storage root is never archive authority: the server's
+    // startup probe and `reconstruct_from_archive_impl` both refuse it, and
+    // the pre-init reconcile must not become the one path that rebuilds a
+    // mailbox from wherever the link points. `symlink_metadata` on the
+    // `projects` leaf alone would accept a real directory under a linked
+    // parent, so check the root itself first.
+    if !is_real_directory(storage_root) {
+        return false;
+    }
     let projects_dir = storage_root.join("projects");
     if !is_real_directory(&projects_dir) {
         return false;
@@ -4729,9 +6149,7 @@ fn pending_archive_drift() -> &'static Mutex<BTreeSet<PathBuf>> {
 }
 
 fn pending_archive_drift_key(primary_path: &Path) -> PathBuf {
-    PathBuf::from(normalize_sqlite_identity_path(
-        &primary_path.to_string_lossy(),
-    ))
+    normalize_sqlite_identity_path_buf(primary_path)
 }
 
 fn record_pending_archive_drift(primary_path: &Path) {
@@ -4913,12 +6331,10 @@ fn reconcile_archive_state_before_init(
         // Check both the caller's spelling and the normalized identity —
         // retire records both, but different pools can reach here with
         // different spellings of the same file (relative, symlinked parent).
-        let identity = normalize_sqlite_identity_path(&primary_path.to_string_lossy());
+        let identity = normalize_sqlite_identity_path_buf(primary_path);
         let promotion_age = crate::write_barrier::time_since_last_promotion(primary_path)
             .into_iter()
-            .chain(crate::write_barrier::time_since_last_promotion(Path::new(
-                &identity,
-            )))
+            .chain(crate::write_barrier::time_since_last_promotion(&identity))
             .min();
         if let Some(age) = promotion_age
             && age < cooldown
@@ -4940,7 +6356,7 @@ fn reconcile_archive_state_before_init(
             record_pending_archive_drift(primary_path);
             tracing::info!(
                 path = %primary_path.display(),
-                foreign_writers = crate::write_barrier::foreign_writer_count(),
+                active_writers = crate::write_barrier::active_writer_count(),
                 "deferred archive-ahead reconcile; in-process write activity or another promotion is in flight"
             );
             return Ok(false);
@@ -4952,7 +6368,16 @@ fn reconcile_archive_state_before_init(
     // reservation release metadata, product-bus rows, and read state) while
     // replaying archive-ahead content. Archive-only replacement silently
     // discarded those rows even though the current database was healthy.
-    let stats = reconstruct_sqlite_file_with_archive_salvage(primary_path, storage_root)?;
+    let stats = match reconstruct_archive_drift_of_healthy_primary(primary_path, storage_root) {
+        Ok(stats) => stats,
+        Err(error) => {
+            return archive_drift_reconstruction_failed_on_healthy_primary(
+                primary_path,
+                storage_root,
+                &error,
+            );
+        }
+    };
     clear_pending_archive_drift(primary_path);
     tracing::warn!(
         path = %primary_path.display(),
@@ -4970,6 +6395,47 @@ fn reconcile_archive_state_before_init(
         "reconciled sqlite database from archive before initialization because archive inventory or project identity state was ahead"
     );
     Ok(true)
+}
+
+/// A drift reconstruction of a primary that has just been proven healthy
+/// failed. Decide whether the healthy primary keeps serving.
+///
+/// The reconcile is best-effort maintenance on a database that already
+/// serves: if the archive-backed candidate cannot be built or promoted (a
+/// receipt refusal over archive debris, a writer that will not drain, a
+/// candidate that fails its integrity check, an environmental write
+/// failure), the right outcome is to keep serving the healthy primary,
+/// remember the drift so the periodic retry and `am doctor` surface it,
+/// and say so; not to fail startup into a restart loop (br-bgwj1) or to arm
+/// the recovery breaker against a file that was never unhealthy
+/// (br-plksu). Only a primary that is no longer healthy after the attempt
+/// turns the failure into an error. Policy refusals that run before the
+/// reconstruction (read-only intent, symlinked paths, a tripped breaker, a
+/// live owner) are not routed through here and stay fatal.
+#[allow(clippy::result_large_err)]
+fn archive_drift_reconstruction_failed_on_healthy_primary(
+    primary_path: &Path,
+    storage_root: &Path,
+    error: &SqlError,
+) -> Result<bool, SqlError> {
+    match sqlite_file_is_healthy(primary_path) {
+        Ok(true) => {
+            record_pending_archive_drift(primary_path);
+            tracing::warn!(
+                path = %primary_path.display(),
+                storage_root = %storage_root.display(),
+                error = %error,
+                "archive-ahead reconcile failed; the healthy live database keeps serving and the drift stays pending (run `am doctor health`, then `am doctor reconstruct --yes` to retry under supervision)"
+            );
+            Ok(false)
+        }
+        Ok(false) => Err(SqlError::Custom(format!(
+            "archive-ahead reconcile failed and the live database is no longer healthy afterwards: {error}"
+        ))),
+        Err(probe_error) => Err(SqlError::Custom(format!(
+            "archive-ahead reconcile failed ({error}) and the live database could not be re-probed afterwards: {probe_error}"
+        ))),
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -5070,7 +6536,7 @@ fn is_macos_temp_firmlink(link: &Path, resolved: &Path) -> bool {
 }
 
 pub struct CanonicalSnapshotTempDir {
-    _guard: tempfile::TempDir,
+    guard: tempfile::TempDir,
     canonical_path: PathBuf,
 }
 
@@ -5097,7 +6563,7 @@ impl CanonicalSnapshotTempDir {
     fn from_guard(guard: tempfile::TempDir) -> std::io::Result<Self> {
         let canonical_path = guard.path().canonicalize()?;
         Ok(Self {
-            _guard: guard,
+            guard,
             canonical_path,
         })
     }
@@ -5105,6 +6571,14 @@ impl CanonicalSnapshotTempDir {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.canonical_path
+    }
+
+    /// Disable automatic cleanup and return the canonical directory path.
+    /// Recovery uses this only on a failed staged-family validation so every
+    /// companion artifact remains available for forensic inspection.
+    #[must_use]
+    pub fn preserve(self) -> PathBuf {
+        self.guard.keep()
     }
 }
 
@@ -5124,6 +6598,45 @@ fn open_sqlite_file_with_lock_retry_canonical(
     open_sqlite_file_with_lock_retry_impl(
         sqlite_path,
         |path| crate::CanonicalDbConn::open_file(path),
+        std::thread::sleep,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn open_sqlite_file_read_only_with_lock_retry(sqlite_path: &str) -> Result<DbConn, SqlError> {
+    open_sqlite_file_with_lock_retry_impl(
+        sqlite_path,
+        |path| DbConn::open_file_read_only(path),
+        std::thread::sleep,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn open_canonical_sqlite_file_read_only_with_lock_retry(
+    sqlite_path: &str,
+) -> Result<crate::CanonicalDbConn, SqlError> {
+    let mut uri = url::Url::from_file_path(Path::new(sqlite_path)).map_err(|()| {
+        SqlError::Custom(format!(
+            "canonical read-only SQLite path {sqlite_path} cannot be represented as a file URI"
+        ))
+    })?;
+    uri.query_pairs_mut()
+        .append_pair("mode", "ro")
+        // SQLite otherwise opens `-shm` read-write and may create or rewrite
+        // it even when the main database uses SQLITE_OPEN_READONLY.
+        .append_pair("readonly_shm", "1");
+    let uri = uri.to_string();
+    let flags = sqlmodel_sqlite::OpenFlags {
+        read_only: true,
+        uri: true,
+        ..Default::default()
+    };
+    open_sqlite_file_with_lock_retry_impl(
+        sqlite_path,
+        |_| {
+            let config = sqlmodel_sqlite::SqliteConfig::file(uri.clone()).flags(flags);
+            crate::CanonicalDbConn::open(&config)
+        },
         std::thread::sleep,
     )
 }
@@ -5280,25 +6793,18 @@ fn read_pragma_i64(conn: &DbConn, sql: &str, column: &str) -> Result<i64, SqlErr
 }
 
 #[allow(clippy::result_large_err)]
-fn read_canonical_journal_mode(sqlite_path: &str) -> Result<String, SqlError> {
-    if sqlite_path == ":memory:" {
-        return Err(SqlError::Custom(
-            "canonical journal_mode probe is unavailable for in-memory databases".to_string(),
-        ));
-    }
-
-    let conn = open_sqlite_file_with_lock_retry_canonical(sqlite_path)?;
+fn read_runtime_journal_mode(conn: &DbConn, sqlite_path: &str) -> Result<String, SqlError> {
     let rows = conn.query_sync("PRAGMA journal_mode;", &[])?;
     let row = rows.first().ok_or_else(|| {
         SqlError::Custom(format!(
-            "canonical PRAGMA journal_mode returned no rows for {sqlite_path}"
+            "runtime PRAGMA journal_mode returned no rows for {sqlite_path}"
         ))
     })?;
     row.get_named::<String>("journal_mode")
         .or_else(|_| row.get_as(0))
         .map_err(|err| {
             SqlError::Custom(format!(
-                "canonical PRAGMA journal_mode did not expose a string value for {sqlite_path}: {err}"
+                "runtime PRAGMA journal_mode did not expose a string value for {sqlite_path}: {err}"
             ))
         })
 }
@@ -5312,7 +6818,10 @@ fn assert_required_startup_pragmas(conn: &DbConn, sqlite_path: &str) -> Result<(
         ));
     }
 
-    let journal_mode = read_canonical_journal_mode(sqlite_path)?;
+    // Probe the already-open runtime handle. Opening canonical SQLite here
+    // would mix engines on the live main file and, on Linux, closing that
+    // second fd could release this process's classic fcntl writer locks.
+    let journal_mode = read_runtime_journal_mode(conn, sqlite_path)?;
     if !journal_mode.eq_ignore_ascii_case("wal") {
         return Err(SqlError::Custom(format!(
             "sqlite startup invariant failed for {sqlite_path}: journal_mode='{journal_mode}', expected 'wal'; WAL mode is required for Agent Mail concurrency"
@@ -5333,6 +6842,21 @@ fn assert_required_startup_pragmas(conn: &DbConn, sqlite_path: &str) -> Result<(
 /// corruption-like open failures when possible.
 #[allow(clippy::result_large_err)]
 pub fn open_sqlite_file_with_recovery(sqlite_path: &str) -> Result<DbConn, SqlError> {
+    if sqlite_path == ":memory:" {
+        return open_sqlite_file_with_recovery_and_storage_root(sqlite_path, Path::new(""));
+    }
+    let config = mcp_agent_mail_core::Config::from_env();
+    open_sqlite_file_with_recovery_and_storage_root(sqlite_path, config.storage_root.as_path())
+}
+
+/// Pool-internal recovery open that preserves the archive authority frozen by
+/// [`DbPoolAuthority`]. The public convenience wrapper resolves its ambient
+/// archive root once per standalone call; a live pool must never do that.
+#[allow(clippy::result_large_err)]
+fn open_sqlite_file_with_recovery_and_storage_root(
+    sqlite_path: &str,
+    storage_root: &Path,
+) -> Result<DbConn, SqlError> {
     if sqlite_path == ":memory:" {
         let conn = DbConn::open_memory()?;
         conn.execute_raw(schema::PRAGMA_CONN_SETTINGS_SQL)?;
@@ -5360,7 +6884,7 @@ pub fn open_sqlite_file_with_recovery(sqlite_path: &str) -> Result<DbConn, SqlEr
                 return Err(primary_err);
             }
 
-            recover_sqlite_file(Path::new(sqlite_path))?;
+            recover_sqlite_file_with_storage_root(Path::new(sqlite_path), storage_root)?;
             open_sqlite_file_with_configured_pragmas(sqlite_path).map_err(|reopen_err| {
                 SqlError::Custom(format!(
                     "cannot open sqlite at {sqlite_path}: {primary_err}; reopen after recovery failed: {reopen_err}"
@@ -5390,6 +6914,28 @@ async fn initialize_sqlite_file_once(
     storage_root: &Path,
 ) -> Outcome<(), SqlError> {
     let path = Path::new(sqlite_path);
+    // A missing primary is normally fresh-start authority, but an adjacent
+    // breaker sidecar remains durable authority for that exact pathname.
+    // Consult it before archive inventory, fresh creation, or any engine open.
+    // Existing namespace entries retain the established cleanup/private-health
+    // decision path, which allows a directly healthy exact family to serve
+    // without rewriting historical breaker state.
+    if sqlite_path != ":memory:"
+        && !path_is_occupied(path)
+        && let Err(error) = preflight_missing_primary_pool_breaker_authority(path)
+    {
+        return Outcome::Err(error);
+    }
+    // Classify before any engine open or archive inventory. The public cleanup
+    // helper enters the durable breaker only when damaged sidecars actually
+    // require mutation, then reclassifies before moving them. A malformed or
+    // tripped breaker therefore refuses pool initialization without changing
+    // the live family.
+    if sqlite_path != ":memory:"
+        && let Err(error) = cleanup_truncated_wal_sidecar(path)
+    {
+        return Outcome::Err(error);
+    }
     // Reconcile archive-backed state before first init so every entrypoint,
     // not just the server startup probe, preserves durable message IDs when a
     // DB is missing or stale relative to the archive.
@@ -5397,6 +6943,25 @@ async fn initialize_sqlite_file_once(
         && let Err(err) = reconcile_archive_state_before_init(path, storage_root)
     {
         return Outcome::Err(err);
+    }
+
+    // The sidecar classifier above catches damaged WAL/SHM, but a corrupt
+    // main-only family can still make the first writable engine open perform
+    // recovery-adjacent filesystem work before its error is returned. Prove a
+    // private copy of the exact family once at the initialization gate. If it
+    // is unhealthy, complete the admission-controlled recovery before either
+    // migrations or pooled connections open the live path. Missing files are
+    // normal fresh-start authority and remain the init path's responsibility.
+    if sqlite_path != ":memory:" && path.exists() {
+        match sqlite_file_is_healthy_without_family_cleanup(path) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(error) = recover_sqlite_file_with_storage_root(path, storage_root) {
+                    return Outcome::Err(error);
+                }
+            }
+            Err(error) => return Outcome::Err(error),
+        }
     }
 
     match run_sqlite_init_once(cx, sqlite_path, run_migrations).await {
@@ -5539,12 +7104,33 @@ fn sqlite_pragma_check_is_ok_canonical(
 }
 
 #[allow(clippy::result_large_err)]
+fn sqlite_pragma_check_is_strictly_ok_canonical(
+    conn: &crate::CanonicalDbConn,
+    kind: integrity::CheckKind,
+) -> Result<bool, SqlError> {
+    let details = sqlite_pragma_check_details_canonical(conn, kind)?;
+    Ok(integrity::details_indicate_ok(&details))
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_path_as_utf8(path: &Path) -> Result<&str, SqlError> {
+    path.to_str().ok_or_else(|| {
+        SqlError::Custom(format!(
+            "SQLite path {} is not valid UTF-8; refusing to substitute a lossy path that could name a different file",
+            path.display()
+        ))
+    })
+}
+
+#[allow(clippy::result_large_err)]
 fn sqlite_canonical_file_check_is_ok(
     path: &Path,
     kind: integrity::CheckKind,
 ) -> Result<bool, SqlError> {
-    let path_str = path.to_string_lossy();
-    let conn = crate::CanonicalDbConn::open_file(path_str.as_ref())?;
+    let conn = open_guarded_read_only_canonical_sqlite_file(
+        path,
+        "canonical SQLite integrity diagnostic",
+    )?;
     sqlite_pragma_check_is_ok_canonical(&conn, kind)
 }
 
@@ -5589,14 +7175,19 @@ const DURABLE_MAILBOX_STATE_TABLES: &[&str] = &[
     "atc_rollup_snapshots",
 ];
 
-/// True only when canonical SQLite can read every *present* durable mailbox
-/// table and each is empty. A partially bootstrapped fresh file may not yet
-/// have the newest tables; an absent table cannot contain recoverable rows.
-/// Failure to inspect a present table remains fail-closed.
+/// True only when a guarded read-only open can read every *present* durable
+/// mailbox table and each is empty. A partially bootstrapped fresh file may
+/// not yet have the newest tables; an absent table cannot contain recoverable
+/// rows. Failure to inspect a present table remains fail-closed.
+///
+/// Engine-dispatching: a fresh bootstrap the runtime has already admitted
+/// carries a namespace pair and is read through FrankenSQLite; an offline or
+/// canonical-written file is read through canonical SQLite. The verdict is
+/// the same either way, and a cross-engine open of an admitted inode is
+/// never attempted.
 #[allow(clippy::result_large_err)]
 fn canonical_mailbox_has_no_durable_rows(path: &Path) -> Result<bool, SqlError> {
-    let path_str = path.to_string_lossy();
-    let conn = crate::CanonicalDbConn::open_file(path_str.as_ref())?;
+    let conn = open_guarded_read_only_sqlite_file(path, "durable-row diagnostic")?;
 
     for table in DURABLE_MAILBOX_STATE_TABLES {
         // `table` comes from the static list above, never user input. A
@@ -5776,6 +7367,56 @@ fn sqlite_canonical_incremental_check_is_ok(
 /// unit-testable without a real on-disk engine divergence, and
 /// `canonical_mailbox_is_schema_only` is injected (and only invoked after a
 /// canonical acceptance for a non-NOCASE complaint) for the same reason.
+/// GH#288: how often an UNCHANGED "both engines rejected the file" verdict is
+/// re-warned per (path, message) pair. Repeats inside the window log at debug.
+const BOTH_REJECTED_REWARN_INTERVAL_SECS: u64 = 6 * 3600;
+
+/// GH#288: process-wide memory of the last WARN per (path, message
+/// fingerprint) for the standing "both rejected" verdict. Bounded: a change in
+/// the verdict text is a different fingerprint (fresh WARN), and the map is
+/// cleared if it somehow accumulates more distinct standing defects than any
+/// sane process observes.
+type BothRejectedWarnKey = (String, u64);
+type BothRejectedWarnMap =
+    std::collections::HashMap<BothRejectedWarnKey, (std::time::Instant, u64)>;
+
+static BOTH_REJECTED_WARN_LOG: std::sync::LazyLock<std::sync::Mutex<BothRejectedWarnMap>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Returns `Some(observation_count)` when the caller should WARN (first
+/// observation, changed message, or the re-warn cadence elapsed) and `None`
+/// when the identical standing verdict should stay at debug.
+fn both_rejected_should_warn(path_for_log: &str, message: &str) -> Option<u64> {
+    use std::hash::{Hash, Hasher as _};
+
+    const MAX_TRACKED: usize = 64;
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    message.hash(&mut hasher);
+    let key = (path_for_log.to_string(), hasher.finish());
+    let mut log = BOTH_REJECTED_WARN_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if log.len() > MAX_TRACKED {
+        log.clear();
+    }
+    let verdict = if let Some((last_warn, observations)) = log.get_mut(&key) {
+        *observations += 1;
+        if last_warn.elapsed() >= std::time::Duration::from_secs(BOTH_REJECTED_REWARN_INTERVAL_SECS)
+        {
+            *last_warn = std::time::Instant::now();
+            Some(*observations)
+        } else {
+            None
+        }
+    } else {
+        log.insert(key, (std::time::Instant::now(), 1));
+        Some(1)
+    };
+    drop(log);
+    verdict
+}
+
 #[allow(clippy::result_large_err)]
 fn reconcile_with_canonical(
     primary: DbResult<integrity::IntegrityCheckResult>,
@@ -5850,13 +7491,30 @@ fn reconcile_with_canonical(
                 })
             }
             Ok(false) => {
-                tracing::warn!(
-                    phase,
-                    path = %path_for_log,
-                    check = %kind,
-                    primary_error = %message,
-                    "integrity probe and canonical SQLite both rejected the file"
-                );
+                // GH#288: this verdict re-derives on every periodic probe for
+                // a standing defect. Log the transition (and a low-cadence
+                // reminder) at WARN; identical repeats drop to debug so
+                // journal monitors see state changes, not an hourly flood.
+                match both_rejected_should_warn(path_for_log, &message) {
+                    Some(observations) => {
+                        tracing::warn!(
+                            phase,
+                            path = %path_for_log,
+                            check = %kind,
+                            primary_error = %message,
+                            observations,
+                            "integrity probe and canonical SQLite both rejected the file"
+                        );
+                    }
+                    None => {
+                        tracing::debug!(
+                            phase,
+                            path = %path_for_log,
+                            check = %kind,
+                            "integrity probe and canonical SQLite both rejected the file (unchanged standing defect; suppressed repeat warn)"
+                        );
+                    }
+                }
                 if !details.is_empty() {
                     tracing::debug!(
                         phase,
@@ -5947,6 +7605,7 @@ fn reconcile_with_canonical(
 /// cannot discard durable data because the smallest possible frame adds a
 /// 24-byte frame header plus at least one SQLite page.
 pub const SQLITE_WAL_HEADER_BYTES: u64 = 32;
+const SQLITE_WAL_HEADER_BYTES_USIZE: usize = 32;
 
 #[must_use]
 pub const fn sqlite_wal_has_committed_frames(wal_len: u64) -> bool {
@@ -5988,15 +7647,348 @@ pub const fn sqlite_wal_is_header_only_or_truncated(wal_len: u64) -> bool {
 /// WAL on the next write. We also quarantine SHM artifacts whose companion WAL
 /// was moved, since the SHM is meaningless without a WAL.
 ///
-/// Public alias for [`cleanup_empty_wal_sidecar`] so callers outside this crate
-/// (e.g. CLI startup self-heal) can run the same WAL cleanup _before_ opening
-/// any connection.  Issue #119: if a force-killed daemon left a header-only
-/// (<=32-byte) WAL sidecar, opening the DB to run orphan-recipient repair fails
-/// with "WAL file too small for header during rebuild".  This entry point lets
-/// the doctor self-heal cleanup truncated WALs first so subsequent open and
-/// integrity probes do not wedge.  Idempotent and safe to call repeatedly.
-pub fn cleanup_truncated_wal_sidecar(sqlite_path: &Path) {
-    cleanup_empty_wal_sidecar(sqlite_path.to_string_lossy().as_ref());
+/// Observable result from an admitted SQLite-family cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqliteFamilyCleanupOutcome {
+    /// No damaged WAL or empty/orphaned SHM required quarantine.
+    NotNeeded,
+    /// One or more generation-bound sidecars were durably moved out of the
+    /// live family.
+    Quarantined {
+        wal: bool,
+        shm: bool,
+        wal_cert: bool,
+        wal_cert_head: bool,
+    },
+}
+
+struct SqliteCleanupSidecarOpen {
+    path: PathBuf,
+    file: std::fs::File,
+    identity: same_file::Handle,
+    len: u64,
+}
+
+struct SqliteCleanupSidecarWitness {
+    path: PathBuf,
+    _file: std::fs::File,
+    identity: same_file::Handle,
+    len: u64,
+    sha256: [u8; 32],
+    prefix: [u8; SQLITE_WAL_HEADER_BYTES_USIZE],
+    prefix_len: usize,
+}
+
+struct SqliteFamilyCleanupPlan {
+    wal: Option<SqliteCleanupSidecarWitness>,
+    shm: Option<SqliteCleanupSidecarWitness>,
+    wal_cert: Option<SqliteCleanupSidecarWitness>,
+    wal_cert_head: Option<SqliteCleanupSidecarWitness>,
+}
+
+impl SqliteFamilyCleanupPlan {
+    const fn is_empty(&self) -> bool {
+        self.wal.is_none()
+            && self.shm.is_none()
+            && self.wal_cert.is_none()
+            && self.wal_cert_head.is_none()
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn open_sqlite_cleanup_sidecar(
+    path: &Path,
+    label: &str,
+) -> Result<Option<SqliteCleanupSidecarOpen>, SqlError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(SqlError::Custom(format!(
+                "refusing SQLite-family cleanup because {label} sidecar {} is not a regular file",
+                path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(SqlError::Custom(format!(
+                "failed to classify {label} sidecar {} before SQLite-family cleanup: {error}",
+                path.display()
+            )));
+        }
+    }
+
+    let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path).map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to open {label} sidecar {} without following links before SQLite-family cleanup: {error}",
+            path.display()
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to inspect opened {label} sidecar {} before SQLite-family cleanup: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(SqlError::Custom(format!(
+            "refusing SQLite-family cleanup because opened {label} sidecar {} is not a regular file",
+            path.display()
+        )));
+    }
+    let identity = same_file::Handle::from_file(file.try_clone().map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to retain {label} sidecar identity for {}: {error}",
+            path.display()
+        ))
+    })?)
+    .map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to identify {label} sidecar {} before SQLite-family cleanup: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(SqliteCleanupSidecarOpen {
+        path: path.to_path_buf(),
+        file,
+        identity,
+        len: metadata.len(),
+    }))
+}
+
+#[allow(clippy::result_large_err)]
+fn seal_sqlite_cleanup_sidecar(
+    opened: SqliteCleanupSidecarOpen,
+) -> Result<SqliteCleanupSidecarWitness, SqlError> {
+    use sha2::Digest as _;
+    use std::io::{Read as _, Seek as _};
+
+    let mut reader = opened.file.try_clone().map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to clone SQLite sidecar {} for cleanup witnessing: {error}",
+            opened.path.display()
+        ))
+    })?;
+    reader.seek(std::io::SeekFrom::Start(0)).map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to rewind SQLite sidecar {} for cleanup witnessing: {error}",
+            opened.path.display()
+        ))
+    })?;
+    let mut hasher = sha2::Sha256::new();
+    let mut prefix = [0_u8; SQLITE_WAL_HEADER_BYTES_USIZE];
+    let mut prefix_len = 0_usize;
+    let mut observed_len = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(|error| {
+            SqlError::Custom(format!(
+                "failed to read SQLite sidecar {} for cleanup witnessing: {error}",
+                opened.path.display()
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        if prefix_len < prefix.len() {
+            let copied = (prefix.len() - prefix_len).min(read);
+            prefix[prefix_len..prefix_len + copied].copy_from_slice(&buffer[..copied]);
+            prefix_len += copied;
+        }
+        hasher.update(&buffer[..read]);
+        observed_len = observed_len.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+    }
+    let after_len = opened
+        .file
+        .metadata()
+        .map_err(|error| {
+            SqlError::Custom(format!(
+                "failed to re-inspect SQLite sidecar {} after cleanup witnessing: {error}",
+                opened.path.display()
+            ))
+        })?
+        .len();
+    if observed_len != opened.len || after_len != opened.len {
+        return Err(SqlError::Custom(format!(
+            "SQLite sidecar {} changed length while cleanup classified it (expected {}, read {observed_len}, now {after_len}); refusing mutation",
+            opened.path.display(),
+            opened.len
+        )));
+    }
+    Ok(SqliteCleanupSidecarWitness {
+        path: opened.path,
+        _file: opened.file,
+        identity: opened.identity,
+        len: opened.len,
+        sha256: hasher.finalize().into(),
+        prefix,
+        prefix_len,
+    })
+}
+
+#[must_use]
+fn witnessed_wal_is_truncation_artifact(wal: &SqliteCleanupSidecarWitness) -> bool {
+    if wal.len == 0 || wal.len > SQLITE_WAL_HEADER_BYTES {
+        return false;
+    }
+    if wal.len < SQLITE_WAL_HEADER_BYTES {
+        return true;
+    }
+    wal.prefix_len != SQLITE_WAL_HEADER_BYTES_USIZE
+        || !matches!(
+            crate::wal_classify::wal_header_verdict(&wal.prefix),
+            crate::wal_classify::WalHeaderVerdict::Valid
+        )
+}
+
+/// Classify the complete mutable SQLite sidecar family without opening a
+/// database connection or changing a namespace entry.
+///
+/// Classification intentionally rejects non-regular primary/recovery-family
+/// objects before planning any rename. That keeps a truncated WAL plus a
+/// symlinked/directory SHM from becoming a partial cleanup: the whole family is
+/// accepted or refused before the durable admission boundary is entered.
+#[allow(clippy::result_large_err)]
+fn classify_sqlite_family_cleanup(sqlite_path: &Path) -> Result<SqliteFamilyCleanupPlan, SqlError> {
+    if let Ok(metadata) = std::fs::symlink_metadata(sqlite_path)
+        && !metadata.file_type().is_file()
+    {
+        return Err(SqlError::Custom(format!(
+            "refusing SQLite-family cleanup for {} because the primary is not a regular file",
+            sqlite_path.display()
+        )));
+    }
+
+    let mut sidecars: HashMap<&'static str, SqliteCleanupSidecarOpen> = HashMap::new();
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+        let path = sqlite_sidecar_path(sqlite_path, suffix);
+        if let Some(opened) =
+            open_sqlite_cleanup_sidecar(&path, sqlite_recovery_sidecar_label(suffix))?
+        {
+            sidecars.insert(suffix, opened);
+        }
+    }
+
+    let wal = match sidecars.remove("-wal") {
+        Some(opened) if opened.len > 0 && opened.len <= SQLITE_WAL_HEADER_BYTES => {
+            let witnessed = seal_sqlite_cleanup_sidecar(opened)?;
+            witnessed_wal_is_truncation_artifact(&witnessed).then_some(witnessed)
+        }
+        _ => None,
+    };
+    // FrankenSQLite does not use canonical SQLite's shared-memory index: a
+    // healthy live family may have no `-shm` pathname at all, or an empty
+    // compatibility placeholder. Rotate SHM only as a companion of a WAL
+    // that this classifier has independently proved damaged. Treating an
+    // empty SHM as standalone cleanup authority can rename a descriptor held
+    // by the live engine and leave a healthy framed WAL sidecarless.
+    let shm = match sidecars.remove("-shm") {
+        Some(opened) if wal.is_some() => Some(seal_sqlite_cleanup_sidecar(opened)?),
+        _ => None,
+    };
+    // FrankenSQLite's WAL certificates describe the exact WAL/main generation.
+    // Keeping either certificate attached after its damaged WAL is detached can
+    // replay the old db_size against the next generation, so they rotate as one
+    // witnessed family even when their own bytes look well-formed.
+    let wal_cert = if wal.is_some() {
+        sidecars
+            .remove("-wal-cert")
+            .map(seal_sqlite_cleanup_sidecar)
+            .transpose()?
+    } else {
+        None
+    };
+    let wal_cert_head = if wal.is_some() {
+        sidecars
+            .remove("-wal-cert-head")
+            .map(seal_sqlite_cleanup_sidecar)
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(SqliteFamilyCleanupPlan {
+        wal,
+        shm,
+        wal_cert,
+        wal_cert_head,
+    })
+}
+
+/// Quarantine a damaged WAL/SHM family only after durable recovery admission.
+///
+/// The outer classification is pure and avoids writing breaker state for a
+/// healthy family. When cleanup is needed, the function acquires the durable
+/// breaker/election, reclassifies under that admission to close the ordinary
+/// classify-then-act window, and uses atomic no-replace moves. A malformed or
+/// tripped breaker therefore preserves the exact live sidecar names and bytes.
+#[allow(clippy::result_large_err)]
+pub fn cleanup_truncated_wal_sidecar(
+    sqlite_path: &Path,
+) -> Result<SqliteFamilyCleanupOutcome, SqlError> {
+    cleanup_truncated_wal_sidecar_with_timeout(
+        sqlite_path,
+        crate::write_barrier::writer_drain_timeout(),
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn cleanup_truncated_wal_sidecar_with_timeout(
+    sqlite_path: &Path,
+    writer_drain_timeout: Duration,
+) -> Result<SqliteFamilyCleanupOutcome, SqlError> {
+    validate_sqlite_target_path(sqlite_path, "SQLite-family cleanup target")?;
+    if classify_sqlite_family_cleanup(sqlite_path)?.is_empty() {
+        return Ok(SqliteFamilyCleanupOutcome::NotNeeded);
+    }
+
+    with_recovery_mutation_admission(sqlite_path, "automatic SQLite-family cleanup", || {
+        // Recovery admission must precede writer drain: a malformed or tripped
+        // durable breaker is authoritative and should refuse immediately rather
+        // than parking healthy writers behind an operation that cannot run.
+        // Once admitted, quiesce this process's write paths and refuse any
+        // external mailbox or foreign file holder before changing a sidecar
+        // namespace entry.
+        let _promotion_barrier = acquire_recovery_promotion_barrier(
+            sqlite_path,
+            "automatic SQLite-family cleanup",
+            writer_drain_timeout,
+        )?;
+        refuse_sqlite_family_cleanup_while_owned(sqlite_path)?;
+        apply_classified_sqlite_family_cleanup(sqlite_path)
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn refuse_sqlite_family_cleanup_while_owned(sqlite_path: &Path) -> Result<(), SqlError> {
+    let inferred_storage_root = sqlite_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let ownership = inspect_mailbox_ownership(sqlite_path, inferred_storage_root);
+    if ownership.blocks_mutation() {
+        return Err(SqlError::Custom(format!(
+            "automatic SQLite-family cleanup refused for {} because another mailbox owner is active: {}",
+            sqlite_path.display(),
+            ownership.detail
+        )));
+    }
+    let foreign_holders = foreign_db_file_holders(sqlite_path);
+    if !foreign_holders.is_empty() {
+        let holders = foreign_holders
+            .iter()
+            .map(|holder| {
+                holder.command.as_deref().map_or_else(
+                    || holder.pid.to_string(),
+                    |command| format!("{} ({command})", holder.pid),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(SqlError::Custom(format!(
+            "automatic SQLite-family cleanup refused for {} because foreign process holder(s) remain: {holders}",
+            sqlite_path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn sqlite_sidecar_cleanup_nonce() -> String {
@@ -6006,18 +7998,14 @@ fn sqlite_sidecar_cleanup_nonce() -> String {
     format!("{}-{millis}", std::process::id())
 }
 
-fn sqlite_cleanup_quarantine_path(sidecar_path: &Path, nonce: &str) -> PathBuf {
+fn sqlite_cleanup_quarantine_path(sidecar_path: &Path, nonce: &str, collision: u32) -> PathBuf {
     let mut candidate_os = sidecar_path.as_os_str().to_os_string();
-    candidate_os.push(format!(".cleanup-quarantine-{nonce}"));
-    let mut candidate = PathBuf::from(candidate_os);
-    let mut suffix = 1_u32;
-    while sqlite_candidate_artifact_conflicts(&candidate) {
-        let mut candidate_os = sidecar_path.as_os_str().to_os_string();
-        candidate_os.push(format!(".cleanup-quarantine-{nonce}-{suffix:02}"));
-        candidate = PathBuf::from(candidate_os);
-        suffix = suffix.saturating_add(1);
+    if collision == 0 {
+        candidate_os.push(format!(".cleanup-quarantine-{nonce}"));
+    } else {
+        candidate_os.push(format!(".cleanup-quarantine-{nonce}-{collision:02}"));
     }
-    candidate
+    PathBuf::from(candidate_os)
 }
 
 fn cleanup_quarantine_nonce(nonce: &mut Option<String>) -> &str {
@@ -6026,92 +8014,255 @@ fn cleanup_quarantine_nonce(nonce: &mut Option<String>) -> &str {
         .as_str()
 }
 
-fn quarantine_sqlite_cleanup_sidecar(
-    sidecar_path: &Path,
-    nonce: &mut Option<String>,
-    reason: &str,
-) -> bool {
-    let quarantine = sqlite_cleanup_quarantine_path(sidecar_path, cleanup_quarantine_nonce(nonce));
-    match std::fs::rename(sidecar_path, &quarantine) {
-        Ok(()) => {
-            tracing::warn!(
-                path = %sidecar_path.display(),
-                quarantine = %quarantine.display(),
-                reason,
-                "quarantined sqlite sidecar before opening database"
-            );
-            true
+#[allow(clippy::result_large_err)]
+fn verify_sqlite_cleanup_sidecar_witness(
+    expected: &SqliteCleanupSidecarWitness,
+    observed_path: &Path,
+) -> Result<SqliteCleanupSidecarWitness, SqlError> {
+    let opened = open_sqlite_cleanup_sidecar(observed_path, "witnessed SQLite-family")?
+        .ok_or_else(|| {
+            SqlError::Custom(format!(
+                "SQLite sidecar {} disappeared after cleanup classification; refusing mutation",
+                observed_path.display()
+            ))
+        })?;
+    let observed = seal_sqlite_cleanup_sidecar(opened)?;
+    if observed.identity != expected.identity
+        || observed.len != expected.len
+        || observed.sha256 != expected.sha256
+    {
+        return Err(SqlError::Custom(format!(
+            "SQLite sidecar {} changed identity or bytes after cleanup classification; refusing to move an unclassified generation",
+            observed_path.display()
+        )));
+    }
+    Ok(observed)
+}
+
+fn rollback_drifted_sqlite_cleanup_move(
+    source_path: &Path,
+    quarantine_path: &Path,
+    drift_error: &SqlError,
+) -> SqlError {
+    if let Err(rollback_error) = rename_noreplace_preserving_source(quarantine_path, source_path) {
+        return SqlError::Custom(format!(
+            "{drift_error}; additionally failed to restore raced SQLite sidecar {} from {} without replacement: {rollback_error}",
+            source_path.display(),
+            quarantine_path.display()
+        ));
+    }
+    if let Err(sync_error) = sync_recovery_parent(source_path) {
+        return SqlError::Custom(format!(
+            "{drift_error}; the raced sidecar was restored to {}, but syncing its parent failed: {sync_error}",
+            source_path.display()
+        ));
+    }
+    SqlError::Custom(format!(
+        "{drift_error}; the raced sidecar was restored to {} and no cleanup was committed",
+        source_path.display()
+    ))
+}
+
+fn rollback_prior_sqlite_cleanup_moves(
+    moved: &[(PathBuf, PathBuf)],
+    original_error: SqlError,
+) -> SqlError {
+    if moved.is_empty() {
+        return original_error;
+    }
+
+    let mut rollback_failures = Vec::new();
+    for (source_path, quarantine_path) in moved.iter().rev() {
+        if let Err(error) = rename_noreplace_preserving_source(quarantine_path, source_path) {
+            rollback_failures.push(format!(
+                "{} <- {}: {error}",
+                source_path.display(),
+                quarantine_path.display()
+            ));
         }
-        Err(e) => {
-            tracing::warn!(
-                path = %sidecar_path.display(),
-                quarantine = %quarantine.display(),
-                reason,
-                error = %e,
-                "failed to quarantine sqlite sidecar before opening database"
-            );
-            false
-        }
+    }
+    if let Some((source_path, _)) = moved.first()
+        && let Err(error) = sync_recovery_parent(source_path)
+    {
+        rollback_failures.push(format!(
+            "sync restored sidecar parent for {}: {error}",
+            source_path.display()
+        ));
+    }
+
+    if rollback_failures.is_empty() {
+        SqlError::Custom(format!(
+            "{original_error}; all earlier SQLite-family cleanup moves were rolled back"
+        ))
+    } else {
+        SqlError::Custom(format!(
+            "{original_error}; rollback of earlier SQLite-family cleanup moves was incomplete: {}",
+            rollback_failures.join("; ")
+        ))
     }
 }
 
-fn cleanup_empty_wal_sidecar(sqlite_path: &str) {
-    let db_path = Path::new(sqlite_path);
-    if !db_path.exists() {
-        return;
-    }
-
-    let mut wal_quarantined = false;
-    let mut quarantine_nonce = None;
-
-    // Check WAL first.
-    {
-        let mut wal_os = db_path.as_os_str().to_os_string();
-        wal_os.push("-wal");
-        let wal_path = PathBuf::from(wal_os);
-        match std::fs::symlink_metadata(&wal_path) {
-            // Quarantine WAL files that are a genuine truncation/corruption
-            // artifact: a sub-header (1..=31 byte) WAL, or a 32-byte header whose
-            // magic is INVALID.
-            // GH#99/#119: an all-zeros (invalid-magic) 32-byte WAL sidecar tripped
-            // "WAL file too small for header during rebuild" on checkpoint, which
-            // the verdict engine escalated to Broken/corrupt. Moving it out of the
-            // live DB family prevents that cycle without losing forensic evidence.
-            // A VALID 32-byte header (a frameless idle WAL) is left attached: the
-            // engine opens it as-is, and quarantining it false-failed health and
-            // churned this self-heal on every restart (ts1/css, 2026-06-17).
-            Ok(meta)
-                if meta.file_type().is_file()
-                    && crate::wal_classify::wal_sidecar_is_truncation_artifact(&wal_path) =>
-            {
-                wal_quarantined = quarantine_sqlite_cleanup_sidecar(
-                    &wal_path,
-                    &mut quarantine_nonce,
-                    "header-only/truncated WAL sidecar",
+#[allow(clippy::result_large_err)]
+fn quarantine_sqlite_cleanup_sidecar_witnessed(
+    witness: &SqliteCleanupSidecarWitness,
+    nonce: &mut Option<String>,
+    reason: &str,
+) -> Result<PathBuf, SqlError> {
+    let nonce = cleanup_quarantine_nonce(nonce).to_string();
+    for collision in 0..=9_999 {
+        let quarantine = sqlite_cleanup_quarantine_path(&witness.path, &nonce, collision);
+        // Hold both the classification-time handle and this freshly verified
+        // handle across rename. If a path replacement wins after this check,
+        // the post-rename identity check detects it and restores that raced-in
+        // generation instead of silently detaching it.
+        let _verified = verify_sqlite_cleanup_sidecar_witness(witness, &witness.path)?;
+        match rename_noreplace_preserving_source(&witness.path, &quarantine) {
+            Ok(()) => {
+                if let Err(drift_error) =
+                    verify_sqlite_cleanup_sidecar_witness(witness, &quarantine)
+                {
+                    return Err(rollback_drifted_sqlite_cleanup_move(
+                        &witness.path,
+                        &quarantine,
+                        &drift_error,
+                    ));
+                }
+                tracing::warn!(
+                    path = %witness.path.display(),
+                    quarantine = %quarantine.display(),
+                    reason,
+                    "quarantined sqlite sidecar before opening database"
                 );
+                return Ok(quarantine);
             }
-            _ => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(SqlError::Custom(format!(
+                    "failed to quarantine SQLite sidecar {} at {} without replacement ({reason}): {error}",
+                    witness.path.display(),
+                    quarantine.display()
+                )));
+            }
         }
+    }
+    Err(SqlError::Custom(format!(
+        "failed to quarantine SQLite sidecar {} because 10000 collision-safe destinations were occupied",
+        witness.path.display()
+    )))
+}
+
+#[allow(clippy::result_large_err)]
+fn quarantine_sqlite_cleanup_sidecar_or_rollback(
+    witness: &SqliteCleanupSidecarWitness,
+    nonce: &mut Option<String>,
+    reason: &str,
+    moved: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<(), SqlError> {
+    match quarantine_sqlite_cleanup_sidecar_witnessed(witness, nonce, reason) {
+        Ok(quarantine_path) => {
+            moved.push((witness.path.clone(), quarantine_path));
+            Ok(())
+        }
+        Err(error) => Err(rollback_prior_sqlite_cleanup_moves(moved, error)),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn apply_classified_sqlite_family_cleanup(
+    db_path: &Path,
+) -> Result<SqliteFamilyCleanupOutcome, SqlError> {
+    apply_classified_sqlite_family_cleanup_with_hook(db_path, |_| {})
+}
+
+#[allow(clippy::result_large_err)]
+fn apply_classified_sqlite_family_cleanup_with_hook<F>(
+    db_path: &Path,
+    mut before_move: F,
+) -> Result<SqliteFamilyCleanupOutcome, SqlError>
+where
+    F: FnMut(&Path),
+{
+    let plan = classify_sqlite_family_cleanup(db_path)?;
+    if plan.is_empty() {
+        return Ok(SqliteFamilyCleanupOutcome::NotNeeded);
     }
 
-    // Quarantine SHM when it's empty OR when we just quarantined the WAL (the
-    // SHM is meaningless without a companion WAL).
-    {
-        let mut shm_os = db_path.as_os_str().to_os_string();
-        shm_os.push("-shm");
-        let shm_path = PathBuf::from(shm_os);
-        match std::fs::symlink_metadata(&shm_path) {
-            Ok(meta) if wal_quarantined || (meta.file_type().is_file() && meta.len() == 0) => {
-                let reason = if wal_quarantined {
-                    "companion WAL quarantined"
-                } else {
-                    "empty SHM sidecar"
-                };
-                let _ = quarantine_sqlite_cleanup_sidecar(&shm_path, &mut quarantine_nonce, reason);
-            }
-            _ => {}
+    let wal = plan.wal.is_some();
+    let shm = plan.shm.is_some();
+    let wal_cert = plan.wal_cert.is_some();
+    let wal_cert_head = plan.wal_cert_head.is_some();
+    let mut quarantine_nonce = None;
+    let mut moved = Vec::new();
+    // Move derived coordination state first and the WAL last. If the process
+    // crashes between moves, the WAL evidence remains attached; moving the WAL
+    // first would leave SHM/certification state that names a detached generation.
+    if let Some(witness) = plan.wal_cert_head.as_ref() {
+        if let Err(error) = refuse_sqlite_family_cleanup_while_owned(db_path) {
+            return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
         }
+        before_move(&witness.path);
+        quarantine_sqlite_cleanup_sidecar_or_rollback(
+            witness,
+            &mut quarantine_nonce,
+            "companion WAL is classified for quarantine",
+            &mut moved,
+        )?;
     }
+    if let Some(witness) = plan.wal_cert.as_ref() {
+        if let Err(error) = refuse_sqlite_family_cleanup_while_owned(db_path) {
+            return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+        }
+        before_move(&witness.path);
+        quarantine_sqlite_cleanup_sidecar_or_rollback(
+            witness,
+            &mut quarantine_nonce,
+            "companion WAL is classified for quarantine",
+            &mut moved,
+        )?;
+    }
+    if let Some(witness) = plan.shm.as_ref() {
+        if let Err(error) = refuse_sqlite_family_cleanup_while_owned(db_path) {
+            return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+        }
+        before_move(&witness.path);
+        let reason = if wal {
+            "companion WAL is classified for quarantine"
+        } else {
+            "empty SHM sidecar"
+        };
+        quarantine_sqlite_cleanup_sidecar_or_rollback(
+            witness,
+            &mut quarantine_nonce,
+            reason,
+            &mut moved,
+        )?;
+    }
+    if let Some(witness) = plan.wal.as_ref() {
+        if let Err(error) = refuse_sqlite_family_cleanup_while_owned(db_path) {
+            return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+        }
+        before_move(&witness.path);
+        quarantine_sqlite_cleanup_sidecar_or_rollback(
+            witness,
+            &mut quarantine_nonce,
+            "header-only/truncated WAL sidecar",
+            &mut moved,
+        )?;
+    }
+    if let Err(error) = sync_recovery_parent(db_path) {
+        return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+    }
+    Ok(SqliteFamilyCleanupOutcome::Quarantined {
+        wal,
+        shm,
+        wal_cert,
+        wal_cert_head,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn cleanup_empty_wal_sidecar(db_path: &Path) -> Result<SqliteFamilyCleanupOutcome, SqlError> {
+    cleanup_truncated_wal_sidecar(db_path)
 }
 
 #[must_use]
@@ -6287,9 +8438,12 @@ pub fn inspect_atc_sidecar_health(primary_sqlite_path: &str) -> AtcSidecarHealth
     let size_bytes = std::fs::metadata(&path).map_or(0, |meta| meta.len());
     let total_size_bytes = primary_size_bytes.saturating_add(size_bytes);
     let (quick_check_ok, experience_rows, detail) =
-        match crate::CanonicalDbConn::open_file(path.as_str()) {
+        match open_guarded_read_only_canonical_sqlite_file(
+            Path::new(&path),
+            "ATC sidecar health diagnostic",
+        ) {
             Ok(conn) => {
-                let _ = conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL);
+                let _ = conn.execute_raw("PRAGMA busy_timeout = 20000;");
                 match crate::integrity::probe_check_rows(
                     |sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()),
                     crate::integrity::CheckKind::Quick,
@@ -6367,58 +8521,113 @@ fn os_str_starts_with(value: &OsStr, prefix: &OsStr) -> bool {
     }
 }
 
-#[must_use]
-fn os_str_ends_with(value: &OsStr, suffix: &OsStr) -> bool {
-    #[cfg(unix)]
-    {
-        value.as_bytes().ends_with(suffix.as_bytes())
+/// A private, source-byte-neutral copy of a SQLite family (main file plus
+/// every recovery sidecar) staged into a caller-owned tempdir.
+///
+/// Dropping the value removes the staged copy; keep it alive for as long as a
+/// connection opened on [`Self::path`] is in use.
+pub struct SqliteHealthProbeSource {
+    _directory: CanonicalSnapshotTempDir,
+    path: PathBuf,
+}
+
+impl SqliteHealthProbeSource {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn stage_sqlite_family_for_health_probe_once(
+    source: &Path,
+) -> std::io::Result<Option<SqliteHealthProbeSource>> {
+    match std::fs::symlink_metadata(source) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
     }
 
-    #[cfg(windows)]
-    {
-        let value_units = value.encode_wide().collect::<Vec<_>>();
-        let suffix_units = suffix.encode_wide().collect::<Vec<_>>();
-        value_units.ends_with(&suffix_units)
+    // Always inspect a private family copy, even when the source currently has
+    // no sidecars. A normal writable SQLite open can create WAL/SHM merely by
+    // probing a cold live database; the health API promises source-byte
+    // neutrality and must never perform that open against the authority path.
+    let directory = CanonicalSnapshotTempDir::new(".mcp-agent-mail-health-probe-")?;
+    let staged_path = directory.path().join("health-probe.sqlite3");
+    copy_file_without_overwrite(source, &staged_path)?;
+
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+        let source_sidecar = sqlite_sidecar_path(source, suffix);
+        match std::fs::symlink_metadata(&source_sidecar) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                copy_file_without_overwrite(
+                    &source_sidecar,
+                    &sqlite_sidecar_path(&staged_path, suffix),
+                )?;
+            }
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
 
-    #[cfg(not(any(unix, windows)))]
-    {
-        value
-            .to_string_lossy()
-            .ends_with(suffix.to_string_lossy().as_ref())
+    Ok(Some(SqliteHealthProbeSource {
+        _directory: directory,
+        path: staged_path,
+    }))
+}
+
+/// Stage a private copy of the SQLite family at `source` for a read-only
+/// health probe, retrying up to three times when a sidecar appears or
+/// disappears between classification and copy.
+///
+/// The copy carries `-journal`, `-wal`, `-shm`, `-wal-cert`, and
+/// `-wal-cert-head` but deliberately not the FrankenSQLite namespace sidecars
+/// (`-fsqlite-ns-gate` / `-fsqlite-ns-use`): those describe the live inode's
+/// engine authority, which the private copy must not inherit. Returns
+/// `Ok(None)` when `source` is not a regular file or a sidecar slot holds a
+/// non-file.
+#[allow(clippy::result_large_err)]
+pub fn stage_sqlite_family_for_health_probe(
+    source: &Path,
+) -> Result<Option<SqliteHealthProbeSource>, SqlError> {
+    validate_sqlite_target_path(source, "SQLite health-probe source")?;
+    #[cfg(test)]
+    note_health_probe_staging_for_test(source);
+    let mut last_not_found = None;
+    for _ in 0..3 {
+        match stage_sqlite_family_for_health_probe_once(source) {
+            Ok(staged) => return Ok(staged),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // WAL/SHM files can legitimately appear or disappear between
+                // metadata classification and a no-follow open. Retry the
+                // complete private copy instead of treating that race as
+                // corruption or falling back to a writable live open.
+                last_not_found = Some(error);
+            }
+            Err(error) => {
+                return Err(SqlError::Custom(format!(
+                    "failed to stage source-byte-neutral SQLite health probe for {}: {error}",
+                    source.display()
+                )));
+            }
+        }
     }
+    Err(SqlError::Custom(format!(
+        "failed to stage source-byte-neutral SQLite health probe for {} because its family changed repeatedly: {}",
+        source.display(),
+        last_not_found.map_or_else(|| "unknown race".to_string(), |error| error.to_string())
+    )))
 }
 
 #[allow(clippy::result_large_err)]
 fn sqlite_file_is_healthy_canonical(path: &Path) -> Result<bool, SqlError> {
-    let path_str = path.to_string_lossy();
-    let conn = crate::CanonicalDbConn::open_file(path_str.as_ref())?;
+    let conn = crate::CanonicalDbConn::open_file(sqlite_path_as_utf8(path)?)?;
 
     if !sqlite_canonical_quick_check_is_ok(&conn)? {
         return Ok(false);
     }
     sqlite_canonical_incremental_check_is_ok(&conn)
-}
-
-/// Validate a database artifact without opening it through FrankenSQLite.
-///
-/// FrankenSQLite's namespace coordination files are intentionally persistent:
-/// opening a temporary pathname and then renaming that database leaves the
-/// namespace record attached to the old pathname. Recovery candidates are
-/// private, single-owner files that are renamed after validation, so all
-/// pre-promotion probes must use canonical SQLite only.
-#[allow(clippy::result_large_err)]
-fn sqlite_canonical_artifact_is_healthy(path: &Path) -> Result<bool, SqlError> {
-    if !is_real_file(path) {
-        return Ok(false);
-    }
-    if SQLITE_RECOVERY_SIDECAR_SUFFIXES.iter().any(|suffix| {
-        std::fs::symlink_metadata(sqlite_sidecar_path(path, suffix))
-            .is_ok_and(|metadata| !metadata.file_type().is_file())
-    }) {
-        return Ok(false);
-    }
-    normalize_recovery_candidate_probe_result(sqlite_file_is_healthy_canonical(path))
 }
 
 #[allow(clippy::result_large_err)]
@@ -6443,20 +8652,6 @@ fn normalize_recovery_candidate_probe_result(
             }
         }
     }
-}
-
-#[allow(clippy::result_large_err)]
-pub(crate) fn sqlite_recovery_candidate_is_healthy(path: &Path) -> Result<bool, SqlError> {
-    if FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES
-        .iter()
-        .any(|suffix| path_is_occupied(&sqlite_sidecar_path(path, suffix)))
-    {
-        return Err(SqlError::Custom(format!(
-            "recovery candidate {} has FrankenSQLite namespace records; refusing to rename a generation that was opened through the live-runtime engine",
-            path.display()
-        )));
-    }
-    sqlite_canonical_artifact_is_healthy(path)
 }
 
 #[allow(clippy::result_large_err)]
@@ -6492,7 +8687,15 @@ fn sqlite_ack_pending_probe_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
 }
 
 #[allow(clippy::result_large_err)]
-pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError> {
+fn sqlite_primary_read_path_is_healthy_direct(path: &Path) -> Result<bool, SqlError> {
+    sqlite_primary_read_path_is_healthy_direct_with_cleanup(path, true)
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_primary_read_path_is_healthy_direct_with_cleanup(
+    path: &Path,
+    allow_family_cleanup: bool,
+) -> Result<bool, SqlError> {
     if !path.exists() {
         return Ok(false);
     }
@@ -6506,7 +8709,7 @@ pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError
     }) {
         return Ok(false);
     }
-    let path_str = path.to_string_lossy();
+    let path_str = sqlite_path_as_utf8(path)?;
 
     // GH#99: if open hits a header-only/truncated WAL (which the pager
     // surfaces as "WAL file too small for header during rebuild"), one
@@ -6514,7 +8717,7 @@ pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError
     // without escalating to the verdict engine's Broken/Corrupt state.
     // Kept strictly to recovery-classified errors; corruption still short-
     // circuits to `Ok(false)` below.
-    let conn = match open_sqlite_file_with_lock_retry(path_str.as_ref()) {
+    let conn = match open_sqlite_file_with_lock_retry(path_str) {
         Ok(conn) => conn,
         Err(first_err) => {
             let msg = first_err.to_string();
@@ -6523,8 +8726,11 @@ pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError
                 return Ok(false);
             }
             if is_sqlite_recovery_error_message(&msg) {
-                cleanup_empty_wal_sidecar(path_str.as_ref());
-                match open_sqlite_file_with_lock_retry(path_str.as_ref()) {
+                if !allow_family_cleanup {
+                    return Ok(false);
+                }
+                let _ = apply_classified_sqlite_family_cleanup(path)?;
+                match open_sqlite_file_with_lock_retry(path_str) {
                     Ok(conn) => conn,
                     Err(retry_err) => {
                         let retry_msg = retry_err.to_string();
@@ -6608,7 +8814,33 @@ pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError
     Ok(true)
 }
 
+/// Run the FrankenSQLite read-path checks against a private copy of the whole
+/// SQLite family.
+///
+/// The live primary and every adjacent sidecar remain byte- and name-identical
+/// even if the engine replays a journal or resets WAL/SHM while opening the
+/// staged copy.
 #[allow(clippy::result_large_err)]
+pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError> {
+    let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
+        return Ok(false);
+    };
+    sqlite_primary_read_path_is_healthy_direct(&staged.path)
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_file_is_healthy_staged(
+    path: &Path,
+    allow_family_cleanup: bool,
+) -> Result<bool, SqlError> {
+    if !sqlite_primary_read_path_is_healthy_direct_with_cleanup(path, allow_family_cleanup)? {
+        return Ok(false);
+    }
+    normalize_compatibility_probe_result(path, sqlite_file_is_healthy_canonical(path))
+}
+
+#[allow(clippy::result_large_err)]
+#[cfg(test)]
 fn sqlite_file_is_healthy_with_compat_probe<F>(
     path: &Path,
     mut compatibility_probe: F,
@@ -6656,17 +8888,264 @@ fn normalize_compatibility_probe_result(
     }
 }
 
-#[allow(clippy::result_large_err)]
-pub fn sqlite_compatibility_read_path_is_healthy(path: &Path) -> Result<bool, SqlError> {
-    if !path.exists() {
-        return Ok(false);
+// ============================================================================
+// Staged health verdict reuse (br-eru3j)
+// ============================================================================
+//
+// Every staged health probe copies the whole SQLite family into a private
+// tempdir and runs the FrankenSQLite quick check on the copy, then the
+// canonical one. On a 163 MB mailbox the FrankenSQLite check alone takes
+// 8-13 s (fsqlite 0.3.14 spawns a thread per validation unit), and a server
+// start pays it three times within seconds: the startup integrity probe, the
+// pool-init probe, and the first health check. A healthy verdict for a
+// family whose bytes have not changed is the same verdict, so it is kept for
+// a short window keyed by the family's metadata and reused instead of
+// staging and checking again. Only healthy verdicts are kept; an unhealthy
+// family is always re-probed.
+
+/// How long a healthy staged-probe verdict may be reused for an unchanged
+/// family. `AM_HEALTH_VERDICT_REUSE_SECS` overrides it; `0` disables reuse.
+const HEALTH_VERDICT_REUSE_WINDOW_SECS: u64 = 30;
+const HEALTH_VERDICT_REUSE_WINDOW_MAX_SECS: u64 = 600;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum HealthVerdictVariant {
+    WithFamilyCleanup,
+    WithoutFamilyCleanup,
+}
+
+/// Family metadata that must be unchanged for a healthy verdict to be reused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HealthVerdictFingerprint {
+    /// Main database file: device, inode, length, mtime in nanoseconds.
+    main: (u64, u64, u64, i128),
+    /// Sidecars whose bytes decide the verdict: suffix, length, mtime.
+    content_sidecars: Vec<(&'static str, u64, i128)>,
+    /// Sidecars whose presence and length matter but whose bytes churn with
+    /// every reader (`-shm` read marks, namespace use counters): suffix, length.
+    shape_sidecars: Vec<(&'static str, u64)>,
+}
+
+struct HealthVerdictEntry {
+    fingerprint: HealthVerdictFingerprint,
+    verified_at: Instant,
+}
+
+static HEALTHY_VERDICT_CACHE: OnceLock<
+    Mutex<HashMap<(PathBuf, HealthVerdictVariant), HealthVerdictEntry>>,
+> = OnceLock::new();
+
+fn healthy_verdict_cache()
+-> &'static Mutex<HashMap<(PathBuf, HealthVerdictVariant), HealthVerdictEntry>> {
+    HEALTHY_VERDICT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn health_verdict_reuse_window() -> Duration {
+    let secs = mcp_agent_mail_core::config::process_env_value("AM_HEALTH_VERDICT_REUSE_SECS")
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(HEALTH_VERDICT_REUSE_WINDOW_SECS);
+    Duration::from_secs(secs.min(HEALTH_VERDICT_REUSE_WINDOW_MAX_SECS))
+}
+
+/// Device, inode, length, and mtime of a regular file; `None` for anything
+/// else (missing, symlink, directory), which also means "never reuse".
+fn health_probe_file_stamp(path: &Path) -> Option<(u64, u64, u64, i128)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
     }
-    normalize_compatibility_probe_result(path, sqlite_file_is_healthy_canonical(path))
+    let mtime = i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec());
+    Some((metadata.dev(), metadata.ino(), metadata.len(), mtime))
+}
+
+fn health_verdict_fingerprint(path: &Path) -> Option<HealthVerdictFingerprint> {
+    let main = health_probe_file_stamp(path)?;
+    let mut content_sidecars = Vec::new();
+    for suffix in ["-wal", "-journal", "-wal-cert", "-wal-cert-head"] {
+        if let Some((_, _, len, mtime)) =
+            health_probe_file_stamp(&sqlite_sidecar_path(path, suffix))
+        {
+            content_sidecars.push((suffix, len, mtime));
+        }
+    }
+    let mut shape_sidecars = Vec::new();
+    for suffix in ["-shm", "-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+        if let Some((_, _, len, _)) = health_probe_file_stamp(&sqlite_sidecar_path(path, suffix)) {
+            shape_sidecars.push((suffix, len));
+        }
+    }
+    Some(HealthVerdictFingerprint {
+        main,
+        content_sidecars,
+        shape_sidecars,
+    })
+}
+
+fn healthy_verdict_reusable(
+    path: &Path,
+    variant: HealthVerdictVariant,
+    fingerprint: &HealthVerdictFingerprint,
+) -> bool {
+    let window = health_verdict_reuse_window();
+    if window.is_zero() {
+        return false;
+    }
+    let now = Instant::now();
+    let mut cache = healthy_verdict_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    cache.retain(|_, entry| now.saturating_duration_since(entry.verified_at) <= window);
+    let key = (normalize_sqlite_identity_path_buf(path), variant);
+    let reusable = cache
+        .get(&key)
+        .is_some_and(|entry| entry.fingerprint == *fingerprint);
+    drop(cache);
+    if reusable {
+        tracing::debug!(
+            path = %path.display(),
+            variant = ?variant,
+            "reusing the recent healthy staged-probe verdict for an unchanged sqlite family"
+        );
+    }
+    reusable
+}
+
+/// Keep a healthy verdict, but only when the family is still exactly what was
+/// staged: a write that landed during the probe changes the fingerprint and
+/// the verdict is dropped rather than stored against the new bytes.
+fn remember_healthy_verdict(
+    path: &Path,
+    variant: HealthVerdictVariant,
+    staged_fingerprint: Option<HealthVerdictFingerprint>,
+) {
+    let Some(fingerprint) = staged_fingerprint else {
+        return;
+    };
+    if health_verdict_reuse_window().is_zero()
+        || health_verdict_fingerprint(path).as_ref() != Some(&fingerprint)
+    {
+        return;
+    }
+    healthy_verdict_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(
+            (normalize_sqlite_identity_path_buf(path), variant),
+            HealthVerdictEntry {
+                fingerprint,
+                verified_at: Instant::now(),
+            },
+        );
+}
+
+#[cfg(test)]
+static HEALTH_PROBE_STAGINGS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+fn note_health_probe_staging_for_test(source: &Path) {
+    *HEALTH_PROBE_STAGINGS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(normalize_sqlite_identity_path_buf(source))
+        .or_insert(0) += 1;
+}
+
+#[cfg(test)]
+pub(crate) fn health_probe_stagings_for_test(source: &Path) -> usize {
+    HEALTH_PROBE_STAGINGS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&normalize_sqlite_identity_path_buf(source))
+        .copied()
+        .unwrap_or(0)
 }
 
 #[allow(clippy::result_large_err)]
-pub(crate) fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
-    sqlite_file_is_healthy_with_compat_probe(path, sqlite_file_is_healthy_canonical)
+pub fn sqlite_compatibility_read_path_is_healthy(path: &Path) -> Result<bool, SqlError> {
+    let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
+        return Ok(false);
+    };
+    normalize_compatibility_probe_result(
+        &staged.path,
+        sqlite_file_is_healthy_canonical(&staged.path),
+    )
+}
+
+#[allow(clippy::result_large_err)]
+pub fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
+    let fingerprint = health_verdict_fingerprint(path);
+    if let Some(fingerprint) = &fingerprint
+        && healthy_verdict_reusable(path, HealthVerdictVariant::WithFamilyCleanup, fingerprint)
+    {
+        return Ok(true);
+    }
+    let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
+        return Ok(false);
+    };
+    let healthy = sqlite_file_is_healthy_staged(&staged.path, true)?;
+    if healthy {
+        remember_healthy_verdict(path, HealthVerdictVariant::WithFamilyCleanup, fingerprint);
+    }
+    Ok(healthy)
+}
+
+/// Prove that the current SQLite family is healthy without first detaching a
+/// damaged WAL or SHM sidecar.
+///
+/// This is stricter than [`sqlite_file_is_healthy`]. The ordinary health probe
+/// may quarantine a truncation artifact on its private staged copy before
+/// checking the primary, which is useful when deciding whether recovery can
+/// repair a family. A caller whose durable recovery breaker is already open
+/// must instead prove that the exact staged family is directly usable without
+/// that cleanup; otherwise allowing startup would only defer the same breaker
+/// refusal to the runtime's first database open.
+#[allow(clippy::result_large_err)]
+pub fn sqlite_file_is_healthy_without_family_cleanup(path: &Path) -> Result<bool, SqlError> {
+    let fingerprint = health_verdict_fingerprint(path);
+    if let Some(fingerprint) = &fingerprint
+        && healthy_verdict_reusable(
+            path,
+            HealthVerdictVariant::WithoutFamilyCleanup,
+            fingerprint,
+        )
+    {
+        return Ok(true);
+    }
+    let healthy = sqlite_file_is_healthy_without_family_cleanup_uncached(path)?;
+    if healthy {
+        remember_healthy_verdict(
+            path,
+            HealthVerdictVariant::WithoutFamilyCleanup,
+            fingerprint,
+        );
+    }
+    Ok(healthy)
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_file_is_healthy_without_family_cleanup_uncached(path: &Path) -> Result<bool, SqlError> {
+    let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
+        return Ok(false);
+    };
+    let staged_wal = crate::wal_classify::classify_wal_sidecar(&staged.path);
+    let staged_sidecars = inspect_mailbox_sidecar_state(&staged.path);
+    // A rollback journal may require recovery merely to observe the database.
+    // The no-cleanup contract must not accept a staged open that succeeded by
+    // replaying or resetting that journal, because the corresponding live
+    // read-only observer has no authority to trigger recovery.
+    if path_is_occupied(&sqlite_sidecar_path(&staged.path, "-journal"))
+        || staged_wal.state.is_damaged()
+        || (staged_sidecars.shm_exists && !staged_sidecars.wal_exists)
+    {
+        return Ok(false);
+    }
+    if !classify_sqlite_family_cleanup(&staged.path)?.is_empty() {
+        return Ok(false);
+    }
+    sqlite_file_is_healthy_staged(&staged.path, false)
 }
 
 #[allow(clippy::result_large_err)]
@@ -6717,6 +9196,11 @@ fn refuse_auto_recovery_with_live_sidecars(primary_path: &Path) -> Result<(), Sq
 fn try_checkpoint_and_clear_sidecars(primary_path: &Path) -> Result<(), SqlError> {
     wal_checkpoint_truncate_path(primary_path)
         .map_err(|e| SqlError::Custom(format!("checkpoint: {e}")))?;
+    // The checkpoint connection has closed, but a writer could have appeared
+    // in the gap between that close and residual-sidecar classification. Do
+    // not treat checkpoint success as continuing authority to detach whatever
+    // now occupies a sidecar pathname.
+    refuse_sqlite_family_cleanup_while_owned(primary_path)?;
     // Move any residual sidecars left after the successful checkpoint out of
     // the live DB family while keeping them available for post-mortem review.
     quarantine_sqlite_sidecars_after_checkpoint(primary_path)?;
@@ -6731,30 +9215,84 @@ fn try_checkpoint_and_clear_sidecars(primary_path: &Path) -> Result<(), SqlError
 
 #[allow(clippy::result_large_err)]
 fn quarantine_sqlite_sidecars_after_checkpoint(primary_path: &Path) -> Result<(), SqlError> {
-    let mut quarantine_nonce = None;
+    quarantine_sqlite_sidecars_after_checkpoint_with_hook(primary_path, |_| {})
+}
+
+#[allow(clippy::result_large_err)]
+fn classify_sqlite_sidecars_after_checkpoint(
+    primary_path: &Path,
+) -> Result<Vec<SqliteCleanupSidecarWitness>, SqlError> {
+    let mut sidecars = HashMap::new();
     for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
-        let sidecar_path = sqlite_path_with_suffix(primary_path, suffix);
-        match std::fs::symlink_metadata(&sidecar_path) {
-            Ok(_) => {
-                if !quarantine_sqlite_cleanup_sidecar(
-                    &sidecar_path,
-                    &mut quarantine_nonce,
-                    "residual sidecar after successful checkpoint",
-                ) {
-                    return Err(SqlError::Custom(format!(
-                        "failed to quarantine residual sqlite sidecar {} after checkpoint",
-                        sidecar_path.display()
-                    )));
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
+        let path = sqlite_path_with_suffix(primary_path, suffix);
+        let Some(opened) =
+            open_sqlite_cleanup_sidecar(&path, sqlite_recovery_sidecar_label(suffix))?
+        else {
+            continue;
+        };
+        // Empty sidecars are ignored by `sqlite_file_has_live_sidecars` and
+        // are safe for SQLite to reuse. Avoid needless namespace churn.
+        if opened.len == 0 {
+            continue;
+        }
+        let witnessed = seal_sqlite_cleanup_sidecar(opened)?;
+        match suffix {
+            "-journal" => {
                 return Err(SqlError::Custom(format!(
-                    "failed to inspect residual sqlite sidecar {} after checkpoint: {e}",
-                    sidecar_path.display()
+                    "checkpoint completed for {} but a non-empty rollback journal appeared; refusing to detach a possibly live transaction",
+                    primary_path.display()
                 )));
             }
+            "-wal" if witnessed.len > SQLITE_WAL_HEADER_BYTES => {
+                return Err(SqlError::Custom(format!(
+                    "checkpoint completed for {} but a WAL with frame bytes appeared; refusing to detach a possibly committed generation",
+                    primary_path.display()
+                )));
+            }
+            _ => {
+                sidecars.insert(suffix, witnessed);
+            }
         }
+    }
+
+    // Derived state moves first and WAL authority last, matching ordinary
+    // damaged-family cleanup. All entries were opened, hashed, and retained
+    // before the first namespace mutation.
+    let mut ordered = Vec::with_capacity(sidecars.len());
+    for suffix in ["-wal-cert-head", "-wal-cert", "-shm", "-wal"] {
+        if let Some(witness) = sidecars.remove(suffix) {
+            ordered.push(witness);
+        }
+    }
+    Ok(ordered)
+}
+
+#[allow(clippy::result_large_err)]
+fn quarantine_sqlite_sidecars_after_checkpoint_with_hook<F>(
+    primary_path: &Path,
+    mut before_move: F,
+) -> Result<(), SqlError>
+where
+    F: FnMut(&Path),
+{
+    refuse_sqlite_family_cleanup_while_owned(primary_path)?;
+    let sidecars = classify_sqlite_sidecars_after_checkpoint(primary_path)?;
+    let mut quarantine_nonce = None;
+    let mut moved = Vec::new();
+    for witness in &sidecars {
+        if let Err(error) = refuse_sqlite_family_cleanup_while_owned(primary_path) {
+            return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+        }
+        before_move(&witness.path);
+        quarantine_sqlite_cleanup_sidecar_or_rollback(
+            witness,
+            &mut quarantine_nonce,
+            "witnessed residual sidecar after successful checkpoint",
+            &mut moved,
+        )?;
+    }
+    if let Err(error) = sync_recovery_parent(primary_path) {
+        return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
     }
     Ok(())
 }
@@ -6810,8 +9348,7 @@ fn try_repair_index_only_corruption(primary_path: &Path) -> Result<bool, SqlErro
     if !primary_path.exists() {
         return Ok(false);
     }
-    let path_str = primary_path.to_string_lossy();
-    let conn = open_sqlite_file_with_lock_retry_canonical(path_str.as_ref())?;
+    let conn = open_sqlite_file_with_lock_retry_canonical(sqlite_path_as_utf8(primary_path)?)?;
     let quick_details = sqlite_pragma_check_details_canonical(&conn, integrity::CheckKind::Quick)?;
     let Some(details) = select_index_only_repair_details(quick_details, || {
         sqlite_pragma_check_details_canonical(&conn, integrity::CheckKind::Full)
@@ -6862,12 +9399,6 @@ fn try_repair_index_only_corruption(primary_path: &Path) -> Result<bool, SqlErro
         "in-place REINDEX repaired index-only sqlite corruption"
     );
     Ok(true)
-}
-
-#[allow(clippy::result_large_err)]
-fn recover_sqlite_file(primary_path: &Path) -> Result<(), SqlError> {
-    let config = mcp_agent_mail_core::Config::from_env();
-    recover_sqlite_file_with_storage_root(primary_path, config.storage_root.as_path())
 }
 
 #[allow(clippy::result_large_err)]
@@ -6950,16 +9481,24 @@ fn parse_wal_checkpoint_rows(
     Ok(u64::try_from(checkpointed.max(0)).unwrap_or(0))
 }
 
-/// Run a strict `TRUNCATE` checkpoint against a SQLite path.
+/// Run a strict canonical-SQLite `TRUNCATE` checkpoint against a private or
+/// process-exclusive SQLite path.
 ///
 /// Returns an error if SQLite reports that the checkpoint was busy or
 /// incomplete, even when the pragma itself executed successfully.
+/// Live mailbox pools must use [`DbPool::wal_checkpoint`] so maintenance stays
+/// inside FrankenSQLite's same-engine transaction fence.
 pub fn wal_checkpoint_truncate_path(db_path: &Path) -> DbResult<u64> {
     if db_path.as_os_str() == ":memory:" {
         return Ok(0);
     }
-    let path_str = db_path.to_string_lossy();
-    let conn = open_sqlite_file_with_lock_retry_canonical(path_str.as_ref())
+    let path_str = db_path.to_str().ok_or_else(|| {
+        DbError::Sqlite(format!(
+            "checkpoint: database path {} is not valid UTF-8",
+            db_path.display()
+        ))
+    })?;
+    let conn = open_sqlite_file_with_lock_retry_canonical(path_str)
         .map_err(|e| DbError::Sqlite(format!("checkpoint: open failed: {e}")))?;
 
     // Maintenance path with no dispatch deadline: a generous 60s lock wait is
@@ -6980,6 +9519,33 @@ fn is_real_directory(path: &Path) -> bool {
 
 fn is_real_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+pub(crate) fn recovery_file_link_count(file: &std::fs::File) -> std::io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        Ok(file.metadata()?.nlink())
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = file;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "stable Windows cannot prove exclusive recovery candidate hard-link ownership",
+        ))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this platform cannot prove exclusive recovery candidate ownership",
+        ))
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -7056,8 +9622,8 @@ fn sqlite_sidecar_occupancy(path: &Path) -> (bool, Option<u64>) {
     }
 }
 
-fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
-    let mut candidates: Vec<(SystemTime, bool, u8, PathBuf)> = Vec::new();
+pub(crate) fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
+    let mut candidates: Vec<(SqliteRecoveryCandidateName, SystemTime, PathBuf)> = Vec::new();
     let Some(file_name) = primary_path.file_name() else {
         return Vec::new();
     };
@@ -7069,18 +9635,19 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
     };
 
     let bak = primary_path.with_file_name(os_string_with_suffix(file_name, ".bak"));
-    if is_real_file(&bak) {
+    if is_real_file(&bak) && sqlite_recovery_candidate_is_standalone(&bak) {
         let modified = bak
             .metadata()
             .and_then(|meta| meta.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        candidates.push((modified, true, 0, bak));
+        if let Some(name) = bak
+            .file_name()
+            .and_then(|candidate| classify_sqlite_recovery_candidate_name(file_name, candidate))
+        {
+            candidates.push((name, modified, bak));
+        }
     }
 
-    let backup_prefix = os_string_with_suffix(file_name, ".backup-");
-    let backup_bak_prefix = os_string_with_suffix(file_name, ".bak.");
-    let recovery_prefix = os_string_with_suffix(file_name, ".recovery");
-    let sidecar_suffixes = SQLITE_RECOVERY_SIDECAR_SUFFIXES.map(OsString::from);
     if let Ok(entries) = std::fs::read_dir(scan_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -7091,50 +9658,48 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
                 continue;
             }
             let name = entry.file_name();
-            let priority = if os_str_starts_with(&name, &backup_bak_prefix) {
-                0
-            } else if os_str_starts_with(&name, &backup_prefix) {
-                1
-            } else if os_str_starts_with(&name, &recovery_prefix) {
-                2
-            } else {
+            let Some(classified) = classify_sqlite_recovery_candidate_name(file_name, &name) else {
                 continue;
             };
-            if sidecar_suffixes
-                .iter()
-                .any(|suffix| os_str_ends_with(&name, suffix.as_os_str()))
+            if classified.kind() == SqliteRecoveryCandidateKind::ProactiveBak
+                || !classified.kind().is_standalone_restore_eligible()
             {
+                // `.recovery` may depend on its copied WAL. Historical
+                // `.backup-*` generations independently published their main
+                // file and sidecars. The current restore path stages only one
+                // main DB file, so either family could silently lose state.
+                continue;
+            }
+            if !sqlite_recovery_candidate_is_standalone(&path) {
                 continue;
             }
             let modified = entry
                 .metadata()
                 .and_then(|meta| meta.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            candidates.push((modified, false, priority, path));
+            candidates.push((classified, modified, path));
         }
     }
 
     candidates.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.2.cmp(&b.2))
-            .then_with(|| b.3.cmp(&a.3))
+        a.0.cmp_newest_first(a.1, b.0, b.1)
+            .then_with(|| b.2.cmp(&a.2))
     });
-    candidates.into_iter().map(|(_, _, _, p)| p).collect()
+    candidates.into_iter().map(|(_, _, path)| path).collect()
 }
 
 fn find_healthy_backup(primary_path: &Path) -> Option<PathBuf> {
     for candidate in sqlite_backup_candidates(primary_path) {
-        match sqlite_canonical_artifact_is_healthy(&candidate) {
+        match sqlite_recovery_candidate_passes_full_integrity_check(&candidate) {
             Ok(true) => return Some(candidate),
             Ok(false) => tracing::warn!(
                 candidate = %candidate.display(),
-                "sqlite backup candidate failed canonical health probes; skipping"
+                "sqlite backup candidate failed full canonical integrity probes; skipping"
             ),
             Err(e) => tracing::warn!(
                 candidate = %candidate.display(),
                 error = %e,
-                "sqlite backup candidate canonical probe failed; skipping"
+                "sqlite backup candidate full canonical integrity probe failed; skipping"
             ),
         }
     }
@@ -7217,7 +9782,16 @@ fn resolve_sqlite_path_with_absolute_fallback(sqlite_path: &str) -> String {
 
 #[must_use]
 pub fn normalize_sqlite_path_for_pool_key(sqlite_path: &str) -> String {
-    resolve_sqlite_path_with_absolute_fallback(sqlite_path)
+    let selected = resolve_sqlite_path_with_absolute_fallback(sqlite_path);
+    if selected == ":memory:" {
+        return selected;
+    }
+    let Ok(absolute_alias) = absolute_lexical_authority_path(Path::new(&selected), "database_url")
+    else {
+        return selected;
+    };
+    let identity = normalize_sqlite_identity_path_buf(&absolute_alias);
+    sqlite_open_path_for_identity(&absolute_alias, &identity).unwrap_or(selected)
 }
 
 pub fn resolve_mailbox_sqlite_path(database_url: &str) -> DbResult<ResolvedMailboxSqlitePath> {
@@ -7226,9 +9800,17 @@ pub fn resolve_mailbox_sqlite_path(database_url: &str) -> DbResult<ResolvedMailb
         ..Default::default()
     };
     let configured_path = config.sqlite_path()?;
-    let canonical_path = normalize_sqlite_path_for_pool_key(&configured_path);
+    let selected_path = resolve_sqlite_path_with_absolute_fallback(&configured_path);
+    let canonical_path = if selected_path == ":memory:" {
+        ":memory:".to_string()
+    } else {
+        let absolute_alias =
+            absolute_lexical_authority_path(Path::new(&selected_path), "database_url")?;
+        let identity = normalize_sqlite_identity_path_buf(&absolute_alias);
+        sqlite_open_path_for_identity(&absolute_alias, &identity)?
+    };
     Ok(ResolvedMailboxSqlitePath {
-        used_absolute_fallback: canonical_path != configured_path,
+        used_absolute_fallback: selected_path != configured_path,
         configured_path,
         canonical_path,
     })
@@ -7260,6 +9842,8 @@ pub fn inspect_mailbox_sidecar_state(db_path: &Path) -> MailboxSidecarState {
 
 #[must_use]
 pub fn inspect_mailbox_recovery_lock(db_path: &Path) -> MailboxRecoveryLockState {
+    const MAX_RECOVERY_LOCK_PID_BYTES: u64 = 32;
+
     let lock_path = sqlite_path_with_suffix(db_path, ".recovery.lock");
     if db_path.as_os_str() == ":memory:" {
         return MailboxRecoveryLockState {
@@ -7271,21 +9855,16 @@ pub fn inspect_mailbox_recovery_lock(db_path: &Path) -> MailboxRecoveryLockState
         };
     }
 
-    if !lock_path.exists() {
-        return MailboxRecoveryLockState {
-            lock_path: lock_path.display().to_string(),
-            exists: false,
-            active: false,
-            pid: None,
-            detail: "No recovery lock present".to_string(),
-        };
-    }
-
-    match std::fs::read_to_string(&lock_path) {
-        Ok(content) => match content.trim().parse::<u32>() {
-            Ok(pid) => {
-                let proc_path = PathBuf::from(format!("/proc/{pid}"));
-                if proc_path.exists() {
+    match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        &lock_path,
+        MAX_RECOVERY_LOCK_PID_BYTES,
+    ) {
+        Ok(content) => match std::str::from_utf8(&content)
+            .ok()
+            .and_then(|content| content.trim().parse::<u32>().ok())
+        {
+            Some(pid) => {
+                if recovery_lock_pid_is_alive(pid) {
                     MailboxRecoveryLockState {
                         lock_path: lock_path.display().to_string(),
                         exists: true,
@@ -7303,22 +9882,61 @@ pub fn inspect_mailbox_recovery_lock(db_path: &Path) -> MailboxRecoveryLockState
                     }
                 }
             }
-            Err(_) => MailboxRecoveryLockState {
+            None => MailboxRecoveryLockState {
                 lock_path: lock_path.display().to_string(),
                 exists: true,
-                active: false,
+                active: true,
                 pid: None,
-                detail: "Recovery lock file has invalid content".to_string(),
+                detail: "Recovery lock file has invalid content; treating it as active because ownership cannot be disproved".to_string(),
             },
         },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            MailboxRecoveryLockState {
+                lock_path: lock_path.display().to_string(),
+                exists: false,
+                active: false,
+                pid: None,
+                detail: "No recovery lock present".to_string(),
+            }
+        }
         Err(error) => MailboxRecoveryLockState {
             lock_path: lock_path.display().to_string(),
             exists: true,
-            active: false,
+            active: true,
             pid: None,
-            detail: format!("Cannot read recovery lock file: {error}"),
+            detail: format!(
+                "Cannot safely read recovery lock file; treating it as active because ownership cannot be disproved: {error}"
+            ),
         },
     }
+}
+
+/// Probe a recovery-lock owner without assuming Linux's `/proc` filesystem.
+///
+/// `kill(pid, 0)` does not signal the process: it asks the kernel whether the
+/// PID exists and whether the caller may address it. Permission denial still
+/// proves that a process owns the PID. Unexpected probe failures are treated
+/// as live so recovery never steals a lock whose owner could not be disproved.
+#[cfg(unix)]
+fn recovery_lock_pid_is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+        Ok(()) | Err(nix::errno::Errno::EPERM) => true,
+        Err(nix::errno::Errno::ESRCH) => false,
+        Err(_) => true,
+    }
+}
+
+/// Without a safe native process probe, fail closed: a non-zero lock owner is
+/// considered live rather than risking concurrent recovery mutation.
+#[cfg(not(unix))]
+const fn recovery_lock_pid_is_alive(pid: u32) -> bool {
+    pid != 0
 }
 
 fn normalized_mailbox_activity_sqlite_path(db_path: &Path) -> PathBuf {
@@ -7343,8 +9961,14 @@ fn linux_device_numbers(dev: u64) -> (u32, u32) {
     (major, minor)
 }
 
+/// Enumerate `(pid, exclusive)` `flock` holders of `path` from `/proc/locks`.
+///
+/// `exclusive` is `true` for a `WRITE` lock and `false` for a `READ` (shared)
+/// lock; a PID that somehow holds both is reported exclusive. The mode is what
+/// separates a live server (exclusive activity lock) from a shared-mode
+/// observer when classifying mailbox ownership.
 #[cfg(target_os = "linux")]
-fn lock_holder_pids_via_proc(path: &Path) -> Vec<u32> {
+fn lock_holder_pids_via_proc(path: &Path) -> Vec<(u32, bool)> {
     use std::os::unix::fs::MetadataExt;
 
     let Ok(meta) = std::fs::metadata(path) else {
@@ -7357,8 +9981,9 @@ fn lock_holder_pids_via_proc(path: &Path) -> Vec<u32> {
         return Vec::new();
     };
 
-    let mut pids = BTreeSet::new();
+    let mut holders = std::collections::BTreeMap::new();
     for line in locks_content.lines() {
+        // `<n>: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> <start> <end>`
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 8 || fields[1] != "FLOCK" {
             continue;
@@ -7382,20 +10007,27 @@ fn lock_holder_pids_via_proc(path: &Path) -> Vec<u32> {
         let Ok(pid) = fields[4].parse::<u32>() else {
             continue;
         };
-        pids.insert(pid);
+        let exclusive = fields[3] == "WRITE";
+        let entry = holders.entry(pid).or_insert(false);
+        *entry |= exclusive;
     }
-    pids.into_iter().collect()
+    holders.into_iter().collect()
 }
 
 #[cfg(not(target_os = "linux"))]
-fn lock_holder_pids_via_proc(path: &Path) -> Vec<u32> {
+fn lock_holder_pids_via_proc(path: &Path) -> Vec<(u32, bool)> {
     // macOS/BSD do not expose `/proc/locks`.  Treat an Agent Mail process
     // with the activity-lock file open as a conservative holder candidate;
     // the caller filters these PIDs through `pid_is_agent_mail`.  This is
     // intentionally fail-closed: misclassifying an open-but-not-locked Agent
     // Mail process as live only defers repair, while missing the real holder
     // can authorize repair/reconstruct against an active database (GH#195).
+    // Without a lock-mode column every candidate is reported as an exclusive
+    // holder for the same fail-closed reason.
     pids_holding_file_via_lsof(path)
+        .into_iter()
+        .map(|pid| (pid, true))
+        .collect()
 }
 
 #[cfg(target_os = "linux")]
@@ -7651,6 +10283,7 @@ fn add_mailbox_process_surface(
             executable_deleted: false,
             holds_storage_root_lock: false,
             holds_sqlite_lock: false,
+            holds_exclusive_lock: false,
             holds_database_file: false,
         });
     mark(entry);
@@ -7663,6 +10296,9 @@ fn describe_mailbox_process(process: &MailboxOwnershipProcess) -> String {
     }
     if process.holds_sqlite_lock {
         surfaces.push("sqlite_lock");
+    }
+    if process.holds_exclusive_lock {
+        surfaces.push("exclusive_lock");
     }
     if process.holds_database_file {
         surfaces.push("db_file");
@@ -7693,15 +10329,70 @@ fn describe_mailbox_process(process: &MailboxOwnershipProcess) -> String {
     )
 }
 
+/// Result of [`classify_mailbox_ownership`]: the disposition plus the PIDs it
+/// was derived from, split into counted owners and reported-only readers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MailboxOwnershipClassification {
+    disposition: MailboxOwnershipDisposition,
+    competing_pids: Vec<u32>,
+    readers: Vec<u32>,
+    supervised_restart_required: bool,
+    detail: String,
+}
+
+/// Whether a live Agent Mail process counts as a mailbox *owner* rather than
+/// a transient reader.
+///
+/// A live server holds an exclusive (`flock` `WRITE`) mailbox activity lock
+/// for as long as it is alive and its argv names a serve transport. A legacy
+/// Python shadow server never takes our activity locks but must still gate
+/// writes (br-bvq1x.9.4 / I4), so its command line is an owner signal too. A
+/// read-only CLI reader (`am inbox`, `am robot handoff`, ...) merely has the
+/// database file open; counting it as a second owner produced false
+/// split-brain / `unsafe-to-touch` verdicts that blocked supervised repair.
+fn mailbox_process_is_owner(process: &MailboxOwnershipProcess) -> bool {
+    process.holds_exclusive_lock
+        || process.command.as_deref().is_some_and(|command| {
+            command_line_is_agent_mail_server(command)
+                || command_is_python_agent_mail_shadow(command)
+        })
+}
+
+fn describe_mailbox_readers(readers: &[&MailboxOwnershipProcess]) -> String {
+    if readers.is_empty() {
+        return String::new();
+    }
+    format!(
+        "; read-only Agent Mail reader(s) not counted as owners: {}",
+        readers
+            .iter()
+            .map(|process| describe_mailbox_process(process))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
 fn classify_mailbox_ownership(
     processes: &[MailboxOwnershipProcess],
     current_pid: u32,
-) -> (MailboxOwnershipDisposition, Vec<u32>, bool, String) {
-    let competing: Vec<&MailboxOwnershipProcess> = processes
-        .iter()
-        .filter(|process| process.pid != current_pid)
-        .collect();
+) -> MailboxOwnershipClassification {
+    let (competing, readers): (Vec<&MailboxOwnershipProcess>, Vec<&MailboxOwnershipProcess>) =
+        processes
+            .iter()
+            .filter(|process| process.pid != current_pid)
+            .partition(|process| mailbox_process_is_owner(process));
     let competing_pids: Vec<u32> = competing.iter().map(|process| process.pid).collect();
+    let reader_pids: Vec<u32> = readers.iter().map(|process| process.pid).collect();
+    let reader_detail = describe_mailbox_readers(&readers);
+    let classification = |disposition: MailboxOwnershipDisposition,
+                          supervised_restart_required: bool,
+                          detail: String| MailboxOwnershipClassification {
+        disposition,
+        competing_pids: competing_pids.clone(),
+        readers: reader_pids.clone(),
+        supervised_restart_required,
+        detail: format!("{detail}{reader_detail}"),
+    };
 
     if competing.len() > 1 {
         let detail = format!(
@@ -7712,20 +10403,14 @@ fn classify_mailbox_ownership(
                 .collect::<Vec<_>>()
                 .join("; ")
         );
-        return (
-            MailboxOwnershipDisposition::SplitBrain,
-            competing_pids,
-            true,
-            detail,
-        );
+        return classification(MailboxOwnershipDisposition::SplitBrain, true, detail);
     }
 
     if let Some(process) = competing.first()
         && process.executable_deleted
     {
-        return (
+        return classification(
             MailboxOwnershipDisposition::DeletedExecutable,
-            competing_pids,
             true,
             format!(
                 "another live Agent Mail mailbox owner is running a deleted executable: {}",
@@ -7753,9 +10438,8 @@ fn classify_mailbox_ownership(
                 .as_deref()
                 .is_some_and(command_line_is_agent_mail_server)
             {
-                return (
+                return classification(
                     MailboxOwnershipDisposition::ActiveOtherOwner,
-                    competing_pids,
                     false,
                     format!(
                         "another Agent Mail server owns the mailbox database: {}",
@@ -7763,9 +10447,11 @@ fn classify_mailbox_ownership(
                     ),
                 );
             }
-            return (
+            // Reachable only for an owner-by-command-line that is not a Rust
+            // serve transport (a legacy Python shadow server): it holds the
+            // database without any activity lock and needs a supervised stop.
+            return classification(
                 MailboxOwnershipDisposition::StaleLiveProcess,
-                competing_pids,
                 true,
                 format!(
                     "live Agent Mail process still holds the mailbox database without mailbox activity locks: {}",
@@ -7773,9 +10459,8 @@ fn classify_mailbox_ownership(
                 ),
             );
         }
-        return (
+        return classification(
             MailboxOwnershipDisposition::ActiveOtherOwner,
-            competing_pids,
             false,
             format!(
                 "another Agent Mail process already owns the mailbox: {}",
@@ -7784,9 +10469,8 @@ fn classify_mailbox_ownership(
         );
     }
 
-    (
+    classification(
         MailboxOwnershipDisposition::Unowned,
-        Vec::new(),
         false,
         "no competing Agent Mail mailbox owners or live database holders detected".to_string(),
     )
@@ -7801,17 +10485,19 @@ pub fn inspect_mailbox_ownership(
     let sqlite_lock_path = mailbox_activity_lock_path_for_sqlite(primary_path);
 
     let mut processes = HashMap::new();
-    for pid in lock_holder_pids_via_proc(&storage_lock_path) {
+    for (pid, exclusive) in lock_holder_pids_via_proc(&storage_lock_path) {
         if pid_is_agent_mail(pid) {
             add_mailbox_process_surface(&mut processes, pid, |process| {
                 process.holds_storage_root_lock = true;
+                process.holds_exclusive_lock |= exclusive;
             });
         }
     }
-    for pid in lock_holder_pids_via_proc(&sqlite_lock_path) {
+    for (pid, exclusive) in lock_holder_pids_via_proc(&sqlite_lock_path) {
         if pid_is_agent_mail(pid) {
             add_mailbox_process_surface(&mut processes, pid, |process| {
                 process.holds_sqlite_lock = true;
+                process.holds_exclusive_lock |= exclusive;
             });
         }
     }
@@ -7845,16 +10531,16 @@ pub fn inspect_mailbox_ownership(
         .collect();
     processes.sort_by_key(|process| process.pid);
 
-    let (disposition, competing_pids, supervised_restart_required, detail) =
-        classify_mailbox_ownership(&processes, current_pid);
+    let classification = classify_mailbox_ownership(&processes, current_pid);
     MailboxOwnershipState {
-        disposition,
+        disposition: classification.disposition,
         storage_lock_path: storage_lock_path.display().to_string(),
         sqlite_lock_path: sqlite_lock_path.display().to_string(),
         processes,
-        competing_pids,
-        supervised_restart_required,
-        detail,
+        competing_pids: classification.competing_pids,
+        readers: classification.readers,
+        supervised_restart_required: classification.supervised_restart_required,
+        detail: classification.detail,
     }
 }
 
@@ -7874,7 +10560,7 @@ pub fn mailbox_owner_executable_deleted(primary_path: &Path, storage_root: &Path
     lock_holder_pids_via_proc(&storage_lock_path)
         .into_iter()
         .chain(lock_holder_pids_via_proc(&sqlite_lock_path))
-        .any(|pid| pid_is_agent_mail(pid) && pid_executable_deleted(pid))
+        .any(|(pid, _exclusive)| pid_is_agent_mail(pid) && pid_executable_deleted(pid))
 }
 
 /// Non-Linux platforms do not expose Linux's deleted `/proc/<pid>/exe` marker.
@@ -8053,23 +10739,64 @@ const SQLITE_RECOVERY_SIDECAR_SUFFIXES: [&str; 5] =
 // never be unlinked here: namespace records are persistent by design and only
 // FrankenSQLite's exclusive private-database cleanup protocol may remove them.
 const FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES: [&str; 2] = ["-fsqlite-ns-gate", "-fsqlite-ns-use"];
+const SQLITE_DATABASE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+const SQLITE_DATABASE_HEADER_BYTES: usize = 100;
 const RECOVERY_DISK_RESERVE_BYTES: u64 = 100 * 1024 * 1024;
 
-/// Zero-footprint viability check for the strict query-only pool (br-uflow).
+/// No-follow header check for an engine-exclusive canonical diagnostic.
 ///
-/// The strict pool must never create, repair, or leave sidecars beside its
-/// target — but FrankenSQLite's open mints persistent namespace records even
-/// for opens that fail, and only its own cleanup protocol may remove them
-/// (see [`FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES`]). Rejecting absent targets
-/// and files that cannot be a SQLite database (bad magic) here keeps such
-/// pathnames out of FrankenSQLite entirely. Deeper corruption still surfaces
-/// from the real open/query path; an empty file is left to the engine, which
-/// treats zero-length databases as valid.
-fn strict_target_precheck(sqlite_path: &str) -> std::result::Result<(), SqlError> {
-    const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
-    let metadata = std::fs::symlink_metadata(sqlite_path).map_err(|error| {
+/// This function deliberately opens and closes the main inode to read its
+/// header. It must never be reused on a live Franken-admitted database: on
+/// Unix, that close could release classic process-wide `fcntl` locks held by
+/// another same-process connection. The public canonical opener rejects
+/// namespace authority and hard-link aliases before reaching this seam.
+fn strict_offline_canonical_target_precheck(
+    sqlite_path: &str,
+) -> std::result::Result<(), SqlError> {
+    let path = Path::new(sqlite_path);
+    // Reject a stable hard-link alias before opening it. On Unix, discovering
+    // nlink > 1 only after open would be too late: returning would drop that
+    // fd and could release same-process locks held through another name.
+    let pathname_metadata = std::fs::symlink_metadata(path).map_err(|error| {
         SqlError::Custom(format!(
-            "strict query-only open refused: cannot stat {sqlite_path}: {error}"
+            "strict query-only open refused: cannot inspect {sqlite_path}: {error}"
+        ))
+    })?;
+    if !pathname_metadata.file_type().is_file() {
+        return Err(SqlError::Custom(format!(
+            "strict query-only open refused: {sqlite_path} is not a regular file"
+        )));
+    }
+    #[cfg(unix)]
+    if pathname_metadata.nlink() != 1 {
+        return Err(SqlError::Custom(format!(
+            "strict query-only open refused: {sqlite_path} has {} hard links; canonical diagnostics cannot prove that no Franken namespace authority exists beside an alias of the same inode",
+            pathname_metadata.nlink()
+        )));
+    }
+    if pathname_metadata.len() == 0 {
+        return Err(SqlError::Custom(format!(
+            "strict query-only open refused: {sqlite_path} is an empty, unmaterialized database file"
+        )));
+    }
+    if pathname_metadata.len() < u64::try_from(SQLITE_DATABASE_HEADER_BYTES).unwrap_or(u64::MAX) {
+        return Err(SqlError::Custom(format!(
+            "strict query-only open refused: {sqlite_path} has a truncated SQLite database header"
+        )));
+    }
+
+    let mut file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path).map_err(|error| {
+        SqlError::Custom(format!(
+            "strict query-only open refused: cannot open {sqlite_path} without following links: {error}"
+        ))
+    })?;
+    // Recheck the opened object for ordinary metadata drift. This is not an
+    // adversarial path-swap lock; the enclosing contract remains explicitly
+    // engine-exclusive/offline because the path-based SQLite API cannot make
+    // link-count validation and its later engine open one atomic operation.
+    let metadata = file.metadata().map_err(|error| {
+        SqlError::Custom(format!(
+            "strict query-only open refused: cannot inspect open target {sqlite_path}: {error}"
         ))
     })?;
     if !metadata.is_file() {
@@ -8077,27 +10804,816 @@ fn strict_target_precheck(sqlite_path: &str) -> std::result::Result<(), SqlError
             "strict query-only open refused: {sqlite_path} is not a regular file"
         )));
     }
-    if metadata.len() == 0 {
-        return Ok(());
-    }
-    let mut header = [0u8; 16];
-    let read = std::fs::File::open(sqlite_path)
-        .and_then(|mut file| std::io::Read::read(&mut file, &mut header))
-        .map_err(|error| {
-            SqlError::Custom(format!(
-                "strict query-only open refused: cannot read header of {sqlite_path}: {error}"
-            ))
-        })?;
-    if read < header.len() || header != *SQLITE_MAGIC {
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
         return Err(SqlError::Custom(format!(
-            "strict query-only open refused: {sqlite_path} is not a SQLite database"
+            "strict query-only open refused: {sqlite_path} has {} hard links; canonical diagnostics cannot prove that no Franken namespace authority exists beside an alias of the same inode",
+            metadata.nlink()
+        )));
+    }
+    if metadata.len() == 0 {
+        return Err(SqlError::Custom(format!(
+            "strict query-only open refused: {sqlite_path} is an empty, unmaterialized database file"
+        )));
+    }
+    if metadata.len() < u64::try_from(SQLITE_DATABASE_HEADER_BYTES).unwrap_or(u64::MAX) {
+        return Err(SqlError::Custom(format!(
+            "strict query-only open refused: {sqlite_path} has a truncated SQLite database header"
+        )));
+    }
+    let mut header = [0u8; SQLITE_DATABASE_HEADER_BYTES];
+    std::io::Read::read_exact(&mut file, &mut header).map_err(|error| {
+        SqlError::Custom(format!(
+            "strict query-only open refused: cannot read header of {sqlite_path}: {error}"
+        ))
+    })?;
+    let raw_page_size = u16::from_be_bytes([header[16], header[17]]);
+    let page_size_is_valid = raw_page_size == 1
+        || ((512..=32_768).contains(&raw_page_size) && raw_page_size.is_power_of_two());
+    let format_versions_are_valid = matches!(header[18], 1 | 2) && matches!(header[19], 1 | 2);
+    let payload_fractions_are_valid = header[21..24] == [64, 32, 32];
+    if header[..SQLITE_DATABASE_HEADER.len()] != *SQLITE_DATABASE_HEADER
+        || !page_size_is_valid
+        || !format_versions_are_valid
+        || !payload_fractions_are_valid
+    {
+        return Err(SqlError::Custom(format!(
+            "strict query-only open refused: {sqlite_path} does not have a valid SQLite database header"
         )));
     }
     Ok(())
 }
 
+/// Prove an engine-exclusive or offline family is safe to hand to canonical
+/// SQLite without granting that engine any writer authority.
+///
+/// This preflight reads/fingerprints the main inode and may build a private
+/// family copy for a no-cleanup health proof. It is therefore intentionally
+/// separate from [`preflight_bound_live_franken_family`], whose contract is
+/// descriptor-neutral. When durable breaker history applies to these exact
+/// primary bytes, breaker authority is unreadable, or the generation sidecar
+/// family is structurally suspect, the private exact-family copy must pass
+/// before the canonical read-only open is allowed.
+#[allow(clippy::result_large_err)]
+fn preflight_guarded_offline_canonical_sqlite_family(
+    sqlite_path: &Path,
+    context: &str,
+) -> Result<PathBuf, SqlError> {
+    preflight_guarded_offline_canonical_sqlite_family_with_probe(
+        sqlite_path,
+        context,
+        sqlite_file_is_healthy_without_family_cleanup,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn preflight_guarded_offline_canonical_sqlite_family_with_probe<F>(
+    sqlite_path: &Path,
+    context: &str,
+    mut exact_family_probe: F,
+) -> Result<PathBuf, SqlError>
+where
+    F: FnMut(&Path) -> Result<bool, SqlError>,
+{
+    validate_sqlite_target_path(sqlite_path, context)?;
+    let sqlite_path_str = sqlite_path_as_utf8(sqlite_path)?;
+    strict_offline_canonical_target_precheck(sqlite_path_str)?;
+    // Resolve once after the no-follow validation above, then inspect and open
+    // the same absolute spelling throughout the canonical/offline path. This
+    // keeps relative callers from classifying one sidecar family and opening a
+    // differently resolved main pathname.
+    let stable_path = std::fs::canonicalize(sqlite_path).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot resolve stable SQLite path {} after validating it: {error}",
+            sqlite_path.display()
+        ))
+    })?;
+    sqlite_path_as_utf8(&stable_path)?;
+
+    let nonclean_authority = match crate::recovery_breaker::load(sqlite_path) {
+        Ok(Some(state)) if state.tripped || state.consecutive_failures > 0 => {
+            let fingerprint = crate::recovery_breaker::fingerprint_db(sqlite_path);
+            (state.db_fingerprint == fingerprint).then(|| {
+                format!(
+                    "durable recovery-breaker state records {} failed attempt(s) for these exact primary bytes{}",
+                    state.consecutive_failures,
+                    if state.tripped { " and is tripped" } else { "" }
+                )
+            })
+        }
+        Ok(_) => None,
+        Err(error) => Some(format!(
+            "durable recovery-breaker authority could not be trusted: {error}"
+        )),
+    };
+    let wal = crate::wal_classify::classify_wal_sidecar(sqlite_path);
+    let sidecars = inspect_mailbox_sidecar_state(sqlite_path);
+    let invalid_sidecar = SQLITE_RECOVERY_SIDECAR_SUFFIXES.iter().find_map(|suffix| {
+        let sidecar_path = sqlite_sidecar_path(sqlite_path, suffix);
+        match std::fs::symlink_metadata(&sidecar_path) {
+            Ok(metadata) if metadata.file_type().is_file() => None,
+            Ok(_) => Some(format!(
+                "the {suffix} sidecar pathname {} is occupied by a non-regular object",
+                sidecar_path.display()
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(format!(
+                "the {suffix} sidecar pathname {} could not be inspected: {error}",
+                sidecar_path.display()
+            )),
+        }
+    });
+    // Canonical SQLite's WAL index lives in SHM. Unlike the bound Franken
+    // opener below, an offline canonical open has no namespace authority or
+    // engine-specific WAL certificate binding that can make a missing SHM
+    // unambiguous. Refuse before the exact-family probe can materialize a new
+    // SHM and accidentally turn a malformed source family into a green proof.
+    if sidecars.wal_exists && !sidecars.shm_exists {
+        return Err(SqlError::Custom(format!(
+            "{context}: refusing canonical read-only SQLite open for {} because a WAL sidecar exists without its required SHM companion",
+            sqlite_path.display()
+        )));
+    }
+    let suspicious_family = if let Some(reason) = invalid_sidecar {
+        Some(reason)
+    } else if wal.state.is_damaged() {
+        Some(format!(
+            "the source-neutral WAL classifier reported {:?}: {}",
+            wal.state, wal.detail
+        ))
+    } else if sidecars.wal_exists && sidecars.wal_bytes.is_none() {
+        Some("the WAL pathname is occupied by an unreadable or non-regular object".to_string())
+    } else if sidecars.shm_exists && sidecars.shm_bytes.is_none() {
+        Some("the SHM pathname is occupied by an unreadable or non-regular object".to_string())
+    } else if sidecars.shm_exists && !sidecars.wal_exists {
+        Some("an orphan SHM sidecar exists without a WAL".to_string())
+    // NOTE: a 0-byte SHM beside a WAL is NOT damage. A healthy, actively
+    // written FrankenSQLite database routinely carries an empty `-shm`
+    // (the sidecar is created before its first mapping grows it), so
+    // refusing on `shm_bytes == Some(0)` misclassified normal live state
+    // as wal_sidecar_corruption and failed conformance wholesale. Startup's
+    // `cleanup_empty_wal_sidecar` remains the place that reaps genuinely
+    // stale empty sidecars.
+    } else if sidecars.journal_exists {
+        Some("a rollback journal is attached to the live database family".to_string())
+    } else {
+        None
+    };
+
+    if let Some(reason) = nonclean_authority.or(suspicious_family) {
+        match exact_family_probe(sqlite_path) {
+            Ok(true) => {
+                tracing::warn!(
+                    operation = context,
+                    path = %sqlite_path.display(),
+                    %reason,
+                    "live read-only SQLite open is proceeding only after a source-neutral exact-family proof"
+                );
+            }
+            Ok(false) => {
+                return Err(SqlError::Custom(format!(
+                    "{context}: refusing live read-only SQLite engine open for {} because {reason}, and the exact family is not healthy without recovery cleanup",
+                    sqlite_path.display()
+                )));
+            }
+            Err(error) => {
+                return Err(SqlError::Custom(format!(
+                    "{context}: refusing live read-only SQLite engine open for {} because {reason}, and a source-neutral exact-family proof failed: {error}",
+                    sqlite_path.display()
+                )));
+            }
+        }
+    }
+
+    Ok(stable_path)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+fn map_read_only_namespace_admission_error(
+    error: fsqlite::FrankenError,
+    stable_path: &Path,
+    context: &str,
+) -> SqlError {
+    match &error {
+        fsqlite::FrankenError::Busy
+        | fsqlite::FrankenError::BusyRecovery
+        | fsqlite::FrankenError::BusySnapshot { .. }
+        | fsqlite::FrankenError::DatabaseLocked { .. }
+        | fsqlite::FrankenError::LockFailed { .. } => {
+            // The bounded retry loop classifies SqlError text. In particular,
+            // FrankenError::LockFailed renders as `file locking failed`, which
+            // is not itself one of that classifier's busy/locked phrases.
+            // Preserve the typed decision locally instead of teaching every
+            // unrelated LockFailed detail to retry globally.
+            SqlError::Custom(format!("database is busy: {error}"))
+        }
+        _ => SqlError::Custom(format!(
+            "{context}: refusing live read-only FrankenSQLite open for {} because its existing namespace authority is malformed or unsafe",
+            stable_path.display()
+        )),
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+#[allow(clippy::result_large_err)]
+/// Shape of the persistent FrankenSQLite namespace sidecar pair
+/// (`-fsqlite-ns-gate` / `-fsqlite-ns-use`) beside a main database file.
+///
+/// The pair is the durable evidence that a family is Franken-admitted. It
+/// decides which read-only engine may touch the family: a complete pair means
+/// the same-engine bound opener, no pair means canonical SQLite's true
+/// read-only flags, and a half pair is ambiguous authority nobody may open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamespaceSidecarShape {
+    /// Neither sidecar exists: the family carries no Franken namespace
+    /// authority (canonical-written, restored from a `.bak`, reconstructed
+    /// from the archive, or a neutralized salvage artifact).
+    Absent,
+    /// Exactly one sidecar exists: an interrupted admission or retirement.
+    Incomplete,
+    /// Both sidecars exist as regular files: a Franken-admitted family.
+    Complete,
+}
+
+/// Inspect the namespace sidecar pair beside `stable_path` without following
+/// symlinks. A non-regular occupant or an uninspectable pathname is refused
+/// outright: neither may reach an engine's fallback behaviour.
+#[allow(clippy::result_large_err)]
+fn inspect_namespace_sidecar_shape(
+    stable_path: &Path,
+    context: &str,
+) -> Result<NamespaceSidecarShape, SqlError> {
+    let mut namespace_sidecars_present = 0_u8;
+    for suffix in FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES {
+        let sidecar = sqlite_sidecar_path(stable_path, suffix);
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                namespace_sidecars_present = namespace_sidecars_present.saturating_add(1);
+            }
+            Ok(_) => {
+                return Err(SqlError::Custom(format!(
+                    "{context}: refusing live read-only FrankenSQLite open for {} because namespace sidecar {} is not a regular file",
+                    stable_path.display(),
+                    sidecar.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(SqlError::Custom(format!(
+                    "{context}: refusing live read-only FrankenSQLite open for {} because namespace sidecar {} cannot be inspected: {error}",
+                    stable_path.display(),
+                    sidecar.display()
+                )));
+            }
+        }
+    }
+    Ok(match namespace_sidecars_present {
+        0 => NamespaceSidecarShape::Absent,
+        2 => NamespaceSidecarShape::Complete,
+        _ => NamespaceSidecarShape::Incomplete,
+    })
+}
+
+fn acquire_guarded_read_only_namespace_binding(
+    stable_path: &Path,
+    context: &str,
+) -> Result<std::sync::Arc<fsqlite::fsqlite_vfs::namespace::DatabaseNamespaceBinding>, SqlError> {
+    use fsqlite::fsqlite_vfs::namespace::{NamespaceOpenIntent, PendingNamespaceOpen};
+
+    // ReadOnlyExisting intentionally treats a namespace with either sidecar
+    // absent as wholly unadmitted. Refuse an asymmetric pair here: silently
+    // ignoring an occupied peer is ambiguous authority, and a non-regular
+    // occupant must never reach the engine's Shared fallback.
+    if inspect_namespace_sidecar_shape(stable_path, context)? != NamespaceSidecarShape::Complete {
+        return Err(SqlError::Custom(format!(
+            "{context}: refusing live read-only FrankenSQLite open for {} because a complete pre-existing namespace sidecar pair is required",
+            stable_path.display()
+        )));
+    }
+
+    let pending = retry_sqlite_lock_impl(
+        sqlite_path_as_utf8(stable_path)?,
+        "strict read-only namespace admission",
+        || {
+            PendingNamespaceOpen::begin(stable_path, NamespaceOpenIntent::ReadOnlyExisting).map_err(
+                |error| map_read_only_namespace_admission_error(error, stable_path, context),
+            )
+        },
+        std::thread::sleep,
+    )?;
+
+    let expected_identity = pending.expected_identity().ok_or_else(|| {
+        SqlError::Custom(format!(
+            "{context}: refusing live read-only FrankenSQLite open for {} because its namespace authority disappeared during admission",
+            stable_path.display()
+        ))
+    })?;
+    // Consume the pending JoinShared lease into a durable binding. On Unix its
+    // path validation is metadata-only: opening and then closing an ad-hoc
+    // main-database fd would release every process-wide fcntl SQLite lock on
+    // that inode, including locks owned by unrelated live connections.
+    let binding = pending.bind(expected_identity).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: refusing live read-only FrankenSQLite open for {} because its namespace binding changed during admission: {error}",
+            stable_path.display()
+        ))
+    })?;
+    binding.validate_path_identity().map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: refusing live read-only FrankenSQLite open for {} because its namespace record names a different database generation: {error}",
+            stable_path.display()
+        ))
+    })?;
+
+    Ok(binding)
+}
+
+/// File-descriptor-neutral preflight for a live, Franken-admitted database.
+///
+/// Never open the main inode here. On Unix, closing any independently opened
+/// descriptor would release every classic process-wide SQLite `fcntl` lock on
+/// that inode, including locks owned by another live Franken connection. The
+/// retained namespace binding proves the generation identity; FrankenSQLite's
+/// engine-enforced read-only open validates the header and query path.
+#[allow(clippy::result_large_err)]
+fn preflight_bound_live_franken_family(stable_path: &Path, context: &str) -> Result<(), SqlError> {
+    let metadata = std::fs::symlink_metadata(stable_path).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot inspect admitted SQLite target {}: {error}",
+            stable_path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(SqlError::Custom(format!(
+            "{context}: refusing live read-only FrankenSQLite open for {} because the admitted target is not a regular file",
+            stable_path.display()
+        )));
+    }
+    if metadata.len() < u64::try_from(SQLITE_DATABASE_HEADER_BYTES).unwrap_or(u64::MAX) {
+        // Same wording as the canonical precheck so the corruption classifier
+        // treats both the same way: a main file shorter than the 100-byte
+        // header is not a salvageable image, and archive recovery may degrade
+        // to an archive-only rebuild instead of refusing.
+        return Err(SqlError::Custom(format!(
+            "{context}: refusing live read-only FrankenSQLite open for {} because the admitted target has a truncated SQLite database header ({} bytes)",
+            stable_path.display(),
+            metadata.len()
+        )));
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        return Err(SqlError::Custom(format!(
+            "{context}: refusing live read-only FrankenSQLite open for {} because its main inode has {} hard links and therefore cannot have one authoritative namespace pathname",
+            stable_path.display(),
+            metadata.nlink()
+        )));
+    }
+
+    match crate::recovery_breaker::load(stable_path) {
+        Ok(Some(state))
+            if (state.tripped || state.consecutive_failures > 0)
+                && RecoveryAdmissionDepthGuard::active_for(stable_path) =>
+        {
+            // This read-only open belongs to the very recovery attempt that
+            // armed (or is retrying past) the breaker. Refusing here made
+            // every archive-ahead reconcile self-refuse its own live-salvage
+            // read, record a real failure, and crash-loop readiness on a
+            // healthy database (br-plksu). The admission gate already
+            // consulted the breaker; the remaining family checks below still
+            // apply.
+            tracing::debug!(
+                operation = context,
+                path = %stable_path.display(),
+                consecutive_failures = state.consecutive_failures,
+                tripped = state.tripped,
+                "live read-only FrankenSQLite open proceeding inside its own admitted recovery attempt despite a nonclean breaker record"
+            );
+        }
+        Ok(Some(state)) if state.tripped || state.consecutive_failures > 0 => {
+            return Err(SqlError::Custom(format!(
+                "{context}: refusing live read-only FrankenSQLite open for {} because durable recovery authority is nonclean and cannot be fingerprinted without opening the live main inode",
+                stable_path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            return Err(SqlError::Custom(format!(
+                "{context}: refusing live read-only FrankenSQLite open for {} because durable recovery authority is malformed or unreadable: {error}",
+                stable_path.display()
+            )));
+        }
+    }
+
+    let invalid_sidecar = SQLITE_RECOVERY_SIDECAR_SUFFIXES.iter().find_map(|suffix| {
+        let sidecar_path = sqlite_sidecar_path(stable_path, suffix);
+        match std::fs::symlink_metadata(&sidecar_path) {
+            Ok(metadata) if metadata.file_type().is_file() => None,
+            Ok(_) => Some(format!(
+                "the {suffix} sidecar pathname {} is occupied by a non-regular object",
+                sidecar_path.display()
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(format!(
+                "the {suffix} sidecar pathname {} could not be inspected: {error}",
+                sidecar_path.display()
+            )),
+        }
+    });
+    let wal = crate::wal_classify::classify_wal_sidecar(stable_path);
+    let sidecars = inspect_mailbox_sidecar_state(stable_path);
+    let materialized_franken_wal_certificate =
+        std::fs::symlink_metadata(sqlite_sidecar_path(stable_path, "-wal-cert"))
+            .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.len() > 0);
+    let suspicious_family = if let Some(reason) = invalid_sidecar {
+        Some(reason)
+    } else if wal.state.is_damaged() {
+        Some(format!(
+            "the source-neutral WAL classifier reported {:?}: {}",
+            wal.state, wal.detail
+        ))
+    } else if sidecars.wal_exists && sidecars.wal_bytes.is_none() {
+        Some("the WAL pathname is occupied by an unreadable or non-regular object".to_string())
+    } else if sidecars.shm_exists && sidecars.shm_bytes.is_none() {
+        Some("the SHM pathname is occupied by an unreadable or non-regular object".to_string())
+    } else if sidecars.wal_exists
+        && sidecars.shm_bytes.unwrap_or(0) == 0
+        && !materialized_franken_wal_certificate
+    {
+        Some("a SHM-less Franken WAL lacks a non-empty WAL certificate".to_string())
+    } else if sidecars.shm_exists && !sidecars.wal_exists {
+        Some("an orphan SHM sidecar exists without a WAL".to_string())
+    // A zero-byte SHM is normal for a live FrankenSQLite WAL family, but only
+    // after the engine-specific WAL certificate above binds that SHM-less
+    // shape to an admitted Franken generation.
+    } else if sidecars.journal_exists {
+        Some("a rollback journal is attached to the live database family".to_string())
+    } else {
+        None
+    };
+    if let Some(reason) = suspicious_family {
+        return Err(SqlError::Custom(format!(
+            "{context}: refusing live read-only FrankenSQLite open for {} because {reason}",
+            stable_path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+/// Open an existing Franken-admitted database through the engine-enforced
+/// read-only mode after a file-descriptor-neutral live-family preflight.
+///
+/// A complete pre-existing namespace pair is required and held under
+/// `ReadOnlyExisting` across the engine open. Its recorded identity is checked
+/// before the engine can enter its writer-capable stale-record fallback.
+/// Sidecar-less databases cannot use this seam because FrankenSQLite cannot
+/// lock the absence of its namespace files. Live mailbox diagnostics use this
+/// same-engine opener; the canonical opener is reserved for engine-exclusive
+/// or offline databases without Franken namespace authority.
+#[allow(clippy::result_large_err)]
+pub fn open_guarded_read_only_franken_existing_file(
+    sqlite_path: &Path,
+    context: &str,
+) -> Result<DbConn, SqlError> {
+    validate_sqlite_target_path(sqlite_path, context)?;
+    let stable_path = std::fs::canonicalize(sqlite_path).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot resolve stable SQLite path {}: {error}",
+            sqlite_path.display()
+        ))
+    })?;
+    let sqlite_path_str = sqlite_path_as_utf8(&stable_path)?;
+    // When a namespace pair exists, hold its lease until the engine has
+    // installed its own read-only binding. A copied/stale recorded identity is
+    // refused above, before the engine can rewrite namespace bytes.
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    let _namespace_binding = acquire_guarded_read_only_namespace_binding(&stable_path, context)?;
+    preflight_bound_live_franken_family(&stable_path, context)?;
+    // The preflight makes retrying only lock/busy failures safe: every attempt
+    // uses the engine's read-only mode, and corruption/open failures are
+    // returned immediately rather than repeatedly touching the pathname.
+    let conn = open_sqlite_file_read_only_with_lock_retry(sqlite_path_str).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot open {} read-only: {error}",
+            stable_path.display()
+        ))
+    })?;
+    if let Err(error) = conn.execute_raw("PRAGMA query_only = ON;") {
+        return Err(SqlError::Custom(format!(
+            "{context}: cannot enforce query-only mode for {}: {error}",
+            stable_path.display()
+        )));
+    }
+    Ok(conn)
+}
+
+/// Open an engine-exclusive or offline database through canonical SQLite's
+/// true read-only flags after a source-neutral family preflight.
+#[allow(clippy::result_large_err)]
+pub fn open_guarded_read_only_canonical_sqlite_file(
+    sqlite_path: &Path,
+    context: &str,
+) -> Result<crate::CanonicalDbConn, SqlError> {
+    if FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES
+        .iter()
+        .any(|suffix| path_is_occupied(&sqlite_sidecar_path(sqlite_path, suffix)))
+    {
+        // Opening and later closing a second engine's fd for a Franken-admitted
+        // main inode can release this process's classic POSIX fcntl locks.
+        // Persistent namespace authority is therefore a fail-closed signal:
+        // live mailbox diagnostics must use the bound Franken opener above.
+        return Err(SqlError::Custom(format!(
+            "database is busy: {context} refuses a cross-engine canonical open for Franken-admitted SQLite path {}",
+            sqlite_path.display()
+        )));
+    }
+    let stable_path = preflight_guarded_offline_canonical_sqlite_family(sqlite_path, context)?;
+    let sqlite_path_str = sqlite_path_as_utf8(&stable_path)?;
+    let conn =
+        open_canonical_sqlite_file_read_only_with_lock_retry(sqlite_path_str).map_err(|error| {
+            SqlError::Custom(format!(
+                "{context}: cannot open {} with canonical SQLite read-only flags: {error}",
+                stable_path.display()
+            ))
+        })?;
+    conn.execute_raw("PRAGMA query_only = ON;")
+        .map_err(|error| {
+            SqlError::Custom(format!(
+                "{context}: cannot enforce canonical query-only mode for {}: {error}",
+                stable_path.display()
+            ))
+        })?;
+    Ok(conn)
+}
+
+/// Which engine served an [`open_guarded_read_only_sqlite_file`] open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardedReadOnlyEngine {
+    /// The family carried a complete FrankenSQLite namespace pair, so the
+    /// bound same-engine read-only opener served it.
+    Franken,
+    /// The family carried no namespace authority, so canonical SQLite's true
+    /// read-only flags served it.
+    Canonical,
+}
+
+impl GuardedReadOnlyEngine {
+    /// Stable lowercase label for diagnostics and JSON payloads.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Franken => "franken",
+            Self::Canonical => "canonical",
+        }
+    }
+}
+
+/// A read-only connection produced by [`open_guarded_read_only_sqlite_file`].
+///
+/// Read-only consumers (inventories, integrity diagnostics, archive
+/// verifiers) use the delegating query methods and never need to know which
+/// engine answered. Callers whose next step is engine-specific, such as a
+/// FrankenSQLite `VACUUM INTO` export of a live family, ask for the Franken
+/// connection explicitly through [`Self::as_franken`].
+pub enum GuardedReadOnlyConn {
+    /// Served by the bound FrankenSQLite read-only opener.
+    Franken(DbConn),
+    /// Served by canonical SQLite's true read-only flags.
+    Canonical(crate::CanonicalDbConn),
+}
+
+impl GuardedReadOnlyConn {
+    /// The engine that served this connection.
+    #[must_use]
+    pub const fn engine(&self) -> GuardedReadOnlyEngine {
+        match self {
+            Self::Franken(_) => GuardedReadOnlyEngine::Franken,
+            Self::Canonical(_) => GuardedReadOnlyEngine::Canonical,
+        }
+    }
+
+    /// The underlying FrankenSQLite connection, when the family was
+    /// Franken-admitted.
+    #[must_use]
+    pub const fn as_franken(&self) -> Option<&DbConn> {
+        match self {
+            Self::Franken(conn) => Some(conn),
+            Self::Canonical(_) => None,
+        }
+    }
+
+    /// Prepare and execute a query, returning every row.
+    #[allow(clippy::result_large_err)]
+    pub fn query_sync(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<sqlmodel_core::Row>, SqlError> {
+        match self {
+            Self::Franken(conn) => conn.query_sync(sql, params),
+            Self::Canonical(conn) => conn.query_sync(sql, params),
+        }
+    }
+
+    /// Execute SQL without parameter binding (PRAGMAs on a read-only handle).
+    #[allow(clippy::result_large_err)]
+    pub fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
+        match self {
+            Self::Franken(conn) => conn.execute_raw(sql),
+            Self::Canonical(conn) => conn.execute_raw(sql),
+        }
+    }
+}
+
+/// A connection that can run a synchronous query: the runtime FrankenSQLite
+/// connection, the canonical connection, or the engine-dispatched read-only
+/// connection.
+///
+/// Read-only diagnostics (readiness probes, archive-drift inventories,
+/// health counts) accept `&impl SyncQuery`, so one helper serves a pooled
+/// runtime connection and a dispatched read-only connection alike instead
+/// of being typed to one engine.
+pub trait SyncQuery {
+    /// Prepare and execute a query, returning every row.
+    #[allow(clippy::result_large_err)]
+    fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, SqlError>;
+}
+
+impl SyncQuery for DbConn {
+    fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, SqlError> {
+        Self::query_sync(self, sql, params)
+    }
+}
+
+impl SyncQuery for crate::CanonicalDbConn {
+    fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, SqlError> {
+        Self::query_sync(self, sql, params)
+    }
+}
+
+impl SyncQuery for GuardedReadOnlyConn {
+    fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, SqlError> {
+        Self::query_sync(self, sql, params)
+    }
+}
+
+/// Whether the family beside `sqlite_path` is Franken-admitted, judged by its
+/// persistent namespace pair.
+///
+/// `Ok(true)` for a complete pair, `Ok(false)` for none, and an error for a
+/// half pair or an uninspectable sidecar (ambiguous authority that neither
+/// engine may open).
+///
+/// Lets a caller that must choose a *source strategy* (for example, the
+/// doctor's choice between a live logical snapshot and a direct offline
+/// canonical open) make the same decision the dispatching opener makes.
+#[allow(clippy::result_large_err)]
+pub fn is_franken_admitted_family(sqlite_path: &Path, context: &str) -> Result<bool, SqlError> {
+    validate_sqlite_target_path(sqlite_path, context)?;
+    let stable_path = std::fs::canonicalize(sqlite_path).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot resolve stable SQLite path {}: {error}",
+            sqlite_path.display()
+        ))
+    })?;
+    match inspect_namespace_sidecar_shape(&stable_path, context)? {
+        NamespaceSidecarShape::Complete => Ok(true),
+        NamespaceSidecarShape::Absent => Ok(false),
+        NamespaceSidecarShape::Incomplete => Err(SqlError::Custom(format!(
+            "{context}: {} has an incomplete FrankenSQLite namespace sidecar pair (exactly one of -fsqlite-ns-gate / -fsqlite-ns-use exists); finish or retire the admission before reading",
+            stable_path.display()
+        ))),
+    }
+}
+
+/// Admit a process-private database into FrankenSQLite's namespace protocol
+/// by opening it once writer-capable and closing it cleanly.
+///
+/// A private snapshot produced by archive reconstruction or a canonical
+/// `VACUUM INTO` carries no namespace pair, so the strict query-only pool
+/// (which must use the bound Franken opener) refuses it. Admitting it first
+/// gives the private family the persistent records every guarded reader
+/// expects. Only for files this process owns exclusively: admitting a live
+/// or shared family is the runtime's job.
+#[allow(clippy::result_large_err)]
+pub fn admit_private_database_with_franken(path: &Path, context: &str) -> Result<(), SqlError> {
+    validate_sqlite_target_path(path, context)?;
+    let sqlite_path_str = sqlite_path_as_utf8(path)?;
+    let conn = DbConn::open_file(sqlite_path_str).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot admit private database {} through FrankenSQLite: {error}",
+            path.display()
+        ))
+    })?;
+    conn.query_sync("SELECT 1", &[]).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: private database {} is not readable through FrankenSQLite: {error}",
+            path.display()
+        ))
+    })?;
+    crate::close_db_conn(conn, "private database admission");
+    let stable_path = std::fs::canonicalize(path).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot resolve stable SQLite path {}: {error}",
+            path.display()
+        ))
+    })?;
+    if inspect_namespace_sidecar_shape(&stable_path, context)? != NamespaceSidecarShape::Complete {
+        return Err(SqlError::Custom(format!(
+            "{context}: FrankenSQLite did not leave a complete namespace pair beside private database {} after admission",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Open an existing database read-only through whichever engine holds
+/// authority over its family.
+///
+/// The persistent namespace sidecar pair decides the engine: a complete pair
+/// routes to [`open_guarded_read_only_franken_existing_file`], no pair routes
+/// to [`open_guarded_read_only_canonical_sqlite_file`], and a half pair is
+/// refused as ambiguous authority. Neither opener's own refusal paths are
+/// bypassed: the Franken opener still preflights the live family and the
+/// canonical opener still refuses a Franken-admitted inode it observes itself.
+///
+/// Before this seam every read-only consumer called the Franken opener
+/// directly, which made any family last written by canonical SQLite, restored
+/// from a `.bak`, or produced by archive reconstruction unreadable ("a
+/// complete pre-existing namespace sidecar pair is required") even though the
+/// canonical opener existed for exactly those files.
+///
+/// A family can change engines between the shape inspection and the engine
+/// admission (a writer admitting the namespace, a salvage retiring it). When
+/// the chosen opener fails, the shape is inspected once more; a changed shape
+/// gets exactly one attempt through the other opener, an unchanged shape keeps
+/// the original error.
+#[allow(clippy::result_large_err)]
+pub fn open_guarded_read_only_sqlite_file(
+    sqlite_path: &Path,
+    context: &str,
+) -> Result<GuardedReadOnlyConn, SqlError> {
+    validate_sqlite_target_path(sqlite_path, context)?;
+    let stable_path = std::fs::canonicalize(sqlite_path).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot resolve stable SQLite path {}: {error}",
+            sqlite_path.display()
+        ))
+    })?;
+    let first_shape = inspect_namespace_sidecar_shape(&stable_path, context)?;
+    match open_guarded_read_only_for_shape(sqlite_path, &stable_path, context, first_shape) {
+        Ok(conn) => Ok(conn),
+        Err(error) => {
+            let second_shape = inspect_namespace_sidecar_shape(&stable_path, context)?;
+            if second_shape == first_shape {
+                return Err(error);
+            }
+            tracing::debug!(
+                path = %stable_path.display(),
+                context,
+                ?first_shape,
+                ?second_shape,
+                error = %error,
+                "guarded read-only open: namespace shape changed during admission; re-dispatching once"
+            );
+            open_guarded_read_only_for_shape(sqlite_path, &stable_path, context, second_shape)
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn open_guarded_read_only_for_shape(
+    sqlite_path: &Path,
+    stable_path: &Path,
+    context: &str,
+    shape: NamespaceSidecarShape,
+) -> Result<GuardedReadOnlyConn, SqlError> {
+    match shape {
+        NamespaceSidecarShape::Complete => {
+            open_guarded_read_only_franken_existing_file(sqlite_path, context)
+                .map(GuardedReadOnlyConn::Franken)
+        }
+        NamespaceSidecarShape::Absent => {
+            open_guarded_read_only_canonical_sqlite_file(sqlite_path, context)
+                .map(GuardedReadOnlyConn::Canonical)
+        }
+        NamespaceSidecarShape::Incomplete => Err(SqlError::Custom(format!(
+            "{context}: refusing read-only open for {} because its FrankenSQLite namespace sidecar pair is incomplete (exactly one of -fsqlite-ns-gate / -fsqlite-ns-use exists); finish or retire the admission before reading",
+            stable_path.display()
+        ))),
+    }
+}
+
 fn recovery_required_free_bytes(expected_write_bytes: u64) -> u64 {
     RECOVERY_DISK_RESERVE_BYTES.saturating_add(expected_write_bytes)
+}
+
+const fn proactive_backup_expected_write_bytes(main_bytes: u64, wal_bytes: u64) -> u64 {
+    // The guarded export and the canonical standalone snapshot coexist until
+    // publication. Either can contain the main database plus committed WAL
+    // truth, so admission must reserve two complete logical generations.
+    main_bytes.saturating_add(wal_bytes).saturating_mul(2)
 }
 
 fn recovery_disk_headroom_is_sufficient(available: u64, expected_write_bytes: u64) -> bool {
@@ -8139,6 +11655,8 @@ fn sqlite_recovery_sidecar_label(suffix: &str) -> &'static str {
         "-shm" => "SHM",
         "-wal-cert" => "WAL-cert",
         "-wal-cert-head" => "WAL-cert-head",
+        "-fsqlite-ns-gate" => "namespace-gate",
+        "-fsqlite-ns-use" => "namespace-use",
         _ => "sqlite",
     }
 }
@@ -8190,28 +11708,194 @@ fn restore_candidate_path(primary_path: &Path, timestamp: &str) -> PathBuf {
     candidate
 }
 
-fn proactive_backup_stage_path(backup_path: &Path, timestamp: &str, suffix: u32) -> PathBuf {
-    let suffix_label = if suffix == 0 {
-        format!(".backup-stage-{timestamp}")
-    } else {
-        format!(".backup-stage-{timestamp}-{suffix:02}")
-    };
-    sqlite_path_with_file_name_suffix(
-        backup_path,
-        &suffix_label,
-        &format!("storage.sqlite3.bak{suffix_label}"),
-    )
+fn copy_file_without_overwrite(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let mut source_file = mcp_agent_mail_core::disk::open_regular_file_no_follow(source)?;
+    let mut destination_file =
+        mcp_agent_mail_core::disk::create_new_private_file_no_follow(destination)?;
+    // Normalize the empty destination before any mailbox bytes are copied.
+    // Source permissions are untrusted recovery input and must never make the
+    // promoted database world-readable or read-only.
+    mcp_agent_mail_core::disk::set_private_writable_file_permissions(&destination_file)?;
+    std::io::copy(&mut source_file, &mut destination_file)?;
+    destination_file.sync_all()
 }
 
-fn copy_file_without_overwrite(source: &Path, destination: &Path) -> std::io::Result<()> {
-    let mut source_file = std::fs::File::open(source)?;
-    let permissions = source_file.metadata()?.permissions();
-    let mut destination_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
-    std::io::copy(&mut source_file, &mut destination_file)?;
-    std::fs::set_permissions(destination, permissions)
+/// Atomically move one filesystem object without replacing an occupied target.
+///
+/// Linux and Apple targets use the kernel's no-replace rename primitive.
+/// Platforms without a safe atomic primitive fail closed: a
+/// hard-link-then-unlink fallback is not a move because an unlink failure can
+/// leave the source and destination aliasing one inode. In particular,
+/// `tempfile`'s Windows no-clobber path mutates source attributes before the
+/// move, so it is unsuitable for arbitrary recovery evidence.
+pub fn rename_noreplace_preserving_source(
+    source: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+        target_os = "redox",
+    ))]
+    {
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            source,
+            rustix::fs::CWD,
+            destination,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(std::io::Error::from)
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = (source, destination);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic no-replace recovery move is unavailable on Windows",
+        ))
+    }
+
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+        target_os = "redox",
+        windows,
+    )))]
+    {
+        let _ = (source, destination);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic no-replace rename is unavailable on this platform",
+        ))
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_recovery_candidate_has_materialized_header(path: &Path) -> Result<bool, SqlError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(SqlError::Custom(format!(
+                "failed to inspect recovery candidate {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    if metadata.len() < 16 {
+        return Ok(false);
+    }
+
+    let mut header = [0_u8; SQLITE_DATABASE_HEADER.len()];
+    let mut file =
+        mcp_agent_mail_core::disk::open_regular_file_no_follow(path).map_err(|error| {
+            SqlError::Custom(format!(
+                "failed to open recovery candidate {} for header validation: {error}",
+                path.display()
+            ))
+        })?;
+    std::io::Read::read_exact(&mut file, &mut header).map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to read recovery candidate header from {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(header == *SQLITE_DATABASE_HEADER)
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_recovery_candidate_has_mailbox_schema(
+    conn: &crate::CanonicalDbConn,
+) -> Result<bool, SqlError> {
+    const MAILBOX_SCHEMA_SIGNATURE: &[(&str, &[&str])] = &[
+        ("projects", &["id", "slug", "human_key"]),
+        ("agents", &["id", "project_id", "name"]),
+        (
+            "messages",
+            &["id", "project_id", "sender_id", "subject", "body_md"],
+        ),
+        ("message_recipients", &["message_id", "agent_id", "kind"]),
+    ];
+
+    for (table, required_columns) in MAILBOX_SCHEMA_SIGNATURE {
+        let table_exists = conn.query_sync(
+            &format!(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '{table}' LIMIT 1"
+            ),
+            &[],
+        )?;
+        if table_exists.is_empty() {
+            return Ok(false);
+        }
+
+        let present_columns = conn
+            .query_sync(&format!("PRAGMA table_info(\"{table}\")"), &[])?
+            .into_iter()
+            .filter_map(|row| row.get_named::<String>("name").ok())
+            .collect::<std::collections::BTreeSet<_>>();
+        if required_columns
+            .iter()
+            .any(|column| !present_columns.contains(*column))
+        {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+/// Open a standalone SQLite artifact without creating journal/WAL companions.
+///
+/// Recovery validators call this only after a raw-file header and companion
+/// precheck. SQLite's immutable URI mode is essential here: an ordinary
+/// read-only open of a checkpointed WAL-mode main file can create `-wal` and
+/// `-shm` files merely while inspecting it, making the validator contaminate
+/// the evidence it is deciding whether to trust.
+#[allow(clippy::result_large_err)]
+pub(crate) fn open_immutable_canonical_sqlite(
+    path: &Path,
+) -> Result<crate::CanonicalDbConn, SqlError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                SqlError::Custom(format!(
+                    "failed to resolve relative SQLite inspection path {}: {error}",
+                    path.display()
+                ))
+            })?
+            .join(path)
+    };
+    let mut uri = url::Url::from_file_path(&absolute).map_err(|()| {
+        SqlError::Custom(format!(
+            "SQLite inspection path {} cannot be represented as a file URI",
+            path.display()
+        ))
+    })?;
+    uri.query_pairs_mut()
+        .append_pair("mode", "ro")
+        .append_pair("immutable", "1");
+    let flags = sqlmodel_sqlite::OpenFlags {
+        read_only: true,
+        uri: true,
+        ..Default::default()
+    };
+    let config = sqlmodel_sqlite::SqliteConfig::file(uri.to_string()).flags(flags);
+    crate::CanonicalDbConn::open(&config)
 }
 
 /// Full `PRAGMA integrity_check` via canonical SQLite.
@@ -8224,41 +11908,109 @@ pub(crate) fn sqlite_file_passes_full_integrity_check(path: &Path) -> Result<boo
     if !is_real_file(path) {
         return Ok(false);
     }
-    sqlite_canonical_file_check_is_ok(path, integrity::CheckKind::Full)
+    // Engine-dispatching: a Franken-admitted salvage source (a quarantined
+    // generation, a Franken-written backup) is checked by FrankenSQLite
+    // itself instead of being refused as a cross-engine canonical open; a
+    // family without namespace authority keeps canonical SQLite's true
+    // read-only check. The acceptance rule is the same for both engines.
+    let conn = open_guarded_read_only_sqlite_file(path, "full integrity diagnostic")?;
+    let rows = sqlite_check_rows_with(|sql| conn.query_sync(sql, &[]), integrity::CheckKind::Full)?;
+    let details = integrity::extract_check_details(&rows, integrity::CheckKind::Full);
+    Ok(integrity::details_indicate_ok(&details)
+        || integrity::integrity_details_are_suspect(&details))
 }
 
-fn sqlite_file_is_backup_safe(path: &Path) -> Result<bool, SqlError> {
-    if !sqlite_file_is_healthy(path)? {
+/// Full `PRAGMA integrity_check` for a PRIVATE staged family copy, via a
+/// WRITABLE canonical open.
+///
+/// The guarded read-only diagnostic cannot classify every staged copy: a
+/// settled snapshot's WAL/SHM are deleted when the settle connection closes,
+/// but a damaged main-file header can still demand WAL recovery — a read-only
+/// open then fails every probe form with "unable to open database file", and
+/// promotion refuses a perfectly good archive candidate because the source
+/// could not be classified at all (observed live on a 2.7 GB cross-linked
+/// mailbox; the GH#283 outage family). A writable open lets canonical SQLite
+/// run recovery on the copy and produce a real verdict. Only ever call this
+/// on a throwaway staging copy: a writable open consumes journal/WAL
+/// sidecars, which is exactly what the authority path must never suffer.
+pub(crate) fn sqlite_private_copy_passes_full_integrity_check(
+    path: &Path,
+) -> Result<bool, SqlError> {
+    if !is_real_file(path) {
         return Ok(false);
     }
-    sqlite_canonical_file_check_is_ok(path, integrity::CheckKind::Full)
+    let conn =
+        crate::CanonicalDbConn::open_file(path.to_string_lossy().as_ref()).map_err(|error| {
+            SqlError::Custom(format!(
+                "private-copy canonical integrity open failed for {}: {error}",
+                path.display()
+            ))
+        })?;
+    sqlite_pragma_check_is_ok_canonical(&conn, integrity::CheckKind::Full)
 }
 
-fn sqlite_staged_backup_is_safe(path: &Path) -> Result<bool, SqlError> {
-    if !sqlite_recovery_candidate_is_healthy(path)? {
+/// Return whether a SQLite candidate is a self-contained main database file.
+///
+/// Recovery currently stages and promotes one main file. Any adjacent SQLite
+/// journal/WAL state or FrankenSQLite certification/namespace state means the
+/// candidate is a family, not a standalone artifact; selecting only its main
+/// file could silently discard committed frames or attach stale coordination
+/// state to a renamed generation.
+#[must_use]
+pub fn sqlite_recovery_candidate_is_standalone(path: &Path) -> bool {
+    !SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .iter()
+        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+        .any(|suffix| path_is_occupied(&sqlite_sidecar_path(path, suffix)))
+}
+
+/// Validate a materialized recovery database through the canonical
+/// quick/incremental probes and a full canonical `PRAGMA integrity_check`.
+///
+/// A zero-byte or schema-less file is valid to SQLite because opening it can
+/// create a new database. It is not, however, evidence of recoverable state.
+/// Require an existing SQLite header and the stable core mailbox table/column
+/// signature so recovery can never promote a newly initialized empty artifact
+/// or an unrelated, internally healthy SQLite database. The signature is
+/// intentionally limited to foundational columns present in legacy Agent Mail
+/// schemas; normal startup migration remains responsible for bringing a valid
+/// older mailbox up to the current schema. The candidate must remain a
+/// standalone main file before and after the single read-only authority probe.
+#[allow(clippy::result_large_err)]
+pub fn sqlite_recovery_candidate_passes_full_integrity_check(
+    path: &Path,
+) -> Result<bool, SqlError> {
+    if !sqlite_recovery_candidate_has_materialized_header(path)?
+        || !sqlite_recovery_candidate_is_standalone(path)
+    {
         return Ok(false);
     }
-    sqlite_canonical_file_check_is_ok(path, integrity::CheckKind::Full)
-}
 
-fn ensure_proactive_backup_source_is_safe(primary: &Path, backup_path: &Path) -> DbResult<()> {
-    match sqlite_file_is_backup_safe(primary) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(DbError::Sqlite(format!(
-            "proactive backup aborted: source database {} failed full health checks; preserving existing backup at {}",
-            primary.display(),
-            backup_path.display()
-        ))),
-        Err(error) => Err(DbError::Sqlite(format!(
-            "proactive backup aborted: source database {} health check failed: {error}; preserving existing backup at {}",
-            primary.display(),
-            backup_path.display()
-        ))),
-    }
+    let probe = (|| -> Result<bool, SqlError> {
+        let conn = open_immutable_canonical_sqlite(path)?;
+        if !sqlite_pragma_check_is_ok_canonical(&conn, integrity::CheckKind::Quick)?
+            || !sqlite_pragma_check_is_ok_canonical(&conn, integrity::CheckKind::Incremental)?
+            || !sqlite_pragma_check_is_strictly_ok_canonical(&conn, integrity::CheckKind::Full)?
+            || !sqlite_recovery_candidate_has_mailbox_schema(&conn)?
+        {
+            return Ok(false);
+        }
+        drop(conn);
+        Ok(sqlite_recovery_candidate_is_standalone(path))
+    })();
+    normalize_recovery_candidate_probe_result(probe)
 }
 
 fn validate_proactive_backup_stage(primary: &Path, staged_backup: &Path) -> DbResult<()> {
-    match sqlite_staged_backup_is_safe(staged_backup) {
+    if !sqlite_recovery_candidate_is_standalone(staged_backup) {
+        return Err(DbError::Sqlite(format!(
+            "proactive backup aborted: staged copy {} from {} has companion SQLite or FrankenSQLite state; staged family was preserved for inspection and existing backup is untouched",
+            staged_backup.display(),
+            primary.display()
+        )));
+    }
+
+    match sqlite_recovery_candidate_passes_full_integrity_check(staged_backup) {
         Ok(true) => {}
         Ok(false) => {
             return Err(DbError::Sqlite(format!(
@@ -8276,39 +12028,199 @@ fn validate_proactive_backup_stage(primary: &Path, staged_backup: &Path) -> DbRe
         }
     }
 
-    wal_checkpoint_truncate_path(staged_backup).map_err(|error| {
-        DbError::Sqlite(format!(
-            "proactive backup aborted: staged copy {} from {} failed checkpoint validation: {error}; existing backup is untouched",
-            staged_backup.display(),
-            primary.display()
-        ))
-    })?;
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
-        let _ = std::fs::remove_file(sqlite_sidecar_path(staged_backup, suffix));
-    }
     Ok(())
 }
 
-fn create_proactive_backup_stage(source: &Path, backup_path: &Path) -> DbResult<PathBuf> {
-    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let mut suffix = 0_u32;
-    loop {
-        let staged_backup = proactive_backup_stage_path(backup_path, &timestamp, suffix);
-        match copy_file_without_overwrite(source, &staged_backup) {
-            Ok(()) => return Ok(staged_backup),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                suffix = suffix.saturating_add(1);
+fn proactive_backup_rotation_path(backup_path: &Path, timestamp: &str, collision: u32) -> PathBuf {
+    let suffix = if collision == 0 {
+        format!(".{timestamp}")
+    } else {
+        format!(".{timestamp}-{collision:02}")
+    };
+    sqlite_path_with_file_name_suffix(
+        backup_path,
+        &suffix,
+        &format!("storage.sqlite3.bak{suffix}"),
+    )
+}
+
+#[derive(Debug)]
+enum ProactiveBackupRollbackOutcome {
+    NotNeeded,
+    RestoredDurably,
+    RestoreMoveFailed(String),
+    RestoredButParentSyncFailed(String),
+}
+
+fn rollback_rotated_proactive_backup_with<F>(
+    rotated_backup: Option<&Path>,
+    backup_path: &Path,
+    sync_parent: F,
+) -> ProactiveBackupRollbackOutcome
+where
+    F: FnOnce(&Path) -> Result<(), SqlError>,
+{
+    let Some(rotated) = rotated_backup else {
+        return ProactiveBackupRollbackOutcome::NotNeeded;
+    };
+    if let Err(error) = rename_noreplace_preserving_source(rotated, backup_path) {
+        return ProactiveBackupRollbackOutcome::RestoreMoveFailed(error.to_string());
+    }
+    match sync_parent(backup_path) {
+        Ok(()) => ProactiveBackupRollbackOutcome::RestoredDurably,
+        Err(error) => {
+            ProactiveBackupRollbackOutcome::RestoredButParentSyncFailed(error.to_string())
+        }
+    }
+}
+
+fn rotate_existing_proactive_backup(backup_path: &Path) -> DbResult<PathBuf> {
+    if !is_real_file(backup_path) || !sqlite_recovery_candidate_is_standalone(backup_path) {
+        return Err(DbError::Sqlite(format!(
+            "proactive backup destination {} is no longer a standalone regular file; refusing rotation",
+            backup_path.display()
+        )));
+    }
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    for collision in 0..=9_999 {
+        let rotated = proactive_backup_rotation_path(backup_path, &timestamp, collision);
+        if sqlite_candidate_artifact_conflicts(&rotated) {
+            continue;
+        }
+        match rename_noreplace_preserving_source(backup_path, &rotated) {
+            Ok(()) => {
+                sync_recovery_parent(&rotated).map_err(|error| {
+                    DbError::Sqlite(format!(
+                        "proactive backup preserved the previous generation at {} but could not durably sync the rotation before publishing a replacement: {error}",
+                        rotated.display()
+                    ))
+                })?;
+                return Ok(rotated);
             }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
-                cleanup_sqlite_candidate_artifact(&staged_backup);
                 return Err(DbError::Sqlite(format!(
-                    "proactive backup failed to stage {} at {}: {error}",
-                    source.display(),
-                    staged_backup.display()
+                    "proactive backup failed to preserve existing generation {} at {}: {error}",
+                    backup_path.display(),
+                    rotated.display()
                 )));
             }
         }
     }
+    Err(DbError::Sqlite(format!(
+        "proactive backup could not allocate a collision-free rotation path for {}",
+        backup_path.display()
+    )))
+}
+
+fn create_proactive_backup_stage(
+    source: &Path,
+    backup_path: &Path,
+) -> DbResult<(CanonicalSnapshotTempDir, PathBuf)> {
+    let stage_parent = backup_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staging_directory = CanonicalSnapshotTempDir::new_in(
+        ".mcp-agent-mail-proactive-backup-",
+        stage_parent,
+    )
+    .map_err(|error| {
+        DbError::Sqlite(format!(
+            "proactive backup failed to create a private staging directory beside {}: {error}",
+            backup_path.display()
+        ))
+    })?;
+    let live_export = staging_directory.path().join("live-export.sqlite3");
+    let live_export_str = sqlite_path_as_utf8(&live_export).map_err(|error| {
+        DbError::Sqlite(format!(
+            "proactive backup private export path is not usable by FrankenSQLite: {error}"
+        ))
+    })?;
+    // Engine-dispatching: a Franken-admitted source exports through the bound
+    // FrankenSQLite opener; a source without a namespace pair (restored,
+    // reconstructed, canonical-written) exports through canonical SQLite.
+    // Either way the source pager is engine-enforced read-only and the
+    // `VACUUM INTO` below writes only the private export.
+    let source_conn =
+        open_guarded_read_only_sqlite_file(source, "proactive backup live-source export")
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "proactive backup failed to open live source {} through guarded read-only authority: {error}",
+                    source.display()
+                ))
+            })?;
+    source_conn
+        .execute_raw("PRAGMA query_only = OFF;")
+        .map_err(|error| DbError::Sqlite(format!("proactive backup snapshot export: {error}")))?;
+    let live_export_literal = format!("'{}'", live_export_str.replace('\'', "''"));
+    source_conn
+        .execute_raw(&format!("VACUUM INTO {live_export_literal}"))
+        .map_err(|error| {
+            DbError::Sqlite(format!(
+                "proactive backup failed to materialize live source {} into private export {}: {error}",
+                source.display(),
+                live_export.display()
+            ))
+        })?;
+    drop(source_conn);
+
+    // FrankenSQLite may leave private namespace records beside VACUUM INTO
+    // output. Canonical SQLite therefore reads only this process-exclusive
+    // intermediate image and emits the standalone artifact that can be
+    // published as the `.bak` generation.
+    let private_source = crate::CanonicalDbConn::open_file(live_export_str).map_err(|error| {
+        DbError::Sqlite(format!(
+            "proactive backup failed to open private export {} with canonical SQLite: {error}",
+            live_export.display()
+        ))
+    })?;
+    let staged_backup = staging_directory.path().join("snapshot.sqlite3");
+    let staged_str = sqlite_path_as_utf8(&staged_backup).map_err(|error| {
+        DbError::Sqlite(format!(
+            "proactive backup stage path is not usable by canonical SQLite: {error}"
+        ))
+    })?;
+    private_source.backup_to_path(staged_str).map_err(|error| {
+        DbError::Sqlite(format!(
+            "proactive backup failed to materialize a standalone snapshot from private export of {} at {}: {error}",
+            source.display(),
+            staged_backup.display()
+        ))
+    })?;
+    drop(private_source);
+
+    let staged_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&staged_backup)
+        .map_err(|error| {
+            DbError::Sqlite(format!(
+                "proactive backup failed to open staged snapshot {} for durability: {error}",
+                staged_backup.display()
+            ))
+        })?;
+    mcp_agent_mail_core::disk::set_private_writable_file_permissions(&staged_file).map_err(
+        |error| {
+            DbError::Sqlite(format!(
+                "proactive backup failed to secure staged snapshot {}: {error}",
+                staged_backup.display()
+            ))
+        },
+    )?;
+    staged_file.sync_all().map_err(|error| {
+        DbError::Sqlite(format!(
+            "proactive backup failed to sync staged snapshot {}: {error}",
+            staged_backup.display()
+        ))
+    })?;
+    sync_recovery_parent(&staged_backup).map_err(|error| {
+        DbError::Sqlite(format!(
+            "proactive backup failed to sync private stage directory {}: {error}",
+            staging_directory.path().display()
+        ))
+    })?;
+    Ok((staging_directory, staged_backup))
 }
 
 fn stage_backup_restore_candidate(
@@ -8331,15 +12243,126 @@ fn stage_backup_restore_candidate(
 }
 
 #[allow(clippy::result_large_err)]
+fn validate_staged_backup_restore_candidate(
+    backup_path: &Path,
+    restore_candidate: &Path,
+) -> Result<(), SqlError> {
+    if !sqlite_recovery_candidate_is_standalone(restore_candidate) {
+        return Err(SqlError::Custom(format!(
+            "staged sqlite backup {} has companion SQLite or FrankenSQLite state; staged family was preserved for inspection and original database is untouched",
+            restore_candidate.display()
+        )));
+    }
+    if !sqlite_recovery_candidate_passes_full_integrity_check(restore_candidate)? {
+        return Err(SqlError::Custom(format!(
+            "sqlite backup {} did not pass full integrity checks after staging copy; original database is untouched",
+            backup_path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
 fn cleanup_sqlite_candidate_artifact(candidate: &Path) {
-    let _ = std::fs::remove_file(candidate);
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
-        let _ = std::fs::remove_file(sqlite_sidecar_path(candidate, suffix));
+    if !sqlite_recovery_candidate_is_standalone(candidate) {
+        tracing::warn!(
+            path = %candidate.display(),
+            "preserving staged SQLite family because companion state is present"
+        );
+        return;
+    }
+    if !path_is_occupied(candidate) {
+        return;
+    }
+    let nonce = format!(
+        "rejected-{}",
+        chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f")
+    );
+    let quarantine = sqlite_cleanup_quarantine_path(candidate, &nonce, 0);
+    match rename_noreplace_preserving_source(candidate, &quarantine) {
+        Ok(()) => tracing::warn!(
+            path = %candidate.display(),
+            quarantine = %quarantine.display(),
+            "preserved rejected standalone SQLite staging artifact under a quarantine name"
+        ),
+        Err(error) => tracing::warn!(
+            path = %candidate.display(),
+            quarantine = %quarantine.display(),
+            %error,
+            "failed to quarantine rejected standalone SQLite staging artifact; source remains in place"
+        ),
+    }
+}
+
+fn reconstruction_quarantine_path(
+    primary_path: &Path,
+    reason: &str,
+    timestamp: &str,
+    collision: u32,
+) -> PathBuf {
+    let suffix = if collision == 0 {
+        format!(".{reason}-{timestamp}")
+    } else {
+        format!(".{reason}-{timestamp}-{collision:02}")
+    };
+    sqlite_path_with_file_name_suffix(primary_path, &suffix, &format!("storage.sqlite3{suffix}"))
+}
+
+#[allow(clippy::result_large_err)]
+fn allocate_reconstruction_quarantine_path(
+    primary_path: &Path,
+    reason: &str,
+    timestamp: &str,
+) -> Result<PathBuf, SqlError> {
+    for collision in 0..=9_999 {
+        let candidate = reconstruction_quarantine_path(primary_path, reason, timestamp, collision);
+        if !sqlite_candidate_artifact_conflicts(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(SqlError::Custom(format!(
+        "failed to allocate a collision-free {reason} quarantine path for {}",
+        primary_path.display()
+    )))
+}
+
+#[allow(clippy::result_large_err)]
+fn rollback_quarantined_candidate_moves(moved: &[(PathBuf, PathBuf)]) -> Result<(), SqlError> {
+    let mut rollback_errors = Vec::new();
+    let mut restored_any = false;
+    for (source, target) in moved.iter().rev() {
+        match rename_noreplace_preserving_source(target, source) {
+            Ok(()) => restored_any = true,
+            Err(error) => {
+                rollback_errors.push(format!(
+                    "{} -> {}: {error}",
+                    target.display(),
+                    source.display()
+                ));
+            }
+        }
+    }
+    if restored_any
+        && let Some((source, _)) = moved.first()
+        && let Err(error) = sync_recovery_parent(source)
+    {
+        rollback_errors.push(format!(
+            "failed to durably sync restored SQLite family beside {}: {error}",
+            source.display()
+        ));
+    }
+    if rollback_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(SqlError::Custom(format!(
+            "failed to roll back partially quarantined SQLite family: {}",
+            rollback_errors.join("; ")
+        )))
     }
 }
 
 #[allow(clippy::result_large_err)]
-fn quarantine_reconstruction_candidate_path(
+pub(crate) fn quarantine_reconstruction_candidate_path(
     candidate_path: &Path,
     primary_path: &Path,
     reason: &str,
@@ -8349,36 +12372,71 @@ fn quarantine_reconstruction_candidate_path(
         return Ok(None);
     }
 
-    let quarantined = sqlite_path_with_file_name_suffix(
-        primary_path,
-        &format!(".{reason}-{timestamp}"),
-        &format!("storage.sqlite3.{reason}-{timestamp}"),
-    );
-    std::fs::rename(candidate_path, &quarantined).map_err(|e| {
-        SqlError::Custom(format!(
-            "failed to quarantine reconstructed sqlite candidate {}: {e}",
+    if FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES
+        .iter()
+        .any(|suffix| path_is_occupied(&sqlite_sidecar_path(candidate_path, suffix)))
+    {
+        return Err(SqlError::Custom(format!(
+            "refusing to quarantine reconstructed SQLite candidate {} because FrankenSQLite namespace records are present; the complete generation remains in place for inspection",
             candidate_path.display()
-        ))
-    })?;
-
-    for suffix in ["-journal", "-wal", "-shm"] {
-        let mut source_os = candidate_path.as_os_str().to_os_string();
-        source_os.push(suffix);
-        let source = PathBuf::from(source_os);
-        if !path_is_occupied(&source) {
-            continue;
-        }
-        let mut target_os = quarantined.as_os_str().to_os_string();
-        target_os.push(suffix);
-        let target = PathBuf::from(target_os);
-        std::fs::rename(&source, &target).map_err(|e| {
-            SqlError::Custom(format!(
-                "failed to quarantine reconstructed sqlite sidecar {}: {e}",
-                source.display()
-            ))
-        })?;
+        )));
     }
 
+    let quarantined = allocate_reconstruction_quarantine_path(primary_path, reason, timestamp)?;
+    let mut planned_moves = vec![(candidate_path.to_path_buf(), quarantined.clone())];
+    planned_moves.extend(
+        SQLITE_RECOVERY_SIDECAR_SUFFIXES
+            .iter()
+            .filter_map(|suffix| {
+                let source = sqlite_sidecar_path(candidate_path, suffix);
+                path_is_occupied(&source)
+                    .then(|| (source, sqlite_sidecar_path(&quarantined, suffix)))
+            }),
+    );
+
+    let mut completed_moves = Vec::with_capacity(planned_moves.len());
+    for (source, target) in planned_moves {
+        if let Err(error) = rename_noreplace_preserving_source(&source, &target) {
+            let rollback = rollback_quarantined_candidate_moves(&completed_moves);
+            return Err(SqlError::Custom(match rollback {
+                Ok(()) => format!(
+                    "failed to quarantine reconstructed SQLite artifact {} as {} without replacement: {error}; earlier family moves were rolled back",
+                    source.display(),
+                    target.display()
+                ),
+                Err(rollback_error) => format!(
+                    "failed to quarantine reconstructed SQLite artifact {} as {} without replacement: {error}; {rollback_error}",
+                    source.display(),
+                    target.display()
+                ),
+            }));
+        }
+        completed_moves.push((source, target));
+    }
+
+    let source_gained_companion = SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .iter()
+        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+        .any(|suffix| path_is_occupied(&sqlite_sidecar_path(candidate_path, suffix)));
+    if source_gained_companion {
+        let rollback = rollback_quarantined_candidate_moves(&completed_moves);
+        return Err(SqlError::Custom(match rollback {
+            Ok(()) => format!(
+                "reconstructed SQLite candidate {} gained companion state during quarantine; moved artifacts were restored",
+                candidate_path.display()
+            ),
+            Err(rollback_error) => format!(
+                "reconstructed SQLite candidate {} gained companion state during quarantine; {rollback_error}",
+                candidate_path.display()
+            ),
+        }));
+    }
+    sync_recovery_parent(&quarantined).map_err(|error| {
+        SqlError::Custom(format!(
+            "quarantined reconstructed SQLite family at {} but could not sync its parent directory: {error}",
+            quarantined.display()
+        ))
+    })?;
     Ok(Some(quarantined))
 }
 
@@ -8395,7 +12453,7 @@ fn activate_reconstruction_candidate(
         )));
     }
 
-    std::fs::rename(candidate_path, primary_path).map_err(|e| {
+    rename_noreplace_preserving_source(candidate_path, primary_path).map_err(|e| {
         SqlError::Custom(format!(
             "failed to activate reconstructed sqlite candidate {} into {}: {e}",
             candidate_path.display(),
@@ -8462,22 +12520,35 @@ fn unique_recovery_quarantine_path(primary_path: &Path, timestamp: &str) -> Path
 }
 
 fn sync_recovery_parent(path: &Path) -> Result<(), SqlError> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let directory = std::fs::File::open(parent).map_err(|error| {
-        SqlError::Custom(format!(
-            "failed to open recovery parent directory {} for durability sync: {error}",
-            parent.display()
-        ))
-    })?;
-    directory.sync_all().map_err(|error| {
-        SqlError::Custom(format!(
-            "failed to sync recovery parent directory {}: {error}",
-            parent.display()
-        ))
-    })
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let directory = std::fs::File::open(parent).map_err(|error| {
+            SqlError::Custom(format!(
+                "failed to open recovery parent directory {} for durability sync: {error}",
+                parent.display()
+            ))
+        })?;
+        directory.sync_all().map_err(|error| {
+            SqlError::Custom(format!(
+                "failed to sync recovery parent directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    // Rust's portable `File::open` cannot open Windows directories, while
+    // every caller has already synced the materialized file itself. Match the
+    // metadata/snapshot publishers in this crate by making directory fsync an
+    // additional Unix durability barrier rather than a cross-platform source
+    // of false recovery failure.
+    #[cfg(not(unix))]
+    let _ = path;
+
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]
@@ -8493,7 +12564,7 @@ fn rollback_recovery_candidate_promotion(
         // branch below — so restoring the old generation cannot clobber it and
         // the caller can still quarantine it for forensics (br-uflow).
         if path_is_occupied(primary_path) && !path_is_occupied(candidate_path) {
-            std::fs::rename(primary_path, candidate_path).map_err(|error| {
+            rename_noreplace_preserving_source(primary_path, candidate_path).map_err(|error| {
                 SqlError::Custom(format!(
                     "failed to return promoted candidate {} to staging path {}: {error}",
                     primary_path.display(),
@@ -8512,7 +12583,7 @@ fn rollback_recovery_candidate_promotion(
                 candidate_path.display()
             )));
         }
-        std::fs::rename(primary_path, candidate_path).map_err(|error| {
+        rename_noreplace_preserving_source(primary_path, candidate_path).map_err(|error| {
             SqlError::Custom(format!(
                 "failed to return promoted candidate {} to staging path {}: {error}",
                 primary_path.display(),
@@ -8571,6 +12642,27 @@ fn rollback_and_abort_recovery_promotion(
     }
 }
 
+#[allow(clippy::result_large_err)]
+fn acquire_recovery_promotion_barrier(
+    primary_path: &Path,
+    operation: &str,
+    timeout: std::time::Duration,
+) -> Result<crate::write_barrier::PromotionBarrierGuard, SqlError> {
+    let (guard, outcome) = crate::write_barrier::acquire_promotion_barrier_draining(timeout);
+    match outcome {
+        crate::write_barrier::DrainOutcome::Idle
+        | crate::write_barrier::DrainOutcome::Drained { .. } => Ok(guard),
+        crate::write_barrier::DrainOutcome::TimedOut { remaining_writers } => {
+            drop(guard);
+            Err(SqlError::Custom(format!(
+                "{operation} deferred for {}: {remaining_writers} in-process writer(s) did not drain within {} ms; no database generation was renamed",
+                primary_path.display(),
+                timeout.as_millis()
+            )))
+        }
+    }
+}
+
 /// Atomically replace a live mailbox SQLite generation with a fully built,
 /// healthy candidate.
 ///
@@ -8581,6 +12673,24 @@ fn rollback_and_abort_recovery_promotion(
 /// never replace a live path directly.
 #[allow(clippy::result_large_err)]
 pub fn promote_recovery_candidate(
+    primary_path: &Path,
+    candidate_path: &Path,
+    storage_root: &Path,
+) -> Result<(), SqlError> {
+    let primary_identity = normalize_sqlite_identity_path_buf(primary_path);
+    let candidate_identity = normalize_sqlite_identity_path_buf(candidate_path);
+    let storage_root_identity = normalize_sqlite_identity_path_buf(storage_root);
+    with_recovery_admission(&primary_identity, "recovery candidate promotion", || {
+        promote_recovery_candidate_admitted(
+            &primary_identity,
+            &candidate_identity,
+            &storage_root_identity,
+        )
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn promote_recovery_candidate_admitted(
     primary_path: &Path,
     candidate_path: &Path,
     storage_root: &Path,
@@ -8619,21 +12729,40 @@ where
         &crate::forensics::PreparedRecoveryReceipt,
     ) -> Result<(), crate::forensics::RecoveryReceiptFinalizeError>,
 {
+    promote_recovery_candidate_with_finalizer_and_timeout(
+        primary_path,
+        candidate_path,
+        storage_root,
+        timestamp,
+        crate::write_barrier::writer_drain_timeout(),
+        finalize_receipt,
+    )
+}
+
+#[allow(clippy::result_large_err, clippy::too_many_lines)]
+fn promote_recovery_candidate_with_finalizer_and_timeout<F>(
+    primary_path: &Path,
+    candidate_path: &Path,
+    storage_root: &Path,
+    timestamp: &str,
+    drain_timeout: std::time::Duration,
+    finalize_receipt: F,
+) -> Result<(), ReconstructionCandidateFailure>
+where
+    F: Fn(
+        &crate::forensics::PreparedRecoveryReceipt,
+    ) -> Result<(), crate::forensics::RecoveryReceiptFinalizeError>,
+{
     // #219: the promotion boundary itself must never rename the live file
     // out from under an in-process write. Reconstruction paths already hold
     // the barrier (this acquisition passes through); backup/snapshot restore
     // callers get their own bounded drain here.
-    let (_promotion_barrier, drain_outcome) =
-        crate::write_barrier::acquire_promotion_barrier_draining(
-            crate::write_barrier::writer_drain_timeout(),
-        );
-    if let crate::write_barrier::DrainOutcome::TimedOut { remaining_writers } = drain_outcome {
-        tracing::warn!(
-            primary = %primary_path.display(),
-            remaining_writers,
-            "promoting recovery candidate despite undrained in-process writers"
-        );
-    }
+    let _promotion_barrier = acquire_recovery_promotion_barrier(
+        primary_path,
+        "recovery candidate promotion",
+        drain_timeout,
+    )
+    .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
     crate::forensics::verify_recovery_receipt_state_for_promotion(storage_root, primary_path)
         .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
     validate_sqlite_target_path(primary_path, "recovery promotion destination")
@@ -8656,6 +12785,28 @@ where
             )),
         ));
     }
+    if FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES
+        .iter()
+        .any(|suffix| path_is_occupied(&sqlite_sidecar_path(candidate_path, suffix)))
+    {
+        return Err(ReconstructionCandidateFailure::before_receipt_commit(
+            SqlError::Custom(format!(
+                "recovery candidate {} has FrankenSQLite namespace records; refusing to rename a generation that was opened through the live-runtime engine",
+                candidate_path.display()
+            )),
+        ));
+    }
+    if SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .iter()
+        .any(|suffix| path_is_occupied(&sqlite_sidecar_path(candidate_path, suffix)))
+    {
+        return Err(ReconstructionCandidateFailure::before_receipt_commit(
+            SqlError::Custom(format!(
+                "recovery candidate {} has an occupied SQLite companion artifact; single-file promotion would discard generation state",
+                candidate_path.display()
+            )),
+        ));
+    }
     if path_is_occupied(primary_path) && !is_real_file(primary_path) {
         return Err(ReconstructionCandidateFailure::before_receipt_commit(
             SqlError::Custom(format!(
@@ -8664,16 +12815,102 @@ where
             )),
         ));
     }
-    if !sqlite_recovery_candidate_is_healthy(candidate_path)
+    let source_existed = is_real_file(primary_path);
+    if !sqlite_recovery_candidate_passes_full_integrity_check(candidate_path)
         .map_err(ReconstructionCandidateFailure::before_receipt_commit)?
     {
         return Err(ReconstructionCandidateFailure::before_receipt_commit(
             SqlError::Custom(format!(
-                "recovery candidate {} failed the pre-promotion health check",
+                "recovery candidate {} failed the pre-promotion full integrity check",
                 candidate_path.display()
             )),
         ));
     }
+    let candidate_file =
+        mcp_agent_mail_core::disk::open_regular_file_for_permission_change_no_follow(
+            candidate_path,
+        )
+        .map_err(|error| {
+            ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+                "failed to open recovery candidate {} for secure permission normalization: {error}",
+                candidate_path.display()
+            )))
+        })?;
+    if source_existed {
+        let primary_file = mcp_agent_mail_core::disk::open_regular_file_no_follow(primary_path)
+            .map_err(|error| {
+                ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+                    "failed to open live database {} for recovery identity verification: {error}",
+                    primary_path.display()
+                )))
+            })?;
+        let primary_identity = same_file::Handle::from_file(primary_file).map_err(|error| {
+            ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+                "failed to inspect open live database identity for {}: {error}",
+                primary_path.display()
+            )))
+        })?;
+        let candidate_identity =
+            same_file::Handle::from_file(candidate_file.try_clone().map_err(|error| {
+                ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+                    "failed to clone recovery candidate handle for identity verification: {error}"
+                )))
+            })?)
+            .map_err(|error| {
+                ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+                    "failed to inspect open recovery candidate identity for {}: {error}",
+                    candidate_path.display()
+                )))
+            })?;
+        if primary_identity == candidate_identity {
+            return Err(ReconstructionCandidateFailure::before_receipt_commit(
+                SqlError::Custom(format!(
+                    "recovery candidate {} aliases the live database {}; promotion requires a distinct file generation",
+                    candidate_path.display(),
+                    primary_path.display()
+                )),
+            ));
+        }
+    }
+    let candidate_link_count = recovery_file_link_count(&candidate_file).map_err(|error| {
+        ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+            "failed to prove exclusive filesystem ownership of recovery candidate {}: {error}",
+            candidate_path.display()
+        )))
+    })?;
+    if candidate_link_count != 1 {
+        return Err(ReconstructionCandidateFailure::before_receipt_commit(
+            SqlError::Custom(format!(
+                "recovery candidate {} has {candidate_link_count} hard links; promotion requires an exclusively owned file generation",
+                candidate_path.display()
+            )),
+        ));
+    }
+    mcp_agent_mail_core::disk::set_private_writable_file_permissions(&candidate_file).map_err(
+        |error| {
+            ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+                "failed to secure recovery candidate {} before promotion: {error}",
+                candidate_path.display()
+            )))
+        },
+    )?;
+    drop(candidate_file);
+    let candidate_sync = mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(
+        candidate_path,
+    )
+    .map_err(|error| {
+        ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+            "failed to reopen secured recovery candidate {} for durability sync: {error}",
+            candidate_path.display()
+        )))
+    })?;
+    candidate_sync.sync_all().map_err(|error| {
+        ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+            "failed to sync secured recovery candidate {} before promotion: {error}",
+            candidate_path.display()
+        )))
+    })?;
+    drop(candidate_sync);
     let candidate_bytes = std::fs::metadata(candidate_path)
         .map_err(|error| {
             ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
@@ -8689,7 +12926,6 @@ where
     )
     .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
 
-    let source_existed = is_real_file(primary_path);
     if source_existed
         && recovery_files_share_identity(primary_path, candidate_path)
             .map_err(ReconstructionCandidateFailure::before_receipt_commit)?
@@ -8722,13 +12958,13 @@ where
         candidate_path,
     )
     .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
-    if !sqlite_recovery_candidate_is_healthy(candidate_path)
+    if !sqlite_recovery_candidate_passes_full_integrity_check(candidate_path)
         .map_err(|error| abort_prepared_recovery_after_safe_rollback(&prepared, error))?
     {
         return Err(abort_prepared_recovery_after_safe_rollback(
             &prepared,
             SqlError::Custom(format!(
-                "recovery candidate {} became unhealthy after its durable intent was prepared",
+                "recovery candidate {} failed full integrity after its durable intent was prepared",
                 candidate_path.display()
             )),
         ));
@@ -8737,7 +12973,7 @@ where
     let quarantined_source =
         source_existed.then(|| unique_recovery_quarantine_path(primary_path, timestamp));
     if let Some(quarantined_source) = quarantined_source.as_ref()
-        && let Err(error) = std::fs::rename(primary_path, quarantined_source)
+        && let Err(error) = rename_noreplace_preserving_source(primary_path, quarantined_source)
     {
         return Err(abort_prepared_recovery_after_safe_rollback(
             &prepared,
@@ -8821,23 +13057,49 @@ where
 fn reconstruct_archive_into_candidate(
     primary_path: &Path,
     storage_root: &Path,
-    salvage_db_path: Option<&Path>,
+    live_salvage_db_path: Option<&Path>,
     timestamp: &str,
 ) -> Result<crate::reconstruct::ReconstructStats, ReconstructionCandidateFailure> {
     reconstruct_archive_into_candidate_with_finalizer(
         primary_path,
         storage_root,
-        salvage_db_path,
+        live_salvage_db_path,
         timestamp,
         crate::forensics::finalize_recovery_receipt,
     )
 }
 
 #[allow(clippy::result_large_err)]
+fn preserve_failed_reconstruction_candidate(
+    candidate_path: &Path,
+    primary_path: &Path,
+    timestamp: &str,
+    failure: ReconstructionCandidateFailure,
+) -> ReconstructionCandidateFailure {
+    if failure.finalized_receipt_committed {
+        return failure;
+    }
+    match quarantine_reconstruction_candidate_path(
+        candidate_path,
+        primary_path,
+        "reconstruct-failed",
+        timestamp,
+    ) {
+        Ok(_) => failure,
+        Err(quarantine_error) => {
+            ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+                "{}; failed to preserve the reconstruction candidate under a quarantine name: {quarantine_error}",
+                failure.error
+            )))
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
 fn reconstruct_archive_into_candidate_with_finalizer<F>(
     primary_path: &Path,
     storage_root: &Path,
-    salvage_db_path: Option<&Path>,
+    live_salvage_db_path: Option<&Path>,
     timestamp: &str,
     finalize_receipt: F,
 ) -> Result<crate::reconstruct::ReconstructStats, ReconstructionCandidateFailure>
@@ -8847,17 +13109,19 @@ where
     ) -> Result<(), crate::forensics::RecoveryReceiptFinalizeError>,
 {
     let candidate_path = reconstruction_candidate_path(primary_path, timestamp);
-    let reconstruct_result = match salvage_db_path {
-        Some(salvage_db_path) => crate::reconstruct::reconstruct_from_archive_with_salvage(
-            &candidate_path,
-            storage_root,
-            Some(salvage_db_path),
-        ),
+    let reconstruct_result = match live_salvage_db_path {
+        Some(live_salvage_db_path) => {
+            crate::reconstruct::reconstruct_from_archive_with_live_salvage(
+                &candidate_path,
+                storage_root,
+                live_salvage_db_path,
+            )
+        }
         None => crate::reconstruct::reconstruct_from_archive(&candidate_path, storage_root),
     };
 
     match reconstruct_result {
-        Ok(stats) => match sqlite_recovery_candidate_is_healthy(&candidate_path) {
+        Ok(stats) => match sqlite_recovery_candidate_passes_full_integrity_check(&candidate_path) {
             Ok(true) => match promote_recovery_candidate_with_finalizer(
                 primary_path,
                 &candidate_path,
@@ -8870,60 +13134,54 @@ where
                     // Failed candidates are preserved under an explicit
                     // quarantine name. A committed `.json` receipt is the point
                     // of no return, so that live generation must remain.
-                    if !failure.finalized_receipt_committed {
-                        let _ = quarantine_reconstruction_candidate_path(
-                            &candidate_path,
-                            primary_path,
-                            "reconstruct-failed",
-                            timestamp,
-                        );
-                    }
-                    Err(ReconstructionCandidateFailure {
+                    let failure = ReconstructionCandidateFailure {
                         error: SqlError::Custom(format!(
                             "archive reconstruction failed for {}: candidate promotion failed: {}",
                             primary_path.display(),
                             failure.error
                         )),
                         finalized_receipt_committed: failure.finalized_receipt_committed,
-                    })
+                    };
+                    Err(preserve_failed_reconstruction_candidate(
+                        &candidate_path,
+                        primary_path,
+                        timestamp,
+                        failure,
+                    ))
                 }
             },
             Ok(false) => {
-                let _ = quarantine_reconstruction_candidate_path(
-                    &candidate_path,
-                    primary_path,
-                    "reconstruct-failed",
-                    timestamp,
-                );
-                Err(ReconstructionCandidateFailure::before_receipt_commit(
+                let failure = ReconstructionCandidateFailure::before_receipt_commit(
                     SqlError::Custom(format!(
-                        "archive reconstruction produced an unhealthy sqlite candidate for {}",
+                        "archive reconstruction produced a sqlite candidate that failed full integrity checks for {}",
                         primary_path.display()
                     )),
-                ))
-            }
-            Err(e) => {
-                let _ = quarantine_reconstruction_candidate_path(
+                );
+                Err(preserve_failed_reconstruction_candidate(
                     &candidate_path,
                     primary_path,
-                    "reconstruct-failed",
                     timestamp,
-                );
-                Err(ReconstructionCandidateFailure::before_receipt_commit(e))
+                    failure,
+                ))
             }
-        },
-        Err(e) => {
-            let _ = quarantine_reconstruction_candidate_path(
+            Err(e) => Err(preserve_failed_reconstruction_candidate(
                 &candidate_path,
                 primary_path,
-                "reconstruct-failed",
                 timestamp,
-            );
-            Err(ReconstructionCandidateFailure::before_receipt_commit(
-                SqlError::Custom(format!(
+                ReconstructionCandidateFailure::before_receipt_commit(e),
+            )),
+        },
+        Err(e) => {
+            let failure =
+                ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
                     "archive reconstruction failed for {}: {e}",
                     primary_path.display()
-                )),
+                )));
+            Err(preserve_failed_reconstruction_candidate(
+                &candidate_path,
+                primary_path,
+                timestamp,
+                failure,
             ))
         }
     }
@@ -8943,7 +13201,7 @@ fn quarantine_sidecar_with_label(
         return Ok(());
     }
     let target = quarantined_sidecar_path(primary_path, suffix, label, timestamp);
-    std::fs::rename(&source, &target).map_err(|e| {
+    rename_noreplace_preserving_source(&source, &target).map_err(|e| {
         SqlError::Custom(format!(
             "failed to quarantine sidecar {}: {e}",
             source.display()
@@ -8996,7 +13254,7 @@ fn restore_quarantined_primary_with_sidecar_label_at(
     }
 
     if path_is_occupied(quarantined_path) {
-        std::fs::rename(quarantined_path, primary_path).map_err(|e| {
+        rename_noreplace_preserving_source(quarantined_path, primary_path).map_err(|e| {
             SqlError::Custom(format!(
                 "failed to restore original database {} from {}: {e}",
                 primary_path.display(),
@@ -9036,7 +13294,18 @@ fn quarantine_corrupt_sidecars_or_restore_primary(
     timestamp: &str,
     context: &str,
 ) -> Result<(), SqlError> {
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+    // The FrankenSQLite namespace records describe the generation that was
+    // just quarantined: they bind its file identity, and the engine's strict
+    // read-only admission refuses a promoted generation whose records "name a
+    // different database generation". They are retired by rename alongside
+    // the journal/WAL/SHM companions (never unlinked), so the promoted family
+    // is sidecar-less until the runtime's next writer-capable open re-admits
+    // it, and every guarded read-only diagnostic reads it through canonical
+    // SQLite in the meantime instead of failing on the stale record.
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .iter()
+        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+    {
         if let Err(e) = quarantine_sidecar(primary_path, suffix, timestamp) {
             let sidecar_label = sqlite_recovery_sidecar_label(suffix);
             if let Err(restore_err) =
@@ -9072,7 +13341,7 @@ fn quarantine_reconstructed_candidate(
         &format!(".{reason}-{timestamp}"),
         &format!("storage.sqlite3.{reason}-{timestamp}"),
     );
-    std::fs::rename(primary_path, &quarantined).map_err(|e| {
+    rename_noreplace_preserving_source(primary_path, &quarantined).map_err(|e| {
         SqlError::Custom(format!(
             "failed to quarantine reconstructed database candidate {}: {e}",
             primary_path.display()
@@ -9134,15 +13403,40 @@ fn restore_quarantined_sidecar(
     live_os.push(suffix);
     let live_path = PathBuf::from(live_os);
     if path_is_occupied(&live_path) {
-        std::fs::remove_file(&live_path).map_err(|e| {
+        let live_metadata = std::fs::symlink_metadata(&live_path).map_err(|error| {
             SqlError::Custom(format!(
-                "failed to clear restored sidecar destination {}: {e}",
+                "failed to inspect newly appeared sidecar {} before restoring the original: {error}",
                 live_path.display()
             ))
         })?;
+        if !live_metadata.file_type().is_file() && !live_metadata.file_type().is_symlink() {
+            return Err(SqlError::Custom(format!(
+                "newly appeared sidecar destination {} is not a file or symlink; preserving it and the quarantined original",
+                live_path.display()
+            )));
+        }
+        let nonce = format!(
+            "rollback-conflict-{}",
+            chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f")
+        );
+        let conflict_quarantine = sqlite_cleanup_quarantine_path(&live_path, &nonce, 0);
+        rename_noreplace_preserving_source(&live_path, &conflict_quarantine).map_err(
+            |error| {
+                SqlError::Custom(format!(
+                    "failed to preserve newly appeared sidecar {} at {} before restoring the original: {error}",
+                    live_path.display(),
+                    conflict_quarantine.display()
+                ))
+            },
+        )?;
+        tracing::warn!(
+            path = %live_path.display(),
+            quarantine = %conflict_quarantine.display(),
+            "preserved a newly appeared SQLite sidecar before rollback restored the original generation"
+        );
     }
 
-    std::fs::rename(&quarantined, &live_path).map_err(|e| {
+    rename_noreplace_preserving_source(&quarantined, &live_path).map_err(|e| {
         SqlError::Custom(format!(
             "failed to restore original sidecar {} from {}: {e}",
             live_path.display(),
@@ -9177,20 +13471,13 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
     // #219: block new in-process writers and give in-flight ones a bounded
     // window to drain before touching the live file. Reentrant: the
     // archive-drift reconcile path already holds the barrier, and this
-    // acquisition passes through. On timeout we proceed anyway — a write
-    // racing an unhealthy database is already doomed, and refusing recovery
-    // indefinitely is worse than a bounded stall.
-    let (_promotion_barrier, drain_outcome) =
-        crate::write_barrier::acquire_promotion_barrier_draining(
-            crate::write_barrier::writer_drain_timeout(),
-        );
-    if let crate::write_barrier::DrainOutcome::TimedOut { remaining_writers } = drain_outcome {
-        tracing::warn!(
-            path = %primary_path.display(),
-            remaining_writers,
-            "proceeding with archive reconstruction despite undrained in-process writers"
-        );
-    }
+    // acquisition passes through. A timeout must defer the operation: no
+    // database generation is safe to rename while a foreign writer remains.
+    let _promotion_barrier = acquire_recovery_promotion_barrier(
+        primary_path,
+        "archive reconstruction",
+        crate::write_barrier::writer_drain_timeout(),
+    )?;
     crate::forensics::verify_recovery_receipt_state(storage_root, primary_path)?;
     refuse_mutating_mailbox_when_owned(primary_path, storage_root)?;
     let source_bytes = if is_real_file(primary_path) {
@@ -9241,40 +13528,12 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
     // generation remains at the live path. The unified promotion API performs
     // the only quarantine/activation/receipt transition after construction is
     // complete, so no low-level builder ever sees or replaces a live target.
-    let salvage_db_path = if salvage_existing {
-        // The salvage source on this automatic path is the unhealthy primary
-        // itself. When it is so damaged that it cannot even be probed as a
-        // SQLite database, there is no readable DB-only coordination state to
-        // protect, and the strict salvage contract would refuse the archive
-        // candidate and leave the mailbox dead (br-eudur; ts1 incident).
-        // Degrade to an archive-only candidate — the damaged source is still
-        // preserved via quarantine. Probe failures that are NOT clearly
-        // corruption (lock/busy, permissions) keep refusing fail-closed.
-        match crate::reconstruct::probe_salvage_database_for_merge(primary_path) {
-            Ok(()) => Some(primary_path),
-            Err(error) => {
-                let message = error.to_string();
-                if is_corruption_error_message(&message) {
-                    tracing::warn!(
-                        path = %primary_path.display(),
-                        error = %message,
-                        "salvage source is unreadable as a SQLite database; \
-                         degrading to archive-only reconstruction (source is \
-                         preserved in quarantine)"
-                    );
-                    None
-                } else {
-                    return Err(SqlError::Custom(format!(
-                        "archive reconstruction refused: salvage source {} failed probing for a non-corruption reason and DB-only coordination state could still exist: {message}",
-                        primary_path.display()
-                    )));
-                }
-            }
-        }
-    } else {
-        None
-    };
-    reconstruct_archive_into_candidate(primary_path, storage_root, salvage_db_path, &timestamp)
+    // The existing primary is live FrankenSQLite state. The reconstruction
+    // layer must materialize it through guarded same-engine access before any
+    // canonical probe; probing the live inode here would reintroduce the
+    // process-wide fcntl lock-erasure hazard this recovery path is avoiding.
+    let live_salvage_db_path = salvage_existing.then_some(primary_path);
+    reconstruct_archive_into_candidate(primary_path, storage_root, live_salvage_db_path, &timestamp)
         .map_err(|failure| failure.error)
 }
 
@@ -9385,10 +13644,30 @@ fn validate_archive_salvage_storage_root(
 fn reconstruct_sqlite_file_with_archive_salvage_uncached(
     primary_path: &Path,
     storage_root: &Path,
+    outcome_policy: RecoveryAdmissionOutcomePolicy,
 ) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
-    let result = with_recovery_admission(primary_path, "archive salvage reconstruction", || {
+    let operation = || {
         reconstruct_sqlite_file_with_archive_salvage_inner(primary_path, storage_root, true, true)
-    });
+    };
+    // A reconstruct of a MISSING or unhealthy primary is a recovery: its
+    // outcome feeds the durable breaker so repeated failures back off. A
+    // drift reconstruct of a HEALTHY primary is not: the live database keeps
+    // serving whether or not the archive-ahead candidate promotes, and
+    // recording that refusal as a recovery failure poisoned every later
+    // guarded read-only open ("recovery authority nonclean") and crash-looped
+    // startup on a perfectly healthy file (br-plksu, br-bgwj1). The mutation
+    // guard still serializes against other recoveries and honors a tripped
+    // breaker; it just never arms it.
+    let result = match outcome_policy {
+        RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome => {
+            with_recovery_admission(primary_path, "archive salvage reconstruction", operation)
+        }
+        RecoveryAdmissionOutcomePolicy::GuardMutationOnly => with_recovery_mutation_admission(
+            primary_path,
+            "archive drift reconstruction",
+            operation,
+        ),
+    };
     if let Ok(stats) = &result {
         let completed_archive_inventory =
             crate::reconstruct::scan_archive_message_inventory(storage_root);
@@ -9411,6 +13690,40 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
     primary_path: &Path,
     storage_root: &Path,
 ) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
+    reconstruct_sqlite_file_with_archive_salvage_with_policy(
+        primary_path,
+        storage_root,
+        RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome,
+    )
+}
+
+/// Archive-ahead drift reconstruct of a primary that is HEALTHY right now.
+///
+/// Same reconstruction and promotion as
+/// [`reconstruct_sqlite_file_with_archive_salvage`], but under the mutation
+/// guard only: a refused promotion (a receipt collision, a busy writer, a
+/// candidate that fails its integrity check) is reported to the caller and
+/// never recorded as a recovery failure, because the live database stays
+/// authoritative and keeps serving (br-plksu, br-bgwj1).
+#[allow(clippy::result_large_err)]
+fn reconstruct_archive_drift_of_healthy_primary(
+    primary_path: &Path,
+    storage_root: &Path,
+) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
+    reconstruct_sqlite_file_with_archive_salvage_with_policy(
+        primary_path,
+        storage_root,
+        RecoveryAdmissionOutcomePolicy::GuardMutationOnly,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn reconstruct_sqlite_file_with_archive_salvage_with_policy(
+    primary_path: &Path,
+    storage_root: &Path,
+    outcome_policy: RecoveryAdmissionOutcomePolicy,
+) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
+    validate_sqlite_target_path(primary_path, "archive salvage reconstruction target")?;
     validate_archive_salvage_storage_root(primary_path, storage_root)?;
 
     let lookup_at = Instant::now();
@@ -9428,6 +13741,7 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
                 return reconstruct_sqlite_file_with_archive_salvage_uncached(
                     primary_path,
                     storage_root,
+                    outcome_policy,
                 );
             }
             Err(error) => {
@@ -9439,6 +13753,7 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
                 return reconstruct_sqlite_file_with_archive_salvage_uncached(
                     primary_path,
                     storage_root,
+                    outcome_policy,
                 );
             }
         }
@@ -9455,7 +13770,11 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
         return Ok(stats);
     }
 
-    reconstruct_sqlite_file_with_archive_salvage_uncached(primary_path, storage_root)
+    reconstruct_sqlite_file_with_archive_salvage_uncached(
+        primary_path,
+        storage_root,
+        outcome_policy,
+    )
 }
 
 #[allow(clippy::result_large_err)]
@@ -9490,6 +13809,12 @@ where
             backup_path.display()
         )));
     }
+    if !sqlite_recovery_candidate_is_standalone(backup_path) {
+        return Err(SqlError::Custom(format!(
+            "refusing to restore sqlite backup {} because companion SQLite or FrankenSQLite state is present",
+            backup_path.display()
+        )));
+    }
     let backup_bytes = std::fs::metadata(backup_path)
         .map_err(|error| {
             SqlError::Custom(format!(
@@ -9501,27 +13826,27 @@ where
     ensure_recovery_disk_headroom(primary_path, backup_bytes, "sqlite backup restore")?;
 
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    // Detach the corrupt primary's stale journal/WAL sidecars BEFORE the
-    // promotion receipt snapshots the source: a stale rollback journal makes
-    // the primary engine's read-only open demand a write (hot-journal
-    // rollback), which turned the receipt snapshot into a hard
-    // "attempt to write a readonly database" failure and blocked restoring
-    // from a perfectly healthy backup. The sidecars are quarantined by
-    // rename (never deleted) under the same `.corrupt-<ts>` names the
-    // promotion path uses.
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
-        quarantine_sidecar(primary_path, suffix, &timestamp)?;
-    }
     let restore_candidate = stage_backup_restore_candidate(backup_path, primary_path, &timestamp)?;
-    if !sqlite_recovery_candidate_is_healthy(&restore_candidate)? {
+    if !sqlite_recovery_candidate_is_standalone(backup_path) {
         cleanup_sqlite_candidate_artifact(&restore_candidate);
         return Err(SqlError::Custom(format!(
-            "sqlite backup {} did not pass health checks after staging copy; original database is untouched",
+            "refusing to restore sqlite backup {} because companion state appeared while it was being staged; original database is untouched",
             backup_path.display()
         )));
     }
+    if let Err(error) = validate_staged_backup_restore_candidate(backup_path, &restore_candidate) {
+        cleanup_sqlite_candidate_artifact(&restore_candidate);
+        return Err(error);
+    }
+    // Detach the corrupt primary's stale journal/WAL sidecars only AFTER the
+    // staged replacement has passed its decisive validation. A stale rollback
+    // journal makes the promotion receipt's read-only source snapshot demand a
+    // write (hot-journal rollback), but moving those sidecars before validating
+    // the replacement would mutate the original generation on a rejected
+    // backup. Sidecars are quarantined by rename (never deleted) under the same
+    // `.corrupt-<ts>` names the promotion path uses.
     for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
-        let _ = std::fs::remove_file(sqlite_sidecar_path(&restore_candidate, suffix));
+        quarantine_sidecar(primary_path, suffix, &timestamp)?;
     }
     promote_recovery_candidate_with_finalizer(
         primary_path,
@@ -9544,14 +13869,13 @@ where
 fn reinitialize_without_backup(primary_path: &Path, storage_root: &Path) -> Result<(), SqlError> {
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let candidate = reconstruction_candidate_path(primary_path, &format!("blank-{timestamp}"));
-    let conn = crate::CanonicalDbConn::open_file(candidate.to_string_lossy().as_ref()).map_err(
-        |error| {
-            SqlError::Custom(format!(
-                "failed to create blank recovery candidate {}: {error}",
-                candidate.display()
-            ))
-        },
-    )?;
+    let candidate_str = sqlite_path_as_utf8(&candidate)?;
+    let conn = crate::CanonicalDbConn::open_file(candidate_str).map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to create blank recovery candidate {}: {error}",
+            candidate.display()
+        ))
+    })?;
     conn.execute_raw(&schema::init_schema_sql_base())
         .map_err(|error| {
             SqlError::Custom(format!(
@@ -9587,7 +13911,9 @@ fn reinitialize_without_backup(primary_path: &Path, storage_root: &Path) -> Resu
 /// Runs layered health probes (`quick_check`, `integrity_check(1)`, and
 /// a schema-aware query smoke test) on the file. If corruption is detected:
 ///
-/// 1. Search for the freshest healthy `.bak` / `.bak.*` / `.backup-*` / `.recovery*` sibling.
+/// 1. Search for the freshest healthy exact `.bak` or published `.bak.*`
+///    sibling. Historical `.backup-*` generations and `.recovery` WAL
+///    families are not treated as standalone backups.
 /// 2. Quarantine the corrupt file (rename to `*.corrupt-{timestamp}`).
 /// 3. Restore from the first healthy backup found.
 /// 4. If no healthy backup exists, reinitialize an empty database file.
@@ -9601,7 +13927,12 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
     crate::forensics::verify_recovery_receipt_state(recovery_receipt_root, primary_path)?;
     let exists = primary_path.exists();
     if exists {
-        cleanup_empty_wal_sidecar(primary_path.to_string_lossy().as_ref());
+        if !classify_sqlite_family_cleanup(primary_path)?.is_empty() {
+            return with_recovery_admission(primary_path, "automatic sqlite recovery", || {
+                ensure_sqlite_file_healthy_inner(primary_path)
+            });
+        }
+        let _ = cleanup_empty_wal_sidecar(primary_path)?;
         if sqlite_file_is_healthy(primary_path)? {
             return Ok(());
         }
@@ -9616,10 +13947,28 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
 
 #[allow(clippy::result_large_err)]
 fn ensure_sqlite_file_healthy_inner(primary_path: &Path) -> Result<(), SqlError> {
+    ensure_sqlite_file_healthy_inner_with_timeout(
+        primary_path,
+        crate::write_barrier::writer_drain_timeout(),
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn ensure_sqlite_file_healthy_inner_with_timeout(
+    primary_path: &Path,
+    writer_drain_timeout: Duration,
+) -> Result<(), SqlError> {
+    // The non-archive recovery path can repair indexes, capture forensic
+    // artifacts, restore a backup, or reinitialize the live generation. Give
+    // that entire sequence the same writer exclusion as archive recovery so
+    // no in-process write can straddle one of those mutations. Nested
+    // promotion barriers are reentrant.
+    let _promotion_barrier =
+        acquire_recovery_promotion_barrier(primary_path, "sqlite recovery", writer_drain_timeout)?;
     validate_sqlite_target_path(primary_path, "sqlite recovery target")?;
     let exists = primary_path.exists();
     if exists {
-        cleanup_empty_wal_sidecar(primary_path.to_string_lossy().as_ref());
+        let _ = cleanup_empty_wal_sidecar(primary_path)?;
     }
     if exists && sqlite_file_is_healthy(primary_path)? {
         return Ok(());
@@ -9674,7 +14023,8 @@ fn ensure_sqlite_file_healthy_inner(primary_path: &Path) -> Result<(), SqlError>
 /// database from the Git archive before falling back to a blank reinitialize.
 ///
 /// Recovery priority:
-/// 1. The freshest healthy `.bak` / `.bak.*` / `.backup-*` / `.recovery*` backup file
+/// 1. The freshest healthy exact `.bak` or published `.bak.*` backup file
+///    (never a historical `.backup-*` generation or lone `.recovery` main)
 /// 2. Git archive reconstruction (recovers messages + agents)
 /// 3. Blank reinitialization (empty database)
 #[allow(clippy::too_many_lines)]
@@ -9701,7 +14051,14 @@ pub fn ensure_sqlite_file_healthy_with_archive(
 
     let had_primary = primary_path.exists();
     if had_primary {
-        cleanup_empty_wal_sidecar(primary_path.to_string_lossy().as_ref());
+        if !classify_sqlite_family_cleanup(primary_path)?.is_empty() {
+            return with_recovery_admission(
+                primary_path,
+                "automatic sqlite archive recovery",
+                || ensure_sqlite_file_healthy_with_archive_inner(primary_path, storage_root),
+            );
+        }
+        let _ = cleanup_empty_wal_sidecar(primary_path)?;
         if sqlite_file_is_healthy(primary_path)? {
             let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
             return Ok(());
@@ -9728,17 +14085,11 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
     // unit under the promotion barrier so no in-process write can straddle
     // any of its file swaps. Nested acquisitions inside promote/reconstruct
     // helpers pass through.
-    let (_promotion_barrier, drain_outcome) =
-        crate::write_barrier::acquire_promotion_barrier_draining(
-            crate::write_barrier::writer_drain_timeout(),
-        );
-    if let crate::write_barrier::DrainOutcome::TimedOut { remaining_writers } = drain_outcome {
-        tracing::warn!(
-            path = %primary_path.display(),
-            remaining_writers,
-            "proceeding with sqlite archive recovery despite undrained in-process writers"
-        );
-    }
+    let _promotion_barrier = acquire_recovery_promotion_barrier(
+        primary_path,
+        "sqlite archive recovery",
+        crate::write_barrier::writer_drain_timeout(),
+    )?;
     validate_sqlite_target_path(primary_path, "sqlite archive recovery target")?;
     if !path_is_occupied(primary_path) && has_quarantined_primary_artifact(primary_path) {
         return Err(SqlError::Custom(format!(
@@ -9755,7 +14106,7 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
 
     let had_primary = primary_path.exists();
     if had_primary {
-        cleanup_empty_wal_sidecar(primary_path.to_string_lossy().as_ref());
+        let _ = cleanup_empty_wal_sidecar(primary_path)?;
     }
     if had_primary && sqlite_file_is_healthy(primary_path)? {
         let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
@@ -9910,9 +14261,23 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
 /// contention on the hot path). The write lock is only held briefly when
 /// creating a new pool.
 pub fn get_or_create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
+    let authority = DbPoolAuthority::resolve(config)?;
+    get_or_create_pool_with_authority(config, authority)
+}
+
+fn get_or_create_pool_with_authority(
+    config: &DbPoolConfig,
+    authority: DbPoolAuthority,
+) -> DbResult<DbPool> {
     let cache =
         POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
-    let cache_key = pool_cache_key(config);
+    let cache_key = pool_cache_key_from_authority(
+        &authority,
+        config.min_connections,
+        config.max_connections,
+        config.acquire_timeout_ms,
+        config.max_lifetime_ms,
+    );
 
     // Fast path: shared read lock for existing live pool (concurrent readers).
     {
@@ -9921,7 +14286,7 @@ pub fn get_or_create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
             && let Some(shared_pool) = pool.upgrade()
             && !shared_pool.is_closed()
         {
-            return DbPool::from_shared_pool(config, shared_pool);
+            return DbPool::from_shared_pool_with_authority(config, shared_pool, false, authority);
         }
     }
 
@@ -9939,7 +14304,7 @@ pub fn get_or_create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
     // bootstrap, wedging the entire server. The per-path `SQLITE_INIT_GATES`
     // once-cell still serializes the heavy on-disk init, so a rare creation
     // race costs at most one redundant pool that is dropped unused below.
-    let pool = DbPool::new(config)?;
+    let pool = DbPool::new_with_authority(config, false, false, authority.clone())?;
 
     let mut guard = cache.write();
     // Double-check after acquiring the write lock — another thread may have
@@ -9950,7 +14315,7 @@ pub fn get_or_create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
         && !shared_pool.is_closed()
     {
         drop(guard);
-        return DbPool::from_shared_pool(config, shared_pool);
+        return DbPool::from_shared_pool_with_authority(config, shared_pool, false, authority);
     }
     guard.insert(cache_key, Arc::downgrade(&pool.pool));
     drop(guard);
@@ -9968,31 +14333,36 @@ pub fn get_or_create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
 /// against the live pool's engine-level coordination.
 #[must_use]
 pub fn get_cached_pool(config: &DbPoolConfig) -> Option<DbPool> {
+    let authority = DbPoolAuthority::resolve(config).ok()?;
+    let cache_key = pool_cache_key_from_authority(
+        &authority,
+        config.min_connections,
+        config.max_connections,
+        config.acquire_timeout_ms,
+        config.max_lifetime_ms,
+    );
     let cache = POOL_CACHE.get()?;
     let guard = cache.read();
-    let shared_pool = guard.get(&pool_cache_key(config))?.upgrade()?;
+    let shared_pool = guard.get(&cache_key)?.upgrade()?;
     if shared_pool.is_closed() {
         return None;
     }
     drop(guard);
-    DbPool::from_shared_pool(config, shared_pool).ok()
+    DbPool::from_shared_pool_with_authority(config, shared_pool, false, authority).ok()
 }
 
-fn compatible_cached_memory_pool(config: &DbPoolConfig) -> DbResult<Option<Arc<Pool<DbConn>>>> {
-    if config.sqlite_path()? != ":memory:" {
-        return Ok(None);
+fn compatible_cached_memory_pool(authority: &DbPoolAuthority) -> Option<Arc<Pool<DbConn>>> {
+    if authority.sqlite_identity.is_some() {
+        return None;
     }
 
-    let storage_root = config.resolved_storage_root();
-    let storage_root_identity = normalize_sqlite_identity_path(&storage_root.to_string_lossy());
-    let key_prefix = format!(":memory:|storage_root={storage_root_identity}|");
     let cache =
         POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
     let guard = cache.read();
 
     let mut candidate: Option<Arc<Pool<DbConn>>> = None;
     for (key, weak) in guard.iter() {
-        if !key.starts_with(&key_prefix) {
+        if key.sqlite_identity.is_some() || key.storage_root_identity != authority.storage_root {
             continue;
         }
         let Some(shared_pool) = weak.upgrade() else {
@@ -10004,12 +14374,12 @@ fn compatible_cached_memory_pool(config: &DbPoolConfig) -> DbResult<Option<Arc<P
         match &candidate {
             None => candidate = Some(shared_pool),
             Some(existing) if Arc::ptr_eq(existing, &shared_pool) => {}
-            Some(_) => return Ok(None),
+            Some(_) => return None,
         }
     }
     drop(guard);
 
-    Ok(candidate)
+    candidate
 }
 
 /// Get a pool for the given config, reusing an existing compatible in-memory
@@ -10020,10 +14390,11 @@ fn compatible_cached_memory_pool(config: &DbPoolConfig) -> DbResult<Option<Arc<P
 /// isolation because they already share durable state through the underlying
 /// SQLite file.
 pub fn get_or_reuse_compatible_memory_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
-    if let Some(shared_pool) = compatible_cached_memory_pool(config)? {
-        return DbPool::from_shared_pool(config, shared_pool);
+    let authority = DbPoolAuthority::resolve(config)?;
+    if let Some(shared_pool) = compatible_cached_memory_pool(&authority) {
+        return DbPool::from_shared_pool_with_authority(config, shared_pool, false, authority);
     }
-    get_or_create_pool(config)
+    get_or_create_pool_with_authority(config, authority)
 }
 
 /// Create (or reuse) a pool for the given config.
@@ -10398,6 +14769,33 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
 
+    // GH#288: the "both rejected" WARN dedups per (path, message) — first
+    // observation warns, identical repeats inside the cadence stay quiet, a
+    // changed message or a different path warns fresh.
+    #[test]
+    fn both_rejected_should_warn_dedups_identical_standing_verdicts() {
+        // Unique path so parallel tests sharing the process-wide map never
+        // collide with this sequence.
+        let path = format!("/both-rejected-test/{}/db.sqlite3", std::process::id());
+        assert_eq!(
+            both_rejected_should_warn(&path, "page 7 never used"),
+            Some(1)
+        );
+        assert_eq!(both_rejected_should_warn(&path, "page 7 never used"), None);
+        assert_eq!(both_rejected_should_warn(&path, "page 7 never used"), None);
+        assert_eq!(
+            both_rejected_should_warn(&path, "page 9 cross-linked"),
+            Some(1),
+            "a changed message is a new fingerprint and must warn"
+        );
+        let other = format!("{path}.other");
+        assert_eq!(
+            both_rejected_should_warn(&other, "page 7 never used"),
+            Some(1),
+            "a different path tracks independently"
+        );
+    }
+
     /// GH#247 regression: a purpose-corrupted fixture whose pages are mass-
     /// orphaned (every integrity_check row is `Page N is never used`). The
     /// pre-fix classifier waved ANY number of never-used rows through as
@@ -10442,6 +14840,142 @@ mod tests {
         assert!(
             !sqlite_file_passes_full_integrity_check(&path).expect("integrity probe"),
             "mass never-used page loss must fail the full canonical integrity check"
+        );
+    }
+
+    #[test]
+    fn recovery_candidate_health_rejects_zero_byte_and_schema_less_databases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let zero_byte = dir.path().join("zero-byte.sqlite3");
+        std::fs::File::create(&zero_byte).expect("create zero-byte candidate");
+        assert!(
+            !sqlite_recovery_candidate_passes_full_integrity_check(&zero_byte)
+                .expect("zero-byte candidate probe"),
+            "opening a zero-byte file as a new SQLite database is not recovery evidence"
+        );
+
+        let schema_less = dir.path().join("schema-less.sqlite3");
+        {
+            let conn = crate::CanonicalDbConn::open_file(
+                schema_less
+                    .to_str()
+                    .expect("temporary path should be valid UTF-8"),
+            )
+            .expect("open schema-less database");
+            conn.execute_raw("PRAGMA user_version = 1; VACUUM;")
+                .expect("materialize schema-less database");
+        }
+        assert!(
+            std::fs::read(&schema_less)
+                .expect("read schema-less database")
+                .starts_with(SQLITE_DATABASE_HEADER),
+            "fixture must be a materialized SQLite image"
+        );
+        assert!(
+            !sqlite_recovery_candidate_passes_full_integrity_check(&schema_less)
+                .expect("schema-less candidate probe"),
+            "a valid but schema-less database must not replace recoverable mailbox state"
+        );
+
+        let unrelated = dir.path().join("unrelated.sqlite3");
+        {
+            let conn = crate::CanonicalDbConn::open_file(
+                unrelated
+                    .to_str()
+                    .expect("temporary path should be valid UTF-8"),
+            )
+            .expect("open unrelated database");
+            conn.execute_raw(
+                "CREATE TABLE inventory (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);",
+            )
+            .expect("materialize unrelated user schema");
+        }
+        assert!(
+            !sqlite_recovery_candidate_passes_full_integrity_check(&unrelated)
+                .expect("unrelated database probe"),
+            "an unrelated healthy SQLite database must not be accepted as a mailbox backup"
+        );
+
+        let materialized = dir.path().join("materialized.sqlite3");
+        write_marker_db(&materialized, "recoverable");
+        assert!(
+            sqlite_recovery_candidate_passes_full_integrity_check(&materialized)
+                .expect("materialized candidate probe"),
+            "a healthy database with the legacy-compatible mailbox signature remains recoverable"
+        );
+    }
+
+    #[test]
+    fn immutable_candidate_probe_accepts_standalone_wal_header_without_side_effects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let candidate = dir.path().join("checkpointed-wal-header.sqlite3");
+        {
+            let conn = crate::CanonicalDbConn::open_file(candidate.to_string_lossy().as_ref())
+                .expect("open WAL-header fixture");
+            conn.execute_raw("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0")
+                .expect("enable WAL");
+            conn.execute_raw(&crate::schema::init_schema_sql_base())
+                .expect("create mailbox schema");
+            conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+                .expect("checkpoint committed schema");
+        }
+        let bytes = std::fs::read(&candidate).expect("read WAL-header fixture");
+        assert_eq!(
+            &bytes[18..20],
+            &[2, 2],
+            "fixture must retain WAL read/write version bytes in page 1"
+        );
+        assert!(
+            sqlite_recovery_candidate_is_standalone(&candidate),
+            "fixture must begin without companion files"
+        );
+
+        assert!(
+            sqlite_recovery_candidate_passes_full_integrity_check(&candidate)
+                .expect("immutable candidate probe"),
+            "a sidecar-free online-backup image with WAL header bytes is valid recovery authority"
+        );
+        assert!(
+            sqlite_recovery_candidate_is_standalone(&candidate),
+            "validation must not create WAL/SHM companions on the evidence it inspects"
+        );
+    }
+
+    #[test]
+    fn recovery_candidate_rejects_even_small_orphan_page_findings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let candidate = dir.path().join("suspect-mailbox.sqlite3");
+        write_marker_db(&candidate, "mailbox");
+        {
+            let conn = crate::CanonicalDbConn::open_file(
+                candidate
+                    .to_str()
+                    .expect("temporary path should be valid UTF-8"),
+            )
+            .expect("open mailbox candidate");
+            conn.execute_raw("PRAGMA journal_mode = DELETE")
+                .expect("journal mode");
+            conn.execute_raw("CREATE TABLE orphan_me (payload BLOB NOT NULL)")
+                .expect("create disposable table");
+            conn.execute_raw("INSERT INTO orphan_me(payload) VALUES (randomblob(256))")
+                .expect("seed disposable table");
+            conn.execute_raw("PRAGMA writable_schema = ON")
+                .expect("writable schema on");
+            conn.execute_raw("DELETE FROM sqlite_master WHERE name = 'orphan_me'")
+                .expect("orphan a small b-tree");
+            conn.execute_raw("PRAGMA writable_schema = OFF")
+                .expect("writable schema off");
+        }
+
+        assert!(
+            sqlite_file_passes_full_integrity_check(&candidate)
+                .expect("live-file compatibility probe"),
+            "fixture should stay in the legacy suspect-but-tolerated live-file class"
+        );
+        assert!(
+            !sqlite_recovery_candidate_passes_full_integrity_check(&candidate)
+                .expect("replacement-authority probe"),
+            "a replacement authority must require an exact full-integrity verdict"
         );
     }
 
@@ -10853,44 +15387,45 @@ mod tests {
     }
 
     #[test]
-    fn normalize_sqlite_identity_path_caches_recent_entries() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("identity_cache.db");
-        let raw_path = db_path.to_string_lossy().into_owned();
+    fn normalize_sqlite_identity_path_returns_an_absolute_identity() {
+        let relative = Path::new("missing-parent").join("identity.db");
+        let identity = normalize_sqlite_identity_path_buf(&relative);
 
-        sqlite_identity_path_cache()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-
-        let first = normalize_sqlite_identity_path(&raw_path);
-        let cached = sqlite_identity_path_cache_get(&raw_path);
-        assert_eq!(cached.as_deref(), Some(first.as_str()));
-
-        let second = normalize_sqlite_identity_path(&raw_path);
-        assert_eq!(second, first);
+        assert!(
+            identity.is_absolute(),
+            "a relative configured path must be frozen against the construction-time cwd"
+        );
+        assert!(
+            identity.ends_with(&relative),
+            "normalization must preserve the unresolved relative suffix"
+        );
     }
 
     #[test]
-    fn sqlite_identity_path_cache_entries_expire_after_test_freshness_window() {
-        let raw_path = "relative/cache-expiry.db";
-        let normalized = "/tmp/cache-expiry.db";
+    fn normalize_sqlite_identity_path_collapses_dotdot_before_missing_leaf() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let child = dir.path().join("existing-child");
+        std::fs::create_dir_all(&child).expect("create existing child");
+        let direct = dir.path().join("not-created-yet.sqlite3");
+        let dotdot_alias = child.join("..").join("not-created-yet.sqlite3");
+        assert!(!direct.exists(), "fixture requires a missing SQLite leaf");
 
-        sqlite_identity_path_cache()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-
-        sqlite_identity_path_cache_insert(raw_path, normalized);
         assert_eq!(
-            sqlite_identity_path_cache_get(raw_path).as_deref(),
-            Some(normalized)
+            normalize_sqlite_identity_path(&direct.to_string_lossy()),
+            normalize_sqlite_identity_path(&dotdot_alias.to_string_lossy()),
+            "dotdot aliases must converge before the SQLite leaf exists"
         );
+    }
 
-        std::thread::sleep(SQLITE_IDENTITY_PATH_CACHE_FRESHNESS + Duration::from_millis(10));
-        assert!(
-            sqlite_identity_path_cache_get(raw_path).is_none(),
-            "expired entries should be evicted on read"
+    #[test]
+    fn sqlite_identity_cache_namespace_distinguishes_path_kinds() {
+        let relative = Path::new("identity.db");
+        let absolute = Path::new("/identity.db");
+
+        assert_ne!(
+            sqlite_identity_cache_namespace(relative),
+            sqlite_identity_cache_namespace(absolute),
+            "cache namespaces must encode the complete frozen path authority"
         );
     }
 
@@ -11086,6 +15621,1816 @@ mod tests {
             );
             assert_eq!(std::fs::read(&db_path).ok(), bytes_before);
         }
+    }
+
+    fn exact_diagnostic_parent_snapshot(
+        directory: &Path,
+    ) -> std::collections::BTreeMap<std::ffi::OsString, (bool, Vec<u8>)> {
+        std::fs::read_dir(directory)
+            .expect("read diagnostic fixture directory")
+            .map(|entry| {
+                let entry = entry.expect("read diagnostic fixture entry");
+                let path = entry.path();
+                let metadata =
+                    std::fs::symlink_metadata(&path).expect("inspect diagnostic fixture entry");
+                let bytes = if metadata.file_type().is_file() {
+                    std::fs::read(&path).expect("read diagnostic fixture file")
+                } else {
+                    Vec::new()
+                };
+                (entry.file_name(), (metadata.file_type().is_file(), bytes))
+            })
+            .collect()
+    }
+
+    fn assert_no_read_only_diagnostic_artifacts(directory: &Path) {
+        for name in std::fs::read_dir(directory)
+            .expect("read diagnostic artifact directory")
+            .map(|entry| {
+                entry
+                    .expect("read diagnostic artifact entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        {
+            assert!(
+                !name.contains("-fsqlite-ns-")
+                    && !name.ends_with(".am-recovery-breaker.lock")
+                    && !name.ends_with(".recovery.lock")
+                    && !name.contains("cleanup-quarantine")
+                    && !name.contains(".corrupt-")
+                    && !name.contains("forensic"),
+                "read-only diagnostic published forbidden artifact {name}"
+            );
+        }
+    }
+
+    /// br-vhxdc (red-test class E1): a family that was never Franken-admitted
+    /// (canonical-written, restored from a backup, reconstructed from the
+    /// archive) carries no namespace pair. The Franken opener alone refuses
+    /// it; the dispatcher must serve it through canonical SQLite, read-only,
+    /// without publishing any artifact beside it.
+    #[test]
+    fn guarded_read_only_dispatch_serves_sidecar_less_family_through_canonical_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("restored.sqlite3");
+        seed_settled_diagnostic_database(&db_path);
+
+        let refusal =
+            match open_guarded_read_only_franken_existing_file(&db_path, "dispatch fixture") {
+                Ok(_) => panic!("the Franken opener alone must still refuse a sidecar-less family"),
+                Err(error) => error.to_string(),
+            };
+        assert!(
+            refusal.contains("complete pre-existing namespace sidecar pair is required"),
+            "unexpected Franken refusal shape: {refusal}"
+        );
+
+        let before = exact_diagnostic_parent_snapshot(dir.path());
+        let conn = open_guarded_read_only_sqlite_file(&db_path, "dispatch fixture")
+            .expect("the dispatcher must serve a sidecar-less family");
+        assert_eq!(conn.engine(), GuardedReadOnlyEngine::Canonical);
+        assert!(conn.as_franken().is_none());
+        let rows = conn
+            .query_sync("SELECT value FROM diagnostic_fixture", &[])
+            .expect("query through the canonical engine");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("value").unwrap(), 7);
+        assert!(
+            conn.execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (8);")
+                .is_err(),
+            "the dispatched connection must be read-only"
+        );
+        drop(conn);
+
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(dir.path()),
+            before,
+            "a read-only dispatch must leave the family byte-identical"
+        );
+        assert_no_read_only_diagnostic_artifacts(dir.path());
+    }
+
+    /// The other half of the dispatch: a Franken-admitted family (complete
+    /// namespace pair) keeps going through the bound same-engine opener, so
+    /// the canonical opener's cross-engine refusal is never reached.
+    #[test]
+    fn guarded_read_only_dispatch_serves_franken_admitted_family_through_franken() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live.sqlite3");
+        seed_settled_diagnostic_database(&db_path);
+        admit_diagnostic_database_with_franken(&db_path);
+
+        let conn = open_guarded_read_only_sqlite_file(&db_path, "dispatch fixture")
+            .expect("the dispatcher must serve a Franken-admitted family");
+        assert_eq!(conn.engine(), GuardedReadOnlyEngine::Franken);
+        assert!(conn.as_franken().is_some());
+        let rows = conn
+            .query_sync("SELECT value FROM diagnostic_fixture", &[])
+            .expect("query through the Franken engine");
+        assert_eq!(rows[0].get_named::<i64>("value").unwrap(), 7);
+        assert!(
+            conn.execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (8);")
+                .is_err(),
+            "the dispatched connection must be read-only"
+        );
+    }
+
+    /// A half namespace pair is ambiguous authority: the dispatcher refuses it
+    /// explicitly and adds no bypass around either single-engine opener.
+    #[test]
+    fn guarded_read_only_dispatch_refuses_incomplete_namespace_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("half.sqlite3");
+        seed_settled_diagnostic_database(&db_path);
+        std::fs::write(sqlite_sidecar_path(&db_path, "-fsqlite-ns-gate"), b"")
+            .expect("plant one namespace sidecar");
+
+        let error = match open_guarded_read_only_sqlite_file(&db_path, "dispatch fixture") {
+            Ok(_) => panic!("a half namespace pair must not open through either engine"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("namespace sidecar pair is incomplete"),
+            "unexpected refusal shape: {error}"
+        );
+        assert!(
+            open_guarded_read_only_franken_existing_file(&db_path, "dispatch fixture").is_err(),
+            "the Franken opener must still refuse a half pair"
+        );
+        assert!(
+            open_guarded_read_only_canonical_sqlite_file(&db_path, "dispatch fixture").is_err(),
+            "the canonical opener must still refuse an occupied namespace pathname"
+        );
+    }
+
+    /// The concrete class-E1 consumer: `inspect_mailbox_db_inventory` on a
+    /// database that was never Franken-admitted used to fail with the
+    /// namespace-pair refusal, which made every archive-drift and health
+    /// comparison against a restored or reconstructed mailbox impossible.
+    #[test]
+    fn mailbox_db_inventory_reads_sidecar_less_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reconstructed.sqlite3");
+        let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open canonical seed database");
+        conn.execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("settle seed journal mode");
+        conn.execute_raw(&schema::init_schema_sql_base())
+            .expect("apply base schema through canonical SQLite");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) \
+             VALUES (1, 'restored-project', '/restored-project', 0);",
+        )
+        .expect("seed project");
+        drop(conn);
+        assert!(!sqlite_sidecar_path(&db_path, "-fsqlite-ns-gate").exists());
+        assert!(!sqlite_sidecar_path(&db_path, "-fsqlite-ns-use").exists());
+
+        let inventory = inspect_mailbox_db_inventory(&db_path)
+            .expect("inventory must read a family without a namespace pair");
+        assert_eq!(inventory.projects, 1);
+        assert_eq!(inventory.agents, 0);
+        assert_eq!(inventory.messages, 0);
+        assert_eq!(inventory.max_message_id, 0);
+        assert!(
+            inventory
+                .project_identities
+                .iter()
+                .any(|identity| identity.slug.as_deref() == Some("restored-project")),
+            "project identities must come from the sidecar-less family: {:?}",
+            inventory.project_identities
+        );
+    }
+
+    fn seed_settled_diagnostic_database(path: &Path) {
+        let conn = crate::CanonicalDbConn::open_file(path.to_string_lossy().as_ref())
+            .expect("open diagnostic seed database");
+        conn.execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("settle diagnostic seed journal mode");
+        conn.execute_raw("CREATE TABLE diagnostic_fixture (value INTEGER NOT NULL);")
+            .expect("create diagnostic fixture table");
+        conn.execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (7);")
+            .expect("populate diagnostic fixture table");
+    }
+
+    fn admit_diagnostic_database_with_franken(path: &Path) {
+        let conn = DbConn::open_file(path.to_string_lossy().as_ref())
+            .expect("open diagnostic fixture through FrankenSQLite");
+        conn.query_sync("SELECT value FROM diagnostic_fixture", &[])
+            .expect("query Franken-admitted diagnostic fixture");
+        crate::close_db_conn(conn, "settle Franken-admitted diagnostic fixture");
+        assert!(sqlite_sidecar_path(path, "-fsqlite-ns-gate").is_file());
+        assert!(sqlite_sidecar_path(path, "-fsqlite-ns-use").is_file());
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    fn seed_quiescent_franken_namespace(path: &Path) {
+        use fsqlite::fsqlite_vfs::namespace::{NamespaceOpenIntent, PendingNamespaceOpen};
+
+        let stable_path = std::fs::canonicalize(path).expect("canonicalize namespace fixture");
+        let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(&stable_path)
+            .expect("open namespace fixture identity");
+        let identity = fsqlite::FileIdentity::from_file(&file)
+            .expect("read namespace fixture identity")
+            .expect("native namespace fixture has a stable identity");
+        let binding = PendingNamespaceOpen::begin(&stable_path, NamespaceOpenIntent::Shared)
+            .expect("admit namespace fixture")
+            .bind(identity)
+            .expect("bind namespace fixture identity");
+        binding
+            .finish_bootstrap()
+            .expect("publish namespace fixture identity");
+        drop(binding);
+    }
+
+    fn install_diagnostic_breaker(path: &Path, breaker_kind: &str) {
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(path);
+        if breaker_kind == "malformed" {
+            std::fs::write(&breaker_path, b"malformed diagnostic breaker authority")
+                .expect("write malformed diagnostic breaker");
+            return;
+        }
+        let config = crate::recovery_breaker::config_from_env();
+        crate::recovery_breaker::store(
+            path,
+            &crate::recovery_breaker::RecoveryBreakerState {
+                schema: 1,
+                db_fingerprint: crate::recovery_breaker::fingerprint_db(path),
+                consecutive_failures: config.max_consecutive_failures,
+                last_failure_unix: recovery_breaker_now_unix(),
+                last_failure_reason: "diagnostic fixture tripped".to_string(),
+                tripped: true,
+            },
+        )
+        .expect("store tripped diagnostic breaker");
+    }
+
+    #[test]
+    fn guarded_read_only_franken_open_proceeds_inside_own_recovery_admission() {
+        // Recovery admission arms the breaker with a provisional failure
+        // before the attempt runs. The attempt's own live-salvage read must
+        // not be refused by that arming (br-plksu self-poisoning), while an
+        // unrelated reader outside any admission still is.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("armed-breaker.sqlite3");
+        seed_settled_diagnostic_database(&db_path);
+        admit_diagnostic_database_with_franken(&db_path);
+        let config = crate::recovery_breaker::config_from_env();
+        let armed = crate::recovery_breaker::record_failure(
+            None,
+            &crate::recovery_breaker::fingerprint_db(&db_path),
+            "automatic recovery attempt did not complete",
+            config,
+            recovery_breaker_now_unix(),
+        );
+        assert_eq!(armed.consecutive_failures, 1);
+        assert!(
+            !armed.tripped,
+            "a single provisional arming must not trip the breaker"
+        );
+        crate::recovery_breaker::store(&db_path, &armed).expect("store armed breaker");
+
+        let refused =
+            match open_guarded_read_only_franken_existing_file(&db_path, "outside admission") {
+                Ok(_) => panic!("an unrelated reader must still honor the nonclean breaker"),
+                Err(error) => error,
+            };
+        assert!(
+            refused.to_string().contains("nonclean"),
+            "unexpected refusal text: {refused}"
+        );
+
+        let stable_path = std::fs::canonicalize(&db_path).expect("canonicalize fixture");
+        let _admission = RecoveryAdmissionDepthGuard::enter(
+            normalize_sqlite_identity_path_lossless(&stable_path),
+        );
+        let conn = open_guarded_read_only_franken_existing_file(&db_path, "inside admission")
+            .expect("the admitted recovery attempt may read the file it armed");
+        let rows = conn
+            .query_sync("SELECT value FROM diagnostic_fixture", &[])
+            .expect("read through the admitted open");
+        assert!(!rows.is_empty());
+        crate::close_db_conn(conn, "settle admitted read-only open");
+    }
+
+    #[test]
+    fn guarded_read_only_breaker_authority_causally_controls_exact_family_proof() {
+        for breaker_kind in ["malformed", "tripped"] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let db_path = directory
+                .path()
+                .join(format!("breaker-causal-{breaker_kind}.sqlite3"));
+            seed_settled_diagnostic_database(&db_path);
+            install_diagnostic_breaker(&db_path, breaker_kind);
+            let probe_calls = std::cell::Cell::new(0_u32);
+
+            preflight_guarded_offline_canonical_sqlite_family_with_probe(
+                &db_path,
+                "breaker-causal diagnostic test",
+                |_| {
+                    probe_calls.set(probe_calls.get().saturating_add(1));
+                    Ok(false)
+                },
+            )
+            .expect_err("nonclean exact breaker authority must require and honor the proof");
+            assert_eq!(
+                probe_calls.get(),
+                1,
+                "{breaker_kind} authority must causally invoke one exact-family proof"
+            );
+        }
+
+        for authority_kind in ["clean", "stale-fingerprint"] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let db_path = directory
+                .path()
+                .join(format!("breaker-noncausal-{authority_kind}.sqlite3"));
+            seed_settled_diagnostic_database(&db_path);
+            let state = if authority_kind == "clean" {
+                crate::recovery_breaker::cleared_state(&crate::recovery_breaker::fingerprint_db(
+                    &db_path,
+                ))
+            } else {
+                crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: "missing".to_string(),
+                    consecutive_failures: 99,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "failure on stale bytes".to_string(),
+                    tripped: true,
+                }
+            };
+            crate::recovery_breaker::store(&db_path, &state)
+                .expect("store irrelevant diagnostic breaker authority");
+            let probe_calls = std::cell::Cell::new(0_u32);
+
+            preflight_guarded_offline_canonical_sqlite_family_with_probe(
+                &db_path,
+                "irrelevant-breaker diagnostic test",
+                |_| {
+                    probe_calls.set(probe_calls.get().saturating_add(1));
+                    Ok(false)
+                },
+            )
+            .expect("clean or stale-fingerprint authority must not demand recovery proof");
+            assert_eq!(
+                probe_calls.get(),
+                0,
+                "{authority_kind} authority must not invoke exact-family proof"
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_read_only_helpers_preserve_suspect_live_families_without_artifacts() {
+        for breaker_kind in ["malformed", "tripped"] {
+            let canonical_directory = tempfile::tempdir().expect("canonical tempdir");
+            let canonical_db_path = canonical_directory
+                .path()
+                .join(format!("canonical-{breaker_kind}.sqlite3"));
+            seed_settled_diagnostic_database(&canonical_db_path);
+            std::fs::write(
+                sqlite_sidecar_path(&canonical_db_path, "-wal"),
+                b"truncated-wal",
+            )
+            .expect("write damaged canonical diagnostic WAL");
+            std::fs::write(
+                sqlite_sidecar_path(&canonical_db_path, "-shm"),
+                b"coordination-shm",
+            )
+            .expect("write canonical diagnostic SHM");
+            install_diagnostic_breaker(&canonical_db_path, breaker_kind);
+            let canonical_before = exact_diagnostic_parent_snapshot(canonical_directory.path());
+
+            assert!(
+                open_guarded_read_only_canonical_sqlite_file(
+                    &canonical_db_path,
+                    "canonical diagnostic helper test",
+                )
+                .is_err(),
+                "canonical helper must refuse suspect exact family"
+            );
+            assert_eq!(
+                exact_diagnostic_parent_snapshot(canonical_directory.path()),
+                canonical_before
+            );
+            assert_no_read_only_diagnostic_artifacts(canonical_directory.path());
+
+            let franken_directory = tempfile::tempdir().expect("Franken tempdir");
+            let db_path = franken_directory
+                .path()
+                .join(format!("franken-{breaker_kind}.sqlite3"));
+            seed_settled_diagnostic_database(&db_path);
+            admit_diagnostic_database_with_franken(&db_path);
+            std::fs::write(sqlite_sidecar_path(&db_path, "-wal"), b"truncated-wal")
+                .expect("write damaged Franken diagnostic WAL");
+            std::fs::write(sqlite_sidecar_path(&db_path, "-shm"), b"coordination-shm")
+                .expect("write Franken diagnostic SHM");
+            install_diagnostic_breaker(&db_path, breaker_kind);
+            let franken_before = exact_diagnostic_parent_snapshot(franken_directory.path());
+
+            assert!(
+                open_guarded_read_only_franken_existing_file(
+                    &db_path,
+                    "Franken diagnostic helper test",
+                )
+                .is_err(),
+                "Franken helper must refuse suspect exact family"
+            );
+            assert_eq!(
+                exact_diagnostic_parent_snapshot(franken_directory.path()),
+                franken_before
+            );
+
+            inspect_mailbox_db_inventory(&db_path)
+                .expect_err("public mailbox inventory must refuse suspect exact family");
+            crate::reconstruct::collect_db_message_ids(&db_path)
+                .expect_err("public message inventory must refuse suspect exact family");
+            let integrity = crate::integrity::inspect_mailbox_integrity(
+                &db_path,
+                crate::integrity::CheckKind::Quick,
+            );
+            assert_eq!(
+                integrity.status,
+                crate::integrity::MailboxIntegrityStatus::Broken
+            );
+            let pool = DbPool::new(&DbPoolConfig {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&db_path),
+                storage_root: Some(franken_directory.path().join("archive")),
+                ..Default::default()
+            })
+            .expect("construct lazy diagnostic pool");
+            pool.sample_recent_message_refs(1)
+                .expect_err("public consistency sampler must refuse suspect exact family");
+
+            assert_eq!(
+                exact_diagnostic_parent_snapshot(franken_directory.path()),
+                franken_before,
+                "every refused public diagnostic must preserve exact names and bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_read_only_helpers_refuse_every_nonregular_generation_sidecar() {
+        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+            let canonical_directory = tempfile::tempdir().expect("canonical tempdir");
+            let canonical_db_path = canonical_directory
+                .path()
+                .join(format!("canonical-nonregular-{}.sqlite3", &suffix[1..]));
+            seed_settled_diagnostic_database(&canonical_db_path);
+            std::fs::create_dir(sqlite_sidecar_path(&canonical_db_path, suffix))
+                .expect("create non-regular canonical sidecar fixture");
+            let canonical_before = exact_diagnostic_parent_snapshot(canonical_directory.path());
+            assert!(
+                open_guarded_read_only_canonical_sqlite_file(
+                    &canonical_db_path,
+                    "non-regular canonical sidecar test",
+                )
+                .is_err(),
+                "canonical helper must refuse non-regular {suffix}"
+            );
+            assert_eq!(
+                exact_diagnostic_parent_snapshot(canonical_directory.path()),
+                canonical_before
+            );
+            assert_no_read_only_diagnostic_artifacts(canonical_directory.path());
+
+            let franken_directory = tempfile::tempdir().expect("Franken tempdir");
+            let franken_db_path = franken_directory
+                .path()
+                .join(format!("franken-nonregular-{}.sqlite3", &suffix[1..]));
+            seed_settled_diagnostic_database(&franken_db_path);
+            admit_diagnostic_database_with_franken(&franken_db_path);
+            std::fs::create_dir(sqlite_sidecar_path(&franken_db_path, suffix))
+                .expect("create non-regular Franken sidecar fixture");
+            let franken_before = exact_diagnostic_parent_snapshot(franken_directory.path());
+            assert!(
+                open_guarded_read_only_franken_existing_file(
+                    &franken_db_path,
+                    "non-regular Franken sidecar test",
+                )
+                .is_err(),
+                "Franken helper must refuse non-regular {suffix}"
+            );
+            assert_eq!(
+                exact_diagnostic_parent_snapshot(franken_directory.path()),
+                franken_before
+            );
+        }
+    }
+
+    #[test]
+    fn live_preflight_accepts_certified_empty_shm_beside_populated_wal() {
+        // Regression: a healthy, actively written FrankenSQLite database
+        // routinely carries a 0-byte `-shm` beside a populated `-wal` (the
+        // sidecar is created before its first mapping grows it). The strict
+        // family preflights briefly classified that normal live shape as
+        // damage, refusing every live read-only open (spurious
+        // wal_sidecar_corruption; conformance failed wholesale).
+        let directory = tempfile::tempdir().expect("empty-shm tempdir");
+        let db_path = directory.path().join("empty-shm.sqlite3");
+        seed_settled_diagnostic_database(&db_path);
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open empty-shm fixture writer"),
+            "clean up empty-shm fixture writer",
+        );
+        writer
+            .execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable WAL mode");
+        writer
+            .execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable autocheckpoint");
+        writer
+            .execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (9);")
+            .expect("commit WAL frame");
+        // Capture the family bytes while the writer is still open (closing the
+        // last connection would checkpoint and delete the WAL), then rebuild
+        // the shape at a second path with NO live engine attached: mutating a
+        // live-mapped -shm in place would SIGBUS the mapping holder.
+        let db_bytes = std::fs::read(&db_path).expect("read fixture db bytes");
+        let wal_bytes =
+            std::fs::read(sqlite_sidecar_path(&db_path, "-wal")).expect("read fixture WAL bytes");
+        assert!(!wal_bytes.is_empty(), "fixture WAL must carry frames");
+        let wal_cert_bytes = std::fs::read(sqlite_sidecar_path(&db_path, "-wal-cert"))
+            .expect("read fixture WAL certificate bytes");
+        assert!(
+            !wal_cert_bytes.is_empty(),
+            "fixture WAL certificate must bind the live Franken generation"
+        );
+        drop(writer);
+
+        let observed_directory = tempfile::tempdir().expect("observed tempdir");
+        let observed_db_path = observed_directory.path().join("empty-shm-observed.sqlite3");
+        std::fs::write(&observed_db_path, &db_bytes).expect("write observed db");
+        std::fs::write(sqlite_sidecar_path(&observed_db_path, "-wal"), &wal_bytes)
+            .expect("write observed WAL");
+        std::fs::write(
+            sqlite_sidecar_path(&observed_db_path, "-wal-cert"),
+            &wal_cert_bytes,
+        )
+        .expect("write observed WAL certificate");
+        let shm_path = sqlite_sidecar_path(&observed_db_path, "-shm");
+        std::fs::write(&shm_path, b"").expect("write empty observed SHM");
+        assert_eq!(std::fs::metadata(&shm_path).expect("shm metadata").len(), 0);
+
+        preflight_bound_live_franken_family(&observed_db_path, "empty-shm regression")
+            .expect("live preflight must accept an empty SHM beside a populated WAL");
+    }
+
+    #[test]
+    fn guarded_read_only_helpers_refuse_valid_wal_without_shm_byte_identically() {
+        let source_directory = tempfile::tempdir().expect("WAL source tempdir");
+        let source_path = source_directory.path().join("source.sqlite3");
+        seed_settled_diagnostic_database(&source_path);
+        let source_writer =
+            crate::CanonicalDbConn::open_file(source_path.to_string_lossy().as_ref())
+                .expect("open WAL source writer");
+        source_writer
+            .execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable source WAL mode");
+        source_writer
+            .execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable source autocheckpoint");
+        source_writer
+            .execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (8);")
+            .expect("commit source WAL frame");
+        let wal_bytes = std::fs::read(sqlite_sidecar_path(&source_path, "-wal"))
+            .expect("read valid source WAL");
+        assert!(wal_bytes.len() > SQLITE_WAL_HEADER_BYTES_USIZE);
+
+        let canonical_directory = tempfile::tempdir().expect("canonical tempdir");
+        let canonical_db_path = canonical_directory.path().join("missing-shm.sqlite3");
+        seed_settled_diagnostic_database(&canonical_db_path);
+        std::fs::write(sqlite_sidecar_path(&canonical_db_path, "-wal"), &wal_bytes)
+            .expect("write canonical WAL-without-SHM fixture");
+        assert!(!sqlite_sidecar_path(&canonical_db_path, "-shm").exists());
+        let canonical_before = exact_diagnostic_parent_snapshot(canonical_directory.path());
+        assert!(
+            open_guarded_read_only_canonical_sqlite_file(
+                &canonical_db_path,
+                "canonical WAL-without-SHM refusal",
+            )
+            .is_err()
+        );
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(canonical_directory.path()),
+            canonical_before
+        );
+        assert_no_read_only_diagnostic_artifacts(canonical_directory.path());
+
+        let franken_directory = tempfile::tempdir().expect("Franken tempdir");
+        let franken_db_path = franken_directory.path().join("missing-shm.sqlite3");
+        seed_settled_diagnostic_database(&franken_db_path);
+        seed_quiescent_franken_namespace(&franken_db_path);
+        std::fs::write(sqlite_sidecar_path(&franken_db_path, "-wal"), &wal_bytes)
+            .expect("write Franken WAL-without-SHM fixture");
+        assert!(!sqlite_sidecar_path(&franken_db_path, "-shm").exists());
+        let franken_before = exact_diagnostic_parent_snapshot(franken_directory.path());
+        assert!(
+            open_guarded_read_only_franken_existing_file(
+                &franken_db_path,
+                "Franken WAL-without-SHM refusal",
+            )
+            .is_err()
+        );
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(franken_directory.path()),
+            franken_before
+        );
+
+        drop(source_writer);
+    }
+
+    #[test]
+    fn guarded_read_only_helpers_reject_corrupt_primaries_without_artifacts() {
+        for (corruption, corrupt_bytes) in
+            [("empty", Vec::new()), ("invalid-header", vec![0xA5; 4096])]
+        {
+            let canonical_directory = tempfile::tempdir().expect("canonical tempdir");
+            let canonical_db_path = canonical_directory
+                .path()
+                .join(format!("canonical-{corruption}.sqlite3"));
+            std::fs::write(&canonical_db_path, &corrupt_bytes)
+                .expect("write corrupt canonical primary fixture");
+            let canonical_before = exact_diagnostic_parent_snapshot(canonical_directory.path());
+            assert!(
+                open_guarded_read_only_canonical_sqlite_file(
+                    &canonical_db_path,
+                    "corrupt canonical header test",
+                )
+                .is_err()
+            );
+            assert_eq!(
+                exact_diagnostic_parent_snapshot(canonical_directory.path()),
+                canonical_before
+            );
+            assert_no_read_only_diagnostic_artifacts(canonical_directory.path());
+
+            let franken_directory = tempfile::tempdir().expect("Franken tempdir");
+            let franken_db_path = franken_directory
+                .path()
+                .join(format!("franken-{corruption}.sqlite3"));
+            seed_settled_diagnostic_database(&franken_db_path);
+            seed_quiescent_franken_namespace(&franken_db_path);
+            // Truncate in place so the namespace's recorded file identity still
+            // names this exact generation. The guarded seam must reach its
+            // fd-free metadata/engine validation, not fail vacuously on a
+            // missing or stale namespace pair.
+            std::fs::write(&franken_db_path, &corrupt_bytes)
+                .expect("overwrite admitted Franken primary fixture");
+            let franken_before = exact_diagnostic_parent_snapshot(franken_directory.path());
+            assert!(
+                open_guarded_read_only_franken_existing_file(
+                    &franken_db_path,
+                    "corrupt Franken header test",
+                )
+                .is_err()
+            );
+            assert_eq!(
+                exact_diagnostic_parent_snapshot(franken_directory.path()),
+                franken_before
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_read_only_helpers_apply_nonclean_authority_without_mutation() {
+        for breaker_kind in ["malformed", "tripped"] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let db_path = directory
+                .path()
+                .join(format!("guarded-healthy-{breaker_kind}.sqlite3"));
+            seed_settled_diagnostic_database(&db_path);
+            install_diagnostic_breaker(&db_path, breaker_kind);
+            let canonical_before = exact_diagnostic_parent_snapshot(directory.path());
+
+            {
+                let conn = open_guarded_read_only_canonical_sqlite_file(
+                    &db_path,
+                    "healthy canonical diagnostic helper test",
+                )
+                .expect("healthy exact family must remain canonically readable");
+                assert_eq!(
+                    conn.query_sync("SELECT value FROM diagnostic_fixture", &[])
+                        .expect("query healthy canonical diagnostic")[0]
+                        .get_named::<i64>("value")
+                        .expect("decode canonical diagnostic value"),
+                    7
+                );
+                conn.execute_raw("PRAGMA query_only = OFF;")
+                    .expect("disable connection-local canonical query_only guard");
+                assert!(
+                    conn.execute_raw("CREATE TABLE forbidden_canonical(value INTEGER)")
+                        .is_err(),
+                    "canonical read-only flags must survive a query_only downgrade attempt"
+                );
+            }
+            assert_eq!(
+                exact_diagnostic_parent_snapshot(directory.path()),
+                canonical_before,
+                "successful canonical diagnostics must preserve exact names and bytes"
+            );
+            assert_no_read_only_diagnostic_artifacts(directory.path());
+
+            // A Franken-typed strict pool is admitted only when an exact
+            // pre-existing Franken namespace can be locked and identity-
+            // checked. Seed that authority before the mutation snapshot.
+            admit_diagnostic_database_with_franken(&db_path);
+            let franken_before = exact_diagnostic_parent_snapshot(directory.path());
+
+            assert!(
+                open_guarded_read_only_franken_existing_file(
+                    &db_path,
+                    "nonclean Franken strict-pool helper test",
+                )
+                .is_err(),
+                "live Franken diagnostics must refuse {breaker_kind} authority without opening the main inode to fingerprint it"
+            );
+
+            inspect_mailbox_db_inventory(&db_path)
+                .expect_err("public mailbox inventory must honor nonclean authority");
+            crate::reconstruct::collect_db_message_ids(&db_path)
+                .expect_err("public message inventory must honor nonclean authority");
+            let integrity = crate::integrity::inspect_mailbox_integrity(
+                &db_path,
+                crate::integrity::CheckKind::Quick,
+            );
+            assert_eq!(
+                integrity.status,
+                crate::integrity::MailboxIntegrityStatus::Broken,
+                "public integrity diagnostics must honor nonclean authority"
+            );
+            let pool = DbPool::new(&DbPoolConfig {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&db_path),
+                storage_root: Some(directory.path().join("archive")),
+                ..Default::default()
+            })
+            .expect("construct lazy nonclean-authority diagnostic pool");
+            pool.sample_recent_message_refs(1)
+                .expect_err("public consistency sampler must honor nonclean authority");
+
+            assert_eq!(
+                exact_diagnostic_parent_snapshot(directory.path()),
+                franken_before,
+                "refused Franken strict-pool reads must preserve exact names and bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_read_only_franken_helper_serves_clean_admitted_family_query_only() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("clean-admitted.sqlite3");
+        seed_settled_diagnostic_database(&db_path);
+        admit_diagnostic_database_with_franken(&db_path);
+        let before = exact_diagnostic_parent_snapshot(directory.path());
+
+        {
+            let conn = open_guarded_read_only_franken_existing_file(
+                &db_path,
+                "clean Franken diagnostic helper test",
+            )
+            .expect("clean admitted family must remain readable");
+            assert_eq!(
+                conn.query_sync("SELECT value FROM diagnostic_fixture", &[])
+                    .expect("query clean Franken diagnostic")[0]
+                    .get_named::<i64>("value")
+                    .expect("decode clean Franken diagnostic value"),
+                7
+            );
+            conn.execute_raw("PRAGMA query_only = OFF;")
+                .expect("disable connection-local Franken query_only guard");
+            assert!(
+                conn.execute_raw("CREATE TABLE forbidden_franken(value INTEGER)")
+                    .is_err(),
+                "Franken engine read-only mode must survive a query_only downgrade attempt"
+            );
+        }
+
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(directory.path()),
+            before,
+            "successful Franken read-only diagnostics must preserve exact names and bytes"
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    fn franken_query_only_seam_refuses_malformed_and_stale_namespace_without_rebinding() {
+        for namespace_kind in ["malformed", "stale-generation"] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let db_path = directory
+                .path()
+                .join(format!("namespace-{namespace_kind}.sqlite3"));
+            seed_settled_diagnostic_database(&db_path);
+            seed_quiescent_franken_namespace(&db_path);
+            let use_path = sqlite_sidecar_path(&db_path, "-fsqlite-ns-use");
+
+            if namespace_kind == "malformed" {
+                std::fs::write(&use_path, b"malformed namespace authority")
+                    .expect("corrupt namespace authority fixture");
+            } else {
+                let displaced = directory.path().join("displaced.sqlite3");
+                std::fs::rename(&db_path, &displaced)
+                    .expect("displace recorded namespace generation");
+                seed_settled_diagnostic_database(&db_path);
+            }
+
+            let sentinel = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+            std::fs::File::options()
+                .write(true)
+                .open(&use_path)
+                .expect("open namespace use record for timestamp sentinel")
+                .set_times(std::fs::FileTimes::new().set_modified(sentinel))
+                .expect("set namespace use timestamp sentinel");
+            let use_before = std::fs::read(&use_path).expect("snapshot namespace use bytes");
+            let use_metadata_before =
+                std::fs::metadata(&use_path).expect("snapshot namespace use metadata");
+            let family_before = exact_diagnostic_parent_snapshot(directory.path());
+
+            assert!(
+                open_guarded_read_only_franken_existing_file(
+                    &db_path,
+                    "stale namespace query-only pool test",
+                )
+                .is_err(),
+                "Franken pool seam must refuse {namespace_kind} namespace authority"
+            );
+
+            assert!(
+                open_guarded_read_only_canonical_sqlite_file(
+                    &db_path,
+                    "stale namespace canonical diagnostic refusal",
+                )
+                .is_err(),
+                "canonical SQLite must not open a main inode with occupied Franken namespace authority"
+            );
+
+            let use_metadata_after =
+                std::fs::metadata(&use_path).expect("inspect preserved namespace use metadata");
+            assert_eq!(std::fs::read(&use_path).unwrap(), use_before);
+            assert_eq!(use_metadata_after.len(), use_metadata_before.len());
+            assert_eq!(
+                use_metadata_after.modified().ok(),
+                use_metadata_before.modified().ok(),
+                "read-only seams must not rewrite namespace authority metadata"
+            );
+            assert_eq!(
+                exact_diagnostic_parent_snapshot(directory.path()),
+                family_before,
+                "read-only seams must preserve every namespace-family name and byte"
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_read_only_helpers_accept_relative_paths_at_their_authority_boundaries() {
+        let current_dir = std::env::current_dir().expect("current directory");
+        let directory = tempfile::Builder::new()
+            .prefix("relative-read-only-")
+            .tempdir_in(&current_dir)
+            .expect("relative-path tempdir");
+        let absolute_db_path = directory.path().join("relative.sqlite3");
+        seed_settled_diagnostic_database(&absolute_db_path);
+        let relative_db_path = absolute_db_path
+            .strip_prefix(&current_dir)
+            .expect("temp database is beneath current directory");
+        assert!(!sqlite_sidecar_path(&absolute_db_path, "-fsqlite-ns-gate").exists());
+        assert!(!sqlite_sidecar_path(&absolute_db_path, "-fsqlite-ns-use").exists());
+        let sidecarless_before = exact_diagnostic_parent_snapshot(directory.path());
+
+        assert!(
+            open_guarded_read_only_franken_existing_file(
+                relative_db_path,
+                "relative sidecar-less Franken refusal control",
+            )
+            .is_err(),
+            "Franken strict read-only opens must require pre-existing namespace authority"
+        );
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(directory.path()),
+            sidecarless_before
+        );
+
+        let canonical = open_guarded_read_only_canonical_sqlite_file(
+            relative_db_path,
+            "relative sidecar-less canonical control",
+        )
+        .expect("relative sidecar-less canonical open");
+        assert_eq!(
+            canonical
+                .query_sync("SELECT value FROM diagnostic_fixture", &[])
+                .expect("query relative canonical database")[0]
+                .get_named::<i64>("value")
+                .expect("decode relative canonical value"),
+            7
+        );
+        drop(canonical);
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(directory.path()),
+            sidecarless_before
+        );
+        assert_no_read_only_diagnostic_artifacts(directory.path());
+
+        admit_diagnostic_database_with_franken(&absolute_db_path);
+        let admitted_before = exact_diagnostic_parent_snapshot(directory.path());
+        let franken = open_guarded_read_only_franken_existing_file(
+            relative_db_path,
+            "relative admitted Franken control",
+        )
+        .expect("relative admitted Franken open");
+        assert_eq!(
+            franken
+                .query_sync("SELECT value FROM diagnostic_fixture", &[])
+                .expect("query relative Franken database")[0]
+                .get_named::<i64>("value")
+                .expect("decode relative Franken value"),
+            7
+        );
+        drop(franken);
+
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(directory.path()),
+            admitted_before
+        );
+    }
+
+    #[test]
+    fn guarded_read_only_helpers_accept_benign_partial_page_tail_byte_identically() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("partial-page-tail.sqlite3");
+        seed_settled_diagnostic_database(&db_path);
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&db_path)
+            .expect("open database for benign tail fixture")
+            .write_all(b"benign trailing slack")
+            .expect("append benign partial-page tail");
+        let sidecarless_before = exact_diagnostic_parent_snapshot(directory.path());
+
+        let canonical = open_guarded_read_only_canonical_sqlite_file(
+            &db_path,
+            "partial-page-tail canonical control",
+        )
+        .expect("canonical reader accepts benign partial-page tail");
+        assert_eq!(
+            canonical
+                .query_sync("SELECT value FROM diagnostic_fixture", &[])
+                .expect("query canonical partial-tail database")[0]
+                .get_named::<i64>("value")
+                .expect("decode canonical partial-tail value"),
+            7
+        );
+        drop(canonical);
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(directory.path()),
+            sidecarless_before
+        );
+        assert_no_read_only_diagnostic_artifacts(directory.path());
+
+        seed_quiescent_franken_namespace(&db_path);
+        let admitted_before = exact_diagnostic_parent_snapshot(directory.path());
+        let franken = open_guarded_read_only_franken_existing_file(
+            &db_path,
+            "partial-page-tail Franken control",
+        )
+        .expect("Franken reader accepts benign partial-page tail");
+        assert_eq!(
+            franken
+                .query_sync("SELECT value FROM diagnostic_fixture", &[])
+                .expect("query Franken partial-tail database")[0]
+                .get_named::<i64>("value")
+                .expect("decode Franken partial-tail value"),
+            7
+        );
+        drop(franken);
+
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(directory.path()),
+            admitted_before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_read_only_helpers_preserve_valid_live_wal_byte_identically() {
+        const WAL_CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_RO_WAL_WRITER_PATH";
+        const WAL_CHILD_TEST_NAME: &str =
+            "pool::tests::guarded_read_only_helpers_preserve_valid_live_wal_byte_identically";
+        const WAL_CHILD_READY: &str = "guarded-read-only-wal-writer-ready";
+
+        if let Some(path) = std::env::var_os(WAL_CHILD_PATH_ENV) {
+            use std::io::{BufRead as _, Write as _};
+
+            let writer =
+                crate::CanonicalDbConn::open_file(PathBuf::from(path).to_string_lossy().as_ref())
+                    .expect("child opens canonical live WAL writer");
+            writer
+                .execute_raw("PRAGMA journal_mode = WAL;")
+                .expect("child enables canonical live WAL mode");
+            writer
+                .execute_raw("PRAGMA wal_autocheckpoint = 0;")
+                .expect("child disables canonical automatic WAL checkpoints");
+            writer
+                .execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (8);")
+                .expect("child commits canonical uncheckpointed live WAL row");
+            println!("{WAL_CHILD_READY}");
+            std::io::stdout()
+                .flush()
+                .expect("flush child ready witness");
+            let mut release = String::new();
+            std::io::stdin()
+                .lock()
+                .read_line(&mut release)
+                .expect("read parent release signal");
+            assert_eq!(release.trim(), "release");
+            drop(writer);
+            return;
+        }
+
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Stdio;
+
+        let canonical_directory = tempfile::tempdir().expect("canonical tempdir");
+        let canonical_db_path = canonical_directory
+            .path()
+            .join("canonical-live-wal.sqlite3");
+        seed_settled_diagnostic_database(&canonical_db_path);
+        let mut canonical_writer = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg(WAL_CHILD_TEST_NAME)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(WAL_CHILD_PATH_ENV, &canonical_db_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn canonical live WAL writer child");
+        let mut child_stdout = std::io::BufReader::new(
+            canonical_writer
+                .stdout
+                .take()
+                .expect("capture canonical writer stdout"),
+        );
+        let mut ready = false;
+        loop {
+            let mut line = String::new();
+            if child_stdout
+                .read_line(&mut line)
+                .expect("read canonical writer witness")
+                == 0
+            {
+                break;
+            }
+            if line.contains(WAL_CHILD_READY) {
+                ready = true;
+                break;
+            }
+        }
+        assert!(
+            ready,
+            "canonical writer child exited before publishing readiness"
+        );
+        assert!(
+            std::fs::metadata(sqlite_sidecar_path(&canonical_db_path, "-wal"))
+                .is_ok_and(|metadata| metadata.len() > SQLITE_WAL_HEADER_BYTES),
+            "canonical fixture must retain at least one committed WAL frame"
+        );
+        let canonical_shm = sqlite_sidecar_path(&canonical_db_path, "-shm");
+        assert!(canonical_shm.is_file());
+        let mut shm_permissions = std::fs::metadata(&canonical_shm)
+            .expect("inspect canonical SHM permissions")
+            .permissions();
+        shm_permissions.set_mode(0o444);
+        std::fs::set_permissions(&canonical_shm, shm_permissions)
+            .expect("make canonical SHM read-only for mutation-sensitive URI proof");
+        let canonical_before = exact_diagnostic_parent_snapshot(canonical_directory.path());
+
+        let canonical = open_guarded_read_only_canonical_sqlite_file(
+            &canonical_db_path,
+            "valid live WAL canonical control",
+        )
+        .expect("canonical reader accepts valid live WAL with read-only SHM");
+        assert_eq!(
+            canonical
+                .query_sync("SELECT MAX(value) AS value FROM diagnostic_fixture", &[])
+                .expect("query valid live WAL through canonical SQLite")[0]
+                .get_named::<i64>("value")
+                .expect("decode canonical live-WAL value"),
+            8
+        );
+        drop(canonical);
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(canonical_directory.path()),
+            canonical_before,
+            "canonical read-only observer must not checkpoint or rewrite a valid live WAL family"
+        );
+        canonical_writer
+            .stdin
+            .as_mut()
+            .expect("canonical writer stdin")
+            .write_all(b"release\n")
+            .expect("release canonical writer child");
+        assert!(
+            canonical_writer
+                .wait()
+                .expect("wait for canonical writer child")
+                .success(),
+            "canonical writer child must exit cleanly"
+        );
+
+        let franken_directory = tempfile::tempdir().expect("Franken tempdir");
+        let franken_db_path = franken_directory.path().join("franken-live-wal.sqlite3");
+        seed_settled_diagnostic_database(&franken_db_path);
+        let franken_writer = DbConn::open_file(franken_db_path.to_string_lossy().as_ref())
+            .expect("open Franken live WAL writer");
+        franken_writer
+            .execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable Franken live WAL mode");
+        franken_writer
+            .execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable Franken automatic WAL checkpoints");
+        franken_writer
+            .execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (8);")
+            .expect("commit Franken uncheckpointed live WAL row");
+        assert!(
+            std::fs::metadata(sqlite_sidecar_path(&franken_db_path, "-wal"))
+                .is_ok_and(|metadata| metadata.len() > SQLITE_WAL_HEADER_BYTES),
+            "Franken fixture must retain at least one committed WAL frame"
+        );
+        assert!(
+            !sqlite_sidecar_path(&franken_db_path, "-shm").exists(),
+            "FrankenSQLite's healthy native WAL family does not require canonical SHM"
+        );
+        assert!(
+            std::fs::metadata(sqlite_sidecar_path(&franken_db_path, "-wal-cert"))
+                .is_ok_and(|metadata| metadata.len() > 0),
+            "SHM-less Franken WAL fixture must carry materialized WAL certificate authority"
+        );
+        assert!(sqlite_sidecar_path(&franken_db_path, "-fsqlite-ns-gate").is_file());
+        assert!(sqlite_sidecar_path(&franken_db_path, "-fsqlite-ns-use").is_file());
+        let franken_before = exact_diagnostic_parent_snapshot(franken_directory.path());
+
+        let franken = open_guarded_read_only_franken_existing_file(
+            &franken_db_path,
+            "valid live WAL Franken control",
+        )
+        .expect("Franken reader accepts valid live WAL");
+        assert_eq!(
+            franken
+                .query_sync("SELECT MAX(value) AS value FROM diagnostic_fixture", &[])
+                .expect("query valid live WAL through Franken")[0]
+                .get_named::<i64>("value")
+                .expect("decode Franken live-WAL value"),
+            8
+        );
+        drop(franken);
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(franken_directory.path()),
+            franken_before,
+            "Franken read-only observer must not checkpoint or rewrite a valid live WAL family"
+        );
+        crate::close_db_conn(franken_writer, "clean up live-WAL test writer");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn maintenance_lock_probe_child_branch(path_env: &str, witness: &str) -> bool {
+        let Some(path) = std::env::var_os(path_env) else {
+            return false;
+        };
+        let config =
+            sqlmodel_sqlite::SqliteConfig::file(PathBuf::from(path).to_string_lossy().into_owned())
+                .flags(sqlmodel_sqlite::OpenFlags::read_write())
+                .busy_timeout(10);
+        let competitor = crate::CanonicalDbConn::open(&config)
+            .expect("child opens competing canonical connection");
+        let blocked = match competitor.execute_raw("BEGIN IMMEDIATE;") {
+            Err(_) => true,
+            Ok(()) => competitor
+                .execute_raw(
+                    "CREATE TABLE __mcp_agent_mail_lock_probe(\
+                         id INTEGER PRIMARY KEY\
+                     );",
+                )
+                .is_err(),
+        };
+        if !blocked {
+            let _ = competitor.execute_raw("ROLLBACK;");
+        }
+        assert!(
+            blocked,
+            "separate process must be unable to perform a conflicting write while the parent holds its writer lock"
+        );
+        println!("{witness}");
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_maintenance_child_observes_busy(
+        test_name: &str,
+        path_env: &str,
+        witness: &str,
+        path: &Path,
+    ) {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg(test_name)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(path_env, path)
+        .output()
+        .expect("run competing child lock probe");
+        assert!(
+            output.status.success(),
+            "child lock probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(witness),
+            "child filter ran no causal lock probe: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn maintenance_test_pool(db_path: &Path) -> DbPool {
+        DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: db_path.parent().map(|parent| parent.join("archive")),
+            min_connections: 0,
+            max_connections: 2,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create live-maintenance test pool")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guarded_read_only_franken_preflight_preserves_same_process_writer_lock() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_RO_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str =
+            "pool::tests::guarded_read_only_franken_preflight_preserves_same_process_writer_lock";
+        const CHILD_WITNESS: &str = "guarded-read-only-child-observed-busy";
+
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            let config = sqlmodel_sqlite::SqliteConfig::file(
+                PathBuf::from(path).to_string_lossy().into_owned(),
+            )
+            .flags(sqlmodel_sqlite::OpenFlags::read_write())
+            .busy_timeout(10);
+            let competitor = crate::CanonicalDbConn::open(&config)
+                .expect("child opens competing canonical connection");
+            assert!(
+                competitor.execute_raw("BEGIN IMMEDIATE;").is_err(),
+                "separate process must not acquire the parent's reserved writer lock"
+            );
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        fn assert_child_observes_busy(path: &Path) {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("resolve current test executable"),
+            )
+            .arg(CHILD_TEST_NAME)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_PATH_ENV, path)
+            .output()
+            .expect("run competing child lock probe");
+            assert!(
+                output.status.success(),
+                "child lock probe failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(CHILD_WITNESS),
+                "child filter ran no causal lock probe: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("writer-lock.sqlite3");
+        seed_settled_diagnostic_database(&db_path);
+        let writer = DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open Franken writer-lock fixture");
+        writer
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("use main-inode rollback locking");
+        // Snapshot before acquiring the writer lock. Reading the main file
+        // during the transaction would itself open/close the inode and could
+        // release the exact process-wide fcntl lock this test is protecting.
+        let family_before = exact_diagnostic_parent_snapshot(directory.path());
+        let main_entry = family_before
+            .get(db_path.file_name().expect("writer-lock database file name"))
+            .cloned()
+            .expect("snapshot writer-lock main database");
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent reserved writer lock");
+        assert!(
+            !sqlite_sidecar_path(&db_path, "-journal").exists(),
+            "BEGIN IMMEDIATE without a write should not materialize a rollback journal"
+        );
+
+        assert_child_observes_busy(&db_path);
+        let observer = open_guarded_read_only_franken_existing_file(
+            &db_path,
+            "same-process writer-lock regression",
+        )
+        .expect("read-only observer coexists with a reserved writer");
+        assert_eq!(
+            observer
+                .query_sync("SELECT value FROM diagnostic_fixture", &[])
+                .expect("query while writer holds reserved lock")[0]
+                .get_named::<i64>("value")
+                .expect("decode writer-lock fixture"),
+            7
+        );
+        drop(observer);
+        assert_child_observes_busy(&db_path);
+
+        // A pathname-only namespace check is insufficient when another name
+        // reaches the same inode: the alias has no adjacent Franken namespace
+        // records, yet opening and closing it through canonical SQLite would
+        // release this process's classic fcntl locks on the original pathname.
+        // Both guarded seams therefore fail closed once the main inode has
+        // more than one link, before either engine opens it.
+        let alias_path = directory.path().join("writer-lock-alias.sqlite3");
+        std::fs::hard_link(&db_path, &alias_path)
+            .expect("create hard-link alias of live writer database");
+        let mut aliased_expected = family_before;
+        aliased_expected.insert(
+            alias_path
+                .file_name()
+                .expect("writer-lock alias file name")
+                .to_os_string(),
+            main_entry,
+        );
+        assert!(
+            open_guarded_read_only_canonical_sqlite_file(
+                &alias_path,
+                "hard-link alias canonical refusal",
+            )
+            .is_err(),
+            "canonical diagnostics must refuse an alias of a Franken-locked inode"
+        );
+        assert!(
+            open_guarded_read_only_franken_existing_file(
+                &db_path,
+                "hard-linked Franken main refusal",
+            )
+            .is_err(),
+            "Franken diagnostics must require one authoritative main pathname"
+        );
+        assert_child_observes_busy(&db_path);
+
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("release parent writer lock");
+        crate::close_db_conn(writer, "clean up writer-lock test fixture");
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(directory.path()),
+            aliased_expected,
+            "guarded observations and hard-link refusals must preserve every family name and byte"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn automatic_recovery_admission_fingerprint_preserves_live_locks_and_tracks_wal() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_BREAKER_FINGERPRINT_LOCK_PATH";
+        const CHILD_MODE_ENV: &str = "MCP_AGENT_MAIL_BREAKER_FINGERPRINT_LOCK_MODE";
+        const CHILD_TEST_NAME: &str = "pool::tests::automatic_recovery_admission_fingerprint_preserves_live_locks_and_tracks_wal";
+        const CHILD_WITNESS: &str = "breaker-fingerprint-child-observed-busy";
+
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            let mode = std::env::var(CHILD_MODE_ENV).expect("child lock-probe mode");
+            let config = sqlmodel_sqlite::SqliteConfig::file(
+                PathBuf::from(path).to_string_lossy().into_owned(),
+            )
+            .flags(sqlmodel_sqlite::OpenFlags::read_write())
+            .busy_timeout(10);
+            let competitor = crate::CanonicalDbConn::open(&config)
+                .expect("child opens competing canonical connection");
+            let conflict = match mode.as_str() {
+                "reserved" => competitor.execute_raw("BEGIN IMMEDIATE;"),
+                "shared" => competitor.execute_raw("BEGIN EXCLUSIVE;"),
+                _ => panic!("unexpected child lock-probe mode: {mode}"),
+            };
+            assert!(
+                conflict.is_err(),
+                "separate process must observe the parent's {mode} lock"
+            );
+            println!("{CHILD_WITNESS}-{mode}");
+            return;
+        }
+
+        fn assert_child_observes_busy(path: &Path, mode: &str) {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("resolve current test executable"),
+            )
+            .arg(CHILD_TEST_NAME)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_PATH_ENV, path)
+            .env(CHILD_MODE_ENV, mode)
+            .output()
+            .expect("run competing child lock probe");
+            assert!(
+                output.status.success(),
+                "child lock probe failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains(&format!("{CHILD_WITNESS}-{mode}")),
+                "child filter ran no causal lock probe: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("breaker-fingerprint-lock.sqlite3");
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open Franken breaker-fingerprint fixture"),
+            "clean up breaker-fingerprint fixture",
+        );
+        writer
+            .execute_raw(
+                "PRAGMA journal_mode = DELETE; \
+                 PRAGMA autocommit_retain = OFF; \
+                 CREATE TABLE fingerprint_probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL); \
+                 INSERT INTO fingerprint_probe(value) VALUES ('settled');",
+            )
+            .expect("seed breaker-fingerprint fixture");
+        assert!(
+            sqlite_path_requires_lock_neutral_fingerprint(&db_path),
+            "a live Franken generation must select the descriptor-neutral fingerprint"
+        );
+
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent RESERVED lock");
+        assert_child_observes_busy(&db_path, "reserved");
+        recovery_admission().reset();
+        with_recovery_admission(&db_path, "lock-neutral fingerprint success probe", || {
+            Ok::<(), SqlError>(())
+        })
+        .expect("successful admitted fingerprint probe");
+        assert_child_observes_busy(&db_path, "reserved");
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("release parent RESERVED lock");
+
+        writer
+            .execute_raw("BEGIN; SELECT value FROM fingerprint_probe;")
+            .expect("acquire parent SHARED lock");
+        assert_child_observes_busy(&db_path, "shared");
+        recovery_admission().reset();
+        let failure =
+            with_recovery_admission(&db_path, "lock-neutral fingerprint failure probe", || {
+                Err::<(), _>(SqlError::Custom("synthetic admitted failure".to_string()))
+            })
+            .expect_err("synthetic recovery must fail after admission");
+        assert!(failure.to_string().contains("synthetic admitted failure"));
+        assert_child_observes_busy(&db_path, "shared");
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("release parent SHARED lock");
+
+        writer
+            .execute_raw("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+            .expect("enable retained WAL generation");
+        let before = recovery_breaker_fingerprint(&db_path, None);
+        let main_before = std::fs::symlink_metadata(&db_path)
+            .expect("stat main before WAL commit")
+            .len();
+        writer
+            .execute_raw("INSERT INTO fingerprint_probe(value) VALUES ('wal-generation');")
+            .expect("commit a WAL-only generation");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        assert!(
+            std::fs::symlink_metadata(&wal_path)
+                .is_ok_and(|metadata| metadata.len() > SQLITE_WAL_HEADER_BYTES),
+            "fixture must retain committed WAL frames"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&db_path)
+                .expect("stat main after WAL commit")
+                .len(),
+            main_before,
+            "the decisive generation change must not rely on main-file growth"
+        );
+        let after = recovery_breaker_fingerprint(&db_path, None);
+        assert!(breaker_fingerprint_is_lock_neutral(&before));
+        assert!(breaker_fingerprint_is_lock_neutral(&after));
+        assert_ne!(
+            before, after,
+            "committed WAL truth must change the lock-neutral breaker fingerprint"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_analyze_preserves_writer_lock_and_populates_statistics_after_rollback() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_ANALYZE_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str = "pool::tests::live_analyze_preserves_writer_lock_and_populates_statistics_after_rollback";
+        const CHILD_WITNESS: &str = "live-analyze-child-observed-busy";
+
+        if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("live-analyze-lock.sqlite3");
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open Franken analyze fixture"),
+            "clean up live analyze lock fixture",
+        );
+        writer
+            .execute_raw(
+                "PRAGMA journal_mode = DELETE; \
+                 PRAGMA autocommit_retain = OFF; \
+                 CREATE TABLE analyze_probe(id INTEGER PRIMARY KEY, value INTEGER NOT NULL); \
+                 CREATE INDEX analyze_probe_value_idx ON analyze_probe(value); \
+                 WITH RECURSIVE seq(n) AS ( \
+                     SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 128 \
+                 ) INSERT INTO analyze_probe(value) SELECT n % 7 FROM seq;",
+            )
+            .expect("seed analyze fixture");
+        let pool = maintenance_test_pool(&db_path);
+
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent analyze writer lock");
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+        let error = pool
+            .analyze()
+            .expect_err("ANALYZE must respect the active same-engine transaction fence");
+        assert!(
+            is_lock_error(&error.to_string()),
+            "fenced ANALYZE should report lock/busy contention: {error}"
+        );
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("release parent analyze writer lock");
+        pool.analyze()
+            .expect("ANALYZE should succeed after the writer rolls back");
+        let verify = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open analyze semantic verifier"),
+            "clean up analyze semantic verifier",
+        );
+        let rows = verify
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM sqlite_stat1 WHERE tbl = 'analyze_probe'",
+                &[],
+            )
+            .expect("query ANALYZE statistics");
+        assert!(
+            rows[0]
+                .get_named::<i64>("count")
+                .expect("decode statistics count")
+                > 0,
+            "successful ANALYZE must materialize planner statistics"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_vacuum_preserves_writer_lock_and_reclaims_pages_after_rollback() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_VACUUM_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str =
+            "pool::tests::live_vacuum_preserves_writer_lock_and_reclaims_pages_after_rollback";
+        const CHILD_WITNESS: &str = "live-vacuum-child-observed-busy";
+
+        if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("live-vacuum-lock.sqlite3");
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open Franken vacuum fixture"),
+            "clean up live vacuum lock fixture",
+        );
+        writer
+            .execute_raw(
+                "PRAGMA journal_mode = DELETE; \
+                 PRAGMA autocommit_retain = OFF; \
+                 CREATE TABLE vacuum_probe(id INTEGER PRIMARY KEY, payload BLOB NOT NULL); \
+                 WITH RECURSIVE seq(n) AS ( \
+                     SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 384 \
+                 ) INSERT INTO vacuum_probe(payload) SELECT randomblob(2048) FROM seq; \
+                 DELETE FROM vacuum_probe;",
+            )
+            .expect("seed deleted pages for vacuum fixture");
+        let free_before = read_pragma_i64(&writer, "PRAGMA freelist_count;", "freelist_count")
+            .expect("read freelist before VACUUM");
+        assert!(free_before > 0, "fixture must contain reclaimable pages");
+        let pool = maintenance_test_pool(&db_path);
+
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent vacuum writer lock");
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+        let error = pool
+            .vacuum()
+            .expect_err("VACUUM must respect the active same-engine maintenance fence");
+        assert!(
+            is_lock_error(&error.to_string()),
+            "fenced VACUUM should report lock/busy contention: {error}"
+        );
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("release parent vacuum writer lock");
+        pool.vacuum()
+            .expect("VACUUM should succeed after the writer rolls back");
+        let verify = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open vacuum semantic verifier"),
+            "clean up vacuum semantic verifier",
+        );
+        let free_after = read_pragma_i64(&verify, "PRAGMA freelist_count;", "freelist_count")
+            .expect("read freelist after VACUUM");
+        assert_eq!(free_after, 0, "successful VACUUM must empty the freelist");
+        assert!(free_after < free_before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_checkpoint_preserves_writer_lock_and_checkpoints_frames_after_rollback() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_CHECKPOINT_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str = "pool::tests::live_checkpoint_preserves_writer_lock_and_checkpoints_frames_after_rollback";
+        const CHILD_WITNESS: &str = "live-checkpoint-child-observed-busy";
+
+        if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("live-checkpoint-lock.sqlite3");
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open Franken checkpoint fixture"),
+            "clean up live checkpoint lock fixture",
+        );
+        writer
+            .execute_raw(
+                "PRAGMA journal_mode = DELETE; \
+                 PRAGMA autocommit_retain = OFF; \
+                 CREATE TABLE checkpoint_probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .expect("seed checkpoint fixture");
+        let pool = maintenance_test_pool(&db_path);
+
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent checkpoint writer lock");
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+        if let Ok(checkpointed) = pool.wal_checkpoint() {
+            assert_eq!(
+                checkpointed, 0,
+                "a checkpoint fenced by a DELETE-mode writer may only succeed as a no-WAL no-op"
+            );
+        }
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("release parent checkpoint writer lock");
+        writer
+            .execute_raw(
+                "PRAGMA journal_mode = WAL; \
+                 PRAGMA wal_autocheckpoint = 0; \
+                 INSERT INTO checkpoint_probe(value) VALUES ('alpha'), ('beta'), ('gamma');",
+            )
+            .expect("create committed WAL frames");
+        let checkpointed = pool
+            .wal_checkpoint()
+            .expect("TRUNCATE checkpoint should succeed after rollback");
+        assert!(
+            checkpointed > 0,
+            "semantic checkpoint fixture must move at least one committed WAL frame"
+        );
+        let rows = writer
+            .query_sync("SELECT COUNT(*) AS count FROM checkpoint_probe", &[])
+            .expect("query data after checkpoint");
+        assert_eq!(
+            rows[0].get_named::<i64>("count").expect("decode row count"),
+            3,
+            "checkpoint must preserve committed rows"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_runtime_pragma_probe_preserves_writer_lock_and_checks_live_handle() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_STARTUP_PRAGMA_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str = "pool::tests::startup_runtime_pragma_probe_preserves_writer_lock_and_checks_live_handle";
+        const CHILD_WITNESS: &str = "startup-pragma-child-observed-busy";
+
+        if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("startup-pragma-lock.sqlite3");
+        let db_path_str = db_path.to_str().expect("utf8 database path");
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(db_path_str).expect("open Franken startup probe fixture"),
+            "clean up startup pragma lock fixture",
+        );
+        writer
+            .execute_raw(&format!(
+                "PRAGMA journal_mode = DELETE; \
+                 PRAGMA autocommit_retain = OFF; \
+                 PRAGMA busy_timeout = {REQUIRED_STARTUP_BUSY_TIMEOUT_MS}; \
+                 CREATE TABLE startup_probe(id INTEGER PRIMARY KEY);"
+            ))
+            .expect("seed startup probe fixture");
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent startup-probe writer lock");
+
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+        let error = assert_required_startup_pragmas(&writer, db_path_str)
+            .expect_err("DELETE mode must fail the startup WAL invariant");
+        assert!(
+            error.to_string().contains("journal_mode='delete'"),
+            "startup probe must report the live handle's mode: {error}"
+        );
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+
+        writer
+            .execute_raw("ROLLBACK; PRAGMA journal_mode = WAL;")
+            .expect("release writer and enable WAL");
+        assert_required_startup_pragmas(&writer, db_path_str)
+            .expect("startup probe should accept WAL on the same runtime handle");
     }
 
     #[test]
@@ -11337,9 +17682,9 @@ mod tests {
         let rt = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
 
         let (project_id, sender_id) = rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let project =
                 crate::queries::ensure_project(&cx, &pool, "/data/projects/am-id-floor-repro")
                     .await
@@ -11389,6 +17734,7 @@ mod tests {
         );
 
         let next = rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             crate::queries::create_message(
                 &cx,
                 &pool,
@@ -11410,6 +17756,711 @@ mod tests {
             Some(9002),
             "next normal INSERT must allocate strictly above the archive max"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn archive_id_floor_advance_preserves_same_process_writer_lock() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_ID_FLOOR_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str =
+            "pool::tests::archive_id_floor_advance_preserves_same_process_writer_lock";
+        const CHILD_WITNESS: &str = "id-floor-child-observed-busy";
+
+        if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("id-floor-lock.sqlite3");
+        let storage_root = directory.path().join("archive");
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open Franken id-floor fixture"),
+            "clean up id-floor lock fixture",
+        );
+        writer
+            .execute_raw(
+                "PRAGMA journal_mode = DELETE; \
+                 PRAGMA autocommit_retain = OFF; \
+                 CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT); \
+                 INSERT INTO messages DEFAULT VALUES;",
+            )
+            .expect("seed id-floor lock fixture");
+        write_id_floor_canonical_message(&storage_root, "archived-project", 9001);
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(storage_root),
+            min_connections: 0,
+            max_connections: 2,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create id-floor test pool");
+
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent id-floor writer lock");
+        writer
+            .execute_raw("INSERT INTO messages DEFAULT VALUES;")
+            .expect("materialize parent id-floor writer lock");
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+        let error = pool
+            .advance_message_id_floor_from_archive()
+            .expect_err("id-floor advance must respect the active same-engine writer fence");
+        assert!(
+            is_lock_error(&error.to_string()),
+            "fenced id-floor advance should report lock/busy contention: {error}"
+        );
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("release parent id-floor writer lock");
+        assert_eq!(
+            pool.advance_message_id_floor_from_archive()
+                .expect("advance id floor after writer rollback"),
+            Some(9001)
+        );
+        let rows = writer
+            .query_sync(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'messages'",
+                &[],
+            )
+            .expect("read advanced id-floor sequence");
+        assert_eq!(
+            rows.len(),
+            1,
+            "FrankenSQLite id-floor advance must leave one allocator row"
+        );
+        assert_eq!(
+            rows[0].get_named::<i64>("seq").expect("decode sequence"),
+            9001
+        );
+    }
+
+    fn seed_pool_authority_sentinel(path: &Path, value: &str) {
+        let insert = match value {
+            "A" => "INSERT INTO pool_authority_sentinel(value) VALUES('A')",
+            "B" => "INSERT INTO pool_authority_sentinel(value) VALUES('B')",
+            other => panic!("unsupported pool-authority sentinel {other:?}"),
+        };
+        let conn = crate::CanonicalDbConn::open_file(
+            path.to_str()
+                .expect("temporary pool-authority path must be valid UTF-8"),
+        )
+        .expect("open pool-authority sentinel database");
+        conn.execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("use standalone journal mode for pool-authority fixture");
+        conn.execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("initialize pool-authority mailbox schema");
+        conn.execute_raw("CREATE TABLE pool_authority_sentinel(value TEXT NOT NULL UNIQUE)")
+            .expect("create pool-authority sentinel table");
+        conn.execute_raw(insert)
+            .expect("insert pool-authority sentinel");
+    }
+
+    fn read_pool_authority_sentinel(pool: &DbPool) -> String {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build pool-authority runtime");
+        let cx = Cx::for_testing();
+        runtime.block_on(async {
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("acquire pool-authority connection");
+            let rows = conn
+                .query_sync("SELECT value FROM pool_authority_sentinel", &[])
+                .expect("read pool-authority sentinel");
+            assert_eq!(rows.len(), 1, "fixture must contain one sentinel row");
+            rows[0]
+                .get_named::<String>("value")
+                .expect("decode pool-authority sentinel")
+        })
+    }
+
+    #[test]
+    fn relative_sqlite_authority_is_frozen_across_cwd_change() {
+        const CHILD_CWD_A_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_CWD_A";
+        const CHILD_CWD_B_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_CWD_B";
+        const CHILD_STORAGE_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_STORAGE";
+        const CHILD_TEST_NAME: &str =
+            "pool::tests::relative_sqlite_authority_is_frozen_across_cwd_change";
+        const CHILD_WITNESS: &str = "relative-pool-authority-frozen";
+
+        if let Some(cwd_b) = std::env::var_os(CHILD_CWD_B_ENV) {
+            let cwd_a =
+                PathBuf::from(std::env::var_os(CHILD_CWD_A_ENV).expect("child cwd A authority"));
+            let cwd_b = PathBuf::from(cwd_b);
+            let storage_root = PathBuf::from(
+                std::env::var_os(CHILD_STORAGE_ENV).expect("child storage authority"),
+            );
+            assert_eq!(
+                std::fs::canonicalize(std::env::current_dir().expect("child current directory"),)
+                    .expect("canonical child current directory"),
+                std::fs::canonicalize(&cwd_a).expect("canonical child cwd A"),
+                "the child must construct the first pool under cwd A"
+            );
+
+            let config = DbPoolConfig {
+                database_url: "sqlite:///./mail.sqlite3".to_string(),
+                storage_root: Some(storage_root),
+                min_connections: 0,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            };
+            let pool_a = get_or_create_pool(&config).expect("construct cwd-A pool");
+            let identity_a = std::fs::canonicalize(cwd_a.join("mail.sqlite3"))
+                .expect("canonical cwd-A database");
+            assert_eq!(
+                pool_a.sqlite_identity.as_deref(),
+                Some(identity_a.as_path())
+            );
+
+            std::env::set_current_dir(&cwd_b).expect("switch child to cwd B");
+            let pool_b = get_or_create_pool(&config).expect("construct cwd-B pool");
+            let identity_b = std::fs::canonicalize(cwd_b.join("mail.sqlite3"))
+                .expect("canonical cwd-B database");
+            assert_eq!(
+                pool_b.sqlite_identity.as_deref(),
+                Some(identity_b.as_path())
+            );
+            assert!(
+                !Arc::ptr_eq(&pool_a.pool, &pool_b.pool),
+                "one relative spelling under different cwd authorities must not reuse a pool"
+            );
+            assert!(
+                !Arc::ptr_eq(
+                    &pool_a.message_id_allocator(),
+                    &pool_b.message_id_allocator(),
+                ),
+                "cwd-distinct SQLite files must not share a message-id allocator"
+            );
+            assert_eq!(
+                read_pool_authority_sentinel(&pool_a),
+                "A",
+                "the first pool must continue opening cwd A after the process moves to cwd B"
+            );
+            assert_eq!(read_pool_authority_sentinel(&pool_b), "B");
+
+            retire_cached_runtime_state_after_recovery(&identity_b, "cwd authority test");
+            assert!(pool_b.pool.is_closed(), "retirement must close cwd-B pool");
+            assert!(
+                pool_b.message_id_allocator().is_retired(),
+                "retirement must retire cwd-B allocator"
+            );
+            assert!(!pool_a.pool.is_closed(), "cwd-A pool must remain live");
+            assert!(
+                !pool_a.message_id_allocator().is_retired(),
+                "cwd-A allocator must remain authoritative"
+            );
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("pool-authority tempdir");
+        let cwd_a = directory.path().join("cwd-a");
+        let cwd_b = directory.path().join("cwd-b");
+        let storage_root = directory.path().join("archive");
+        std::fs::create_dir_all(&cwd_a).expect("create cwd A");
+        std::fs::create_dir_all(&cwd_b).expect("create cwd B");
+        std::fs::create_dir_all(&storage_root).expect("create archive root");
+        seed_pool_authority_sentinel(&cwd_a.join("mail.sqlite3"), "A");
+        seed_pool_authority_sentinel(&cwd_b.join("mail.sqlite3"), "B");
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg(CHILD_TEST_NAME)
+        .arg("--exact")
+        .arg("--nocapture")
+        .current_dir(&cwd_a)
+        .env(CHILD_CWD_A_ENV, &cwd_a)
+        .env(CHILD_CWD_B_ENV, &cwd_b)
+        .env(CHILD_STORAGE_ENV, &storage_root)
+        .output()
+        .expect("run relative pool-authority child");
+        assert!(
+            output.status.success(),
+            "relative pool-authority child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(CHILD_WITNESS),
+            "child filter ran no causal relative-authority proof: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_retarget_cannot_cross_sqlite_authority() {
+        use std::os::unix::fs::symlink;
+
+        const CHILD_ALIAS_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_ALIAS";
+        const CHILD_NEXT_ALIAS_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_NEXT_ALIAS";
+        const CHILD_OLD_ALIAS_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_OLD_ALIAS";
+        const CHILD_DB_A_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_DB_A";
+        const CHILD_DB_B_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_DB_B";
+        const CHILD_STORAGE_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_SYMLINK_STORAGE";
+        const CHILD_TEST_NAME: &str = "pool::tests::symlink_retarget_cannot_cross_sqlite_authority";
+        const CHILD_WITNESS: &str = "symlink-pool-authority-frozen";
+
+        if let Some(alias) = std::env::var_os(CHILD_ALIAS_ENV) {
+            let alias = PathBuf::from(alias);
+            let next_alias = PathBuf::from(
+                std::env::var_os(CHILD_NEXT_ALIAS_ENV).expect("replacement alias authority"),
+            );
+            let old_alias = PathBuf::from(
+                std::env::var_os(CHILD_OLD_ALIAS_ENV).expect("preserved alias authority"),
+            );
+            let db_a =
+                PathBuf::from(std::env::var_os(CHILD_DB_A_ENV).expect("database A authority"));
+            let db_b =
+                PathBuf::from(std::env::var_os(CHILD_DB_B_ENV).expect("database B authority"));
+            let storage_root = PathBuf::from(
+                std::env::var_os(CHILD_STORAGE_ENV).expect("symlink storage authority"),
+            );
+            let config = DbPoolConfig {
+                database_url: format!("sqlite:///{}", alias.display()),
+                storage_root: Some(storage_root.clone()),
+                min_connections: 0,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            };
+            let unopened_path = alias.with_file_name("mail-unopened.sqlite3");
+            assert!(
+                !unopened_path.exists(),
+                "late-symlink fixture requires a missing SQLite leaf"
+            );
+            let unopened_pool = DbPool::new(&DbPoolConfig {
+                database_url: format!("sqlite:///{}", unopened_path.display()),
+                storage_root: Some(storage_root),
+                min_connections: 0,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("freeze missing-leaf SQLite authority");
+            let unopened_storage_root = alias.with_file_name("archive-unopened");
+            let storage_authority_db = alias.with_file_name("storage-authority.sqlite3");
+            assert!(!unopened_storage_root.exists());
+            assert!(!storage_authority_db.exists());
+            let unopened_storage_pool = DbPool::new(&DbPoolConfig {
+                database_url: format!("sqlite:///{}", storage_authority_db.display()),
+                storage_root: Some(unopened_storage_root.clone()),
+                min_connections: 0,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("freeze missing-leaf storage-root authority");
+
+            let pool_a = get_or_create_pool(&config).expect("construct symlink-to-A pool");
+            let identity_a = std::fs::canonicalize(&db_a).expect("canonical database A");
+            assert_eq!(
+                pool_a.sqlite_identity.as_deref(),
+                Some(identity_a.as_path())
+            );
+
+            std::fs::rename(&alias, &old_alias).expect("preserve original A alias");
+            std::fs::rename(&next_alias, &alias).expect("publish replacement B alias");
+            let pool_b = get_or_create_pool(&config).expect("construct symlink-to-B pool");
+            let identity_b = std::fs::canonicalize(&db_b).expect("canonical database B");
+            assert_eq!(
+                pool_b.sqlite_identity.as_deref(),
+                Some(identity_b.as_path())
+            );
+            assert!(
+                !Arc::ptr_eq(&pool_a.pool, &pool_b.pool),
+                "retargeting a symlink to another file must not reuse the first pool"
+            );
+            assert!(
+                !Arc::ptr_eq(
+                    &pool_a.message_id_allocator(),
+                    &pool_b.message_id_allocator(),
+                ),
+                "symlink-distinct SQLite files must not share a message-id allocator"
+            );
+            assert_eq!(
+                read_pool_authority_sentinel(&pool_a),
+                "A",
+                "the first pool must keep opening database A after alias retarget"
+            );
+            assert_eq!(read_pool_authority_sentinel(&pool_b), "B");
+
+            symlink(&db_b, &unopened_path).expect("replace missing leaf with database-B symlink");
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build late-symlink runtime");
+            let cx = Cx::for_testing();
+            let late_open =
+                runtime.block_on(async { unopened_pool.acquire(&cx).await.into_result() });
+            assert!(
+                late_open.is_err_and(|error| {
+                    error
+                        .to_string()
+                        .contains("refusing to cross database authority")
+                }),
+                "a symlink inserted after construction must fail closed before the lazy open"
+            );
+            let integrity_error = unopened_pool
+                .run_startup_integrity_check()
+                .expect_err("direct integrity I/O must reject a retargeted SQLite authority");
+            assert!(
+                integrity_error
+                    .to_string()
+                    .contains("refusing to cross database authority"),
+                "unexpected direct-method authority error: {integrity_error}"
+            );
+            symlink(
+                db_b.parent().expect("database B has a parent"),
+                &unopened_storage_root,
+            )
+            .expect("replace missing storage root with foreign symlink");
+            let late_storage_open =
+                runtime.block_on(async { unopened_storage_pool.acquire(&cx).await.into_result() });
+            assert!(
+                late_storage_open.is_err_and(|error| {
+                    error
+                        .to_string()
+                        .contains("refusing to cross archive authority")
+                }),
+                "a storage-root symlink inserted after construction must fail before pool init"
+            );
+            assert!(
+                !storage_authority_db.exists(),
+                "storage authority rejection must precede SQLite creation and archive init"
+            );
+
+            retire_cached_runtime_state_after_recovery(&identity_b, "symlink authority test");
+            assert!(
+                pool_b.pool.is_closed(),
+                "retirement must close database-B pool"
+            );
+            assert!(
+                pool_b.message_id_allocator().is_retired(),
+                "retirement must retire database-B allocator"
+            );
+            assert!(!pool_a.pool.is_closed(), "database-A pool must remain live");
+            assert!(
+                !pool_a.message_id_allocator().is_retired(),
+                "database-A allocator must remain authoritative"
+            );
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("pool-authority tempdir");
+        let target_a = directory.path().join("target-a");
+        let target_b = directory.path().join("target-b");
+        let storage_root = directory.path().join("archive");
+        std::fs::create_dir_all(&target_a).expect("create target A");
+        std::fs::create_dir_all(&target_b).expect("create target B");
+        std::fs::create_dir_all(&storage_root).expect("create archive root");
+        let db_a = target_a.join("mail.sqlite3");
+        let db_b = target_b.join("mail.sqlite3");
+        seed_pool_authority_sentinel(&db_a, "A");
+        seed_pool_authority_sentinel(&db_b, "B");
+        let alias = directory.path().join("mail.sqlite3");
+        let next_alias = directory.path().join("mail-next.sqlite3");
+        let old_alias = directory.path().join("mail-original.sqlite3");
+        symlink(&db_a, &alias).expect("create database-A alias");
+        symlink(&db_b, &next_alias).expect("create database-B replacement alias");
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg(CHILD_TEST_NAME)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(CHILD_ALIAS_ENV, &alias)
+        .env(CHILD_NEXT_ALIAS_ENV, &next_alias)
+        .env(CHILD_OLD_ALIAS_ENV, &old_alias)
+        .env(CHILD_DB_A_ENV, &db_a)
+        .env(CHILD_DB_B_ENV, &db_b)
+        .env(CHILD_STORAGE_ENV, &storage_root)
+        .output()
+        .expect("run symlink pool-authority child");
+        assert!(
+            output.status.success(),
+            "symlink pool-authority child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(CHILD_WITNESS),
+            "child filter ran no causal symlink-authority proof: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn independent_file_pools_share_allocator_by_normalized_sqlite_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("shared-allocator.sqlite3");
+        std::fs::File::create(&db_path).expect("create allocator identity fixture");
+        let aliased_path = dir.path().join(".").join("shared-allocator.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let base = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(storage_root.clone()),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let aliased = DbPoolConfig {
+            database_url: format!("sqlite:///{}", aliased_path.display()),
+            ..base.clone()
+        };
+        let first_pool = DbPool::new(&base).expect("create first independent pool");
+        let second_pool = DbPool::new(&aliased).expect("create second independent pool");
+
+        assert!(
+            !Arc::ptr_eq(&first_pool.pool, &second_pool.pool),
+            "the fixture must use distinct underlying pool Arcs"
+        );
+        assert_ne!(
+            first_pool.cache_generation, second_pool.cache_generation,
+            "read-cache generation remains scoped to each underlying pool"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &first_pool.message_id_allocator(),
+                &second_pool.message_id_allocator()
+            ),
+            "normalized aliases of one SQLite file must share an allocator"
+        );
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let first_allocator = first_pool.message_id_allocator();
+        let first_id = rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs allocator context");
+            first_allocator.allocate(&cx, 0, &storage_root).await
+        });
+        let second_allocator = second_pool.message_id_allocator();
+        let second_id = rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs allocator context");
+            second_allocator.allocate(&cx, 0, &storage_root).await
+        });
+        assert!(matches!(first_id, Outcome::Ok(1)));
+        assert!(matches!(second_id, Outcome::Ok(2)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_sqlite_leaf_aliases_share_allocator_by_existing_parent_identity() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_parent = dir.path().join("real-parent");
+        let aliased_parent = dir.path().join("aliased-parent");
+        std::fs::create_dir_all(&real_parent).expect("create real parent");
+        symlink(&real_parent, &aliased_parent).expect("create parent alias");
+        let direct_db = real_parent.join("not-created-yet.sqlite3");
+        let aliased_db = aliased_parent.join("not-created-yet.sqlite3");
+        assert!(
+            !direct_db.exists(),
+            "fixture requires a missing SQLite leaf"
+        );
+        assert!(
+            !aliased_db.exists(),
+            "fixture requires a missing SQLite leaf"
+        );
+
+        let storage_root = real_parent.join("storage");
+        let direct_config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", direct_db.display()),
+            storage_root: Some(storage_root.clone()),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let aliased_config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", aliased_db.display()),
+            ..direct_config.clone()
+        };
+
+        let direct_pool = DbPool::new(&direct_config).expect("create direct first-run pool");
+        let aliased_pool = DbPool::new(&aliased_config).expect("create aliased first-run pool");
+        assert!(
+            Arc::ptr_eq(
+                &direct_pool.message_id_allocator(),
+                &aliased_pool.message_id_allocator()
+            ),
+            "a missing leaf below aliased existing parents is one SQLite identity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_sqlite_leaf_preserves_symlink_sensitive_dotdot_semantics() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let authority_parent = dir.path().join("authority-parent");
+        let symlink_target = authority_parent.join("child");
+        std::fs::create_dir_all(&symlink_target).expect("create symlink target");
+        let link = dir.path().join("linked-child");
+        symlink(&symlink_target, &link).expect("create directory alias");
+
+        let direct_db = authority_parent.join("not-created-yet.sqlite3");
+        let symlink_dotdot_db = link.join("..").join("not-created-yet.sqlite3");
+        assert!(
+            !direct_db.exists(),
+            "fixture requires a missing SQLite leaf"
+        );
+        assert!(
+            !symlink_dotdot_db.exists(),
+            "fixture requires a missing SQLite leaf"
+        );
+        assert_eq!(
+            normalize_sqlite_identity_path(&direct_db.to_string_lossy()),
+            normalize_sqlite_identity_path(&symlink_dotdot_db.to_string_lossy()),
+            "the existing symlink prefix must resolve before its dotdot component"
+        );
+
+        let storage_root = dir.path().join("storage");
+        let direct_config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", direct_db.display()),
+            storage_root: Some(storage_root.clone()),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let alias_config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", symlink_dotdot_db.display()),
+            ..direct_config.clone()
+        };
+        let direct_pool = DbPool::new(&direct_config).expect("create direct first-run pool");
+        let alias_pool = DbPool::new(&alias_config).expect("create dotdot first-run pool");
+        assert!(Arc::ptr_eq(
+            &direct_pool.message_id_allocator(),
+            &alias_pool.message_id_allocator()
+        ));
+    }
+
+    #[test]
+    fn independent_memory_pools_keep_allocator_and_cache_generation_isolated() {
+        let config = DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: None,
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let first_pool = DbPool::new(&config).expect("create first memory pool");
+        let second_pool = DbPool::new(&config).expect("create second memory pool");
+
+        assert!(!Arc::ptr_eq(&first_pool.pool, &second_pool.pool));
+        assert_ne!(first_pool.cache_generation, second_pool.cache_generation);
+        assert!(
+            !Arc::ptr_eq(
+                &first_pool.message_id_allocator(),
+                &second_pool.message_id_allocator()
+            ),
+            "distinct in-memory databases must never share an allocator"
+        );
+    }
+
+    #[test]
+    fn recovery_invalidation_retires_old_live_allocator_before_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("recovered-allocator.sqlite3");
+        std::fs::File::create(&db_path).expect("create allocator identity fixture");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(dir.path().join("storage")),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let old_pool = DbPool::new(&config).expect("create pre-recovery pool");
+        let old_allocator = old_pool.message_id_allocator();
+        let identity = normalize_sqlite_identity_path_buf(&db_path);
+        assert!(
+            invalidate_file_message_id_allocator(&identity),
+            "the live file identity must be present before invalidation"
+        );
+
+        let replacement = DbPool::new(&config).expect("create replacement pool");
+        assert!(
+            !Arc::ptr_eq(&old_allocator, &replacement.message_id_allocator()),
+            "post-recovery pools must not inherit the old archive seed/high-water state"
+        );
+        assert_ne!(old_pool.cache_generation, replacement.cache_generation);
+
+        let replacement_allocator = replacement.message_id_allocator();
+        let storage_root = config.resolved_storage_root();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let old_barrier = Arc::clone(&barrier);
+        let old_storage_root = storage_root.clone();
+        let old_handle = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build old allocator runtime");
+            old_barrier.wait();
+            runtime.block_on(async move {
+                let cx = Cx::current().expect("runtime installs allocator context");
+                old_allocator.allocate(&cx, 0, &old_storage_root).await
+            })
+        });
+        let replacement_barrier = Arc::clone(&barrier);
+        let replacement_handle = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build replacement allocator runtime");
+            replacement_barrier.wait();
+            runtime.block_on(async move {
+                let cx = Cx::current().expect("runtime installs allocator context");
+                replacement_allocator.allocate(&cx, 0, &storage_root).await
+            })
+        });
+        barrier.wait();
+
+        assert!(matches!(
+            old_handle.join().expect("join old allocator"),
+            Outcome::Err(error) if error.to_string().contains("retired after database recovery")
+        ));
+        assert!(matches!(
+            replacement_handle
+                .join()
+                .expect("join replacement allocator"),
+            Outcome::Ok(1)
+        ));
     }
 
     #[test]
@@ -11439,9 +18490,9 @@ mod tests {
         let rt = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let project =
                 crate::queries::ensure_project(&cx, &pool, "/data/projects/am-alloc-route")
                     .await
@@ -11724,6 +18775,110 @@ mod tests {
     }
 
     #[test]
+    fn pooled_connections_observe_configured_and_runtime_journal_size_limits() {
+        const CONFIGURED_LIMIT: i64 = 1_048_577;
+        const RETUNED_LIMIT: i64 = 2_097_153;
+
+        let configured_limit = CONFIGURED_LIMIT.to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DB_JOURNAL_SIZE_LIMIT_BYTES", configured_limit.as_str())],
+            || {
+                let directory = tempfile::tempdir().expect("tempdir");
+                let db_path = directory.path().join("journal-limit.sqlite3");
+                let pool = DbPool::new_without_startup_init(&DbPoolConfig {
+                    database_url: format!("sqlite:///{}", db_path.display()),
+                    storage_root: Some(directory.path().join("archive")),
+                    min_connections: 0,
+                    max_connections: 2,
+                    run_migrations: false,
+                    warmup_connections: 0,
+                    ..Default::default()
+                })
+                .expect("create journal-limit pool");
+                let final_pragma = format!("PRAGMA journal_size_limit = {CONFIGURED_LIMIT};");
+                assert!(
+                    pool.init_sql.trim_end().ends_with(final_pragma.as_str()),
+                    "operator limit must be the authoritative final connection-init assignment: {}",
+                    pool.init_sql
+                );
+
+                let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                let cx = asupersync::Cx::for_testing();
+                runtime.block_on(async {
+                    let original = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("acquire initially configured connection");
+                    assert_eq!(
+                        read_pragma_i64(
+                            &original,
+                            "PRAGMA journal_size_limit;",
+                            "journal_size_limit",
+                        )
+                        .expect("read configured journal_size_limit"),
+                        CONFIGURED_LIMIT
+                    );
+
+                    pool.set_journal_size_limit(RETUNED_LIMIT.unsigned_abs())
+                        .expect("retune pool journal_size_limit");
+                    let newly_opened = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("acquire newly opened connection after retune");
+                    assert_eq!(
+                        read_pragma_i64(
+                            &newly_opened,
+                            "PRAGMA journal_size_limit;",
+                            "journal_size_limit",
+                        )
+                        .expect("read retuned limit on new connection"),
+                        RETUNED_LIMIT
+                    );
+
+                    // The only idle handle is the connection that was active
+                    // during the retune, so this acquisition causally proves
+                    // checkout repairs that stale connection-local setting.
+                    drop(original);
+                    let recycled_original = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("reacquire connection that spanned retune");
+                    assert_eq!(
+                        read_pragma_i64(
+                            &recycled_original,
+                            "PRAGMA journal_size_limit;",
+                            "journal_size_limit",
+                        )
+                        .expect("read retuned limit on recycled connection"),
+                        RETUNED_LIMIT
+                    );
+                    drop(recycled_original);
+                    drop(newly_opened);
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn journal_size_limit_rejects_values_outside_sqlite_integer_range() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let pool = maintenance_test_pool(&directory.path().join("journal-limit-range.sqlite3"));
+        let invalid = i64::MAX.unsigned_abs() + 1;
+        let error = pool
+            .set_journal_size_limit(invalid)
+            .expect_err("SQLite PRAGMA integers cannot represent u64 values above i64::MAX");
+        assert!(
+            error.to_string().contains("signed 64-bit PRAGMA range"),
+            "unexpected range error: {error}"
+        );
+    }
+
+    #[test]
     fn per_connection_pragmas_omit_db_wide_journal_mode() {
         assert!(
             !schema::PRAGMA_CONN_SETTINGS_SQL.contains("journal_mode"),
@@ -11754,16 +18909,10 @@ mod tests {
         let conn = open_sqlite_file_with_lock_retry(db_path_str)
             .expect("runtime sqlite should open before invariant check");
         conn.execute_raw(&format!(
-            "PRAGMA busy_timeout = {REQUIRED_STARTUP_BUSY_TIMEOUT_MS};"
+            "PRAGMA journal_mode = DELETE; \
+             PRAGMA busy_timeout = {REQUIRED_STARTUP_BUSY_TIMEOUT_MS};"
         ))
-        .expect("set required runtime busy_timeout");
-
-        let canonical = open_sqlite_file_with_lock_retry_canonical(db_path_str)
-            .expect("open canonical sqlite file");
-        canonical
-            .execute_raw("PRAGMA journal_mode=DELETE;")
-            .expect("force rollback journal mode");
-        drop(canonical);
+        .expect("set rollback mode and required runtime busy_timeout");
 
         let err = assert_required_startup_pragmas(&conn, db_path_str)
             .expect_err("DELETE-mode databases must fail the WAL startup invariant");
@@ -12040,55 +19189,37 @@ mod tests {
     }
 
     fn sqlite_marker_value(path: &Path) -> Option<String> {
-        let path_str = path.to_string_lossy();
-        let conn = DbConn::open_file(path_str.as_ref()).ok()?;
-        conn.execute_raw("CREATE TABLE IF NOT EXISTS marker(value TEXT NOT NULL)")
-            .ok()?;
+        let conn = open_immutable_canonical_sqlite(path).ok()?;
         let rows = conn
             .query_sync("SELECT value FROM marker ORDER BY rowid DESC LIMIT 1", &[])
             .ok()?;
         rows.first()?.get_named::<String>("value").ok()
     }
 
-    fn canonical_sqlite_marker_value(path: &Path) -> Option<String> {
-        let path_str = path.to_string_lossy();
-        let conn = crate::CanonicalDbConn::open_file(path_str.as_ref()).ok()?;
-        conn.execute_raw("CREATE TABLE IF NOT EXISTS marker(value TEXT NOT NULL)")
-            .ok()?;
-        let rows = conn
-            .query_sync("SELECT value FROM marker ORDER BY rowid DESC LIMIT 1", &[])
-            .ok()?;
-        rows.first()?.get_named::<String>("value").ok()
-    }
-
-    fn checkpoint_and_remove_sqlite_sidecars(path: &Path) {
-        wal_checkpoint_truncate_path(path).expect("checkpoint test sqlite db");
-        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
-            let _ = std::fs::remove_file(sqlite_sidecar_path(path, suffix));
-        }
+    fn checkpoint_into_standalone_delete_mode(path: &Path) {
+        let conn = crate::CanonicalDbConn::open_file(path.to_string_lossy().as_ref())
+            .expect("open test database for standalone checkpoint");
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE")
+            .expect("checkpoint and leave standalone DELETE-mode database");
+        drop(conn);
     }
 
     fn write_marker_db(path: &Path, value: &str) {
         let path_str = path.to_string_lossy();
-        let conn = DbConn::open_file(path_str.as_ref()).expect("open marker db");
+        let conn = crate::CanonicalDbConn::open_file(path_str.as_ref()).expect("open marker db");
+        conn.execute_raw("PRAGMA journal_mode=DELETE")
+            .expect("use standalone rollback-journal mode");
+        conn.execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("create mailbox schema");
         conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL)")
             .expect("create marker table");
         conn.execute_raw(&format!("INSERT INTO marker(value) VALUES('{value}')"))
             .expect("insert marker value");
         drop(conn);
-        checkpoint_and_remove_sqlite_sidecars(path);
-    }
-
-    fn write_canonical_marker_db(path: &Path, value: &str) {
-        let path_str = path.to_string_lossy();
-        let conn =
-            crate::CanonicalDbConn::open_file(path_str.as_ref()).expect("open canonical marker db");
-        conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL)")
-            .expect("create canonical marker table");
-        conn.execute_raw(&format!("INSERT INTO marker(value) VALUES('{value}')"))
-            .expect("insert canonical marker value");
-        drop(conn);
-        checkpoint_and_remove_sqlite_sidecars(path);
+        assert!(
+            sqlite_recovery_candidate_is_standalone(path),
+            "DELETE-mode fixture must close as one standalone main file"
+        );
     }
 
     #[test]
@@ -12096,10 +19227,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("storage.sqlite3");
         let dot_bak = dir.path().join("storage.sqlite3.bak");
-        let backup_series = dir.path().join("storage.sqlite3.bak.20260212_000000");
         std::fs::write(&primary, b"primary").expect("write primary");
         std::fs::write(&dot_bak, b"bak").expect("write .bak");
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::File::options()
+            .write(true)
+            .open(&dot_bak)
+            .expect("open .bak for timestamp control")
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+            .expect("backdate .bak mtime");
+        let backup_series = dir.path().join("storage.sqlite3.bak.20260212_000000");
         std::fs::write(&backup_series, b"series").expect("write timestamped .bak series");
 
         let candidates = sqlite_backup_candidates(&primary);
@@ -12127,7 +19263,7 @@ mod tests {
         std::env::set_current_dir(dir.path()).expect("set cwd");
 
         let primary = PathBuf::from("storage.sqlite3");
-        let backup_series = PathBuf::from("storage.sqlite3.backup-20260212_000000");
+        let backup_series = PathBuf::from("storage.sqlite3.bak.20260212_000000");
         std::fs::write(&primary, b"primary").expect("write primary");
         std::fs::write(&backup_series, b"series").expect("write backup series");
 
@@ -12135,27 +19271,27 @@ mod tests {
         assert!(
             candidates.iter().any(|c| {
                 c.file_name().and_then(|n| n.to_str())
-                    == Some("storage.sqlite3.backup-20260212_000000")
+                    == Some("storage.sqlite3.bak.20260212_000000")
             }),
-            "relative primary path should still discover backup-series candidates"
+            "relative primary path should still discover timestamped .bak candidates"
         );
     }
 
     #[test]
-    fn sqlite_backup_candidates_include_timestamped_bak_series() {
+    fn sqlite_backup_candidates_include_only_standalone_published_series() {
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("storage.sqlite3");
         let backup_bak_series = dir.path().join("storage.sqlite3.bak.20260212_000000");
-        let backup_series = dir.path().join("storage.sqlite3.backup-20260212_010000");
+        let backup_series = dir.path().join("storage.sqlite3.backup-20260212-010000");
         std::fs::write(&primary, b"primary").expect("write primary");
         std::fs::write(&backup_bak_series, b"bak series").expect("write .bak timestamp series");
         std::fs::write(&backup_series, b"backup series").expect("write .backup- series");
 
         let candidates = sqlite_backup_candidates(&primary);
-        assert_eq!(
-            candidates.first().map(PathBuf::as_path),
-            Some(backup_bak_series.as_path()),
-            "timestamped .bak.* backups should be discovered and prioritized over .backup-*"
+        assert_eq!(candidates, vec![backup_bak_series]);
+        assert!(
+            !candidates.contains(&backup_series),
+            "historical .backup-* files are ambiguous multi-file generations and require explicit family-aware recovery"
         );
     }
 
@@ -12174,12 +19310,130 @@ mod tests {
         std::fs::write(&backup_journal, b"journal").expect("write backup journal");
 
         let candidates = sqlite_backup_candidates(&primary);
-        assert_eq!(candidates, vec![backup_bak_series]);
+        assert!(
+            candidates.is_empty(),
+            "a backup with sidecars is a family and cannot be restored by the single-file path"
+        );
+    }
+
+    #[test]
+    fn sqlite_backup_candidates_never_drop_committed_wal_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let backup = dir.path().join("storage.sqlite3.bak.20260212_000000");
+        std::fs::write(&primary, b"broken primary").expect("write primary");
+
+        let conn = crate::CanonicalDbConn::open_file(backup.display().to_string())
+            .expect("open backup candidate");
+        conn.execute_raw("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .expect("enable WAL");
+        conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL);")
+            .expect("create marker table");
+        conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+            .expect("checkpoint base schema");
+        conn.execute_raw("INSERT INTO marker(value) VALUES('committed-only-in-wal');")
+            .expect("commit marker into WAL");
+
+        let wal = sqlite_sidecar_path(&backup, "-wal");
+        assert!(
+            std::fs::metadata(&wal).is_ok_and(|metadata| metadata.len() > 0),
+            "fixture must carry committed state in its WAL"
+        );
+        assert!(
+            sqlite_backup_candidates(&primary).is_empty(),
+            "single-file recovery must not select a backup whose committed WAL would be omitted"
+        );
+        assert!(
+            find_healthy_backup(&primary).is_none(),
+            "health probing must not turn a WAL family into a standalone backup"
+        );
+    }
+
+    #[test]
+    fn sqlite_backup_candidates_never_drop_historical_companion_wal_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let live_source = dir.path().join("source.sqlite3");
+        let backup = dir.path().join("storage.sqlite3.backup-20260212-000000");
+        let historical_wal = dir
+            .path()
+            .join("storage.sqlite3-wal.backup-20260212-000000-01");
+        std::fs::write(&primary, b"broken primary").expect("write primary");
+
+        let conn = crate::CanonicalDbConn::open_file(
+            live_source
+                .to_str()
+                .expect("temporary path should be valid UTF-8"),
+        )
+        .expect("open source database");
+        conn.execute_raw("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .expect("enable WAL");
+        conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL);")
+            .expect("create marker table");
+        conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+            .expect("checkpoint base schema");
+        conn.execute_raw("INSERT INTO marker(value) VALUES('committed-only-in-wal');")
+            .expect("commit marker into WAL");
+
+        let source_wal = sqlite_sidecar_path(&live_source, "-wal");
+        assert!(
+            std::fs::metadata(&source_wal).is_ok_and(|metadata| metadata.len() > 0),
+            "fixture must carry committed state in its WAL"
+        );
+        std::fs::copy(&live_source, &backup).expect("copy historical main backup");
+        std::fs::copy(&source_wal, &historical_wal).expect("copy historical WAL backup");
+
+        assert!(
+            sqlite_backup_candidates(&primary).is_empty(),
+            "a historical main backup must stay paired with a same-generation WAL backup even when their collision suffixes differ"
+        );
+        assert!(
+            find_healthy_backup(&primary).is_none(),
+            "health probing must not promote the historical main file without its committed WAL"
+        );
+    }
+
+    #[test]
+    fn sqlite_backup_candidates_reject_private_stages_and_malformed_series() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let published = dir.path().join("storage.sqlite3.bak.20260212_000000");
+        let historical = dir.path().join("storage.sqlite3.backup-20260212-010000");
+        let private_stage = dir
+            .path()
+            .join("storage.sqlite3.bak.backup-stage-20260212_020000");
+        let metadata = dir.path().join("storage.sqlite3.bak.meta.json");
+        let metadata_stage = dir.path().join("storage.sqlite3.bak.meta.json.tmp");
+        let cross_family_grammar = dir.path().join("storage.sqlite3.backup-20260212_040000");
+        let recovery_family = dir.path().join("storage.sqlite3.recovery");
+        std::fs::write(&primary, b"primary").expect("write primary");
+        write_marker_db(&published, "published");
+        write_marker_db(&historical, "historical");
+        write_marker_db(&private_stage, "private-stage");
+        write_marker_db(&metadata, "metadata");
+        write_marker_db(&metadata_stage, "metadata-stage");
+        write_marker_db(&cross_family_grammar, "wrong-grammar");
+        write_marker_db(&recovery_family, "recovery-family");
+
+        let candidates = sqlite_backup_candidates(&primary);
+        assert_eq!(candidates, vec![published]);
+        assert!(
+            !candidates.contains(&historical),
+            "a historical .backup-* main file is not a standalone restorable generation"
+        );
+        assert!(!candidates.contains(&private_stage));
+        assert!(!candidates.contains(&metadata));
+        assert!(!candidates.contains(&metadata_stage));
+        assert!(!candidates.contains(&cross_family_grammar));
+        assert!(
+            !candidates.contains(&recovery_family),
+            "a .recovery main file is not a standalone restorable candidate"
+        );
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
-    fn sqlite_backup_candidates_include_non_utf8_backups() {
+    fn sqlite_backup_candidates_enumerate_non_utf8_backups_without_validating_them() {
         let dir = tempfile::tempdir().expect("tempdir");
         let base_name = OsString::from_vec(b"storage-\xFF.sqlite3".to_vec());
         let primary = dir.path().join(PathBuf::from(base_name.clone()));
@@ -12188,7 +19442,7 @@ mod tests {
             .join(PathBuf::from(os_string_with_suffix(&base_name, ".bak")));
         let backup_series = dir.path().join(PathBuf::from(os_string_with_suffix(
             &base_name,
-            ".backup-20260212_000000",
+            ".bak.20260212_000000",
         )));
         std::fs::write(&primary, b"primary").expect("write primary");
         std::fs::write(&dot_bak, b"bak").expect("write .bak");
@@ -12203,7 +19457,75 @@ mod tests {
             candidates
                 .iter()
                 .any(|candidate| candidate == &backup_series),
-            "non-UTF-8 primary names should still resolve backup-series candidates"
+            "non-UTF-8 primary names should still resolve timestamped .bak candidates"
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn recovery_candidate_health_never_validates_a_lossy_utf8_alias() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let invalid_name = OsString::from_vec(b"storage-\xFF.sqlite3.bak".to_vec());
+        let invalid_path = dir.path().join(&invalid_name);
+        std::fs::write(&invalid_path, b"unvalidated bytes").expect("write invalid-byte candidate");
+
+        let lossy_alias = dir.path().join(invalid_name.to_string_lossy().into_owned());
+        write_marker_db(&lossy_alias, "healthy alias");
+
+        assert!(
+            !sqlite_recovery_candidate_passes_full_integrity_check(&invalid_path)
+                .expect("non-UTF-8 candidate should fail closed"),
+            "health validation must not open a different U+FFFD alias"
+        );
+        assert!(
+            sqlite_file_passes_full_integrity_check(&invalid_path).is_err(),
+            "the lower-level full probe used by salvage must also reject the non-UTF-8 path"
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn live_health_inventory_and_wal_cleanup_never_use_a_lossy_path_alias() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let invalid_name = OsString::from_vec(b"storage-\xFF.sqlite3".to_vec());
+        let invalid_path = dir.path().join(&invalid_name);
+        std::fs::write(&invalid_path, b"raw-invalid-path-main").unwrap();
+        let invalid_wal = sqlite_sidecar_path(&invalid_path, "-wal");
+        std::fs::write(&invalid_wal, b"x").unwrap();
+
+        let lossy_alias = dir.path().join(invalid_name.to_string_lossy().into_owned());
+        write_marker_db(&lossy_alias, "healthy-lossy-alias");
+        let alias_main_bytes = std::fs::read(&lossy_alias).unwrap();
+        let alias_wal = sqlite_sidecar_path(&lossy_alias, "-wal");
+        std::fs::write(&alias_wal, b"alias-wal-witness").unwrap();
+
+        let health_error = sqlite_primary_read_path_is_healthy(&invalid_path)
+            .expect_err("live health must reject a non-UTF-8 engine path");
+        assert!(health_error.to_string().contains("not valid UTF-8"));
+        let inventory_error = inspect_mailbox_db_inventory(&invalid_path)
+            .expect_err("inventory must reject a non-UTF-8 engine path");
+        assert!(inventory_error.to_string().contains("not valid UTF-8"));
+
+        cleanup_truncated_wal_sidecar(&invalid_path).expect("admitted exact-path WAL cleanup");
+        assert!(
+            !invalid_wal.exists(),
+            "the exact raw-name WAL was quarantined"
+        );
+        assert_eq!(std::fs::read(&alias_wal).unwrap(), b"alias-wal-witness");
+        assert_eq!(std::fs::read(&lossy_alias).unwrap(), alias_main_bytes);
+        let raw_prefix = os_string_with_suffix(&invalid_name, "-wal.cleanup-quarantine-");
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .as_os_str()
+                        .as_bytes()
+                        .starts_with(raw_prefix.as_os_str().as_bytes())
+                }),
+            "the raw-name WAL must remain available under quarantine"
         );
     }
 
@@ -12216,11 +19538,11 @@ mod tests {
         let primary = dir.path().join("storage.sqlite3");
         let real_backup = dir.path().join("outside.sqlite3");
         let symlinked_bak = dir.path().join("storage.sqlite3.bak");
-        let symlinked_series = dir.path().join("storage.sqlite3.backup-20260212_000000");
+        let symlinked_series = dir.path().join("storage.sqlite3.bak.20260212_000000");
         std::fs::write(&primary, b"primary").expect("write primary");
         std::fs::write(&real_backup, b"backup").expect("write real backup");
         symlink(&real_backup, &symlinked_bak).expect("symlink .bak");
-        symlink(&real_backup, &symlinked_series).expect("symlink .backup- series");
+        symlink(&real_backup, &symlinked_series).expect("symlink timestamped .bak series");
 
         let candidates = sqlite_backup_candidates(&primary);
         assert!(
@@ -12235,14 +19557,8 @@ mod tests {
         let primary = dir.path().join("storage.sqlite3");
         let backup = dir.path().join("storage.sqlite3.bak");
 
-        // Create a healthy DB as a backup.
-        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
-        conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL)")
-            .unwrap();
-        conn.execute_raw("INSERT INTO marker(value) VALUES('from-backup')")
-            .unwrap();
-        drop(conn);
-        checkpoint_and_remove_sqlite_sidecars(&primary);
+        // Create a healthy mailbox DB as a backup.
+        write_marker_db(&primary, "from-backup");
         std::fs::copy(&primary, &backup).unwrap();
 
         // Corrupt the primary DB file.
@@ -12296,19 +19612,34 @@ mod tests {
         let backup = dir.path().join("storage.sqlite3.bak");
 
         write_marker_db(&primary, "live-db");
+        let primary_bytes = std::fs::read(&primary).unwrap();
         std::fs::write(&backup, b"not-a-valid-sqlite-backup").unwrap();
+        let primary_wal = sqlite_sidecar_path(&primary, "-wal");
+        let primary_wal_cert = sqlite_sidecar_path(&primary, "-wal-cert");
+        std::fs::write(&primary_wal, b"primary-wal-witness").unwrap();
+        std::fs::write(&primary_wal_cert, b"primary-wal-cert-witness").unwrap();
 
         let err = restore_from_backup(&primary, &backup, dir.path())
             .expect_err("invalid staged backup should fail closed");
         let err_text = err.to_string();
         assert!(
-            err_text.contains("did not pass health checks after staging copy"),
+            err_text.contains("did not pass full integrity checks after staging copy"),
             "unexpected error: {err_text}"
         );
         assert_eq!(
-            sqlite_marker_value(&primary).as_deref(),
-            Some("live-db"),
-            "primary database should remain untouched when staged backup validation fails"
+            std::fs::read(&primary).unwrap(),
+            primary_bytes,
+            "primary main file should remain byte-identical when staged backup validation fails"
+        );
+        assert_eq!(
+            std::fs::read(&primary_wal).unwrap(),
+            b"primary-wal-witness",
+            "primary WAL witness must remain byte-identical when the replacement is rejected"
+        );
+        assert_eq!(
+            std::fs::read(&primary_wal_cert).unwrap(),
+            b"primary-wal-cert-witness",
+            "primary WAL certificate must remain byte-identical when the replacement is rejected"
         );
         let restoring_artifacts = std::fs::read_dir(dir.path())
             .unwrap()
@@ -12404,13 +19735,82 @@ mod tests {
     }
 
     #[test]
+    fn recovery_promotion_timeout_preserves_every_generation_byte() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let candidate = dir.path().join("storage.sqlite3.candidate");
+        let primary_wal = sqlite_sidecar_path(&primary, "-wal");
+        let candidate_certificate = sqlite_sidecar_path(&candidate, "-wal-cert");
+        std::fs::write(&primary, b"live-main-witness").expect("write live main");
+        std::fs::write(&primary_wal, b"live-wal-witness").expect("write live WAL");
+        std::fs::write(&candidate, b"candidate-main-witness").expect("write candidate main");
+        std::fs::write(&candidate_certificate, b"candidate-cert-witness")
+            .expect("write candidate certificate");
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            let _writer = crate::write_barrier::begin_write_activity();
+            ready_tx.send(()).expect("signal held writer");
+            release_rx.recv().expect("wait for release");
+        });
+        ready_rx
+            .recv()
+            .expect("writer must hold its activity guard");
+
+        let epoch_before = crate::write_barrier::promotion_epoch();
+        let result = promote_recovery_candidate_with_finalizer_and_timeout(
+            &primary,
+            &candidate,
+            dir.path(),
+            "20260824_000000_000",
+            std::time::Duration::ZERO,
+            crate::forensics::finalize_recovery_receipt,
+        );
+        release_tx.send(()).expect("release held writer");
+        writer.join().expect("join held writer");
+
+        let failure = result.expect_err("promotion must defer while a foreign writer remains");
+        assert!(
+            failure.error.to_string().contains("did not drain"),
+            "unexpected error: {}",
+            failure.error
+        );
+        assert!(!failure.finalized_receipt_committed);
+        assert_eq!(std::fs::read(&primary).unwrap(), b"live-main-witness");
+        assert_eq!(std::fs::read(&primary_wal).unwrap(), b"live-wal-witness");
+        assert_eq!(
+            std::fs::read(&candidate).unwrap(),
+            b"candidate-main-witness"
+        );
+        assert_eq!(
+            std::fs::read(&candidate_certificate).unwrap(),
+            b"candidate-cert-witness"
+        );
+        assert_eq!(crate::write_barrier::promotion_epoch(), epoch_before);
+        assert!(
+            !dir.path()
+                .join(".mcp-agent-mail-recovery-receipts")
+                .exists(),
+            "a timed-out promotion must not prepare a recovery receipt"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".corrupt-")),
+            "a timed-out promotion must not quarantine any live artifact"
+        );
+    }
+
+    #[test]
     fn recovery_promotion_can_recover_again_after_receipted_source_corrupts() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
         let first_candidate = dir.path().join("storage.sqlite3.first-candidate");
         let second_candidate = dir.path().join("storage.sqlite3.second-candidate");
         write_marker_db(&primary, "original-generation");
-        write_canonical_marker_db(&first_candidate, "first-recovered-generation");
+        write_marker_db(&first_candidate, "first-recovered-generation");
 
         promote_recovery_candidate(&primary, &first_candidate, dir.path())
             .expect("first recovery promotion");
@@ -12419,7 +19819,7 @@ mod tests {
 
         std::fs::write(&primary, b"NOT A SQLITE DATABASE")
             .expect("corrupt previously receipted live generation");
-        write_canonical_marker_db(&second_candidate, "second-recovered-generation");
+        write_marker_db(&second_candidate, "second-recovered-generation");
         promote_recovery_candidate(&primary, &second_candidate, dir.path())
             .expect("a verified receipt chain must not make later corruption unrecoverable");
 
@@ -12479,7 +19879,7 @@ mod tests {
             b"stale-cert-head",
         )
         .expect("write stale wal-cert-head");
-        write_canonical_marker_db(&candidate, "new-generation");
+        write_marker_db(&candidate, "new-generation");
 
         promote_recovery_candidate(&primary, &candidate, dir.path())
             .expect("promotion with stale cert sidecars present must succeed");
@@ -12515,7 +19915,19 @@ mod tests {
         let primary = dir.path().join("storage.sqlite3");
         let candidate = dir.path().join("storage.sqlite3.candidate");
         write_marker_db(&primary, "live-generation");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(&primary, std::fs::Permissions::from_mode(0o400))
+                .expect("plant read-only live generation mode");
+        }
         std::fs::hard_link(&primary, &candidate).expect("hard-link candidate to live database");
+        assert!(
+            recovery_files_share_identity(&primary, &candidate)
+                .expect("inspect hard-link fixture identity"),
+            "fixture must present two paths to the same file generation"
+        );
 
         let error = promote_recovery_candidate(&primary, &candidate, dir.path())
             .expect_err("a hard-link alias must not be promoted as a distinct generation");
@@ -12523,26 +19935,77 @@ mod tests {
             error.to_string().contains("aliases the live database"),
             "unexpected error: {error}"
         );
-        // FrankenSQLite deliberately refuses to reopen a path with multiple
-        // hard links: aliases do not form an isolated authority namespace for
-        // its path-derived coordination sidecars. The rejected candidate stays
-        // inspectable, so assert the live bytes through the canonical SQLite
-        // reader rather than converting this intentional fail-closed boundary
-        // into a false data-loss report.
-        // `expect_err` needs Debug on the Ok type, which FrankenConnection
-        // deliberately does not implement; assert the shape instead.
-        assert!(
-            DbConn::open_file(primary.to_string_lossy().as_ref()).is_err(),
-            "FrankenSQLite must fail closed while a hard-link alias exists"
-        );
+        // The promotion boundary owns this same-file rejection independently
+        // of either SQLite backend's current hard-link policy. The rejected
+        // candidate stays inspectable, so verify the live bytes through the
+        // immutable canonical reader without minting coordination sidecars.
         assert_eq!(
-            canonical_sqlite_marker_value(&primary).as_deref(),
+            sqlite_marker_value(&primary).as_deref(),
             Some("live-generation"),
             "rejecting a hard-link candidate must not alter the live generation"
         );
         assert!(
             candidate.exists(),
             "rejected candidate must remain inspectable"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_eq!(
+                std::fs::metadata(&primary)
+                    .expect("stat rejected live generation")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o400,
+                "alias rejection must occur before candidate permission normalization can mutate the live inode"
+            );
+        }
+        crate::forensics::verify_recovery_receipt_state(dir.path(), &primary)
+            .expect("rejection before receipt admission must not degrade readiness");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_promotion_rejects_candidate_linked_to_external_evidence() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let external = dir.path().join("operator-evidence.sqlite3");
+        let candidate = dir.path().join("storage.sqlite3.candidate");
+        write_marker_db(&primary, "live-generation");
+        write_marker_db(&external, "external-evidence");
+        std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o400))
+            .expect("plant read-only external evidence mode");
+        std::fs::hard_link(&external, &candidate)
+            .expect("hard-link candidate to external evidence");
+
+        let error = promote_recovery_candidate(&primary, &candidate, dir.path())
+            .expect_err("a multiply-linked candidate must never be promoted");
+
+        assert!(
+            error.to_string().contains("has 2 hard links"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            sqlite_marker_value(&primary).as_deref(),
+            Some("live-generation")
+        );
+        assert_eq!(
+            sqlite_marker_value(&external).as_deref(),
+            Some("external-evidence")
+        );
+        assert!(candidate.exists(), "rejected candidate remains evidence");
+        assert_eq!(
+            std::fs::symlink_metadata(&external)
+                .expect("external evidence metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400,
+            "rejection must occur before permission normalization touches the shared inode"
         );
         crate::forensics::verify_recovery_receipt_state(dir.path(), &primary)
             .expect("rejection before receipt admission must not degrade readiness");
@@ -12573,7 +20036,7 @@ mod tests {
         let candidate = dir.path().join("storage.sqlite3.candidate");
         let candidate_namespace = sqlite_sidecar_path(&candidate, "-fsqlite-ns-use");
         write_marker_db(&primary, "live-generation");
-        write_canonical_marker_db(&candidate, "candidate-generation");
+        write_marker_db(&candidate, "candidate-generation");
         std::fs::write(&candidate_namespace, b"persistent namespace record")
             .expect("seed candidate namespace record");
 
@@ -12601,6 +20064,36 @@ mod tests {
     }
 
     #[test]
+    fn recovery_promotion_rejects_candidate_with_sqlite_companion_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let candidate = dir.path().join("storage.sqlite3.candidate");
+        let candidate_wal = sqlite_sidecar_path(&candidate, "-wal");
+        write_marker_db(&primary, "live-generation");
+        write_marker_db(&candidate, "candidate-generation");
+        std::fs::write(&candidate_wal, b"candidate WAL state").expect("seed candidate WAL state");
+
+        let error = promote_recovery_candidate(&primary, &candidate, dir.path())
+            .expect_err("a multi-file candidate generation must not be promoted as one main file");
+        assert!(
+            error
+                .to_string()
+                .contains("occupied SQLite companion artifact"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            sqlite_marker_value(&primary).as_deref(),
+            Some("live-generation"),
+            "rejected candidate must not disturb the live generation"
+        );
+        assert!(candidate.exists(), "candidate main must remain inspectable");
+        assert_eq!(
+            std::fs::read(&candidate_wal).expect("candidate WAL must remain inspectable"),
+            b"candidate WAL state"
+        );
+    }
+
+    #[test]
     fn recovery_disk_headroom_reserves_space_beyond_expected_copy_bytes() {
         let copy_bytes = 512 * 1024 * 1024;
         let required = recovery_required_free_bytes(copy_bytes);
@@ -12611,6 +20104,45 @@ mod tests {
         ));
         assert!(recovery_disk_headroom_is_sufficient(required, copy_bytes));
         assert_eq!(recovery_required_free_bytes(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn proactive_backup_headroom_covers_two_complete_logical_generations() {
+        let main_bytes = 700 * 1024 * 1024;
+        let wal_bytes = 300 * 1024 * 1024;
+        assert_eq!(
+            proactive_backup_expected_write_bytes(main_bytes, wal_bytes),
+            2_000 * 1024 * 1024
+        );
+        assert_eq!(proactive_backup_expected_write_bytes(u64::MAX, 1), u64::MAX);
+        assert_eq!(
+            proactive_backup_expected_write_bytes(u64::MAX / 2 + 1, 0),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn atomic_noreplace_move_consumes_source_and_never_clobbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.sqlite3");
+        let destination = dir.path().join("destination.sqlite3");
+        std::fs::write(&source, b"new generation").unwrap();
+
+        rename_noreplace_preserving_source(&source, &destination)
+            .expect("supported targets must provide an atomic no-replace move");
+        assert!(
+            std::fs::symlink_metadata(&source).is_err(),
+            "successful move must consume the source name rather than hard-link it"
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new generation");
+
+        let second_source = dir.path().join("second-source.sqlite3");
+        std::fs::write(&second_source, b"second generation").unwrap();
+        let error = rename_noreplace_preserving_source(&second_source, &destination)
+            .expect_err("an occupied destination must never be replaced");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&second_source).unwrap(), b"second generation");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new generation");
     }
 
     #[cfg(unix)]
@@ -12644,6 +20176,36 @@ mod tests {
         assert!(
             !redirected_target.exists(),
             "restore staging must not write through a symlinked candidate path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_backup_restore_candidate_never_follows_a_symlinked_source() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let backup = dir.path().join("storage.sqlite3.bak");
+        let sentinel = dir.path().join("operator-evidence.sqlite3");
+        let timestamp = "20260505_010101_001";
+        let candidate = restore_candidate_path(&primary, timestamp);
+        std::fs::write(&sentinel, b"operator evidence").unwrap();
+        symlink(&sentinel, &backup).unwrap();
+
+        let error = stage_backup_restore_candidate(&backup, &primary, timestamp)
+            .expect_err("backup staging must reject a symlinked source");
+        assert!(
+            matches!(
+                error,
+                SqlError::Custom(ref message) if message.contains("failed to stage sqlite backup")
+            ),
+            "unexpected error: {error}"
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"operator evidence");
+        assert!(
+            std::fs::symlink_metadata(&candidate).is_err(),
+            "source rejection must happen before a destination is created"
         );
     }
 
@@ -12687,6 +20249,70 @@ mod tests {
     }
 
     #[test]
+    fn staged_backup_validation_preserves_a_raced_companion_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let backup = dir.path().join("storage.sqlite3.bak");
+        write_marker_db(&primary, "live-generation");
+        write_marker_db(&backup, "backup-generation");
+
+        let staged = stage_backup_restore_candidate(&backup, &primary, "20260505_010101_001")
+            .expect("stage backup");
+        let raced_certificate = sqlite_sidecar_path(&staged, "-wal-cert");
+        std::fs::write(&raced_certificate, b"raced-certificate-witness")
+            .expect("seed raced companion");
+
+        let error = validate_staged_backup_restore_candidate(&backup, &staged)
+            .expect_err("a raced companion must fail staged validation");
+        assert!(
+            error
+                .to_string()
+                .contains("has companion SQLite or FrankenSQLite state"),
+            "unexpected error: {error}"
+        );
+        cleanup_sqlite_candidate_artifact(&staged);
+        assert!(staged.exists(), "the staged main must remain inspectable");
+        assert_eq!(
+            std::fs::read(&raced_certificate).expect("raced companion remains inspectable"),
+            b"raced-certificate-witness"
+        );
+        assert_eq!(
+            sqlite_marker_value(&primary).as_deref(),
+            Some("live-generation"),
+            "rejecting the raced stage must not disturb the live generation"
+        );
+    }
+
+    #[test]
+    fn rejected_standalone_stage_is_quarantined_instead_of_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir
+            .path()
+            .join("storage.sqlite3.restoring-20260505_010101_001");
+        std::fs::write(&staged, b"partial staged bytes").unwrap();
+
+        cleanup_sqlite_candidate_artifact(&staged);
+
+        assert!(
+            !staged.exists(),
+            "the rejected name must no longer be active"
+        );
+        let preserved = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy().starts_with(
+                        "storage.sqlite3.restoring-20260505_010101_001.cleanup-quarantine-rejected-",
+                    )
+                })
+            })
+            .expect("rejected staged bytes must remain under a quarantine name");
+        assert_eq!(std::fs::read(preserved).unwrap(), b"partial staged bytes");
+    }
+
+    #[test]
     fn restore_from_backup_quarantines_stale_journal_sidecars() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
@@ -12727,20 +20353,12 @@ mod tests {
         let backup1 = dir.path().join("storage.sqlite3.bak.20240101_120000");
         let backup2 = dir.path().join("storage.sqlite3.bak.20240102_120000"); // Should pick the newest
 
-        // Create a healthy DB.
-        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
-        conn.execute_raw("CREATE TABLE t (x INTEGER)").unwrap();
-        drop(conn);
-        checkpoint_and_remove_sqlite_sidecars(&primary);
+        // Create a healthy mailbox DB before corrupting the live generation.
+        write_marker_db(&primary, "live-generation");
 
         // Create dummy older backup and real newer backup (which must be a valid DB!).
         std::fs::write(&backup1, b"corrupted-old-backup").unwrap();
-        let conn2 = DbConn::open_file(backup2.to_string_lossy().as_ref()).unwrap();
-        conn2
-            .execute_raw("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (42);")
-            .unwrap();
-        drop(conn2);
-        checkpoint_and_remove_sqlite_sidecars(&backup2);
+        write_marker_db(&backup2, "newest-timestamped-backup");
 
         // Corrupt the primary to trigger recovery.
         std::fs::write(&primary, b"broken").unwrap();
@@ -12748,12 +20366,9 @@ mod tests {
         ensure_sqlite_file_healthy(&primary).expect("auto-recovery should succeed");
 
         // Verify the restored DB is exactly the valid backup.
-        let restored_conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
-        let val: i64 = restored_conn.query_sync("SELECT x FROM t", &[]).unwrap()[0]
-            .get_named("x")
-            .unwrap();
         assert_eq!(
-            val, 42,
+            sqlite_marker_value(&primary).as_deref(),
+            Some("newest-timestamped-backup"),
             "restored DB should preserve timestamped backup data"
         );
     }
@@ -12779,10 +20394,15 @@ mod tests {
     }
 
     #[test]
-    fn startup_integrity_check_recovers_open_failure_without_backup() {
+    fn startup_integrity_check_recovers_corrupt_primary_under_admission() {
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("startup_corrupt.db");
         std::fs::write(&primary, b"not-a-sqlite-file").expect("write corrupt file");
+        let breaker_lock = crate::recovery_breaker::breaker_lock_path(&primary);
+        assert!(
+            std::fs::symlink_metadata(&breaker_lock).is_err(),
+            "fixture must begin without an election file"
+        );
 
         let config = DbPoolConfig {
             database_url: format!("sqlite:///{}", primary.display()),
@@ -12802,6 +20422,15 @@ mod tests {
             sqlite_file_is_healthy(&primary).expect("post-startup health check"),
             "sqlite file should be healthy after startup recovery"
         );
+        assert!(
+            breaker_lock.is_file(),
+            "cold-start corruption must acquire durable recovery admission before opening the live family"
+        );
+        let breaker = crate::recovery_breaker::load(&primary)
+            .expect("load breaker after recovery")
+            .expect("successful admitted recovery persists cleared authority");
+        assert_eq!(breaker.consecutive_failures, 0);
+        assert!(!breaker.tripped);
     }
 
     #[test]
@@ -13009,6 +20638,350 @@ mod tests {
             matches!(result, Err(DbError::IntegrityCorruption { .. })),
             "missing file should be treated as integrity corruption needing recovery"
         );
+    }
+
+    fn assert_startup_integrity_breaker_preserves_truncated_family(
+        db_name: &str,
+        expected_error_fragment: &str,
+        install_breaker: impl FnOnce(&Path),
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(db_name);
+        {
+            let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("create startup-integrity fixture");
+            conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                .expect("detach fixture WAL mode");
+            conn.execute_raw("CREATE TABLE fixture (value INTEGER);")
+                .expect("create fixture table");
+        }
+        let primary_bytes = std::fs::read(&db_path).expect("read primary fixture");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL fixture");
+        std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+        install_breaker(&db_path);
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list startup-integrity fixture before probe")
+            .map(|entry| {
+                entry
+                    .expect("read startup-integrity fixture entry")
+                    .file_name()
+            })
+            .collect::<BTreeSet<_>>();
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(dir.path().join("storage")),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("construct lazy pool");
+
+        recovery_admission().reset();
+        let error = pool
+            .run_startup_integrity_check()
+            .expect_err("breaker authority must refuse before the integrity engine opens");
+
+        assert!(
+            error.to_string().contains(expected_error_fragment),
+            "unexpected startup-integrity refusal: {error}"
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), primary_bytes);
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list startup-integrity fixture after refusal")
+            .map(|entry| {
+                entry
+                    .expect("read startup-integrity fixture entry")
+                    .file_name()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names_after, names_before,
+            "refused startup integrity must not create lock, quarantine, forensic, or SQLite artifacts"
+        );
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn startup_integrity_preserves_truncated_family_behind_malformed_breaker() {
+        assert_startup_integrity_breaker_preserves_truncated_family(
+            "startup-integrity-malformed.sqlite3",
+            "could not be trusted",
+            |db_path| {
+                std::fs::write(
+                    crate::recovery_breaker::breaker_sidecar_path(db_path),
+                    b"malformed breaker authority",
+                )
+                .expect("write malformed breaker");
+            },
+        );
+    }
+
+    #[test]
+    fn startup_integrity_preserves_truncated_family_behind_tripped_breaker() {
+        assert_startup_integrity_breaker_preserves_truncated_family(
+            "startup-integrity-tripped.sqlite3",
+            "circuit-broken",
+            |db_path| {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "startup integrity fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(db_path, &state).expect("store tripped breaker");
+            },
+        );
+    }
+
+    fn assert_startup_integrity_breaker_preserves_corrupt_primary(
+        db_name: &str,
+        expected_error_fragment: &str,
+        install_breaker: impl FnOnce(&Path),
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(db_name);
+        let primary_bytes = b"corrupt-primary-without-sidecars";
+        std::fs::write(&db_path, primary_bytes).expect("write corrupt primary fixture");
+        install_breaker(&db_path);
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list corrupt-primary fixture before probe")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(dir.path().join("storage")),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("construct lazy pool");
+
+        recovery_admission().reset();
+        let error = pool
+            .run_startup_integrity_check()
+            .expect_err("breaker authority must refuse before opening corrupt primary bytes");
+
+        assert!(
+            error.to_string().contains(expected_error_fragment),
+            "unexpected corrupt-primary refusal: {error}"
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), primary_bytes);
+        assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list corrupt-primary fixture after refusal")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names_after, names_before,
+            "refused cold-start integrity must not create SQLite, election, recovery, or forensic artifacts"
+        );
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn startup_integrity_preserves_corrupt_primary_behind_malformed_breaker() {
+        assert_startup_integrity_breaker_preserves_corrupt_primary(
+            "startup-corrupt-malformed.sqlite3",
+            "could not be trusted",
+            |db_path| {
+                std::fs::write(
+                    crate::recovery_breaker::breaker_sidecar_path(db_path),
+                    b"malformed breaker authority",
+                )
+                .expect("write malformed breaker");
+            },
+        );
+    }
+
+    #[test]
+    fn startup_integrity_preserves_corrupt_primary_behind_tripped_breaker() {
+        assert_startup_integrity_breaker_preserves_corrupt_primary(
+            "startup-corrupt-tripped.sqlite3",
+            "circuit-broken",
+            |db_path| {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "corrupt-primary fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(db_path, &state).expect("store tripped breaker");
+            },
+        );
+    }
+
+    #[test]
+    fn startup_integrity_allows_healthy_family_with_nonclean_breaker_authority() {
+        for breaker_kind in ["malformed", "tripped"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir
+                .path()
+                .join(format!("healthy-breaker-{breaker_kind}.sqlite3"));
+            {
+                let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                    .expect("create healthy startup fixture");
+                conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                    .expect("force standalone primary");
+                conn.execute_raw("CREATE TABLE fixture (value INTEGER);")
+                    .expect("create fixture table");
+            }
+            let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+            if breaker_kind == "malformed" {
+                std::fs::write(&breaker_path, b"malformed breaker authority")
+                    .expect("write malformed breaker");
+            } else {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "healthy-family fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(&db_path, &state).expect("store tripped breaker");
+            }
+            let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+            let election_path = crate::recovery_breaker::breaker_lock_path(&db_path);
+            let pool = DbPool::new(&DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                storage_root: Some(dir.path().join("storage")),
+                ..Default::default()
+            })
+            .expect("construct lazy pool");
+
+            let result = pool
+                .run_startup_integrity_check()
+                .expect("healthy exact family does not require recovery admission");
+
+            assert!(result.ok);
+            assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+            assert!(
+                std::fs::symlink_metadata(&election_path).is_err(),
+                "a healthy exact family must not create a recovery-election artifact"
+            );
+            assert!(
+                std::fs::read_dir(dir.path())
+                    .expect("list healthy startup fixture")
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .all(|name| !name.contains("cleanup-quarantine")
+                        && !name.contains(".corrupt-")
+                        && !name.contains(".recovery")),
+                "healthy startup must not publish recovery artifacts"
+            );
+        }
+    }
+
+    #[test]
+    fn full_integrity_breakers_preserve_suspect_family_before_engine_open() {
+        for family_kind in ["damaged-wal", "corrupt-primary"] {
+            for breaker_kind in ["malformed", "tripped"] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let db_path = dir
+                    .path()
+                    .join(format!("full-{family_kind}-{breaker_kind}.sqlite3"));
+                if family_kind == "damaged-wal" {
+                    let conn =
+                        crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                            .expect("create healthy primary fixture");
+                    conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                        .expect("force standalone primary");
+                    conn.execute_raw("CREATE TABLE fixture (value INTEGER);")
+                        .expect("create fixture table");
+                    drop(conn);
+                    std::fs::write(sqlite_sidecar_path(&db_path, "-wal"), b"truncated-wal")
+                        .expect("write damaged WAL");
+                    std::fs::write(sqlite_sidecar_path(&db_path, "-shm"), b"coordination-shm")
+                        .expect("write SHM fixture");
+                } else {
+                    std::fs::write(&db_path, b"corrupt main-only family")
+                        .expect("write corrupt primary fixture");
+                }
+
+                let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+                if breaker_kind == "malformed" {
+                    std::fs::write(&breaker_path, b"malformed breaker authority")
+                        .expect("write malformed breaker");
+                } else {
+                    let config = crate::recovery_breaker::config_from_env();
+                    let state = crate::recovery_breaker::RecoveryBreakerState {
+                        schema: 1,
+                        db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+                        consecutive_failures: config.max_consecutive_failures,
+                        last_failure_unix: recovery_breaker_now_unix(),
+                        last_failure_reason: "full-integrity fixture tripped".to_string(),
+                        tripped: true,
+                    };
+                    crate::recovery_breaker::store(&db_path, &state)
+                        .expect("store tripped breaker");
+                }
+
+                let family_paths = [
+                    db_path.clone(),
+                    sqlite_sidecar_path(&db_path, "-wal"),
+                    sqlite_sidecar_path(&db_path, "-shm"),
+                    breaker_path.clone(),
+                ];
+                let family_bytes_before =
+                    family_paths.each_ref().map(|path| std::fs::read(path).ok());
+                let names_before = std::fs::read_dir(dir.path())
+                    .expect("list full-integrity fixture before probe")
+                    .map(|entry| entry.expect("read fixture entry").file_name())
+                    .collect::<BTreeSet<_>>();
+                let pool = DbPool::new(&DbPoolConfig {
+                    database_url: format!("sqlite:///{}", db_path.display()),
+                    storage_root: Some(dir.path().join("storage")),
+                    ..Default::default()
+                })
+                .expect("construct lazy pool");
+
+                recovery_admission().reset();
+                let error = pool
+                    .run_full_integrity_check()
+                    .expect_err("breaker authority must refuse the full-cycle live open");
+                let expected = if breaker_kind == "malformed" {
+                    "could not be trusted"
+                } else {
+                    "circuit-broken"
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "unexpected {family_kind}/{breaker_kind} full-cycle refusal: {error}"
+                );
+                assert_eq!(
+                    family_paths.each_ref().map(|path| std::fs::read(path).ok()),
+                    family_bytes_before,
+                    "refused full-cycle open must preserve every family byte"
+                );
+                let names_after = std::fs::read_dir(dir.path())
+                    .expect("list full-integrity fixture after refusal")
+                    .map(|entry| entry.expect("read fixture entry").file_name())
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(
+                    names_after, names_before,
+                    "refused full-cycle open must not create election, cleanup, recovery, or forensic artifacts"
+                );
+                recovery_admission().reset();
+            }
+        }
     }
 
     /// Verify `run_full_integrity_check` passes on a healthy file-backed DB.
@@ -13483,8 +21456,8 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = Cx::for_testing();
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let project = crate::queries::ensure_project(&cx, &pool, "/tmp/orphan-proj")
                 .await
                 .into_result()
@@ -13593,7 +21566,7 @@ mod tests {
     }
 
     #[test]
-    fn get_or_create_pool_keeps_distinct_storage_roots_isolated_for_same_sqlite_path() {
+    fn get_or_create_pool_rejects_conflicting_archive_roots_for_same_sqlite_path() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("shared.sqlite3");
         let storage_a = dir.path().join("storage-a");
@@ -13612,12 +21585,146 @@ mod tests {
             ..Default::default()
         };
 
-        let pool_a = get_or_create_pool(&cfg_a).expect("pool a");
-        let pool_b = get_or_create_pool(&cfg_b).expect("pool b");
-
+        let pool_a = get_or_create_pool(&cfg_a).expect("establish archive authority");
+        let conflicting = get_or_create_pool(&cfg_b);
+        let Err(error) = conflicting else {
+            panic!("one live SQLite identity must reject a second archive authority")
+        };
+        assert!(matches!(
+            error,
+            DbError::InvalidArgument {
+                field: "storage_root",
+                ..
+            }
+        ));
         assert!(
-            !Arc::ptr_eq(&pool_a.pool, &pool_b.pool),
-            "pool cache must not alias the same sqlite file across distinct storage roots"
+            !pool_a.message_id_allocator().is_retired(),
+            "a rejected conflicting root must not disturb established authority"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_byte_archive_roots_remain_distinct_allocator_authorities() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("invalid-byte-roots.sqlite3");
+        let storage_a = dir
+            .path()
+            .join(OsString::from_vec(b"storage-\xff".to_vec()));
+        let storage_b = dir
+            .path()
+            .join(OsString::from_vec(b"storage-\xfe".to_vec()));
+        std::fs::create_dir_all(&storage_a).expect("create first invalid-byte root");
+        std::fs::create_dir_all(&storage_b).expect("create second invalid-byte root");
+        assert_ne!(storage_a, storage_b);
+        assert_eq!(
+            storage_a.to_string_lossy(),
+            storage_b.to_string_lossy(),
+            "fixture must collide under the former lossy String identity"
+        );
+
+        let base = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(storage_a.clone()),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let conflicting = DbPoolConfig {
+            storage_root: Some(storage_b.clone()),
+            ..base.clone()
+        };
+        assert_ne!(
+            pool_cache_key(&base).expect("resolve first pool key"),
+            pool_cache_key(&conflicting).expect("resolve second pool key"),
+            "pool reuse must not collide before allocator admission runs"
+        );
+        let base_authority = DbPoolAuthority::resolve(&base).expect("resolve first authority");
+        let conflicting_authority =
+            DbPoolAuthority::resolve(&conflicting).expect("resolve second authority");
+        assert_ne!(
+            sqlite_init_gate_key(
+                base_authority.sqlite_identity.as_deref(),
+                &base_authority.storage_root,
+            ),
+            sqlite_init_gate_key(
+                conflicting_authority.sqlite_identity.as_deref(),
+                &conflicting_authority.storage_root,
+            ),
+            "a completed init gate for one byte-exact archive root must not skip another root's init"
+        );
+        let established = DbPool::new(&base).expect("establish first archive authority");
+        let Err(error) = DbPool::new(&conflicting) else {
+            panic!("losslessly distinct roots must not reuse one archive authority")
+        };
+        assert!(matches!(
+            error,
+            DbError::InvalidArgument {
+                field: "storage_root",
+                ..
+            }
+        ));
+        assert!(!established.message_id_allocator().is_retired());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_byte_sqlite_targets_remain_distinct_allocator_identities() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target_a = dir
+            .path()
+            .join(OsString::from_vec(b"database-parent-\xff".to_vec()));
+        let target_b = dir
+            .path()
+            .join(OsString::from_vec(b"database-parent-\xfe".to_vec()));
+        std::fs::create_dir_all(&target_a).expect("create first invalid-byte database parent");
+        std::fs::create_dir_all(&target_b).expect("create second invalid-byte database parent");
+        let alias_a = dir.path().join("database-alias-a");
+        let alias_b = dir.path().join("database-alias-b");
+        symlink(&target_a, &alias_a).expect("create first database parent alias");
+        symlink(&target_b, &alias_b).expect("create second database parent alias");
+        let high_byte_db = alias_a.join("mail.sqlite3");
+        let lower_byte_db = alias_b.join("mail.sqlite3");
+        let high_byte_url_path = high_byte_db.to_str().expect("UTF-8 alias path");
+        let lower_byte_url_path = lower_byte_db.to_str().expect("UTF-8 alias path");
+
+        assert_eq!(
+            normalize_sqlite_identity_path(high_byte_url_path),
+            normalize_sqlite_identity_path(lower_byte_url_path),
+            "fixture must collide under the former lossy String database identity"
+        );
+        assert_ne!(
+            normalize_file_sqlite_identity(high_byte_url_path),
+            normalize_file_sqlite_identity(lower_byte_url_path),
+            "allocator authority must retain the canonical target's native bytes"
+        );
+
+        let storage_root = dir.path().join("shared-storage");
+        let config_a = DbPoolConfig {
+            database_url: format!("sqlite:///{high_byte_url_path}"),
+            storage_root: Some(storage_root.clone()),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let config_b = DbPoolConfig {
+            database_url: format!("sqlite:///{lower_byte_url_path}"),
+            ..config_a.clone()
+        };
+        let pool_a = DbPool::new(&config_a).expect("create first database authority");
+        let pool_b = DbPool::new(&config_b).expect("create second database authority");
+        assert!(
+            !Arc::ptr_eq(
+                &pool_a.message_id_allocator(),
+                &pool_b.message_id_allocator()
+            ),
+            "byte-distinct SQLite files must never share one allocator"
         );
     }
 
@@ -13702,7 +21809,8 @@ mod tests {
             let cache = POOL_CACHE
                 .get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
             let guard = cache.read();
-            let has_pool_entry = guard.contains_key(&pool_cache_key(&config));
+            let has_pool_entry = guard
+                .contains_key(&pool_cache_key(&config).expect("resolve cached pool authority"));
             drop(guard);
             assert!(
                 has_pool_entry,
@@ -13714,7 +21822,7 @@ mod tests {
                 .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
             let guard = gates.read();
             let has_init_gate = guard.contains_key(&sqlite_init_gate_key(
-                pool.sqlite_path(),
+                pool.sqlite_identity.as_deref(),
                 pool.storage_root(),
             ));
             drop(guard);
@@ -13775,7 +21883,8 @@ mod tests {
             let cache = POOL_CACHE
                 .get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
             let guard = cache.read();
-            let has_pool_entry = guard.contains_key(&pool_cache_key(&config));
+            let has_pool_entry = guard
+                .contains_key(&pool_cache_key(&config).expect("resolve cached pool authority"));
             drop(guard);
             assert!(
                 !has_pool_entry,
@@ -13787,7 +21896,7 @@ mod tests {
                 .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
             let guard = gates.read();
             let has_init_gate = guard.contains_key(&sqlite_init_gate_key(
-                pool.sqlite_path(),
+                pool.sqlite_identity.as_deref(),
                 pool.storage_root(),
             ));
             drop(guard);
@@ -14333,6 +22442,94 @@ mod tests {
         assert!(healthy, "valid DB should be healthy");
     }
 
+    fn seed_healthy_probe_db(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        let conn = DbConn::open_file(path.to_string_lossy().as_ref()).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create");
+        conn.execute_raw("INSERT INTO t(x) VALUES (1)")
+            .expect("insert");
+        crate::close_db_conn(conn, "seed healthy probe db");
+        path
+    }
+
+    /// br-eru3j: back-to-back probes of an unchanged family stage and check
+    /// it once; the second call reuses the healthy verdict.
+    #[test]
+    fn healthy_staged_verdict_is_reused_for_an_unchanged_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seed_healthy_probe_db(dir.path(), "reuse.db");
+        let before = health_probe_stagings_for_test(&path);
+
+        assert!(sqlite_file_is_healthy(&path).expect("first probe"));
+        assert_eq!(health_probe_stagings_for_test(&path), before + 1);
+        assert!(sqlite_file_is_healthy(&path).expect("second probe"));
+        assert_eq!(
+            health_probe_stagings_for_test(&path),
+            before + 1,
+            "an unchanged healthy family must not be staged again inside the reuse window"
+        );
+
+        // The no-cleanup contract is a stricter verdict and keeps its own entry.
+        assert!(sqlite_file_is_healthy_without_family_cleanup(&path).expect("no-cleanup probe"));
+        assert_eq!(health_probe_stagings_for_test(&path), before + 2);
+        assert!(sqlite_file_is_healthy_without_family_cleanup(&path).expect("no-cleanup reuse"));
+        assert_eq!(health_probe_stagings_for_test(&path), before + 2);
+    }
+
+    #[test]
+    fn healthy_staged_verdict_is_dropped_when_the_family_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seed_healthy_probe_db(dir.path(), "changed.db");
+        let before = health_probe_stagings_for_test(&path);
+        assert!(sqlite_file_is_healthy(&path).expect("first probe"));
+        assert_eq!(health_probe_stagings_for_test(&path), before + 1);
+
+        let conn = DbConn::open_file(path.to_string_lossy().as_ref()).expect("reopen");
+        conn.execute_raw("INSERT INTO t(x) VALUES (2)")
+            .expect("write");
+        crate::close_db_conn(conn, "mutate probed db");
+
+        assert!(sqlite_file_is_healthy(&path).expect("probe after write"));
+        assert_eq!(
+            health_probe_stagings_for_test(&path),
+            before + 2,
+            "a write changes the family fingerprint, so the verdict must be recomputed"
+        );
+    }
+
+    #[test]
+    fn unhealthy_staged_verdict_is_never_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.db");
+        std::fs::write(&path, b"not a sqlite database at all, just bytes").unwrap();
+        let before = health_probe_stagings_for_test(&path);
+        assert!(!sqlite_file_is_healthy(&path).expect("corrupt probe"));
+        assert!(!sqlite_file_is_healthy(&path).expect("corrupt probe again"));
+        assert_eq!(
+            health_probe_stagings_for_test(&path),
+            before + 2,
+            "an unhealthy family is re-probed every time"
+        );
+    }
+
+    #[test]
+    fn healthy_staged_verdict_reuse_can_be_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seed_healthy_probe_db(dir.path(), "disabled.db");
+        let before = health_probe_stagings_for_test(&path);
+        let overrides = [("AM_HEALTH_VERDICT_REUSE_SECS", "0")];
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(&overrides, || {
+            assert!(sqlite_file_is_healthy(&path).expect("first probe"));
+            assert!(sqlite_file_is_healthy(&path).expect("second probe"));
+        });
+        assert_eq!(
+            health_probe_stagings_for_test(&path),
+            before + 2,
+            "AM_HEALTH_VERDICT_REUSE_SECS=0 must stage every probe"
+        );
+    }
+
     #[test]
     fn sqlite_file_has_live_sidecars_detects_non_empty_sidecar() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -14634,6 +22831,23 @@ mod tests {
 
         let resolved = resolve_sqlite_path_with_absolute_fallback(&missing_relative);
         assert_eq!(resolved, missing_relative);
+
+        let database_url = format!("sqlite:///{missing_relative}");
+        let mailbox_path =
+            resolve_mailbox_sqlite_path(&database_url).expect("resolve shared mailbox authority");
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url,
+            ..DbPoolConfig::default()
+        })
+        .expect("construct lazy pool");
+        let frozen_relative_identity = normalize_sqlite_identity_path_buf(&missing_relative_path)
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(mailbox_path.canonical_path, frozen_relative_identity);
+        assert_eq!(
+            pool.sqlite_path, mailbox_path.canonical_path,
+            "the shared resolver and actual pool must freeze one fresh-start authority"
+        );
     }
 
     #[test]
@@ -14692,6 +22906,26 @@ mod tests {
 
         // Should not error when WAL doesn't exist.
         quarantine_sidecar(&primary, "-wal", "20260218_120000_000").expect("quarantine noop");
+    }
+
+    #[test]
+    fn quarantine_sidecar_never_replaces_existing_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("test.db");
+        let wal = dir.path().join("test.db-wal");
+        let quarantine = dir.path().join("test.db-wal.corrupt-20260218_120000_000");
+        std::fs::write(&wal, b"new wal generation").unwrap();
+        std::fs::write(&quarantine, b"older forensic evidence").unwrap();
+
+        quarantine_sidecar(&primary, "-wal", "20260218_120000_000")
+            .expect_err("occupied quarantine target must fail closed");
+
+        assert_eq!(std::fs::read(&wal).unwrap(), b"new wal generation");
+        assert_eq!(
+            std::fs::read(&quarantine).unwrap(),
+            b"older forensic evidence",
+            "quarantine must never replace an earlier witness"
+        );
     }
 
     #[test]
@@ -14803,6 +23037,34 @@ mod tests {
     }
 
     #[test]
+    fn restore_quarantined_sidecar_preserves_newly_appeared_live_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("test.db");
+        let live_wal = sqlite_sidecar_path(&primary, "-wal");
+        let quarantined_wal =
+            quarantined_sidecar_path(&primary, "-wal", "corrupt", "20260218_120000_000");
+        std::fs::write(&live_wal, b"newly-appeared-wal").unwrap();
+        std::fs::write(&quarantined_wal, b"original-wal").unwrap();
+
+        restore_quarantined_sidecar(&primary, "-wal", "corrupt", "20260218_120000_000")
+            .expect("restore original WAL without deleting the new witness");
+
+        assert_eq!(std::fs::read(&live_wal).unwrap(), b"original-wal");
+        let preserved = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .contains("test.db-wal.cleanup-quarantine-rollback-conflict-")
+                })
+            })
+            .expect("newly appeared WAL must be preserved under a unique quarantine name");
+        assert_eq!(std::fs::read(preserved).unwrap(), b"newly-appeared-wal");
+    }
+
+    #[test]
     fn quarantine_reconstructed_candidate_uses_reason_specific_sidecar_paths() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("test.db");
@@ -14868,6 +23130,27 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_reconstructed_candidate_never_replaces_existing_main_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("test.db");
+        let quarantine = dir
+            .path()
+            .join("test.db.reconstruct-failed-20260218_120000_000");
+        std::fs::write(&primary, b"candidate generation").unwrap();
+        std::fs::write(&quarantine, b"older failed generation").unwrap();
+
+        quarantine_reconstructed_candidate(&primary, "20260218_120000_000", "reconstruct-failed")
+            .expect_err("occupied quarantine target must fail closed");
+
+        assert_eq!(std::fs::read(&primary).unwrap(), b"candidate generation");
+        assert_eq!(
+            std::fs::read(&quarantine).unwrap(),
+            b"older failed generation",
+            "an older failed generation is evidence, not a replaceable temp file"
+        );
+    }
+
+    #[test]
     fn reconstruction_candidate_path_avoids_existing_artifacts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("test.db");
@@ -14920,7 +23203,7 @@ mod tests {
     }
 
     #[test]
-    fn quarantine_reconstruction_candidate_path_moves_candidate_and_journal() {
+    fn quarantine_reconstruction_candidate_path_moves_complete_sqlite_family() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("test.db");
         let candidate = dir
@@ -14929,9 +23212,14 @@ mod tests {
         let candidate_journal = dir
             .path()
             .join("test.db.reconstructing-20260218_120000_000-journal");
+        let candidate_certificate = dir
+            .path()
+            .join("test.db.reconstructing-20260218_120000_000-wal-cert");
 
         std::fs::write(&candidate, b"candidate").expect("write candidate");
         std::fs::write(&candidate_journal, b"journal").expect("write candidate journal");
+        std::fs::write(&candidate_certificate, b"certificate")
+            .expect("write candidate certificate");
 
         let quarantined = quarantine_reconstruction_candidate_path(
             &candidate,
@@ -14956,6 +23244,74 @@ mod tests {
             )
             .unwrap(),
             b"journal"
+        );
+        assert_eq!(
+            std::fs::read(
+                dir.path()
+                    .join("test.db.reconstruct-failed-20260218_120000_000-wal-cert")
+            )
+            .unwrap(),
+            b"certificate"
+        );
+    }
+
+    #[test]
+    fn quarantine_reconstruction_candidate_never_replaces_existing_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("test.db");
+        let candidate = dir
+            .path()
+            .join("test.db.reconstructing-20260218_120000_000");
+        let occupied = dir
+            .path()
+            .join("test.db.reconstruct-failed-20260218_120000_000");
+        std::fs::write(&candidate, b"new-candidate").unwrap();
+        std::fs::write(&occupied, b"older-evidence").unwrap();
+
+        let quarantined = quarantine_reconstruction_candidate_path(
+            &candidate,
+            &primary,
+            "reconstruct-failed",
+            "20260218_120000_000",
+        )
+        .expect("quarantine candidate")
+        .expect("quarantined path");
+
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"older-evidence");
+        assert_eq!(
+            quarantined,
+            dir.path()
+                .join("test.db.reconstruct-failed-20260218_120000_000-01")
+        );
+        assert_eq!(std::fs::read(&quarantined).unwrap(), b"new-candidate");
+    }
+
+    #[test]
+    fn quarantine_reconstruction_candidate_preserves_namespaced_generation_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("test.db");
+        let candidate = dir
+            .path()
+            .join("test.db.reconstructing-20260218_120000_000");
+        let namespace = sqlite_sidecar_path(&candidate, "-fsqlite-ns-use");
+        std::fs::write(&candidate, b"candidate-main").unwrap();
+        std::fs::write(&namespace, b"namespace-witness").unwrap();
+
+        let error = quarantine_reconstruction_candidate_path(
+            &candidate,
+            &primary,
+            "reconstruct-failed",
+            "20260218_120000_000",
+        )
+        .expect_err("a namespaced generation must remain intact");
+
+        assert!(error.to_string().contains("namespace records"));
+        assert_eq!(std::fs::read(&candidate).unwrap(), b"candidate-main");
+        assert_eq!(std::fs::read(&namespace).unwrap(), b"namespace-witness");
+        assert!(
+            !dir.path()
+                .join("test.db.reconstruct-failed-20260218_120000_000")
+                .exists()
         );
     }
 
@@ -15227,7 +23583,7 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        checkpoint_and_remove_sqlite_sidecars(&primary);
+        checkpoint_into_standalone_delete_mode(&primary);
         std::fs::copy(&primary, &backup).unwrap();
 
         // Corrupt the primary.
@@ -15427,7 +23783,7 @@ mod tests {
 
         crate::reconstruct::reconstruct_from_archive(&primary, &storage_root)
             .expect("seed db for backup");
-        checkpoint_and_remove_sqlite_sidecars(&primary);
+        checkpoint_into_standalone_delete_mode(&primary);
         std::fs::copy(&primary, &backup).unwrap();
 
         std::fs::write(
@@ -15712,13 +24068,12 @@ mod tests {
     #[test]
     fn reconcile_archive_state_before_init_ignores_unrelated_default_archive_overlap() {
         let dir = tempfile::tempdir().unwrap();
-        let xdg_data_root = dir.path().join("xdg-data");
-        std::fs::create_dir_all(&xdg_data_root).unwrap();
-        let xdg_data_root_str = xdg_data_root.to_str().unwrap().to_string();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("XDG_DATA_HOME", xdg_data_root_str.as_str())],
-            || {
+        // br-99aih: redirect the *default* storage root into a private tempdir
+        // (HOME + XDG_DATA_HOME); an XDG-only override still resolved to the
+        // operator's live archive on any host that had run the daemon.
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(
+            |_isolated_default_root| {
                 let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
                 assert!(mcp_agent_mail_core::config::is_default_storage_root(
                     &storage_root
@@ -16265,6 +24620,264 @@ mod tests {
         );
     }
 
+    #[test]
+    fn nested_recovery_admission_allows_same_path_and_refuses_different_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.sqlite3");
+        let second = dir.path().join("second.sqlite3");
+        std::fs::write(&first, b"first generation").unwrap();
+        std::fs::write(&second, b"second generation").unwrap();
+        let same_path_calls = std::cell::Cell::new(0_u8);
+        let different_path_calls = std::cell::Cell::new(0_u8);
+
+        recovery_admission().reset();
+        with_recovery_admission(&first, "outer recovery", || {
+            with_recovery_admission(&first, "same-path nested recovery", || {
+                same_path_calls.set(same_path_calls.get().saturating_add(1));
+                Ok(())
+            })?;
+            let error = with_recovery_admission(&second, "different-path nested recovery", || {
+                different_path_calls.set(different_path_calls.get().saturating_add(1));
+                Ok(())
+            })
+            .expect_err("a nested recovery must not inherit admission for another database");
+            assert!(
+                error
+                    .to_string()
+                    .contains("nested recovery may only target")
+            );
+            Ok(())
+        })
+        .expect("outer and same-path nested recovery should succeed");
+
+        assert_eq!(same_path_calls.get(), 1);
+        assert_eq!(different_path_calls.get(), 0);
+        assert!(
+            std::fs::symlink_metadata(crate::recovery_breaker::breaker_sidecar_path(&second))
+                .is_err(),
+            "different-path refusal must happen before creating breaker authority"
+        );
+        recovery_admission().reset();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_recovery_admission_distinguishes_lossy_colliding_unix_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir
+            .path()
+            .join(OsString::from_vec(b"authority-\x80.sqlite3".to_vec()));
+        let second = dir
+            .path()
+            .join(OsString::from_vec(b"authority-\x81.sqlite3".to_vec()));
+        assert_eq!(
+            first.to_string_lossy(),
+            second.to_string_lossy(),
+            "fixture must collide under lossy UTF-8 conversion"
+        );
+        std::fs::write(&first, b"first generation").unwrap();
+        std::fs::write(&second, b"second generation").unwrap();
+        let second_operation_called = std::cell::Cell::new(false);
+
+        recovery_admission().reset();
+        with_recovery_admission(&first, "outer non-UTF8 recovery", || {
+            let error = with_recovery_admission(&second, "nested non-UTF8 recovery", || {
+                second_operation_called.set(true);
+                Ok(())
+            })
+            .expect_err("lossy-colliding path must not inherit another database's admission");
+            assert!(
+                error
+                    .to_string()
+                    .contains("nested recovery may only target")
+            );
+            Ok(())
+        })
+        .expect("outer recovery should retain its own lossless identity");
+
+        assert!(!second_operation_called.get());
+        assert!(
+            std::fs::symlink_metadata(crate::recovery_breaker::breaker_sidecar_path(&second))
+                .is_err(),
+            "path-B refusal must occur before creating its breaker authority"
+        );
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn automatic_recovery_refuses_malformed_breaker_authority_before_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("storage.sqlite3");
+        std::fs::write(&db, b"corrupt-content").unwrap();
+        std::fs::write(
+            crate::recovery_breaker::breaker_sidecar_path(&db),
+            b"malformed breaker state",
+        )
+        .unwrap();
+        let election_path = crate::recovery_breaker::breaker_lock_path(&db);
+        assert!(std::fs::symlink_metadata(&election_path).is_err());
+        let operation_called = std::cell::Cell::new(false);
+
+        recovery_admission().reset();
+        let error = with_recovery_admission(&db, "test recovery", || {
+            operation_called.set(true);
+            Ok(())
+        })
+        .expect_err("untrusted breaker authority must fail closed");
+        assert!(error.to_string().contains("could not be trusted"));
+        assert!(
+            !operation_called.get(),
+            "automatic operation must not run when breaker authority is malformed"
+        );
+        assert!(
+            std::fs::symlink_metadata(&election_path).is_err(),
+            "malformed authority must refuse without creating a persistent election artifact"
+        );
+    }
+
+    #[test]
+    fn automatic_recovery_allowed_preflight_still_acquires_durable_election() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("storage.sqlite3");
+        std::fs::write(&db, b"recoverable-content").unwrap();
+        let election_path = crate::recovery_breaker::breaker_lock_path(&db);
+        assert!(std::fs::symlink_metadata(&election_path).is_err());
+        let operation_called = std::cell::Cell::new(false);
+
+        recovery_admission().reset();
+        with_recovery_admission(&db, "test admitted recovery", || {
+            operation_called.set(true);
+            Ok(())
+        })
+        .expect("clean breaker preflight should admit recovery");
+
+        assert!(operation_called.get());
+        assert!(
+            std::fs::symlink_metadata(&election_path).is_ok_and(|metadata| metadata.is_file()),
+            "an allowed attempt must still use the durable cross-process election"
+        );
+    }
+
+    #[test]
+    fn terminal_breaker_failure_uses_completion_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("storage.sqlite3");
+        std::fs::write(&db, b"corrupt-content").unwrap();
+        let clock_calls = std::cell::Cell::new(0_u8);
+
+        recovery_admission().reset();
+        let error = with_recovery_admission_using_clock(
+            &db,
+            "test recovery",
+            || Err::<(), _>(SqlError::Custom("late failure".to_string())),
+            || {
+                let call = clock_calls.get();
+                clock_calls.set(call.saturating_add(1));
+                if call == 0 { 100 } else { 250 }
+            },
+        )
+        .expect_err("synthetic recovery must fail");
+        assert!(error.to_string().contains("late failure"));
+        let state = crate::recovery_breaker::load(&db)
+            .expect("load sidecar")
+            .expect("sidecar");
+        assert_eq!(state.last_failure_unix, 250);
+        assert_eq!(clock_calls.get(), 2);
+    }
+
+    #[test]
+    fn failed_recovery_mutations_remain_in_one_breaker_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("storage.sqlite3");
+        std::fs::write(&db, b"initial-corrupt-content").unwrap();
+
+        for attempt in 1..=3 {
+            recovery_admission().reset();
+            let error = with_recovery_admission(&db, "mutating recovery", || {
+                std::fs::write(&db, format!("failed-repair-generation-{attempt}"))
+                    .expect("mutate primary before synthetic failure");
+                Err::<(), _>(SqlError::Custom(format!("failure {attempt}")))
+            })
+            .expect_err("synthetic repair must fail");
+            assert!(error.to_string().contains(&format!("failure {attempt}")));
+        }
+
+        let state = crate::recovery_breaker::load(&db)
+            .expect("load terminal breaker state")
+            .expect("breaker state must persist");
+        assert_eq!(
+            state.db_fingerprint,
+            crate::recovery_breaker::fingerprint_db(&db),
+            "failure authority must bind to the terminal bytes, not the pre-attempt bytes"
+        );
+        assert_eq!(state.consecutive_failures, 3);
+        assert!(state.tripped);
+
+        recovery_admission().reset();
+        let fourth_called = std::cell::Cell::new(false);
+        let error = with_recovery_admission(&db, "mutating recovery", || {
+            fourth_called.set(true);
+            Ok(())
+        })
+        .expect_err("terminal generation must remain circuit-broken");
+        assert!(error.to_string().contains("circuit-broken"));
+        assert!(
+            !fourth_called.get(),
+            "the breaker must refuse before a fourth mutating operation"
+        );
+    }
+
+    #[test]
+    fn crashed_half_open_probe_is_durably_rearmed_before_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("storage.sqlite3");
+        std::fs::write(&db, b"corrupt-content").unwrap();
+        let fingerprint = crate::recovery_breaker::fingerprint_db(&db);
+        let config = crate::recovery_breaker::config_from_env();
+        let old_failure = recovery_breaker_now_unix()
+            .saturating_sub(i64::try_from(config.cooldown_secs).unwrap_or(i64::MAX))
+            .saturating_sub(1);
+        let prior = crate::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: fingerprint,
+            consecutive_failures: config.max_consecutive_failures,
+            last_failure_unix: old_failure.max(0),
+            last_failure_reason: "old failure".to_string(),
+            tripped: true,
+        };
+        crate::recovery_breaker::store(&db, &prior).expect("seed elapsed breaker");
+
+        recovery_admission().reset();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = with_recovery_admission::<(), _>(&db, "test recovery", || {
+                panic!("synthetic process crash during half-open recovery")
+            });
+        }));
+        assert!(panicked.is_err());
+        let rearmed = crate::recovery_breaker::load(&db)
+            .expect("load rearmed sidecar")
+            .expect("rearmed sidecar");
+        assert_eq!(
+            rearmed.consecutive_failures,
+            prior.consecutive_failures.saturating_add(1)
+        );
+        assert!(rearmed.last_failure_unix > prior.last_failure_unix);
+        assert_eq!(
+            rearmed.last_failure_reason,
+            "automatic recovery attempt did not complete"
+        );
+
+        recovery_admission().reset();
+        let retried = std::cell::Cell::new(false);
+        let error = with_recovery_admission(&db, "test recovery", || {
+            retried.set(true);
+            Ok(())
+        })
+        .expect_err("freshly rearmed breaker must refuse immediate retry");
+        assert!(error.to_string().contains("circuit-broken"));
+        assert!(!retried.get());
+    }
+
     /// br-acusl: the durable circuit breaker parks repeated AUTOMATIC
     /// recovery failures on the same database content — refusing BEFORE the
     /// admitted operation (which is what captures forensic bundles) ever
@@ -16287,7 +24900,9 @@ mod tests {
                 "attempt {attempt} must reach the operation: {error}"
             );
         }
-        let state = crate::recovery_breaker::load(&db).expect("breaker sidecar must persist");
+        let state = crate::recovery_breaker::load(&db)
+            .expect("load breaker sidecar")
+            .expect("breaker sidecar must persist");
         assert!(state.tripped, "third same-content failure must trip");
         assert_eq!(state.consecutive_failures, 3);
 
@@ -16323,7 +24938,9 @@ mod tests {
         let error = with_recovery_admission(&db, "test recovery", fail_op)
             .expect_err("synthetic recovery must fail");
         assert!(error.to_string().contains("synthetic recovery failure"));
-        let state = crate::recovery_breaker::load(&db).expect("sidecar");
+        let state = crate::recovery_breaker::load(&db)
+            .expect("load sidecar")
+            .expect("sidecar");
         assert_eq!(
             state.consecutive_failures, 1,
             "fingerprint change must restart the count"
@@ -16333,7 +24950,9 @@ mod tests {
         // Success clears the breaker durably (sidecar overwritten, not deleted).
         recovery_admission().reset();
         with_recovery_admission(&db, "test recovery", || Ok(())).expect("successful recovery");
-        let cleared = crate::recovery_breaker::load(&db).expect("cleared sidecar persists");
+        let cleared = crate::recovery_breaker::load(&db)
+            .expect("load cleared sidecar")
+            .expect("cleared sidecar persists");
         assert!(!cleared.tripped);
         assert_eq!(cleared.consecutive_failures, 0);
     }
@@ -16361,7 +24980,10 @@ mod tests {
             let _ = with_recovery_admission(&db, "test recovery", fail_op);
         }
         assert!(
-            crate::recovery_breaker::load(&db).expect("sidecar").tripped,
+            crate::recovery_breaker::load(&db)
+                .expect("load sidecar")
+                .expect("sidecar")
+                .tripped,
             "fixture must start tripped"
         );
 
@@ -16386,13 +25008,12 @@ mod tests {
     #[test]
     fn archive_recovery_ignores_unrelated_default_archive_overlap_for_missing_external_db() {
         let dir = tempfile::tempdir().unwrap();
-        let xdg_data_root = dir.path().join("xdg-data");
-        std::fs::create_dir_all(&xdg_data_root).unwrap();
-        let xdg_data_root_str = xdg_data_root.to_str().unwrap().to_string();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("XDG_DATA_HOME", xdg_data_root_str.as_str())],
-            || {
+        // br-99aih: redirect the *default* storage root into a private tempdir
+        // (HOME + XDG_DATA_HOME); an XDG-only override still resolved to the
+        // operator's live archive on any host that had run the daemon.
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(
+            |_isolated_default_root| {
                 let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
                 assert!(mcp_agent_mail_core::config::is_default_storage_root(
                     &storage_root
@@ -16443,16 +25064,20 @@ mod tests {
             executable_deleted: false,
             holds_storage_root_lock: true,
             holds_sqlite_lock: true,
+            holds_exclusive_lock: true,
             holds_database_file: true,
         }];
 
-        let (disposition, competing_pids, supervised_restart_required, detail) =
-            classify_mailbox_ownership(&processes, current_pid);
+        let classification = classify_mailbox_ownership(&processes, current_pid);
 
-        assert_eq!(disposition, MailboxOwnershipDisposition::Unowned);
-        assert_eq!(competing_pids, [] as [u32; 0]);
-        assert!(!supervised_restart_required);
-        assert!(detail.contains("no competing"));
+        assert_eq!(
+            classification.disposition,
+            MailboxOwnershipDisposition::Unowned
+        );
+        assert_eq!(classification.competing_pids, [] as [u32; 0]);
+        assert_eq!(classification.readers, [] as [u32; 0]);
+        assert!(!classification.supervised_restart_required);
+        assert!(classification.detail.contains("no competing"));
     }
 
     #[test]
@@ -16464,37 +25089,51 @@ mod tests {
             executable_deleted: true,
             holds_storage_root_lock: true,
             holds_sqlite_lock: false,
+            holds_exclusive_lock: true,
             holds_database_file: true,
         }];
 
-        let (disposition, competing_pids, supervised_restart_required, detail) =
-            classify_mailbox_ownership(&processes, std::process::id());
+        let classification = classify_mailbox_ownership(&processes, std::process::id());
 
-        assert_eq!(disposition, MailboxOwnershipDisposition::DeletedExecutable);
-        assert_eq!(competing_pids, vec![4242]);
-        assert!(supervised_restart_required);
-        assert!(detail.contains("deleted executable"));
+        assert_eq!(
+            classification.disposition,
+            MailboxOwnershipDisposition::DeletedExecutable
+        );
+        assert_eq!(classification.competing_pids, vec![4242]);
+        assert!(classification.supervised_restart_required);
+        assert!(classification.detail.contains("deleted executable"));
     }
 
     #[test]
     fn classify_mailbox_ownership_flags_stale_live_process_without_activity_locks() {
+        // A legacy Python shadow server never takes our activity locks but is
+        // an owner by command line (br-bvq1x.9.4 / I4): it must keep gating
+        // writes as a lockless live process, not slip through as a reader.
         let processes = vec![MailboxOwnershipProcess {
             pid: 4343,
-            command: Some("mcp-agent-mail serve".to_string()),
-            executable_path: Some("/tmp/mcp-agent-mail".to_string()),
+            command: Some("python3 -m mcp_agent_mail serve".to_string()),
+            executable_path: Some("/usr/bin/python3".to_string()),
             executable_deleted: false,
             holds_storage_root_lock: false,
             holds_sqlite_lock: false,
+            holds_exclusive_lock: false,
             holds_database_file: true,
         }];
 
-        let (disposition, competing_pids, supervised_restart_required, detail) =
-            classify_mailbox_ownership(&processes, std::process::id());
+        let classification = classify_mailbox_ownership(&processes, std::process::id());
 
-        assert_eq!(disposition, MailboxOwnershipDisposition::StaleLiveProcess);
-        assert_eq!(competing_pids, vec![4343]);
-        assert!(supervised_restart_required);
-        assert!(detail.contains("without mailbox activity locks"));
+        assert_eq!(
+            classification.disposition,
+            MailboxOwnershipDisposition::StaleLiveProcess
+        );
+        assert_eq!(classification.competing_pids, vec![4343]);
+        assert_eq!(classification.readers, [] as [u32; 0]);
+        assert!(classification.supervised_restart_required);
+        assert!(
+            classification
+                .detail
+                .contains("without mailbox activity locks")
+        );
     }
 
     #[test]
@@ -16506,16 +25145,23 @@ mod tests {
             executable_deleted: false,
             holds_storage_root_lock: false,
             holds_sqlite_lock: false,
+            holds_exclusive_lock: false,
             holds_database_file: true,
         }];
 
-        let (disposition, competing_pids, supervised_restart_required, detail) =
-            classify_mailbox_ownership(&processes, std::process::id());
+        let classification = classify_mailbox_ownership(&processes, std::process::id());
 
-        assert_eq!(disposition, MailboxOwnershipDisposition::ActiveOtherOwner);
-        assert_eq!(competing_pids, vec![4344]);
-        assert!(!supervised_restart_required);
-        assert!(detail.contains("server owns the mailbox database"));
+        assert_eq!(
+            classification.disposition,
+            MailboxOwnershipDisposition::ActiveOtherOwner
+        );
+        assert_eq!(classification.competing_pids, vec![4344]);
+        assert!(!classification.supervised_restart_required);
+        assert!(
+            classification
+                .detail
+                .contains("server owns the mailbox database")
+        );
     }
 
     #[test]
@@ -16528,6 +25174,7 @@ mod tests {
                 executable_deleted: false,
                 holds_storage_root_lock: true,
                 holds_sqlite_lock: false,
+                holds_exclusive_lock: true,
                 holds_database_file: true,
             },
             MailboxOwnershipProcess {
@@ -16537,17 +25184,144 @@ mod tests {
                 executable_deleted: false,
                 holds_storage_root_lock: false,
                 holds_sqlite_lock: true,
+                holds_exclusive_lock: true,
                 holds_database_file: true,
             },
         ];
 
-        let (disposition, competing_pids, supervised_restart_required, detail) =
-            classify_mailbox_ownership(&processes, std::process::id());
+        let classification = classify_mailbox_ownership(&processes, std::process::id());
 
-        assert_eq!(disposition, MailboxOwnershipDisposition::SplitBrain);
-        assert_eq!(competing_pids, vec![4444, 5555]);
-        assert!(supervised_restart_required);
-        assert!(detail.contains("split-brain"));
+        assert_eq!(
+            classification.disposition,
+            MailboxOwnershipDisposition::SplitBrain
+        );
+        assert_eq!(classification.competing_pids, vec![4444, 5555]);
+        assert!(classification.supervised_restart_required);
+        assert!(classification.detail.contains("split-brain"));
+    }
+
+    #[test]
+    fn classify_mailbox_ownership_ignores_read_only_cli_reader() {
+        // Production shape: the server's argv can be just `am` (rewritten
+        // process title), so only its exclusive activity lock proves
+        // ownership; a transient `am robot handoff` merely has the database
+        // file open.
+        let processes = vec![
+            MailboxOwnershipProcess {
+                pid: 4444,
+                command: Some("am".to_string()),
+                executable_path: Some("/home/ubuntu/.local/bin/am".to_string()),
+                executable_deleted: false,
+                holds_storage_root_lock: true,
+                holds_sqlite_lock: false,
+                holds_exclusive_lock: true,
+                holds_database_file: true,
+            },
+            MailboxOwnershipProcess {
+                pid: 5555,
+                command: Some("am robot handoff".to_string()),
+                executable_path: Some("/home/ubuntu/.local/bin/am".to_string()),
+                executable_deleted: false,
+                holds_storage_root_lock: false,
+                holds_sqlite_lock: false,
+                holds_exclusive_lock: false,
+                holds_database_file: true,
+            },
+        ];
+
+        let classification = classify_mailbox_ownership(&processes, std::process::id());
+
+        assert_eq!(
+            classification.disposition,
+            MailboxOwnershipDisposition::ActiveOtherOwner
+        );
+        assert_eq!(classification.competing_pids, vec![4444]);
+        assert_eq!(classification.readers, vec![5555]);
+        assert!(!classification.supervised_restart_required);
+        assert!(
+            !classification.detail.contains("split-brain"),
+            "a read-only reader must not produce a split-brain verdict: {}",
+            classification.detail
+        );
+        assert!(
+            classification
+                .detail
+                .contains("reader(s) not counted as owners: PID 5555"),
+            "readers must still be reported for operators: {}",
+            classification.detail
+        );
+    }
+
+    #[test]
+    fn classify_mailbox_ownership_lone_read_only_reader_is_unowned() {
+        let processes = vec![MailboxOwnershipProcess {
+            pid: 6666,
+            command: Some("am inbox --json".to_string()),
+            executable_path: Some("/home/ubuntu/.local/bin/am".to_string()),
+            executable_deleted: false,
+            holds_storage_root_lock: false,
+            holds_sqlite_lock: false,
+            holds_exclusive_lock: false,
+            holds_database_file: true,
+        }];
+
+        let classification = classify_mailbox_ownership(&processes, std::process::id());
+
+        assert_eq!(
+            classification.disposition,
+            MailboxOwnershipDisposition::Unowned
+        );
+        assert_eq!(classification.competing_pids, [] as [u32; 0]);
+        assert_eq!(classification.readers, vec![6666]);
+        assert!(!classification.supervised_restart_required);
+        assert!(classification.detail.contains("PID 6666"));
+    }
+
+    #[test]
+    fn classify_mailbox_ownership_still_flags_two_exclusive_owners() {
+        let processes = vec![
+            MailboxOwnershipProcess {
+                pid: 4444,
+                command: Some("am".to_string()),
+                executable_path: Some("/home/ubuntu/.local/bin/am".to_string()),
+                executable_deleted: false,
+                holds_storage_root_lock: true,
+                holds_sqlite_lock: false,
+                holds_exclusive_lock: true,
+                holds_database_file: true,
+            },
+            MailboxOwnershipProcess {
+                pid: 5555,
+                command: Some("am serve-stdio".to_string()),
+                executable_path: Some("/tmp/mcp-agent-mail-cli".to_string()),
+                executable_deleted: false,
+                holds_storage_root_lock: false,
+                holds_sqlite_lock: true,
+                holds_exclusive_lock: true,
+                holds_database_file: true,
+            },
+            MailboxOwnershipProcess {
+                pid: 7777,
+                command: Some("am robot status".to_string()),
+                executable_path: Some("/home/ubuntu/.local/bin/am".to_string()),
+                executable_deleted: false,
+                holds_storage_root_lock: false,
+                holds_sqlite_lock: false,
+                holds_exclusive_lock: false,
+                holds_database_file: true,
+            },
+        ];
+
+        let classification = classify_mailbox_ownership(&processes, std::process::id());
+
+        assert_eq!(
+            classification.disposition,
+            MailboxOwnershipDisposition::SplitBrain
+        );
+        assert_eq!(classification.competing_pids, vec![4444, 5555]);
+        assert_eq!(classification.readers, vec![7777]);
+        assert!(classification.supervised_restart_required);
+        assert!(classification.detail.contains("split-brain"));
     }
 
     #[cfg(unix)]
@@ -16745,6 +25519,39 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn archive_salvage_rejects_symlinked_target_before_breaker_side_effects() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real-mailbox");
+        let linked_parent = dir.path().join("linked-mailbox");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(&real_parent).unwrap();
+        std::fs::create_dir_all(storage_root.join("projects")).unwrap();
+        symlink(&real_parent, &linked_parent).unwrap();
+
+        let primary = linked_parent.join("storage.sqlite3");
+        let real_primary = real_parent.join("storage.sqlite3");
+        let error = reconstruct_sqlite_file_with_archive_salvage(&primary, &storage_root)
+            .expect_err("a symlinked target parent must fail before recovery admission");
+        assert!(
+            error.to_string().contains("traverses symlinked path"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            std::fs::symlink_metadata(crate::recovery_breaker::breaker_sidecar_path(&real_primary))
+                .is_err(),
+            "target validation must precede breaker state creation"
+        );
+        assert!(
+            std::fs::symlink_metadata(crate::recovery_breaker::breaker_lock_path(&real_primary))
+                .is_err(),
+            "target validation must precede breaker lock creation"
+        );
+    }
+
     #[test]
     fn archive_salvage_recovery_preserves_original_sidecars_when_archive_root_invalid() {
         let dir = tempfile::tempdir().unwrap();
@@ -16773,6 +25580,180 @@ mod tests {
         assert!(primary.exists(), "original database should be restored");
         assert_eq!(std::fs::read(&wal).unwrap(), b"original wal");
         assert_eq!(std::fs::read(&shm).unwrap(), b"original shm");
+    }
+
+    /// Seed an archive with one project, one agent, and one message, and
+    /// reconstruct the primary from it so the database is healthy and in
+    /// sync with the archive. Returns the message directory so a caller can
+    /// push the archive ahead by dropping in another message file.
+    fn seed_reconstructed_primary_from_archive(primary: &Path, storage_root: &Path) -> PathBuf {
+        let proj_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = proj_dir.join("agents").join("Alice");
+        let msg_dir = proj_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"First\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:00:00Z\",\"attachments\":[]}\n---\n\nfirst body\n",
+        )
+        .unwrap();
+        crate::reconstruct::reconstruct_from_archive(primary, storage_root)
+            .expect("seed initial reconstructed db");
+        msg_dir
+    }
+
+    fn push_archive_ahead(msg_dir: &Path) {
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-05-00Z__second__2.md"),
+            "---json\n{\"id\":2,\"from\":\"Alice\",\"to\":[\"Carol\"],\"subject\":\"Second\",\"importance\":\"urgent\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:05:00Z\",\"attachments\":[]}\n---\n\nsecond body\n",
+        )
+        .unwrap();
+    }
+
+    fn count_messages(primary: &Path) -> i64 {
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS count FROM messages", &[])
+            .unwrap();
+        rows.first()
+            .and_then(|row| row.get_named::<i64>("count").ok())
+            .unwrap_or(0)
+    }
+
+    /// Restores a directory's permissions when dropped so a failed assertion
+    /// never leaves the tempdir undeletable.
+    struct RestoreDirMode {
+        path: PathBuf,
+        mode: u32,
+    }
+
+    impl Drop for RestoreDirMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
+        }
+    }
+
+    /// br-bgwj1: a healthy primary whose archive is ahead must keep serving
+    /// when the drift reconcile cannot complete. Here the primary's parent
+    /// directory is made read-only so the reconstruction candidate cannot be
+    /// created; before this fix that error propagated out of
+    /// `ensure_sqlite_file_healthy_with_archive` and failed startup even
+    /// though the live database was fine.
+    #[test]
+    fn archive_drift_reconcile_failure_keeps_healthy_primary_serving() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let primary = db_dir.join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let msg_dir = seed_reconstructed_primary_from_archive(&primary, &storage_root);
+        assert_eq!(count_messages(&primary), 1);
+        push_archive_ahead(&msg_dir);
+        clear_pending_archive_drift(&primary);
+
+        std::fs::set_permissions(&db_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let restore = RestoreDirMode {
+            path: db_dir.clone(),
+            mode: 0o755,
+        };
+        if std::fs::write(db_dir.join("write-probe"), b"x").is_ok() {
+            // Running as a user that ignores directory modes (root); the
+            // failure injection cannot work here, so there is nothing to prove.
+            let _ = std::fs::remove_file(db_dir.join("write-probe"));
+            return;
+        }
+
+        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect("a healthy primary must keep serving when the archive-drift reconcile fails");
+        assert!(
+            has_pending_archive_drift(&primary),
+            "the failed reconcile must leave the drift pending for the periodic retry"
+        );
+        assert_eq!(
+            count_messages(&primary),
+            1,
+            "the live database must be untouched by the failed reconcile"
+        );
+        assert!(
+            matches!(sqlite_file_is_healthy(&primary), Ok(true)),
+            "the live database must still be healthy after the failed reconcile"
+        );
+
+        drop(restore);
+        retry_archive_drift_reconcile(&primary, &storage_root)
+            .expect("once the environment is writable again the pending drift reconciles");
+        assert_eq!(count_messages(&primary), 2);
+        assert!(!has_pending_archive_drift(&primary));
+    }
+
+    /// br-plksu: a drift reconcile of a healthy primary is guarded against
+    /// concurrent mutation but never records a recovery outcome, so a
+    /// failed reconcile cannot arm the recovery breaker against a database
+    /// that was never unhealthy. The failure injected here is a held
+    /// in-process writer, which makes the promotion barrier refuse to drain
+    /// (the default drain timeout applies, so this test takes about ten
+    /// seconds). A plain recovery admission of the same failure records it.
+    #[test]
+    fn archive_drift_reconcile_failure_does_not_arm_recovery_breaker() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let msg_dir = seed_reconstructed_primary_from_archive(&primary, &storage_root);
+        push_archive_ahead(&msg_dir);
+        let primary_bytes_before = std::fs::read(&primary).unwrap();
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            let _writer = crate::write_barrier::begin_write_activity();
+            ready_tx.send(()).expect("signal held writer");
+            release_rx.recv().expect("wait for release");
+        });
+        ready_rx
+            .recv()
+            .expect("writer must hold its activity guard");
+
+        let drift_result = reconstruct_archive_drift_of_healthy_primary(&primary, &storage_root);
+        let recorded_result = with_recovery_admission(&primary, "test recovery", || {
+            Err::<(), SqlError>(SqlError::Custom("injected recovery failure".into()))
+        });
+        release_tx.send(()).expect("release held writer");
+        writer.join().expect("join held writer");
+
+        let drift_error = drift_result
+            .expect_err("the drift reconcile must fail while a writer refuses to drain");
+        assert!(
+            drift_error.to_string().contains("did not drain"),
+            "unexpected drift failure: {drift_error}"
+        );
+        assert_eq!(
+            std::fs::read(&primary).unwrap(),
+            primary_bytes_before,
+            "a failed drift reconcile must not touch the live database"
+        );
+        recorded_result.expect_err("the injected recovery failure propagates");
+
+        let breaker = crate::recovery_breaker::load(&primary)
+            .expect("breaker state must be readable")
+            .expect("a plain recovery admission records its failure");
+        assert_eq!(
+            breaker.consecutive_failures, 1,
+            "only the plain recovery admission may record a failure; the drift reconcile must not: {breaker:?}"
+        );
     }
 
     /// Archive-aware recovery should skip when DB is already healthy.
@@ -16840,6 +25821,152 @@ mod tests {
         );
     }
 
+    #[test]
+    fn proactive_online_backup_captures_rows_committed_only_in_live_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_live_wal.db");
+        let bak_path = dir.path().join("test_live_wal.db.bak");
+        write_marker_db(&db_path, "main-generation");
+
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_str().unwrap()).expect("open live WAL writer"),
+            "clean up proactive-backup WAL writer",
+        );
+        writer
+            .execute_raw("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .expect("keep committed frames in WAL");
+        writer
+            .execute_raw("UPDATE marker SET value = 'wal-generation'")
+            .expect("commit WAL-only generation");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        assert!(
+            std::fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() > 32),
+            "fixture must retain committed frames in the live WAL"
+        );
+
+        let main_only_before = dir.path().join("main-only-before.sqlite3");
+        std::fs::copy(&db_path, &main_only_before).expect("capture pre-backup main bytes");
+        assert_eq!(
+            sqlite_marker_value(&main_only_before).as_deref(),
+            Some("main-generation"),
+            "the decisive row must not already be present in a plain main-file copy"
+        );
+
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        })
+        .expect("open pool");
+        pool.create_proactive_backup(std::time::Duration::ZERO)
+            .expect("online backup");
+
+        assert_eq!(
+            sqlite_marker_value(&bak_path).as_deref(),
+            Some("wal-generation"),
+            "online backup must include the committed WAL generation"
+        );
+        let main_only_after = dir.path().join("main-only-after.sqlite3");
+        std::fs::copy(&db_path, &main_only_after).expect("capture post-backup main bytes");
+        assert_eq!(
+            sqlite_marker_value(&main_only_after).as_deref(),
+            Some("main-generation"),
+            "the test must remain mutation-sensitive to replacing online backup with a raw main-file copy"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proactive_backup_preserves_same_process_writer_lock() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_PROACTIVE_BACKUP_LOCK_PATH";
+        const CHILD_TEST_NAME: &str =
+            "pool::tests::proactive_backup_preserves_same_process_writer_lock";
+        const CHILD_WITNESS: &str = "proactive-backup-child-observed-busy";
+
+        if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("proactive-backup-lock.sqlite3");
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open proactive-backup lock fixture"),
+            "clean up proactive-backup lock fixture",
+        );
+        writer
+            .execute_raw(
+                "PRAGMA journal_mode = DELETE; \
+                 PRAGMA autocommit_retain = OFF; \
+                 CREATE TABLE backup_lock_probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL); \
+                 INSERT INTO backup_lock_probe(value) VALUES ('settled');",
+            )
+            .expect("seed proactive-backup lock fixture");
+        let pool = maintenance_test_pool(&db_path);
+
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent proactive-backup writer lock");
+        writer
+            .execute_raw("UPDATE backup_lock_probe SET value = 'uncommitted';")
+            .expect("materialize parent proactive-backup writer lock");
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+        let _ = pool.create_proactive_backup(std::time::Duration::ZERO);
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("release parent proactive-backup writer lock");
+        let backup = pool
+            .create_proactive_backup(std::time::Duration::ZERO)
+            .expect("proactive backup succeeds after writer rollback")
+            .expect("proactive backup path");
+        let verify = crate::CanonicalDbConn::open_file(backup.to_string_lossy().as_ref())
+            .expect("open private published backup verifier");
+        let rows = verify
+            .query_sync("SELECT value FROM backup_lock_probe", &[])
+            .expect("query published proactive backup");
+        assert_eq!(
+            rows[0]
+                .get_named::<String>("value")
+                .expect("decode published backup value"),
+            "settled"
+        );
+    }
+
+    #[test]
+    fn proactive_backup_stage_read_only_open_never_creates_a_missing_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_source = dir.path().join("missing.sqlite3");
+        let backup_path = dir.path().join("missing.sqlite3.bak");
+
+        let error = match create_proactive_backup_stage(&missing_source, &backup_path) {
+            Err(error) => error,
+            Ok(_) => panic!("read-only source open must fail instead of creating a blank database"),
+        };
+        assert!(
+            error.to_string().contains("guarded read-only authority"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&missing_source).is_err(),
+            "a vanished backup source must stay absent"
+        );
+        assert!(
+            std::fs::symlink_metadata(&backup_path).is_err(),
+            "source-open failure must precede backup materialization"
+        );
+    }
+
     /// Proactive backup skips when existing backup is fresh.
     #[test]
     fn proactive_backup_skips_fresh_backup() {
@@ -16870,6 +25997,228 @@ mod tests {
             .create_proactive_backup(std::time::Duration::from_hours(1))
             .unwrap();
         assert!(second.is_none(), "should skip since backup is fresh");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn proactive_backup_refresh_is_portable_and_preserves_prior_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_refresh.db");
+        let bak_path = dir.path().join("test_refresh.db.bak");
+        write_marker_db(&db_path, "generation-one");
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        })
+        .expect("open pool");
+
+        pool.create_proactive_backup(std::time::Duration::ZERO)
+            .expect("first backup");
+        assert_eq!(
+            sqlite_marker_value(&bak_path).as_deref(),
+            Some("generation-one")
+        );
+
+        let writer = DbConn::open_file(db_path.to_str().unwrap()).expect("open writer");
+        writer
+            .execute_raw("UPDATE marker SET value = 'generation-two'")
+            .expect("commit second generation");
+        drop(writer);
+
+        pool.create_proactive_backup(std::time::Duration::ZERO)
+            .expect("portable replacement refresh");
+        assert_eq!(
+            sqlite_marker_value(&bak_path).as_deref(),
+            Some("generation-two"),
+            "canonical .bak must describe the newly published generation"
+        );
+
+        let preserved = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .and_then(|name| {
+                        mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(
+                            OsStr::new("test_refresh.db"),
+                            OsStr::new(name),
+                        )
+                    })
+                    .is_some_and(|candidate| {
+                        candidate.kind()
+                            == mcp_agent_mail_core::disk::SqliteRecoveryCandidateKind::TimestampedBak
+                            && candidate.generation_micros().is_some()
+                    })
+            })
+            .find(|path| sqlite_marker_value(path).as_deref() == Some("generation-one"))
+            .expect("the previous verified backup generation must be preserved");
+        assert!(preserved.exists());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn proactive_backup_rollback_distinguishes_restored_but_unsynced_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("storage.sqlite3.bak");
+        let rotated = dir.path().join("storage.sqlite3.bak.20260824_120000");
+        std::fs::write(&rotated, b"prior verified generation").unwrap();
+
+        let outcome = rollback_rotated_proactive_backup_with(Some(&rotated), &backup, |_| {
+            Err(SqlError::Custom("injected parent sync failure".to_string()))
+        });
+
+        assert!(matches!(
+            outcome,
+            ProactiveBackupRollbackOutcome::RestoredButParentSyncFailed(ref detail)
+                if detail.contains("injected parent sync failure")
+        ));
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"prior verified generation",
+            "the namespace is restored even though its crash durability is uncertain"
+        );
+        assert!(
+            std::fs::symlink_metadata(&rotated).is_err(),
+            "state-honest reporting must not claim the generation remains rotated"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn ordinary_backup_refresh_preserves_rotated_verified_snapshot_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("verified-refresh.sqlite3");
+        let canonical = crate::CanonicalDbConn::open_file(db_path.to_str().unwrap())
+            .expect("open canonical fixture");
+        canonical
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("initialize mailbox schema");
+        canonical
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                     VALUES (1, 'snapshot-project', '/snapshot-project', 1);
+                 INSERT INTO agents
+                     (id, project_id, name, program, model, task_description,
+                      inception_ts, last_active_ts, attachments_policy, contact_policy,
+                      reaper_exempt, registration_token)
+                     VALUES
+                     (1, 1, 'BlueLake', 'codex-cli', 'test', '', 1, 1,
+                      'auto', 'auto', 0, NULL);
+                 INSERT INTO messages
+                     (id, project_id, sender_id, subject, body_md, importance,
+                      ack_required, created_ts, recipients_json, attachments)
+                     VALUES
+                     (1, 1, 1, 'verified', 'generation one', 'normal', 0, 1, '{}', '[]');",
+            )
+            .expect("seed verified generation");
+        canonical
+            .query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+            .expect("checkpoint verified generation");
+        drop(canonical);
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        })
+        .expect("open pool");
+
+        let verified = pool
+            .create_verified_snapshot()
+            .expect("create verified snapshot")
+            .expect("healthy mailbox produces metadata");
+        assert_eq!(verified.row_counts.get("messages"), Some(&1));
+
+        let writer = crate::CanonicalDbConn::open_file(db_path.to_str().unwrap())
+            .expect("open next-generation writer");
+        writer
+            .execute_raw(
+                "INSERT INTO messages
+                     (id, project_id, sender_id, subject, body_md, importance,
+                      ack_required, created_ts, recipients_json, attachments)
+                     VALUES
+                     (2, 1, 1, 'unverified', 'generation two', 'normal', 0, 2, '{}', '[]');",
+            )
+            .expect("seed unverified generation");
+        writer
+            .query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+            .expect("checkpoint unverified generation");
+        drop(writer);
+
+        pool.create_proactive_backup(std::time::Duration::ZERO)
+            .expect("ordinary backup refresh");
+
+        assert_eq!(
+            crate::snapshot::latest_verified_snapshot(&db_path),
+            Some(verified.clone()),
+            "ordinary refresh must keep the prior verified hash discoverable"
+        );
+        let selected = crate::snapshot::verified_snapshot_source_path(&db_path)
+            .expect("rotated verified source");
+        assert_ne!(selected, crate::snapshot::snapshot_bak_path(&db_path));
+        assert!(
+            selected.file_name().is_some_and(|name| {
+                mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(
+                    db_path.file_name().unwrap(),
+                    name,
+                )
+                .is_some_and(|candidate| {
+                    candidate.kind()
+                        == mcp_agent_mail_core::disk::SqliteRecoveryCandidateKind::TimestampedBak
+                })
+            }),
+            "selected source must be the strict timestamped rotation"
+        );
+
+        std::fs::write(&db_path, b"corrupt live generation").expect("corrupt primary");
+        let restored = crate::snapshot::restore_from_verified_snapshot(&db_path, dir.path())
+            .expect("restore rotated verified generation")
+            .expect("verified generation remains available");
+        assert_eq!(restored, verified);
+        let restored = crate::CanonicalDbConn::open_file(db_path.to_str().unwrap())
+            .expect("open restored mailbox");
+        let rows = restored
+            .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+            .expect("count restored messages");
+        assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 1);
+    }
+
+    #[test]
+    fn proactive_backup_rejects_a_fresh_bak_with_companion_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_fresh_family.db");
+        let bak_path = dir.path().join("test_fresh_family.db.bak");
+        let bak_certificate = sqlite_sidecar_path(&bak_path, "-wal-cert");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).unwrap();
+
+        write_marker_db(&db_path, "healthy-primary");
+        write_marker_db(&bak_path, "fresh-backup-main");
+        let bak_bytes = std::fs::read(&bak_path).unwrap();
+        std::fs::write(&bak_certificate, b"companion-generation-witness").unwrap();
+
+        let error = pool
+            .create_proactive_backup(std::time::Duration::from_hours(1))
+            .expect_err("a fresh main with companion state is not a self-contained backup");
+        assert!(
+            error
+                .to_string()
+                .contains("has companion SQLite or FrankenSQLite state"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&bak_path).unwrap(),
+            bak_bytes,
+            "rejection must preserve the published main byte-for-byte"
+        );
+        assert_eq!(
+            std::fs::read(&bak_certificate).unwrap(),
+            b"companion-generation-witness",
+            "rejection must preserve the companion witness"
+        );
     }
 
     #[test]
@@ -16934,9 +26283,9 @@ mod tests {
             .expect_err("unhealthy primary must not overwrite backup");
         let msg = err.to_string();
         assert!(
-            msg.contains("proactive backup aborted")
-                && msg.contains("source database")
-                && msg.contains("preserving existing backup"),
+            msg.contains("proactive backup")
+                && (msg.contains("guarded read-only authority")
+                    || msg.contains("failed to materialize live source")),
             "unexpected error: {msg}"
         );
         assert_eq!(
@@ -16951,8 +26300,8 @@ mod tests {
                 .all(|entry| !entry
                     .file_name()
                     .to_string_lossy()
-                    .contains(".backup-stage-")),
-            "source validation should fail before any staged backup is written"
+                    .contains(".mcp-agent-mail-proactive-backup-")),
+            "failed guarded export must not leave a staging directory behind"
         );
     }
 
@@ -16974,7 +26323,9 @@ mod tests {
             .expect_err("unhealthy primary must not create a backup");
         let msg = err.to_string();
         assert!(
-            msg.contains("proactive backup aborted") && msg.contains("source database"),
+            msg.contains("proactive backup")
+                && (msg.contains("guarded read-only authority")
+                    || msg.contains("failed to materialize live source")),
             "unexpected error: {msg}"
         );
         assert!(
@@ -17204,6 +26555,741 @@ mod tests {
     }
 
     #[test]
+    fn malformed_breaker_preserves_exact_truncated_sqlite_family_before_ensure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("malformed-breaker.sqlite3");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&db_path, b"primary authority").unwrap();
+        std::fs::write(&wal_path, b"truncated-wal").unwrap();
+        std::fs::write(&shm_path, b"coordination-shm").unwrap();
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        std::fs::write(&breaker_path, b"malformed breaker authority").unwrap();
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list malformed ensure fixture before refusal")
+            .map(|entry| {
+                entry
+                    .expect("read malformed ensure fixture entry")
+                    .file_name()
+            })
+            .collect::<BTreeSet<_>>();
+
+        recovery_admission().reset();
+        let error = ensure_sqlite_file_healthy(&db_path)
+            .expect_err("malformed breaker must refuse before sidecar cleanup");
+        assert!(error.to_string().contains("could not be trusted"));
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"primary authority");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(
+            std::fs::read(&breaker_path).unwrap(),
+            b"malformed breaker authority"
+        );
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list malformed ensure fixture after refusal")
+            .map(|entry| {
+                entry
+                    .expect("read malformed ensure fixture entry")
+                    .file_name()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names_after, names_before,
+            "malformed-breaker refusal must not create election, cleanup, recovery, candidate, or forensic artifacts"
+        );
+        assert!(!crate::recovery_breaker::breaker_lock_path(&db_path).exists());
+        assert!(!sqlite_sidecar_path(&db_path, ".recovery.lock").exists());
+        assert!(!dir.path().join("doctor").join("forensics").exists());
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn tripped_breaker_preserves_exact_truncated_sqlite_family_before_ensure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("tripped-breaker.sqlite3");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&db_path, b"primary authority").unwrap();
+        std::fs::write(&wal_path, b"truncated-wal").unwrap();
+        std::fs::write(&shm_path, b"coordination-shm").unwrap();
+        let config = crate::recovery_breaker::config_from_env();
+        let state = crate::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+            consecutive_failures: config.max_consecutive_failures,
+            last_failure_unix: recovery_breaker_now_unix(),
+            last_failure_reason: "fixture tripped".to_string(),
+            tripped: true,
+        };
+        crate::recovery_breaker::store(&db_path, &state).unwrap();
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).unwrap();
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list tripped ensure fixture before refusal")
+            .map(|entry| {
+                entry
+                    .expect("read tripped ensure fixture entry")
+                    .file_name()
+            })
+            .collect::<BTreeSet<_>>();
+
+        recovery_admission().reset();
+        let error = ensure_sqlite_file_healthy(&db_path)
+            .expect_err("tripped breaker must refuse before sidecar cleanup");
+        assert!(error.to_string().contains("circuit-broken"));
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"primary authority");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list tripped ensure fixture after refusal")
+            .map(|entry| {
+                entry
+                    .expect("read tripped ensure fixture entry")
+                    .file_name()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names_after, names_before,
+            "tripped-breaker refusal must not create election, cleanup, recovery, candidate, or forensic artifacts"
+        );
+        assert!(!crate::recovery_breaker::breaker_lock_path(&db_path).exists());
+        assert!(!sqlite_sidecar_path(&db_path, ".recovery.lock").exists());
+        assert!(!dir.path().join("doctor").join("forensics").exists());
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn archive_ensure_breakers_preserve_exact_truncated_sqlite_family() {
+        for breaker_kind in ["malformed", "tripped"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir.path().join(format!("archive-{breaker_kind}.sqlite3"));
+            let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+            let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+            let storage_root = dir.path().join("storage");
+            std::fs::create_dir_all(storage_root.join("projects"))
+                .expect("create authoritative archive root");
+            std::fs::write(&db_path, b"archive primary authority").expect("write primary fixture");
+            std::fs::write(&wal_path, b"truncated-wal").expect("write WAL fixture");
+            std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+
+            let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+            if breaker_kind == "malformed" {
+                std::fs::write(&breaker_path, b"malformed breaker authority")
+                    .expect("write malformed breaker");
+            } else {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "archive fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(&db_path, &state).expect("store tripped breaker");
+            }
+            let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+            let names_before = std::fs::read_dir(dir.path())
+                .expect("list archive fixture before ensure")
+                .map(|entry| entry.expect("read archive fixture entry").file_name())
+                .collect::<BTreeSet<_>>();
+
+            recovery_admission().reset();
+            let error = ensure_sqlite_file_healthy_with_archive(&db_path, &storage_root)
+                .expect_err("breaker authority must refuse archive recovery before cleanup");
+
+            let expected = if breaker_kind == "malformed" {
+                "could not be trusted"
+            } else {
+                "circuit-broken"
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected {breaker_kind} archive refusal: {error}"
+            );
+            assert_eq!(
+                std::fs::read(&db_path).unwrap(),
+                b"archive primary authority"
+            );
+            assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+            assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+            assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+            let names_after = std::fs::read_dir(dir.path())
+                .expect("list archive fixture after refusal")
+                .map(|entry| entry.expect("read archive fixture entry").file_name())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                names_after, names_before,
+                "refused archive recovery must not create election, quarantine, or recovery artifacts"
+            );
+            assert!(
+                !storage_root.join("doctor").join("forensics").exists(),
+                "refused archive recovery must not capture forensics"
+            );
+            recovery_admission().reset();
+        }
+    }
+
+    fn assert_pool_init_breaker_preserves_truncated_family(
+        db_name: &str,
+        expected_error_fragment: &str,
+        install_breaker: impl FnOnce(&Path),
+    ) {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(db_name);
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&db_path, b"pool-init-primary-authority").expect("write primary fixture");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL");
+        std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+        install_breaker(&db_path);
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list pool-init fixture before acquire")
+            .map(|entry| entry.expect("read pool-init fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(dir.path().join("storage")),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("construct lazy pool");
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build current-thread runtime");
+        let cx = Cx::for_testing();
+
+        recovery_admission().reset();
+        let error = match runtime.block_on(pool.acquire(&cx)) {
+            Outcome::Err(error) => error,
+            Outcome::Ok(_) => panic!("breaker authority must refuse pool initialization"),
+            Outcome::Cancelled(reason) => panic!("pool initialization was cancelled: {reason:?}"),
+            Outcome::Panicked(payload) => {
+                panic!("pool initialization panicked: {}", payload.message())
+            }
+        };
+
+        assert!(
+            error.to_string().contains(expected_error_fragment),
+            "unexpected pool-init refusal: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            b"pool-init-primary-authority"
+        );
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list pool-init fixture after refusal")
+            .map(|entry| entry.expect("read pool-init fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names_after, names_before);
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn pool_init_preserves_truncated_family_behind_malformed_breaker() {
+        assert_pool_init_breaker_preserves_truncated_family(
+            "pool-init-malformed.sqlite3",
+            "could not be trusted",
+            |db_path| {
+                std::fs::write(
+                    crate::recovery_breaker::breaker_sidecar_path(db_path),
+                    b"malformed breaker authority",
+                )
+                .expect("write malformed breaker");
+            },
+        );
+    }
+
+    #[test]
+    fn pool_init_preserves_truncated_family_behind_tripped_breaker() {
+        assert_pool_init_breaker_preserves_truncated_family(
+            "pool-init-tripped.sqlite3",
+            "circuit-broken",
+            |db_path| {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "pool init fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(db_path, &state).expect("store tripped breaker");
+            },
+        );
+    }
+
+    fn assert_missing_primary_pool_init_breaker_refusal(
+        db_name: &str,
+        expected_error_fragment: &str,
+        install_breaker: impl FnOnce(&Path),
+    ) {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(db_name);
+        let storage_root = dir.path().join("storage");
+        assert!(!db_path.exists(), "fixture primary must start absent");
+        install_breaker(&db_path);
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list missing-primary fixture before acquire")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(storage_root.clone()),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("construct lazy pool");
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build current-thread runtime");
+        let cx = Cx::for_testing();
+
+        recovery_admission().reset();
+        let error = match runtime.block_on(pool.acquire(&cx)) {
+            Outcome::Err(error) => error,
+            Outcome::Ok(_) => {
+                panic!("breaker authority must refuse missing-primary pool init")
+            }
+            Outcome::Cancelled(reason) => {
+                panic!("pool initialization was cancelled: {reason:?}")
+            }
+            Outcome::Panicked(payload) => {
+                panic!("pool initialization panicked: {}", payload.message())
+            }
+        };
+
+        assert!(
+            error.to_string().contains(expected_error_fragment),
+            "unexpected missing-primary pool-init refusal: {error}"
+        );
+        assert!(
+            !db_path.exists(),
+            "refused pool init must not create even a zero-byte primary body"
+        );
+        assert_eq!(
+            std::fs::read(&breaker_path).expect("read breaker after refusal"),
+            breaker_bytes,
+            "refused pool init must preserve exact breaker authority bytes"
+        );
+        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+            .iter()
+            .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+        {
+            assert!(
+                !sqlite_sidecar_path(&db_path, suffix).exists(),
+                "refused pool init must not create {suffix} beside the absent primary"
+            );
+        }
+        assert!(
+            !crate::recovery_breaker::breaker_lock_path(&db_path).exists(),
+            "pure breaker refusal must precede persistent election-file creation"
+        );
+        assert!(
+            !sqlite_sidecar_path(&db_path, ".recovery.lock").exists(),
+            "refused pool init must not create a recovery lock"
+        );
+        assert!(
+            !storage_root.join("doctor").join("forensics").exists(),
+            "refused pool init must not capture forensics"
+        );
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list missing-primary fixture after refusal")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names_after, names_before,
+            "refused pool init must preserve the exact directory namespace"
+        );
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn pool_init_missing_primary_refuses_malformed_breaker_without_artifacts() {
+        assert_missing_primary_pool_init_breaker_refusal(
+            "pool-missing-malformed.sqlite3",
+            "could not be trusted",
+            |db_path| {
+                std::fs::write(
+                    crate::recovery_breaker::breaker_sidecar_path(db_path),
+                    b"malformed missing-primary breaker authority",
+                )
+                .expect("write malformed breaker");
+            },
+        );
+    }
+
+    #[test]
+    fn pool_init_missing_primary_refuses_tripped_breaker_without_artifacts() {
+        assert_missing_primary_pool_init_breaker_refusal(
+            "pool-missing-tripped.sqlite3",
+            "circuit-broken",
+            |db_path| {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "missing-primary pool init fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(db_path, &state)
+                    .expect("store tripped missing-primary breaker");
+            },
+        );
+    }
+
+    #[test]
+    fn pool_init_missing_primary_without_breaker_creates_fresh_database() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("pool-missing-clean.sqlite3");
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        assert!(!db_path.exists());
+        assert!(!breaker_path.exists());
+
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(dir.path().join("storage")),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("construct lazy pool");
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build current-thread runtime");
+        let cx = Cx::for_testing();
+
+        recovery_admission().reset();
+        let connection = match runtime.block_on(pool.acquire(&cx)) {
+            Outcome::Ok(connection) => connection,
+            Outcome::Err(error) => panic!("clean missing-primary init failed: {error}"),
+            Outcome::Cancelled(reason) => {
+                panic!("pool initialization was cancelled: {reason:?}")
+            }
+            Outcome::Panicked(payload) => {
+                panic!("pool initialization panicked: {}", payload.message())
+            }
+        };
+        let projects_table = connection
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'projects'",
+                &[],
+            )
+            .expect("query initialized schema");
+        assert_eq!(projects_table.len(), 1, "fresh init must install schema");
+        drop(connection);
+
+        assert!(is_real_file(&db_path), "fresh init must create the primary");
+        assert!(
+            std::fs::metadata(&db_path)
+                .expect("stat fresh primary")
+                .len()
+                > 0,
+            "fresh init must create a nonempty SQLite body"
+        );
+        assert!(
+            !breaker_path.exists(),
+            "clean fresh start must not invent recovery-breaker state"
+        );
+        assert!(
+            !crate::recovery_breaker::breaker_lock_path(&db_path).exists(),
+            "pure clean preflight must not create a breaker election file"
+        );
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn pool_init_existing_healthy_family_allows_nonclean_breaker_authority() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        for breaker_kind in ["malformed", "tripped"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir
+                .path()
+                .join(format!("pool-healthy-{breaker_kind}.sqlite3"));
+            {
+                let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                    .expect("create healthy pool-init fixture");
+                conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                    .expect("force standalone primary");
+                conn.execute_raw("CREATE TABLE fixture (value INTEGER);")
+                    .expect("create fixture table");
+            }
+            let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+            if breaker_kind == "malformed" {
+                std::fs::write(&breaker_path, b"malformed breaker authority")
+                    .expect("write malformed breaker");
+            } else {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "healthy pool-init fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(&db_path, &state).expect("store tripped breaker");
+            }
+            let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+            let pool = DbPool::new(&DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                storage_root: Some(dir.path().join("storage")),
+                min_connections: 1,
+                max_connections: 1,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("construct lazy pool");
+            let runtime = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build current-thread runtime");
+            let cx = Cx::for_testing();
+
+            recovery_admission().reset();
+            let connection = match runtime.block_on(pool.acquire(&cx)) {
+                Outcome::Ok(connection) => connection,
+                Outcome::Err(error) => {
+                    panic!("healthy {breaker_kind} pool init failed: {error}")
+                }
+                Outcome::Cancelled(reason) => {
+                    panic!("pool initialization was cancelled: {reason:?}")
+                }
+                Outcome::Panicked(payload) => {
+                    panic!("pool initialization panicked: {}", payload.message())
+                }
+            };
+            connection
+                .query_sync("SELECT COUNT(*) AS count FROM fixture", &[])
+                .expect("query healthy fixture after pool init");
+            drop(connection);
+
+            assert_eq!(
+                std::fs::read(&breaker_path).expect("read breaker after healthy init"),
+                breaker_bytes,
+                "healthy exact family must not clear historical breaker authority"
+            );
+            assert!(
+                !crate::recovery_breaker::breaker_lock_path(&db_path).exists(),
+                "healthy exact family must not enter recovery election"
+            );
+            recovery_admission().reset();
+        }
+    }
+
+    #[test]
+    fn pool_init_breakers_preserve_corrupt_primary_before_engine_open() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        for breaker_kind in ["malformed", "tripped"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir
+                .path()
+                .join(format!("pool-main-only-{breaker_kind}.sqlite3"));
+            let primary_bytes = b"corrupt pool-init primary without sidecars";
+            std::fs::write(&db_path, primary_bytes).expect("write corrupt primary fixture");
+            let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+            if breaker_kind == "malformed" {
+                std::fs::write(&breaker_path, b"malformed breaker authority")
+                    .expect("write malformed breaker");
+            } else {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "pool main-only fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(&db_path, &state).expect("store tripped breaker");
+            }
+            let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+            let names_before = std::fs::read_dir(dir.path())
+                .expect("list pool main-only fixture before acquire")
+                .map(|entry| entry.expect("read fixture entry").file_name())
+                .collect::<BTreeSet<_>>();
+            let pool = DbPool::new(&DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                storage_root: Some(dir.path().join("storage")),
+                min_connections: 1,
+                max_connections: 1,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("construct lazy pool");
+            let runtime = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build current-thread runtime");
+            let cx = Cx::for_testing();
+
+            recovery_admission().reset();
+            let error = match runtime.block_on(pool.acquire(&cx)) {
+                Outcome::Err(error) => error,
+                Outcome::Ok(_) => panic!("breaker authority must refuse main-only pool init"),
+                Outcome::Cancelled(reason) => {
+                    panic!("pool initialization was cancelled: {reason:?}")
+                }
+                Outcome::Panicked(payload) => {
+                    panic!("pool initialization panicked: {}", payload.message())
+                }
+            };
+
+            let expected = if breaker_kind == "malformed" {
+                "could not be trusted"
+            } else {
+                "circuit-broken"
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected {breaker_kind} pool-init refusal: {error}"
+            );
+            assert_eq!(std::fs::read(&db_path).unwrap(), primary_bytes);
+            assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+            let names_after = std::fs::read_dir(dir.path())
+                .expect("list pool main-only fixture after refusal")
+                .map(|entry| entry.expect("read fixture entry").file_name())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                names_after, names_before,
+                "refused main-only pool init must not create SQLite, election, recovery, or forensic artifacts"
+            );
+            recovery_admission().reset();
+        }
+    }
+
+    #[test]
+    fn health_probes_settle_private_copy_without_mutating_source_family() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("source-neutral-health.sqlite3");
+        {
+            let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("create source database");
+            conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                .expect("force standalone primary");
+            conn.execute_raw("CREATE TABLE t (value INTEGER);")
+                .expect("create table");
+            conn.execute_raw("INSERT INTO t VALUES (1);")
+                .expect("seed table");
+        }
+        let main_bytes = std::fs::read(&db_path).unwrap();
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&wal_path, b"truncated-wal").unwrap();
+        std::fs::write(&shm_path, b"coordination-shm").unwrap();
+
+        assert!(
+            !sqlite_file_is_healthy_without_family_cleanup(&db_path)
+                .expect("strict source-neutral health probe"),
+            "a private probe that requires WAL cleanup is not proof that a breaker-blocked runtime can open the exact live family"
+        );
+        assert!(
+            sqlite_primary_read_path_is_healthy(&db_path).expect("primary staged health probe")
+        );
+        assert!(sqlite_file_is_healthy(&db_path).expect("layered staged health probe"));
+        assert_eq!(std::fs::read(&db_path).unwrap(), main_bytes);
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "source-neutral-health.sqlite3-wal"),
+            Vec::<PathBuf>::new(),
+            "health probes must not publish a WAL quarantine beside the source"
+        );
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "source-neutral-health.sqlite3-shm"),
+            Vec::<PathBuf>::new(),
+            "health probes must not publish an SHM quarantine beside the source"
+        );
+    }
+
+    #[test]
+    fn primary_read_probe_preserves_breaker_blocked_source_family() {
+        for breaker_kind in ["malformed", "tripped"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir
+                .path()
+                .join(format!("read-probe-{breaker_kind}.sqlite3"));
+            {
+                let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                    .expect("create source database");
+                conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                    .expect("force standalone primary");
+                conn.execute_raw("CREATE TABLE fixture (value INTEGER);")
+                    .expect("create fixture table");
+            }
+            let primary_bytes = std::fs::read(&db_path).expect("read primary fixture");
+            let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+            let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+            std::fs::write(&wal_path, b"truncated-wal").expect("write WAL fixture");
+            std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+
+            let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+            if breaker_kind == "malformed" {
+                std::fs::write(&breaker_path, b"malformed breaker authority")
+                    .expect("write malformed breaker");
+            } else {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "read-probe fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(&db_path, &state).expect("store tripped breaker");
+            }
+            let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+            let names_before = std::fs::read_dir(dir.path())
+                .expect("list read-probe fixture before probe")
+                .map(|entry| entry.expect("read fixture entry").file_name())
+                .collect::<BTreeSet<_>>();
+
+            assert!(
+                sqlite_primary_read_path_is_healthy(&db_path)
+                    .expect("run source-neutral primary read probe"),
+                "private staged cleanup should prove the healthy primary readable"
+            );
+            assert_eq!(std::fs::read(&db_path).unwrap(), primary_bytes);
+            assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+            assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+            assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+            let names_after = std::fs::read_dir(dir.path())
+                .expect("list read-probe fixture after probe")
+                .map(|entry| entry.expect("read fixture entry").file_name())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                names_after, names_before,
+                "read-only health probing must not create election, cleanup, or forensic artifacts"
+            );
+        }
+    }
+
+    #[test]
     fn cleanup_empty_wal_sidecar_preserves_zero_byte_wal() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("cleanup_test.db");
@@ -17219,7 +27305,7 @@ mod tests {
         assert!(wal_path.exists());
         assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
 
-        cleanup_empty_wal_sidecar(db_path.to_str().unwrap());
+        cleanup_empty_wal_sidecar(&db_path).expect("classify benign empty WAL");
 
         assert!(
             wal_path.exists(),
@@ -17231,6 +27317,224 @@ mod tests {
             0,
             "0-byte WAL should not create a cleanup quarantine artifact"
         );
+    }
+
+    #[test]
+    fn sqlite_family_cleanup_refuses_before_mutation_while_writer_is_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("writer-held-cleanup.sqlite3");
+        std::fs::write(&db_path, b"primary authority").expect("write primary fixture");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL");
+        std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list family before refusal")
+            .map(|entry| entry.expect("read family entry").file_name())
+            .collect::<BTreeSet<_>>();
+        let writer = crate::write_barrier::begin_write_activity();
+
+        let error = cleanup_truncated_wal_sidecar_with_timeout(&db_path, Duration::from_millis(1))
+            .expect_err("an active writer must block automatic sidecar cleanup");
+
+        assert!(error.to_string().contains("did not drain"));
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"primary authority");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list family after refusal")
+            .map(|entry| entry.expect("read family entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names_after, names_before);
+        drop(writer);
+    }
+
+    #[test]
+    fn non_archive_recovery_refuses_before_mutation_while_writer_is_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("writer-held-recovery.sqlite3");
+        std::fs::write(&primary, b"corrupt primary authority")
+            .expect("write corrupt primary fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list recovery fixture before refusal")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        let writer = crate::write_barrier::begin_write_activity();
+
+        let error = ensure_sqlite_file_healthy_inner_with_timeout(&primary, Duration::ZERO)
+            .expect_err("an active writer must block non-archive recovery");
+
+        assert!(
+            error.to_string().contains("did not drain"),
+            "unexpected writer-drain refusal: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&primary).unwrap(),
+            b"corrupt primary authority"
+        );
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list recovery fixture after refusal")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names_after, names_before,
+            "writer refusal must precede forensic capture, quarantine, restore, or reinitialize"
+        );
+        drop(writer);
+    }
+
+    #[test]
+    fn tripped_breaker_preempts_writer_drain_for_sidecar_cleanup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("tripped-writer-held-cleanup.sqlite3");
+        std::fs::write(&db_path, b"primary authority").expect("write primary fixture");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL");
+        std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+        let config = crate::recovery_breaker::config_from_env();
+        let state = crate::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+            consecutive_failures: config.max_consecutive_failures,
+            last_failure_unix: recovery_breaker_now_unix(),
+            last_failure_reason: "fixture tripped before writer drain".to_string(),
+            tripped: true,
+        };
+        crate::recovery_breaker::store(&db_path, &state).expect("store tripped breaker");
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read tripped breaker");
+        let writer = crate::write_barrier::begin_write_activity();
+
+        recovery_admission().reset();
+        let error = cleanup_truncated_wal_sidecar_with_timeout(&db_path, Duration::ZERO)
+            .expect_err("tripped breaker must refuse before attempting writer drain");
+
+        assert!(
+            error.to_string().contains("circuit-broken"),
+            "authoritative breaker refusal must preempt the zero-timeout writer-drain error: {error}"
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"primary authority");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "tripped-writer-held-cleanup.sqlite3-wal"),
+            Vec::<PathBuf>::new(),
+            "breaker refusal must not publish a WAL quarantine"
+        );
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "tripped-writer-held-cleanup.sqlite3-shm"),
+            Vec::<PathBuf>::new(),
+            "breaker refusal must not publish an SHM quarantine"
+        );
+        drop(writer);
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn successful_sidecar_cleanup_does_not_clear_prior_recovery_failure_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("breaker-history-cleanup.sqlite3");
+        std::fs::write(&db_path, b"primary authority").expect("write primary fixture");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL");
+        let config = crate::recovery_breaker::RecoveryBreakerConfig {
+            max_consecutive_failures: 3,
+            cooldown_secs: 21_600,
+        };
+        let fingerprint = crate::recovery_breaker::fingerprint_db(&db_path);
+        let prior = crate::recovery_breaker::record_failure(
+            None,
+            &fingerprint,
+            "prior whole-recovery failure",
+            config,
+            1_000,
+        );
+        crate::recovery_breaker::store(&db_path, &prior).expect("store prior breaker state");
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes_before =
+            std::fs::read(&breaker_path).expect("read breaker before sidecar cleanup");
+
+        let outcome = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_RECOVERY_BREAKER_MAX_CONSECUTIVE_FAILURES", "3")],
+            || cleanup_truncated_wal_sidecar(&db_path),
+        )
+        .expect("admitted sidecar cleanup");
+
+        assert_eq!(
+            outcome,
+            SqliteFamilyCleanupOutcome::Quarantined {
+                wal: true,
+                shm: false,
+                wal_cert: false,
+                wal_cert_head: false,
+            }
+        );
+        assert_eq!(
+            std::fs::read(&breaker_path).expect("read breaker after sidecar cleanup"),
+            breaker_bytes_before,
+            "a sidecar-only mutation is not proof that whole-database recovery succeeded"
+        );
+    }
+
+    #[test]
+    fn nested_sidecar_cleanup_preserves_outer_recovery_failure_lineage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("outer-failure-cleanup.sqlite3");
+        std::fs::write(&db_path, b"corrupt primary authority").expect("write primary fixture");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL");
+        let config = crate::recovery_breaker::RecoveryBreakerConfig {
+            max_consecutive_failures: 3,
+            cooldown_secs: 21_600,
+        };
+        let fingerprint = crate::recovery_breaker::fingerprint_db(&db_path);
+        let prior = crate::recovery_breaker::record_failure(
+            None,
+            &fingerprint,
+            "first whole-recovery failure",
+            config,
+            1_000,
+        );
+        crate::recovery_breaker::store(&db_path, &prior).expect("store prior breaker state");
+
+        recovery_admission().reset();
+        let error = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_RECOVERY_BREAKER_MAX_CONSECUTIVE_FAILURES", "3")],
+            || {
+                with_recovery_admission(&db_path, "whole recovery fixture", || {
+                    cleanup_truncated_wal_sidecar(&db_path)?;
+                    Err::<(), SqlError>(SqlError::Custom(
+                        "terminal whole-recovery failure".to_string(),
+                    ))
+                })
+            },
+        )
+        .expect_err("outer recovery fixture must fail after admitted cleanup");
+        assert!(
+            error
+                .to_string()
+                .contains("terminal whole-recovery failure")
+        );
+
+        let terminal = crate::recovery_breaker::load(&db_path)
+            .expect("load terminal breaker")
+            .expect("terminal breaker state");
+        assert_eq!(terminal.consecutive_failures, 2);
+        assert_eq!(
+            terminal.last_failure_reason,
+            "terminal whole-recovery failure"
+        );
+        assert!(
+            !wal_path.exists(),
+            "nested cleanup must run so the test is mutation-sensitive"
+        );
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "outer-failure-cleanup.sqlite3-wal").len(),
+            1
+        );
+        recovery_admission().reset();
     }
 
     #[test]
@@ -17247,12 +27551,85 @@ mod tests {
         // frame data, since those frames may be durable writes not yet
         // checkpointed into the main DB.
         let wal_path = dir.path().join("preserve_test.db-wal");
+        let wal_cert_path = dir.path().join("preserve_test.db-wal-cert");
+        let wal_cert_head_path = dir.path().join("preserve_test.db-wal-cert-head");
         std::fs::write(&wal_path, [0xAA; 64]).expect("create wal");
+        std::fs::write(&wal_cert_path, b"live-wal-cert").expect("create WAL certificate");
+        std::fs::write(&wal_cert_head_path, b"live-wal-cert-head")
+            .expect("create WAL certificate head");
         assert!(wal_path.exists());
 
-        cleanup_empty_wal_sidecar(db_path.to_str().unwrap());
+        cleanup_empty_wal_sidecar(&db_path).expect("classify framed WAL");
 
         assert!(wal_path.exists(), "WAL > 32 bytes should be preserved");
+        assert_eq!(std::fs::read(&wal_cert_path).unwrap(), b"live-wal-cert");
+        assert_eq!(
+            std::fs::read(&wal_cert_head_path).unwrap(),
+            b"live-wal-cert-head"
+        );
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "preserve_test.db-wal-cert"),
+            Vec::<PathBuf>::new(),
+            "framed WAL classification must not quarantine its certificate"
+        );
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "preserve_test.db-wal-cert-head"),
+            Vec::<PathBuf>::new(),
+            "framed WAL classification must not quarantine its certificate head"
+        );
+    }
+
+    #[test]
+    fn cleanup_preserves_franken_framed_wal_with_empty_shm_placeholder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("franken-empty-shm.sqlite3");
+        let writer = DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open FrankenSQLite writer");
+        writer
+            .execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable WAL mode");
+        writer
+            .execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable automatic checkpoints");
+        writer
+            .execute_raw("CREATE TABLE live_value (value INTEGER NOT NULL);")
+            .expect("create live fixture table");
+        writer
+            .execute_raw("INSERT INTO live_value (value) VALUES (8);")
+            .expect("commit live WAL frame");
+
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        assert!(
+            std::fs::metadata(&wal_path)
+                .is_ok_and(|metadata| metadata.len() > SQLITE_WAL_HEADER_BYTES),
+            "fixture must retain a healthy framed WAL"
+        );
+        assert!(
+            !shm_path.exists(),
+            "FrankenSQLite's native WAL path should not require canonical SHM"
+        );
+        std::fs::write(&shm_path, []).expect("materialize empty compatibility SHM placeholder");
+        let family_before = exact_diagnostic_parent_snapshot(dir.path());
+
+        assert_eq!(
+            cleanup_truncated_wal_sidecar(&db_path).expect("classify healthy Franken family"),
+            SqliteFamilyCleanupOutcome::NotNeeded
+        );
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(dir.path()),
+            family_before,
+            "cleanup must not detach an empty SHM placeholder from a healthy Franken WAL family"
+        );
+        assert_eq!(
+            writer
+                .query_sync("SELECT value FROM live_value", &[])
+                .expect("query live value after cleanup classification")[0]
+                .get_named::<i64>("value")
+                .expect("decode live value"),
+            8
+        );
+        crate::close_db_conn(writer, "clean up empty-SHM regression writer");
     }
 
     #[test]
@@ -17274,8 +27651,24 @@ mod tests {
         assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 32);
         let shm_path = dir.path().join("header_only_test.db-shm");
         std::fs::write(&shm_path, b"stale-shm").expect("create companion shm");
+        let wal_cert_path = dir.path().join("header_only_test.db-wal-cert");
+        std::fs::write(&wal_cert_path, b"stale-wal-cert")
+            .expect("create companion WAL certificate");
+        let wal_cert_head_path = dir.path().join("header_only_test.db-wal-cert-head");
+        std::fs::write(&wal_cert_head_path, b"stale-wal-cert-head")
+            .expect("create companion WAL certificate head");
 
-        cleanup_empty_wal_sidecar(db_path.to_str().unwrap());
+        let outcome = cleanup_empty_wal_sidecar(&db_path).expect("quarantine damaged WAL family");
+
+        assert_eq!(
+            outcome,
+            SqliteFamilyCleanupOutcome::Quarantined {
+                wal: true,
+                shm: true,
+                wal_cert: true,
+                wal_cert_head: true,
+            }
+        );
 
         assert!(
             !wal_path.exists(),
@@ -17284,6 +27677,14 @@ mod tests {
         assert!(
             !shm_path.exists(),
             "companion SHM should move out of the live DB family with the WAL"
+        );
+        assert!(
+            !wal_cert_path.exists(),
+            "companion WAL certificate should rotate with the damaged WAL"
+        );
+        assert!(
+            !wal_cert_head_path.exists(),
+            "companion WAL certificate head should rotate with the damaged WAL"
         );
 
         let wal_quarantines = sqlite_cleanup_quarantines(dir.path(), "header_only_test.db-wal");
@@ -17307,6 +27708,92 @@ mod tests {
             std::fs::read(&shm_quarantines[0]).expect("read quarantined SHM"),
             b"stale-shm"
         );
+
+        let wal_cert_quarantines =
+            sqlite_cleanup_quarantines(dir.path(), "header_only_test.db-wal-cert");
+        assert_eq!(
+            wal_cert_quarantines.len(),
+            1,
+            "companion WAL certificate should be preserved in quarantine"
+        );
+        assert_eq!(
+            std::fs::read(&wal_cert_quarantines[0]).expect("read quarantined WAL certificate"),
+            b"stale-wal-cert"
+        );
+
+        let wal_cert_head_quarantines =
+            sqlite_cleanup_quarantines(dir.path(), "header_only_test.db-wal-cert-head");
+        assert_eq!(
+            wal_cert_head_quarantines.len(),
+            1,
+            "companion WAL certificate head should be preserved in quarantine"
+        );
+        assert_eq!(
+            std::fs::read(&wal_cert_head_quarantines[0])
+                .expect("read quarantined WAL certificate head"),
+            b"stale-wal-cert-head"
+        );
+    }
+
+    #[test]
+    fn classified_sidecar_cleanup_refuses_raced_in_wal_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("cleanup-race.sqlite3");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        let wal_cert_path = sqlite_sidecar_path(&db_path, "-wal-cert");
+        let wal_cert_head_path = sqlite_sidecar_path(&db_path, "-wal-cert-head");
+        let preserved_wal_path = dir.path().join("cleanup-race.original-wal");
+        std::fs::write(&db_path, b"primary authority").expect("write primary fixture");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write classified WAL");
+        std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+        std::fs::write(&wal_cert_path, b"wal-cert").expect("write WAL certificate");
+        std::fs::write(&wal_cert_head_path, b"wal-cert-head").expect("write WAL certificate head");
+
+        let mut injected = false;
+        let error = apply_classified_sqlite_family_cleanup_with_hook(&db_path, |sidecar| {
+            if !injected && sidecar == wal_path {
+                std::fs::rename(&wal_path, &preserved_wal_path)
+                    .expect("preserve classified WAL before race");
+                std::fs::write(&wal_path, [0xAA; 64]).expect("race in framed WAL generation");
+                injected = true;
+            }
+        })
+        .expect_err("cleanup must reject a WAL generation that replaced its witness");
+
+        assert!(
+            error.to_string().contains("changed identity or bytes"),
+            "unexpected race refusal: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("all earlier SQLite-family cleanup moves were rolled back"),
+            "the raced WAL must roll back earlier certificate/SHM moves: {error}"
+        );
+        assert!(injected, "test must inject the classify-to-rename race");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), [0xAA; 64]);
+        assert_eq!(
+            std::fs::read(&preserved_wal_path).unwrap(),
+            b"truncated-wal"
+        );
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(std::fs::read(&wal_cert_path).unwrap(), b"wal-cert");
+        assert_eq!(
+            std::fs::read(&wal_cert_head_path).unwrap(),
+            b"wal-cert-head"
+        );
+        for sidecar_name in [
+            "cleanup-race.sqlite3-wal",
+            "cleanup-race.sqlite3-shm",
+            "cleanup-race.sqlite3-wal-cert",
+            "cleanup-race.sqlite3-wal-cert-head",
+        ] {
+            assert!(
+                sqlite_cleanup_quarantines(dir.path(), sidecar_name).is_empty(),
+                "a refused race must roll back quarantine for {sidecar_name}"
+            );
+        }
     }
 
     #[test]
@@ -17344,7 +27831,7 @@ mod tests {
         std::fs::write(&wal_path, header).expect("write valid 32-byte header");
         assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 32);
 
-        cleanup_empty_wal_sidecar(db_path.to_str().unwrap());
+        cleanup_empty_wal_sidecar(&db_path).expect("classify valid header-only WAL");
 
         assert!(
             wal_path.exists(),
@@ -17364,15 +27851,19 @@ mod tests {
         let journal = dir.path().join("checkpoint_sidecars.db-journal");
         let wal = dir.path().join("checkpoint_sidecars.db-wal");
         let shm = dir.path().join("checkpoint_sidecars.db-shm");
-        std::fs::write(&journal, b"journal").expect("write journal");
-        std::fs::write(&wal, [0xAA; 64]).expect("write wal");
+        let wal_cert = dir.path().join("checkpoint_sidecars.db-wal-cert");
+        let wal_cert_head = dir.path().join("checkpoint_sidecars.db-wal-cert-head");
+        std::fs::write(&journal, b"").expect("write benign empty journal");
+        std::fs::write(&wal, [0x00; 32]).expect("write frameless wal");
         std::fs::write(&shm, b"shm").expect("write shm");
+        std::fs::write(&wal_cert, b"wal-cert").expect("write wal certificate");
+        std::fs::write(&wal_cert_head, b"wal-cert-head").expect("write wal certificate head");
 
         quarantine_sqlite_sidecars_after_checkpoint(&primary).expect("quarantine sidecars");
 
         assert!(
-            !journal.exists(),
-            "residual journal should move out of the live DB family"
+            journal.exists(),
+            "a zero-length journal is benign and should not churn the namespace"
         );
         assert!(
             !wal.exists(),
@@ -17382,10 +27873,18 @@ mod tests {
             !shm.exists(),
             "residual SHM should move out of the live DB family"
         );
+        assert!(
+            !wal_cert.exists(),
+            "residual WAL certificate should move with its generation"
+        );
+        assert!(
+            !wal_cert_head.exists(),
+            "residual WAL certificate head should move with its generation"
+        );
 
         assert_eq!(
             sqlite_cleanup_quarantines(dir.path(), "checkpoint_sidecars.db-journal").len(),
-            1
+            0
         );
         assert_eq!(
             sqlite_cleanup_quarantines(dir.path(), "checkpoint_sidecars.db-wal").len(),
@@ -17394,6 +27893,112 @@ mod tests {
         assert_eq!(
             sqlite_cleanup_quarantines(dir.path(), "checkpoint_sidecars.db-shm").len(),
             1
+        );
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "checkpoint_sidecars.db-wal-cert").len(),
+            1
+        );
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "checkpoint_sidecars.db-wal-cert-head").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn checkpoint_sidecar_cleanup_refuses_wal_with_frame_bytes_without_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("checkpoint-framed-wal.db");
+        let wal = sqlite_sidecar_path(&primary, "-wal");
+        let shm = sqlite_sidecar_path(&primary, "-shm");
+        std::fs::write(&primary, b"primary authority").expect("write primary");
+        std::fs::write(&wal, [0xAA; 64]).expect("write framed WAL fixture");
+        std::fs::write(&shm, b"coordination-shm").expect("write SHM fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list fixture before refusal")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+
+        let error = quarantine_sqlite_sidecars_after_checkpoint(&primary)
+            .expect_err("checkpoint cleanup must not detach a WAL with frame bytes");
+
+        assert!(
+            error.to_string().contains("WAL with frame bytes"),
+            "unexpected framed-WAL refusal: {error}"
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), b"primary authority");
+        assert_eq!(std::fs::read(&wal).unwrap(), [0xAA; 64]);
+        assert_eq!(std::fs::read(&shm).unwrap(), b"coordination-shm");
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list fixture after refusal")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names_after, names_before);
+    }
+
+    #[test]
+    fn checkpoint_sidecar_cleanup_refuses_nonempty_journal_without_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("checkpoint-live-journal.db");
+        let journal = sqlite_sidecar_path(&primary, "-journal");
+        let shm = sqlite_sidecar_path(&primary, "-shm");
+        std::fs::write(&primary, b"primary authority").expect("write primary");
+        std::fs::write(&journal, b"possible live transaction")
+            .expect("write rollback journal fixture");
+        std::fs::write(&shm, b"coordination-shm").expect("write SHM fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list fixture before refusal")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+
+        let error = quarantine_sqlite_sidecars_after_checkpoint(&primary)
+            .expect_err("checkpoint cleanup must not detach a nonempty rollback journal");
+
+        assert!(
+            error.to_string().contains("non-empty rollback journal"),
+            "unexpected journal refusal: {error}"
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), b"primary authority");
+        assert_eq!(
+            std::fs::read(&journal).unwrap(),
+            b"possible live transaction"
+        );
+        assert_eq!(std::fs::read(&shm).unwrap(), b"coordination-shm");
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list fixture after refusal")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names_after, names_before);
+    }
+
+    #[test]
+    fn checkpoint_sidecar_cleanup_refuses_raced_in_wal_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("checkpoint-race.db");
+        let wal = sqlite_sidecar_path(&primary, "-wal");
+        let preserved_wal = dir.path().join("checkpoint-race.original-wal");
+        std::fs::write(&primary, b"primary authority").expect("write primary");
+        std::fs::write(&wal, [0x00; 32]).expect("write classified frameless WAL");
+
+        let mut injected = false;
+        let error = quarantine_sqlite_sidecars_after_checkpoint_with_hook(&primary, |sidecar| {
+            if !injected && sidecar == wal {
+                std::fs::rename(&wal, &preserved_wal).expect("preserve classified WAL");
+                std::fs::write(&wal, [0xAA; 64]).expect("race in framed WAL generation");
+                injected = true;
+            }
+        })
+        .expect_err("checkpoint cleanup must reject a raced-in WAL generation");
+
+        assert!(
+            error.to_string().contains("changed identity or bytes"),
+            "unexpected race refusal: {error}"
+        );
+        assert!(injected, "test must inject the checkpoint cleanup race");
+        assert_eq!(std::fs::read(&wal).unwrap(), [0xAA; 64]);
+        assert_eq!(std::fs::read(&preserved_wal).unwrap(), [0x00; 32]);
+        assert!(
+            sqlite_cleanup_quarantines(dir.path(), "checkpoint-race.db-wal").is_empty(),
+            "a refused race must not quarantine the unclassified WAL generation"
         );
     }
 
@@ -17412,6 +28017,11 @@ mod tests {
             wal.exists(),
             "empty wal stub should exist before health check"
         );
+        assert!(
+            sqlite_file_is_healthy_without_family_cleanup(&primary)
+                .expect("strict health check with benign empty WAL"),
+            "the strict fail-open probe must not reject a directly usable zero-byte WAL family"
+        );
 
         ensure_sqlite_file_healthy(&primary).expect("healthy db with empty wal should pass");
 
@@ -17420,8 +28030,13 @@ mod tests {
             "primary db should remain healthy with an empty wal attached"
         );
         assert!(
-            !wal.exists() || std::fs::metadata(&wal).expect("stat retained WAL").len() == 0,
-            "health checks may let SQLite remove an inert empty WAL, but must not rewrite it into live data"
+            wal.exists(),
+            "source-neutral health must retain the empty WAL name"
+        );
+        assert_eq!(
+            std::fs::metadata(&wal).expect("stat retained WAL").len(),
+            0,
+            "source-neutral health must retain the empty WAL bytes"
         );
         assert_eq!(
             sqlite_cleanup_quarantines(dir.path(), "zero-byte-wal.db-wal").len(),
@@ -17457,8 +28072,13 @@ mod tests {
             "primary db should remain healthy with an empty wal attached"
         );
         assert!(
-            !wal.exists() || std::fs::metadata(&wal).expect("stat retained WAL").len() == 0,
-            "archive-aware health checks may let SQLite remove an inert empty WAL, but must not rewrite it into live data"
+            wal.exists(),
+            "archive-aware source-neutral health must retain the empty WAL name"
+        );
+        assert_eq!(
+            std::fs::metadata(&wal).expect("stat retained WAL").len(),
+            0,
+            "archive-aware source-neutral health must retain the empty WAL bytes"
         );
         assert_eq!(
             sqlite_cleanup_quarantines(dir.path(), "zero-byte-wal-archive.db-wal").len(),
@@ -17546,6 +28166,41 @@ mod tests {
         assert_eq!(
             sleep_calls.borrow().as_slice(),
             &[sqlite_lock_retry_delay(0), sqlite_lock_retry_delay(1)]
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn namespace_lockfailed_mapping_reaches_bounded_retry() {
+        let attempts = std::cell::Cell::new(0usize);
+        let sleep_calls = std::cell::RefCell::new(Vec::new());
+        let result = retry_sqlite_lock_impl(
+            "ignored.sqlite3",
+            "strict read-only namespace admission test",
+            || {
+                let next = attempts.get().saturating_add(1);
+                attempts.set(next);
+                if next == 1 {
+                    Err(map_read_only_namespace_admission_error(
+                        fsqlite::FrankenError::LockFailed {
+                            detail: "namespace use lock is contended".to_string(),
+                        },
+                        Path::new("ignored.sqlite3"),
+                        "namespace retry test",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            |delay| sleep_calls.borrow_mut().push(delay),
+        );
+
+        assert!(result.is_ok(), "mapped namespace contention must retry");
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(
+            sleep_calls.borrow().as_slice(),
+            &[sqlite_lock_retry_delay(0)]
         );
     }
 
@@ -19334,6 +29989,103 @@ mod tests {
             .query_sync("SELECT COUNT(*) FROM atc_experiences", &[])
             .expect("query sidecar");
         assert_eq!(rows.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validated_atc_sqlite_path_accepts_regular_authority_and_rejects_existing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("ATC authority tempdir");
+        let ordinary_dir = root.path().join("ordinary");
+        let redirected_dir = root.path().join("redirected");
+        std::fs::create_dir_all(&ordinary_dir).expect("create ordinary ATC authority directory");
+        std::fs::create_dir_all(&redirected_dir)
+            .expect("create redirected ATC authority directory");
+
+        let ordinary_primary = ordinary_dir.join("storage.sqlite3");
+        let ordinary_primary_text = ordinary_primary
+            .to_str()
+            .expect("temporary ordinary primary path is UTF-8");
+        let ordinary_primary_conn = crate::CanonicalDbConn::open_file(ordinary_primary_text)
+            .expect("open ordinary primary fixture");
+        ordinary_primary_conn
+            .execute_raw("CREATE TABLE ordinary_primary_authority(id INTEGER PRIMARY KEY)")
+            .expect("materialize ordinary primary fixture");
+        drop(ordinary_primary_conn);
+        let ordinary_storage = ordinary_dir.join("archive");
+        std::fs::create_dir_all(&ordinary_storage).expect("create ordinary archive authority");
+        let ordinary_pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", ordinary_primary.display()),
+            storage_root: Some(ordinary_storage),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("freeze ordinary ATC authority");
+        let ordinary_sidecar = atc_sidecar_sqlite_path(ordinary_primary_text);
+        assert!(
+            !Path::new(&ordinary_sidecar).exists(),
+            "ordinary ATC fixture must begin with a missing sidecar leaf"
+        );
+        assert_eq!(
+            ordinary_pool
+                .validated_atc_sqlite_path("ordinary missing ATC sidecar")
+                .expect("missing ATC sidecar leaf remains authoritative")
+                .expect("file-backed pool has an ATC sidecar"),
+            ordinary_sidecar
+        );
+        write_sidecar_fixture(&ordinary_sidecar);
+        assert_eq!(
+            ordinary_pool
+                .validated_atc_sqlite_path("ordinary regular ATC sidecar")
+                .expect("regular ATC sidecar remains authoritative")
+                .expect("file-backed pool has an ATC sidecar"),
+            ordinary_sidecar
+        );
+
+        let redirected_primary = redirected_dir.join("storage.sqlite3");
+        let redirected_primary_text = redirected_primary
+            .to_str()
+            .expect("temporary redirected primary path is UTF-8");
+        let redirected_primary_conn = crate::CanonicalDbConn::open_file(redirected_primary_text)
+            .expect("open redirected primary fixture");
+        redirected_primary_conn
+            .execute_raw("CREATE TABLE redirected_primary_authority(id INTEGER PRIMARY KEY)")
+            .expect("materialize redirected primary fixture");
+        drop(redirected_primary_conn);
+        let redirected_storage = redirected_dir.join("archive");
+        std::fs::create_dir_all(&redirected_storage).expect("create redirected archive authority");
+        let foreign_sidecar = root.path().join("missing-foreign-atc.sqlite3");
+        assert!(
+            !foreign_sidecar.exists(),
+            "redirected ATC fixture requires a dangling symlink target"
+        );
+        let redirected_sidecar = atc_sidecar_sqlite_path(redirected_primary_text);
+        symlink(&foreign_sidecar, &redirected_sidecar)
+            .expect("insert dangling foreign ATC symlink before validation admission");
+        let redirected_pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", redirected_primary.display()),
+            storage_root: Some(redirected_storage),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("freeze redirected ATC primary authority");
+
+        let error = redirected_pool
+            .validated_atc_sqlite_path("existing ATC sidecar symlink")
+            .expect_err("ATC validation must reject an existing sidecar symlink");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to cross database authority"),
+            "unexpected ATC sidecar authority error: {error}"
+        );
     }
 
     #[test]

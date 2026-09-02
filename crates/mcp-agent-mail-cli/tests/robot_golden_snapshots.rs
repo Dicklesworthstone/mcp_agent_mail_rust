@@ -105,6 +105,7 @@ fn message_envelope() -> RobotEnvelope<MessageContext> {
         MessageContext {
             id: 101,
             from: "BlueLake".to_string(),
+            topic: None,
             from_program: Some("claude-code".to_string()),
             from_model: Some("opus-4.6".to_string()),
             to: vec!["RedFox".to_string()],
@@ -138,6 +139,7 @@ fn thread_envelope() -> RobotEnvelope<Vec<ThreadMessage>> {
         OutputFormat::Markdown,
         vec![
             ThreadMessage {
+                topic: None,
                 position: 1,
                 from: "BlueLake".to_string(),
                 to: "RedFox".to_string(),
@@ -148,6 +150,7 @@ fn thread_envelope() -> RobotEnvelope<Vec<ThreadMessage>> {
                 body: Some("Opening note for the golden thread.".to_string()),
             },
             ThreadMessage {
+                topic: None,
                 position: 2,
                 from: "RedFox".to_string(),
                 to: "BlueLake".to_string(),
@@ -302,6 +305,7 @@ fn search_result(id: i64, from: &str, subject: &str, thread: &str, snippet: &str
     SearchResult {
         id,
         relevance: 0.91,
+        topic: None,
         from: from.to_string(),
         subject: subject.to_string(),
         thread: thread.to_string(),

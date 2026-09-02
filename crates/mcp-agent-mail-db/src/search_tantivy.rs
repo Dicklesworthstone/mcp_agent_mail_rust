@@ -8,23 +8,23 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use mcp_agent_mail_core::search_types::{
-    DateRange, DocKind as ScDocKind, ImportanceFilter, SearchFilter, SearchHit, SearchResults,
-};
-use crate::tantivy_schema::{
-    build_schema, register_tokenizer, FieldHandles, BODY_BOOST, SUBJECT_BOOST,
-};
-use crate::search_filter_compiler::compile_filters;
 use crate::query_assistance::{
     LexicalParser, LexicalParserConfig, ParseOutcome, SanitizedQuery, extract_terms, sanitize_query,
 };
-use crate::search_response::{execute_search as tantivy_execute, ResponseConfig};
-use tantivy::query::AllQuery;
+use crate::search_filter_compiler::compile_filters;
+use crate::search_response::{ResponseConfig, execute_search as tantivy_execute};
+use crate::tantivy_schema::{
+    BODY_BOOST, FieldHandles, SUBJECT_BOOST, build_schema, register_tokenizer,
+};
+use mcp_agent_mail_core::search_types::{
+    DateRange, DocKind as ScDocKind, ImportanceFilter, SearchFilter, SearchHit, SearchResults,
+};
 use tantivy::Index;
+use tantivy::query::AllQuery;
 
 use crate::error::DbError;
-use crate::search_planner::{DocKind, PlanMethod, QueryExplain, SearchCursor, SearchQuery};
 use crate::search_planner::SearchResult;
+use crate::search_planner::{DocKind, PlanMethod, QueryExplain, SearchCursor, SearchQuery};
 
 // ────────────────────────────────────────────────────────────────────
 // Engine selection
@@ -407,10 +407,7 @@ fn map_hit_to_search_result(hit: &SearchHit, doc_kind: DocKind) -> SearchResult 
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    let from_agent = m
-        .get("sender")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let from_agent = m.get("sender").and_then(|v| v.as_str()).map(String::from);
 
     #[allow(clippy::cast_possible_wrap)]
     let project_id = m

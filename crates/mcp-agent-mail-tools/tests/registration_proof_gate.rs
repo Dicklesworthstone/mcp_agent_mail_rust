@@ -11,6 +11,8 @@
 //! - enabled gate + valid proof => registration succeeds through the tool and
 //!   through a macro (proving macros forward the proof and cannot bypass it).
 
+#![recursion_limit = "256"]
+
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use base64::Engine;

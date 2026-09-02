@@ -195,13 +195,14 @@ am serve-http
 # This scenario does NOT require a kill switch — the ledger is fine,
 # only the decision engine is misbehaving.
 
-# Option A: Force safe mode (disables proactive actions, keeps observation)
-export AM_ATC_SAFE_MODE=1
-# Restart or wait for the runtime config to take effect
+# Option A: Stop side effects but keep observation and decisions
+export AM_ATC_EXECUTOR_MODE=shadow   # the default since v0.3.31
+# Restart the server — no mail is sent and no reservations are released
 
-# Option B: If safe mode is insufficient, disable the operator runtime
+# Option B: If shadow is insufficient, disable the operator runtime
 export AM_ATC_ENABLED=false
-# Restart the server — ATC observation continues but no operator actions
+# Restart the server — ATC ignores all hooks; liveness surfaces fall back
+# to DB last_active_ts heuristics ("passive liveness only")
 
 # Option C: Nuclear — full kill switch (stops all ATC activity)
 echo "bad policy decisions $(date -u +%FT%TZ)" \

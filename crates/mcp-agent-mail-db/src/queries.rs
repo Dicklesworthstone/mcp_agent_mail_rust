@@ -101,6 +101,7 @@ fn sha256_hex(data: &str) -> String {
 struct TrackedConnection<'conn> {
     inner: &'conn crate::DbConn,
     transaction_write_intent: TransactionWriteIntent,
+    retire_after_deferred_checkpoint: Option<&'conn AtomicBool>,
 }
 
 impl<'conn> TrackedConnection<'conn> {
@@ -108,6 +109,24 @@ impl<'conn> TrackedConnection<'conn> {
         Self {
             inner,
             transaction_write_intent: TransactionWriteIntent::default(),
+            retire_after_deferred_checkpoint: None,
+        }
+    }
+
+    fn with_retirement_signal(
+        inner: &'conn crate::DbConn,
+        retire_after_deferred_checkpoint: &'conn AtomicBool,
+    ) -> Self {
+        Self {
+            inner,
+            transaction_write_intent: TransactionWriteIntent::default(),
+            retire_after_deferred_checkpoint: Some(retire_after_deferred_checkpoint),
+        }
+    }
+
+    fn retire_after_deferred_checkpoint(&self) {
+        if let Some(signal) = self.retire_after_deferred_checkpoint {
+            signal.store(true, Ordering::Release);
         }
     }
 }
@@ -972,7 +991,7 @@ fn decode_product_row_indexed(row: &SqlRow) -> std::result::Result<ProductRow, D
 /// Decode `AgentRow` from raw SQL query result using positional (indexed) column access.
 /// Expected column order: `id`, `project_id`, `name`, `program`, `model`, `task_description`,
 /// `inception_ts`, `last_active_ts`, `attachments_policy`, `contact_policy`, `reaper_exempt`,
-/// `registration_token`.
+/// `registration_token`, `retired_at`.
 fn decode_agent_row_indexed(row: &SqlRow) -> AgentRow {
     fn get_i64(row: &SqlRow, idx: usize) -> i64 {
         row.get(idx).and_then(value_as_i64).unwrap_or(0)
@@ -1014,6 +1033,7 @@ fn decode_agent_row_indexed(row: &SqlRow) -> AgentRow {
         },
         reaper_exempt: get_opt_i64(row, 10).unwrap_or(0),
         registration_token: get_opt_string(row, 11),
+        retired_at: get_opt_i64(row, 12),
     }
 }
 
@@ -1232,11 +1252,99 @@ fn recent_contact_union_sql(item_count: usize) -> &'static str {
     &cache[capped]
 }
 
-async fn acquire_conn(
-    cx: &Cx,
-    pool: &DbPool,
-) -> Outcome<sqlmodel_pool::PooledConnection<crate::DbConn>, DbError> {
-    map_sql_outcome(pool.acquire(cx).await)
+/// Retirement-aware owner for one pooled FrankenSQLite checkout.
+///
+/// A contended fail-fast post-commit checkpoint leaves the durable commit on
+/// the connection worker until that worker closes. The flag lets the tracked
+/// transaction request retirement without taking ownership away from its
+/// caller. Detaching closes only this checkout; pool waiters recheck capacity
+/// on their bounded 100ms acquisition loop.
+struct RetirablePooledHandle {
+    inner: Option<sqlmodel_pool::PooledConnection<crate::DbConn>>,
+    retire_after_deferred_checkpoint: AtomicBool,
+}
+
+impl RetirablePooledHandle {
+    fn new(inner: sqlmodel_pool::PooledConnection<crate::DbConn>) -> Self {
+        Self {
+            inner: Some(inner),
+            retire_after_deferred_checkpoint: AtomicBool::new(false),
+        }
+    }
+
+    fn inner(&self) -> &sqlmodel_pool::PooledConnection<crate::DbConn> {
+        self.inner
+            .as_ref()
+            .expect("retirable pooled handle accessed after drop")
+    }
+}
+
+impl std::ops::Deref for RetirablePooledHandle {
+    type Target = crate::DbConn;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner()
+    }
+}
+
+impl std::ops::DerefMut for RetirablePooledHandle {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner
+            .as_mut()
+            .expect("retirable pooled handle mutably accessed after drop")
+    }
+}
+
+impl Drop for RetirablePooledHandle {
+    fn drop(&mut self) {
+        let Some(pooled) = self.inner.take() else {
+            return;
+        };
+        if !self
+            .retire_after_deferred_checkpoint
+            .load(Ordering::Acquire)
+        {
+            drop(pooled);
+            return;
+        }
+
+        let db_path = pooled.path().to_string();
+        let connection = pooled.detach();
+        if let Err(error) = connection.close_without_checkpoint_sync() {
+            tracing::warn!(
+                db_path = %db_path,
+                error = %error,
+                "deferred_checkpoint_connection_retirement_failed"
+            );
+        }
+    }
+}
+
+/// Outer checkout layer retained for the existing `&*conn` call pattern: one
+/// explicit dereference yields the retirement-aware handle, while ordinary
+/// method calls continue through it to `DbConn`.
+struct AcquiredConnection {
+    handle: RetirablePooledHandle,
+}
+
+impl std::ops::Deref for AcquiredConnection {
+    type Target = RetirablePooledHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
+}
+
+impl std::ops::DerefMut for AcquiredConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.handle
+    }
+}
+
+async fn acquire_conn(cx: &Cx, pool: &DbPool) -> Outcome<AcquiredConnection, DbError> {
+    map_sql_outcome(pool.acquire(cx).await).map(|inner| AcquiredConnection {
+        handle: RetirablePooledHandle::new(inner),
+    })
 }
 
 fn canonical_table_columns(
@@ -1494,8 +1602,21 @@ pub(crate) async fn ensure_file_backed_atc_pool_initialized(
     // keys, subjects, and evidence summaries (br-bvq1x.11.7). Best-effort — a
     // chmod failure must not block ATC telemetry.
     #[cfg(unix)]
-    if let Some(atc_path) = pool.atc_sqlite_path() {
+    {
         use std::os::unix::fs::PermissionsExt;
+        let atc_path = match pool.validated_atc_sqlite_path("restrict ATC sidecar permissions") {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                close_canonical_db_conn(conn, "initialize canonical ATC schema connection");
+                return Outcome::Err(DbError::Internal(
+                    "file-backed ATC initialization lost its sidecar path".to_string(),
+                ));
+            }
+            Err(error) => {
+                close_canonical_db_conn(conn, "initialize canonical ATC schema connection");
+                return Outcome::Err(error);
+            }
+        };
         if let Err(error) =
             std::fs::set_permissions(&atc_path, std::fs::Permissions::from_mode(0o600))
         {
@@ -1527,8 +1648,35 @@ pub(crate) async fn ensure_file_backed_atc_pool_initialized(
     }
 }
 
-fn tracked(conn: &crate::DbConn) -> TrackedConnection<'_> {
-    TrackedConnection::new(conn)
+trait TrackedConnectionSource {
+    fn db_conn(&self) -> &crate::DbConn;
+
+    fn retirement_signal(&self) -> Option<&AtomicBool> {
+        None
+    }
+}
+
+impl TrackedConnectionSource for crate::DbConn {
+    fn db_conn(&self) -> &crate::DbConn {
+        self
+    }
+}
+
+impl TrackedConnectionSource for RetirablePooledHandle {
+    fn db_conn(&self) -> &crate::DbConn {
+        self
+    }
+
+    fn retirement_signal(&self) -> Option<&AtomicBool> {
+        Some(&self.retire_after_deferred_checkpoint)
+    }
+}
+
+fn tracked<T: TrackedConnectionSource + ?Sized>(conn: &T) -> TrackedConnection<'_> {
+    match conn.retirement_signal() {
+        Some(signal) => TrackedConnection::with_retirement_signal(conn.db_conn(), signal),
+        None => TrackedConnection::new(conn.db_conn()),
+    }
 }
 
 // =============================================================================
@@ -1583,21 +1731,103 @@ async fn begin_concurrent_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcom
     }
 }
 
-/// Commit the current transaction and publish file-backed writes to fresh handles.
+/// Commit the current transaction and opportunistically publish it to
+/// canonical SQLite readers without waiting for their snapshots.
+///
+/// FrankenSQLite makes a successful COMMIT durable for its own handles, but a
+/// canonical SQLite process only sees those frames after checkpoint backfill.
+/// The publication attempt must remain strictly best-effort: with the normal
+/// 20-second request `busy_timeout`, FrankenSQLite's PASSIVE checkpoint waits
+/// behind an unrelated canonical read snapshot and can consume the enclosing
+/// HTTP deadline after the transaction already committed. Temporarily using a
+/// zero lock-wait preserves the uncontended fresh-handle visibility contract
+/// while deferring contended publication to the structured periodic pool
+/// maintenance task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalCheckpointProgress {
+    busy: i64,
+    log: i64,
+    checkpointed: i64,
+}
+
+impl WalCheckpointProgress {
+    fn fully_published(self) -> bool {
+        let non_wal_sentinel = self.log == -1 && self.checkpointed == -1;
+        let wal_fully_backfilled = self.log >= 0 && self.checkpointed >= self.log;
+        self.busy == 0 && (non_wal_sentinel || wal_fully_backfilled)
+    }
+}
+
+fn wal_checkpoint_progress(rows: &[SqlRow]) -> Option<WalCheckpointProgress> {
+    let row = rows.first()?;
+    let busy = row.get(0).and_then(value_as_i64)?;
+    let log = row.get(1).and_then(value_as_i64)?;
+    let checkpointed = row.get(2).and_then(value_as_i64)?;
+    Some(WalCheckpointProgress {
+        busy,
+        log,
+        checkpointed,
+    })
+}
+
 async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
     match map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await) {
         Outcome::Ok(_) => {
             if tracked.inner.path() != ":memory:" {
-                // FrankenSQLite can otherwise keep a successful COMMIT private
-                // to the pooled connection until a later close. The checkpoint
-                // gives post-commit probes and sibling processes the same view
-                // immediately after the write path returns.
-                if let Err(error) = tracked.inner.execute_raw("PRAGMA wal_checkpoint(PASSIVE)") {
+                let mut retire = false;
+                match tracked.inner.execute_raw("PRAGMA busy_timeout = 0;") {
+                    Ok(()) => match tracked
+                        .inner
+                        .query_sync("PRAGMA wal_checkpoint(PASSIVE);", &[])
+                    {
+                        Ok(rows)
+                            if wal_checkpoint_progress(&rows)
+                                .is_some_and(WalCheckpointProgress::fully_published) =>
+                        {
+                            // Canonical publication completed without waiting.
+                        }
+                        Ok(rows) => {
+                            retire = true;
+                            let progress = wal_checkpoint_progress(&rows);
+                            tracing::debug!(
+                                db_path = %tracked.inner.path(),
+                                checkpoint_busy = ?progress.map(|value| value.busy),
+                                checkpoint_log = ?progress.map(|value| value.log),
+                                checkpointed = ?progress.map(|value| value.checkpointed),
+                                "post_commit_checkpoint_deferred_by_contention"
+                            );
+                        }
+                        Err(error) => {
+                            retire = true;
+                            tracing::debug!(
+                                db_path = %tracked.inner.path(),
+                                error = %error,
+                                "post_commit_checkpoint_deferred_by_contention"
+                            );
+                        }
+                    },
+                    Err(error) => {
+                        retire = true;
+                        tracing::warn!(
+                            db_path = %tracked.inner.path(),
+                            error = %error,
+                            "post_commit_fail_fast_checkpoint_setup_failed"
+                        );
+                    }
+                }
+                if let Err(error) = tracked.inner.execute_raw(&format!(
+                    "PRAGMA busy_timeout = {};",
+                    mcp_agent_mail_core::config::DB_RUNTIME_BUSY_TIMEOUT_MS
+                )) {
+                    retire = true;
                     tracing::warn!(
                         db_path = %tracked.inner.path(),
                         error = %error,
-                        "post_commit_checkpoint_failed_after_successful_commit"
+                        "post_commit_busy_timeout_restore_failed"
                     );
+                }
+                if retire {
+                    tracked.retire_after_deferred_checkpoint();
                 }
             }
             Outcome::Ok(())
@@ -1610,9 +1840,9 @@ async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbEr
 
 /// End a transaction that has only observed database state.
 ///
-/// This intentionally bypasses [`commit_tx`]: that helper checkpoints the WAL
-/// after writes, while authoritative guard reads must not cause any durable
-/// database or WAL mutation of their own.
+/// This intentionally bypasses [`commit_tx`]: that helper attempts canonical
+/// publication after writes, while authoritative guard reads must not cause
+/// any durable database or WAL mutation of their own.
 async fn commit_read_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
     map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await).map(|_| ())
 }
@@ -1724,6 +1954,9 @@ async fn durability_probe_query(
         // Use a plain open — no recovery, no fallback paths. Durability probes
         // must be side-effect-free so they never trigger REINDEX or open a
         // fallback database, which could make committed rows appear to vanish.
+        if let Err(error) = pool.validated_sqlite_path("durability probe") {
+            return Outcome::Err(error);
+        }
         let probe_conn = match crate::DbConn::open_file(pool.sqlite_path()) {
             Ok(conn) => conn,
             Err(e) => return Outcome::Err(DbError::Sqlite(e.to_string())),
@@ -1793,7 +2026,7 @@ async fn verify_agent_visible_after_commit(
     // same row get_agent / register_agent reuse resolves.
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token \
+               registration_token, retired_at \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                ORDER BY id ASC LIMIT 1";
     let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -2136,6 +2369,7 @@ async fn fetch_durable_atc_experience_by_id(
 }
 
 fn open_fresh_file_backed_conn(pool: &DbPool) -> std::result::Result<crate::DbConn, DbError> {
+    pool.validated_sqlite_path("fresh file-backed connection")?;
     let conn = crate::DbConn::open_file(pool.sqlite_path())
         .map_err(|error| DbError::Sqlite(error.to_string()))?;
     conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL)
@@ -2172,7 +2406,7 @@ pub(crate) fn open_canonical_atc_conn(
     // storage.sqlite3's VACUUM/integrity/backup/size (br-bvq1x.11.7). The
     // sidecar is opened only through canonical SQLite, which sidesteps the
     // FrankenConnection page-corruption bug (br-q37ep) entirely.
-    let atc_path = pool.atc_sqlite_path().ok_or_else(|| {
+    let atc_path = pool.validated_atc_sqlite_path(purpose)?.ok_or_else(|| {
         DbError::Internal(format!(
             "{purpose}: canonical ATC connection requested for an in-memory pool"
         ))
@@ -2203,7 +2437,7 @@ pub(crate) fn open_canonical_atc_conn(
 /// idle mailbox never logs `no such table: atc_experiences` (GH#232). The
 /// probe never creates the sidecar file.
 pub(crate) fn atc_sidecar_schema_ready(pool: &DbPool) -> std::result::Result<bool, DbError> {
-    let Some(atc_path) = pool.atc_sqlite_path() else {
+    let Some(atc_path) = pool.validated_atc_sqlite_path("atc sidecar readiness probe")? else {
         return Ok(false);
     };
     match std::fs::metadata(&atc_path) {
@@ -3824,7 +4058,7 @@ where
 /// attempts made, the wall-clock time spent, and honest fallback guidance
 /// instead of advising yet another blind retry (br-bvq1x.4.3 / D3).
 async fn run_with_mvcc_retry_with_budget<T, F, Fut>(
-    _cx: &Cx,
+    cx: &Cx,
     operation: &'static str,
     max: u32,
     mut op: F,
@@ -3851,6 +4085,11 @@ where
         inner: Box::new(e),
     };
     for attempt in 0..=max {
+        if cx.checkpoint().is_err() {
+            return Outcome::Cancelled(cx.cancel_reason().unwrap_or_else(|| {
+                CancelReason::user("database operation cancelled before retry attempt")
+            }));
+        }
         match op().await {
             Outcome::Err(e) if is_mvcc_error(&e) && attempt < max => {
                 MVCC_RETRIES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3861,7 +4100,9 @@ where
                     operation,
                     "MVCC write conflict, retrying whole transaction"
                 );
-                mvcc_backoff(attempt);
+                if let Err(reason) = mvcc_backoff(cx, attempt) {
+                    return Outcome::Cancelled(reason);
+                }
             }
             Outcome::Err(e) if is_plain_write_contention_error(&e) && attempt < max => {
                 tracing::warn!(
@@ -3871,7 +4112,9 @@ where
                     operation,
                     "SQLite write contention, retrying whole transaction"
                 );
-                mvcc_backoff(attempt);
+                if let Err(reason) = mvcc_backoff(cx, attempt) {
+                    return Outcome::Cancelled(reason);
+                }
             }
             Outcome::Err(e) if is_mvcc_error(&e) => {
                 MVCC_EXHAUSTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3926,17 +4169,19 @@ where
 /// Interplay with the dispatch deadline (br-ovy6e): each attempt may also
 /// block up to the runtime `busy_timeout`
 /// ([`mcp_agent_mail_core::config::DB_RUNTIME_BUSY_TIMEOUT_MS`], 20s) inside
-/// SQLite, so the absolute worst case for a fully lock-starved write is
+/// SQLite, so an uncancelled, fully lock-starved write can still consume
 /// ~17 × 20s + ~30s ≈ 370s. That total cannot be squeezed under the 30s
 /// [`mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS`] by constant
 /// tweaks without gutting the #98 contention budget (even one 20s busy wait
-/// plus the required ~20s of backoff already exceeds 30s). The invariant this
-/// layering guarantees instead is that every *individual* blocking SQLite
-/// wait is bounded at 20s < 30s dispatch deadline < 60s deadline+hard-grace,
-/// so a contended worker thread always returns to Rust code well before the
-/// dispatch layer would have to zombify a thread stuck inside one SQLite
-/// call.
-fn mvcc_backoff(attempt: u32) {
+/// plus the required ~20s of backoff already exceeds 30s). Request
+/// cancellation is therefore part of this layer's contract: after the current
+/// SQLite call returns, cancellation prevents every later attempt and
+/// interrupts backoff within one 25ms sleep slice. The current blocking SQLite
+/// wait remains bounded at 20s < 30s dispatch deadline < 60s
+/// deadline+hard-grace, so a contended worker thread returns to cancellation-
+/// aware Rust code before the dispatch layer would have to zombify a thread
+/// stuck inside one SQLite call.
+fn mvcc_backoff(cx: &Cx, attempt: u32) -> std::result::Result<(), CancelReason> {
     use crate::retry::RetryConfig;
     let config = RetryConfig {
         base_delay: std::time::Duration::from_millis(25),
@@ -3944,7 +4189,24 @@ fn mvcc_backoff(attempt: u32) {
         use_circuit_breaker: false,
         ..Default::default()
     };
-    std::thread::sleep(config.delay_for_attempt(attempt));
+    let delay = config.delay_for_attempt(attempt);
+    let deadline = std::time::Instant::now() + delay;
+    loop {
+        if cx.checkpoint().is_err() {
+            return Err(cx.cancel_reason().unwrap_or_else(|| {
+                CancelReason::user("database operation cancelled during retry backoff")
+            }));
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        // This path deliberately runs on a blocking worker, but cancellation
+        // still needs a bounded observation latency. Sleeping in short slices
+        // prevents an abandoned request from waiting out the full 3-second
+        // backoff and entering another potentially 20-second SQLite call.
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(25)));
+    }
 }
 
 /// Snapshot of MVCC retry metrics for health/diagnostics.
@@ -4084,11 +4346,17 @@ pub async fn ensure_project(
             Value::Text(row.human_key.clone()),
             Value::BigInt(row.created_at),
         ];
-        try_in_tx!(
+        let inserted = try_in_tx!(
             cx,
             &tracked,
             map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
         );
+        if inserted > 1 {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(format!(
+                "project insert affected {inserted} rows for slug={slug}; expected at most one"
+            )));
+        }
 
         let rows = try_in_tx!(
             cx,
@@ -4108,6 +4376,20 @@ pub async fn ensure_project(
                 return Outcome::Err(e);
             }
         };
+
+        // Initial sibling discovery belongs to project creation, where the
+        // write transaction is already held. Performing this work from the
+        // projects GET route forced a fresh BEGIN IMMEDIATE during startup
+        // maintenance and could consume the entire HTTP request deadline.
+        // The creator that actually inserted the row owns seeding; a racing
+        // ON CONFLICT loser observes the winner's committed suggestions.
+        if inserted == 1 {
+            try_in_tx!(
+                cx,
+                &tracked,
+                seed_project_sibling_suggestions_for_new_project(cx, &tracked, &fresh).await
+            );
+        }
 
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
         Outcome::Ok(fresh)
@@ -4230,7 +4512,38 @@ pub async fn get_project_by_human_key(
                         crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
                         Outcome::Ok(row)
                     }
-                    Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", human_key)),
+                    Outcome::Ok(None) => {
+                        // GH-mined fix (PR #267 idea): `ensure_project` keys a
+                        // project's identity on the *stable slug* derived by
+                        // `resolve_project_identity` (which canonicalizes e.g.
+                        // GitHub owner case), while `human_key` records one
+                        // historical spelling. Reads must apply the same
+                        // identity fallback: otherwise a canonical key whose
+                        // path does not exist on disk (so no filesystem alias
+                        // matches) finds nothing by exact `human_key` even
+                        // though a write through `ensure_project` would reuse
+                        // the existing row via its slug. Only absolute keys
+                        // are eligible — relative identifiers are handled by
+                        // slug/alias resolution above.
+                        if Path::new(human_key).is_absolute() {
+                            let slug =
+                                mcp_agent_mail_core::resolve_project_identity(human_key).slug;
+                            // Release this connection before re-entering the
+                            // pool so the slug retry cannot deadlock a
+                            // single-connection pool. (`tracked` is not Drop;
+                            // moving it into `_` ends its borrow of `conn`.)
+                            let _ = tracked;
+                            drop(conn);
+                            match get_project_by_slug(cx, pool, &slug).await {
+                                Outcome::Ok(row) => return Outcome::Ok(row),
+                                Outcome::Err(DbError::NotFound { .. }) => {}
+                                Outcome::Err(e) => return Outcome::Err(e),
+                                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                                Outcome::Panicked(p) => return Outcome::Panicked(p),
+                            }
+                        }
+                        Outcome::Err(DbError::not_found("Project", human_key))
+                    }
                     Outcome::Err(e) => Outcome::Err(e),
                     Outcome::Cancelled(r) => Outcome::Cancelled(r),
                     Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -4538,6 +4851,787 @@ pub async fn list_project_rows(cx: &Cx, pool: &DbPool) -> Outcome<Vec<ProjectRow
     Outcome::Ok(out)
 }
 
+/// Count registered agents per project in one grouped query.
+pub async fn count_agents_by_project(
+    cx: &Cx,
+    pool: &DbPool,
+) -> Outcome<BTreeMap<i64, usize>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let rows = match map_sql_outcome(
+        traw_query(
+            cx,
+            &tracked,
+            "SELECT project_id, COUNT(*) FROM agents GROUP BY project_id ORDER BY project_id",
+            &[],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    let mut counts = BTreeMap::new();
+    for row in &rows {
+        let Some(project_id) = row.get(0).and_then(value_as_i64) else {
+            return Outcome::Err(DbError::Internal(
+                "missing project_id in grouped agent count".to_string(),
+            ));
+        };
+        let Some(raw_count) = row.get(1).and_then(value_as_i64) else {
+            return Outcome::Err(DbError::Internal(
+                "missing count in grouped agent count".to_string(),
+            ));
+        };
+        let Ok(count) = usize::try_from(raw_count) else {
+            return Outcome::Err(DbError::Internal(format!(
+                "invalid grouped agent count {raw_count} for project {project_id}"
+            )));
+        };
+        counts.insert(project_id, count);
+    }
+    Outcome::Ok(counts)
+}
+
+// =============================================================================
+// Project sibling suggestions
+// =============================================================================
+
+/// Persisted review state for a project-sibling suggestion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectSiblingStatus {
+    Suggested,
+    Confirmed,
+    Dismissed,
+}
+
+impl ProjectSiblingStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Suggested => "suggested",
+            Self::Confirmed => "confirmed",
+            Self::Dismissed => "dismissed",
+        }
+    }
+
+    fn from_persisted(raw: &str) -> std::result::Result<Self, DbError> {
+        match raw {
+            "suggested" => Ok(Self::Suggested),
+            "confirmed" => Ok(Self::Confirmed),
+            "dismissed" => Ok(Self::Dismissed),
+            _ => Err(DbError::Internal(format!(
+                "invalid project sibling suggestion status '{raw}'"
+            ))),
+        }
+    }
+}
+
+/// Project identity embedded in a sibling-suggestion response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSiblingPeer {
+    pub id: i64,
+    pub slug: String,
+    pub human_key: String,
+}
+
+/// A sibling suggestion joined with both project identities.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectSiblingSuggestion {
+    pub id: i64,
+    pub status: ProjectSiblingStatus,
+    pub score: f64,
+    pub rationale: String,
+    pub project_a: ProjectSiblingPeer,
+    pub project_b: ProjectSiblingPeer,
+    pub evaluated_ts: i64,
+    pub confirmed_ts: Option<i64>,
+    pub dismissed_ts: Option<i64>,
+}
+
+impl ProjectSiblingSuggestion {
+    fn decision_timestamps_match_status(&self) -> bool {
+        match self.status {
+            ProjectSiblingStatus::Suggested => {
+                self.confirmed_ts.is_none() && self.dismissed_ts.is_none()
+            }
+            ProjectSiblingStatus::Confirmed => {
+                self.confirmed_ts.is_some() && self.dismissed_ts.is_none()
+            }
+            ProjectSiblingStatus::Dismissed => {
+                self.confirmed_ts.is_none() && self.dismissed_ts.is_some()
+            }
+        }
+    }
+}
+
+/// Maximum number of project pairs evaluated by one live refresh.
+pub const PROJECT_SIBLING_REFRESH_LIMIT: usize = 3;
+
+/// Minimum score rendered as a reviewable suggestion by the mail UI.
+pub const PROJECT_SIBLING_MIN_SUGGESTION_SCORE: f64 = 0.92;
+
+const PROJECT_SIBLING_REFRESH_TTL_MICROS: i64 = 12 * 60 * 60 * 1_000_000;
+const PROJECT_SIBLING_DISMISS_COOLDOWN_MICROS: i64 = 7 * 24 * 60 * 60 * 1_000_000;
+const PROJECT_SIBLING_PROJECT_SCAN_LIMIT: usize = 256;
+const PROJECT_SIBLING_SIMILARITY_INPUT_LIMIT: usize = 512;
+
+/// Bounded work performed by one sibling-suggestion refresh.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSiblingRefreshSummary {
+    pub evaluated: usize,
+    pub inserted: usize,
+    pub refreshed: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectSiblingRefreshCandidate {
+    left_project: ProjectRow,
+    right_project: ProjectRow,
+    existing: Option<ProjectSiblingSuggestion>,
+}
+
+fn project_sibling_needs_refresh(existing: Option<&ProjectSiblingSuggestion>, now: i64) -> bool {
+    let Some(suggestion) = existing else {
+        return true;
+    };
+    let age = now.saturating_sub(suggestion.evaluated_ts).max(0);
+    if suggestion.status == ProjectSiblingStatus::Dismissed
+        && age < PROJECT_SIBLING_DISMISS_COOLDOWN_MICROS
+    {
+        return false;
+    }
+    age >= PROJECT_SIBLING_REFRESH_TTL_MICROS
+}
+
+fn bounded_project_similarity(left: &str, right: &str) -> f64 {
+    let left_bytes = &left.as_bytes()[..left.len().min(PROJECT_SIBLING_SIMILARITY_INPUT_LIMIT)];
+    let right_bytes = &right.as_bytes()[..right.len().min(PROJECT_SIBLING_SIMILARITY_INPUT_LIMIT)];
+    let total = left_bytes.len() + right_bytes.len();
+    if total == 0 {
+        return 1.0;
+    }
+
+    let mut previous = vec![0usize; right_bytes.len() + 1];
+    let mut current = vec![0usize; right_bytes.len() + 1];
+    for left_byte in left_bytes {
+        for (right_index, right_byte) in right_bytes.iter().enumerate() {
+            current[right_index + 1] = if left_byte.eq_ignore_ascii_case(right_byte) {
+                previous[right_index] + 1
+            } else {
+                previous[right_index + 1].max(current[right_index])
+            };
+        }
+        std::mem::swap(&mut previous, &mut current);
+        current.fill(0);
+    }
+
+    let total = u32::try_from(total).expect("bounded sibling similarity length fits u32");
+    2.0 * previous[right_bytes.len()] as f64 / f64::from(total)
+}
+
+fn project_sibling_similarity(
+    left_project: &ProjectRow,
+    right_project: &ProjectRow,
+) -> (f64, String) {
+    if left_project.human_key == right_project.human_key {
+        return (
+            0.0,
+            "Identical project paths identify the same project".to_string(),
+        );
+    }
+
+    let slug_ratio = bounded_project_similarity(&left_project.slug, &right_project.slug);
+    let human_key_ratio =
+        bounded_project_similarity(&left_project.human_key, &right_project.human_key);
+    let left_name = Path::new(&left_project.human_key)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let right_name = Path::new(&right_project.human_key)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let directory_name_ratio = bounded_project_similarity(left_name, right_name);
+
+    let mut score = slug_ratio.max(human_key_ratio).max(directory_name_ratio);
+    let mut reasons = Vec::with_capacity(4);
+    if slug_ratio > 0.6 {
+        reasons.push(format!("Slugs are similar ({slug_ratio:.2})"));
+    }
+    if human_key_ratio > 0.6 {
+        reasons.push(format!("Project paths align ({human_key_ratio:.2})"));
+    }
+    if directory_name_ratio > 0.6 {
+        reasons.push(format!(
+            "Directory names are similar ({directory_name_ratio:.2})"
+        ));
+    }
+
+    let left_parent = Path::new(&left_project.human_key).parent();
+    let right_parent = Path::new(&right_project.human_key).parent();
+    if left_parent.is_some() && left_parent == right_parent {
+        score = score.max(0.85);
+        reasons.push("Projects share the same parent directory".to_string());
+    }
+    if reasons.is_empty() {
+        reasons.push("Heuristic comparison found limited overlap".to_string());
+    }
+
+    (score.clamp(0.0, 1.0), reasons.join(", "))
+}
+
+/// Seed bounded sibling candidates while the new project's creation
+/// transaction already owns the write lock.
+///
+/// The caller owns commit/rollback. Only a genuinely inserted project may be
+/// passed here: existing projects keep their review decisions, while explicit
+/// maintenance uses [`refresh_project_sibling_suggestions`].
+async fn seed_project_sibling_suggestions_for_new_project(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    new_project: &ProjectRow,
+) -> Outcome<usize, DbError> {
+    let Some(new_project_id) = new_project.id else {
+        return Outcome::Err(DbError::Internal(
+            "cannot seed sibling suggestions for a project without an id".to_string(),
+        ));
+    };
+    let other_rows = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT id, slug, human_key, created_at FROM projects \
+             WHERE id <> ? ORDER BY id DESC LIMIT ?",
+            &[
+                Value::BigInt(new_project_id),
+                Value::BigInt(
+                    i64::try_from(PROJECT_SIBLING_REFRESH_LIMIT)
+                        .expect("project sibling refresh limit fits i64"),
+                ),
+            ],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    let now = now_micros();
+    let mut inserted = 0usize;
+    for row in &other_rows {
+        if cx.checkpoint().is_err() {
+            return Outcome::Cancelled(
+                cx.cancel_reason()
+                    .unwrap_or_else(|| CancelReason::user("project sibling seeding cancelled")),
+            );
+        }
+        let other_project = match decode_project_row(row) {
+            Ok(project) => project,
+            Err(error) => return Outcome::Err(error),
+        };
+        let Some(other_project_id) = other_project.id else {
+            return Outcome::Err(DbError::Internal(
+                "project sibling seeding read a project without an id".to_string(),
+            ));
+        };
+        let (score, rationale) = project_sibling_similarity(new_project, &other_project);
+        let smaller_id = new_project_id.min(other_project_id);
+        let larger_id = new_project_id.max(other_project_id);
+        let changed = match map_sql_outcome(
+            traw_execute(
+                cx,
+                tracked,
+                "INSERT INTO project_sibling_suggestions \
+                 (project_a_id, project_b_id, score, status, rationale, \
+                  created_ts, evaluated_ts, confirmed_ts, dismissed_ts) \
+                 VALUES (?, ?, ?, 'suggested', ?, ?, ?, NULL, NULL) \
+                 ON CONFLICT(project_a_id, project_b_id) DO NOTHING",
+                &[
+                    Value::BigInt(smaller_id),
+                    Value::BigInt(larger_id),
+                    Value::Double(score),
+                    Value::Text(rationale),
+                    Value::BigInt(now),
+                    Value::BigInt(now),
+                ],
+            )
+            .await,
+        ) {
+            Outcome::Ok(changed) => changed,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        if changed > 1 {
+            return Outcome::Err(DbError::Internal(format!(
+                "project sibling seed affected {changed} rows for pair \
+                 {smaller_id},{larger_id}; expected at most one"
+            )));
+        }
+        inserted += usize::try_from(changed).expect("bounded sibling seed count fits usize");
+    }
+    Outcome::Ok(inserted)
+}
+
+const PROJECT_SIBLING_SELECT: &str = "SELECT s.id, s.status, s.score, s.rationale, s.evaluated_ts, \
+            s.confirmed_ts, s.dismissed_ts, \
+            a.id, a.slug, a.human_key, b.id, b.slug, b.human_key \
+     FROM project_sibling_suggestions AS s \
+     JOIN projects AS a ON a.id = s.project_a_id \
+     JOIN projects AS b ON b.id = s.project_b_id";
+
+fn decode_project_sibling_suggestion(
+    row: &SqlRow,
+) -> std::result::Result<ProjectSiblingSuggestion, DbError> {
+    let status_raw: String = row.get_as(1).map_err(|error| map_sql_error(&error))?;
+    Ok(ProjectSiblingSuggestion {
+        id: row.get_as(0).map_err(|error| map_sql_error(&error))?,
+        status: ProjectSiblingStatus::from_persisted(&status_raw)?,
+        score: row.get_as(2).map_err(|error| map_sql_error(&error))?,
+        rationale: row.get_as(3).map_err(|error| map_sql_error(&error))?,
+        evaluated_ts: row.get_as(4).map_err(|error| map_sql_error(&error))?,
+        confirmed_ts: row.get_as(5).map_err(|error| map_sql_error(&error))?,
+        dismissed_ts: row.get_as(6).map_err(|error| map_sql_error(&error))?,
+        project_a: ProjectSiblingPeer {
+            id: row.get_as(7).map_err(|error| map_sql_error(&error))?,
+            slug: row.get_as(8).map_err(|error| map_sql_error(&error))?,
+            human_key: row.get_as(9).map_err(|error| map_sql_error(&error))?,
+        },
+        project_b: ProjectSiblingPeer {
+            id: row.get_as(10).map_err(|error| map_sql_error(&error))?,
+            slug: row.get_as(11).map_err(|error| map_sql_error(&error))?,
+            human_key: row.get_as(12).map_err(|error| map_sql_error(&error))?,
+        },
+    })
+}
+
+/// List all sibling suggestions with their project identities.
+pub async fn list_project_sibling_suggestions(
+    cx: &Cx,
+    pool: &DbPool,
+) -> Outcome<Vec<ProjectSiblingSuggestion>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let sql = format!("{PROJECT_SIBLING_SELECT} ORDER BY s.score DESC, s.id ASC");
+    let rows = match map_sql_outcome(traw_query(cx, &tracked, &sql, &[]).await) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    let mut suggestions = Vec::with_capacity(rows.len());
+    for row in &rows {
+        match decode_project_sibling_suggestion(row) {
+            Ok(suggestion) => suggestions.push(suggestion),
+            Err(error) => return Outcome::Err(error),
+        }
+    }
+    Outcome::Ok(suggestions)
+}
+
+/// Discover or refresh a bounded set of project-sibling suggestions.
+///
+/// The refresh is a live write path. Callers serving read-only snapshots or
+/// static exports must use [`list_project_sibling_suggestions`] instead.
+/// Project and pair order are deterministic, every pair is canonical, and the
+/// whole refresh commits atomically. Existing confirmed or dismissed decisions
+/// are never reset by scoring refreshes.
+pub async fn refresh_project_sibling_suggestions(
+    cx: &Cx,
+    pool: &DbPool,
+) -> Outcome<ProjectSiblingRefreshSummary, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+
+    run_with_mvcc_retry(cx, "refresh_project_sibling_suggestions", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        if cx.checkpoint().is_err() {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Cancelled(
+                cx.cancel_reason()
+                    .unwrap_or_else(|| CancelReason::user("project sibling refresh cancelled")),
+            );
+        }
+
+        let now = now_micros();
+        let project_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, slug, human_key, created_at FROM projects \
+                     ORDER BY id ASC LIMIT ?",
+                    &[Value::BigInt(
+                        i64::try_from(PROJECT_SIBLING_PROJECT_SCAN_LIMIT)
+                            .expect("project sibling scan limit fits i64"),
+                    )],
+                )
+                .await
+            )
+        );
+        let mut projects = Vec::with_capacity(project_rows.len());
+        for row in &project_rows {
+            let project = match decode_project_row(row) {
+                Ok(project) => project,
+                Err(error) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(error);
+                }
+            };
+            if project.id.is_none() {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "project sibling refresh read a project without an id".to_string(),
+                ));
+            }
+            projects.push(project);
+        }
+        if projects.len() < 2 {
+            try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+            return Outcome::Ok(ProjectSiblingRefreshSummary::default());
+        }
+
+        let project_ids: Vec<i64> = projects.iter().filter_map(|project| project.id).collect();
+        let placeholders = vec!["?"; project_ids.len()].join(", ");
+        let existing_sql = format!(
+            "{PROJECT_SIBLING_SELECT} \
+             WHERE s.project_a_id IN ({placeholders}) \
+               AND s.project_b_id IN ({placeholders}) \
+             ORDER BY s.project_a_id ASC, s.project_b_id ASC"
+        );
+        let mut existing_params = Vec::with_capacity(project_ids.len() * 2);
+        existing_params.extend(project_ids.iter().copied().map(Value::BigInt));
+        existing_params.extend(project_ids.iter().copied().map(Value::BigInt));
+        let existing_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &existing_sql, &existing_params).await)
+        );
+        let mut existing_map = HashMap::with_capacity(existing_rows.len());
+        for row in &existing_rows {
+            let suggestion = match decode_project_sibling_suggestion(row) {
+                Ok(suggestion) => suggestion,
+                Err(error) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(error);
+                }
+            };
+            let pair = (
+                suggestion.project_a.id.min(suggestion.project_b.id),
+                suggestion.project_a.id.max(suggestion.project_b.id),
+            );
+            if existing_map.insert(pair, suggestion).is_some() {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "multiple project sibling suggestions represent canonical pair {},{}",
+                    pair.0, pair.1
+                )));
+            }
+        }
+
+        let mut candidates = Vec::with_capacity(PROJECT_SIBLING_REFRESH_LIMIT);
+        'project_pairs: for (left_index, left_project) in projects.iter().enumerate() {
+            for right_project in &projects[left_index + 1..] {
+                if candidates.len() >= PROJECT_SIBLING_REFRESH_LIMIT {
+                    break 'project_pairs;
+                }
+                if left_project.human_key == right_project.human_key {
+                    continue;
+                }
+                let left_id = left_project.id.expect("validated project id");
+                let right_id = right_project.id.expect("validated project id");
+                let pair = (left_id.min(right_id), left_id.max(right_id));
+                let existing = existing_map.get(&pair);
+                if !project_sibling_needs_refresh(existing, now) {
+                    continue;
+                }
+                candidates.push(ProjectSiblingRefreshCandidate {
+                    left_project: left_project.clone(),
+                    right_project: right_project.clone(),
+                    existing: existing.cloned(),
+                });
+            }
+        }
+
+        if candidates.is_empty() {
+            try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+            return Outcome::Ok(ProjectSiblingRefreshSummary::default());
+        }
+
+        let mut summary = ProjectSiblingRefreshSummary {
+            evaluated: candidates.len(),
+            ..ProjectSiblingRefreshSummary::default()
+        };
+        for candidate in candidates {
+            if cx.checkpoint().is_err() {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Cancelled(
+                    cx.cancel_reason()
+                        .unwrap_or_else(|| CancelReason::user("project sibling refresh cancelled")),
+                );
+            }
+            let (score, rationale) =
+                project_sibling_similarity(&candidate.left_project, &candidate.right_project);
+            let left_id = candidate.left_project.id.expect("validated project id");
+            let right_id = candidate.right_project.id.expect("validated project id");
+            let smaller_id = left_id.min(right_id);
+            let larger_id = left_id.max(right_id);
+
+            let changed = if let Some(existing) = candidate.existing {
+                let changed = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(
+                        traw_execute(
+                            cx,
+                            &tracked,
+                            "UPDATE project_sibling_suggestions \
+                             SET project_a_id = ?, project_b_id = ?, score = ?, \
+                                 rationale = ?, evaluated_ts = ? \
+                             WHERE id = ?",
+                            &[
+                                Value::BigInt(smaller_id),
+                                Value::BigInt(larger_id),
+                                Value::Double(score),
+                                Value::Text(rationale),
+                                Value::BigInt(now),
+                                Value::BigInt(existing.id),
+                            ],
+                        )
+                        .await
+                    )
+                );
+                summary.refreshed += 1;
+                changed
+            } else {
+                let changed = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(
+                        traw_execute(
+                            cx,
+                            &tracked,
+                            "INSERT INTO project_sibling_suggestions \
+                             (project_a_id, project_b_id, score, status, rationale, \
+                              created_ts, evaluated_ts, confirmed_ts, dismissed_ts) \
+                             VALUES (?, ?, ?, 'suggested', ?, ?, ?, NULL, NULL)",
+                            &[
+                                Value::BigInt(smaller_id),
+                                Value::BigInt(larger_id),
+                                Value::Double(score),
+                                Value::Text(rationale),
+                                Value::BigInt(now),
+                                Value::BigInt(now),
+                            ],
+                        )
+                        .await
+                    )
+                );
+                summary.inserted += 1;
+                changed
+            };
+            if changed != 1 {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "project sibling refresh affected {changed} rows for pair \
+                     {smaller_id},{larger_id}; expected exactly one"
+                )));
+            }
+        }
+
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(summary)
+    })
+    .await
+}
+
+/// Atomically transition an existing sibling suggestion to a new review state.
+///
+/// Project pairs are canonicalized so callers may supply either orientation.
+/// Resetting to `suggested` clears both prior-decision timestamps.
+pub async fn update_project_sibling_status(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    other_id: i64,
+    status: ProjectSiblingStatus,
+) -> Outcome<ProjectSiblingSuggestion, DbError> {
+    if project_id <= 0 || other_id <= 0 {
+        return Outcome::Err(DbError::invalid(
+            "project_id",
+            "Project identifiers must be positive integers",
+        ));
+    }
+    if project_id == other_id {
+        return Outcome::Err(DbError::invalid(
+            "other_id",
+            "A project cannot be its own sibling",
+        ));
+    }
+
+    let (smaller_id, larger_id) = if project_id < other_id {
+        (project_id, other_id)
+    } else {
+        (other_id, project_id)
+    };
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+
+    run_with_mvcc_retry(cx, "update_project_sibling_status", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        // Timestamp each whole-transaction attempt once it owns the write
+        // lock. A contended request can spend seconds in the retry loop;
+        // recording its pre-wait time would make the audit trail misleading.
+        let now = now_micros();
+        let confirmed_ts = if status == ProjectSiblingStatus::Confirmed {
+            Value::BigInt(now)
+        } else {
+            Value::Null
+        };
+        let dismissed_ts = if status == ProjectSiblingStatus::Dismissed {
+            Value::BigInt(now)
+        } else {
+            Value::Null
+        };
+
+        let project_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT COUNT(*) FROM projects WHERE id IN (?, ?)",
+                    &[Value::BigInt(smaller_id), Value::BigInt(larger_id)],
+                )
+                .await
+            )
+        );
+        let project_count = project_rows
+            .first()
+            .and_then(row_first_i64)
+            .unwrap_or_default();
+        if project_count != 2 {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found(
+                "Project pair",
+                format!("{smaller_id},{larger_id}"),
+            ));
+        }
+
+        let select_sql = format!(
+            "{PROJECT_SIBLING_SELECT} WHERE s.project_a_id = ? AND s.project_b_id = ? LIMIT 1"
+        );
+        let select_params = [Value::BigInt(smaller_id), Value::BigInt(larger_id)];
+        let existing_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &select_sql, &select_params).await)
+        );
+        let Some(existing_row) = existing_rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found(
+                "Project sibling suggestion",
+                format!("{smaller_id},{larger_id}"),
+            ));
+        };
+        let existing = match decode_project_sibling_suggestion(existing_row) {
+            Ok(suggestion) => suggestion,
+            Err(error) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(error);
+            }
+        };
+        if existing.status == status && existing.decision_timestamps_match_status() {
+            try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+            return Outcome::Ok(existing);
+        }
+
+        let update_params = [
+            Value::Text(status.as_str().to_string()),
+            Value::BigInt(now),
+            confirmed_ts.clone(),
+            dismissed_ts.clone(),
+            Value::BigInt(smaller_id),
+            Value::BigInt(larger_id),
+        ];
+        let changed = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "UPDATE project_sibling_suggestions \
+                     SET status = ?, evaluated_ts = ?, confirmed_ts = ?, dismissed_ts = ? \
+                     WHERE project_a_id = ? AND project_b_id = ?",
+                    &update_params,
+                )
+                .await
+            )
+        );
+        if changed != 1 {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(format!(
+                "sibling suggestion transition affected {changed} rows; expected exactly one"
+            )));
+        }
+
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &select_sql, &select_params).await)
+        );
+        let Some(row) = rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(
+                "sibling suggestion update succeeded but re-select failed".to_string(),
+            ));
+        };
+        let suggestion = match decode_project_sibling_suggestion(row) {
+            Ok(suggestion) => suggestion,
+            Err(error) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(error);
+            }
+        };
+
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(suggestion)
+    })
+    .await
+}
+
 // =============================================================================
 // Database generation identity (br-n8qh6)
 // =============================================================================
@@ -4656,6 +5750,14 @@ pub async fn register_agent(
             format!("Invalid agent name '{name}'. Must be adjective+noun format"),
         ));
     }
+    if task_description
+        .is_some_and(crate::models::task_description_uses_reserved_deregistered_prefix)
+    {
+        return Outcome::Err(DbError::invalid(
+            "task_description",
+            "task description uses the reserved deregistration tombstone prefix",
+        ));
+    }
     let now = now_micros();
     let (provisional, durable) = {
         let conn = match acquire_conn(cx, pool).await {
@@ -4680,7 +5782,7 @@ pub async fn register_agent(
                 );
                 let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                                  inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                                 registration_token \
+                                 registration_token, retired_at \
                                  FROM agents \
                                  WHERE project_id = ? AND name = ? COLLATE NOCASE \
                                  ORDER BY id ASC LIMIT 1";
@@ -4692,6 +5794,23 @@ pub async fn register_agent(
                 )
                 .first()
                 .map(decode_agent_row_indexed);
+
+                if let Some(existing_id) = existing.as_ref().and_then(|agent| agent.id)
+                    && try_in_tx!(
+                        cx,
+                        &tracked,
+                        get_agent_deregistered_at_in_tx(cx, &tracked, existing_id).await
+                    )
+                    .is_some()
+                {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::invalid(
+                        "agent_deregistered",
+                        format!(
+                            "Agent '{name}' was deregistered and cannot be re-registered; create a new identity"
+                        ),
+                    ));
+                }
 
                 // Retain the canonical stored spelling when an older database lacks
                 // the NOCASE unique index.  Otherwise a case-only re-registration
@@ -4855,6 +5974,14 @@ pub async fn create_agent(
             format!("Invalid agent name '{name}'. Must be adjective+noun format"),
         ));
     }
+    if task_description
+        .is_some_and(crate::models::task_description_uses_reserved_deregistered_prefix)
+    {
+        return Outcome::Err(DbError::invalid(
+            "task_description",
+            "task description uses the reserved deregistration tombstone prefix",
+        ));
+    }
     let now = now_micros();
     let (provisional, durable) = {
         let conn = match acquire_conn(cx, pool).await {
@@ -4875,7 +6002,7 @@ pub async fn create_agent(
             // resolves; see the get_agent note for the full rationale.
             let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                              inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                             registration_token \
+                             registration_token, retired_at \
                              FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                              ORDER BY id ASC LIMIT 1";
             let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -5057,7 +6184,7 @@ pub async fn get_agent(
     // and release then always resolve to the same row.
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token \
+               registration_token, retired_at \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                ORDER BY id ASC LIMIT 1";
     let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -5097,7 +6224,7 @@ pub async fn get_agent_by_id(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<A
     // Use raw SQL with explicit column order to avoid ORM decoding issues
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token \
+               registration_token, retired_at \
                FROM agents WHERE id = ? LIMIT 1";
     let params = [Value::BigInt(agent_id)];
 
@@ -5136,7 +6263,7 @@ pub async fn get_agent_by_id_fresh(
 
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token \
+               registration_token, retired_at \
                FROM agents WHERE id = ? LIMIT 1";
     let params = [Value::BigInt(agent_id)];
 
@@ -5184,7 +6311,9 @@ pub async fn list_atc_population_snapshot(
     let sql = "SELECT p.id, p.human_key, a.name, a.program, a.last_active_ts \
                FROM agents AS a \
                JOIN projects AS p ON p.id = a.project_id \
-               WHERE a.last_active_ts <= 0 OR a.last_active_ts >= ? \
+               WHERE (a.last_active_ts <= 0 OR a.last_active_ts >= ?) \
+                 AND a.retired_at IS NULL \
+                 AND a.id NOT IN (SELECT agent_id FROM agent_deregistrations) \
                ORDER BY a.last_active_ts DESC, a.id DESC \
                LIMIT ?";
     let params = [Value::BigInt(min_last_active_ts), Value::BigInt(limit)];
@@ -5242,6 +6371,28 @@ pub async fn list_agents_bounded(
     min_last_active_ts: Option<i64>,
     limit: Option<usize>,
 ) -> Outcome<Vec<AgentRow>, DbError> {
+    list_agents_bounded_inner(cx, pool, project_id, min_last_active_ts, limit, false).await
+}
+
+/// List only active agents, applying the result cap after lifecycle filtering.
+pub async fn list_active_agents_bounded(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    min_last_active_ts: Option<i64>,
+    limit: Option<usize>,
+) -> Outcome<Vec<AgentRow>, DbError> {
+    list_agents_bounded_inner(cx, pool, project_id, min_last_active_ts, limit, true).await
+}
+
+async fn list_agents_bounded_inner(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    min_last_active_ts: Option<i64>,
+    limit: Option<usize>,
+    active_only: bool,
+) -> Outcome<Vec<AgentRow>, DbError> {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -5255,9 +6406,13 @@ pub async fn list_agents_bounded(
     // Keep this as a simple ordered scan: startup/TUI paths call this often,
     // and case-insensitive de-duplication is cheap in Rust while avoiding a
     // FrankenSQLite window-function dependency during mailbox recovery.
+    // Read every historical row before lifecycle filtering. Older databases
+    // can contain case-variant duplicates; `get_agent` routes through the
+    // lowest-id canonical row, so filtering first could expose a newer active
+    // duplicate while sends resolve to a retired canonical identity.
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token \
+               registration_token, retired_at \
                FROM agents \
                WHERE project_id = ? \
                ORDER BY last_active_ts DESC, id DESC";
@@ -5266,6 +6421,56 @@ pub async fn list_agents_bounded(
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
         Outcome::Ok(rows) => {
             let mut agents: Vec<AgentRow> = rows.iter().map(decode_agent_row_indexed).collect();
+            if active_only {
+                let deregistered_rows = match map_sql_outcome(
+                    traw_query(
+                        cx,
+                        &tracked,
+                        "SELECT d.agent_id \
+                         FROM agent_deregistrations d \
+                         JOIN agents a ON a.id = d.agent_id \
+                         WHERE a.project_id = ?",
+                        &params,
+                    )
+                    .await,
+                ) {
+                    Outcome::Ok(rows) => rows,
+                    Outcome::Err(error) => return Outcome::Err(error),
+                    Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                    Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+                };
+                let deregistered_ids: HashSet<i64> =
+                    deregistered_rows.iter().filter_map(row_first_i64).collect();
+
+                // Canonicalize case variants exactly like `get_agent` before
+                // evaluating lifecycle state.
+                agents.sort_by_key(|agent| agent.id.unwrap_or(i64::MAX));
+                let mut seen_names = HashSet::new();
+                agents.retain(|agent| seen_names.insert(agent.name.to_ascii_lowercase()));
+                agents.retain(|agent| {
+                    agent.retired_at.is_none()
+                        && agent
+                            .id
+                            .is_none_or(|agent_id| !deregistered_ids.contains(&agent_id))
+                });
+            } else {
+                agents.sort_by(|left, right| {
+                    right
+                        .last_active_ts
+                        .cmp(&left.last_active_ts)
+                        .then_with(|| {
+                            right
+                                .id
+                                .unwrap_or_default()
+                                .cmp(&left.id.unwrap_or_default())
+                        })
+                });
+                let mut seen_names = HashSet::new();
+                agents.retain(|agent| seen_names.insert(agent.name.to_ascii_lowercase()));
+            }
+
+            // Lifecycle canonicalization above sorts by id; restore the public
+            // most-recently-active ordering before applying floor and cap.
             agents.sort_by(|left, right| {
                 right
                     .last_active_ts
@@ -5277,9 +6482,6 @@ pub async fn list_agents_bounded(
                             .cmp(&left.id.unwrap_or_default())
                     })
             });
-
-            let mut seen_names = HashSet::new();
-            agents.retain(|agent| seen_names.insert(agent.name.to_ascii_lowercase()));
 
             if let Some(floor) = min_last_active_ts {
                 agents.retain(|agent| agent.last_active_ts >= floor);
@@ -5337,7 +6539,7 @@ pub async fn get_agents_by_ids(
         let sql = format!(
             "SELECT id, project_id, name, program, model, task_description, \
              inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-             registration_token \
+             registration_token, retired_at \
              FROM agents WHERE id IN ({placeholders})"
         );
 
@@ -5626,6 +6828,20 @@ pub async fn set_agent_contact_policy(
     let agent = match run_with_mvcc_retry(cx, "set_agent_contact_policy", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
+        if try_in_tx!(
+            cx,
+            &tracked,
+            get_agent_deregistered_at_in_tx(cx, &tracked, agent_id).await
+        )
+        .is_some()
+        {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::invalid(
+                "agent_deregistered",
+                "deregistered agents cannot change contact policy",
+            ));
+        }
+
         let now = now_micros();
         let sql = "UPDATE agents SET contact_policy = ?, last_active_ts = ? WHERE id = ?";
         let params = [
@@ -5643,7 +6859,7 @@ pub async fn set_agent_contact_policy(
         // Fetch updated agent using raw SQL with explicit column order.
         let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                          inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                         registration_token \
+                         registration_token, retired_at \
                          FROM agents WHERE id = ? LIMIT 1";
         let fetch_params = [Value::BigInt(agent_id)];
         let rows = try_in_tx!(
@@ -5667,6 +6883,290 @@ pub async fn set_agent_contact_policy(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
     crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &agent);
+    Outcome::Ok(agent)
+}
+
+async fn get_agent_deregistered_at_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    agent_id: i64,
+) -> Outcome<Option<i64>, DbError> {
+    match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT deregistered_at FROM agent_deregistrations WHERE agent_id = ? LIMIT 1",
+            &[Value::BigInt(agent_id)],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => Outcome::Ok(rows.first().and_then(row_first_i64)),
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+/// Return the explicit deregistration timestamp for an agent, if present.
+pub async fn get_agent_deregistered_at(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+) -> Outcome<Option<i64>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    get_agent_deregistered_at_in_tx(cx, &tracked(&*conn), agent_id).await
+}
+
+/// Return the ids of deregistered agents in one project.
+pub async fn list_deregistered_agent_ids(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+) -> Outcome<HashSet<i64>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    match map_sql_outcome(
+        traw_query(
+            cx,
+            &tracked(&*conn),
+            "SELECT d.agent_id \
+             FROM agent_deregistrations d \
+             JOIN agents a ON a.id = d.agent_id \
+             WHERE a.project_id = ?",
+            &[Value::BigInt(project_id)],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => Outcome::Ok(rows.iter().filter_map(row_first_i64).collect()),
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+/// Set or clear an agent's retirement timestamp.
+pub async fn set_agent_retired_at(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+    retired_at: Option<i64>,
+) -> Outcome<AgentRow, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let agent = match run_with_mvcc_retry(cx, "set_agent_retired_at", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        if try_in_tx!(
+            cx,
+            &tracked,
+            get_agent_deregistered_at_in_tx(cx, &tracked, agent_id).await
+        )
+        .is_some()
+        {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::invalid(
+                "agent_deregistered",
+                "deregistered agents cannot change retirement state",
+            ));
+        }
+
+        // Retiring is idempotent at the mutation boundary, not merely in the
+        // caller's preceding read. Two concurrent retire requests can both
+        // observe an active row; COALESCE ensures whichever transaction wins
+        // first owns the durable retirement timestamp. Clearing retirement is
+        // an explicit transition and therefore writes NULL unconditionally.
+        let (sql, params) = retired_at.map_or_else(
+            || {
+                (
+                    "UPDATE agents SET retired_at = NULL WHERE id = ?",
+                    vec![Value::BigInt(agent_id)],
+                )
+            },
+            |timestamp| {
+                (
+                    "UPDATE agents SET retired_at = COALESCE(retired_at, ?) WHERE id = ?",
+                    vec![Value::BigInt(timestamp), Value::BigInt(agent_id)],
+                )
+            },
+        );
+        let affected = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+        );
+        if affected == 0 {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        }
+
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, project_id, name, program, model, task_description, \
+                     inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                     registration_token, retired_at \
+                     FROM agents WHERE id = ? LIMIT 1",
+                    &[Value::BigInt(agent_id)],
+                )
+                .await
+            )
+        );
+        let Some(row) = rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        };
+        let agent = decode_agent_row_indexed(row);
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(agent)
+    })
+    .await
+    {
+        Outcome::Ok(agent) => agent,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    let cache = crate::cache::read_cache();
+    let scope = cache_scope_for_pool(pool);
+    cache.invalidate_agent_scoped(&scope, agent.project_id, &agent.name, agent.id);
+    cache.put_agent_scoped(&scope, &agent);
+    Outcome::Ok(agent)
+}
+
+/// Mark an agent deregistered while preserving its row, reservations, and message history.
+pub async fn deregister_agent(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+    deregistered_at: i64,
+) -> Outcome<AgentRow, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let agent = match run_with_mvcc_retry(cx, "deregister_agent", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, project_id, name, program, model, task_description, \
+                     inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                     registration_token, retired_at \
+                     FROM agents WHERE id = ? LIMIT 1",
+                    &[Value::BigInt(agent_id)],
+                )
+                .await
+            )
+        );
+        let Some(current) = rows.first().map(decode_agent_row_indexed) else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        };
+
+        if try_in_tx!(
+            cx,
+            &tracked,
+            get_agent_deregistered_at_in_tx(cx, &tracked, agent_id).await
+        )
+        .is_some()
+        {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Ok(current);
+        }
+
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (?, ?)",
+                    &[Value::BigInt(agent_id), Value::BigInt(deregistered_at)],
+                )
+                .await
+            )
+        );
+
+        let tombstone = format!("[DEREGISTERED {}] ", crate::micros_to_iso(deregistered_at));
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "UPDATE agents SET contact_policy = 'block_all', \
+                     task_description = ? || task_description WHERE id = ?",
+                    &[Value::Text(tombstone), Value::BigInt(agent_id)],
+                )
+                .await
+            )
+        );
+
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, project_id, name, program, model, task_description, \
+                     inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                     registration_token, retired_at \
+                     FROM agents WHERE id = ? LIMIT 1",
+                    &[Value::BigInt(agent_id)],
+                )
+                .await
+            )
+        );
+        let Some(row) = rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        };
+        let agent = decode_agent_row_indexed(row);
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(agent)
+    })
+    .await
+    {
+        Outcome::Ok(agent) => agent,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    let cache = crate::cache::read_cache();
+    let scope = cache_scope_for_pool(pool);
+    cache.invalidate_agent_scoped(&scope, agent.project_id, &agent.name, agent.id);
+    cache.put_agent_scoped(&scope, &agent);
     Outcome::Ok(agent)
 }
 
@@ -5704,7 +7204,7 @@ pub async fn set_agent_contact_policy_by_name(
         // case-variant duplicates exist.
         let current_sql = "SELECT id, project_id, name, program, model, task_description, \
                            inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                           registration_token \
+                           registration_token, retired_at \
                            FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                            ORDER BY id ASC LIMIT 1";
         let current_params = [
@@ -5729,6 +7229,19 @@ pub async fn set_agent_contact_policy_by_name(
                 "policy update lookup returned agent without id for {project_id}:{normalized_name}"
             )));
         };
+        if try_in_tx!(
+            cx,
+            &tracked,
+            get_agent_deregistered_at_in_tx(cx, &tracked, current_id).await
+        )
+        .is_some()
+        {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::invalid(
+                "agent_deregistered",
+                "deregistered agents cannot change contact policy",
+            ));
+        }
 
         let sql = "UPDATE agents SET contact_policy = ?, last_active_ts = ? WHERE id = ?";
         let params = [
@@ -5745,7 +7258,7 @@ pub async fn set_agent_contact_policy_by_name(
 
         let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                          inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                         registration_token \
+                         registration_token, retired_at \
                          FROM agents WHERE id = ? LIMIT 1";
         let fetch_params = [Value::BigInt(current_id)];
         let rows = try_in_tx!(
@@ -5784,6 +7297,7 @@ pub struct ThreadMessageRow {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub body_md: String,
     pub importance: String,
@@ -6023,19 +7537,22 @@ pub async fn create_message(
     // rationale) and insert it explicitly, so it can never be re-issued even
     // when the live SQLite's durable AUTOINCREMENT fails to advance.
     let id_allocator = pool.message_id_allocator();
-    let archive_seed = if id_allocator.needs_archive_seed() {
-        id_allocator.mark_archive_seeded();
-        crate::id_floor::max_message_id_in_archive(pool.storage_root()).unwrap_or(0)
-    } else {
-        0
-    };
     let db_floor = match read_messages_id_floor(cx, &tracked).await {
         Outcome::Ok(floor) => floor,
         Outcome::Err(e) => return Outcome::Err(e),
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
-    let message_id = id_allocator.allocate(db_floor, archive_seed);
+    let storage_root = match pool.validated_storage_root("message creation archive allocator") {
+        Ok(storage_root) => storage_root,
+        Err(error) => return Outcome::Err(error),
+    };
+    let message_id = match id_allocator.allocate(cx, db_floor, storage_root).await {
+        Outcome::Ok(id) => id,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
 
     let row = match run_with_mvcc_retry(cx, "create_message", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
@@ -6068,6 +7585,7 @@ pub async fn create_message(
             project_id,
             sender_id,
             thread_id: thread_id.map(String::from),
+            topic: None,
             subject: subject.to_string(),
             body_md: body_md.to_string(),
             importance: importance.to_string(),
@@ -6137,12 +7655,13 @@ fn index_created_message_best_effort(
 }
 
 /// Read the messages-table allocator floor: the larger of `MAX(id)` and the
-/// `sqlite_sequence` row for `messages`.
+/// maximum `sqlite_sequence` row for `messages`.
 ///
 /// Used to seed/advance the process-wide [`MessageIdAllocator`](crate::id_floor::MessageIdAllocator)
-/// (mcp_agent_mail#176). A missing `sqlite_sequence` row (or table, on a
-/// brand-new database) is treated as `0` so it can never block message
-/// creation.
+/// (mcp_agent_mail#176). A missing `sqlite_sequence` row is represented by the
+/// aggregate as `0`; a missing table, query failure, cancellation, panic, or
+/// malformed aggregate result is propagated rather than silently publishing a
+/// lower allocator floor.
 async fn read_messages_id_floor(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<i64, DbError> {
     // This read runs OUTSIDE the caller's retried write transaction, and the
     // fsqlite 0.3.4 registry engine can answer a bare read with
@@ -6150,38 +7669,50 @@ async fn read_messages_id_floor(cx: &Cx, tracked: &TrackedConnection<'_>) -> Out
     // pre-registry engine never surfaced busy on this path). Give it the same
     // bounded contention retry the write body gets, so a transient busy here
     // cannot fail message creation before the transaction even begins.
-    let db_max = match run_with_mvcc_retry(cx, "read_messages_id_floor", || async {
+    let outcome = run_with_mvcc_retry(cx, "read_messages_id_floor", || async {
         map_sql_outcome(
             traw_query(
                 cx,
                 tracked,
-                "SELECT COALESCE(MAX(id), 0) AS v FROM messages",
+                "SELECT MAX(v) AS v FROM (\
+                    SELECT COALESCE(MAX(id), 0) AS v FROM messages \
+                    UNION ALL \
+                    SELECT COALESCE(MAX(seq), 0) AS v \
+                      FROM sqlite_sequence WHERE name = 'messages'\
+                 )",
                 &[],
             )
             .await,
         )
     })
-    .await
-    {
-        Outcome::Ok(rows) => rows.first().and_then(row_first_i64).unwrap_or(0),
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    .await;
+    decode_messages_id_floor_outcome(outcome)
+}
+
+fn decode_messages_id_floor_outcome(
+    outcome: Outcome<Vec<SqlRow>, DbError>,
+) -> Outcome<i64, DbError> {
+    let rows = match outcome {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
-    let seq_val = match map_sql_outcome(
-        traw_query(
-            cx,
-            tracked,
-            "SELECT COALESCE(seq, 0) AS v FROM sqlite_sequence WHERE name = 'messages'",
-            &[],
-        )
-        .await,
-    ) {
-        Outcome::Ok(rows) => rows.first().and_then(row_first_i64).unwrap_or(0),
-        // sqlite_sequence may be absent on a fresh DB; not an error here.
-        Outcome::Err(_) | Outcome::Cancelled(_) | Outcome::Panicked(_) => 0,
-    };
-    Outcome::Ok(db_max.max(seq_val))
+    if rows.len() != 1 {
+        return Outcome::Err(DbError::Internal(format!(
+            "read_messages_id_floor: aggregate returned {} rows instead of exactly one",
+            rows.len()
+        )));
+    }
+    match rows.first().and_then(row_first_i64) {
+        Some(floor) if floor >= 0 => Outcome::Ok(floor),
+        Some(floor) => Outcome::Err(DbError::Internal(format!(
+            "read_messages_id_floor: aggregate returned negative floor {floor}"
+        ))),
+        None => Outcome::Err(DbError::Internal(
+            "read_messages_id_floor: aggregate row did not contain an i64 floor".to_string(),
+        )),
+    }
 }
 
 /// Create a message AND insert all recipients in a single `SQLite` transaction.
@@ -6206,6 +7737,39 @@ pub async fn create_message_with_recipients(
     attachments: &str,
     recipients: &[(i64, &str)], // (agent_id, kind)
 ) -> Outcome<MessageRow, DbError> {
+    create_message_with_recipients_topic(
+        cx,
+        pool,
+        project_id,
+        sender_id,
+        subject,
+        body_md,
+        thread_id,
+        None,
+        importance,
+        ack_required,
+        attachments,
+        recipients,
+    )
+    .await
+}
+
+/// Create a message with an optional topic and all recipients atomically.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_message_with_recipients_topic(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    sender_id: i64,
+    subject: &str,
+    body_md: &str,
+    thread_id: Option<&str>,
+    topic: Option<&str>,
+    importance: &str,
+    ack_required: bool,
+    attachments: &str,
+    recipients: &[(i64, &str)],
+) -> Outcome<MessageRow, DbError> {
     match create_message_with_recipients_impl(
         cx,
         pool,
@@ -6214,6 +7778,7 @@ pub async fn create_message_with_recipients(
         subject,
         body_md,
         thread_id,
+        topic,
         importance,
         ack_required,
         attachments,
@@ -6262,6 +7827,41 @@ pub async fn create_message_with_recipients_idempotent(
     recipients: &[(i64, &str)],
     claim: IdempotencyClaim<'_>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
+    create_message_with_recipients_idempotent_topic(
+        cx,
+        pool,
+        project_id,
+        sender_id,
+        subject,
+        body_md,
+        thread_id,
+        None,
+        importance,
+        ack_required,
+        attachments,
+        recipients,
+        claim,
+    )
+    .await
+}
+
+/// Idempotent topic-aware variant of [`create_message_with_recipients_topic`].
+#[allow(clippy::too_many_arguments)]
+pub async fn create_message_with_recipients_idempotent_topic(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    sender_id: i64,
+    subject: &str,
+    body_md: &str,
+    thread_id: Option<&str>,
+    topic: Option<&str>,
+    importance: &str,
+    ack_required: bool,
+    attachments: &str,
+    recipients: &[(i64, &str)],
+    claim: IdempotencyClaim<'_>,
+) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
     create_message_with_recipients_impl(
         cx,
         pool,
@@ -6270,6 +7870,7 @@ pub async fn create_message_with_recipients_idempotent(
         subject,
         body_md,
         thread_id,
+        topic,
         importance,
         ack_required,
         attachments,
@@ -6288,6 +7889,7 @@ async fn create_message_with_recipients_impl(
     subject: &str,
     body_md: &str,
     thread_id: Option<&str>,
+    topic: Option<&str>,
     importance: &str,
     ack_required: bool,
     attachments: &str,
@@ -6360,19 +7962,22 @@ async fn create_message_with_recipients_impl(
         // MESSAGE_WRITE_SERIALIZER) so MVCC retries of the transaction reuse a
         // stable id.
         let id_allocator = pool.message_id_allocator();
-        let archive_seed = if id_allocator.needs_archive_seed() {
-            id_allocator.mark_archive_seeded();
-            crate::id_floor::max_message_id_in_archive(pool.storage_root()).unwrap_or(0)
-        } else {
-            0
-        };
         let db_floor = match read_messages_id_floor(cx, &tracked).await {
             Outcome::Ok(floor) => floor,
             Outcome::Err(e) => return Outcome::Err(e),
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
-        let message_id = id_allocator.allocate(db_floor, archive_seed);
+        let storage_root = match pool.validated_storage_root("message creation archive allocator") {
+            Ok(storage_root) => storage_root,
+            Err(error) => return Outcome::Err(error),
+        };
+        let message_id = match id_allocator.allocate(cx, db_floor, storage_root).await {
+            Outcome::Ok(id) => id,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
 
         let created_outcome =
             match run_with_mvcc_retry(cx, "create_message_with_recipients", || {
@@ -6384,6 +7989,7 @@ async fn create_message_with_recipients_impl(
                     subject,
                     body_md,
                     thread_id,
+                    topic,
                     importance,
                     ack_required,
                     attachments,
@@ -6544,6 +8150,88 @@ async fn create_message_with_recipients_impl(
     Outcome::Ok(IdempotentOutcome::Fresh(row))
 }
 
+/// Revalidate sender and recipients inside the message transaction.
+///
+/// Lifecycle writes touch the same agent rows or deregistration ledger, so a
+/// concurrent retire/deregister either becomes visible here or conflicts with
+/// this transaction and the outer MVCC retry observes the new state.
+async fn ensure_message_participants_active_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    sender_id: i64,
+    recipients: &[(i64, &str)],
+) -> Outcome<(), DbError> {
+    let mut participant_ids = Vec::with_capacity(recipients.len().saturating_add(1));
+    participant_ids.push(sender_id);
+    for &(agent_id, _) in recipients {
+        if !participant_ids.contains(&agent_id) {
+            participant_ids.push(agent_id);
+        }
+    }
+
+    let mut states: HashMap<i64, (String, Option<i64>, Option<i64>)> = HashMap::new();
+    for chunk in participant_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let sql = format!(
+            "SELECT a.id, a.name, a.retired_at, d.deregistered_at \
+             FROM agents a \
+             LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
+             WHERE a.id IN ({})",
+            placeholders(chunk.len())
+        );
+        let params: Vec<Value> = chunk.iter().copied().map(Value::BigInt).collect();
+        let rows = match map_sql_outcome(traw_query(cx, tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        for row in &rows {
+            let Some(agent_id) = row.get(0).and_then(value_as_i64) else {
+                continue;
+            };
+            let name = row
+                .get(1)
+                .and_then(|value| match value {
+                    Value::Text(name) => Some(name.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| format!("agent-{agent_id}"));
+            states.insert(
+                agent_id,
+                (
+                    name,
+                    row.get(2).and_then(value_as_i64),
+                    row.get(3).and_then(value_as_i64),
+                ),
+            );
+        }
+    }
+
+    for agent_id in participant_ids {
+        let Some((name, retired_at, deregistered_at)) = states.remove(&agent_id) else {
+            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        };
+        if let Some(timestamp) = deregistered_at {
+            return Outcome::Err(DbError::invalid(
+                "agent_deregistered",
+                format!("Agent '{name}' was deregistered at {timestamp}"),
+            ));
+        }
+        if let Some(timestamp) = retired_at {
+            return Outcome::Err(DbError::invalid(
+                "agent_retired",
+                format!("Agent '{name}' was retired at {timestamp}"),
+            ));
+        }
+    }
+
+    Outcome::Ok(())
+}
+
+const INSERT_MESSAGE_RECIPIENT_SQL: &str = "INSERT INTO message_recipients \
+    (message_id, agent_id, kind, read_ts, ack_ts) \
+    VALUES (?, ?, ?, NULL, NULL) ON CONFLICT DO NOTHING";
+
 /// Inner transaction body for [`create_message_with_recipients`].
 ///
 /// Runs BEGIN CONCURRENT → INSERT message → INSERT recipients → COMMIT.
@@ -6557,6 +8245,7 @@ async fn create_message_with_recipients_tx(
     subject: &str,
     body_md: &str,
     thread_id: Option<&str>,
+    topic: Option<&str>,
     importance: &str,
     ack_required: bool,
     attachments: &str,
@@ -6606,6 +8295,12 @@ async fn create_message_with_recipients_tx(
             }
         }
     }
+
+    try_in_tx!(
+        cx,
+        tracked,
+        ensure_message_participants_active_in_tx(cx, tracked, sender_id, recipients).await
+    );
 
     // Fetch recipient names to build recipients_json
     let mut to_names = Vec::new();
@@ -6657,13 +8352,14 @@ async fn create_message_with_recipients_tx(
     // engine state. (Inserting an explicit id > the current sequence also
     // advances `sqlite_sequence`, keeping any non-explicit path consistent.)
     let sql = "INSERT INTO messages \
-               (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+               (id, project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     let params = [
         Value::BigInt(message_id),
         Value::BigInt(project_id),
         Value::BigInt(sender_id),
         thread_id.map_or_else(|| Value::Null, |t| Value::Text(t.to_string())),
+        topic.map_or_else(|| Value::Null, |value| Value::Text(value.to_string())),
         Value::Text(subject.to_string()),
         Value::Text(body_md.to_string()),
         Value::Text(importance.to_string()),
@@ -6684,6 +8380,7 @@ async fn create_message_with_recipients_tx(
         project_id,
         sender_id,
         thread_id: thread_id.map(String::from),
+        topic: topic.map(String::from),
         subject: subject.to_string(),
         body_md: body_md.to_string(),
         importance: importance.to_string(),
@@ -6697,22 +8394,23 @@ async fn create_message_with_recipients_tx(
     // This avoids a known multi-row INSERT + trigger path that can surface
     // spurious PRIMARY KEY conflicts in the franken sqlite engine.
     //
-    // `ON CONFLICT(message_id, agent_id) DO NOTHING` makes a re-driven insert
-    // idempotent (see #243 Bug 2): under busy/MVCC retry a partial re-drive of
-    // the recipient loop must not fail with a UNIQUE-constraint error that gets
-    // surfaced as a false `isError` after the message + all distinct recipients
-    // were already persisted. The caller de-duplicates recipient ids before this
-    // runs, so a genuinely-distinct recipient is never silently dropped; the
-    // post-commit visibility probe still verifies every distinct recipient is
-    // present, so a swallowed engine quirk cannot hide a missing row.
-    let insert_recipient_sql = "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (?, ?, ?, NULL, NULL) ON CONFLICT(message_id, agent_id) DO NOTHING";
+    // Targetless `ON CONFLICT DO NOTHING` makes a re-driven insert idempotent
+    // under both admitted primary-key shapes: current databases key on
+    // (message_id, agent_id), while legacy Python databases may also include
+    // kind. Naming only the current key makes SQLite reject the statement
+    // before insertion on those legacy databases. The caller de-duplicates
+    // recipient ids before this runs, so a genuinely distinct recipient is
+    // never silently dropped; the post-commit visibility probe still verifies
+    // every distinct recipient is present.
     for (agent_id, kind) in recipients {
         let params = [
             Value::BigInt(message_id),
             Value::BigInt(*agent_id),
             Value::Text((*kind).to_string()),
         ];
-        match map_sql_outcome(traw_execute(cx, tracked, insert_recipient_sql, &params).await) {
+        match map_sql_outcome(
+            traw_execute(cx, tracked, INSERT_MESSAGE_RECIPIENT_SQL, &params).await,
+        ) {
             Outcome::Ok(_) => {}
             Outcome::Err(error) => {
                 let existing_rows = match map_sql_outcome(
@@ -6960,7 +8658,7 @@ pub async fn get_messages_details_by_ids(
             ""
         };
         let sql = format!(
-            "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
+            "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, m.body_md, \
                     m.importance, m.ack_required, m.created_ts, m.recipients_json, \
                     m.attachments, COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') as from_name \
              FROM messages m \
@@ -7005,35 +8703,39 @@ pub async fn get_messages_details_by_ids(
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let subject: String = match row.get_as(4) {
+                    let topic: Option<String> = match row.get_as(4) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let body_md: String = match row.get_as(5) {
+                    let subject: String = match row.get_as(5) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let importance: String = match row.get_as(6) {
+                    let body_md: String = match row.get_as(6) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let ack_required: i64 = match get_i64(7) {
+                    let importance: String = match row.get_as(7) {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let ack_required: i64 = match get_i64(8) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(e),
                     };
-                    let created_ts: i64 = match get_i64(8) {
+                    let created_ts: i64 = match get_i64(9) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(e),
                     };
-                    let recipients: String = match row.get_as::<Option<String>>(9) {
+                    let recipients: String = match row.get_as::<Option<String>>(10) {
                         Ok(v) => v.unwrap_or_else(|| "{}".to_string()),
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let attachments: String = match row.get_as::<Option<String>>(10) {
+                    let attachments: String = match row.get_as::<Option<String>>(11) {
                         Ok(v) => v.unwrap_or_else(|| "[]".to_string()),
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let from: String = match row.get_as::<Option<String>>(11) {
+                    let from: String = match row.get_as::<Option<String>>(12) {
                         Ok(v) => v.unwrap_or_default(),
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
@@ -7042,6 +8744,7 @@ pub async fn get_messages_details_by_ids(
                         project_id,
                         sender_id,
                         thread_id,
+                        topic,
                         subject,
                         body_md,
                         importance,
@@ -7103,7 +8806,7 @@ pub async fn list_thread_messages(
             (
                 format!(
                     "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
-                            m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
+                            m.thread_id AS thread_id, m.topic AS topic, m.subject AS subject, m.body_md AS body_md, \
                             m.importance AS importance, m.ack_required AS ack_required, \
                             m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
                             m.attachments AS attachments, \
@@ -7120,7 +8823,7 @@ pub async fn list_thread_messages(
         (true, None) => (
             format!(
                 "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
-                        m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
+                        m.thread_id AS thread_id, m.topic AS topic, m.subject AS subject, m.body_md AS body_md, \
                         m.importance AS importance, m.ack_required AS ack_required, \
                         m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
                         m.attachments AS attachments, \
@@ -7140,7 +8843,7 @@ pub async fn list_thread_messages(
             (
                 format!(
                     "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
-                            m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
+                            m.thread_id AS thread_id, m.topic AS topic, m.subject AS subject, m.body_md AS body_md, \
                             m.importance AS importance, m.ack_required AS ack_required, \
                             m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
                             m.attachments AS attachments, \
@@ -7157,7 +8860,7 @@ pub async fn list_thread_messages(
         (false, None) => (
             format!(
                 "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
-                        m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
+                        m.thread_id AS thread_id, m.topic AS topic, m.subject AS subject, m.body_md AS body_md, \
                         m.importance AS importance, m.ack_required AS ack_required, \
                         m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
                         m.attachments AS attachments, \
@@ -7192,35 +8895,39 @@ pub async fn list_thread_messages(
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let subject: String = match row.get_as(4) {
+                let topic: Option<String> = match row.get_as(4) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let body_md: String = match row.get_as(5) {
+                let subject: String = match row.get_as(5) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let importance: String = match row.get_as(6) {
+                let body_md: String = match row.get_as(6) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let ack_required: i64 = match row.get_as(7) {
+                let importance: String = match row.get_as(7) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let created_ts: i64 = match row.get_as(8) {
+                let ack_required: i64 = match row.get_as(8) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let recipients: String = match row.get_as(9) {
+                let created_ts: i64 = match row.get_as(9) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let attachments: String = match row.get_as(10) {
+                let recipients: String = match row.get_as(10) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let from: String = match row.get_as(11) {
+                let attachments: String = match row.get_as(11) {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let from: String = match row.get_as(12) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
@@ -7229,6 +8936,7 @@ pub async fn list_thread_messages(
                     project_id,
                     sender_id,
                     thread_id,
+                    topic,
                     subject,
                     body_md,
                     importance,
@@ -7391,6 +9099,181 @@ pub async fn list_message_recipient_names_for_messages(
     Outcome::Ok(out)
 }
 
+/// List the distinct agent names that have participated in a thread, capped to
+/// the `limit` most recent thread messages (the numeric root message, when the
+/// thread id parses as one, is always included).
+///
+/// GH#260: purpose-built for `send_message`/`reply_message` contact
+/// enforcement, which only needs participant *names*. The general
+/// `list_thread_messages` + `list_message_recipient_names_for_messages` pair
+/// materializes full `body_md` for every row and uses `OR`-disjunct and
+/// `IN (…) + JOIN` shapes that FrankenSQLite's planner executes as whole-table
+/// nested loops — on a ~47k-row mailbox one send into a ≥500-message thread
+/// burned CPU for minutes behind the global message-write serializer. This
+/// variant issues only narrow, single-predicate, join-free queries:
+///
+/// 1. `messages(project_id, thread_id)` scan via `idx_msg_thread_created`,
+///    projecting `(id, sender_id)` only — no `OR m.id = ?` disjunct, no join,
+///    no bodies;
+/// 2. a primary-key point lookup for the numeric thread root, when applicable;
+/// 3. `message_recipients.message_id IN (…)` over the table's
+///    `(message_id, agent_id)` primary key — no join back onto `messages`
+///    (the ids are already project-scoped by query 1/2);
+/// 4. one `agents.id IN (…)` pass to resolve names.
+pub async fn list_thread_participant_names(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    thread_id: &str,
+    limit: usize,
+) -> Outcome<Vec<String>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let Ok(limit_i64) = i64::try_from(limit) else {
+        return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
+    };
+
+    let mut message_ids: Vec<i64> = Vec::new();
+    let mut agent_ids: Vec<i64> = Vec::new();
+
+    let member_sql = "SELECT m.id AS id, m.sender_id AS sender_id \
+         FROM messages m \
+         WHERE m.project_id = ? AND m.thread_id = ? \
+         ORDER BY m.created_ts DESC, m.id DESC \
+         LIMIT ?";
+    let member_params = [
+        Value::BigInt(project_id),
+        Value::Text(thread_id.to_string()),
+        Value::BigInt(limit_i64),
+    ];
+    match map_sql_outcome(traw_query(cx, &tracked, member_sql, &member_params).await) {
+        Outcome::Ok(rows) => {
+            for row in rows {
+                let id: i64 = match row.get_named("id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let sender_id: i64 = match row.get_named("sender_id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                message_ids.push(id);
+                agent_ids.push(sender_id);
+            }
+        }
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
+
+    // Numeric thread ids are reply-seeded threads rooted at that message id:
+    // fetch the root by primary key instead of folding it into the thread scan
+    // as an `OR` disjunct (which defeats the thread index).
+    if let Ok(root_id) = thread_id.parse::<i64>()
+        && !message_ids.contains(&root_id)
+    {
+        let root_sql = "SELECT m.id AS id, m.sender_id AS sender_id \
+                 FROM messages m WHERE m.project_id = ? AND m.id = ?";
+        let root_params = [Value::BigInt(project_id), Value::BigInt(root_id)];
+        match map_sql_outcome(traw_query(cx, &tracked, root_sql, &root_params).await) {
+            Outcome::Ok(rows) => {
+                for row in rows {
+                    let id: i64 = match row.get_named("id") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let sender_id: i64 = match row.get_named("sender_id") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    message_ids.push(id);
+                    agent_ids.push(sender_id);
+                }
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+    }
+
+    if message_ids.is_empty() {
+        return Outcome::Ok(vec![]);
+    }
+
+    for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let sql = format!(
+            "SELECT r.agent_id AS agent_id FROM message_recipients r \
+             WHERE r.message_id IN ({})",
+            placeholders(chunk.len())
+        );
+        let params: Vec<Value> = chunk.iter().map(|id| Value::BigInt(*id)).collect();
+        match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => {
+                for row in rows {
+                    let agent_id: i64 = match row.get_named("agent_id") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    agent_ids.push(agent_id);
+                }
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+    }
+
+    agent_ids.sort_unstable();
+    agent_ids.dedup();
+
+    let mut names: Vec<String> = Vec::with_capacity(agent_ids.len());
+    let mut name_by_id: HashMap<i64, String> = HashMap::with_capacity(agent_ids.len());
+    for chunk in agent_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let sql = format!(
+            "SELECT a.id AS id, a.name AS name FROM agents a WHERE a.id IN ({})",
+            placeholders(chunk.len())
+        );
+        let params: Vec<Value> = chunk.iter().map(|id| Value::BigInt(*id)).collect();
+        match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => {
+                for row in rows {
+                    let id: i64 = match row.get_named("id") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let name: Option<String> = match row.get_named("name") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    name_by_id.insert(id, resolved_agent_display(id, name));
+                }
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+    }
+    for id in &agent_ids {
+        names.push(
+            name_by_id
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| unknown_agent_display(*id)),
+        );
+    }
+
+    names.sort();
+    names.dedup();
+    Outcome::Ok(names)
+}
+
 /// List recipients for a single message, preserving delivery kind ordering.
 pub async fn list_message_recipients_by_message(
     cx: &Cx,
@@ -7546,7 +9429,7 @@ pub async fn get_message(cx: &Cx, pool: &DbPool, message_id: i64) -> Outcome<Mes
 
     let tracked = tracked(&*conn);
 
-    let sql = "SELECT id, project_id, sender_id, thread_id, subject, body_md, importance, \
+    let sql = "SELECT id, project_id, sender_id, thread_id, topic, subject, body_md, importance, \
                        ack_required, created_ts, recipients_json, attachments \
                 FROM messages \
                 WHERE id = ? \
@@ -7572,6 +9455,10 @@ pub async fn get_message(cx: &Cx, pool: &DbPool, message_id: i64) -> Outcome<Mes
                 Err(e) => return Outcome::Err(map_sql_error(&e)),
             };
             let thread_id: Option<String> = match row.get_named("thread_id") {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(map_sql_error(&e)),
+            };
+            let topic: Option<String> = match row.get_named("topic") {
                 Ok(v) => v,
                 Err(e) => return Outcome::Err(map_sql_error(&e)),
             };
@@ -7609,6 +9496,7 @@ pub async fn get_message(cx: &Cx, pool: &DbPool, message_id: i64) -> Outcome<Mes
                 project_id,
                 sender_id,
                 thread_id,
+                topic,
                 subject,
                 body_md,
                 importance,
@@ -7632,6 +9520,13 @@ pub struct InboxRow {
     pub sender_name: String,
     pub read_ts: Option<i64>,
     pub ack_ts: Option<i64>,
+}
+
+/// Project-scoped message returned by an exact topic lookup.
+#[derive(Debug, Clone)]
+pub struct TopicMessageRow {
+    pub message: MessageRow,
+    pub sender_name: String,
 }
 
 /// Fetch one durable, body-free recipient delivery page for monitor clients.
@@ -7811,6 +9706,7 @@ pub async fn fetch_inbox(
             unread_only: false,
             ack_required_only: false,
             ack_overdue_before: None,
+            topic: None,
             body_policy: InboxBodyPolicy::Full,
         },
     )
@@ -7838,6 +9734,7 @@ pub async fn fetch_inbox_metadata(
             unread_only: false,
             ack_required_only: false,
             ack_overdue_before: None,
+            topic: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
@@ -7865,6 +9762,7 @@ pub async fn fetch_inbox_unread(
             unread_only: true,
             ack_required_only: false,
             ack_overdue_before: None,
+            topic: None,
             body_policy: InboxBodyPolicy::Full,
         },
     )
@@ -7892,6 +9790,7 @@ pub async fn fetch_inbox_unread_metadata(
             unread_only: true,
             ack_required_only: false,
             ack_overdue_before: None,
+            topic: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
@@ -7920,6 +9819,7 @@ pub async fn fetch_inbox_ack_overdue(
             unread_only: false,
             ack_required_only: false,
             ack_overdue_before: Some(ack_overdue_before),
+            topic: None,
             body_policy: InboxBodyPolicy::Full,
         },
     )
@@ -7948,6 +9848,7 @@ pub async fn fetch_inbox_ack_overdue_metadata(
             unread_only: false,
             ack_required_only: false,
             ack_overdue_before: Some(ack_overdue_before),
+            topic: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
@@ -7973,6 +9874,7 @@ pub async fn fetch_inbox_ack_required(
             unread_only: false,
             ack_required_only: true,
             ack_overdue_before: None,
+            topic: None,
             body_policy: InboxBodyPolicy::Full,
         },
     )
@@ -7998,6 +9900,7 @@ pub async fn fetch_inbox_ack_required_metadata(
             unread_only: false,
             ack_required_only: true,
             ack_overdue_before: None,
+            topic: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
@@ -8011,12 +9914,126 @@ enum InboxBodyPolicy {
 }
 
 #[derive(Clone, Copy)]
-struct InboxQueryOptions {
+struct InboxQueryOptions<'a> {
     urgent_only: bool,
     unread_only: bool,
     ack_required_only: bool,
     ack_overdue_before: Option<i64>,
+    topic: Option<&'a str>,
     body_policy: InboxBodyPolicy,
+}
+
+/// Fetch inbox rows with the full MCP filter set, including an optional topic.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_inbox_filtered(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    urgent_only: bool,
+    unread_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+    ack_overdue_before: Option<i64>,
+    topic: Option<&str>,
+    include_bodies: bool,
+) -> Outcome<Vec<InboxRow>, DbError> {
+    fetch_inbox_impl(
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        since_ts,
+        limit,
+        InboxQueryOptions {
+            urgent_only,
+            unread_only,
+            ack_required_only: false,
+            ack_overdue_before,
+            topic,
+            body_policy: if include_bodies {
+                InboxBodyPolicy::Full
+            } else {
+                InboxBodyPolicy::MetadataOnly
+            },
+        },
+    )
+    .await
+}
+
+/// Fetch project messages carrying one exact case-insensitive topic.
+///
+/// The topic predicate is applied before ordering and limiting, so unrelated
+/// newer mail cannot displace matching rows from a bounded result window.
+pub async fn fetch_topic_messages(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    topic: &str,
+    since_ts: Option<i64>,
+    limit: usize,
+    include_bodies: bool,
+) -> Outcome<Vec<TopicMessageRow>, DbError> {
+    let Ok(limit_i64) = i64::try_from(limit) else {
+        return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
+    };
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let body_select = if include_bodies {
+        "m.body_md"
+    } else {
+        "'' AS body_md"
+    };
+    let mut sql = format!(
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, \
+                {body_select}, m.importance, m.ack_required, m.created_ts, \
+                m.recipients_json, m.attachments, \
+                COALESCE(sender.name, ?) AS sender_name \
+         FROM messages m \
+         LEFT JOIN agents sender ON sender.id = m.sender_id \
+         WHERE m.project_id = ? AND m.topic = ? COLLATE NOCASE"
+    );
+    let mut params = vec![
+        Value::Text(UNKNOWN_SENDER_DISPLAY.to_string()),
+        Value::BigInt(project_id),
+        Value::Text(topic.to_string()),
+    ];
+    if let Some(since_ts) = since_ts {
+        sql.push_str(" AND m.created_ts > ?");
+        params.push(Value::BigInt(since_ts));
+    }
+    sql.push_str(" ORDER BY m.created_ts DESC, m.id DESC LIMIT ?");
+    params.push(Value::BigInt(limit_i64));
+
+    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let mut messages = Vec::with_capacity(rows.len());
+            for row in rows {
+                let message = match decode_message_row_indexed(&row) {
+                    Ok(message) => message,
+                    Err(error) => return Outcome::Err(error),
+                };
+                let sender_name = match row.get_as(12) {
+                    Ok(value) => value,
+                    Err(error) => return Outcome::Err(map_sql_error(&error)),
+                };
+                messages.push(TopicMessageRow {
+                    message,
+                    sender_name,
+                });
+            }
+            Outcome::Ok(messages)
+        }
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8027,7 +10044,7 @@ async fn fetch_inbox_impl(
     agent_id: i64,
     since_ts: Option<i64>,
     limit: usize,
-    options: InboxQueryOptions,
+    options: InboxQueryOptions<'_>,
 ) -> Outcome<Vec<InboxRow>, DbError> {
     let Ok(_limit_i64) = i64::try_from(limit) else {
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
@@ -8040,49 +10057,26 @@ async fn fetch_inbox_impl(
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
 
-    let run_query = || match (options.body_policy, options.ack_overdue_before) {
-        (InboxBodyPolicy::Full, Some(threshold)) => {
-            crate::sync::fetch_inbox_ack_overdue_rows_from_conn(
-                &conn,
-                project_id,
-                agent_id,
-                options.urgent_only,
-                since_ts,
-                limit,
-                threshold,
-            )
-        }
-        (InboxBodyPolicy::MetadataOnly, Some(threshold)) => {
-            crate::sync::fetch_inbox_ack_overdue_metadata_rows_from_conn(
-                &conn,
-                project_id,
-                agent_id,
-                options.urgent_only,
-                since_ts,
-                limit,
-                threshold,
-            )
-        }
-        (InboxBodyPolicy::Full, None) => crate::sync::fetch_inbox_rows_from_conn(
+    let run_query = || {
+        crate::sync::fetch_inbox_filtered_rows_from_conn(
             &conn,
             project_id,
             agent_id,
-            options.urgent_only,
-            options.unread_only,
-            options.ack_required_only,
             since_ts,
             limit,
-        ),
-        (InboxBodyPolicy::MetadataOnly, None) => crate::sync::fetch_inbox_metadata_rows_from_conn(
-            &conn,
-            project_id,
-            agent_id,
-            options.urgent_only,
-            options.unread_only,
-            options.ack_required_only,
-            since_ts,
-            limit,
-        ),
+            crate::sync::InboxFetchOptions {
+                urgent_only: options.urgent_only,
+                unread_only: options.unread_only,
+                ack_required_only: options.ack_required_only,
+                ack_overdue_before: options.ack_overdue_before,
+                topic: options.topic,
+                body_policy: if matches!(options.body_policy, InboxBodyPolicy::Full) {
+                    crate::sync::InboxBodyPolicy::Full
+                } else {
+                    crate::sync::InboxBodyPolicy::MetadataOnly
+                },
+            },
+        )
     };
 
     // The fsqlite 0.3.4 registry engine can answer a bare inbox read with
@@ -8102,7 +10096,9 @@ async fn fetch_inbox_impl(
                     error = %error,
                     "inbox read hit transient contention; retrying"
                 );
-                mvcc_backoff(attempt);
+                if let Err(reason) = mvcc_backoff(cx, attempt) {
+                    return Outcome::Cancelled(reason);
+                }
             }
             other => break other,
         }
@@ -8114,37 +10110,32 @@ async fn fetch_inbox_impl(
     }
 }
 
+fn decode_message_row_indexed(row: &SqlRow) -> std::result::Result<MessageRow, DbError> {
+    Ok(MessageRow {
+        id: Some(row.get_as(0).map_err(|error| map_sql_error(&error))?),
+        project_id: row.get_as(1).map_err(|error| map_sql_error(&error))?,
+        sender_id: row.get_as(2).map_err(|error| map_sql_error(&error))?,
+        thread_id: row.get_as(3).map_err(|error| map_sql_error(&error))?,
+        topic: row.get_as(4).map_err(|error| map_sql_error(&error))?,
+        subject: row.get_as(5).map_err(|error| map_sql_error(&error))?,
+        body_md: row.get_as(6).map_err(|error| map_sql_error(&error))?,
+        importance: row.get_as(7).map_err(|error| map_sql_error(&error))?,
+        ack_required: row.get_as(8).map_err(|error| map_sql_error(&error))?,
+        created_ts: row.get_as(9).map_err(|error| map_sql_error(&error))?,
+        recipients_json: row.get_as(10).map_err(|error| map_sql_error(&error))?,
+        attachments: row.get_as(11).map_err(|error| map_sql_error(&error))?,
+    })
+}
+
 fn decode_inbox_row_indexed(row: &SqlRow) -> std::result::Result<InboxRow, DbError> {
-    let id: i64 = row.get_as(0).map_err(|e| map_sql_error(&e))?;
-    let project_id: i64 = row.get_as(1).map_err(|e| map_sql_error(&e))?;
-    let sender_id: i64 = row.get_as(2).map_err(|e| map_sql_error(&e))?;
-    let thread_id: Option<String> = row.get_as(3).map_err(|e| map_sql_error(&e))?;
-    let subject: String = row.get_as(4).map_err(|e| map_sql_error(&e))?;
-    let body_md: String = row.get_as(5).map_err(|e| map_sql_error(&e))?;
-    let importance: String = row.get_as(6).map_err(|e| map_sql_error(&e))?;
-    let ack_required: i64 = row.get_as(7).map_err(|e| map_sql_error(&e))?;
-    let created_ts: i64 = row.get_as(8).map_err(|e| map_sql_error(&e))?;
-    let recipients_json: String = row.get_as(9).map_err(|e| map_sql_error(&e))?;
-    let attachments: String = row.get_as(10).map_err(|e| map_sql_error(&e))?;
-    let kind: String = row.get_as(11).map_err(|e| map_sql_error(&e))?;
-    let sender_name: String = row.get_as(12).map_err(|e| map_sql_error(&e))?;
-    let read_ts: Option<i64> = row.get_as(13).map_err(|e| map_sql_error(&e))?;
-    let ack_ts: Option<i64> = row.get_as(14).map_err(|e| map_sql_error(&e))?;
+    let message = decode_message_row_indexed(row)?;
+    let kind: String = row.get_as(12).map_err(|e| map_sql_error(&e))?;
+    let sender_name: String = row.get_as(13).map_err(|e| map_sql_error(&e))?;
+    let read_ts: Option<i64> = row.get_as(14).map_err(|e| map_sql_error(&e))?;
+    let ack_ts: Option<i64> = row.get_as(15).map_err(|e| map_sql_error(&e))?;
 
     Ok(InboxRow {
-        message: MessageRow {
-            id: Some(id),
-            project_id,
-            sender_id,
-            thread_id,
-            subject,
-            body_md,
-            importance,
-            ack_required,
-            created_ts,
-            recipients_json,
-            attachments,
-        },
+        message,
         kind,
         sender_name,
         read_ts,
@@ -8232,7 +10223,7 @@ async fn fetch_inbox_for_product_agent_impl(
         InboxBodyPolicy::MetadataOnly => "'' AS body_md",
     };
     let mut sql = format!(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, {body_select}, \
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, {body_select}, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
                 r.kind, COALESCE(s.name, ?) AS sender_name, r.read_ts, r.ack_ts \
          FROM product_project_links ppl \
@@ -8287,6 +10278,7 @@ pub struct SearchRow {
     pub thread_id: Option<String>,
     pub from: String,
     pub body_md: String,
+    pub topic: Option<String>,
 }
 
 pub const UNKNOWN_SENDER_DISPLAY: &str = "[unknown sender]";
@@ -8313,6 +10305,7 @@ pub struct SearchRowWithProject {
     pub from: String,
     pub body_md: String,
     pub project_id: i64,
+    pub topic: Option<String>,
 }
 
 // FTS5 unsearchable patterns that cannot produce meaningful results.
@@ -8593,7 +10586,7 @@ async fn run_like_fallback(
 
     let sql = format!(
         "SELECT m.id, m.sender_id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, \
-                COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') as from_name, m.body_md \
+                COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') as from_name, m.body_md, m.topic \
          FROM messages m \
          LEFT JOIN agents a ON a.id = m.sender_id \
          WHERE m.project_id = ? AND ({where_clause}) \
@@ -8628,7 +10621,7 @@ async fn run_like_fallback_product(
 
     let sql = format!(
         "SELECT m.id, m.sender_id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, \
-                COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') as from_name, m.body_md, m.project_id \
+                COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') as from_name, m.body_md, m.project_id, m.topic \
          FROM messages m \
          LEFT JOIN agents a ON a.id = m.sender_id \
          JOIN product_project_links ppl ON ppl.project_id = m.project_id \
@@ -8712,6 +10705,7 @@ pub async fn search_messages(
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
                 let body_md: String = row.get_as(8).unwrap_or_default();
+                let topic: Option<String> = row.get_as(9).unwrap_or_default();
 
                 out.push(SearchRow {
                     id,
@@ -8723,6 +10717,7 @@ pub async fn search_messages(
                     thread_id,
                     from,
                     body_md,
+                    topic,
                 });
             }
             Outcome::Ok(out)
@@ -8779,7 +10774,7 @@ pub async fn search_messages_for_product(
                 // Use positional access for aliased columns where ORM column name inference
                 // incorrectly parses "a.name as from_name" as "name as" instead of "from_name".
                 // Column order: id(0), sender_id(1), subject(2), importance(3), ack_required(4),
-                // created_ts(5), thread_id(6), from_name(7), body_md(8), project_id(9)
+                // created_ts(5), thread_id(6), from_name(7), body_md(8), project_id(9), topic(10)
                 let id: i64 = match row.get_named("id") {
                     Ok(v) => v,
                     Err(_) => match row.get_as(0) {
@@ -8841,6 +10836,7 @@ pub async fn search_messages_for_product(
                         None => 0,
                     },
                 };
+                let topic: Option<String> = row.get_as(10).unwrap_or_default();
 
                 out.push(SearchRowWithProject {
                     id,
@@ -8853,6 +10849,7 @@ pub async fn search_messages_for_product(
                     from,
                     body_md,
                     project_id,
+                    topic,
                 });
             }
             Outcome::Ok(out)
@@ -8876,6 +10873,9 @@ pub struct GlobalInboxRow {
     pub ack_ts: Option<i64>,
     pub project_id: i64,
     pub project_slug: String,
+    /// Project message topic, duplicated from `message.topic` for global-view
+    /// consumers that operate on the outer project-context row.
+    pub topic: Option<String>,
 }
 
 /// Fetch inbox across ALL projects for a given agent name.
@@ -8902,7 +10902,7 @@ pub async fn fetch_inbox_global(
     let tracked = tracked(&*conn);
 
     let mut sql = format!(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, m.body_md, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, \
                 m.attachments, \
                 r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') as sender_name, r.ack_ts, \
@@ -8939,17 +10939,18 @@ pub async fn fetch_inbox_global(
                 let project_id: i64 = row.get_as(1).unwrap_or(0);
                 let sender_id: i64 = row.get_as(2).unwrap_or(0);
                 let thread_id: Option<String> = row.get_as(3).unwrap_or(None);
-                let subject: String = row.get_as(4).unwrap_or_default();
-                let body_md: String = row.get_as(5).unwrap_or_default();
-                let importance: String = row.get_as(6).unwrap_or_default();
-                let ack_required: i64 = row.get_as(7).unwrap_or(0);
-                let created_ts: i64 = row.get_as(8).unwrap_or(0);
-                let recipients_json: String = row.get_as(9).unwrap_or_default();
-                let attachments: String = row.get_as(10).unwrap_or_default();
-                let kind: String = row.get_as(11).unwrap_or_default();
-                let sender_name: String = row.get_as(12).unwrap_or_default();
-                let ack_ts: Option<i64> = row.get_as(13).unwrap_or(None);
-                let project_slug: String = row.get_as(14).unwrap_or_default();
+                let topic: Option<String> = row.get_as(4).unwrap_or(None);
+                let subject: String = row.get_as(5).unwrap_or_default();
+                let body_md: String = row.get_as(6).unwrap_or_default();
+                let importance: String = row.get_as(7).unwrap_or_default();
+                let ack_required: i64 = row.get_as(8).unwrap_or(0);
+                let created_ts: i64 = row.get_as(9).unwrap_or(0);
+                let recipients_json: String = row.get_as(10).unwrap_or_default();
+                let attachments: String = row.get_as(11).unwrap_or_default();
+                let kind: String = row.get_as(12).unwrap_or_default();
+                let sender_name: String = row.get_as(13).unwrap_or_default();
+                let ack_ts: Option<i64> = row.get_as(14).unwrap_or(None);
+                let project_slug: String = row.get_as(15).unwrap_or_default();
 
                 out.push(GlobalInboxRow {
                     message: MessageRow {
@@ -8957,6 +10958,7 @@ pub async fn fetch_inbox_global(
                         project_id,
                         sender_id,
                         thread_id,
+                        topic: topic.clone(),
                         subject,
                         body_md,
                         importance,
@@ -8970,6 +10972,7 @@ pub async fn fetch_inbox_global(
                     ack_ts,
                     project_id,
                     project_slug,
+                    topic,
                 });
             }
             Outcome::Ok(out)
@@ -9055,6 +11058,8 @@ pub struct GlobalSearchRow {
     pub body_md: String,
     pub project_id: i64,
     pub project_slug: String,
+    /// Project message topic carried through cross-project search results.
+    pub topic: Option<String>,
 }
 
 /// Full-text search across ALL projects.
@@ -9109,6 +11114,7 @@ pub async fn search_messages_global(
                 let body_md: String = row.get_as(8).unwrap_or_default();
                 let project_id: i64 = row.get_as(9).unwrap_or_default();
                 let project_slug: String = row.get_as(10).unwrap_or_default();
+                let topic: Option<String> = row.get_as(11).unwrap_or_default();
 
                 out.push(GlobalSearchRow {
                     id,
@@ -9122,6 +11128,7 @@ pub async fn search_messages_global(
                     body_md,
                     project_id,
                     project_slug,
+                    topic,
                 });
             }
             Outcome::Ok(out)
@@ -9156,7 +11163,8 @@ async fn run_like_fallback_global(
     let sql = format!(
         "SELECT m.id, m.sender_id, m.subject, m.importance, m.ack_required, m.created_ts, \
                 m.thread_id, COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') as from_name, m.body_md, \
-                m.project_id, COALESCE(NULLIF(TRIM(p.slug), ''), '[unknown-project-' || m.project_id || ']') as project_slug \
+                m.project_id, COALESCE(NULLIF(TRIM(p.slug), ''), '[unknown-project-' || m.project_id || ']') as project_slug, \
+                m.topic \
          FROM messages m \
          LEFT JOIN agents a ON a.id = m.sender_id \
          LEFT JOIN projects p ON p.id = m.project_id \
@@ -9484,6 +11492,381 @@ pub async fn mark_all_messages_read_in_project(
         Outcome::Ok(count_i64)
     })
     .await
+}
+
+/// Result of a capped bulk mark-read pass (GH#273).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BulkMarkReadOutcome {
+    /// Number of messages newly marked read for the agent in this call.
+    pub marked: u64,
+    /// True when more unread messages matching the filters remain (the caller
+    /// should call again to continue draining the backlog).
+    pub more: bool,
+}
+
+/// Mark up to `limit` unread messages read for one agent in one project.
+///
+/// GH#273: the bulk mark-read primitive behind the `mark_all_read` MCP tool
+/// and the `am mark-all-read` CLI verb.
+///
+/// Differences from [`mark_all_messages_read_in_project`] (the uncapped web
+/// dashboard path):
+/// - `older_than_us`: when `Some`, only messages with `created_ts <=
+///   older_than_us` are marked (lets operators drain aged backlog while
+///   keeping fresh mail unread).
+/// - `limit`: hard cap on messages transitioned per call; oldest messages
+///   (lowest id) are marked first, and the returned `more` flag reports
+///   whether eligible unread rows remain past the cap.
+///
+/// Read receipts only: acknowledgement state (`ack_ts`) is never touched.
+pub async fn mark_messages_read_bulk(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    older_than_us: Option<i64>,
+    limit: usize,
+) -> Outcome<BulkMarkReadOutcome, DbError> {
+    if limit == 0 {
+        return Outcome::Ok(BulkMarkReadOutcome {
+            marked: 0,
+            more: false,
+        });
+    }
+    let now = now_micros();
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    run_with_mvcc_retry(cx, "mark_messages_read_bulk", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        // Select the exact unread rows this call will transition (oldest-first
+        // by id, over-fetch by one to detect remaining backlog) so the count
+        // and the `more` flag are truthful even with unreliable rows_affected.
+        let mut find_sql = String::from(
+            "SELECT m.id FROM message_recipients r \
+             JOIN messages m ON m.id = r.message_id \
+             WHERE r.agent_id = ? AND r.read_ts IS NULL \
+             AND m.project_id = ?",
+        );
+        let mut find_params = vec![Value::BigInt(agent_id), Value::BigInt(project_id)];
+        if let Some(cutoff) = older_than_us {
+            find_sql.push_str(" AND m.created_ts <= ?");
+            find_params.push(Value::BigInt(cutoff));
+        }
+        find_sql.push_str(" ORDER BY m.id LIMIT ?");
+        let overfetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        find_params.push(Value::BigInt(overfetch));
+
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &find_sql, &find_params).await)
+        );
+
+        let mut message_ids = Vec::with_capacity(rows.len().min(limit));
+        for row in &rows {
+            let Some(message_id) = row_first_i64(row) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "bulk mark-read query returned a message without an integer id".to_string(),
+                ));
+            };
+            if message_ids.len() < limit {
+                message_ids.push(message_id);
+            }
+        }
+        let more = rows.len() > limit;
+
+        if !message_ids.is_empty() {
+            for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+                let ph = placeholders(chunk.len());
+                let sql = format!(
+                    "UPDATE message_recipients \
+                     SET read_ts = ? \
+                     WHERE agent_id = ? AND read_ts IS NULL \
+                     AND message_id IN ({ph})"
+                );
+                let mut params = Vec::with_capacity(2 + chunk.len());
+                params.push(Value::BigInt(now));
+                params.push(Value::BigInt(agent_id));
+                params.extend(chunk.iter().copied().map(Value::BigInt));
+                try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await)
+                );
+
+                // Do not report success unless every selected row in this
+                // chunk is now read (see mark_all_messages_read_in_project).
+                let verify_sql = format!(
+                    "SELECT COUNT(*) FROM message_recipients \
+                     WHERE agent_id = ? AND read_ts IS NULL AND message_id IN ({ph})"
+                );
+                let mut verify_params = Vec::with_capacity(1 + chunk.len());
+                verify_params.push(Value::BigInt(agent_id));
+                verify_params.extend(chunk.iter().copied().map(Value::BigInt));
+                let verify_rows = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_query(cx, &tracked, &verify_sql, &verify_params).await)
+                );
+                let remaining = verify_rows.first().and_then(row_first_i64).unwrap_or(0);
+                if remaining > 0 {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::Internal(format!(
+                        "bulk mark-read left {remaining} unread rows in project {project_id} for agent {agent_id}"
+                    )));
+                }
+            }
+
+            // Rebuild inbox_stats from ground truth.
+            try_in_tx!(
+                cx,
+                &tracked,
+                rebuild_agents_inbox_stats_in_tx(cx, &tracked, &[agent_id]).await
+            );
+        }
+
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        // Post-commit invalidation — see mark_message_read.
+        crate::cache::read_cache()
+            .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
+
+        Outcome::Ok(BulkMarkReadOutcome {
+            marked: u64::try_from(message_ids.len()).unwrap_or(u64::MAX),
+            more,
+        })
+    })
+    .await
+}
+
+/// SQL predicate selecting "settled" messages eligible for retention pruning
+/// (GH#273): every recipient has read the message, and — when the message
+/// requires acknowledgement — every recipient has acknowledged it. A message
+/// with no recipient rows left (e.g. repaired FK orphans) is vacuously
+/// settled. The caller adds the age horizon (`m.created_ts <= ?`).
+const SETTLED_MESSAGE_PREDICATE: &str = "NOT EXISTS (\
+     SELECT 1 FROM message_recipients r \
+     WHERE r.message_id = m.id \
+       AND (r.read_ts IS NULL \
+            OR (m.ack_required != 0 AND r.ack_ts IS NULL)))";
+
+/// Count settled messages older than `older_than_us` (GH#273).
+///
+/// "Settled" means read by every recipient and acked where the message
+/// requires it — i.e. exactly what a retention prune at that horizon WOULD
+/// delete. Used by the retention worker's report-only mode when
+/// `MESSAGES_RETENTION_DAYS` is off.
+pub async fn count_prunable_messages(
+    cx: &Cx,
+    pool: &DbPool,
+    older_than_us: i64,
+) -> Outcome<u64, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    let sql = format!(
+        "SELECT COUNT(*) FROM messages m WHERE m.created_ts <= ? AND {SETTLED_MESSAGE_PREDICATE}"
+    );
+    let params = [Value::BigInt(older_than_us)];
+    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let count = rows.first().and_then(row_first_i64).unwrap_or(0);
+            Outcome::Ok(u64::try_from(count).unwrap_or(0))
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Result of one retention prune sweep over the `messages` table (GH#273).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MessagePruneReport {
+    /// `messages` rows deleted.
+    pub deleted_messages: u64,
+    /// `message_recipients` rows deleted alongside their messages.
+    pub deleted_recipients: u64,
+    /// True when eligible messages remain past the per-sweep cap (the next
+    /// sweep will continue).
+    pub more: bool,
+}
+
+/// Retention sweep: hard-`DELETE` settled messages older than `older_than_us`
+/// (GH#273, the demand-side twin of [`prune_released_file_reservations`]).
+///
+/// A message is eligible when BOTH:
+///   1. it is settled — every recipient has `read_ts`, and every recipient
+///      has `ack_ts` when the message has `ack_required` — so unread or
+///      unacknowledged mail is NEVER pruned, AND
+///   2. `created_ts <= older_than_us`.
+///
+/// The per-project git archive (`projects/<slug>/messages/YYYY/MM/*.md` plus
+/// mailbox copies) retains the full message history independently, so the DB
+/// delete is non-destructive to the durable record — the same precedent as
+/// the file-reservation retention prune (GH#154).
+///
+/// Deletes are executed oldest-first in bounded batches of `batch_size`
+/// messages, each in its own transaction (fsqlite-friendly: bounded write
+/// sets, never one giant transaction), with at most `max_messages` messages
+/// removed per sweep. Rows referencing each pruned message are removed in
+/// FK-safe order inside the same transaction: signal receipts and delivery
+/// events first, then recipient rows, then the message itself (the
+/// `messages_ad` trigger clears `fts_messages`). Affected agents'
+/// `inbox_stats` are rebuilt in-transaction and their cached counts
+/// invalidated post-commit.
+pub async fn prune_settled_messages(
+    cx: &Cx,
+    pool: &DbPool,
+    older_than_us: i64,
+    batch_size: usize,
+    max_messages: usize,
+) -> Outcome<MessagePruneReport, DbError> {
+    let mut report = MessagePruneReport::default();
+    if max_messages == 0 {
+        return Outcome::Ok(report);
+    }
+    let batch_size = batch_size.clamp(1, MAX_IN_CLAUSE_ITEMS);
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    // Select eligible ids first (mirrors prune_released_file_reservations —
+    // never trust a correlated DELETE), over-fetching by one so the report
+    // can state whether backlog remains past the per-sweep cap.
+    let select_sql = format!(
+        "SELECT m.id FROM messages m \
+         WHERE m.created_ts <= ? AND {SETTLED_MESSAGE_PREDICATE} \
+         ORDER BY m.id LIMIT ?"
+    );
+    let overfetch = i64::try_from(max_messages.saturating_add(1)).unwrap_or(i64::MAX);
+    let params = [Value::BigInt(older_than_us), Value::BigInt(overfetch)];
+    let rows = match map_sql_outcome(traw_query(cx, &tracked, &select_sql, &params).await) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let mut ids: Vec<i64> = Vec::with_capacity(rows.len().min(max_messages));
+    for row in &rows {
+        if let Some(id) = row_first_i64(row)
+            && ids.len() < max_messages
+        {
+            ids.push(id);
+        }
+    }
+    report.more = rows.len() > max_messages;
+    if ids.is_empty() {
+        return Outcome::Ok(report);
+    }
+
+    for chunk in ids.chunks(batch_size) {
+        let ph = placeholders(chunk.len());
+        let chunk_params: Vec<Value> = chunk.iter().copied().map(Value::BigInt).collect();
+
+        let batch_outcome = run_with_mvcc_retry(cx, "prune_settled_messages_batch", || async {
+            try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+            // Capture affected recipients before their rows are removed so
+            // inbox_stats can be rebuilt from ground truth in this
+            // transaction.
+            let agents_sql = format!(
+                "SELECT DISTINCT agent_id FROM message_recipients WHERE message_id IN ({ph})"
+            );
+            let agent_rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(cx, &tracked, &agents_sql, &chunk_params).await)
+            );
+            let mut agent_ids: Vec<i64> = Vec::with_capacity(agent_rows.len());
+            for row in &agent_rows {
+                if let Some(agent_id) = row_first_i64(row) {
+                    agent_ids.push(agent_id);
+                }
+            }
+
+            // FK-safe cascade order: children first, message row last.
+            let del_receipts =
+                format!("DELETE FROM message_delivery_signal_receipts WHERE message_id IN ({ph})");
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, &del_receipts, &chunk_params).await)
+            );
+
+            let del_events =
+                format!("DELETE FROM inbox_delivery_events WHERE message_id IN ({ph})");
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, &del_events, &chunk_params).await)
+            );
+
+            let del_recipients =
+                format!("DELETE FROM message_recipients WHERE message_id IN ({ph})");
+            let recipients_deleted = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, &del_recipients, &chunk_params).await)
+            );
+
+            let del_messages = format!("DELETE FROM messages WHERE id IN ({ph})");
+            let messages_deleted = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, &del_messages, &chunk_params).await)
+            );
+
+            if !agent_ids.is_empty() {
+                try_in_tx!(
+                    cx,
+                    &tracked,
+                    rebuild_agents_inbox_stats_in_tx(cx, &tracked, &agent_ids).await
+                );
+            }
+
+            try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+            Outcome::Ok((messages_deleted, recipients_deleted, agent_ids))
+        })
+        .await;
+
+        let chunk_agents = match batch_outcome {
+            Outcome::Ok((messages_deleted, recipients_deleted, agent_ids)) => {
+                report.deleted_messages = report.deleted_messages.saturating_add(messages_deleted);
+                report.deleted_recipients =
+                    report.deleted_recipients.saturating_add(recipients_deleted);
+                agent_ids
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        // Post-commit invalidation so concurrent readers repopulate fresh
+        // counts (see mark_message_read).
+        let scope = cache_scope_for_pool(pool);
+        for agent_id in chunk_agents {
+            crate::cache::read_cache().invalidate_inbox_stats_scoped(&scope, agent_id);
+        }
+    }
+
+    Outcome::Ok(report)
 }
 
 /// Acknowledge message
@@ -13527,7 +15910,7 @@ pub async fn fetch_unacked_for_agent(
     };
 
     let sql = format!(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, m.body_md, \
                   m.importance, m.ack_required, m.created_ts, m.recipients_json, \
                   m.attachments, \
                   r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts \
@@ -13566,43 +15949,47 @@ pub async fn fetch_unacked_for_agent(
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let subject: String = match row.get_as(4) {
+                let topic: Option<String> = match row.get_as(4) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let body_md: String = match row.get_as(5) {
+                let subject: String = match row.get_as(5) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let importance: String = match row.get_as(6) {
+                let body_md: String = match row.get_as(6) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let ack_required: i64 = match row.get_as(7) {
+                let importance: String = match row.get_as(7) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let created_ts: i64 = match row.get_as(8) {
+                let ack_required: i64 = match row.get_as(8) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let recipients_json: String = match row.get_as(9) {
+                let created_ts: i64 = match row.get_as(9) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let attachments: String = match row.get_as(10) {
+                let recipients_json: String = match row.get_as(10) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let kind: String = match row.get_as(11) {
+                let attachments: String = match row.get_as(11) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let sender_name: String = match row.get_as(12) {
+                let kind: String = match row.get_as(12) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let read_ts: Option<i64> = match row.get_as(13) {
+                let sender_name: String = match row.get_as(13) {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let read_ts: Option<i64> = match row.get_as(14) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
@@ -13613,6 +16000,7 @@ pub async fn fetch_unacked_for_agent(
                         project_id: proj_id,
                         sender_id,
                         thread_id,
+                        topic,
                         subject,
                         body_md,
                         importance,
@@ -13683,7 +16071,7 @@ pub async fn insert_system_agent(
 
         let select_sql = "SELECT id, project_id, name, program, model, task_description, \
                           inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                          registration_token \
+                          registration_token, retired_at \
                           FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                           ORDER BY id ASC LIMIT 1";
         let select_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -15441,6 +17829,90 @@ mod tests {
     use tracing::field::{Field, Visit};
     use tracing::{Event, Id, Metadata, Subscriber, span};
 
+    #[cfg(unix)]
+    #[test]
+    fn open_fresh_file_backed_conn_accepts_regular_authority_and_rejects_existing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("fresh-connection authority tempdir");
+        let ordinary_dir = root.path().join("ordinary");
+        let redirected_dir = root.path().join("redirected");
+        std::fs::create_dir_all(&ordinary_dir).expect("create ordinary authority directory");
+        std::fs::create_dir_all(&redirected_dir).expect("create redirected authority directory");
+
+        let ordinary_db = ordinary_dir.join("mail.sqlite3");
+        let ordinary_db_text = ordinary_db
+            .to_str()
+            .expect("temporary ordinary database path is UTF-8");
+        let ordinary_seed = crate::DbConn::open_file(ordinary_db_text)
+            .expect("open ordinary fresh-connection fixture");
+        ordinary_seed
+            .execute_raw("CREATE TABLE fresh_authority_sentinel(value TEXT NOT NULL)")
+            .expect("create ordinary fresh-connection sentinel");
+        ordinary_seed
+            .execute_raw("INSERT INTO fresh_authority_sentinel(value) VALUES('ordinary')")
+            .expect("seed ordinary fresh-connection sentinel");
+        drop(ordinary_seed);
+        let ordinary_storage = ordinary_dir.join("archive");
+        std::fs::create_dir_all(&ordinary_storage).expect("create ordinary archive authority");
+        let ordinary_pool = crate::DbPool::new(&crate::DbPoolConfig {
+            database_url: format!("sqlite:///{}", ordinary_db.display()),
+            storage_root: Some(ordinary_storage),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("freeze ordinary fresh-connection authority");
+
+        let ordinary_conn = open_fresh_file_backed_conn(&ordinary_pool)
+            .expect("ordinary frozen authority must admit a fresh connection");
+        let rows = ordinary_conn
+            .query_sync("SELECT value FROM fresh_authority_sentinel", &[])
+            .expect("read ordinary fresh-connection sentinel");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]
+                .get_named::<String>("value")
+                .expect("decode ordinary fresh-connection sentinel"),
+            "ordinary"
+        );
+        drop(ordinary_conn);
+
+        let frozen_alias = redirected_dir.join("mail.sqlite3");
+        let foreign_db = redirected_dir.join("missing-foreign.sqlite3");
+        assert!(
+            !foreign_db.exists(),
+            "redirected fresh-connection fixture requires a dangling symlink target"
+        );
+        let redirected_storage = redirected_dir.join("archive");
+        std::fs::create_dir_all(&redirected_storage).expect("create redirected archive authority");
+        let redirected_pool = crate::DbPool::new(&crate::DbPoolConfig {
+            database_url: format!("sqlite:///{}", frozen_alias.display()),
+            storage_root: Some(redirected_storage),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("freeze missing fresh-connection authority");
+
+        symlink(&foreign_db, &frozen_alias)
+            .expect("insert dangling database symlink before fresh connection admission");
+        let error = match open_fresh_file_backed_conn(&redirected_pool) {
+            Ok(_) => panic!("fresh connection must reject an existing authority symlink"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to cross database authority"),
+            "unexpected fresh-connection authority error: {error}"
+        );
+    }
+
     #[test]
     fn orphan_placeholder_identifier_shape_gates_the_inventory_scan() {
         // Only the literal placeholder shape can ever match a placeholder row,
@@ -15658,6 +18130,58 @@ mod tests {
     }
 
     #[test]
+    fn mvcc_retry_stops_before_work_and_during_backoff_when_cancelled() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        rt.block_on(async move {
+            let expired_cx = Cx::for_request_with_budget(
+                asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+            );
+            let pre_cancel_calls = AtomicU64::new(0);
+            let before_work: Outcome<(), DbError> =
+                run_with_mvcc_retry_with_budget(&expired_cx, "cancel_before_work", 16, || {
+                    pre_cancel_calls.fetch_add(1, Ordering::Relaxed);
+                    async { Outcome::Err(DbError::ResourceBusy("database is locked".into())) }
+                })
+                .await;
+            assert!(matches!(before_work, Outcome::Cancelled(_)));
+            assert_eq!(
+                pre_cancel_calls.load(Ordering::Relaxed),
+                0,
+                "a cancelled request must not enter another SQLite attempt"
+            );
+
+            let cx = Cx::for_testing();
+            let cancel_from_attempt = cx.clone();
+            let retry_calls = AtomicU64::new(0);
+            let started = std::time::Instant::now();
+            let during_backoff: Outcome<(), DbError> =
+                run_with_mvcc_retry_with_budget(&cx, "cancel_during_backoff", 16, || {
+                    retry_calls.fetch_add(1, Ordering::Relaxed);
+                    cancel_from_attempt.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("mounted HTTP dispatch timed out"),
+                    );
+                    async { Outcome::Err(DbError::ResourceBusy("database is locked".into())) }
+                })
+                .await;
+            assert!(matches!(during_backoff, Outcome::Cancelled(_)));
+            assert_eq!(
+                retry_calls.load(Ordering::Relaxed),
+                1,
+                "cancellation after a busy result must prevent all later retries"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "cancellation must interrupt the retry delay promptly"
+            );
+        });
+    }
+
+    #[test]
     fn mvcc_retry_success_and_non_busy_errors_pass_through_unwrapped() {
         use asupersync::runtime::RuntimeBuilder;
         let rt = RuntimeBuilder::current_thread()
@@ -15762,7 +18286,10 @@ mod tests {
         row.get_named("cnt").expect("decode count")
     }
 
-    fn create_file_pool_with_schema_for_test(label: &str) -> (tempfile::TempDir, DbPool) {
+    fn create_file_pool_with_schema_for_test_with_max(
+        label: &str,
+        max_connections: usize,
+    ) -> (tempfile::TempDir, DbPool) {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir
             .path()
@@ -15781,13 +18308,17 @@ mod tests {
         let cfg = crate::pool::DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
             min_connections: 1,
-            max_connections: 1,
+            max_connections,
             run_migrations: false,
             warmup_connections: 0,
             ..Default::default()
         };
         let pool = crate::create_pool(&cfg).expect("create pool");
         (dir, pool)
+    }
+
+    fn create_file_pool_with_schema_for_test(label: &str) -> (tempfile::TempDir, DbPool) {
+        create_file_pool_with_schema_for_test_with_max(label, 1)
     }
 
     async fn insert_project_row_for_test(cx: &Cx, pool: &DbPool, row: &ProjectRow) {
@@ -15812,6 +18343,950 @@ mod tests {
         )
         .into_result()
         .expect("insert project row");
+    }
+
+    async fn insert_project_sibling_for_test(
+        cx: &Cx,
+        pool: &DbPool,
+        smaller_id: i64,
+        larger_id: i64,
+        score: f64,
+    ) {
+        let conn = acquire_conn(cx, pool)
+            .await
+            .into_result()
+            .expect("acquire conn");
+        let tracked = tracked(&*conn);
+        map_sql_outcome(
+            traw_execute(
+                cx,
+                &tracked,
+                "INSERT INTO project_sibling_suggestions \
+                 (project_a_id, project_b_id, score, status, rationale, created_ts, evaluated_ts) \
+                VALUES (?, ?, ?, 'suggested', 'shared workspace', 10, 10)",
+                &[
+                    Value::BigInt(smaller_id),
+                    Value::BigInt(larger_id),
+                    Value::Double(score),
+                ],
+            )
+            .await,
+        )
+        .into_result()
+        .expect("insert project sibling suggestion");
+    }
+
+    #[test]
+    fn project_sibling_transitions_are_canonical_atomic_and_durable() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("project-sibling-transition");
+
+        rt.block_on(async {
+            let project_a = ProjectRow {
+                id: Some(101),
+                slug: "project-a".to_string(),
+                human_key: "/workspace/project-a".to_string(),
+                created_at: 1,
+            };
+            let project_b = ProjectRow {
+                id: Some(202),
+                slug: "project-b".to_string(),
+                human_key: "/workspace/project-b".to_string(),
+                created_at: 2,
+            };
+            let project_c = ProjectRow {
+                id: Some(303),
+                slug: "project-c".to_string(),
+                human_key: "/workspace/project-c".to_string(),
+                created_at: 3,
+            };
+            insert_project_row_for_test(&cx, &pool, &project_a).await;
+            insert_project_row_for_test(&cx, &pool, &project_b).await;
+            insert_project_row_for_test(&cx, &pool, &project_c).await;
+            insert_project_sibling_for_test(&cx, &pool, 101, 202, 0.97).await;
+            insert_project_sibling_for_test(&cx, &pool, 101, 303, 0.42).await;
+
+            let confirmed = update_project_sibling_status(
+                &cx,
+                &pool,
+                202,
+                101,
+                ProjectSiblingStatus::Confirmed,
+            )
+            .await
+            .into_result()
+            .expect("confirm from reverse orientation");
+            assert_eq!(confirmed.status, ProjectSiblingStatus::Confirmed);
+            assert_eq!(confirmed.project_a.id, 101);
+            assert_eq!(confirmed.project_b.id, 202);
+            assert_eq!(confirmed.score, 0.97);
+            assert_eq!(confirmed.rationale, "shared workspace");
+            assert!(confirmed.confirmed_ts.is_some());
+            assert_eq!(confirmed.dismissed_ts, None);
+            assert!(confirmed.evaluated_ts > 10);
+
+            let confirmed_again = update_project_sibling_status(
+                &cx,
+                &pool,
+                101,
+                202,
+                ProjectSiblingStatus::Confirmed,
+            )
+            .await
+            .into_result()
+            .expect("repeat confirm suggestion");
+            assert_eq!(
+                confirmed_again, confirmed,
+                "idempotent retries must preserve the original audit timestamps"
+            );
+
+            let dismissed = update_project_sibling_status(
+                &cx,
+                &pool,
+                101,
+                202,
+                ProjectSiblingStatus::Dismissed,
+            )
+            .await
+            .into_result()
+            .expect("dismiss suggestion");
+            assert_eq!(dismissed.status, ProjectSiblingStatus::Dismissed);
+            assert_eq!(dismissed.confirmed_ts, None);
+            assert!(dismissed.dismissed_ts.is_some());
+
+            let reset = update_project_sibling_status(
+                &cx,
+                &pool,
+                202,
+                101,
+                ProjectSiblingStatus::Suggested,
+            )
+            .await
+            .into_result()
+            .expect("reset suggestion");
+            assert_eq!(reset.status, ProjectSiblingStatus::Suggested);
+            assert_eq!(reset.confirmed_ts, None);
+            assert_eq!(reset.dismissed_ts, None);
+
+            {
+                let conn = acquire_conn(&cx, &pool)
+                    .await
+                    .into_result()
+                    .expect("acquire legacy-state fixture connection");
+                let tracked = tracked(&*conn);
+                map_sql_outcome(
+                    traw_execute(
+                        &cx,
+                        &tracked,
+                        "UPDATE project_sibling_suggestions \
+                         SET confirmed_ts = 7 \
+                         WHERE project_a_id = 101 AND project_b_id = 202",
+                        &[],
+                    )
+                    .await,
+                )
+                .into_result()
+                .expect("seed stale reset timestamp");
+            }
+            let repaired_reset = update_project_sibling_status(
+                &cx,
+                &pool,
+                101,
+                202,
+                ProjectSiblingStatus::Suggested,
+            )
+            .await
+            .into_result()
+            .expect("repair stale reset timestamp");
+            assert_eq!(repaired_reset.status, ProjectSiblingStatus::Suggested);
+            assert_eq!(repaired_reset.confirmed_ts, None);
+            assert_eq!(repaired_reset.dismissed_ts, None);
+
+            let listed = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list sibling suggestions");
+            assert_eq!(listed.len(), 2);
+            assert_eq!(listed[0], repaired_reset);
+            assert_eq!(listed[1].project_a.id, 101);
+            assert_eq!(listed[1].project_b.id, 303);
+            assert_eq!(listed[1].status, ProjectSiblingStatus::Suggested);
+            assert_eq!(listed[1].evaluated_ts, 10);
+            assert_eq!(listed[1].confirmed_ts, None);
+            assert_eq!(listed[1].dismissed_ts, None);
+        });
+
+        let fresh = crate::DbConn::open_file(pool.sqlite_path()).expect("open independent reader");
+        let rows = fresh
+            .query_sync(
+                "SELECT status, confirmed_ts, dismissed_ts \
+                 FROM project_sibling_suggestions \
+                 WHERE project_a_id = 101 AND project_b_id = 202",
+                &[],
+            )
+            .expect("read transition from independent connection");
+        let row = rows.first().expect("durable sibling suggestion row");
+        assert_eq!(
+            row.get_named::<String>("status").expect("decode status"),
+            "suggested"
+        );
+        assert_eq!(
+            row.get_named::<Option<i64>>("confirmed_ts")
+                .expect("decode confirmed_ts"),
+            None
+        );
+        assert_eq!(
+            row.get_named::<Option<i64>>("dismissed_ts")
+                .expect("decode dismissed_ts"),
+            None
+        );
+    }
+
+    #[test]
+    fn project_sibling_transition_rejects_invalid_and_missing_pairs() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("project-sibling-errors");
+
+        rt.block_on(async {
+            let project_a = ProjectRow {
+                id: Some(301),
+                slug: "project-a".to_string(),
+                human_key: "/workspace/project-a".to_string(),
+                created_at: 1,
+            };
+            let project_b = ProjectRow {
+                id: Some(302),
+                slug: "project-b".to_string(),
+                human_key: "/workspace/project-b".to_string(),
+                created_at: 2,
+            };
+            insert_project_row_for_test(&cx, &pool, &project_a).await;
+            insert_project_row_for_test(&cx, &pool, &project_b).await;
+
+            let non_positive =
+                update_project_sibling_status(&cx, &pool, 0, 302, ProjectSiblingStatus::Confirmed)
+                    .await;
+            assert!(matches!(
+                non_positive,
+                Outcome::Err(DbError::InvalidArgument {
+                    field: "project_id",
+                    ..
+                })
+            ));
+
+            let self_pair = update_project_sibling_status(
+                &cx,
+                &pool,
+                301,
+                301,
+                ProjectSiblingStatus::Confirmed,
+            )
+            .await;
+            assert!(matches!(
+                self_pair,
+                Outcome::Err(DbError::InvalidArgument { .. })
+            ));
+
+            let missing_project = update_project_sibling_status(
+                &cx,
+                &pool,
+                301,
+                999,
+                ProjectSiblingStatus::Confirmed,
+            )
+            .await;
+            assert!(matches!(
+                missing_project,
+                Outcome::Err(DbError::NotFound {
+                    entity: "Project pair",
+                    ..
+                })
+            ));
+
+            let missing_suggestion = update_project_sibling_status(
+                &cx,
+                &pool,
+                301,
+                302,
+                ProjectSiblingStatus::Confirmed,
+            )
+            .await;
+            assert!(matches!(
+                missing_suggestion,
+                Outcome::Err(DbError::NotFound {
+                    entity: "Project sibling suggestion",
+                    ..
+                })
+            ));
+        });
+    }
+
+    #[test]
+    fn concurrent_duplicate_project_sibling_transitions_converge_idempotently() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) =
+            create_file_pool_with_schema_for_test_with_max("project-sibling-concurrent", 2);
+        rt.block_on(async {
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(401),
+                    slug: "project-a".to_string(),
+                    human_key: "/workspace/project-a".to_string(),
+                    created_at: 1,
+                },
+            )
+            .await;
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(402),
+                    slug: "project-b".to_string(),
+                    human_key: "/workspace/project-b".to_string(),
+                    created_at: 2,
+                },
+            )
+            .await;
+            insert_project_sibling_for_test(&cx, &pool, 401, 402, 0.99).await;
+        });
+
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let spawn_confirm = || {
+            let pool = pool.clone();
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build thread runtime");
+                start.wait();
+                rt.block_on(async {
+                    let cx = Cx::current().expect("runtime installs sibling test context");
+                    update_project_sibling_status(
+                        &cx,
+                        &pool,
+                        402,
+                        401,
+                        ProjectSiblingStatus::Confirmed,
+                    )
+                    .await
+                    .into_result()
+                    .expect("concurrent confirm")
+                })
+            })
+        };
+        let handles = [spawn_confirm(), spawn_confirm()];
+        let results = handles.map(|handle| handle.join().expect("join concurrent confirm"));
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[0].status, ProjectSiblingStatus::Confirmed);
+        assert!(results[0].confirmed_ts.is_some());
+        assert_eq!(results[0].dismissed_ts, None);
+
+        rt.block_on(async {
+            let rows = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list after concurrent confirms");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0], results[0]);
+        });
+    }
+
+    #[test]
+    fn project_sibling_similarity_is_bounded_and_respects_visibility_threshold() {
+        let backend = ProjectRow {
+            id: Some(501),
+            slug: "backend_core".to_string(),
+            human_key: "/workspace/backend_core".to_string(),
+            created_at: 1,
+        };
+        let frontend = ProjectRow {
+            id: Some(502),
+            slug: "backend_core_ui".to_string(),
+            human_key: "/workspace/backend_core_ui".to_string(),
+            created_at: 2,
+        };
+        let (high_score, high_rationale) = project_sibling_similarity(&backend, &frontend);
+        assert!(high_score >= PROJECT_SIBLING_MIN_SUGGESTION_SCORE);
+        assert_ne!(high_rationale, "");
+
+        let unrelated = ProjectRow {
+            id: Some(503),
+            slug: "zulu".to_string(),
+            human_key: "/workspace/zulu".to_string(),
+            created_at: 3,
+        };
+        let alpha = ProjectRow {
+            id: Some(504),
+            slug: "alpha".to_string(),
+            human_key: "/workspace/alpha".to_string(),
+            created_at: 4,
+        };
+        let (low_score, low_rationale) = project_sibling_similarity(&alpha, &unrelated);
+        assert_eq!(low_score, 0.85);
+        assert!(low_score < PROJECT_SIBLING_MIN_SUGGESTION_SCORE);
+        assert!(low_rationale.contains("same parent directory"));
+
+        let mut duplicate = backend.clone();
+        duplicate.id = Some(505);
+        duplicate.slug = "backend-core-alias".to_string();
+        let (duplicate_score, _) = project_sibling_similarity(&backend, &duplicate);
+        assert_eq!(duplicate_score, 0.0);
+
+        let long_left = "a".repeat(PROJECT_SIBLING_SIMILARITY_INPUT_LIMIT * 20);
+        let long_right = "b".repeat(PROJECT_SIBLING_SIMILARITY_INPUT_LIMIT * 20);
+        let bounded_score = bounded_project_similarity(&long_left, &long_right);
+        assert!((0.0..=1.0).contains(&bounded_score));
+        assert_eq!(bounded_score, 0.0);
+    }
+
+    #[test]
+    fn project_sibling_creation_seeds_bounded_canonical_suggestions_atomically() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("project-sibling-create-seed");
+
+        rt.block_on(async {
+            let first = ensure_project(&cx, &pool, "/workspace/backend_core")
+                .await
+                .into_result()
+                .expect("create first sibling project");
+            let first_id = first.id.expect("first project id");
+            assert_eq!(
+                list_project_sibling_suggestions(&cx, &pool)
+                    .await
+                    .into_result()
+                    .expect("list before second project")
+                    .len(),
+                0
+            );
+
+            let second = ensure_project(&cx, &pool, "/workspace/backend_core_ui")
+                .await
+                .into_result()
+                .expect("create second sibling project");
+            let second_id = second.id.expect("second project id");
+            let seeded = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list creation-seeded sibling");
+            assert_eq!(seeded.len(), 1);
+            assert_eq!(seeded[0].project_a.id, first_id.min(second_id));
+            assert_eq!(seeded[0].project_b.id, first_id.max(second_id));
+            assert_eq!(seeded[0].status, ProjectSiblingStatus::Suggested);
+            assert!(seeded[0].score >= PROJECT_SIBLING_MIN_SUGGESTION_SCORE);
+
+            let evaluated_ts = seeded[0].evaluated_ts;
+            ensure_project(&cx, &pool, "/workspace/backend_core_ui")
+                .await
+                .into_result()
+                .expect("repeat second project lookup");
+            let after_repeat = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list after repeated project lookup");
+            assert_eq!(after_repeat.len(), 1);
+            assert_eq!(after_repeat[0].evaluated_ts, evaluated_ts);
+        });
+    }
+
+    #[test]
+    fn project_sibling_creation_considers_recent_projects_after_older_unrelated_rows() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("project-sibling-recent-seed");
+
+        rt.block_on(async {
+            for human_key in [
+                "/workspace/alpha",
+                "/workspace/bravo",
+                "/workspace/charlie",
+                "/workspace/delta",
+            ] {
+                ensure_project(&cx, &pool, human_key)
+                    .await
+                    .into_result()
+                    .expect("create older unrelated project");
+            }
+
+            let backend = ensure_project(&cx, &pool, "/workspace/backend_core")
+                .await
+                .into_result()
+                .expect("create recent sibling project");
+            let backend_ui = ensure_project(&cx, &pool, "/workspace/backend_core_ui")
+                .await
+                .into_result()
+                .expect("create newest sibling project");
+            let backend_id = backend.id.expect("backend project id");
+            let backend_ui_id = backend_ui.id.expect("backend UI project id");
+            let expected_pair = (backend_id.min(backend_ui_id), backend_id.max(backend_ui_id));
+
+            let suggestions = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list creation-seeded siblings");
+            let sibling = suggestions
+                .iter()
+                .find(|suggestion| {
+                    (suggestion.project_a.id, suggestion.project_b.id) == expected_pair
+                })
+                .expect("newest related projects must be evaluated together");
+            assert!(sibling.score >= PROJECT_SIBLING_MIN_SUGGESTION_SCORE);
+            assert_eq!(sibling.status, ProjectSiblingStatus::Suggested);
+
+            let newest_pairs = suggestions
+                .iter()
+                .filter(|suggestion| {
+                    suggestion.project_a.id == backend_ui_id
+                        || suggestion.project_b.id == backend_ui_id
+                })
+                .count();
+            assert_eq!(newest_pairs, PROJECT_SIBLING_REFRESH_LIMIT);
+        });
+    }
+
+    #[test]
+    fn project_sibling_refresh_inserts_canonical_rows_and_honors_ttl() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("project-sibling-refresh");
+
+        rt.block_on(async {
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(511),
+                    slug: "backend_core".to_string(),
+                    human_key: "/workspace/backend_core".to_string(),
+                    created_at: 1,
+                },
+            )
+            .await;
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(512),
+                    slug: "backend_core_ui".to_string(),
+                    human_key: "/workspace/backend_core_ui".to_string(),
+                    created_at: 2,
+                },
+            )
+            .await;
+
+            let first = refresh_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("initial sibling refresh");
+            assert_eq!(
+                first,
+                ProjectSiblingRefreshSummary {
+                    evaluated: 1,
+                    inserted: 1,
+                    refreshed: 0,
+                }
+            );
+            let first_rows = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list initial sibling refresh");
+            assert_eq!(first_rows.len(), 1);
+            assert_eq!(first_rows[0].project_a.id, 511);
+            assert_eq!(first_rows[0].project_b.id, 512);
+            assert!(first_rows[0].score >= PROJECT_SIBLING_MIN_SUGGESTION_SCORE);
+            let evaluated_ts = first_rows[0].evaluated_ts;
+
+            let second = refresh_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("fresh sibling refresh should be a no-op");
+            assert_eq!(second, ProjectSiblingRefreshSummary::default());
+            let second_rows = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list after fresh no-op");
+            assert_eq!(second_rows[0].evaluated_ts, evaluated_ts);
+        });
+    }
+
+    #[test]
+    fn project_sibling_refresh_normalizes_reversed_rows_without_duplication() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("project-sibling-reversed");
+
+        rt.block_on(async {
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(521),
+                    slug: "backend_core".to_string(),
+                    human_key: "/workspace/backend_core".to_string(),
+                    created_at: 1,
+                },
+            )
+            .await;
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(522),
+                    slug: "backend_core_ui".to_string(),
+                    human_key: "/workspace/backend_core_ui".to_string(),
+                    created_at: 2,
+                },
+            )
+            .await;
+            insert_project_sibling_for_test(&cx, &pool, 522, 521, 0.1).await;
+
+            let summary = refresh_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("refresh reversed row");
+            assert_eq!(summary.evaluated, 1);
+            assert_eq!(summary.inserted, 0);
+            assert_eq!(summary.refreshed, 1);
+
+            let rows = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list normalized row");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].project_a.id, 521);
+            assert_eq!(rows[0].project_b.id, 522);
+            assert!(rows[0].score >= PROJECT_SIBLING_MIN_SUGGESTION_SCORE);
+        });
+    }
+
+    #[test]
+    fn project_sibling_refresh_preserves_decisions_and_dismiss_cooldown() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("project-sibling-decisions");
+
+        rt.block_on(async {
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(531),
+                    slug: "backend_core".to_string(),
+                    human_key: "/workspace/backend_core".to_string(),
+                    created_at: 1,
+                },
+            )
+            .await;
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(532),
+                    slug: "backend_core_ui".to_string(),
+                    human_key: "/workspace/backend_core_ui".to_string(),
+                    created_at: 2,
+                },
+            )
+            .await;
+            refresh_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("seed sibling suggestion");
+
+            let confirmed = update_project_sibling_status(
+                &cx,
+                &pool,
+                532,
+                531,
+                ProjectSiblingStatus::Confirmed,
+            )
+            .await
+            .into_result()
+            .expect("confirm suggestion");
+            let confirmed_ts = confirmed.confirmed_ts.expect("confirmed timestamp");
+            let stale_evaluated_ts = now_micros() - PROJECT_SIBLING_REFRESH_TTL_MICROS - 1;
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire stale-confirm fixture connection");
+            let tracked_conn = tracked(&*conn);
+            map_sql_outcome(
+                traw_execute(
+                    &cx,
+                    &tracked_conn,
+                    "UPDATE project_sibling_suggestions SET evaluated_ts = ? WHERE id = ?",
+                    &[
+                        Value::BigInt(stale_evaluated_ts),
+                        Value::BigInt(confirmed.id),
+                    ],
+                )
+                .await,
+            )
+            .into_result()
+            .expect("age confirmed suggestion");
+            drop(conn);
+
+            let confirmed_refresh = refresh_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("refresh confirmed suggestion");
+            assert_eq!(confirmed_refresh.refreshed, 1);
+            let confirmed_rows = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list refreshed confirmed suggestion");
+            assert_eq!(confirmed_rows[0].status, ProjectSiblingStatus::Confirmed);
+            assert_eq!(confirmed_rows[0].confirmed_ts, Some(confirmed_ts));
+            assert_eq!(confirmed_rows[0].dismissed_ts, None);
+
+            let dismissed = update_project_sibling_status(
+                &cx,
+                &pool,
+                531,
+                532,
+                ProjectSiblingStatus::Dismissed,
+            )
+            .await
+            .into_result()
+            .expect("dismiss suggestion");
+            let dismissed_ts = dismissed.dismissed_ts.expect("dismissed timestamp");
+            let within_cooldown_ts = now_micros() - 6 * 24 * 60 * 60 * 1_000_000;
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire cooldown fixture connection");
+            let tracked_conn = tracked(&*conn);
+            map_sql_outcome(
+                traw_execute(
+                    &cx,
+                    &tracked_conn,
+                    "UPDATE project_sibling_suggestions SET evaluated_ts = ? WHERE id = ?",
+                    &[
+                        Value::BigInt(within_cooldown_ts),
+                        Value::BigInt(dismissed.id),
+                    ],
+                )
+                .await,
+            )
+            .into_result()
+            .expect("age dismissed suggestion within cooldown");
+            drop(conn);
+
+            let blocked_refresh = refresh_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("dismiss cooldown refresh");
+            assert_eq!(blocked_refresh, ProjectSiblingRefreshSummary::default());
+            let blocked_rows = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list cooldown-protected suggestion");
+            assert_eq!(blocked_rows[0].evaluated_ts, within_cooldown_ts);
+            assert_eq!(blocked_rows[0].dismissed_ts, Some(dismissed_ts));
+
+            let expired_cooldown_ts = now_micros() - PROJECT_SIBLING_DISMISS_COOLDOWN_MICROS - 1;
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire expired-cooldown fixture connection");
+            let tracked_conn = tracked(&*conn);
+            map_sql_outcome(
+                traw_execute(
+                    &cx,
+                    &tracked_conn,
+                    "UPDATE project_sibling_suggestions SET evaluated_ts = ? WHERE id = ?",
+                    &[
+                        Value::BigInt(expired_cooldown_ts),
+                        Value::BigInt(dismissed.id),
+                    ],
+                )
+                .await,
+            )
+            .into_result()
+            .expect("expire dismissed suggestion cooldown");
+            drop(conn);
+
+            let expired_refresh = refresh_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("refresh after dismiss cooldown");
+            assert_eq!(expired_refresh.refreshed, 1);
+            let expired_rows = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list refreshed dismissed suggestion");
+            assert_eq!(expired_rows[0].status, ProjectSiblingStatus::Dismissed);
+            assert_eq!(expired_rows[0].confirmed_ts, None);
+            assert_eq!(expired_rows[0].dismissed_ts, Some(dismissed_ts));
+            assert!(expired_rows[0].evaluated_ts > expired_cooldown_ts);
+        });
+    }
+
+    #[test]
+    fn project_sibling_refresh_enforces_pair_limit_and_cancellation() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let healthy_cx = Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("project-sibling-limits");
+
+        rt.block_on(async {
+            for id in 541..=545 {
+                insert_project_row_for_test(
+                    &healthy_cx,
+                    &pool,
+                    &ProjectRow {
+                        id: Some(id),
+                        slug: format!("project-{id}"),
+                        human_key: format!("/workspace/project-{id}"),
+                        created_at: id,
+                    },
+                )
+                .await;
+            }
+
+            let cancelled_cx = Cx::for_request_with_budget(
+                asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+            );
+            let cancelled = refresh_project_sibling_suggestions(&cancelled_cx, &pool).await;
+            assert!(matches!(cancelled, Outcome::Cancelled(_)));
+            let rows_after_cancel = list_project_sibling_suggestions(&healthy_cx, &pool)
+                .await
+                .into_result()
+                .expect("list after cancelled refresh");
+            assert_eq!(rows_after_cancel.len(), 0);
+
+            let summary = refresh_project_sibling_suggestions(&healthy_cx, &pool)
+                .await
+                .into_result()
+                .expect("bounded refresh");
+            assert_eq!(summary.evaluated, PROJECT_SIBLING_REFRESH_LIMIT);
+            assert_eq!(summary.inserted, PROJECT_SIBLING_REFRESH_LIMIT);
+            let rows = list_project_sibling_suggestions(&healthy_cx, &pool)
+                .await
+                .into_result()
+                .expect("list bounded refresh");
+            assert_eq!(rows.len(), PROJECT_SIBLING_REFRESH_LIMIT);
+            assert!(
+                rows.iter().all(|row| row.project_a.id < row.project_b.id),
+                "new sibling rows must always use canonical orientation"
+            );
+        });
+    }
+
+    #[test]
+    fn concurrent_project_sibling_refreshes_converge_without_duplicates() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) =
+            create_file_pool_with_schema_for_test_with_max("project-sibling-refresh-race", 2);
+        rt.block_on(async {
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(551),
+                    slug: "backend_core".to_string(),
+                    human_key: "/workspace/backend_core".to_string(),
+                    created_at: 1,
+                },
+            )
+            .await;
+            insert_project_row_for_test(
+                &cx,
+                &pool,
+                &ProjectRow {
+                    id: Some(552),
+                    slug: "backend_core_ui".to_string(),
+                    human_key: "/workspace/backend_core_ui".to_string(),
+                    created_at: 2,
+                },
+            )
+            .await;
+        });
+
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let spawn_refresh = || {
+            let pool = pool.clone();
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build thread runtime");
+                start.wait();
+                rt.block_on(async {
+                    let cx = Cx::current().expect("runtime installs sibling refresh context");
+                    refresh_project_sibling_suggestions(&cx, &pool)
+                        .await
+                        .into_result()
+                        .expect("concurrent sibling refresh")
+                })
+            })
+        };
+        let handles = [spawn_refresh(), spawn_refresh()];
+        let summaries = handles.map(|handle| handle.join().expect("join sibling refresh"));
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.inserted)
+                .sum::<usize>(),
+            1
+        );
+
+        rt.block_on(async {
+            let rows = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list after concurrent refreshes");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].project_a.id, 551);
+            assert_eq!(rows[0].project_b.id, 552);
+        });
     }
 
     #[test]
@@ -15859,7 +19334,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect("acquire a");
-            crate::schema::migrate_to_latest_base(&cx, &*conn_a)
+            crate::schema::migrate_to_latest_base(&cx, &**conn_a)
                 .await
                 .into_result()
                 .expect("migrate a");
@@ -15868,7 +19343,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect("acquire b");
-            crate::schema::migrate_to_latest_base(&cx, &*conn_b)
+            crate::schema::migrate_to_latest_base(&cx, &**conn_b)
                 .await
                 .into_result()
                 .expect("migrate b");
@@ -16121,6 +19596,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn messages_id_floor_uses_maximum_across_duplicate_sequence_rows() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("message-id-floor-duplicate-sequence.db");
+        rt.block_on(async {
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            conn.execute_raw(
+                "DELETE FROM sqlite_sequence WHERE name = 'messages'; \
+                 INSERT INTO sqlite_sequence(name, seq) VALUES ('messages', 7); \
+                 INSERT INTO sqlite_sequence(name, seq) VALUES ('messages', 42); \
+                 INSERT INTO sqlite_sequence(name, seq) VALUES ('messages', 19);",
+            )
+            .expect("seed duplicate sequence rows");
+            let tracked = tracked(&*conn);
+
+            let outcome = read_messages_id_floor(&cx, &tracked).await;
+            assert!(
+                matches!(&outcome, Outcome::Ok(42)),
+                "the aggregate must use MAX(seq) across every duplicate row; got {outcome:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn messages_id_floor_never_coerces_failure_outcomes_or_empty_rows_to_zero() {
+        let error = decode_messages_id_floor_outcome(Outcome::Err(DbError::Sqlite(
+            "injected floor query failure".to_string(),
+        )));
+        assert!(matches!(
+            error,
+            Outcome::Err(DbError::Sqlite(message))
+                if message == "injected floor query failure"
+        ));
+
+        let expected_cancel = CancelReason::user("injected floor cancellation");
+        let cancelled =
+            decode_messages_id_floor_outcome(Outcome::Cancelled(expected_cancel.clone()));
+        assert!(matches!(
+            cancelled,
+            Outcome::Cancelled(reason) if reason == expected_cancel
+        ));
+
+        let expected_panic = asupersync::PanicPayload::new("injected floor panic");
+        let panicked = decode_messages_id_floor_outcome(Outcome::Panicked(expected_panic.clone()));
+        assert!(matches!(
+            panicked,
+            Outcome::Panicked(payload) if payload == expected_panic
+        ));
+
+        let empty = decode_messages_id_floor_outcome(Outcome::Ok(Vec::new()));
+        assert!(
+            matches!(empty, Outcome::Err(DbError::Internal(message)) if message.contains(
+                "exactly one"
+            ))
+        );
+    }
+
     fn setup_test_pool(db_name: &str) -> (Cx, DbPool, tempfile::TempDir) {
         let cx = Cx::for_testing();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -16149,6 +19688,66 @@ mod tests {
             Outcome::Panicked(payload) => std::panic::resume_unwind(Box::new(payload)),
         }
         (cx, pool, dir)
+    }
+
+    #[test]
+    fn set_agent_retired_at_preserves_first_timestamp_until_explicit_unretire() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build retirement idempotency runtime");
+        let (cx, pool, _dir) = setup_test_pool("retirement_timestamp_idempotency.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/retirement-timestamp-idempotency")
+                .await
+                .into_result()
+                .expect("create retirement test project");
+            let agent = register_agent(
+                &cx,
+                &pool,
+                project.id.expect("project id"),
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("retirement idempotency test"),
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register retirement test agent");
+            let agent_id = agent.id.expect("agent id");
+
+            let first = set_agent_retired_at(&cx, &pool, agent_id, Some(111))
+                .await
+                .into_result()
+                .expect("retire agent first time");
+            assert_eq!(first.retired_at, Some(111));
+
+            let retry = set_agent_retired_at(&cx, &pool, agent_id, Some(222))
+                .await
+                .into_result()
+                .expect("retry retirement");
+            assert_eq!(
+                retry.retired_at,
+                Some(111),
+                "a later retry must not replace the first durable retirement timestamp"
+            );
+
+            let active = set_agent_retired_at(&cx, &pool, agent_id, None)
+                .await
+                .into_result()
+                .expect("explicitly unretire agent");
+            assert_eq!(active.retired_at, None);
+
+            let second_retirement = set_agent_retired_at(&cx, &pool, agent_id, Some(333))
+                .await
+                .into_result()
+                .expect("retire agent after explicit reactivation");
+            assert_eq!(second_retirement.retired_at, Some(333));
+        });
     }
 
     fn open_direct_repair_connection(db_path: &std::path::Path) -> crate::DbConn {
@@ -18672,8 +22271,6 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
-
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("register_then_get_agent.db");
         let init_conn = crate::DbConn::open_file(db_path.display().to_string())
@@ -18696,6 +22293,7 @@ mod tests {
             ..Default::default()
         };
         let pool = crate::create_pool(&cfg).expect("create pool");
+        let cx = asupersync::Cx::for_testing();
 
         rt.block_on(async {
             let base = now_micros();
@@ -18958,6 +22556,250 @@ mod tests {
             "agent must be visible to a fresh canonical handle"
         );
         drop(pool);
+    }
+
+    #[test]
+    fn post_commit_checkpoint_requires_complete_progress_tuple() {
+        let conn = crate::DbConn::open_file(":memory:".to_string()).expect("open test database");
+        let cases = [
+            (
+                "SELECT 0 AS busy, -1 AS log, -1 AS checkpointed",
+                true,
+                "non-WAL sentinel",
+            ),
+            (
+                "SELECT 0 AS busy, 5 AS log, 5 AS checkpointed",
+                true,
+                "fully backfilled WAL",
+            ),
+            (
+                "SELECT 0 AS busy, 5 AS log, 4 AS checkpointed",
+                false,
+                "PASSIVE checkpoint with unbackfilled frames",
+            ),
+            (
+                "SELECT 1 AS busy, 5 AS log, 5 AS checkpointed",
+                false,
+                "busy checkpoint",
+            ),
+            (
+                "SELECT 0 AS busy, -2 AS log, -2 AS checkpointed",
+                false,
+                "malformed negative counts",
+            ),
+        ];
+
+        for (sql, expected, case) in cases {
+            let rows = conn.query_sync(sql, &[]).expect("query checkpoint tuple");
+            let progress = wal_checkpoint_progress(&rows).expect("decode checkpoint tuple");
+            assert_eq!(progress.fully_published(), expected, "{case}: {progress:?}");
+        }
+
+        let malformed = conn
+            .query_sync("SELECT 0 AS busy, 5 AS log", &[])
+            .expect("query malformed checkpoint tuple");
+        assert_eq!(
+            wal_checkpoint_progress(&malformed),
+            None,
+            "missing progress columns must fail closed"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn commit_tx_does_not_wait_for_external_reader_checkpoint() {
+        const READER_PATH_ENV: &str = "MCP_AGENT_MAIL_COMMIT_READER_PATH";
+        const READER_READY: &str = "commit-reader-ready";
+        const TEST_NAME: &str =
+            "queries::tests::commit_tx_does_not_wait_for_external_reader_checkpoint";
+
+        if let Some(db_path) = std::env::var_os(READER_PATH_ENV) {
+            use std::io::{BufRead as _, Write as _};
+
+            let reader = crate::CanonicalDbConn::open_file(
+                std::path::PathBuf::from(db_path).to_string_lossy().as_ref(),
+            )
+            .expect("child opens external canonical reader");
+            reader
+                .execute_raw("BEGIN;")
+                .expect("child begins external read transaction");
+            reader
+                .query_sync("SELECT COUNT(*) FROM projects", &[])
+                .expect("child pins external read snapshot");
+            println!("{READER_READY}");
+            std::io::stdout()
+                .flush()
+                .expect("flush external reader witness");
+
+            let mut release = String::new();
+            std::io::stdin()
+                .lock()
+                .read_line(&mut release)
+                .expect("read external reader release signal");
+            assert_eq!(release.trim(), "release");
+            reader
+                .execute_raw("ROLLBACK;")
+                .expect("child releases external read transaction");
+            return;
+        }
+
+        use std::io::{BufRead as _, Write as _};
+        use std::process::Stdio;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().expect("external-reader tempdir");
+        let db_path = directory.path().join("external-reader.sqlite3");
+        let pool = crate::create_pool(&crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create external-reader pool");
+        let setup_runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build external-reader setup runtime");
+        let setup_cx = asupersync::Cx::for_testing();
+        setup_runtime
+            .block_on(ensure_project(
+                &setup_cx,
+                &pool,
+                "/workspace/commit-reader-baseline",
+            ))
+            .into_result()
+            .expect("initialize external-reader schema and baseline row");
+
+        let mut reader = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg(TEST_NAME)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(READER_PATH_ENV, &db_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn external canonical reader child");
+        let mut reader_stdout = std::io::BufReader::new(
+            reader
+                .stdout
+                .take()
+                .expect("capture external reader stdout"),
+        );
+        let mut ready = false;
+        loop {
+            let mut line = String::new();
+            if reader_stdout
+                .read_line(&mut line)
+                .expect("read external reader witness")
+                == 0
+            {
+                break;
+            }
+            if line.contains(READER_READY) {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "external reader exited before publishing readiness");
+
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let writer_pool = pool.clone();
+        let writer = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build external-reader writer runtime");
+            let cx = asupersync::Cx::for_testing();
+            let result = runtime.block_on(ensure_project(
+                &cx,
+                &writer_pool,
+                "/workspace/commit-must-not-checkpoint",
+            ));
+            result_tx
+                .send(result)
+                .expect("publish external-reader writer result");
+        });
+
+        let prompt_result = result_rx.recv_timeout(Duration::from_secs(3));
+        writeln!(
+            reader
+                .stdin
+                .as_mut()
+                .expect("external reader stdin remains available"),
+            "release"
+        )
+        .expect("release external canonical reader");
+        let reader_status = reader.wait().expect("wait for external reader child");
+        assert!(reader_status.success(), "external reader child failed");
+
+        let completed_while_reader_held = prompt_result.is_ok();
+        let result = match prompt_result {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => result_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("writer must finish after releasing external reader"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("external-reader writer disconnected")
+            }
+        };
+        writer.join().expect("join external-reader writer");
+        let project = result
+            .into_result()
+            .expect("writer commits project while external reader is active");
+
+        assert!(
+            completed_while_reader_held,
+            "COMMIT must not run a checkpoint that waits for an unrelated external reader"
+        );
+        assert_eq!(
+            project.human_key, "/workspace/commit-must-not-checkpoint",
+            "writer returns the committed project"
+        );
+
+        let pooled = setup_runtime
+            .block_on(pool.acquire(&setup_cx))
+            .into_result()
+            .expect("reacquire writer connection after commit");
+        let timeout_rows = pooled
+            .query_sync("PRAGMA busy_timeout;", &[])
+            .expect("read restored runtime busy timeout");
+        assert_eq!(
+            timeout_rows
+                .first()
+                .and_then(|row| row.get(0))
+                .and_then(value_as_i64),
+            Some(
+                i64::try_from(mcp_agent_mail_core::config::DB_RUNTIME_BUSY_TIMEOUT_MS)
+                    .expect("runtime busy timeout fits i64")
+            ),
+            "post-commit publication must restore the connection's request lock-wait policy"
+        );
+        drop(pooled);
+
+        pool.wal_checkpoint_passive()
+            .expect("structured maintenance publishes deferred committed frames");
+        let verify = crate::CanonicalDbConn::open_file(
+            db_path
+                .to_str()
+                .expect("external-reader database path is UTF-8"),
+        )
+        .expect("open fresh canonical durability observer");
+        let rows = verify
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM projects WHERE human_key = ?",
+                &[Value::Text(
+                    "/workspace/commit-must-not-checkpoint".to_string(),
+                )],
+            )
+            .expect("query fresh canonical durability observer");
+        assert_eq!(
+            rows.first()
+                .and_then(|row| row.get_named::<i64>("count").ok()),
+            Some(1),
+            "structured maintenance publishes deferred WAL frames to a fresh canonical handle"
+        );
     }
 
     #[test]
@@ -19428,6 +23270,349 @@ mod tests {
         });
     }
 
+    /// GH#273: capped bulk mark-read honors the older-than filter, the per-call
+    /// cap (with a truthful `more` flag), never touches ack state, and leaves
+    /// other agents' unread rows alone.
+    #[test]
+    fn mark_messages_read_bulk_respects_filters_and_cap() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("mark_messages_read_bulk.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/bulk-mark-read")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender = register_agent(
+                &cx, &pool, project_id, "BlueLake", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let sender_id = sender.id.expect("sender id");
+            let recipient = register_agent(
+                &cx, &pool, project_id, "GreenStone", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+            let recipient_id = recipient.id.expect("recipient id");
+            let bystander = register_agent(
+                &cx, &pool, project_id, "AmberHill", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register bystander");
+            let bystander_id = bystander.id.expect("bystander id");
+
+            let day_us: i64 = 86_400 * 1_000_000;
+            let now = now_micros();
+            let old_ts = now - 30 * day_us;
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            // Messages 1-3 old, 4-5 fresh; all unread for the recipient. The
+            // bystander also receives message 1 (must stay unread for them).
+            for (id, created_ts) in [
+                (1, old_ts),
+                (2, old_ts + 1),
+                (3, old_ts + 2),
+                (4, now),
+                (5, now + 1),
+            ] {
+                conn.execute_raw(&format!(
+                    "INSERT INTO messages \
+                     (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+                     VALUES ({id}, {project_id}, {sender_id}, 'bulk', 's{id}', 'b', 'normal', 0, {created_ts}, '[]')"
+                ))
+                .expect("insert message");
+                conn.execute_raw(&format!(
+                    "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                     VALUES ({id}, {recipient_id}, 'to', NULL, NULL)"
+                ))
+                .expect("insert recipient row");
+            }
+            conn.execute_raw(&format!(
+                "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                 VALUES (1, {bystander_id}, 'cc', NULL, NULL)"
+            ))
+            .expect("insert bystander row");
+            drop(conn);
+
+            // Older-than filter: only the three aged messages transition.
+            let outcome = mark_messages_read_bulk(
+                &cx,
+                &pool,
+                project_id,
+                recipient_id,
+                Some(old_ts + 2),
+                500,
+            )
+            .await
+            .into_result()
+            .expect("bulk mark aged");
+            assert_eq!(outcome.marked, 3, "exactly the aged messages are marked");
+            assert!(!outcome.more, "no aged backlog remains");
+
+            // Cap: one of the two remaining unread messages, more=true.
+            let outcome =
+                mark_messages_read_bulk(&cx, &pool, project_id, recipient_id, None, 1)
+                    .await
+                    .into_result()
+                    .expect("bulk mark capped");
+            assert_eq!(outcome.marked, 1);
+            assert!(outcome.more, "one unread message remains past the cap");
+
+            // Drain the rest.
+            let outcome =
+                mark_messages_read_bulk(&cx, &pool, project_id, recipient_id, None, 500)
+                    .await
+                    .into_result()
+                    .expect("bulk mark drain");
+            assert_eq!(outcome.marked, 1);
+            assert!(!outcome.more);
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("reacquire connection");
+            let unread = conn
+                .query_sync(
+                    &format!(
+                        "SELECT COUNT(*) AS c FROM message_recipients \
+                         WHERE agent_id = {recipient_id} AND read_ts IS NULL"
+                    ),
+                    &[],
+                )
+                .expect("count unread");
+            assert_eq!(unread[0].get_named::<i64>("c").unwrap(), 0);
+            // Ack state untouched; bystander unaffected.
+            let acked = conn
+                .query_sync(
+                    &format!(
+                        "SELECT COUNT(*) AS c FROM message_recipients \
+                         WHERE agent_id = {recipient_id} AND ack_ts IS NOT NULL"
+                    ),
+                    &[],
+                )
+                .expect("count acked");
+            assert_eq!(acked[0].get_named::<i64>("c").unwrap(), 0, "read-only: never acks");
+            let bystander_unread = conn
+                .query_sync(
+                    &format!(
+                        "SELECT COUNT(*) AS c FROM message_recipients \
+                         WHERE agent_id = {bystander_id} AND read_ts IS NULL"
+                    ),
+                    &[],
+                )
+                .expect("count bystander unread");
+            assert_eq!(
+                bystander_unread[0].get_named::<i64>("c").unwrap(),
+                1,
+                "another agent's unread state is untouched"
+            );
+        });
+    }
+
+    /// GH#273: the message retention prune deletes only settled (fully read,
+    /// fully acked where required) messages past the horizon — inclusive at
+    /// the boundary — cascades FK-safely through recipient/delivery/receipt
+    /// rows, respects the per-sweep cap, and reports would-prune counts.
+    #[test]
+    fn prune_settled_messages_eligibility_cascade_and_cap() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("prune_settled_messages.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/prune-messages")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender = register_agent(
+                &cx, &pool, project_id, "BlueLake", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let sender_id = sender.id.expect("sender id");
+            let reader_a = register_agent(
+                &cx, &pool, project_id, "GreenStone", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register reader A");
+            let a_id = reader_a.id.expect("reader A id");
+            let reader_b = register_agent(
+                &cx, &pool, project_id, "AmberHill", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register reader B");
+            let b_id = reader_b.id.expect("reader B id");
+
+            let day_us: i64 = 86_400 * 1_000_000;
+            let now = now_micros();
+            let horizon = now - 30 * day_us;
+            let old_ts = horizon - day_us;
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            // m1: read by both, no ack required, created EXACTLY at the
+            //     horizon (inclusive boundary) → prunable.
+            // m2: read by A only → NOT prunable (unread mail is never pruned).
+            // m3: ack required, read+acked by both → prunable.
+            // m4: ack required, read by both, acked by A only → NOT prunable.
+            // m5: read by both but fresh → NOT prunable (horizon).
+            // m6: zero recipient rows, old → vacuously settled, prunable.
+            let seed: &[(i64, i64, i64)] = &[
+                (1, 0, horizon),
+                (2, 0, old_ts),
+                (3, 1, old_ts),
+                (4, 1, old_ts),
+                (5, 0, now),
+                (6, 0, old_ts),
+            ];
+            for (id, ack_required, created_ts) in seed {
+                conn.execute_raw(&format!(
+                    "INSERT INTO messages \
+                     (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+                     VALUES ({id}, {project_id}, {sender_id}, 'ret', 's{id}', 'b', 'normal', {ack_required}, {created_ts}, '[]')"
+                ))
+                .expect("insert message");
+            }
+            let read = now - day_us;
+            let read_s = read.to_string();
+            let recipient_rows: Vec<(i64, i64, &str, &str)> = vec![
+                (1, a_id, read_s.as_str(), "NULL"),
+                (1, b_id, read_s.as_str(), "NULL"),
+                (2, a_id, read_s.as_str(), "NULL"),
+                (2, b_id, "NULL", "NULL"),
+                (3, a_id, read_s.as_str(), read_s.as_str()),
+                (3, b_id, read_s.as_str(), read_s.as_str()),
+                (4, a_id, read_s.as_str(), read_s.as_str()),
+                (4, b_id, read_s.as_str(), "NULL"),
+                (5, a_id, read_s.as_str(), "NULL"),
+            ];
+            for (message_id, agent_id, read_ts, ack_ts) in &recipient_rows {
+                conn.execute_raw(&format!(
+                    "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                     VALUES ({message_id}, {agent_id}, 'to', {read_ts}, {ack_ts})"
+                ))
+                .expect("insert recipient row");
+            }
+            // Message-bound signal receipt for a prunable message (the v26
+            // ledger has no delete path of its own).
+            conn.execute_raw(&format!(
+                "INSERT INTO message_delivery_signal_receipts \
+                 (message_id, agent_id, delivery_route, signal_path_digest, observed_ts) \
+                 VALUES (1, {a_id}, 'signal_file', 'digest', {read})"
+            ))
+            .expect("insert signal receipt");
+            drop(conn);
+
+            // Report-only counter: three messages WOULD be pruned.
+            let would_prune = count_prunable_messages(&cx, &pool, horizon)
+                .await
+                .into_result()
+                .expect("count prunable");
+            assert_eq!(would_prune, 3, "m1, m3, m6 are settled and past the horizon");
+
+            // Per-sweep cap: only the oldest eligible message goes, more=true.
+            let capped = prune_settled_messages(&cx, &pool, horizon, 500, 1)
+                .await
+                .into_result()
+                .expect("capped prune");
+            assert_eq!(capped.deleted_messages, 1);
+            assert!(capped.more, "eligible backlog remains past the cap");
+
+            // Drain with a small batch size to exercise multi-batch commits.
+            let report = prune_settled_messages(&cx, &pool, horizon, 1, 500)
+                .await
+                .into_result()
+                .expect("full prune");
+            assert_eq!(report.deleted_messages, 2);
+            assert!(!report.more);
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("reacquire connection");
+            let remaining = conn
+                .query_sync("SELECT id FROM messages ORDER BY id", &[])
+                .expect("select remaining messages");
+            let ids: Vec<i64> = remaining
+                .iter()
+                .filter_map(|r| r.get_named::<i64>("id").ok())
+                .collect();
+            assert_eq!(
+                ids,
+                vec![2, 4, 5],
+                "unread (m2), unacked (m4), and fresh (m5) messages survive"
+            );
+
+            // FK integrity: no child table may reference a pruned message.
+            // (fts_messages is only checked when the FTS table exists in this
+            // pool — the messages_ad trigger clears it wherever it does.)
+            let fts_exists = !conn
+                .query_sync(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name = 'fts_messages'",
+                    &[],
+                )
+                .expect("probe fts_messages")
+                .is_empty();
+            let mut orphan_checks: Vec<(&str, &str)> = vec![
+                ("message_recipients", "message_id"),
+                ("inbox_delivery_events", "message_id"),
+                ("message_delivery_signal_receipts", "message_id"),
+            ];
+            if fts_exists {
+                orphan_checks.push(("fts_messages", "message_id"));
+            }
+            for (table, column) in orphan_checks {
+                let orphans = conn
+                    .query_sync(
+                        &format!(
+                            "SELECT COUNT(*) AS c FROM {table} t \
+                             LEFT JOIN messages m ON m.id = t.{column} \
+                             WHERE m.id IS NULL"
+                        ),
+                        &[],
+                    )
+                    .expect("count orphans");
+                assert_eq!(
+                    orphans[0].get_named::<i64>("c").unwrap(),
+                    0,
+                    "{table} must hold no rows for pruned messages"
+                );
+            }
+            // Unread state for survivors is intact.
+            let unread_b = conn
+                .query_sync(
+                    &format!(
+                        "SELECT COUNT(*) AS c FROM message_recipients \
+                         WHERE agent_id = {b_id} AND read_ts IS NULL"
+                    ),
+                    &[],
+                )
+                .expect("count unread");
+            assert_eq!(unread_b[0].get_named::<i64>("c").unwrap(), 1, "m2 stays unread for B");
+        });
+    }
+
     #[test]
     fn register_agent_without_task_description_clears_existing_description() {
         use asupersync::runtime::RuntimeBuilder;
@@ -19756,6 +23941,55 @@ mod tests {
         );
     }
 
+    /// A canonical GitHub-style key that differs from the stored row's
+    /// spelling only in owner case (and whose path does not exist on disk, so
+    /// no filesystem alias can rescue it) must resolve to the existing row via
+    /// the stable slug — the same identity `ensure_project` would reuse —
+    /// instead of reporting the project missing.
+    #[test]
+    fn get_project_by_human_key_falls_back_to_stable_slug_for_case_alias() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("slug-fallback-case-alias");
+        let historical_key = "/repos/github.com/Dicklesworthstone/some_nonexistent_repo";
+        let canonical_key = "/repos/github.com/dicklesworthstone/some_nonexistent_repo";
+
+        rt.block_on(async {
+            let seeded = ensure_project(&cx, &pool, historical_key)
+                .await
+                .into_result()
+                .expect("seed project under historical spelling");
+
+            let resolved = get_project_by_human_key(&cx, &pool, canonical_key)
+                .await
+                .into_result()
+                .expect("canonical case alias must resolve via the stable slug");
+
+            assert_eq!(resolved.id, seeded.id);
+            assert_eq!(resolved.slug, seeded.slug);
+            assert_eq!(resolved.human_key, historical_key);
+            assert_eq!(
+                count_projects_for_test(&cx, &pool).await,
+                1,
+                "slug fallback must reuse the existing row, not imply a second one"
+            );
+
+            // A key for a genuinely different project must still miss.
+            let unrelated = get_project_by_human_key(
+                &cx,
+                &pool,
+                "/repos/github.com/dicklesworthstone/entirely_other_repo",
+            )
+            .await
+            .into_result();
+            assert!(unrelated.is_err(), "unrelated key must stay NotFound");
+        });
+    }
+
     #[test]
     fn ensure_project_collapses_case_variants_when_filesystem_is_case_insensitive() {
         use asupersync::runtime::RuntimeBuilder;
@@ -19859,9 +24093,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("thread_limit_latest_window.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("thread_limit_latest_window.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-thread-limit-{base}"))
                 .await
@@ -19939,9 +24174,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("dedupe_duplicate_recipients.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("dedupe_duplicate_recipients.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-dedupe-recip-{base}"))
                 .await
@@ -20042,15 +24278,69 @@ mod tests {
     }
 
     #[test]
+    fn message_recipient_retry_insert_supports_current_and_legacy_primary_keys() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        for (schema_name, primary_key) in [
+            ("current", "PRIMARY KEY(message_id, agent_id)"),
+            ("legacy", "PRIMARY KEY(message_id, agent_id, kind)"),
+        ] {
+            let db_path = dir.path().join(format!("recipient_retry_{schema_name}.db"));
+            let conn = crate::DbConn::open_file(db_path.display().to_string())
+                .expect("open recipient retry fixture");
+            conn.execute_raw(&format!(
+                "CREATE TABLE message_recipients (\
+                    message_id INTEGER NOT NULL, \
+                    agent_id INTEGER NOT NULL, \
+                    kind TEXT NOT NULL, \
+                    read_ts INTEGER, \
+                    ack_ts INTEGER, \
+                    {primary_key}\
+                )"
+            ))
+            .unwrap_or_else(|error| panic!("create {schema_name} fixture: {error}"));
+
+            let params = [
+                Value::BigInt(8172),
+                Value::BigInt(193),
+                Value::Text("to".to_string()),
+            ];
+            conn.execute_sync(INSERT_MESSAGE_RECIPIENT_SQL, &params)
+                .unwrap_or_else(|error| panic!("insert into {schema_name} fixture: {error}"));
+            conn.execute_sync(INSERT_MESSAGE_RECIPIENT_SQL, &params)
+                .unwrap_or_else(|error| panic!("retry {schema_name} insert: {error}"));
+
+            let rows = conn
+                .query_sync(
+                    "SELECT COUNT(*) AS count, MIN(kind) AS kind FROM message_recipients",
+                    &[],
+                )
+                .unwrap_or_else(|error| panic!("query {schema_name} fixture: {error}"));
+            assert_eq!(
+                rows[0].get_named::<i64>("count").unwrap_or(-1),
+                1,
+                "{schema_name} retry must leave exactly one recipient row"
+            );
+            assert_eq!(
+                rows[0].get_named::<String>("kind").expect("recipient kind"),
+                "to",
+                "{schema_name} retry must preserve recipient kind"
+            );
+        }
+    }
+
+    #[test]
     fn create_message_recipients_json_preserves_request_order() {
         use asupersync::runtime::RuntimeBuilder;
 
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("recipients_json_request_order.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("recipients_json_request_order.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-recip-order-{base}"))
                 .await
@@ -20147,9 +24437,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("thread_no_limit_order.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("thread_no_limit_order.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-thread-no-limit-{base}"))
                 .await
@@ -20227,9 +24518,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("thread_orphaned_sender.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("thread_orphaned_sender.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(
                 &cx,
@@ -20315,9 +24607,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("thread_roots_with_replies.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("thread_roots_with_replies.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(
                 &cx,
@@ -21332,7 +25625,6 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
 
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("message_recipient_durability_guard.db");
@@ -21390,6 +25682,7 @@ mod tests {
         let pool = crate::create_pool(&cfg).expect("create pool");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let project_id = 1_i64;
             let sender_id = 1_i64;
             let recipients = [(2_i64, "to")];
@@ -21744,9 +26037,11 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("create_message_rebuild_inbox_stats_chunks.db");
+        let (_setup_cx, pool, _dir) =
+            setup_test_pool("create_message_rebuild_inbox_stats_chunks.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let conn = crate::open_sqlite_file_with_recovery(pool.sqlite_path())
                 .expect("open sqlite connection for inbox_stats setup");
             create_inbox_stats_table_for_test(&conn);
@@ -23163,7 +27458,7 @@ mod tests {
                 let pool = crate::create_pool(&cfg).expect("create pool");
 
                 rt.block_on(async {
-                    let cx = Cx::for_testing();
+                    let cx = Cx::current().expect("runtime installs message test context");
                     let project = ensure_project(
                         &cx,
                         &pool,
@@ -23266,9 +27561,9 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = Cx::for_testing();
 
         let (project_id, sender_id, recipient_id) = rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let project = ensure_project(&cx, &pool, "/tmp/am-concurrent-message-durability")
                 .await
                 .into_result()
@@ -23323,10 +27618,11 @@ mod tests {
                         .expect("build thread runtime");
                     start_barrier.wait();
                     for message_idx in 0..messages_per_thread {
-                        let cx = Cx::for_testing();
                         let subject = format!("writer-{thread_idx}-message-{message_idx}");
                         let body = format!("body-{thread_idx}-{message_idx}");
                         match rt.block_on(async {
+                            let cx =
+                                Cx::current().expect("runtime installs message test context");
                             create_message_with_recipients(
                                 &cx,
                                 &pool,
@@ -23385,6 +27681,7 @@ mod tests {
         drop(failures);
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let rows = durability_probe_query(
                 &cx,
                 &pool,
@@ -23992,9 +28289,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("recent_contact_union_matches_legacy.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("recent_contact_union_matches_legacy.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-recent-union-{base}"))
                 .await
@@ -24236,9 +28534,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("recent_contact_bidirectional_dedup.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("recent_contact_bidirectional_dedup.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-recent-dedup-{base}"))
                 .await
@@ -24347,9 +28646,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("recent_contact_received_alias.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("recent_contact_received_alias.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-recent-alias-{base}"))
                 .await
@@ -24442,9 +28742,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("recent_contact_candidate_cap.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("recent_contact_candidate_cap.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-recent-cap-{base}"))
                 .await
@@ -24551,8 +28852,6 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
-
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("like_fallback_100_terms.db");
         let init_conn = crate::DbConn::open_file(db_path.display().to_string())
@@ -24576,6 +28875,7 @@ mod tests {
         let pool = crate::create_pool(&cfg).expect("create pool");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-like-fallback-{base}"))
                 .await
@@ -24647,8 +28947,6 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
-
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("like_fallback_union.db");
         let init_conn = crate::DbConn::open_file(db_path.display().to_string())
@@ -24672,6 +28970,7 @@ mod tests {
         let pool = crate::create_pool(&cfg).expect("create pool");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-like-union-{base}"))
                 .await
@@ -24783,9 +29082,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("search_orphaned_sender.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("search_orphaned_sender.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-search-orphaned-{base}"))
                 .await
@@ -24909,9 +29209,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("product_search_orphaned_sender.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("product_search_orphaned_sender.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(
                 &cx,
@@ -25333,9 +29634,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("product_inbox_global_fan_in.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("product_inbox_global_fan_in.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project_a = ensure_project(&cx, &pool, &format!("/tmp/am-product-inbox-a-{base}"))
                 .await
@@ -25615,8 +29917,6 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
-
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("product_search_across_projects.db");
         let init_conn = crate::DbConn::open_file(db_path.display().to_string())
@@ -25640,6 +29940,7 @@ mod tests {
         let pool = crate::create_pool(&cfg).expect("create pool");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project_a = ensure_project(&cx, &pool, &format!("/tmp/am-prod-search-a-{base}"))
                 .await
@@ -25700,7 +30001,7 @@ mod tests {
             .expect("create sender B");
             let sender_b_id = sender_b.id.expect("sender B id");
 
-            create_message(
+            create_message_with_recipients_topic(
                 &cx,
                 &pool,
                 project_a_id,
@@ -25708,9 +30009,11 @@ mod tests {
                 "alpha project-a signal",
                 "body A",
                 Some("THREAD-A"),
+                Some("br-search.1"),
                 "normal",
                 false,
                 "[]",
+                &[],
             )
             .await
             .into_result()
@@ -25750,6 +30053,8 @@ mod tests {
             );
             assert_eq!(rows[0].subject, "alpha project-b signal");
             assert_eq!(rows[1].subject, "alpha project-a signal");
+            assert_eq!(rows[0].topic, None);
+            assert_eq!(rows[1].topic.as_deref(), Some("br-search.1"));
         });
     }
 
@@ -25834,6 +30139,7 @@ mod tests {
                 project_id: 10,
                 sender_id: 100,
                 thread_id: Some("t1".to_string()),
+                topic: Some("br-abc.1".to_string()),
                 subject: "Test".to_string(),
                 body_md: "Body".to_string(),
                 importance: "normal".to_string(),
@@ -25847,11 +30153,13 @@ mod tests {
             ack_ts: None,
             project_id: 10,
             project_slug: "my-project".to_string(),
+            topic: Some("br-abc.1".to_string()),
         };
 
         assert_eq!(row.project_id, 10);
         assert_eq!(row.project_slug, "my-project");
         assert_eq!(row.message.subject, "Test");
+        assert_eq!(row.topic, row.message.topic);
     }
 
     #[test]
@@ -25881,12 +30189,14 @@ mod tests {
             body_md: "Content here".to_string(),
             project_id: 5,
             project_slug: "frontend".to_string(),
+            topic: Some("br-abc.1".to_string()),
         };
 
         assert_eq!(row.id, 1);
         assert_eq!(row.project_id, 5);
         assert_eq!(row.project_slug, "frontend");
         assert_eq!(row.from, "Bob");
+        assert_eq!(row.topic.as_deref(), Some("br-abc.1"));
     }
 
     #[test]
@@ -25946,8 +30256,6 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
-
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("global_inbox_case_insensitive.db");
         let init_conn = crate::DbConn::open_file(db_path.display().to_string())
@@ -25971,6 +30279,7 @@ mod tests {
         let pool = crate::create_pool(&cfg).expect("create pool");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-global-case-{base}"))
                 .await
@@ -26042,9 +30351,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("global_inbox_orphaned_sender.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("global_inbox_orphaned_sender.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project =
                 ensure_project(&cx, &pool, &format!("/tmp/am-global-inbox-orphaned-{base}"))
@@ -26131,9 +30441,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, dir) = setup_test_pool("global_inbox_orphaned_project.db");
+        let (_setup_cx, pool, dir) = setup_test_pool("global_inbox_orphaned_project.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(
                 &cx,
@@ -26221,9 +30532,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("unacked_orphaned_sender.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("unacked_orphaned_sender.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-unacked-orphaned-{base}"))
                 .await
@@ -26309,9 +30621,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("inbox_orphaned_sender.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("inbox_orphaned_sender.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-inbox-orphaned-{base}"))
                 .await
@@ -26390,15 +30703,164 @@ mod tests {
     }
 
     #[test]
+    fn fetch_inbox_topic_filter_is_exact_case_insensitive_and_applied_before_limit() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("inbox_topic_filter.db");
+
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-topic-filter-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender_id = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender")
+            .id
+            .expect("sender id");
+            let recipient_id = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient")
+            .id
+            .expect("recipient id");
+
+            create_message_with_recipients_topic(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "topic witness",
+                "topic body",
+                Some("topic-thread"),
+                Some("Br-Abc.1"),
+                "normal",
+                false,
+                "[]",
+                &[(recipient_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create topic message");
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "newer topicless message",
+                "topicless body",
+                None,
+                "normal",
+                false,
+                "[]",
+                &[(recipient_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create topicless message");
+
+            let filtered = fetch_inbox_filtered(
+                &cx,
+                &pool,
+                project_id,
+                recipient_id,
+                false,
+                false,
+                None,
+                1,
+                None,
+                Some("br-abc.1"),
+                false,
+            )
+            .await
+            .into_result()
+            .expect("fetch topic-filtered inbox");
+            assert_eq!(filtered.len(), 1);
+            assert_eq!(filtered[0].message.subject, "topic witness");
+            assert_eq!(filtered[0].message.topic.as_deref(), Some("Br-Abc.1"));
+            assert!(
+                filtered[0].message.body_md.is_empty(),
+                "metadata-only fetch should not hydrate bodies"
+            );
+
+            let unfiltered = fetch_inbox_filtered(
+                &cx,
+                &pool,
+                project_id,
+                recipient_id,
+                false,
+                false,
+                None,
+                10,
+                None,
+                None,
+                true,
+            )
+            .await
+            .into_result()
+            .expect("fetch unfiltered inbox");
+            assert_eq!(unfiltered.len(), 2);
+            assert!(unfiltered.iter().any(|row| row.message.topic.is_none()));
+            assert!(
+                unfiltered
+                    .iter()
+                    .any(|row| row.message.body_md == "topic body")
+            );
+
+            let topic_messages =
+                fetch_topic_messages(&cx, &pool, project_id, "BR-ABC.1", None, 1, false)
+                    .await
+                    .into_result()
+                    .expect("fetch project topic messages");
+            assert_eq!(topic_messages.len(), 1);
+            assert_eq!(topic_messages[0].message.subject, "topic witness");
+            assert_eq!(topic_messages[0].sender_name, "GreenStone");
+            assert_eq!(topic_messages[0].message.topic.as_deref(), Some("Br-Abc.1"));
+            assert!(
+                topic_messages[0].message.body_md.is_empty(),
+                "metadata-only topic fetch should not hydrate bodies"
+            );
+        });
+    }
+
+    #[test]
     fn fetch_inbox_ack_required_keeps_orphaned_sender_rows_visible() {
         use asupersync::runtime::RuntimeBuilder;
 
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("inbox_ack_orphaned_sender.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("inbox_ack_orphaned_sender.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-inbox-ack-orphaned-{base}"))
                 .await
@@ -26483,9 +30945,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, dir) = setup_test_pool("recipient_lookup_orphaned_agent.db");
+        let (_setup_cx, pool, dir) = setup_test_pool("recipient_lookup_orphaned_agent.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(
                 &cx,
@@ -26621,6 +31084,132 @@ mod tests {
     }
 
     #[test]
+    fn list_thread_participant_names_covers_senders_recipients_and_numeric_root() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("thread_participant_names.db");
+
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
+            let base = now_micros();
+            let project =
+                ensure_project(&cx, &pool, &format!("/tmp/am-thread-participants-{base}"))
+                    .await
+                    .into_result()
+                    .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let mut agent_ids = Vec::new();
+            for name in ["GreenStone", "BlueLake", "RedFox"] {
+                let agent = register_agent(
+                    &cx,
+                    &pool,
+                    project_id,
+                    name,
+                    "codex-cli",
+                    "gpt-5",
+                    Some("participant"),
+                    Some("auto"),
+                    None,
+                )
+                .await
+                .into_result()
+                .expect("register agent");
+                agent_ids.push(agent.id.expect("agent id"));
+            }
+            let (green_id, blue_id, red_id) = (agent_ids[0], agent_ids[1], agent_ids[2]);
+
+            // Numeric (reply-seeded) thread: root message without a thread id,
+            // then a reply carrying the root id as its thread id.
+            let root = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                green_id,
+                "Thread root",
+                "Body",
+                None,
+                "normal",
+                false,
+                "[]",
+                &[(blue_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create root message");
+            let root_id = root.id.expect("root message id");
+            let thread = root_id.to_string();
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                red_id,
+                "Reply",
+                "Body",
+                Some(&thread),
+                "normal",
+                false,
+                "[]",
+                &[(green_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create reply");
+
+            let names = list_thread_participant_names(&cx, &pool, project_id, &thread, 500)
+                .await
+                .into_result()
+                .expect("list numeric-thread participants");
+            assert_eq!(
+                names,
+                vec![
+                    "BlueLake".to_string(),
+                    "GreenStone".to_string(),
+                    "RedFox".to_string()
+                ],
+                "numeric thread must include the root's sender/recipients and the reply's"
+            );
+
+            // Alphanumeric thread id.
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                green_id,
+                "Alpha thread",
+                "Body",
+                Some("alpha-thread"),
+                "normal",
+                false,
+                "[]",
+                &[(blue_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create alpha-thread message");
+            let names = list_thread_participant_names(&cx, &pool, project_id, "alpha-thread", 500)
+                .await
+                .into_result()
+                .expect("list alpha-thread participants");
+            assert_eq!(
+                names,
+                vec!["BlueLake".to_string(), "GreenStone".to_string()]
+            );
+
+            // Unknown thread id resolves to no participants.
+            let names =
+                list_thread_participant_names(&cx, &pool, project_id, "no-such-thread", 500)
+                    .await
+                    .into_result()
+                    .expect("list unknown-thread participants");
+            assert_eq!(names, [] as [std::string::String; 0]);
+        });
+    }
+
+    #[test]
     fn count_unread_global_empty_returns_empty() {
         use asupersync::runtime::RuntimeBuilder;
         use tempfile::tempdir;
@@ -26676,8 +31265,6 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
-
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("global_unread_case_insensitive.db");
         let init_conn = crate::DbConn::open_file(db_path.display().to_string())
@@ -26701,6 +31288,7 @@ mod tests {
         let pool = crate::create_pool(&cfg).expect("create pool");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-unread-case-{base}"))
                 .await
@@ -26772,9 +31360,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, dir) = setup_test_pool("global_unread_orphaned_project.db");
+        let (_setup_cx, pool, dir) = setup_test_pool("global_unread_orphaned_project.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(
                 &cx,
@@ -26955,9 +31544,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("global_search_orphaned_sender.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("global_search_orphaned_sender.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(
                 &cx,
@@ -27028,9 +31618,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, dir) = setup_test_pool("global_search_orphaned_project.db");
+        let (_setup_cx, pool, dir) = setup_test_pool("global_search_orphaned_project.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(
                 &cx,
@@ -27353,7 +31944,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect("acquire a");
-            crate::schema::migrate_to_latest_base(&cx, &*conn_a)
+            crate::schema::migrate_to_latest_base(&cx, &**conn_a)
                 .await
                 .into_result()
                 .expect("migrate a");
@@ -27362,7 +31953,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect("acquire b");
-            crate::schema::migrate_to_latest_base(&cx, &*conn_b)
+            crate::schema::migrate_to_latest_base(&cx, &**conn_b)
                 .await
                 .into_result()
                 .expect("migrate b");
@@ -27612,9 +32203,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("acknowledge_messages_batch_large_wave.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("acknowledge_messages_batch_large_wave.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let project_a = ensure_project(&cx, &pool, "/tmp/am-batch-ack-project-a")
                 .await
                 .into_result()
@@ -27860,9 +32452,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("mark_message_read_keeps_ack_pending.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("mark_message_read_keeps_ack_pending.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let project = ensure_project(&cx, &pool, "/tmp/am-mark-read-keeps-ack-pending")
                 .await
                 .into_result()
@@ -27955,9 +32548,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("mark_message_read_missing_inbox_stats.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("mark_message_read_missing_inbox_stats.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let project = ensure_project(&cx, &pool, "/tmp/am-mark-read-missing-inbox-stats")
                 .await
                 .into_result()
@@ -28031,9 +32625,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("mark_message_read_inbox_stats_view.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("mark_message_read_inbox_stats_view.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let conn = crate::open_sqlite_file_with_recovery(pool.sqlite_path())
                 .expect("open sqlite connection");
             create_inbox_stats_table_for_test(&conn);

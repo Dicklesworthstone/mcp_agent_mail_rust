@@ -6,7 +6,9 @@
 #![forbid(unsafe_code)]
 
 use crate::Config;
-use std::cmp;
+use std::cmp::{self, Ordering};
+use std::ffi::OsStr;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +24,11 @@ const MIB: u64 = 1024 * 1024;
 /// spelling and its canonical destination are verified, so this exception does
 /// not extend to arbitrary symlinks.
 #[must_use]
+// Not `const`: the macOS branch calls `std::fs::canonicalize`. Only the
+// non-macOS stub body would qualify, and `const fn` cannot be cfg-split
+// without duplicating the signature, so suppress the nursery lint that
+// fires when compiling for non-macOS targets.
+#[allow(clippy::missing_const_for_fn)]
 pub fn is_trusted_system_directory_alias(path: &Path) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -35,9 +42,9 @@ pub fn is_trusted_system_directory_alias(path: &Path) -> bool {
             None
         };
 
-        return expected.is_some_and(|expected| {
+        expected.is_some_and(|expected| {
             std::fs::canonicalize(path).is_ok_and(|resolved| resolved == expected)
-        });
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -45,6 +52,555 @@ pub fn is_trusted_system_directory_alias(path: &Path) -> bool {
         let _ = path;
         false
     }
+}
+
+/// Open a regular file for reading without following a final-component link.
+///
+/// Unix uses `O_NOFOLLOW | O_NONBLOCK`; the latter prevents a FIFO swapped
+/// into place from blocking `open`. Windows opens the reparse point itself and
+/// rejects it. Every platform verifies the opened handle is a regular file.
+#[cfg(unix)]
+pub fn open_regular_file_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+/// Open a regular Windows file without traversing a leaf reparse point.
+pub fn open_regular_file_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !metadata.file_type().is_file()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular non-reparse-point file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+/// Open a regular file without following a leaf link on other platforms.
+pub fn open_regular_file_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular non-symlink file", path.display()),
+        ));
+    }
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} changed to a non-regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+/// Open a regular file without following a final-component link, requesting
+/// only the access needed to change its permissions.
+///
+/// Unix permits `fchmod` through a read-only descriptor. Windows requests
+/// attribute read/write rights without requesting data-write access, so a
+/// read-only recovery source can be made writable before promotion.
+#[cfg(unix)]
+pub fn open_regular_file_for_permission_change_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+/// Open a regular Windows file for attribute updates without traversing a leaf
+/// reparse point.
+#[cfg(windows)]
+pub fn open_regular_file_for_permission_change_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !metadata.file_type().is_file()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular non-reparse-point file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+/// Open a regular file for permission updates without following a leaf link
+/// on other platforms.
+#[cfg(not(any(unix, windows)))]
+pub fn open_regular_file_for_permission_change_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular non-symlink file", path.display()),
+        ));
+    }
+    let file = std::fs::OpenOptions::new().read(true).open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} changed to a non-regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+/// Open a regular file read-write without following a final-component link.
+///
+/// Call this only after clearing a source read-only attribute through
+/// [`open_regular_file_for_permission_change_no_follow`] when normalizing an
+/// untrusted recovery artifact.
+#[cfg(unix)]
+pub fn open_regular_file_read_write_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+/// Open a regular Windows file read-write without traversing a leaf reparse
+/// point.
+#[cfg(windows)]
+pub fn open_regular_file_read_write_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !metadata.file_type().is_file()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular non-reparse-point file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+/// Open a regular file read-write without following a leaf link on other
+/// platforms.
+#[cfg(not(any(unix, windows)))]
+pub fn open_regular_file_read_write_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular non-symlink file", path.display()),
+        ));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} changed to a non-regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+/// Normalize an already-open private database or control file for writable,
+/// owner-only use.
+///
+/// On Unix this sets an exact `0600` mode through the file descriptor, so a
+/// permissive umask or an untrusted source file cannot make recovered mailbox
+/// bytes world-readable. On Windows the destination inherits the ACL of its
+/// private parent directory; this helper clears only the read-only attribute
+/// while preserving the rest of that inherited security descriptor. Other
+/// platforms retain their creation-time permissions.
+pub fn set_private_writable_file_permissions(file: &std::fs::File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+    }
+
+    #[cfg(windows)]
+    {
+        let mut permissions = file.metadata()?.permissions();
+        #[allow(
+            clippy::permissions_set_readonly_false,
+            reason = "Windows set_readonly changes only the readonly file attribute, not Unix mode bits"
+        )]
+        permissions.set_readonly(false);
+        file.set_permissions(permissions)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Ok(())
+    }
+}
+
+/// Atomically create a new private regular file for mailbox staging.
+///
+/// Unix supplies mode `0600` to the creation syscall, preventing a permissive
+/// umask from exposing even the initially empty inode to another user before
+/// normalization. Windows uses create-new semantics and inherits the ACL from
+/// the caller's private parent directory. Every platform validates the opened
+/// handle and then applies [`set_private_writable_file_permissions`] as
+/// defense in depth.
+#[cfg(unix)]
+pub fn create_new_private_file_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    set_private_writable_file_permissions(&file)?;
+    Ok(file)
+}
+
+/// Atomically create a new private regular Windows file without traversing a
+/// leaf reparse point.
+#[cfg(windows)]
+pub fn create_new_private_file_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !metadata.file_type().is_file()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular non-reparse-point file", path.display()),
+        ));
+    }
+    set_private_writable_file_permissions(&file)?;
+    Ok(file)
+}
+
+/// Atomically create a new private regular file on other platforms.
+#[cfg(not(any(unix, windows)))]
+pub fn create_new_private_file_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    set_private_writable_file_permissions(&file)?;
+    Ok(file)
+}
+
+/// Read a small regular control file without following a leaf link.
+///
+/// The size is checked both before and during the bounded read, so a file that
+/// grows concurrently cannot force an unbounded allocation.
+pub fn read_regular_file_no_follow_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    // Control files are intentionally small. Avoid turning a caller-supplied
+    // large limit into a speculative allocation even when the current file is
+    // sparse or its metadata races with the bounded read below.
+    const MAX_INITIAL_ALLOCATION: u64 = 64 * 1024;
+
+    let mut file = open_regular_file_no_follow(path)?;
+    let metadata_len = file.metadata()?.len();
+    if metadata_len > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is {metadata_len} bytes, exceeding the {max_bytes}-byte control-file limit",
+                path.display()
+            ),
+        ));
+    }
+    let allocation = usize::try_from(metadata_len.min(max_bytes).min(MAX_INITIAL_ALLOCATION))
+        .unwrap_or(64 * 1024);
+    let mut bytes = Vec::with_capacity(allocation);
+    file.by_ref()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} grew beyond the control-file limit", path.display()),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Published SQLite recovery-candidate filename families.
+///
+/// The distinction is security-sensitive: private staging and control files
+/// can share a broad prefix such as `<db>.bak.` but must never become eligible
+/// for automatic recovery merely because they happen to contain a valid
+/// SQLite image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqliteRecoveryCandidateKind {
+    /// The exact `<db>.recovery` artifact produced by canonical recovery.
+    Recovery,
+    /// A published `<db>.bak.<timestamp>` operator safety backup.
+    TimestampedBak,
+    /// The main member of a historical archive-restore safety generation.
+    TimestampedBackup,
+    /// The exact `<db>.bak` proactive backup.
+    ProactiveBak,
+}
+
+impl SqliteRecoveryCandidateKind {
+    const fn family_priority(self) -> u8 {
+        match self {
+            Self::TimestampedBak => 0,
+            Self::ProactiveBak => 1,
+            Self::TimestampedBackup => 2,
+            Self::Recovery => 3,
+        }
+    }
+
+    /// Return whether this filename family can be restored as one main file.
+    ///
+    /// Exact `.recovery` artifacts may carry committed state in a companion
+    /// WAL. Historical `.backup-*` generations independently backed up the
+    /// main file and its sidecars, including independently allocated collision
+    /// suffixes, so there is no unambiguous single-file member to promote.
+    /// Both families require an explicit future family-aware settlement path.
+    #[must_use]
+    pub const fn is_standalone_restore_eligible(self) -> bool {
+        !matches!(self, Self::Recovery | Self::TimestampedBackup)
+    }
+}
+
+/// Parsed authority metadata for a published SQLite recovery candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqliteRecoveryCandidateName {
+    kind: SqliteRecoveryCandidateKind,
+    generation_micros: Option<i64>,
+    collision_sequence: u32,
+}
+
+impl SqliteRecoveryCandidateName {
+    /// Return the published candidate family.
+    #[must_use]
+    pub const fn kind(self) -> SqliteRecoveryCandidateKind {
+        self.kind
+    }
+
+    /// Return the timestamp encoded in a published series filename.
+    #[must_use]
+    pub const fn generation_micros(self) -> Option<i64> {
+        self.generation_micros
+    }
+
+    /// Compare two candidates in recovery preference order (newest first).
+    ///
+    /// Timestamped series use the generation encoded in their filename,
+    /// because `copy` may preserve a source file's old mtime. Untimestamped
+    /// `.recovery` and the exact proactive `.bak` fall back to mtime. Collision
+    /// suffixes break ties between candidates minted in the same timestamp.
+    #[must_use]
+    pub fn cmp_newest_first(
+        self,
+        self_modified: SystemTime,
+        other: Self,
+        other_modified: SystemTime,
+    ) -> Ordering {
+        let self_generation = self
+            .generation_micros
+            .unwrap_or_else(|| system_time_micros(self_modified));
+        let other_generation = other
+            .generation_micros
+            .unwrap_or_else(|| system_time_micros(other_modified));
+        other_generation
+            .cmp(&self_generation)
+            .then_with(|| other.collision_sequence.cmp(&self.collision_sequence))
+            .then_with(|| {
+                self.kind
+                    .family_priority()
+                    .cmp(&other.kind.family_priority())
+            })
+    }
+}
+
+fn system_time_micros(value: SystemTime) -> i64 {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_micros()).ok())
+        .unwrap_or(i64::MIN)
+}
+
+fn sqlite_candidate_ascii_suffix(primary: &OsStr, candidate: &OsStr) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let suffix = candidate.as_bytes().strip_prefix(primary.as_bytes())?;
+        std::str::from_utf8(suffix).ok().map(str::to_owned)
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let candidate = candidate.encode_wide().collect::<Vec<_>>();
+        let primary = primary.encode_wide().collect::<Vec<_>>();
+        let suffix = candidate.strip_prefix(primary.as_slice())?;
+        String::from_utf16(suffix).ok()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        candidate
+            .to_string_lossy()
+            .strip_prefix(primary.to_string_lossy().as_ref())
+            .map(str::to_owned)
+    }
+}
+
+fn parse_sqlite_backup_timestamp(value: &str, format: &str) -> Option<i64> {
+    let parsed = chrono::NaiveDateTime::parse_from_str(value, format).ok()?;
+    if parsed.format(format).to_string() != value {
+        return None;
+    }
+    Some(parsed.and_utc().timestamp_micros())
+}
+
+fn sqlite_backup_generation(value: &str, format: &str) -> Option<(i64, u32)> {
+    if let Some(timestamp) = parse_sqlite_backup_timestamp(value, format) {
+        return Some((timestamp, 0));
+    }
+    let (timestamp, collision) = value.rsplit_once('-')?;
+    if collision.len() < 2 || !collision.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let collision_sequence: u32 = collision.parse().ok()?;
+    if collision_sequence == 0 || format!("{collision_sequence:02}") != collision {
+        return None;
+    }
+    Some((
+        parse_sqlite_backup_timestamp(timestamp, format)?,
+        collision_sequence,
+    ))
+}
+
+/// Classify a recovery candidate by its complete published filename grammar.
+///
+/// Matching is performed on raw platform path units before parsing the ASCII
+/// suffix, so a non-UTF-8 primary filename remains supported on Unix. Broad
+/// prefix matches are deliberately insufficient: stage files, sidecars,
+/// metadata, locks, and arbitrary suffixes return `None`. Classification is
+/// also inventory-only: callers must separately require
+/// [`SqliteRecoveryCandidateKind::is_standalone_restore_eligible`] before
+/// selecting an artifact for automatic single-file recovery.
+#[must_use]
+pub fn classify_sqlite_recovery_candidate_name(
+    primary: &OsStr,
+    candidate: &OsStr,
+) -> Option<SqliteRecoveryCandidateName> {
+    let suffix = sqlite_candidate_ascii_suffix(primary, candidate)?;
+    let (kind, generation_micros, collision_sequence) = if suffix == ".recovery" {
+        (SqliteRecoveryCandidateKind::Recovery, None, 0)
+    } else if suffix == ".bak" {
+        (SqliteRecoveryCandidateKind::ProactiveBak, None, 0)
+    } else if let Some(timestamp) = suffix.strip_prefix(".bak.") {
+        let (generation_micros, collision_sequence) =
+            sqlite_backup_generation(timestamp, "%Y%m%d_%H%M%S")?;
+        (
+            SqliteRecoveryCandidateKind::TimestampedBak,
+            Some(generation_micros),
+            collision_sequence,
+        )
+    } else {
+        let timestamp = suffix.strip_prefix(".backup-")?;
+        let (generation_micros, collision_sequence) =
+            sqlite_backup_generation(timestamp, "%Y%m%d-%H%M%S")?;
+        (
+            SqliteRecoveryCandidateKind::TimestampedBackup,
+            Some(generation_micros),
+            collision_sequence,
+        )
+    };
+
+    Some(SqliteRecoveryCandidateName {
+        kind,
+        generation_micros,
+        collision_sequence,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -606,6 +1162,189 @@ pub fn is_platform_temp_firmlink(link: &Path, resolved: &Path) -> bool {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn bounded_control_file_read_rejects_oversized_input() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("control.json");
+        std::fs::write(&path, vec![b'x'; 33]).unwrap();
+
+        let error = read_regular_file_no_follow_bounded(&path, 32)
+            .expect_err("oversized control state must fail before allocation");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_create_is_owner_only_before_returning_the_handle() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("private-stage.sqlite3");
+        let file = create_new_private_file_no_follow(&path).expect("create private stage");
+        assert_eq!(
+            file.metadata().unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the creation helper must return an exact owner-only inode"
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        assert_eq!(
+            create_new_private_file_no_follow(&path)
+                .expect_err("create-new must not replace an occupied stage")
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_follow_control_file_read_rejects_leaf_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.json");
+        let link = dir.path().join("control.json");
+        std::fs::write(&target, b"sentinel").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(open_regular_file_no_follow(&link).is_err());
+        assert!(read_regular_file_no_follow_bounded(&link, 1024).is_err());
+    }
+
+    #[test]
+    fn sqlite_recovery_candidate_classifier_accepts_only_published_names() {
+        let primary = OsStr::new("storage.sqlite3");
+        for (name, expected_kind) in [
+            (
+                "storage.sqlite3.recovery",
+                SqliteRecoveryCandidateKind::Recovery,
+            ),
+            (
+                "storage.sqlite3.bak",
+                SqliteRecoveryCandidateKind::ProactiveBak,
+            ),
+            (
+                "storage.sqlite3.bak.20260824_120102",
+                SqliteRecoveryCandidateKind::TimestampedBak,
+            ),
+            (
+                "storage.sqlite3.bak.20260824_120102-01",
+                SqliteRecoveryCandidateKind::TimestampedBak,
+            ),
+            (
+                "storage.sqlite3.backup-20260824-120102",
+                SqliteRecoveryCandidateKind::TimestampedBackup,
+            ),
+            (
+                "storage.sqlite3.backup-20260824-120102-01",
+                SqliteRecoveryCandidateKind::TimestampedBackup,
+            ),
+            (
+                "storage.sqlite3.backup-20260824-120102-100",
+                SqliteRecoveryCandidateKind::TimestampedBackup,
+            ),
+        ] {
+            let classified = classify_sqlite_recovery_candidate_name(primary, OsStr::new(name))
+                .unwrap_or_else(|| panic!("expected published candidate: {name}"));
+            assert_eq!(classified.kind(), expected_kind, "candidate {name}");
+        }
+
+        for name in [
+            "storage.sqlite3.bak.backup-stage-20260824_120102_345",
+            "storage.sqlite3.bak.20260824_120102-wal",
+            "storage.sqlite3.bak.20260824_120102_345",
+            "storage.sqlite3.bak.2026082_120102",
+            "storage.sqlite3.bak.20260824_12012",
+            "storage.sqlite3.bak.20260824_120102-00",
+            "storage.sqlite3.bak.20260824_120102.metadata",
+            "storage.sqlite3.backup-test",
+            "storage.sqlite3.backup-20260824_120102",
+            "storage.sqlite3.backup-2026082-120102",
+            "storage.sqlite3.backup-20260824-120102-1",
+            "storage.sqlite3.backup-20260824-120102-00",
+            "storage.sqlite3.backup-20260824-120102-001",
+            "storage.sqlite3.backup-20260824-120102.123",
+            "storage.sqlite3.recovery.lock",
+            "storage.sqlite3.recovery-wal",
+            "other.sqlite3.bak.20260824_120102",
+        ] {
+            assert!(
+                classify_sqlite_recovery_candidate_name(primary, OsStr::new(name)).is_none(),
+                "private or malformed candidate must be rejected: {name}"
+            );
+        }
+
+        assert!(SqliteRecoveryCandidateKind::ProactiveBak.is_standalone_restore_eligible());
+        assert!(SqliteRecoveryCandidateKind::TimestampedBak.is_standalone_restore_eligible());
+        assert!(!SqliteRecoveryCandidateKind::Recovery.is_standalone_restore_eligible());
+        assert!(
+            !SqliteRecoveryCandidateKind::TimestampedBackup.is_standalone_restore_eligible(),
+            "historical .backup-* main and sidecar collision suffixes were allocated independently"
+        );
+    }
+
+    #[test]
+    fn sqlite_recovery_candidate_order_uses_name_generation_mtime_and_collision() {
+        let primary = OsStr::new("storage.sqlite3");
+        let older = classify_sqlite_recovery_candidate_name(
+            primary,
+            OsStr::new("storage.sqlite3.bak.20260823_120000"),
+        )
+        .expect("older timestamped backup");
+        let newer = classify_sqlite_recovery_candidate_name(
+            primary,
+            OsStr::new("storage.sqlite3.backup-20260824-120000"),
+        )
+        .expect("newer timestamped backup");
+        let proactive =
+            classify_sqlite_recovery_candidate_name(primary, OsStr::new("storage.sqlite3.bak"))
+                .expect("proactive backup");
+        let first_collision = classify_sqlite_recovery_candidate_name(
+            primary,
+            OsStr::new("storage.sqlite3.bak.20260824_120000-01"),
+        )
+        .expect("first collision backup");
+        let second_collision = classify_sqlite_recovery_candidate_name(
+            primary,
+            OsStr::new("storage.sqlite3.bak.20260824_120000-02"),
+        )
+        .expect("second collision backup");
+        let old_mtime = UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let future_mtime = UNIX_EPOCH + std::time::Duration::from_secs(u64::from(u32::MAX));
+
+        assert_eq!(
+            newer.cmp_newest_first(old_mtime, older, future_mtime),
+            Ordering::Less,
+            "logical filename generation must outrank preserved filesystem mtime"
+        );
+        assert_eq!(
+            proactive.cmp_newest_first(future_mtime, newer, old_mtime),
+            Ordering::Less,
+            "the actively refreshed proactive .bak must participate by mtime"
+        );
+        assert_eq!(
+            second_collision.cmp_newest_first(old_mtime, first_collision, future_mtime),
+            Ordering::Less,
+            "the later collision sequence must win when logical generations tie"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_recovery_candidate_classifier_supports_non_utf8_primary_names() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let primary = std::ffi::OsString::from_vec(b"storage-\xFF.sqlite3".to_vec());
+        let mut candidate = primary.clone().into_vec();
+        candidate.extend_from_slice(b".bak.20260824_120102");
+        let candidate = std::ffi::OsString::from_vec(candidate);
+
+        assert_eq!(
+            classify_sqlite_recovery_candidate_name(&primary, &candidate)
+                .map(SqliteRecoveryCandidateName::kind),
+            Some(SqliteRecoveryCandidateKind::TimestampedBak)
+        );
+    }
 
     #[test]
     fn platform_temp_firmlink_accepts_apple_firmlink_roots() {

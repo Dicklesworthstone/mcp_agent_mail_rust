@@ -14,8 +14,7 @@
 //!
 //! ## Detection (pure, on-disk state)
 //!
-//! 1. Open `storage.sqlite3` read-only with URI `?immutable=1`
-//!    (no WAL/SHM sidecar creation or journal replay).
+//! 1. Query the command's retained WAL-aware logical read source.
 //! 2. Verify Search V3 is active by probing the canonical marker
 //!    file: `<storage_root>/search_index/.managed.json`. If
 //!    absent, FTS5 IS the active backend and residue is normal —
@@ -166,8 +165,17 @@ impl LegacyFtsResidueFinding {
 /// - the DB can't be opened
 /// - the sqlite_master query fails
 pub fn detect(candidate_paths: &[PathBuf]) -> Vec<LegacyFtsResidueFinding> {
+    let read_candidates =
+        super::explicit_offline_db_read_candidates(candidate_paths, "legacy FTS residue detection");
+    detect_prepared(&read_candidates)
+}
+
+pub(crate) fn detect_prepared(
+    read_candidates: &[super::DoctorDbReadCandidate],
+) -> Vec<LegacyFtsResidueFinding> {
     let mut out = Vec::new();
-    for db_path in candidate_paths {
+    for candidate in read_candidates {
+        let db_path = candidate.target_path();
         if !db_path.is_file() {
             continue;
         }
@@ -180,17 +188,17 @@ pub fn detect(candidate_paths: &[PathBuf]) -> Vec<LegacyFtsResidueFinding> {
             // expected.
             continue;
         }
-        let Ok(conn) = super::open_immutable_sqlite(db_path) else {
+        let Some(conn) = candidate.connection() else {
             continue;
         };
-        let Some(residue) = read_fts_residue(&conn) else {
+        let Some(residue) = read_fts_residue(conn) else {
             continue;
         };
         if residue.is_empty() {
             continue;
         }
         out.push(LegacyFtsResidueFinding {
-            db_path: db_path.clone(),
+            db_path: db_path.to_path_buf(),
             v3_marker_path: marker_path,
             residual_objects: residue,
         });
@@ -289,14 +297,30 @@ pub fn fix(
     ctx: &MutateContext,
     finding: &LegacyFtsResidueFinding,
 ) -> Result<FixOutcome, MutateError> {
-    if !finding.db_path.exists() {
+    let candidate = super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+        &finding.db_path,
+        "legacy FTS residue pre-fix source selection",
+    );
+    fix_prepared(ctx, finding, &candidate)
+}
+
+pub(crate) fn fix_prepared(
+    ctx: &MutateContext,
+    _finding: &LegacyFtsResidueFinding,
+    candidate: &super::DoctorDbReadCandidate,
+) -> Result<FixOutcome, MutateError> {
+    let refreshed = candidate.refresh("legacy FTS residue pre-mutation revalidation");
+    let Some(fresh_finding) = detect_prepared(std::slice::from_ref(&refreshed))
+        .into_iter()
+        .next()
+    else {
         return Ok(FixOutcome {
             actions_taken: 0,
             actions_skipped: 1,
             quarantined_paths: Vec::new(),
         });
-    }
-    let sql = build_drop_sql(&finding.residual_objects);
+    };
+    let sql = build_drop_sql(&fresh_finding.residual_objects);
     if sql.trim().is_empty() {
         return Ok(FixOutcome {
             actions_taken: 0,
@@ -304,7 +328,7 @@ pub fn fix(
             quarantined_paths: Vec::new(),
         });
     }
-    mutate(ctx, &finding.db_path, Op::DbExec { sql })?;
+    mutate(ctx, &fresh_finding.db_path, Op::DbExec { sql })?;
     Ok(FixOutcome {
         actions_taken: 1,
         actions_skipped: 0,

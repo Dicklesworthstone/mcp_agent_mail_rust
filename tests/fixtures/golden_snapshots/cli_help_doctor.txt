@@ -7,9 +7,9 @@ Commands:
   archive-scan       Audit archive hygiene without mutating the mailbox archive
   archive-verify     Cross-check archive artifacts against SQLite for tamper evidence
   artifacts          Inventory test, perf, forensic, and e2e artifact roots without deleting anything
-  backups
+  backups            
   capabilities       Print the agent-facing contract: detectors, fixers, exit codes, env vars, run-artifact schema. JSON only
-  check
+  check              
   drain              Report the supervised drain/restart protocol for the current mailbox owner without killing any process (read-only)
   explain            Expand a single finding by id with full evidence + remediation
   fix                Attempt automatic remediation for detected issues
@@ -22,13 +22,14 @@ Commands:
   pack-archive       Run git maintenance (loose-object repack) on the archive repository
   reclaim            Reclaim stale recovery debris (forensic bundles + corrupt-DB quarantines)
   reconstruct        Reconstruct the database from the Git archive
-  repair
-  restore
+  repair             
+  restore            
   robot-docs         Print the paste-ready agent handbook (Markdown)
   selftest           End-to-end self-test of the mutate() chokepoint primitives
   support-bundle     Build a sanitized incident bundle for maintainer support
   triage             Mega-command: returns `{summary, findings, actions_planned, recommended_command, capabilities_url}` in a single round-trip
   undo               Restore from `.doctor/runs/<run-id>/backups/`
+  vacuum             Reclaim orphaned pages INSIDE the live database (VACUUM + ANALYZE)
   write-selftest     Real write-path self-test in an isolated scratch mailbox
   help               Print this message or the help of the given subcommand(s)
 

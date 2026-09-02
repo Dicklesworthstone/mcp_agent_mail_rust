@@ -878,10 +878,10 @@ fn render_index_page(projects: &[ProjectInfo], config: &StaticRenderConfig) -> S
 
 fn render_projects_page(projects: &[ProjectInfo], config: &StaticRenderConfig) -> String {
     let body = format!(
-        r#"<table>
+        r"<table>
   <thead><tr><th>Slug</th><th>Path</th><th>Messages</th><th>Agents</th></tr></thead>
   <tbody>{rows}</tbody>
-</table>"#,
+</table>",
         rows = projects
             .iter()
             .map(|p| format!(
@@ -1447,7 +1447,7 @@ fn project_inbox_route(project_slug: &str) -> String {
     )
 }
 
-fn find_char_boundary(s: &str, target: usize) -> usize {
+const fn find_char_boundary(s: &str, target: usize) -> usize {
     if target >= s.len() {
         return s.len();
     }

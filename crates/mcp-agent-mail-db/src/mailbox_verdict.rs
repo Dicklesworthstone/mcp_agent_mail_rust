@@ -673,13 +673,8 @@ pub fn verdict_prefers_archive_snapshot_reads(verdict: &MailboxHealthVerdict) ->
         .iter()
         .filter(|probe| !probe.passed)
         .all(|probe| probe.name == "archive_db_parity");
-    if only_archive_parity_failures
-        && verdict.archive_drift.state == MailboxArchiveDriftState::DbAhead
-    {
-        return false;
-    }
-
-    true
+    !(only_archive_parity_failures
+        && verdict.archive_drift.state == MailboxArchiveDriftState::DbAhead)
 }
 
 /// Whether read surfaces using the primary FrankenSQLite path should prefer
@@ -703,13 +698,8 @@ pub fn verdict_prefers_archive_snapshot_reads_for_primary_read_surface(
         .iter()
         .filter(|probe| !probe.passed)
         .all(|probe| probe.name == "db_sanity");
-    if only_db_sanity_failures
-        && crate::pool::sqlite_primary_read_path_is_healthy(sqlite_path).unwrap_or(false)
-    {
-        return false;
-    }
-
-    true
+    !(only_db_sanity_failures
+        && crate::pool::sqlite_primary_read_path_is_healthy(sqlite_path).unwrap_or(false))
 }
 
 /// Compute the state from probe results.
@@ -873,6 +863,7 @@ pub fn compute_mailbox_verdict(
                     sqlite_lock_path: String::new(),
                     processes: Vec::new(),
                     competing_pids: Vec::new(),
+                    readers: Vec::new(),
                     supervised_restart_required: false,
                     detail: "Ownership inspection skipped because canonical path resolution failed"
                         .to_string(),
@@ -929,6 +920,7 @@ pub fn compute_mailbox_verdict(
             sqlite_lock_path: format!("{}.activity.lock", db_path.display()),
             processes: Vec::new(),
             competing_pids: Vec::new(),
+            readers: Vec::new(),
             supervised_restart_required: false,
             detail: "Ownership inspection skipped by verdict options".to_string(),
         }
@@ -1476,8 +1468,12 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
         );
     }
 
-    let path_str = db_path.display().to_string();
-    let conn = match crate::DbConn::open_file(&path_str) {
+    // Engine-dispatching: a restored or reconstructed family (no namespace
+    // pair) must get a schema verdict, not an open refusal.
+    let conn = match crate::pool::open_guarded_read_only_sqlite_file(
+        db_path,
+        "mailbox schema-population diagnostic",
+    ) {
         Ok(conn) => conn,
         Err(error) => {
             return ProbeResult::error(
@@ -1486,8 +1482,6 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
             );
         }
     };
-    let conn = crate::guard_db_conn(conn, "mailbox_verdict::probe_schema_populated");
-
     let table_count = match conn.query_sync(
         "SELECT COUNT(*) AS table_count FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
         &[],
@@ -1498,7 +1492,6 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
             .and_then(|count| usize::try_from(count).ok())
             .unwrap_or(0),
         Err(error) => {
-            crate::close_db_conn(conn.into_inner(), "mailbox_verdict::probe_schema_populated");
             return ProbeResult::error(
                 "schema_populated",
                 format!("Cannot query sqlite_master: {error}"),
@@ -1513,7 +1506,7 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
         )
         .is_ok_and(|rows| !rows.is_empty());
 
-    let result = match (table_count, archive_presence, has_messages_table) {
+    match (table_count, archive_presence, has_messages_table) {
         (0, ArchiveStatePresence::Empty, _) => ProbeResult::ok(
             "schema_populated",
             "Database schema is empty and the archive is also empty",
@@ -1537,9 +1530,7 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
             format!("Database schema populated with {tables} tables including 'messages'"),
         ),
         _ => ProbeResult::ok("schema_populated", "Schema state accepted"),
-    };
-    crate::close_db_conn(conn.into_inner(), "mailbox_verdict::probe_schema_populated");
-    result
+    }
 }
 
 // ============================================================================
@@ -1957,6 +1948,7 @@ mod tests {
                 sqlite_lock_path: "storage.sqlite3.activity.lock".to_string(),
                 processes: Vec::new(),
                 competing_pids: Vec::new(),
+                readers: Vec::new(),
                 supervised_restart_required: false,
                 detail: "test mailbox ownership".to_string(),
             },
@@ -2481,6 +2473,7 @@ mod tests {
             sqlite_lock_path: "storage.sqlite3.activity.lock".to_string(),
             processes: Vec::new(),
             competing_pids: Vec::new(),
+            readers: Vec::new(),
             supervised_restart_required: false,
             detail: "clean".to_string(),
         });
@@ -2492,6 +2485,7 @@ mod tests {
             sqlite_lock_path: "storage.sqlite3.activity.lock".to_string(),
             processes: Vec::new(),
             competing_pids: vec![1234],
+            readers: Vec::new(),
             supervised_restart_required: false,
             detail: "other owner".to_string(),
         });
@@ -2504,6 +2498,7 @@ mod tests {
             sqlite_lock_path: "storage.sqlite3.activity.lock".to_string(),
             processes: Vec::new(),
             competing_pids: vec![1234, 5678],
+            readers: Vec::new(),
             supervised_restart_required: true,
             detail: "split-brain".to_string(),
         });
@@ -2654,7 +2649,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_schema_populated_closes_health_probe_connection_explicitly() {
+    fn probe_schema_populated_uses_checkpoint_free_read_only_drop() {
         let capture = EventCapture::default();
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("health-probe.sqlite3");
@@ -2677,7 +2672,7 @@ mod tests {
 
         assert!(
             !capture.saw_drop_close(),
-            "schema health probe must close its DB connection explicitly"
+            "schema health probe read-only drop must not enter the writer checkpoint path"
         );
     }
 

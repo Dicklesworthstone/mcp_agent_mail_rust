@@ -23,8 +23,8 @@
 //!
 //! ## Detection (pure function)
 //!
-//! Opens the DB read-only with URI `?immutable=1` (no -shm
-//! creation, no locking). Runs:
+//! Production dispatch materializes live FrankenSQLite state to one retained
+//! private logical snapshot, then runs:
 //!
 //! ```sql
 //! PRAGMA integrity_check(1)
@@ -145,28 +145,28 @@ impl IntegrityPageMalformedFinding {
 /// (`--only fm-db-state-files-integrity-page-malformed`) rather
 /// than bundling it into a sub-200ms health probe.
 pub fn detect(candidate_dbs: &[PathBuf]) -> Vec<IntegrityPageMalformedFinding> {
+    let read_candidates =
+        super::explicit_offline_db_read_candidates(candidate_dbs, "integrity-page detection");
+    detect_prepared(&read_candidates)
+}
+
+pub(crate) fn detect_prepared(
+    read_candidates: &[super::DoctorDbReadCandidate],
+) -> Vec<IntegrityPageMalformedFinding> {
     let mut out = Vec::new();
-    for db in candidate_dbs {
-        if let Some(f) = detect_one(db) {
+    for candidate in read_candidates {
+        if let Some(f) = detect_one(candidate) {
             out.push(f);
         }
     }
     out
 }
 
-fn detect_one(db_path: &std::path::Path) -> Option<IntegrityPageMalformedFinding> {
-    if !has_sqlite_header(db_path) {
-        return None;
-    }
-    // URI + immutable=1: read-only, no -shm creation, no
-    // locking. Matches the pass-35H pattern.
-    let conn = match super::open_immutable_sqlite(db_path) {
-        Ok(conn) => conn,
-        Err(error) => {
-            let detail = error.to_string();
-            if !mcp_agent_mail_db::is_corruption_error_message(&detail) {
-                return None;
-            }
+fn detect_one(candidate: &super::DoctorDbReadCandidate) -> Option<IntegrityPageMalformedFinding> {
+    let db_path = candidate.target_path();
+    let result = match candidate.integrity_check_one() {
+        super::DoctorIntegrityProbe::Result(result) => result,
+        super::DoctorIntegrityProbe::Corruption(detail) => {
             let db_size_bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
             return Some(IntegrityPageMalformedFinding {
                 db_path: db_path.to_path_buf(),
@@ -174,16 +174,7 @@ fn detect_one(db_path: &std::path::Path) -> Option<IntegrityPageMalformedFinding
                 db_size_bytes,
             });
         }
-    };
-    let result = match conn.query_sync("PRAGMA integrity_check(1)", &[]) {
-        Ok(rows) => rows.first()?.get_named::<String>("integrity_check").ok()?,
-        Err(error) => {
-            let detail = error.to_string();
-            if !mcp_agent_mail_db::is_corruption_error_message(&detail) {
-                return None;
-            }
-            format!("PRAGMA integrity_check(1) failed: {detail}")
-        }
+        super::DoctorIntegrityProbe::Unavailable => return None,
     };
     if result == "ok" {
         return None;
@@ -194,40 +185,6 @@ fn detect_one(db_path: &std::path::Path) -> Option<IntegrityPageMalformedFinding
         integrity_check_result: result,
         db_size_bytes,
     })
-}
-
-fn has_sqlite_header(path: &std::path::Path) -> bool {
-    use std::io::Read as _;
-
-    let Ok(mut file) = open_nonblock_for_read(path) else {
-        return false;
-    };
-    let Ok(meta) = file.metadata() else {
-        return false;
-    };
-    if !meta.file_type().is_file() || meta.len() < super::empty_or_truncated_db::SQLITE_HEADER_BYTES
-    {
-        return false;
-    }
-    let mut header = [0u8; 16];
-    if file.read_exact(&mut header).is_err() {
-        return false;
-    }
-    header == *super::empty_or_truncated_db::SQLITE_MAGIC
-}
-
-#[cfg(unix)]
-fn open_nonblock_for_read(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NONBLOCK)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn open_nonblock_for_read(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    std::fs::File::open(path)
 }
 
 /// Detect-only FM. `fix()` is a no-op.
@@ -248,6 +205,12 @@ mod tests {
     use sqlmodel_sqlite::SqliteConnection;
     use tempfile::TempDir;
 
+    const WAL_WRITER_PATH_ENV: &str = "AM_DOCTOR_INTEGRITY_WAL_WRITER_PATH";
+    const WAL_WRITER_READY_ENV: &str = "AM_DOCTOR_INTEGRITY_WAL_WRITER_READY";
+    const WAL_WRITER_RELEASE_ENV: &str = "AM_DOCTOR_INTEGRITY_WAL_WRITER_RELEASE";
+    const WAL_WRITER_TEST: &str = "doctor::fixers::integrity_page_malformed::tests::live_wal_only_check_violation_is_integrity_truth";
+    const WAL_WRITER_WITNESS: &str = "INTEGRITY_WAL_WRITER_CHILD_RAN";
+
     fn make_healthy_db(td: &TempDir) -> PathBuf {
         let db = td.path().join("storage.sqlite3");
         let conn = SqliteConnection::open_file(db.to_string_lossy().into_owned()).unwrap();
@@ -263,6 +226,200 @@ mod tests {
         let db = make_healthy_db(&td);
         let findings = detect(std::slice::from_ref(&db));
         assert!(findings.is_empty(), "healthy DB must not flag");
+    }
+
+    #[test]
+    fn live_wal_only_check_violation_is_integrity_truth() {
+        if let Ok(db_path) = std::env::var(WAL_WRITER_PATH_ENV) {
+            let ready_path = PathBuf::from(
+                std::env::var(WAL_WRITER_READY_ENV).expect("integrity WAL writer ready path"),
+            );
+            let release_path = PathBuf::from(
+                std::env::var(WAL_WRITER_RELEASE_ENV).expect("integrity WAL writer release path"),
+            );
+            let writer = mcp_agent_mail_db::DbConn::open_file(db_path)
+                .expect("open cross-process integrity WAL writer");
+            writer
+                .execute_raw(
+                    "PRAGMA wal_autocheckpoint = 0;
+                     PRAGMA ignore_check_constraints = ON;
+                     INSERT INTO checked_values(value) VALUES (-1);",
+                )
+                .expect("commit invalid CHECK row only to WAL");
+            std::fs::write(&ready_path, b"ready").expect("publish integrity WAL writer readiness");
+            println!("{WAL_WRITER_WITNESS}");
+            assert!(
+                super::super::wait_for_cross_process_release(&release_path),
+                "parent did not release integrity WAL writer in time"
+            );
+            drop(writer);
+            return;
+        }
+
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("storage.sqlite3");
+        let admitted = mcp_agent_mail_db::DbConn::open_file(db.display().to_string())
+            .expect("open live integrity fixture");
+        admitted
+            .execute_raw(
+                "CREATE TABLE checked_values(value INTEGER NOT NULL CHECK(value > 0));
+                 PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .expect("seed checked table");
+        mcp_agent_mail_db::close_db_conn(admitted, "settle integrity WAL baseline");
+        let main_before = std::fs::read(&db).expect("read settled integrity main");
+
+        // SQLite's integrity_check validates CHECK constraints. Disable only
+        // insertion-time enforcement and commit the invalid row to WAL, leaving
+        // the settled main image healthy. A direct immutable main-file probe
+        // therefore false-greens this fixture.
+        let ready_path = td.path().join("integrity-wal-writer.ready");
+        let release_path = td.path().join("integrity-wal-writer.release");
+        let child = std::process::Command::new(
+            std::env::current_exe().expect("resolve integrity test executable"),
+        )
+        .arg(WAL_WRITER_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(WAL_WRITER_PATH_ENV, &db)
+        .env(WAL_WRITER_READY_ENV, &ready_path)
+        .env(WAL_WRITER_RELEASE_ENV, &release_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn cross-process integrity WAL writer");
+        let child = super::super::CrossProcessTestChild::new(child, release_path);
+        if !super::super::wait_for_cross_process_signal(&ready_path) {
+            let output = child
+                .release_and_wait()
+                .expect("collect unready integrity WAL writer");
+            panic!(
+                "integrity WAL writer never became ready: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let main_after = std::fs::read(&db);
+        let wal_len = std::fs::metadata(PathBuf::from(format!("{}-wal", db.display())))
+            .map(|metadata| metadata.len());
+
+        let candidate = super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+            &db,
+            "cross-process WAL-only integrity truth test",
+        );
+        let findings = detect_prepared(std::slice::from_ref(&candidate));
+
+        let output = child
+            .release_and_wait()
+            .expect("collect integrity WAL writer");
+        assert!(
+            output.status.success(),
+            "integrity WAL writer failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(WAL_WRITER_WITNESS),
+            "integrity WAL writer filter was vacuous: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            main_after.expect("read WAL-only integrity main"),
+            main_before,
+            "fixture must keep the violating row out of the main image"
+        );
+        assert!(
+            wal_len.is_ok_and(|len| len > 32),
+            "fixture must retain committed WAL frames"
+        );
+        assert_eq!(findings.len(), 1, "WAL-only violation must be visible");
+        assert!(
+            findings[0]
+                .integrity_check_result
+                .to_ascii_lowercase()
+                .contains("check constraint"),
+            "unexpected integrity result: {}",
+            findings[0].integrity_check_result
+        );
+    }
+
+    #[test]
+    fn live_physical_index_damage_is_not_hidden_by_logical_snapshot() {
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("storage.sqlite3");
+        let conn = SqliteConnection::open_file(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE indexed_values(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             CREATE INDEX idx_indexed_values_name ON indexed_values(name);",
+        )
+        .unwrap();
+        for id in 1..=50_i64 {
+            conn.execute_raw(&format!(
+                "INSERT INTO indexed_values(id, name) VALUES ({id}, 'IndexWitness{id:02}');"
+            ))
+            .unwrap();
+        }
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let root_page = conn
+            .query_sync(
+                "SELECT rootpage FROM sqlite_master WHERE name = 'idx_indexed_values_name'",
+                &[],
+            )
+            .unwrap()[0]
+            .get_named::<i64>("rootpage")
+            .unwrap();
+        drop(conn);
+
+        let mut bytes = std::fs::read(&db).unwrap();
+        let raw_page_size = u16::from_be_bytes([bytes[16], bytes[17]]);
+        let page_size = if raw_page_size == 1 {
+            65_536_usize
+        } else {
+            usize::from(raw_page_size)
+        };
+        let page_start = (usize::try_from(root_page).unwrap() - 1) * page_size;
+        let page = &bytes[page_start..page_start + page_size];
+        let needle = b"IndexWitness";
+        let hit = page
+            .windows(needle.len())
+            .skip(16)
+            .position(|window| window == needle)
+            .expect("index page must contain a witness key")
+            + 16;
+        bytes[page_start + hit + 7] ^= 0x01;
+        std::fs::write(&db, bytes).unwrap();
+
+        let admitted = mcp_agent_mail_db::DbConn::open_file(db.display().to_string())
+            .expect("admit physical-index corruption through FrankenSQLite");
+        let rows = admitted
+            .query_sync("SELECT COUNT(*) AS count FROM indexed_values", &[])
+            .expect("table b-tree remains readable");
+        assert_eq!(rows[0].get_named::<i64>("count").unwrap(), 50);
+        mcp_agent_mail_db::close_db_conn(admitted, "settle physical integrity fixture");
+
+        let candidate = super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+            &db,
+            "physical integrity authority test",
+        );
+        let logical_result = candidate
+            .connection()
+            .expect("logical snapshot")
+            .query_sync("PRAGMA integrity_check(1)", &[])
+            .expect("check rebuilt logical snapshot")[0]
+            .get_named::<String>("integrity_check")
+            .unwrap();
+        assert_eq!(logical_result, "ok", "VACUUM should rebuild the index");
+        let findings = detect_prepared(std::slice::from_ref(&candidate));
+        assert_eq!(
+            findings.len(),
+            1,
+            "physical index corruption must remain authoritative"
+        );
+        assert_ne!(findings[0].integrity_check_result, "ok");
     }
 
     #[test]
@@ -294,6 +451,32 @@ mod tests {
         std::fs::write(&p, super::super::empty_or_truncated_db::SQLITE_MAGIC).unwrap();
         let findings = detect(std::slice::from_ref(&p));
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn production_prepared_source_keeps_non_sqlite_and_truncated_ownership_separate() {
+        let td = TempDir::new().unwrap();
+        let garbage = td.path().join("garbage.sqlite3");
+        let truncated = td.path().join("truncated.sqlite3");
+        std::fs::write(&garbage, b"not a sqlite db").unwrap();
+        std::fs::write(
+            &truncated,
+            super::super::empty_or_truncated_db::SQLITE_MAGIC,
+        )
+        .unwrap();
+        let candidates = [garbage, truncated]
+            .iter()
+            .map(|path| {
+                super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+                    path,
+                    "prepared integrity ownership test",
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            detect_prepared(&candidates).is_empty(),
+            "non-SQLite and truncated targets belong to empty_or_truncated_db"
+        );
     }
 
     #[cfg(unix)]

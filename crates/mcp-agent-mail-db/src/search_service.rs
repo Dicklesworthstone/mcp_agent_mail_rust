@@ -69,7 +69,7 @@ use sqlmodel_core::{Connection, Value};
 #[cfg(feature = "hybrid")]
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(feature = "hybrid")]
 use std::sync::RwLock;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -847,6 +847,7 @@ async fn canonicalize_message_results(
         result.ack_required = Some(detail.ack_required != 0);
         result.created_ts = Some(detail.created_ts);
         result.thread_id.clone_from(&detail.thread_id);
+        result.topic.clone_from(&detail.topic);
         result.from_agent = Some(detail.from.clone());
         result.from_agent_id = Some(detail.sender_id);
         result.to = Some(recipients.to);
@@ -910,9 +911,33 @@ fn stable_direct_surface_index_dir(pool: &DbPool) -> PathBuf {
     // from a replaced or drifted DB are dropped at query time by candidate
     // canonicalization, exactly as on the shared route.
     let mut hasher = Sha256::new();
-    hasher.update(pool.storage_root().display().to_string().as_bytes());
+    update_path_identity_digest(&mut hasher, pool.storage_root());
     let digest = hex::encode(hasher.finalize());
     stable_direct_surface_index_root().join(digest)
+}
+
+fn update_path_identity_digest(hasher: &mut Sha256, path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        hasher.update(b"unix\0");
+        hasher.update(path.as_os_str().as_bytes());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        hasher.update(b"windows-utf16le\0");
+        for unit in path.as_os_str().encode_wide() {
+            hasher.update(unit.to_le_bytes());
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        hasher.update(b"platform-lossy\0");
+        hasher.update(path.to_string_lossy().as_bytes());
+    }
 }
 
 fn stable_direct_surface_index_root() -> PathBuf {
@@ -938,12 +963,15 @@ fn sanitize_search_index_owner(value: &str) -> String {
         .collect()
 }
 
-fn direct_surface_index_dir(pool: &DbPool) -> PathBuf {
-    let shared = pool.storage_root().join("search_index");
+fn direct_surface_index_dir(pool: &DbPool) -> Result<PathBuf, DbError> {
+    pool.validated_sqlite_path("lexical search database selection")?;
+    let shared = pool
+        .validated_storage_root("lexical search index selection")?
+        .join("search_index");
     if shared.join("backfill_state.json").exists() || shared.join("meta.json").exists() {
-        return shared;
+        return Ok(shared);
     }
-    stable_direct_surface_index_dir(pool)
+    Ok(stable_direct_surface_index_dir(pool))
 }
 
 /// Read-only snapshot of the lexical Search V3 backfill/index state.
@@ -1077,23 +1105,50 @@ fn sqlite_file_lexical_backfill_fingerprint(db_path: &str) -> Option<LexicalBack
 #[must_use]
 pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
     let sqlite_key = sqlite_key_for_pool(pool);
-    let index_dir = direct_surface_index_dir(pool);
-    let index_dir_display = index_dir.display().to_string();
     let active_key = lexical_active_db_key()
         .lock()
         .map_or(None, |guard| guard.clone());
+    // `sqlite_key` / `active_key` are process-global cache keys and carry an
+    // encoding discriminator; the report shows the operator-facing
+    // `<path>@<generation>` spelling instead.
+    let db_identity = crate::pool::display_sqlite_identity_key(&sqlite_key);
+    let active_db_identity = active_key
+        .as_deref()
+        .map(crate::pool::display_sqlite_identity_key);
+    let index_dir = match direct_surface_index_dir(pool) {
+        Ok(index_dir) => index_dir,
+        Err(error) => {
+            return LexicalBackfillHealth {
+                state: "unavailable".to_string(),
+                db_identity: db_identity.clone(),
+                index_dir: stable_direct_surface_index_dir(pool).display().to_string(),
+                indexed_messages: 0,
+                source_messages: None,
+                skipped_messages: 0,
+                last_backfill_at_micros: None,
+                rebuild_in_progress: false,
+                active_db_identity: active_db_identity.clone(),
+                stale_reason: Some(error.to_string()),
+                safe_remediation: Some(
+                    "Restore the configured SQLite and storage-root paths to their original filesystem authorities, then retry lexical health"
+                        .to_string(),
+                ),
+            };
+        }
+    };
+    let index_dir_display = index_dir.display().to_string();
 
     if pool.sqlite_path() == ":memory:" {
         return LexicalBackfillHealth {
             state: "in_memory".to_string(),
-            db_identity: sqlite_key,
+            db_identity: db_identity.clone(),
             index_dir: index_dir_display,
             indexed_messages: 0,
             source_messages: None,
             skipped_messages: 0,
             last_backfill_at_micros: None,
             rebuild_in_progress: false,
-            active_db_identity: active_key,
+            active_db_identity: active_db_identity.clone(),
             stale_reason: Some(
                 "lexical backfill cannot inspect pooled sqlite:///:memory: contents".to_string(),
             ),
@@ -1110,14 +1165,14 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
     if let Some(Err(error)) = cached_bootstrap {
         return LexicalBackfillHealth {
             state: "unavailable".to_string(),
-            db_identity: sqlite_key,
+            db_identity: db_identity.clone(),
             index_dir: index_dir_display,
             indexed_messages: 0,
             source_messages: None,
             skipped_messages: 0,
             last_backfill_at_micros: None,
             rebuild_in_progress: false,
-            active_db_identity: active_key,
+            active_db_identity: active_db_identity.clone(),
             stale_reason: Some(error),
             safe_remediation: Some("Retry search bootstrap or run `am doctor health`".to_string()),
         };
@@ -1130,14 +1185,14 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
         Err(error) => {
             return LexicalBackfillHealth {
                 state: "unavailable".to_string(),
-                db_identity: sqlite_key,
+                db_identity: db_identity.clone(),
                 index_dir: index_dir_display,
                 indexed_messages: 0,
                 source_messages: None,
                 skipped_messages: 0,
                 last_backfill_at_micros: None,
                 rebuild_in_progress: false,
-                active_db_identity: active_key,
+                active_db_identity: active_db_identity.clone(),
                 stale_reason: Some(error),
                 safe_remediation: Some(
                     "Run `am robot search <query>` to retry lexical bridge initialization"
@@ -1155,14 +1210,14 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
         };
         return LexicalBackfillHealth {
             state: "delayed".to_string(),
-            db_identity: sqlite_key,
+            db_identity: db_identity.clone(),
             index_dir: index_dir_display,
             indexed_messages: 0,
             source_messages: None,
             skipped_messages: 0,
             last_backfill_at_micros: None,
             rebuild_in_progress: false,
-            active_db_identity: active_key,
+            active_db_identity: active_db_identity.clone(),
             stale_reason: Some(reason.to_string()),
             safe_remediation: Some(
                 "Run `am robot search <query>` or wait for startup search backfill, then recheck `am robot health --format json`"
@@ -1237,18 +1292,32 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
 
     LexicalBackfillHealth {
         state: health_state.to_string(),
-        db_identity: sqlite_key,
+        db_identity,
         index_dir: index_dir_display,
         indexed_messages,
         source_messages: Some(source_messages),
         skipped_messages,
         last_backfill_at_micros: Some(state.updated_at_micros),
         rebuild_in_progress: false,
-        active_db_identity: active_key,
-        stale_reason,
+        active_db_identity,
         safe_remediation: (health_state != "fresh").then(|| {
-            "Run `am robot search <query>` to refresh Search V3 lexical backfill".to_string()
+            if stale_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("process-global lexical bridge"))
+            {
+                // GH#261: the active-bridge key is process-global state inside
+                // the daemon; an external `am robot search` runs in a different
+                // process and can never clear it, so hinting it sends
+                // operators in circles.
+                "Restart the server process so the lexical bridge rebinds to this database \
+                 (the active-bridge key is process-global; an external `am robot search` \
+                 cannot clear it)"
+                    .to_string()
+            } else {
+                "Run `am robot search <query>` to refresh Search V3 lexical backfill".to_string()
+            }
         }),
+        stale_reason,
     }
 }
 
@@ -1328,6 +1397,31 @@ pub fn note_startup_lexical_backfill_completed(database_url: &str) -> Result<(),
     record_lexical_bootstrap_success(&sqlite_key)
 }
 
+/// Record startup lexical backfill completion under the live pool's identity.
+///
+/// GH#261: the URL-based [`note_startup_lexical_backfill_completed`] derives a
+/// *bare path* key, while `lexical_backfill_health` and
+/// `ensure_lexical_bridge_initialized` compare against
+/// `pool.sqlite_identity_key()` (`path@generation`). Those strings can never be
+/// equal, so a daemon whose startup backfill completed before its first search
+/// marked its own (only) database as "a different database" and silently served
+/// the plain-SQL fallback for its entire lifetime. Callers that have (or can
+/// resolve) the live pool must use this variant so completion is recorded under
+/// exactly the identity the health probe checks.
+pub fn note_startup_lexical_backfill_completed_for_pool(pool: &DbPool) -> Result<(), DbError> {
+    if pool.sqlite_path() == ":memory:" {
+        return Ok(());
+    }
+    if crate::search_v3::get_bridge().is_none() {
+        return Ok(());
+    }
+    let sqlite_key = sqlite_key_for_pool(pool);
+    let _guard = lexical_init_guard()
+        .lock()
+        .map_err(|e| DbError::Sqlite(format!("search bootstrap init guard lock poisoned: {e}")))?;
+    record_lexical_bootstrap_success(&sqlite_key)
+}
+
 fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
     if pool.sqlite_path() == ":memory:" {
         return Ok(());
@@ -1341,7 +1435,7 @@ fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
 
 fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
     let sqlite_key = sqlite_key_for_pool(pool);
-    let index_dir = direct_surface_index_dir(pool);
+    let index_dir = direct_surface_index_dir(pool)?;
     let _guard = lexical_init_guard()
         .lock()
         .map_err(|e| DbError::Sqlite(format!("search bootstrap init guard lock poisoned: {e}")))?;
@@ -1637,6 +1731,7 @@ impl SemanticBridge {
                 ack_required: None,
                 created_ts: None,
                 thread_id: None,
+                topic: None,
                 from_agent: None,
                 reason_codes: Vec::new(),
                 score_factors: Vec::new(),
@@ -1785,6 +1880,7 @@ fn scored_results_to_search_results(hits: Vec<ScoredResult>) -> Vec<SearchResult
             ack_required: None,
             created_ts: None,
             thread_id: None,
+            topic: None,
             from_agent: None,
             reason_codes: Vec::new(),
             score_factors: Vec::new(),
@@ -4380,6 +4476,7 @@ async fn legacy_sql_candidate_results(
                         ack_required: Some(row.ack_required != 0),
                         created_ts: Some(row.created_ts),
                         thread_id: row.thread_id,
+                        topic: row.topic,
                         from_agent: Some(row.from),
                         from_agent_id: Some(row.sender_id),
                         reason_codes: Vec::new(),
@@ -4411,6 +4508,7 @@ async fn legacy_sql_candidate_results(
                         ack_required: Some(row.ack_required != 0),
                         created_ts: Some(row.created_ts),
                         thread_id: row.thread_id,
+                        topic: row.topic,
                         from_agent: Some(row.from),
                         from_agent_id: Some(row.sender_id),
                         reason_codes: Vec::new(),
@@ -4440,6 +4538,7 @@ async fn legacy_sql_candidate_results(
                         ack_required: Some(row.ack_required != 0),
                         created_ts: Some(row.created_ts),
                         thread_id: row.thread_id,
+                        topic: row.topic,
                         from_agent: Some(row.from),
                         from_agent_id: Some(row.sender_id),
                         reason_codes: Vec::new(),
@@ -4505,6 +4604,7 @@ fn map_planned_rows(rows: Vec<sqlmodel_core::Row>, doc_kind: DocKind) -> Vec<Sea
                         .unwrap_or(0),
                 ),
                 score: Some(row.get_as::<f64>(10).unwrap_or(0.0)),
+                topic: row.get_as::<Option<String>>(11).unwrap_or_default(),
                 ..SearchResult::default()
             })
             .collect(),
@@ -4782,7 +4882,7 @@ mod tests {
         let pool = crate::DbPool::new(&config).expect("pool");
 
         assert_eq!(
-            direct_surface_index_dir(&pool),
+            direct_surface_index_dir(&pool).expect("select shared index authority"),
             root.path().join("search_index")
         );
     }
@@ -4797,10 +4897,91 @@ mod tests {
         };
         let pool = crate::DbPool::new(&config).expect("pool");
 
-        let chosen = direct_surface_index_dir(&pool);
+        let chosen =
+            direct_surface_index_dir(&pool).expect("select stable fallback index authority");
         assert_ne!(chosen, root.path().join("search_index"));
         assert!(chosen.starts_with(stable_direct_surface_index_root()));
         assert_eq!(chosen, stable_direct_surface_index_dir(&pool));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_surface_index_dir_rejects_post_construction_storage_root_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let frozen_storage_root = root.path().join("missing-storage-root");
+        let foreign_storage_root = root.path().join("foreign-storage-root");
+        let foreign_index = foreign_storage_root.join("search_index");
+        std::fs::create_dir_all(&foreign_index).expect("create foreign search index");
+        std::fs::write(foreign_index.join("meta.json"), "{}").expect("write foreign index marker");
+        let pool = crate::DbPool::new(&crate::DbPoolConfig {
+            database_url: format!("sqlite:///{}", root.path().join("mail.sqlite3").display()),
+            storage_root: Some(frozen_storage_root.clone()),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("freeze missing storage-root authority");
+
+        symlink(&foreign_storage_root, &frozen_storage_root)
+            .expect("insert foreign storage-root symlink");
+        let error = direct_surface_index_dir(&pool)
+            .expect_err("search index selection must reject retargeted storage authority");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to cross archive authority"),
+            "unexpected authority error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_surface_index_dir_accepts_missing_leaf_then_rejects_existing_sqlite_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("search authority tempdir");
+        let storage_root = root.path().join("archive");
+        let shared_index = storage_root.join("search_index");
+        std::fs::create_dir_all(&shared_index).expect("create shared search authority");
+        std::fs::write(shared_index.join("meta.json"), "{}").expect("write shared search marker");
+
+        let frozen_db = root.path().join("mail.sqlite3");
+        let foreign_db = root.path().join("missing-foreign.sqlite3");
+        assert!(
+            !foreign_db.exists(),
+            "search authority fixture requires a dangling symlink target"
+        );
+
+        let pool = crate::DbPool::new(&crate::DbPoolConfig {
+            database_url: format!("sqlite:///{}", frozen_db.display()),
+            storage_root: Some(storage_root),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("freeze missing search database authority");
+        assert_eq!(
+            direct_surface_index_dir(&pool)
+                .expect("an unchanged missing SQLite leaf remains an ordinary lazy authority"),
+            shared_index
+        );
+
+        symlink(&foreign_db, &frozen_db)
+            .expect("insert dangling SQLite symlink before search index admission");
+        let error = direct_surface_index_dir(&pool)
+            .expect_err("search index selection must reject retargeted SQLite authority");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to cross database authority"),
+            "unexpected search database authority error: {error}"
+        );
     }
 
     #[test]
@@ -4839,6 +5020,47 @@ mod tests {
             .expect("pool"),
         );
         assert_ne!(first, other);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_direct_surface_index_dir_keeps_native_byte_authorities_distinct() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let storage_a = root
+            .path()
+            .join(OsString::from_vec(b"storage-\xff".to_vec()));
+        let storage_b = root
+            .path()
+            .join(OsString::from_vec(b"storage-\xfe".to_vec()));
+        std::fs::create_dir_all(&storage_a).expect("create first native-byte root");
+        std::fs::create_dir_all(&storage_b).expect("create second native-byte root");
+        assert_eq!(
+            storage_a.to_string_lossy(),
+            storage_b.to_string_lossy(),
+            "fixture must collide under the former display-string namespace"
+        );
+
+        let pool_for = |db_name: &str, storage_root: PathBuf| {
+            crate::DbPool::new(&crate::DbPoolConfig {
+                database_url: format!("sqlite:///{}", root.path().join(db_name).display()),
+                storage_root: Some(storage_root),
+                min_connections: 0,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("construct native-byte search authority")
+        };
+        let first = stable_direct_surface_index_dir(&pool_for("first.sqlite3", storage_a));
+        let second = stable_direct_surface_index_dir(&pool_for("second.sqlite3", storage_b));
+        assert_ne!(
+            first, second,
+            "byte-distinct archive roots must not share a lexical index namespace"
+        );
     }
 
     #[test]
@@ -5328,6 +5550,55 @@ mod tests {
     }
 
     #[test]
+    fn startup_lexical_backfill_completion_for_pool_binds_pool_identity() {
+        // GH#261: recording completion under the URL-derived bare path while
+        // the health probe compares `pool.sqlite_identity_key()`
+        // ("path@generation") permanently marked a daemon's only database as
+        // foreign. The pool-keyed recording must bind exactly the identity the
+        // health probe checks.
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        let bridge_ready = crate::search_v3::get_bridge().is_some();
+
+        note_startup_lexical_backfill_completed_for_pool(&pool)
+            .expect("record pool-keyed startup bootstrap");
+
+        let active_key = lexical_active_db_key()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        if bridge_ready {
+            let pool_key = pool.sqlite_identity_key();
+            assert_eq!(
+                active_key.as_deref(),
+                Some(pool_key.as_str()),
+                "startup completion must be recorded under the pool identity the health probe compares"
+            );
+            assert!(has_run_lexical_backfill(&pool_key).expect("backfill marker"));
+            let health = lexical_backfill_health(&pool);
+            assert!(
+                !health
+                    .stale_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with("process-global lexical bridge"),
+                "the daemon's own database must not be reported as a different database: {:?}",
+                health.stale_reason
+            );
+        } else {
+            assert!(active_key.is_none());
+        }
+
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
     fn startup_lexical_backfill_completion_ignores_memory_db() {
         let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
             .lock()
@@ -5417,6 +5688,39 @@ mod tests {
     }
 
     #[test]
+    fn lexical_backfill_health_reports_plain_db_identity_without_cache_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mailbox.sqlite3");
+        let config = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..crate::pool::DbPoolConfig::default()
+        };
+        let pool = DbPool::new(&config).expect("file-backed pool");
+
+        let health = lexical_backfill_health(&pool);
+        let expected_prefix = format!("{}@", db_path.display());
+        assert!(
+            health.db_identity.starts_with(&expected_prefix),
+            "db_identity must be the operator-facing `<path>@<generation>` spelling, got {}",
+            health.db_identity
+        );
+        assert!(
+            !health.db_identity.starts_with("utf8:"),
+            "internal cache-key namespace must not leak into db_identity: {}",
+            health.db_identity
+        );
+        if let Some(active) = health.active_db_identity.as_deref() {
+            assert!(
+                !active.starts_with("utf8:"),
+                "internal cache-key namespace must not leak into active_db_identity: {active}"
+            );
+        }
+        // The cache key itself keeps its discriminator so byte-distinct paths
+        // cannot collide inside process-global caches.
+        assert!(sqlite_key_for_pool(&pool).starts_with("utf8:"));
+    }
+
+    #[test]
     fn sqlite_key_for_pool_is_stable_across_memory_pool_clones() {
         let config = crate::pool::DbPoolConfig {
             database_url: "sqlite:///:memory:".to_string(),
@@ -5482,6 +5786,7 @@ mod tests {
             ack_required: None,
             created_ts: None,
             thread_id: None,
+            topic: None,
             from_agent: None,
             from_agent_id: None,
             to: None,
@@ -5527,6 +5832,7 @@ mod tests {
                 ack_required: None,
                 created_ts: None,
                 thread_id: None,
+                topic: None,
                 from_agent: None,
                 reason_codes: Vec::new(),
                 score_factors: Vec::new(),
@@ -5558,6 +5864,7 @@ mod tests {
             ack_required: None,
             created_ts: Some(1_700_000_000_000_123),
             thread_id: None,
+            topic: None,
             from_agent: None,
             from_agent_id: None,
             to: None,
@@ -5592,6 +5899,7 @@ mod tests {
                 "body_md".to_string(),
                 "project_id".to_string(),
                 "score".to_string(),
+                "topic".to_string(),
             ],
             vec![
                 Value::BigInt(7),
@@ -5605,6 +5913,7 @@ mod tests {
                 Value::Text("Thread preview".to_string()),
                 Value::BigInt(3),
                 Value::Double(0.0),
+                Value::Text("br-thread.7".to_string()),
             ],
         );
 
@@ -5613,6 +5922,7 @@ mod tests {
         assert_eq!(results[0].from_agent.as_deref(), Some("BlueLake"));
         assert_eq!(results[0].from_agent_id, Some(42));
         assert_eq!(results[0].thread_id.as_deref(), Some("thread-7"));
+        assert_eq!(results[0].topic.as_deref(), Some("br-thread.7"));
     }
 
     #[test]
@@ -5630,6 +5940,7 @@ mod tests {
                 "body_md".to_string(),
                 "project_id".to_string(),
                 "score".to_string(),
+                "topic".to_string(),
             ],
             vec![
                 Value::BigInt(8),
@@ -5643,6 +5954,7 @@ mod tests {
                 Value::Text("Thread preview".to_string()),
                 Value::BigInt(4),
                 Value::Double(0.0),
+                Value::Null,
             ],
         );
 
@@ -5653,6 +5965,7 @@ mod tests {
             Some(UNKNOWN_SENDER_DISPLAY)
         );
         assert_eq!(results[0].from_agent_id, None);
+        assert_eq!(results[0].topic, None);
     }
 
     #[test]
@@ -5669,6 +5982,7 @@ mod tests {
                 ack_required: None,
                 created_ts: Some(300),
                 thread_id: None,
+                topic: None,
                 from_agent: None,
                 from_agent_id: None,
                 to: None,
@@ -5690,6 +6004,7 @@ mod tests {
                 ack_required: None,
                 created_ts: Some(200),
                 thread_id: None,
+                topic: None,
                 from_agent: None,
                 from_agent_id: None,
                 to: None,
@@ -5722,6 +6037,7 @@ mod tests {
                     ack_required: None,
                     created_ts: Some(100),
                     thread_id: None,
+                    topic: None,
                     from_agent: None,
                     from_agent_id: None,
                     to: None,
@@ -5755,6 +6071,7 @@ mod tests {
                 ack_required: None,
                 created_ts: Some(300),
                 thread_id: None,
+                topic: None,
                 from_agent: None,
                 from_agent_id: None,
                 to: None,
@@ -5776,6 +6093,7 @@ mod tests {
                 ack_required: None,
                 created_ts: None,
                 thread_id: None,
+                topic: None,
                 from_agent: None,
                 from_agent_id: None,
                 to: None,
@@ -5808,6 +6126,7 @@ mod tests {
                     ack_required: None,
                     created_ts: Some(100),
                     thread_id: None,
+                    topic: None,
                     from_agent: None,
                     from_agent_id: None,
                     to: None,
@@ -5841,6 +6160,7 @@ mod tests {
                 ack_required: None,
                 created_ts: None,
                 thread_id: None,
+                topic: None,
                 from_agent: None,
                 from_agent_id: None,
                 to: None,
@@ -5862,6 +6182,7 @@ mod tests {
                 ack_required: None,
                 created_ts: None,
                 thread_id: None,
+                topic: None,
                 from_agent: None,
                 from_agent_id: None,
                 to: None,
@@ -5893,6 +6214,7 @@ mod tests {
                     ack_required: None,
                     created_ts: None,
                     thread_id: None,
+                    topic: None,
                     from_agent: None,
                     from_agent_id: None,
                     to: None,
@@ -5925,6 +6247,7 @@ mod tests {
             ack_required: None,
             created_ts: None,
             thread_id: None,
+            topic: None,
             from_agent: None,
             from_agent_id: None,
             to: None,
@@ -6283,6 +6606,7 @@ mod tests {
             project_id,
             sender_id: 1,
             thread_id: thread_id.map(std::borrow::ToOwned::to_owned),
+            topic: None,
             subject: "subject".to_string(),
             body_md: "body".to_string(),
             importance: importance.to_string(),
@@ -6471,6 +6795,7 @@ mod tests {
             ack_required: Some(false),
             created_ts: Some(2_400),
             thread_id: Some("br-240".to_string()),
+            topic: None,
             from_agent: Some("RedPeak".to_string()),
             from_agent_id: None,
             to: None,
@@ -6502,6 +6827,7 @@ mod tests {
             ack_required: Some(false),
             created_ts: Some(2_500),
             thread_id: Some("br-250".to_string()),
+            topic: None,
             from_agent: None,
             from_agent_id: None,
             to: None,
@@ -6532,6 +6858,7 @@ mod tests {
             ack_required: Some(false),
             created_ts: Some(2_600),
             thread_id: Some("br-260".to_string()),
+            topic: None,
             from_agent: None,
             from_agent_id: None,
             to: None,
@@ -6910,6 +7237,7 @@ mod tests {
             ack_required: None,
             created_ts: None,
             thread_id: None,
+            topic: None,
             from_agent: None,
             from_agent_id: None,
             to: None,

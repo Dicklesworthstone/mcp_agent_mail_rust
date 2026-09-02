@@ -466,6 +466,8 @@ pub struct ProductSearchItem {
     pub ack_required: i32,
     pub created_ts: Option<String>,
     pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub from: String,
     pub project_id: i64,
     /// Message body (Markdown). Populated only when the caller passes
@@ -685,6 +687,7 @@ pub async fn search_messages_product(
             ack_required: i32::from(r.ack_required.unwrap_or(false)),
             created_ts: r.created_ts.map(micros_to_iso),
             thread_id: r.thread_id,
+            topic: r.topic,
             from: r.from_agent.unwrap_or_default(),
             project_id: r.project_id.unwrap_or(0),
             body_md: if include_body_md { Some(r.body) } else { None },
@@ -809,6 +812,7 @@ pub async fn fetch_inbox_product(
                 project_id: msg.project_id,
                 sender_id: msg.sender_id,
                 thread_id: msg.thread_id,
+                topic: msg.topic,
                 subject: msg.subject,
                 importance: msg.importance,
                 ack_required: msg.ack_required != 0,
@@ -1272,6 +1276,7 @@ mod tests {
             ack_required: 1,
             created_ts: Some("2026-02-12T10:00:00Z".to_string()),
             thread_id: Some("br-123".to_string()),
+            topic: Some("br-abc.1".to_string()),
             from: "GoldFox".to_string(),
             project_id: 5,
             body_md: None,
@@ -1283,6 +1288,7 @@ mod tests {
         assert_eq!(parsed.importance, "high");
         assert_eq!(parsed.ack_required, 1);
         assert_eq!(parsed.thread_id, Some("br-123".to_string()));
+        assert_eq!(parsed.topic.as_deref(), Some("br-abc.1"));
         assert_eq!(parsed.from, "GoldFox");
         assert_eq!(parsed.project_id, 5);
         assert!(parsed.body_md.is_none());
@@ -1299,6 +1305,7 @@ mod tests {
             ack_required: 0,
             created_ts: None,
             thread_id: None,
+            topic: None,
             from: "Agent".to_string(),
             project_id: 1,
             body_md: None,
@@ -1318,6 +1325,7 @@ mod tests {
             ack_required: 0,
             created_ts: None,
             thread_id: None,
+            topic: None,
             from: "Agent".to_string(),
             project_id: 1,
             body_md: Some("body contents".to_string()),
@@ -1353,6 +1361,7 @@ mod tests {
                     ack_required: 1,
                     created_ts: None,
                     thread_id: None,
+                    topic: None,
                     from: "A".to_string(),
                     project_id: 1,
                     body_md: None,
@@ -1364,6 +1373,7 @@ mod tests {
                     ack_required: 0,
                     created_ts: None,
                     thread_id: None,
+                    topic: None,
                     from: "B".to_string(),
                     project_id: 2,
                     body_md: None,
@@ -1898,6 +1908,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: Some("PRODUCT-LIMIT-1".to_string()),
+            topic: None,
             subject: subject.to_string(),
             body_md: format!("- {subject} point"),
             importance: "normal".to_string(),

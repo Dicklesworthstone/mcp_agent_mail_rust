@@ -551,10 +551,10 @@ fi
 e2e_save_artifact "case_13_omp_project.json" "$OMP_PROJECT"
 e2e_save_artifact "case_13_omp_user.json" "$OMP_USER"
 
-if json_get "$OMP_PROJECT" "entry=d['mcpServers']['mcp-agent-mail']; assert entry['type']=='http' and entry['url']=='http://127.0.0.1:8765/mcp/' and entry['headers']['Authorization']=='Bearer omp-token-789' and entry['enabled'] is True; assert d['disabledServers']==['keep-disabled']"; then
-    e2e_pass "OMP project config uses native authenticated HTTP shape"
+if json_get "$OMP_PROJECT" "entry=d['mcpServers']['mcp-agent-mail']; assert entry['type']=='http' and entry['url']=='http://127.0.0.1:8765/mcp/' and entry['headers']['Authorization']=='Bearer omp-token-789' and entry['enabled'] is True; assert d['disabledServers']==['keep-disabled', 'mcp-agent-mail']"; then
+    e2e_pass "OMP project config uses native authenticated HTTP shape and preserves ignored project runtime lists"
 else
-    e2e_fail "OMP project config shape" "native authenticated HTTP entry" "missing or malformed"
+    e2e_fail "OMP project config shape" "native authenticated HTTP entry with untouched project runtime lists" "missing or malformed"
 fi
 
 if json_get "$OMP_PROJECT" "keep=d['mcpServers']['keep-me']; assert keep['command']=='node' and keep['args']==['server.js']"; then

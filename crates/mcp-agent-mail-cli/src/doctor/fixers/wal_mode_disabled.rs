@@ -14,10 +14,8 @@
 //!
 //! ## Detection (pure function)
 //!
-//! Open the DB at `db_path` read-only with URI `?immutable=1`
-//! (no WAL/SHM sidecar creation or journal replay), run
-//! `PRAGMA journal_mode;`, parse the result. If the value is
-//! anything other than `wal` (case-insensitive), emit a finding.
+//! Read the DB header's persisted journal-mode version bytes. If they do not
+//! encode WAL mode, emit a finding. No SQL engine touches the live inode.
 //!
 //! ## Fix (`Op::DbExec` — new pattern)
 //!
@@ -91,8 +89,8 @@ impl WalModeDisabledFinding {
     }
 }
 
-/// Detector. PURE w.r.t. caller-supplied DB paths; reads from the
-/// SQLite file via `PRAGMA journal_mode;`.
+/// Detector. PURE w.r.t. caller-supplied DB paths; reads the persisted journal
+/// mode directly from the 100-byte SQLite header.
 ///
 /// `candidate_paths` is typically `[<storage_root>/storage.sqlite3]`.
 /// Empty slice skips the FM. `:memory:` URLs should be filtered
@@ -103,10 +101,7 @@ pub fn detect(candidate_paths: &[PathBuf]) -> Vec<WalModeDisabledFinding> {
         if !path.is_file() {
             continue;
         }
-        let mode = match read_journal_mode_from_header(path).or_else(|| {
-            let conn = super::open_immutable_sqlite(path).ok()?;
-            read_journal_mode(&conn)
-        }) {
+        let mode = match read_journal_mode_from_header(path) {
             Some(m) => m,
             None => continue,
         };
@@ -127,6 +122,7 @@ pub fn detect(candidate_paths: &[PathBuf]) -> Vec<WalModeDisabledFinding> {
 /// sqlmodel-sqlite's `execute_raw` returns `Result<(), Error>` and
 /// doesn't expose query results. For the PRAGMA we need a query
 /// result, so use `query_sync` instead.
+#[cfg(test)]
 fn read_journal_mode(conn: &sqlmodel_sqlite::SqliteConnection) -> Option<String> {
     let rows = conn.query_sync("PRAGMA journal_mode;", &[]).ok()?;
     let first = rows.first()?;

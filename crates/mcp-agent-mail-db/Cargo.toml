@@ -13,7 +13,7 @@ publish = false
 
 [dependencies]
 mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
-tantivy.workspace = true
+tantivy = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
@@ -24,6 +24,11 @@ unicode-normalization.workspace = true
 sha2.workspace = true
 hex.workspace = true
 tempfile.workspace = true
+fs2.workspace = true
+same-file.workspace = true
+nix = { workspace = true, features = ["fs", "process", "signal"] }
+rustix.workspace = true
+url.workspace = true
 
 # frankensearch: two-tier hybrid search implementation (optional, for hybrid feature)
 frankensearch = { workspace = true, optional = true }
@@ -41,6 +46,7 @@ rayon = { workspace = true, optional = true }
 dirs = { workspace = true, optional = true }
 
 # sqlmodel dependencies
+fsqlite.workspace = true
 sqlmodel.workspace = true
 sqlmodel-core.workspace = true
 sqlmodel-query.workspace = true
@@ -61,7 +67,7 @@ default = ["hybrid", "s3fifo", "tantivy-engine"]
 # Portable build: everything except hybrid search. Used by CI release builds.
 portable = ["s3fifo", "tantivy-engine"]
 # Enable Tantivy-based lexical search (moved from search-core)
-tantivy-engine = []
+tantivy-engine = ["dep:tantivy"]
 # Enable hybrid search (lexical + local semantic + frankensearch) without
 # FastEmbed/hf-hub/reqwest/tokio. Do not use frankensearch's aggregate
 # `hybrid` feature here; it currently includes FastEmbed.
@@ -100,10 +106,6 @@ hybrid = [
 loom-tests = []
 # Use S3-FIFO eviction in ReadCache (replaces IndexMap LRU)
 s3fifo = []
-
-[target.'cfg(windows)'.dependencies]
-# Stable file-identity check (std's windows_by_handle is still unstable).
-same-file.workspace = true
 
 [dev-dependencies]
 # asupersync `Cx::for_testing()` (the `Cx<cap::All>` constructor) is gated

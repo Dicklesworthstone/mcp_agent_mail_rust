@@ -1474,7 +1474,7 @@ fn normalize_input_path(raw: &str, base: &Path) -> PathBuf {
 }
 
 fn normalize_path_for_overlap(path: &Path) -> PathBuf {
-    canonicalize_existing_prefix(&normalize_lexical_path(path))
+    normalize_lexical_path(&canonicalize_existing_prefix(path))
 }
 
 /// Resolve the longest existing prefix while retaining a not-yet-created

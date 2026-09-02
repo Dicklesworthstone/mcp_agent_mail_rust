@@ -7,7 +7,7 @@
 //! - **CI replay**: 100 agents across 10 projects using isolated SQLite/storage.
 //! - **Scenario A**: Registration storm — 1000 agents register across 50 threads.
 //! - **Scenario B**: Message burst — 100 agents send 10 messages each.
-//! - **Scenario C**: Mixed workload — 60s sustained mixed read/write operations.
+//! - **Scenario C**: Mixed workload — 30s sustained mixed read/write operations.
 //! - **Scenario D**: Thundering herd — 500 concurrent `fetch_inbox` on one project.
 //!
 //! Each scenario collects per-operation latencies, reports p50/p95/p99/max,
@@ -105,6 +105,90 @@ fn make_load_pool(max_connections: usize) -> (DbPool, tempfile::TempDir) {
     };
     let pool = DbPool::new(&config).expect("create pool");
     (pool, dir)
+}
+
+/// Prove that a load scenario leaves a database structurally sound both while
+/// the writer pool is live and after every pooled connection has been dropped
+/// and a fresh pool reopens the same file. The second leg is load-bearing for
+/// GH#257: several field incidents first became undeniable at the next
+/// integrity/restart boundary rather than as an API error during the write.
+fn durable_message_counts(sqlite_path: &str, scenario: &str) -> (i64, i64) {
+    let conn = mcp_agent_mail_db::DbConn::open_file(sqlite_path)
+        .unwrap_or_else(|error| panic!("{scenario}: independent count connection failed: {error}"));
+    let rows = conn
+        .query_sync(
+            "SELECT (SELECT COUNT(*) FROM messages), \
+                    (SELECT COUNT(*) FROM message_recipients)",
+            &[],
+        )
+        .unwrap_or_else(|error| panic!("{scenario}: durable row-count query failed: {error}"));
+    let row = rows
+        .first()
+        .unwrap_or_else(|| panic!("{scenario}: durable row-count query returned no rows"));
+    let message_count = row
+        .get_as(0)
+        .unwrap_or_else(|error| panic!("{scenario}: message count decode failed: {error}"));
+    let recipient_count = row
+        .get_as(1)
+        .unwrap_or_else(|error| panic!("{scenario}: recipient count decode failed: {error}"));
+    mcp_agent_mail_db::close_db_conn(conn, "load bench durable row-count probe");
+    (message_count, recipient_count)
+}
+
+fn assert_full_integrity_before_and_after_reopen(
+    pool: DbPool,
+    scenario: &str,
+    expected_messages: usize,
+    expected_recipients: usize,
+) {
+    let sqlite_path = pool.sqlite_path().to_string();
+    let expected_messages =
+        i64::try_from(expected_messages).expect("load-bench message count fits in i64");
+    let expected_recipients =
+        i64::try_from(expected_recipients).expect("load-bench recipient count fits in i64");
+    let live = pool
+        .run_full_integrity_check()
+        .unwrap_or_else(|error| panic!("{scenario}: live full integrity check failed: {error}"));
+    assert!(
+        live.ok,
+        "{scenario}: live database failed full integrity check: {:?}",
+        live.details
+    );
+    assert_eq!(
+        durable_message_counts(&sqlite_path, scenario),
+        (expected_messages, expected_recipients),
+        "{scenario}: successful writes must be independently visible before pool shutdown"
+    );
+
+    drop(pool);
+
+    let reopened = DbPool::new_without_startup_init(&DbPoolConfig {
+        database_url: format!("sqlite:///{sqlite_path}"),
+        storage_root: Path::new(&sqlite_path)
+            .parent()
+            .map(|parent| parent.join("storage")),
+        max_connections: 4,
+        min_connections: 0,
+        acquire_timeout_ms: 120_000,
+        max_lifetime_ms: 3_600_000,
+        run_migrations: true,
+        warmup_connections: 0,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
+    })
+    .unwrap_or_else(|error| panic!("{scenario}: fresh pool reopen failed: {error}"));
+    let after_reopen = reopened.run_full_integrity_check().unwrap_or_else(|error| {
+        panic!("{scenario}: reopened full integrity check failed: {error}")
+    });
+    assert!(
+        after_reopen.ok,
+        "{scenario}: reopened database failed full integrity check: {:?}",
+        after_reopen.details
+    );
+    assert_eq!(
+        durable_message_counts(&sqlite_path, scenario),
+        (expected_messages, expected_recipients),
+        "{scenario}: successful writes must survive a fresh pool reopen"
+    );
 }
 
 fn cap(s: &str) -> String {
@@ -1658,6 +1742,12 @@ fn load_scenario_b_message_burst() {
         "SLO: p99 < 500ms, got {:.1}ms",
         report.p99 as f64 / 1000.0
     );
+    assert_full_integrity_before_and_after_reopen(
+        pool,
+        "100-agent message burst",
+        n_agents * msgs_per_agent,
+        n_agents * msgs_per_agent,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1723,7 +1813,7 @@ fn load_scenario_c_mixed_workload() {
         for a in 0..agent_ids.len().min(5) {
             let sender = agent_ids[a];
             let receiver = agent_ids[(a + 1) % agent_ids.len()];
-            let _ = block_on(|cx| {
+            block_on(|cx| {
                 let pp = pool.clone();
                 let pid = *project_id;
                 async move {
@@ -1742,6 +1832,10 @@ fn load_scenario_c_mixed_workload() {
                     )
                     .await
                 }
+            })
+            .into_result()
+            .unwrap_or_else(|error| {
+                panic!("mixed-workload seed message {a} failed before load began: {error}")
             });
         }
     }
@@ -1969,6 +2063,14 @@ fn load_scenario_c_mixed_workload() {
         combined_r.p99 < 1_000_000,
         "SLO: combined p99 < 1s, got {:.1}ms",
         combined_r.p99 as f64 / 1000.0
+    );
+    let seeded_messages = n_projects * 5;
+    let expected_messages = seeded_messages + send_r.count;
+    assert_full_integrity_before_and_after_reopen(
+        pool,
+        "30-second mixed workload",
+        expected_messages,
+        expected_messages,
     );
 }
 
@@ -2313,6 +2415,7 @@ fn make_cache_profile_agent(idx: usize) -> AgentRow {
         contact_policy: "auto".to_string(),
         reaper_exempt: 0,
         registration_token: None,
+        retired_at: None,
     }
 }
 

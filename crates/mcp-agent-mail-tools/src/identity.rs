@@ -11,7 +11,7 @@ use asupersync::Outcome;
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_db::{DbConn, guard_db_conn, micros_to_iso};
+use mcp_agent_mail_db::{DbConn, micros_to_iso};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -983,8 +983,11 @@ fn resolve_health_check_sqlite_path(database_url: &str) -> Result<Option<PathBuf
 
 fn open_health_check_sync_db_connection(path: &Path) -> Result<DbConn, String> {
     let display = path.display().to_string();
-    let conn = DbConn::open_file(&display)
-        .map_err(|err| format!("open sqlite file {display} for health_check: {err}"))?;
+    let conn = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+        path,
+        "tool health_check semantic-readiness probe",
+    )
+    .map_err(|err| format!("open sqlite file {display} for health_check: {err}"))?;
     conn.execute_raw(&format!(
         "PRAGMA busy_timeout = {HEALTH_CHECK_SYNC_DB_BUSY_TIMEOUT_MS};"
     ))
@@ -1054,8 +1057,6 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
             return semantic_readiness_response(status, error);
         }
     };
-    let conn = guard_db_conn(conn, "identity::health_check semantic probe");
-
     if let Err(error) = conn.query_sync("SELECT 1", &[]) {
         let error = error.to_string();
         let status = if mcp_agent_mail_db::is_lock_error(&error) {
@@ -1233,6 +1234,28 @@ fn try_write_agent_profile(config: &Config, project_slug: &str, agent_json: &ser
         op,
         &format!("agent profile archive write project={project_slug}"),
     );
+}
+
+/// Serialize the durable, non-secret portion of an agent profile for the Git
+/// archive. Keeping lifecycle fields in the profile makes reconstruction
+/// preserve routing state without ever archiving the registration token.
+fn agent_archive_profile_json(
+    agent: &mcp_agent_mail_db::AgentRow,
+    deregistered_at: Option<i64>,
+) -> serde_json::Value {
+    json!({
+        "name": agent.name,
+        "program": agent.program,
+        "model": agent.model,
+        "task_description": agent.task_description,
+        "inception_ts": micros_to_iso(agent.inception_ts),
+        "last_active_ts": micros_to_iso(agent.last_active_ts),
+        "attachments_policy": agent.attachments_policy,
+        "contact_policy": agent.contact_policy,
+        "reaper_exempt": agent.reaper_exempt != 0,
+        "retired_at": agent.retired_at.map(micros_to_iso),
+        "deregistered_at": deregistered_at.map(micros_to_iso),
+    })
 }
 
 /// If the project root is ephemeral and the current storage root is the
@@ -1589,6 +1612,81 @@ pub struct AgentResponse {
     /// `sender_token` when sending messages to prove ownership of this agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_token: Option<String>,
+    /// Retirement timestamp, when the identity is temporarily inactive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<String>,
+    /// Deregistration timestamp, when the identity is permanently inactive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deregistered_at: Option<String>,
+}
+
+fn authenticate_lifecycle_agent(
+    project: &mcp_agent_mail_db::ProjectRow,
+    agent: &mcp_agent_mail_db::AgentRow,
+    registration_token: Option<&str>,
+    pane_id: Option<&str>,
+    action: &str,
+) -> McpResult<()> {
+    let provided_token = registration_token.filter(|token| !token.is_empty());
+    let token_matches = provided_token.is_some_and(|provided| {
+        agent.registration_token.as_deref().is_some_and(|stored| {
+            mcp_agent_mail_core::setup::constant_time_str_eq(provided, stored)
+        })
+    });
+    // An explicitly supplied but invalid token must not silently fall back to
+    // ambient pane identity. That keeps stale or stolen credentials loud.
+    let pane_matches = provided_token.is_none()
+        && mcp_agent_mail_core::resolve_identity_with_optional_pane(&project.human_key, pane_id)
+            .is_some_and(|resolved| resolved.eq_ignore_ascii_case(&agent.name));
+    if token_matches || pane_matches {
+        return Ok(());
+    }
+
+    Err(legacy_tool_error(
+        "AUTHENTICATION_REQUIRED",
+        format!(
+            "{action} requires the registration_token for agent '{}', or a pane session bound to that agent.",
+            agent.name
+        ),
+        true,
+        json!({
+            "agent_name": agent.name,
+            "project_key": project.human_key,
+            "token_param": "registration_token",
+        }),
+    ))
+}
+
+async fn reject_deregistered_lifecycle_transition(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    agent: &mcp_agent_mail_db::AgentRow,
+    action: &str,
+) -> McpResult<()> {
+    let agent_id = agent
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+    let deregistered_at = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent_deregistered_at(ctx.cx(), pool, agent_id).await,
+    )?;
+    let Some(deregistered_at) = deregistered_at else {
+        return Ok(());
+    };
+
+    Err(legacy_tool_error(
+        "AGENT_DEREGISTERED",
+        format!(
+            "Agent '{}' was deregistered and cannot be {action}; create a new identity instead.",
+            agent.name
+        ),
+        false,
+        json!({
+            "agent_name": agent.name,
+            "state": "deregistered",
+            "action": action,
+            "deregistered_at": micros_to_iso(deregistered_at),
+        }),
+    ))
 }
 
 /// Whois response with optional recent commits
@@ -2221,15 +2319,7 @@ Check that all parameters have valid values."
 
     // Write agent profile to git archive (best-effort)
     let config = &Config::get();
-    let agent_json = serde_json::json!({
-        "name": row.name,
-        "program": row.program,
-        "model": row.model,
-        "task_description": row.task_description,
-        "inception_ts": micros_to_iso(row.inception_ts),
-        "last_active_ts": micros_to_iso(row.last_active_ts),
-        "attachments_policy": row.attachments_policy,
-    });
+    let agent_json = agent_archive_profile_json(&row, None);
     try_write_agent_profile(config, &project.slug, &agent_json);
 
     // Write per-pane identity file (best-effort, only when $TMUX_PANE is set)
@@ -2267,6 +2357,8 @@ Check that all parameters have valid values."
         // (the documented Optional) rather than Some("") so clients cannot
         // store a blank token and get silently downgraded to unverified.
         registration_token: (!registration_token.is_empty()).then_some(registration_token),
+        retired_at: row.retired_at.map(micros_to_iso),
+        deregistered_at: None,
     };
 
     serde_json::to_string(&response)
@@ -2517,15 +2609,7 @@ Choose a different name (or omit the name to auto-generate one)."
 
     // Write agent profile to git archive (best-effort)
     let config = &Config::get();
-    let agent_json = serde_json::json!({
-        "name": row.name,
-        "program": row.program,
-        "model": row.model,
-        "task_description": row.task_description,
-        "inception_ts": micros_to_iso(row.inception_ts),
-        "last_active_ts": micros_to_iso(row.last_active_ts),
-        "attachments_policy": row.attachments_policy,
-    });
+    let agent_json = agent_archive_profile_json(&row, None);
     try_write_agent_profile(config, &project.slug, &agent_json);
 
     // Write per-pane identity file (best-effort, only when $TMUX_PANE is set)
@@ -2570,6 +2654,8 @@ Choose a different name (or omit the name to auto-generate one)."
         // Same contract as register_agent: no persisted token → null.
         registration_token: (echo_token && !registration_token.is_empty())
             .then_some(registration_token),
+        retired_at: row.retired_at.map(micros_to_iso),
+        deregistered_at: None,
     };
 
     if echo_token {
@@ -2583,6 +2669,173 @@ Choose a different name (or omit the name to auto-generate one)."
         serde_json::to_string(&value)
             .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
     }
+}
+
+/// Temporarily remove an agent from active routing while preserving history.
+#[tool(
+    description = "Soft-delete an agent: mark it as retired so it stops accepting new messages while preserving message history. Retired agents are hidden from active agent lists but visible in 'all agents' views.\n\nRust authorization extension: authorization requires either the agent registration_token or a pane bound to the agent."
+)]
+pub async fn retire_agent(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    registration_token: Option<String>,
+    pane_id: Option<String>,
+) -> McpResult<String> {
+    let pool = get_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let agent = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            &agent_name,
+        )
+        .await,
+    )?;
+    authenticate_lifecycle_agent(
+        &project,
+        &agent,
+        registration_token.as_deref(),
+        pane_id.as_deref(),
+        "retire_agent",
+    )?;
+    reject_deregistered_lifecycle_transition(ctx, &pool, &agent, "retired").await?;
+
+    let agent_id = agent
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+    // Preserve the first retirement timestamp across harmless retries.
+    let retired_at = agent
+        .retired_at
+        .unwrap_or_else(mcp_agent_mail_db::now_micros);
+    let updated = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::set_agent_retired_at(
+            ctx.cx(),
+            &pool,
+            agent_id,
+            Some(retired_at),
+        )
+        .await,
+    )?;
+    let agent_json = agent_archive_profile_json(&updated, None);
+    try_write_agent_profile(&Config::get(), &project.slug, &agent_json);
+
+    serde_json::to_string(&json!({
+        "status": "retired",
+        "agent_name": updated.name,
+        "project_key": project_key,
+        "retired_at": micros_to_iso(retired_at),
+    }))
+    .map_err(|error| McpError::internal_error(format!("JSON error: {error}")))
+}
+
+/// Restore a retired agent to active routing.
+#[tool(
+    description = "Restore a retired agent back to active status. The agent will resume accepting new messages.\n\nRust authorization extension: deregistered agents cannot be unretired, and authorization requires either the agent registration_token or a pane bound to the agent."
+)]
+pub async fn unretire_agent(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    registration_token: Option<String>,
+    pane_id: Option<String>,
+) -> McpResult<String> {
+    let pool = get_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let agent = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            &agent_name,
+        )
+        .await,
+    )?;
+    authenticate_lifecycle_agent(
+        &project,
+        &agent,
+        registration_token.as_deref(),
+        pane_id.as_deref(),
+        "unretire_agent",
+    )?;
+    reject_deregistered_lifecycle_transition(ctx, &pool, &agent, "unretired").await?;
+
+    let agent_id = agent
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+    let updated = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::set_agent_retired_at(ctx.cx(), &pool, agent_id, None).await,
+    )?;
+    let agent_json = agent_archive_profile_json(&updated, None);
+    try_write_agent_profile(&Config::get(), &project.slug, &agent_json);
+
+    serde_json::to_string(&json!({
+        "status": "active",
+        "agent_name": updated.name,
+        "project_key": project_key,
+    }))
+    .map_err(|error| McpError::internal_error(format!("JSON error: {error}")))
+}
+
+/// Permanently remove an agent from active routing without deleting history.
+#[tool(
+    description = "Remove an agent from a project. Marks the agent as inactive and removes it from the active roster. Messages from/to the agent are preserved for audit but the agent can no longer send or receive new messages.\n\nRust authorization extension: deregistration also preserves reservations and Git archive history. It is permanent for that identity, and authorization requires either the agent registration_token or a pane bound to the agent."
+)]
+pub async fn deregister_agent(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    registration_token: Option<String>,
+    pane_id: Option<String>,
+) -> McpResult<String> {
+    let pool = get_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let agent = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            &agent_name,
+        )
+        .await,
+    )?;
+    authenticate_lifecycle_agent(
+        &project,
+        &agent,
+        registration_token.as_deref(),
+        pane_id.as_deref(),
+        "deregister_agent",
+    )?;
+
+    let agent_id = agent
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+    let updated = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::deregister_agent(
+            ctx.cx(),
+            &pool,
+            agent_id,
+            mcp_agent_mail_db::now_micros(),
+        )
+        .await,
+    )?;
+    // Read back the ledger timestamp so concurrent/idempotent retries archive
+    // the authoritative first deregistration time, never a later candidate.
+    let deregistered_at = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent_deregistered_at(ctx.cx(), &pool, agent_id).await,
+    )?
+    .ok_or_else(|| McpError::internal_error("Deregistration ledger row missing after commit"))?;
+    let agent_json = agent_archive_profile_json(&updated, Some(deregistered_at));
+    try_write_agent_profile(&Config::get(), &project.slug, &agent_json);
+
+    serde_json::to_string(&json!({
+        "status": "deregistered",
+        "agent_name": updated.name,
+        "project_key": project_key,
+        "deregistered_at": micros_to_iso(deregistered_at),
+    }))
+    .map_err(|error| McpError::internal_error(format!("JSON error: {error}")))
 }
 
 /// Validate `attachments_policy` value.
@@ -2684,6 +2937,14 @@ pub async fn whois(
         Vec::new()
     };
 
+    let deregistered_at = if let Some(agent_id) = agent_row.id {
+        db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::get_agent_deregistered_at(ctx.cx(), &pool, agent_id).await,
+        )?
+    } else {
+        None
+    };
+
     let response = WhoisResponse {
         agent: AgentResponse {
             id: agent_row.id.unwrap_or(0),
@@ -2702,6 +2963,8 @@ pub async fn whois(
                 .collect(),
             // Never expose registration_token in whois responses
             registration_token: None,
+            retired_at: agent_row.retired_at.map(micros_to_iso),
+            deregistered_at: deregistered_at.map(micros_to_iso),
         },
         recent_commits,
     };
@@ -2884,7 +3147,7 @@ pub async fn list_agents(
     });
 
     let agents = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_agents_bounded(
+        mcp_agent_mail_db::queries::list_active_agents_bounded(
             ctx.cx(),
             &pool,
             project_id,
@@ -3383,6 +3646,8 @@ mod tests {
                 .map(|s| (*s).to_string())
                 .collect(),
             registration_token: None,
+            retired_at: None,
+            deregistered_at: None,
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
@@ -3412,6 +3677,8 @@ mod tests {
                 .map(|s| (*s).to_string())
                 .collect(),
             registration_token: None,
+            retired_at: None,
+            deregistered_at: None,
         };
         let json_str = serde_json::to_string(&original).unwrap();
         let deserialized: AgentResponse = serde_json::from_str(&json_str).unwrap();
@@ -3439,6 +3706,8 @@ mod tests {
                     .map(|s| (*s).to_string())
                     .collect(),
                 registration_token: None,
+                retired_at: None,
+                deregistered_at: None,
             },
             recent_commits: vec![CommitInfo {
                 hexsha: "abc123".into(),
@@ -3474,6 +3743,8 @@ mod tests {
                     .map(|s| (*s).to_string())
                     .collect(),
                 registration_token: None,
+                retired_at: None,
+                deregistered_at: None,
             },
             recent_commits: vec![],
         };
@@ -4141,15 +4412,13 @@ body
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("custom-health-check.sqlite3");
         let database_url = format!("sqlite:///{}", db_path.display());
-        let xdg_data_home = temp.path().join("xdg");
-        let xdg_data_home_text = xdg_data_home.to_string_lossy().into_owned();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("DATABASE_URL", database_url.as_str()),
-                ("XDG_DATA_HOME", xdg_data_home_text.as_str()),
-            ],
-            || {
+        // br-99aih: redirect the *default* storage root into a private tempdir
+        // (HOME + XDG_DATA_HOME); an XDG-only override still resolved to the
+        // operator's live archive on any host that had run the daemon.
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_and_env_overrides_for_test(
+            &[("DATABASE_URL", database_url.as_str())],
+            |_isolated_default_root| {
                 Config::reset_cached();
                 let storage_root = Config::from_env().storage_root;
                 let project_dir = storage_root.join("projects").join("ahead-project");

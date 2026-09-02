@@ -19,7 +19,7 @@ enum TransportKind {
 impl TransportKind {
     const ALL: [Self; 2] = [Self::Stdio, Self::Http];
 
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::Stdio => "stdio",
             Self::Http => "http",
@@ -40,7 +40,7 @@ struct SharedBufferWriter {
 
 impl SharedBufferWriter {
     fn snapshot(&self) -> Vec<u8> {
-        self.buf.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.buf.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 }
 
@@ -48,7 +48,7 @@ impl Write for SharedBufferWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.buf
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend_from_slice(buf);
         Ok(buf.len())
     }
@@ -65,8 +65,8 @@ struct TransportExecution {
 }
 
 /// Agent Mail's locked HTTP MCP path (`HTTP_PATH` default `/mcp/`).
-/// FastMCP 0.3 defaulted `HttpHandlerConfig::base_path` to `/mcp/v1`; tests
-/// that use the raw FastMCP HTTP transport must pin Agent Mail's trailing-slash
+/// `FastMCP` 0.3 defaulted `HttpHandlerConfig::base_path` to `/mcp/v1`; tests
+/// that use the raw `FastMCP` HTTP transport must pin Agent Mail's trailing-slash
 /// contract instead of inheriting that default (br-w9v59.1).
 fn agent_mail_http_config() -> HttpHandlerConfig {
     HttpHandlerConfig {
@@ -158,8 +158,8 @@ fn execute_transport(transport: TransportKind, payloads: Vec<Payload>) -> Transp
             let raw_output = output.snapshot();
             let (responses, http_headers) = parse_http_responses(&raw_output);
             TransportExecution {
-                responses,
                 raw_output,
+                responses,
                 http_headers,
             }
         }
@@ -450,7 +450,7 @@ fn transport_framing_and_utf8_round_trip_are_stable() {
     let handler = HttpRequestHandler::with_config(agent_mail_http_config());
     let http_request = HttpRequest::new(HttpMethod::Post, "/mcp/")
         .with_header("Content-Type", "application/json")
-        .with_body(encoded.clone().into_bytes());
+        .with_body(encoded.into_bytes());
     let request = handler.parse_request(&http_request).expect("http parse");
     assert_eq!(
         request

@@ -190,23 +190,410 @@ pub(crate) fn sqlite_immutable_uri(db_path: &std::path::Path) -> String {
     uri
 }
 
-/// Open a SQLite database for detector-only inspection without creating
-/// sidecars, replaying WAL/journals, taking writer locks, or creating a
-/// missing file.
+/// Test-only owner for a subprocess that holds decisive cross-process state.
 ///
-/// SQLite's plain read-only mode can still create or require `-shm` files for
-/// WAL databases. The URI `immutable=1` flag tells SQLite the file cannot
-/// change under this connection, which is the contract doctor detectors need:
-/// observe bytes and schema, never perturb the state being diagnosed.
-#[allow(clippy::result_large_err)]
-pub(crate) fn open_immutable_sqlite(
-    db_path: &std::path::Path,
-) -> sqlmodel_core::Result<sqlmodel_sqlite::SqliteConnection> {
-    let uri = sqlite_immutable_uri(db_path);
-    let mut flags = sqlmodel_sqlite::OpenFlags::read_only();
-    flags.uri = true;
-    let config = sqlmodel_sqlite::SqliteConfig::file(uri).flags(flags);
-    sqlmodel_sqlite::SqliteConnection::open(&config)
+/// The release sentinel is written and the child reaped even while the parent
+/// test is unwinding, so a failed assertion cannot leave a writer behind.
+#[cfg(test)]
+pub(crate) struct CrossProcessTestChild {
+    child: Option<std::process::Child>,
+    release_path: std::path::PathBuf,
+    released: bool,
+}
+
+#[cfg(test)]
+impl CrossProcessTestChild {
+    #[must_use]
+    pub(crate) const fn new(child: std::process::Child, release_path: std::path::PathBuf) -> Self {
+        Self {
+            child: Some(child),
+            release_path,
+            released: false,
+        }
+    }
+
+    fn release(&mut self) -> std::io::Result<()> {
+        if !self.released {
+            std::fs::write(&self.release_path, b"release")?;
+            self.released = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_and_wait(mut self) -> std::io::Result<std::process::Output> {
+        self.release()?;
+        self.child
+            .take()
+            .expect("cross-process test child is present")
+            .wait_with_output()
+    }
+}
+
+#[cfg(test)]
+impl Drop for CrossProcessTestChild {
+    fn drop(&mut self) {
+        let _ = self.release();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(test)]
+#[must_use]
+pub(crate) fn wait_for_cross_process_signal(path: &std::path::Path) -> bool {
+    (0..1_000).any(|_| {
+        if path.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+#[must_use]
+pub(crate) fn wait_for_cross_process_release(path: &std::path::Path) -> bool {
+    (0..3_000).any(|_| {
+        if path.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    })
+}
+
+/// How a detector's canonical connection obtained its stable read authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorDbReadSourceKind {
+    /// A live FrankenSQLite family exported through guarded `VACUUM INTO`.
+    LiveLogicalSnapshot,
+    /// A live Franken-admitted family whose logical export failed, staged as
+    /// a private byte-for-byte copy (main file plus recovery sidecars) by the
+    /// health-probe mechanism. Physical checks on the copy are authoritative
+    /// for the copied bytes, so the copy owns its own integrity verdict.
+    StagedFamilyCopy,
+    /// A caller-designated engine-exclusive/offline SQLite family.
+    ExplicitOffline,
+    /// Source selection failed before a canonical connection was available.
+    Unavailable,
+}
+
+pub(crate) enum DoctorIntegrityProbe {
+    Result(String),
+    Corruption(String),
+    Unavailable,
+}
+
+/// A typed detector source that keeps the repair target distinct from the
+/// inode canonical SQLite is allowed to open.
+///
+/// Live FrankenSQLite mailboxes are materialized to one retained private
+/// logical snapshot (or, when that export fails, one retained staged family
+/// copy) before any fixer detector runs. Explicitly offline families use the
+/// guarded WAL-aware canonical opener directly. The connection and any
+/// backing tempdir live for this value's entire lifetime, so aggregate
+/// detection observes one coherent source rather than reopening the live
+/// primary once per failure mode.
+pub(crate) struct DoctorDbReadCandidate {
+    target_path: std::path::PathBuf,
+    connection: Option<mcp_agent_mail_db::CanonicalDbConn>,
+    _retained_snapshot: Option<crate::CanonicalSnapshotSource>,
+    _retained_staged_family: Option<mcp_agent_mail_db::pool::SqliteHealthProbeSource>,
+    source_kind: DoctorDbReadSourceKind,
+    open_error: Option<String>,
+    physical_corruption_error: Option<String>,
+}
+
+impl DoctorDbReadCandidate {
+    fn unavailable(target_path: &std::path::Path, error: impl Into<String>) -> Self {
+        Self {
+            target_path: target_path.to_path_buf(),
+            connection: None,
+            _retained_snapshot: None,
+            _retained_staged_family: None,
+            source_kind: DoctorDbReadSourceKind::Unavailable,
+            open_error: Some(error.into()),
+            physical_corruption_error: None,
+        }
+    }
+
+    fn unavailable_with_physical_corruption(
+        target_path: &std::path::Path,
+        error: impl Into<String>,
+        physical_corruption_error: String,
+    ) -> Self {
+        Self {
+            target_path: target_path.to_path_buf(),
+            connection: None,
+            _retained_snapshot: None,
+            _retained_staged_family: None,
+            source_kind: DoctorDbReadSourceKind::Unavailable,
+            open_error: Some(error.into()),
+            physical_corruption_error: Some(physical_corruption_error),
+        }
+    }
+
+    /// Select a safe production source. A Franken-admitted live family is
+    /// exported through the same engine; only a family accepted by the
+    /// explicit offline canonical guard may bypass that export.
+    pub(crate) fn open_live_or_explicit_offline(
+        target_path: &std::path::Path,
+        operation: &str,
+    ) -> Self {
+        match crate::doctor_open_canonical_source_for_diagnostic(target_path, operation) {
+            Ok(opened) => {
+                let source_kind = match opened.kind {
+                    crate::DoctorCanonicalDiagnosticSourceKind::LiveLogicalSnapshot => {
+                        DoctorDbReadSourceKind::LiveLogicalSnapshot
+                    }
+                    crate::DoctorCanonicalDiagnosticSourceKind::StagedFamilyCopy => {
+                        DoctorDbReadSourceKind::StagedFamilyCopy
+                    }
+                    crate::DoctorCanonicalDiagnosticSourceKind::OfflineCanonical => {
+                        DoctorDbReadSourceKind::ExplicitOffline
+                    }
+                    crate::DoctorCanonicalDiagnosticSourceKind::InMemory => {
+                        return Self::unavailable(
+                            target_path,
+                            "file-backed doctor fixer unexpectedly selected an in-memory source",
+                        );
+                    }
+                };
+                Self {
+                    target_path: target_path.to_path_buf(),
+                    connection: Some(opened.conn),
+                    _retained_snapshot: opened._snapshot_source,
+                    _retained_staged_family: opened._staged_family,
+                    source_kind,
+                    open_error: None,
+                    physical_corruption_error: None,
+                }
+            }
+            Err(error) => {
+                let source_error = error.to_string();
+                match mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+                    target_path,
+                    "doctor fixer failed-export physical corruption probe",
+                ) {
+                    Err(physical_error)
+                        if integrity_open_error_is_authoritative_corruption(
+                            &physical_error.to_string(),
+                        ) =>
+                    {
+                        Self::unavailable_with_physical_corruption(
+                            target_path,
+                            source_error,
+                            physical_error.to_string(),
+                        )
+                    }
+                    Ok(connection) => {
+                        drop(connection);
+                        Self::unavailable(target_path, source_error)
+                    }
+                    Err(_) => Self::unavailable(target_path, source_error),
+                }
+            }
+        }
+    }
+
+    /// Open a caller-designated offline family without ever falling back to a
+    /// live FrankenSQLite primary. This is the explicit source used by unit
+    /// fixtures and genuinely offline maintenance callers.
+    pub(crate) fn open_explicit_offline(target_path: &std::path::Path, operation: &str) -> Self {
+        match mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(
+            target_path,
+            operation,
+        ) {
+            Ok(connection) => Self {
+                target_path: target_path.to_path_buf(),
+                connection: Some(connection),
+                _retained_snapshot: None,
+                _retained_staged_family: None,
+                source_kind: DoctorDbReadSourceKind::ExplicitOffline,
+                open_error: None,
+                physical_corruption_error: None,
+            },
+            Err(error) => Self::unavailable(target_path, error.to_string()),
+        }
+    }
+
+    pub(crate) fn target_path(&self) -> &std::path::Path {
+        &self.target_path
+    }
+
+    pub(crate) fn connection(&self) -> Option<&sqlmodel_sqlite::SqliteConnection> {
+        self.connection.as_ref()
+    }
+
+    /// Run the integrity probe against the physical source that owns the
+    /// verdict. A VACUUM snapshot is correct for logical rows but can rebuild
+    /// a damaged index and therefore cannot prove a live primary's b-tree is
+    /// healthy. A staged family copy carries the live bytes verbatim, so its
+    /// own connection answers, like an explicitly offline family.
+    pub(crate) fn integrity_check_one(&self) -> DoctorIntegrityProbe {
+        match self.source_kind {
+            DoctorDbReadSourceKind::LiveLogicalSnapshot => {
+                let conn =
+                    match mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+                        &self.target_path,
+                        "doctor fixer physical integrity probe",
+                    ) {
+                        Ok(conn) => conn,
+                        Err(error) => {
+                            return classify_integrity_probe_open_error(error.to_string());
+                        }
+                    };
+                match conn.query_sync("PRAGMA integrity_check(1)", &[]) {
+                    Ok(rows) => match rows
+                        .first()
+                        .and_then(|row| row.get_named::<String>("integrity_check").ok())
+                    {
+                        Some(result) => DoctorIntegrityProbe::Result(result),
+                        None => DoctorIntegrityProbe::Unavailable,
+                    },
+                    Err(error) => classify_integrity_probe_error(error.to_string()),
+                }
+            }
+            DoctorDbReadSourceKind::ExplicitOffline | DoctorDbReadSourceKind::StagedFamilyCopy => {
+                let Some(conn) = self.connection() else {
+                    return DoctorIntegrityProbe::Unavailable;
+                };
+                match conn.query_sync("PRAGMA integrity_check(1)", &[]) {
+                    Ok(rows) => match rows
+                        .first()
+                        .and_then(|row| row.get_named::<String>("integrity_check").ok())
+                    {
+                        Some(result) => DoctorIntegrityProbe::Result(result),
+                        None => DoctorIntegrityProbe::Unavailable,
+                    },
+                    Err(error) => classify_integrity_probe_error(error.to_string()),
+                }
+            }
+            DoctorDbReadSourceKind::Unavailable => self.physical_corruption_error.clone().map_or(
+                DoctorIntegrityProbe::Unavailable,
+                DoctorIntegrityProbe::Corruption,
+            ),
+        }
+    }
+
+    /// Re-observe the decisive database invariants immediately before a
+    /// mutating fixer acts. Live sources must remain live (a logical
+    /// snapshot or a staged family copy are both Franken-admitted live
+    /// sources); explicit-offline sources must remain accepted by the offline
+    /// guard.
+    pub(crate) fn refresh(&self, operation: &str) -> Self {
+        match self.source_kind {
+            DoctorDbReadSourceKind::LiveLogicalSnapshot
+            | DoctorDbReadSourceKind::StagedFamilyCopy => {
+                let refreshed = Self::open_live_or_explicit_offline(&self.target_path, operation);
+                if matches!(
+                    refreshed.source_kind,
+                    DoctorDbReadSourceKind::LiveLogicalSnapshot
+                        | DoctorDbReadSourceKind::StagedFamilyCopy
+                ) {
+                    refreshed
+                } else {
+                    Self::unavailable(
+                        &self.target_path,
+                        refreshed.open_error.unwrap_or_else(|| {
+                            "live doctor fixer source lost FrankenSQLite admission".to_string()
+                        }),
+                    )
+                }
+            }
+            DoctorDbReadSourceKind::ExplicitOffline => {
+                Self::open_explicit_offline(&self.target_path, operation)
+            }
+            DoctorDbReadSourceKind::Unavailable => Self::unavailable(
+                &self.target_path,
+                self.open_error
+                    .clone()
+                    .unwrap_or_else(|| "doctor fixer source is unavailable".to_string()),
+            ),
+        }
+    }
+}
+
+fn classify_integrity_probe_error(detail: String) -> DoctorIntegrityProbe {
+    if integrity_error_is_authoritative_corruption(&detail) {
+        DoctorIntegrityProbe::Corruption(detail)
+    } else {
+        DoctorIntegrityProbe::Unavailable
+    }
+}
+
+fn classify_integrity_probe_open_error(detail: String) -> DoctorIntegrityProbe {
+    if integrity_open_error_is_authoritative_corruption(&detail) {
+        DoctorIntegrityProbe::Corruption(detail)
+    } else {
+        DoctorIntegrityProbe::Unavailable
+    }
+}
+
+fn integrity_error_is_authoritative_corruption(detail: &str) -> bool {
+    matches!(
+        mcp_agent_mail_db::classify_db_error_message(detail).class,
+        mcp_agent_mail_db::DbErrorClass::MainDbBtreeCorruption
+    )
+}
+
+fn integrity_open_error_is_authoritative_corruption(detail: &str) -> bool {
+    let normalized = detail.to_ascii_lowercase();
+    ![
+        "file is not a database",
+        "not a database",
+        "database file too small for header",
+        "invalid database header",
+    ]
+    .iter()
+    .any(|ownership_error| normalized.contains(ownership_error))
+        && integrity_error_is_authoritative_corruption(detail)
+}
+
+fn prepare_doctor_db_read_candidates(
+    db_paths: &[std::path::PathBuf],
+    operation: &str,
+) -> Vec<DoctorDbReadCandidate> {
+    db_paths
+        .iter()
+        .map(|path| DoctorDbReadCandidate::open_live_or_explicit_offline(path, operation))
+        .collect()
+}
+
+fn fm_uses_logical_db_read(fm_id: &str) -> bool {
+    matches!(
+        fm_id,
+        schema_version_mismatch::FM_ID
+            | inbox_stats_divergence::FM_ID
+            | integrity_page_malformed::FM_ID
+            | legacy_fts_residue::FM_ID
+            | orphan_foreign_key_rows::FM_ID
+            | reservation_db_archive_parity::FM_ID
+            | reservation_artifact_normalize::FM_ID
+            | text_timestamp_contamination::FM_ID
+    )
+}
+
+fn db_read_candidate_for_path<'a>(
+    candidates: &'a [DoctorDbReadCandidate],
+    path: &std::path::Path,
+) -> Option<&'a DoctorDbReadCandidate> {
+    candidates
+        .iter()
+        .find(|candidate| candidate.target_path() == path)
+}
+
+pub(crate) fn explicit_offline_db_read_candidates(
+    db_paths: &[std::path::PathBuf],
+    operation: &str,
+) -> Vec<DoctorDbReadCandidate> {
+    db_paths
+        .iter()
+        .map(|path| DoctorDbReadCandidate::open_explicit_offline(path, operation))
+        .collect()
 }
 
 #[cfg(unix)]
@@ -1074,6 +1461,14 @@ pub fn dispatch_only(
     ctx: &crate::doctor::mutate::MutateContext,
     inputs: &DispatchInputs,
 ) -> Result<DispatchOutcome, DispatchError> {
+    let db_read_candidates = if fm_uses_logical_db_read(fm_id) {
+        prepare_doctor_db_read_candidates(
+            &inputs.db_file_candidates,
+            "doctor fixer detect-and-fix dispatch",
+        )
+    } else {
+        Vec::new()
+    };
     let mut outcome = DispatchOutcome {
         fm_id: fm_id.to_string(),
         ..Default::default()
@@ -1593,7 +1988,7 @@ pub fn dispatch_only(
             outcome.quarantined_paths.extend(result.quarantined_paths);
         }
     } else if fm_id == schema_version_mismatch::FM_ID {
-        let findings = schema_version_mismatch::detect(&inputs.db_file_candidates);
+        let findings = schema_version_mismatch::detect_prepared(&db_read_candidates);
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
@@ -1602,16 +1997,21 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == inbox_stats_divergence::FM_ID {
-        let findings = inbox_stats_divergence::detect(&inputs.db_file_candidates);
+        let findings = inbox_stats_divergence::detect_prepared(&db_read_candidates);
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
-            let result = inbox_stats_divergence::fix(ctx, f)?;
+            let Some(candidate) = db_read_candidate_for_path(&db_read_candidates, &f.db_path)
+            else {
+                outcome.actions_skipped += 1;
+                continue;
+            };
+            let result = inbox_stats_divergence::fix_prepared(ctx, f, candidate)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == integrity_page_malformed::FM_ID {
-        let findings = integrity_page_malformed::detect(&inputs.db_file_candidates);
+        let findings = integrity_page_malformed::detect_prepared(&db_read_candidates);
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
@@ -1620,50 +2020,70 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == legacy_fts_residue::FM_ID {
-        let findings = legacy_fts_residue::detect(&inputs.db_file_candidates);
+        let findings = legacy_fts_residue::detect_prepared(&db_read_candidates);
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
             // Auto-fix via Op::DbExec: dependency-ordered DROP of
             // the residual fts_* objects. Reversible via the
             // chokepoint's whole-DB-file backup.
-            let result = legacy_fts_residue::fix(ctx, f)?;
+            let Some(candidate) = db_read_candidate_for_path(&db_read_candidates, &f.db_path)
+            else {
+                outcome.actions_skipped += 1;
+                continue;
+            };
+            let result = legacy_fts_residue::fix_prepared(ctx, f, candidate)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == orphan_foreign_key_rows::FM_ID {
-        let findings = orphan_foreign_key_rows::detect(&inputs.db_file_candidates);
+        let findings = orphan_foreign_key_rows::detect_prepared(&db_read_candidates);
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
             // Auto-fix is intentionally narrow: stale file_reservations
             // and release-ledger sidecars are quarantined via DbExec;
             // message-recipient history remains detect-only inside the FM.
-            let result = orphan_foreign_key_rows::fix(ctx, f)?;
+            let Some(candidate) = db_read_candidate_for_path(&db_read_candidates, &f.db_path)
+            else {
+                outcome.actions_skipped += 1;
+                continue;
+            };
+            let result = orphan_foreign_key_rows::fix_prepared(ctx, f, candidate)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == reservation_db_archive_parity::FM_ID {
-        let findings = reservation_db_archive_parity::detect(
+        let findings = reservation_db_archive_parity::detect_prepared(
             inputs.storage_root.as_deref(),
-            &inputs.db_file_candidates,
+            &db_read_candidates,
         );
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
-            let result = reservation_db_archive_parity::fix(ctx, f)?;
+            let Some(candidate) = db_read_candidate_for_path(&db_read_candidates, &f.db_path)
+            else {
+                outcome.actions_skipped += 1;
+                continue;
+            };
+            let result = reservation_db_archive_parity::fix_prepared(ctx, f, candidate)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == reservation_artifact_normalize::FM_ID {
-        let findings = reservation_artifact_normalize::detect(
+        let findings = reservation_artifact_normalize::detect_prepared(
             inputs.storage_root.as_deref(),
-            &inputs.db_file_candidates,
+            &db_read_candidates,
         );
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
-            let result = reservation_artifact_normalize::fix(ctx, f)?;
+            let Some(candidate) = db_read_candidate_for_path(&db_read_candidates, &f.db_path)
+            else {
+                outcome.actions_skipped += 1;
+                continue;
+            };
+            let result = reservation_artifact_normalize::fix_prepared(ctx, f, candidate)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
             outcome.quarantined_paths.extend(result.quarantined_paths);
@@ -1685,7 +2105,8 @@ pub fn dispatch_only(
         // `detect_mcp_config_locations_default` is a pure helper
         // that reads no env state beyond `dirs::home_dir()` + CWD;
         // we don't need a dedicated DispatchInputs field.
-        let locations = mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default();
+        let locations =
+            mcp_agent_mail_core::mcp_config::detect_mcp_config_mutation_locations_default();
         let findings = codex_startup_timeout::detect(&locations);
         outcome.findings_count = findings.len();
         for f in &findings {
@@ -1726,7 +2147,8 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == stale_python_launcher_entry::FM_ID {
-        let locations = mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default();
+        let locations =
+            mcp_agent_mail_core::mcp_config::detect_mcp_config_mutation_locations_default();
         let inputs = stale_python_launcher_entry::DetectInputs {
             locations,
             rust_binary_path: default_rust_binary_path(),
@@ -1740,7 +2162,7 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == text_timestamp_contamination::FM_ID {
-        let findings = text_timestamp_contamination::detect(&inputs.db_file_candidates);
+        let findings = text_timestamp_contamination::detect_prepared(&db_read_candidates);
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
@@ -1944,6 +2366,22 @@ pub struct DetectOutcome {
 /// cheaper than `--dry-run` for FMs whose `fix()` does substantial
 /// pre-mutate work (JSON re-parse, etc.).
 pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome, DispatchError> {
+    let db_read_candidates = if fm_uses_logical_db_read(fm_id) {
+        prepare_doctor_db_read_candidates(
+            &inputs.db_file_candidates,
+            "doctor single-fixer detection",
+        )
+    } else {
+        Vec::new()
+    };
+    detect_only_with_db_reads(fm_id, inputs, &db_read_candidates)
+}
+
+fn detect_only_with_db_reads(
+    fm_id: &str,
+    inputs: &DispatchInputs,
+    db_read_candidates: &[DoctorDbReadCandidate],
+) -> Result<DetectOutcome, DispatchError> {
     let mut outcome = DetectOutcome {
         fm_id: fm_id.to_string(),
         ..Default::default()
@@ -2261,42 +2699,42 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == schema_version_mismatch::FM_ID {
-        schema_version_mismatch::detect(&inputs.db_file_candidates)
+        schema_version_mismatch::detect_prepared(db_read_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == inbox_stats_divergence::FM_ID {
-        inbox_stats_divergence::detect(&inputs.db_file_candidates)
+        inbox_stats_divergence::detect_prepared(db_read_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == integrity_page_malformed::FM_ID {
-        integrity_page_malformed::detect(&inputs.db_file_candidates)
+        integrity_page_malformed::detect_prepared(db_read_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == legacy_fts_residue::FM_ID {
-        legacy_fts_residue::detect(&inputs.db_file_candidates)
+        legacy_fts_residue::detect_prepared(db_read_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == orphan_foreign_key_rows::FM_ID {
-        orphan_foreign_key_rows::detect(&inputs.db_file_candidates)
+        orphan_foreign_key_rows::detect_prepared(db_read_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == reservation_db_archive_parity::FM_ID {
-        reservation_db_archive_parity::detect(
+        reservation_db_archive_parity::detect_prepared(
             inputs.storage_root.as_deref(),
-            &inputs.db_file_candidates,
+            db_read_candidates,
         )
         .iter()
         .map(|f| f.to_finding())
         .collect()
     } else if fm_id == reservation_artifact_normalize::FM_ID {
-        reservation_artifact_normalize::detect(
+        reservation_artifact_normalize::detect_prepared(
             inputs.storage_root.as_deref(),
-            &inputs.db_file_candidates,
+            db_read_candidates,
         )
         .iter()
         .map(|f| f.to_finding())
@@ -2331,7 +2769,8 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == stale_python_launcher_entry::FM_ID {
-        let locations = mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default();
+        let locations =
+            mcp_agent_mail_core::mcp_config::detect_mcp_config_mutation_locations_default();
         let inputs = stale_python_launcher_entry::DetectInputs {
             locations,
             rust_binary_path: default_rust_binary_path(),
@@ -2341,7 +2780,7 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == text_timestamp_contamination::FM_ID {
-        text_timestamp_contamination::detect(&inputs.db_file_candidates)
+        text_timestamp_contamination::detect_prepared(db_read_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
@@ -2503,6 +2942,10 @@ pub struct DetectAllOutcome {
 /// `am doctor fix --list` report without invoking any fixer.
 pub fn detect_all(inputs: &DispatchInputs) -> Result<DetectAllOutcome, DispatchError> {
     let specs = registry();
+    let db_read_candidates = prepare_doctor_db_read_candidates(
+        &inputs.db_file_candidates,
+        "aggregate doctor fixer detection",
+    );
     let mut outcome = DetectAllOutcome {
         fm_count: specs.len(),
         total_findings: 0,
@@ -2512,7 +2955,7 @@ pub fn detect_all(inputs: &DispatchInputs) -> Result<DetectAllOutcome, DispatchE
     };
 
     for spec in &specs {
-        match detect_only(spec.id, inputs) {
+        match detect_only_with_db_reads(spec.id, inputs, &db_read_candidates) {
             Ok(detected) => {
                 outcome.total_findings += detected.findings_count;
                 outcome.total_actions_planned += detected.actions_planned;
@@ -2569,7 +3012,7 @@ mod tests {
     }
 
     #[test]
-    fn open_immutable_sqlite_does_not_create_wal_sidecars() {
+    fn explicit_offline_candidate_does_not_create_wal_sidecars() {
         let td = TempDir::new().unwrap();
         let db = td.path().join("storage.sqlite3");
         let wal = td.path().join("storage.sqlite3-wal");
@@ -2587,7 +3030,9 @@ mod tests {
         let before_dir = sorted_dir_entries(td.path());
         let before_wal = wal.exists();
         let before_shm = shm.exists();
-        let conn = open_immutable_sqlite(&db).expect("immutable open");
+        let candidate =
+            DoctorDbReadCandidate::open_explicit_offline(&db, "explicit-offline candidate test");
+        let conn = candidate.connection().expect("guarded offline open");
         let rows = conn
             .query_sync("SELECT COUNT(*) AS n FROM t", &[])
             .expect("immutable read");
@@ -2595,8 +3040,6 @@ mod tests {
             .first()
             .and_then(|row| row.get_named::<i64>("n").ok())
             .expect("count row");
-        drop(conn);
-
         assert_eq!(n, 1);
         assert_eq!(
             before_dir,

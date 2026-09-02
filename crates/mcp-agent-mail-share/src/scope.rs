@@ -1,7 +1,7 @@
 //! Step 2: Project scoping — delete rows for non-selected projects.
 //!
 //! Given a snapshot database and a list of project identifiers (slugs or
-//! human_keys), removes all data belonging to non-selected projects.
+//! `human_keys`), removes all data belonging to non-selected projects.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -52,7 +52,7 @@ pub struct RemainingCounts {
 /// Apply project scoping to a snapshot database.
 ///
 /// If `identifiers` is empty, all projects are kept and no deletions occur.
-/// Otherwise, only projects matching the given slugs or human_keys (case-insensitive,
+/// Otherwise, only projects matching the given slugs or `human_keys` (case-insensitive,
 /// trimmed) are retained; all other project data is deleted.
 ///
 /// # Errors
@@ -171,8 +171,7 @@ pub fn apply_project_scope(
         // 1. agent_links (cross-project)
         if table_exists(&conn, "agent_links")? {
             let sql = format!(
-                "DELETE FROM agent_links WHERE a_project_id NOT IN ({p}) OR b_project_id NOT IN ({p})",
-                p = placeholders
+                "DELETE FROM agent_links WHERE a_project_id NOT IN ({placeholders}) OR b_project_id NOT IN ({placeholders})"
             );
             let mut params = id_values.clone();
             params.extend(id_values.iter().cloned());
@@ -182,8 +181,7 @@ pub fn apply_project_scope(
         // 2. project_sibling_suggestions
         if table_exists(&conn, "project_sibling_suggestions")? {
             let sql = format!(
-                "DELETE FROM project_sibling_suggestions WHERE project_a_id NOT IN ({p}) OR project_b_id NOT IN ({p})",
-                p = placeholders
+                "DELETE FROM project_sibling_suggestions WHERE project_a_id NOT IN ({placeholders}) OR project_b_id NOT IN ({placeholders})"
             );
             let mut params = id_values.clone();
             params.extend(id_values.iter().cloned());
@@ -192,8 +190,7 @@ pub fn apply_project_scope(
 
         // 3. Collect message IDs for non-allowed projects
         let msg_sql = format!(
-            "SELECT id FROM messages WHERE project_id NOT IN ({p}) ORDER BY id ASC",
-            p = placeholders
+            "SELECT id FROM messages WHERE project_id NOT IN ({placeholders}) ORDER BY id ASC"
         );
         let msg_rows = conn
             .query_sync(&msg_sql, &id_values)
@@ -220,8 +217,7 @@ pub fn apply_project_scope(
         exec(
             &conn,
             &format!(
-                "DELETE FROM messages WHERE project_id NOT IN ({p})",
-                p = placeholders
+                "DELETE FROM messages WHERE project_id NOT IN ({placeholders})"
             ),
             &id_values,
         )?;
@@ -230,8 +226,7 @@ pub fn apply_project_scope(
         exec(
             &conn,
             &format!(
-                "DELETE FROM file_reservations WHERE project_id NOT IN ({p})",
-                p = placeholders
+                "DELETE FROM file_reservations WHERE project_id NOT IN ({placeholders})"
             ),
             &id_values,
         )?;
@@ -250,8 +245,7 @@ pub fn apply_project_scope(
             exec(
                 &conn,
                 &format!(
-                    "DELETE FROM product_project_links WHERE project_id NOT IN ({p})",
-                    p = placeholders
+                    "DELETE FROM product_project_links WHERE project_id NOT IN ({placeholders})"
                 ),
                 &id_values,
             )?;
@@ -265,17 +259,32 @@ pub fn apply_project_scope(
             }
         }
 
-        // 8. Delete agents
+        // 8. Remove lifecycle ledger rows for agents outside the selected
+        // project scope before removing their parent rows. Older snapshots do
+        // not have this table, so keep the operation schema-tolerant.
+        if table_exists(&conn, "agent_deregistrations")? {
+            exec(
+                &conn,
+                &format!(
+                    "DELETE FROM agent_deregistrations \
+                     WHERE agent_id IN (\
+                         SELECT id FROM agents WHERE project_id NOT IN ({placeholders})\
+                     )"
+                ),
+                &id_values,
+            )?;
+        }
+
+        // 9. Delete agents
         exec(
             &conn,
             &format!(
-                "DELETE FROM agents WHERE project_id NOT IN ({p})",
-                p = placeholders
+                "DELETE FROM agents WHERE project_id NOT IN ({placeholders})"
             ),
             &id_values,
         )?;
 
-        // 9. Delete recipient links that now point at filtered-out agents, then
+        // 10. Delete recipient links that now point at filtered-out agents, then
         // repair the denormalized recipients envelope for kept messages.
         exec(
             &conn,
@@ -287,19 +296,18 @@ pub fn apply_project_scope(
             sync_scope_recipients_json(&conn)?;
         }
 
-        // 10. Rebuild agent-scoped aggregates that are not protected by FK
+        // 11. Rebuild agent-scoped aggregates that are not protected by FK
         // constraints. Kept agents can otherwise retain stale counts from
         // messages trimmed out of scope.
         if table_exists(&conn, "inbox_stats")? {
             rebuild_scope_inbox_stats(&conn)?;
         }
 
-        // 11. Delete projects
+        // 12. Delete projects
         exec(
             &conn,
             &format!(
-                "DELETE FROM projects WHERE id NOT IN ({placeholders})",
-                placeholders = placeholders
+                "DELETE FROM projects WHERE id NOT IN ({placeholders})"
             ),
             &id_values,
         )?;
@@ -466,8 +474,8 @@ fn build_placeholders(n: usize) -> String {
 }
 
 /// Check if a table exists in the database.
-/// Uses a direct SELECT probe because FrankenConnection does not
-/// support sqlite_master queries.
+/// Uses a direct SELECT probe because `FrankenConnection` does not
+/// support `sqlite_master` queries.
 fn table_exists(conn: &Conn, name: &str) -> Result<bool, ShareError> {
     let probe = format!("SELECT 1 FROM \"{name}\" LIMIT 0");
     match conn.query_sync(&probe, &[]) {
@@ -887,7 +895,7 @@ mod tests {
         let db = create_test_db(dir.path());
         let result = apply_project_scope(
             &db,
-            &["".to_string(), "   ".to_string(), "proj-alpha".to_string()],
+            &[String::new(), "   ".to_string(), "proj-alpha".to_string()],
         )
         .unwrap();
         assert_eq!(result.removed_count, 1);
@@ -899,7 +907,7 @@ mod tests {
     fn scope_only_empty_identifiers_keeps_all() {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
-        let result = apply_project_scope(&db, &["".to_string(), "   ".to_string()]).unwrap();
+        let result = apply_project_scope(&db, &[String::new(), "   ".to_string()]).unwrap();
         assert_eq!(result.removed_count, 0);
         assert_eq!(result.projects.len(), 2);
         assert_eq!(result.remaining.projects, 2);

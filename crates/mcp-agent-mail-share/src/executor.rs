@@ -604,7 +604,7 @@ fn generate_headers_content(provider: HostingProvider) -> String {
     match provider {
         HostingProvider::GithubPages
         | HostingProvider::CloudflarePages
-        | HostingProvider::Netlify => r#"/*
+        | HostingProvider::Netlify => r"/*
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
   Cross-Origin-Resource-Policy: cross-origin
@@ -614,10 +614,10 @@ fn generate_headers_content(provider: HostingProvider) -> String {
 
 /*.sqlite3
   Content-Type: application/x-sqlite3
-"#
+"
         .to_string(),
         HostingProvider::S3 | HostingProvider::Custom => {
-            r#"# Required headers for Agent Mail viewer
+            r"# Required headers for Agent Mail viewer
 # Configure these in your server/CDN:
 #
 # Cross-Origin-Opener-Policy: same-origin
@@ -629,7 +629,7 @@ fn generate_headers_content(provider: HostingProvider) -> String {
 #
 # For .sqlite3 files:
 #   Content-Type: application/x-sqlite3
-"#
+"
             .to_string()
         }
     }
@@ -1253,7 +1253,7 @@ mod tests {
         assert_eq!(result.metadata.mode, WizardMode::NonInteractive);
         assert!(result.metadata.dry_run);
         assert_eq!(result.metadata.version, WIZARD_VERSION);
-        assert!(!result.metadata.timestamp.is_empty());
+        assert_ne!(result.metadata.timestamp, "");
         assert_eq!(result.provider, HostingProvider::CloudflarePages);
         assert_eq!(
             result.deployed_url,
@@ -1312,7 +1312,7 @@ mod tests {
 
         let outcome = execute_step(&step, &plan, false).unwrap();
         assert!(outcome.success);
-        assert!(outcome.files_created.is_empty());
+        assert_eq!(outcome.files_created, [] as [std::path::PathBuf; 0]);
     }
 
     #[test]
@@ -1550,7 +1550,7 @@ mod tests {
 
     #[test]
     fn execute_step_create_workflow_resolves_relative_path_against_plan_root() {
-        let _cwd_lock = CWD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cwd_lock = CWD_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let repo = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let _cwd = CwdGuard::chdir(outside.path());
@@ -1574,7 +1574,7 @@ mod tests {
 
         let plan = DeploymentPlan {
             provider: HostingProvider::GithubPages,
-            bundle_path: bundle_path.clone(),
+            bundle_path: bundle_path,
             steps: vec![],
             expected_url: None,
             generated_files: vec![
@@ -1611,7 +1611,7 @@ mod tests {
 
     #[test]
     fn execute_step_unknown_id_runs_command_in_plan_root() {
-        let _cwd_lock = CWD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cwd_lock = CWD_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let repo = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let _cwd = CwdGuard::chdir(outside.path());
@@ -1624,7 +1624,7 @@ mod tests {
         let outside_marker = outside.path().join("command-cwd.txt");
         let plan = DeploymentPlan {
             provider: HostingProvider::Custom,
-            bundle_path: bundle_path.clone(),
+            bundle_path: bundle_path,
             steps: vec![],
             expected_url: None,
             generated_files: vec![],

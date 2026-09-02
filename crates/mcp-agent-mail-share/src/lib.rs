@@ -48,7 +48,10 @@ pub use planner::{PlanResult, format_plan_human, generate_plan, validate_inputs}
 pub use prompt::{WizardConfig, WizardOutcome, format_json_output, run_interactive_wizard};
 pub use scope::{ProjectRecord, ProjectScopeResult, RemainingCounts, apply_project_scope};
 pub use scrub::{ScrubSummary, scan_for_secrets, scrub_snapshot};
-pub use snapshot::{SnapshotContext, create_snapshot_context, create_sqlite_snapshot};
+pub use snapshot::{
+    SnapshotContext, create_private_canonical_snapshot_context,
+    create_private_canonical_sqlite_snapshot, create_snapshot_context, create_sqlite_snapshot,
+};
 pub use static_render::{
     SearchIndexEntry, SitemapEntry, StaticRenderConfig, StaticRenderResult, render_static_site,
 };
@@ -83,7 +86,7 @@ pub enum ScrubPreset {
 
 impl ScrubPreset {
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Standard => "standard",
             Self::Strict => "strict",
@@ -144,7 +147,7 @@ impl ExportRedactionPolicy {
 
     /// No redaction applied (archive/operator mode).
     #[must_use]
-    pub fn none() -> Self {
+    pub const fn none() -> Self {
         Self {
             scan_secrets: false,
             redact_bodies: false,
@@ -156,7 +159,7 @@ impl ExportRedactionPolicy {
 
     /// Returns `true` if any redaction rules are active.
     #[must_use]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         self.scan_secrets || self.redact_bodies || self.redact_recipients
     }
 }
@@ -185,7 +188,7 @@ pub enum RedactionReason {
 impl RedactionReason {
     /// Operator-facing description of why content was hidden.
     #[must_use]
-    pub fn description(self) -> &'static str {
+    pub const fn description(self) -> &'static str {
         match self {
             Self::ScrubPreset => "Content removed during scrub pass (preset policy)",
             Self::SecretDetected => "Secret pattern detected and replaced",
@@ -236,7 +239,7 @@ impl RedactionAuditLog {
 
     /// Total number of redaction actions taken.
     #[must_use]
-    pub fn total(&self) -> usize {
+    pub const fn total(&self) -> usize {
         self.events.len()
     }
 }
@@ -338,7 +341,7 @@ pub fn adjust_detach_threshold(inline_threshold: usize, detach_threshold: usize)
 }
 
 /// Validate non-negative integer thresholds and minimum chunk size.
-pub fn validate_thresholds(
+pub const fn validate_thresholds(
     inline_threshold: i64,
     detach_threshold: i64,
     chunk_threshold: i64,
@@ -377,8 +380,7 @@ pub fn default_decrypt_output(encrypted_path: &Path) -> PathBuf {
     if encrypted_path
         .extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("age"))
-        .unwrap_or(false)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("age"))
     {
         return encrypted_path.with_extension("");
     }
@@ -511,7 +513,7 @@ fn get_str_list(value: Option<&Value>) -> Vec<String> {
         return Vec::new();
     };
     arr.iter()
-        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
         .collect()
 }
 
@@ -885,7 +887,7 @@ mod tests {
             load_bundle_export_config(dir.path()).expect_err("invalid manifest should fail parse");
         match err {
             ShareError::ManifestParse { message } => {
-                assert!(!message.is_empty());
+                assert_ne!(message, "");
             }
             other => panic!("unexpected error variant: {other:?}"),
         }

@@ -84,7 +84,14 @@ const KNOWN_TABLES: &[KnownTable] = &[
             "contact_policy",
             "reaper_exempt",
             "registration_token",
+            "retired_at",
         ],
+    },
+    KnownTable {
+        name: "agent_deregistrations",
+        page_by_column: Some("agent_id"),
+        primary_key_columns: &["agent_id"],
+        columns: &["agent_id", "deregistered_at"],
     },
     KnownTable {
         name: "messages",
@@ -202,11 +209,20 @@ const KNOWN_TABLES: &[KnownTable] = &[
     },
 ];
 
-/// Create a snapshot of the source SQLite database at `destination`.
+/// Create a snapshot of a live `FrankenSQLite` database at `destination`.
 ///
-/// 1. Opens source DB with FrankenSQLite (runtime driver).
-/// 2. If `checkpoint` is true, runs `PRAGMA wal_checkpoint(TRUNCATE)`.
-/// 3. Transfers schema + data to a fresh destination file.
+/// The source must already be admitted by `FrankenSQLite` and retain its complete
+/// namespace sidecar pair. It is opened through the guarded, engine-enforced
+/// read-only seam and copied inside one read transaction, so committed rows in
+/// the primary file and WAL are observed as one consistent database snapshot.
+/// The live source is never checkpointed or otherwise mutated. `checkpoint`
+/// is retained for callers that share this signature with private canonical
+/// snapshots, but has no effect for this live-source API.
+///
+/// Use [`create_private_canonical_sqlite_snapshot`] for a caller-owned,
+/// engine-exclusive canonical SQLite artifact. There is intentionally no
+/// namespace-absent fallback here: missing, incomplete, malformed, or stale
+/// `FrankenSQLite` namespace authority fails closed.
 ///
 /// Returns the destination path on success.
 ///
@@ -227,6 +243,32 @@ pub fn create_sqlite_snapshot(
         destination,
         checkpoint,
         SnapshotSourceProfile::Runtime,
+        SnapshotDestinationProfile::Default,
+    )
+}
+
+/// Create a snapshot from a private, engine-exclusive canonical SQLite file.
+///
+/// This API may open the source with canonical SQLite and therefore must never
+/// receive a live FrankenSQLite-managed mailbox path. It is intended for
+/// caller-owned archive reconstructions and already-materialized snapshots.
+/// When `checkpoint` is true, the private source is checkpointed through the
+/// same canonical connection before its consistent read transaction begins.
+///
+/// # Errors
+///
+/// Returns [`ShareError`] when source validation, canonical SQLite access,
+/// transfer, or publication fails.
+pub fn create_private_canonical_sqlite_snapshot(
+    source: &Path,
+    destination: &Path,
+    checkpoint: bool,
+) -> Result<PathBuf, ShareError> {
+    rebuild_sqlite_snapshot_with_profiles(
+        source,
+        destination,
+        checkpoint,
+        SnapshotSourceProfile::CanonicalExport,
         SnapshotDestinationProfile::Default,
     )
 }
@@ -253,6 +295,9 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
             });
         }
         Err(error) => return Err(ShareError::Io(error)),
+    }
+    if matches!(source_profile, SnapshotSourceProfile::CanonicalExport) {
+        validate_private_canonical_snapshot_source(&source)?;
     }
 
     // Resolve destination to absolute path
@@ -299,17 +344,6 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
             .unwrap_or("mailbox.sqlite3"),
     );
 
-    if checkpoint {
-        mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&source).map_err(|e| {
-            ShareError::Sqlite {
-                message: format!(
-                    "cannot checkpoint source DB {} before snapshot: {e}",
-                    source.display()
-                ),
-            }
-        })?;
-    }
-
     let source_str = source.display().to_string();
 
     // Page size must be chosen before page 1 is initialized, so configure the
@@ -328,27 +362,48 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
 
     match source_profile {
         SnapshotSourceProfile::Runtime => {
-            let src = DbConn::open_file(&source_str).map_err(|e| ShareError::Sqlite {
-                message: format!("cannot open runtime source DB {source_str}: {e}"),
+            let src = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+                &source,
+                "share live SQLite snapshot",
+            )
+            .map_err(|e| ShareError::Sqlite {
+                message: format!(
+                    "cannot open live runtime source DB {} read-only: {e}",
+                    source.display()
+                ),
             })?;
-            transfer_tables(&src, &dst_conn)?;
+            transfer_tables_in_consistent_read(&src, &dst_conn)?;
+            // A true read-only observer must use ordinary Drop. Checkpointing
+            // close helpers are writer teardown and may mutate a live WAL.
+            drop(src);
         }
         SnapshotSourceProfile::CanonicalExport => {
             let src = CanonicalDbConn::open_file(&source_str).map_err(|e| ShareError::Sqlite {
                 message: format!("cannot open canonical export source DB {source_str}: {e}"),
             })?;
-            transfer_tables(&src, &dst_conn)?;
+            if checkpoint {
+                src.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .map_err(|e| ShareError::Sqlite {
+                        message: format!(
+                            "cannot checkpoint private canonical source DB {source_str}: {e}"
+                        ),
+                    })?;
+            }
+            transfer_tables_in_consistent_read(&src, &dst_conn)?;
         }
     }
-    drop(dst_conn);
-    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&staged_dest).map_err(|e| {
-        ShareError::Sqlite {
+    // Use the existing canonical staging connection for any destination
+    // checkpoint. Opening the same inode with a second engine is unnecessary
+    // and can invalidate process-wide classic fcntl locks on Unix.
+    dst_conn
+        .execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+        .map_err(|e| ShareError::Sqlite {
             message: format!(
                 "cannot checkpoint destination DB {} before publishing snapshot: {e}",
                 staged_dest.display()
             ),
-        }
-    })?;
+        })?;
+    drop(dst_conn);
     // Staging ran with synchronous=OFF (br-gi4z3), so force the finished image
     // to disk once, here, before the rename publishes it.
     std::fs::File::open(&staged_dest)
@@ -424,6 +479,58 @@ fn sqlite_sidecar_artifacts_exist(path: &Path) -> Result<bool, ShareError> {
         }
     }
     Ok(false)
+}
+
+/// Enforce the engine-exclusive source contract before canonical SQLite can
+/// open the main inode. Franken namespace authority means the path may be live
+/// and must use the guarded same-engine API instead. A multiply-linked inode
+/// likewise defeats pathname-based ownership checks because another alias can
+/// still be live or replaced independently.
+fn validate_private_canonical_snapshot_source(path: &Path) -> Result<(), ShareError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(ShareError::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(ShareError::Validation {
+            message: format!(
+                "private canonical snapshot source is not a regular file: {}",
+                path.display()
+            ),
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.nlink() != 1 {
+            return Err(ShareError::Validation {
+                message: format!(
+                    "private canonical snapshot source must have exactly one hard link: {} has {}",
+                    path.display(),
+                    metadata.nlink()
+                ),
+            });
+        }
+    }
+
+    for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(_) => {
+                return Err(ShareError::Validation {
+                    message: format!(
+                        "private canonical snapshot source refuses FrankenSQLite namespace artifact {}",
+                        sidecar.display()
+                    ),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ShareError::Io(error)),
+        }
+    }
+
+    Ok(())
 }
 
 /// How the guarded directory traversal in [`create_real_directory_all`]
@@ -516,6 +623,12 @@ fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
 }
 
 trait SnapshotSource {
+    // Mirrors `DbConn::execute_raw`'s signature. Snapshot reads use an
+    // explicit transaction so every table and pagination page observes one
+    // primary-plus-WAL state.
+    #[allow(clippy::result_large_err)]
+    fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error>;
+
     // Mirrors `DbConn::query_sync`'s signature; `sqlmodel_core::Error`'s size
     // is upstream's choice and boxing here would diverge from that API.
     #[allow(clippy::result_large_err)]
@@ -527,6 +640,10 @@ trait SnapshotSource {
 }
 
 impl SnapshotSource for DbConn {
+    fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+        self.execute_raw(sql)
+    }
+
     fn query_snapshot(
         &self,
         sql: &str,
@@ -537,12 +654,55 @@ impl SnapshotSource for DbConn {
 }
 
 impl SnapshotSource for CanonicalDbConn {
+    fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+        self.execute_raw(sql)
+    }
+
     fn query_snapshot(
         &self,
         sql: &str,
         params: &[Value],
     ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
         self.query_sync(sql, params)
+    }
+}
+
+/// Copy every known table while one source read transaction pins the database
+/// snapshot. In WAL mode, separate queries without this transaction can each
+/// observe a different commit and produce a cross-table or cross-page state
+/// that never existed in the source.
+fn transfer_tables_in_consistent_read<S: SnapshotSource>(
+    src: &S,
+    dst: &CanonicalDbConn,
+) -> Result<(), ShareError> {
+    src.execute_snapshot("BEGIN")
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("cannot begin consistent source snapshot read: {e}"),
+        })?;
+
+    match transfer_tables(src, dst) {
+        Ok(()) => match src.execute_snapshot("COMMIT") {
+            Ok(()) => Ok(()),
+            Err(commit_error) => {
+                let rollback_result = src.execute_snapshot("ROLLBACK");
+                let rollback_suffix = rollback_result.err().map_or_else(String::new, |error| {
+                    format!("; rollback after commit failure also failed: {error}")
+                });
+                Err(ShareError::Sqlite {
+                    message: format!(
+                        "cannot commit consistent source snapshot read: {commit_error}{rollback_suffix}"
+                    ),
+                })
+            }
+        },
+        Err(transfer_error) => match src.execute_snapshot("ROLLBACK") {
+            Ok(()) => Err(transfer_error),
+            Err(rollback_error) => Err(ShareError::Sqlite {
+                message: format!(
+                    "snapshot transfer failed ({transfer_error}); source read transaction rollback also failed: {rollback_error}"
+                ),
+            }),
+        },
     }
 }
 
@@ -742,12 +902,16 @@ fn snapshot_column_prefers_text(column: &str) -> bool {
     column.ends_with("_ts") || column.ends_with("_at")
 }
 
-/// Full snapshot preparation pipeline.
+/// Full snapshot preparation pipeline for a live `FrankenSQLite` mailbox.
 ///
 /// 1. Create snapshot
 /// 2. Apply project scope
 /// 3. Scrub data
 /// 4. Finalize (FTS, materialized views, performance indexes, VACUUM)
+///
+/// The source assumptions are the same as [`create_sqlite_snapshot`]: a
+/// complete, valid `FrankenSQLite` namespace pair is mandatory and the source
+/// is opened only through the guarded read-only seam.
 pub fn create_snapshot_context(
     source: &Path,
     snapshot_path: &Path,
@@ -755,6 +919,34 @@ pub fn create_snapshot_context(
     scrub_preset: crate::ScrubPreset,
 ) -> Result<SnapshotContext, ShareError> {
     create_sqlite_snapshot(source, snapshot_path, true)?;
+    finish_snapshot_context(snapshot_path, project_filters, scrub_preset)
+}
+
+/// Full snapshot preparation pipeline for a private canonical SQLite source.
+///
+/// The source must be a caller-owned, engine-exclusive archive reconstruction
+/// or materialized snapshot. Never pass a live `FrankenSQLite` mailbox path;
+/// use [`create_snapshot_context`] for that case.
+///
+/// # Errors
+///
+/// Returns [`ShareError`] when snapshot creation, project scoping, scrubbing,
+/// or finalization fails.
+pub fn create_private_canonical_snapshot_context(
+    source: &Path,
+    snapshot_path: &Path,
+    project_filters: &[String],
+    scrub_preset: crate::ScrubPreset,
+) -> Result<SnapshotContext, ShareError> {
+    create_private_canonical_sqlite_snapshot(source, snapshot_path, true)?;
+    finish_snapshot_context(snapshot_path, project_filters, scrub_preset)
+}
+
+fn finish_snapshot_context(
+    snapshot_path: &Path,
+    project_filters: &[String],
+    scrub_preset: crate::ScrubPreset,
+) -> Result<SnapshotContext, ShareError> {
     let mut scope = crate::apply_project_scope(snapshot_path, project_filters)?;
     let scrub_summary = crate::scrub_snapshot(snapshot_path, scrub_preset)?;
     if !matches!(scrub_preset, crate::ScrubPreset::Archive) {
@@ -782,6 +974,42 @@ pub struct SnapshotContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct InterleavingSnapshotSource {
+        inner: DbConn,
+        writer_trigger: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+        writer_done: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl SnapshotSource for InterleavingSnapshotSource {
+        fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+            self.inner.execute_raw(sql)
+        }
+
+        fn query_snapshot(
+            &self,
+            sql: &str,
+            params: &[Value],
+        ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+            let rows = self.inner.query_sync(sql, params)?;
+            if sql.contains("FROM \"projects\"") {
+                let trigger = self
+                    .writer_trigger
+                    .lock()
+                    .expect("lock snapshot test writer trigger")
+                    .take();
+                if let Some(trigger) = trigger {
+                    trigger.send(()).expect("release concurrent WAL writer");
+                    self.writer_done
+                        .lock()
+                        .expect("lock snapshot test writer completion")
+                        .recv()
+                        .expect("concurrent WAL writer commits");
+                }
+            }
+            Ok(rows)
+        }
+    }
 
     // GH#230: the firmlink allowance itself is a pure predicate over
     // synthetic paths (real firmlinks cannot be fabricated at `/` inside a
@@ -917,6 +1145,255 @@ mod tests {
         let rows = copy_conn.query_sync("PRAGMA integrity_check", &[]).unwrap();
         let result: String = rows[0].get_named("integrity_check").unwrap();
         assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn private_canonical_snapshot_is_explicit_and_live_api_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("private-canonical.sqlite3");
+        let private_dest = dir.path().join("private-copy.sqlite3");
+        let refused_live_dest = dir.path().join("refused-live-copy.sqlite3");
+
+        let conn = CanonicalDbConn::open_file(source.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO projects VALUES (1, 'private', '/private', 0)")
+            .unwrap();
+        drop(conn);
+
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            assert!(
+                !PathBuf::from(format!("{}{suffix}", source.display())).exists(),
+                "canonical fixture must not accidentally gain FrankenSQLite namespace authority"
+            );
+        }
+
+        create_private_canonical_sqlite_snapshot(&source, &private_dest, true)
+            .expect("explicit private canonical snapshot succeeds");
+        let copy = CanonicalDbConn::open_file(private_dest.display().to_string()).unwrap();
+        let rows = copy
+            .query_sync("SELECT slug FROM projects WHERE id = 1", &[])
+            .unwrap();
+        assert_eq!(rows[0].get_named::<String>("slug").unwrap(), "private");
+
+        let error = create_sqlite_snapshot(&source, &refused_live_dest, false)
+            .expect_err("live API must not fall back for a namespace-less source");
+        assert!(
+            error
+                .to_string()
+                .contains("complete pre-existing namespace sidecar pair"),
+            "unexpected live-source refusal: {error}"
+        );
+        assert!(!refused_live_dest.exists());
+    }
+
+    #[test]
+    fn private_canonical_api_rejects_franken_namespace_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("live-franken.sqlite3");
+        let destination = dir.path().join("unsafe-canonical-copy.sqlite3");
+        let conn = DbConn::open_file(source.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = create_private_canonical_sqlite_snapshot(&source, &destination, false)
+            .expect_err("private canonical API must refuse Franken namespace authority");
+        assert!(
+            error
+                .to_string()
+                .contains("refuses FrankenSQLite namespace artifact"),
+            "unexpected namespace refusal: {error}"
+        );
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_canonical_api_rejects_hard_linked_main_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("private-canonical.sqlite3");
+        let alias = dir.path().join("private-canonical-alias.sqlite3");
+        let destination = dir.path().join("unsafe-hardlink-copy.sqlite3");
+        let conn = CanonicalDbConn::open_file(source.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        drop(conn);
+        std::fs::hard_link(&source, &alias).unwrap();
+
+        let error = create_private_canonical_sqlite_snapshot(&source, &destination, false)
+            .expect_err("private canonical API must refuse multiply-linked main inodes");
+        assert!(
+            error
+                .to_string()
+                .contains("must have exactly one hard link"),
+            "unexpected hard-link refusal: {error}"
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn snapshot_pins_one_primary_and_wal_state_across_all_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("live-wal.sqlite3");
+        let destination = dir.path().join("consistent-copy.sqlite3");
+
+        let seed = DbConn::open_file(source.display().to_string()).unwrap();
+        seed.execute_raw("PRAGMA journal_mode = WAL").unwrap();
+        seed.execute_raw("PRAGMA wal_autocheckpoint = 0").unwrap();
+        seed.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        seed.execute_raw(
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, product_uid TEXT, name TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        seed.execute_raw("INSERT INTO projects VALUES (1, 'before', '/before', 0)")
+            .unwrap();
+        drop(seed);
+
+        let reader = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+            &source,
+            "consistent snapshot test",
+        )
+        .unwrap();
+        let destination_conn =
+            CanonicalDbConn::open_file(destination.display().to_string()).unwrap();
+        let (writer_trigger_tx, writer_trigger_rx) = std::sync::mpsc::sync_channel(0);
+        let (writer_done_tx, writer_done_rx) = std::sync::mpsc::sync_channel(0);
+        let writer_path = source;
+        let writer = std::thread::spawn(move || {
+            let conn = DbConn::open_file(writer_path.display().to_string()).unwrap();
+            conn.execute_raw("PRAGMA wal_autocheckpoint = 0").unwrap();
+            writer_trigger_rx.recv().unwrap();
+            conn.execute_raw("INSERT INTO products VALUES (1, 'later', 'Later', 1)")
+                .unwrap();
+            writer_done_tx.send(()).unwrap();
+        });
+        let interleaving_reader = InterleavingSnapshotSource {
+            inner: reader,
+            writer_trigger: std::sync::Mutex::new(Some(writer_trigger_tx)),
+            writer_done: std::sync::Mutex::new(writer_done_rx),
+        };
+
+        transfer_tables_in_consistent_read(&interleaving_reader, &destination_conn)
+            .expect("snapshot transfer stays on one source read transaction");
+        writer.join().unwrap();
+
+        let projects = destination_conn
+            .query_sync("SELECT count(*) AS count FROM projects", &[])
+            .unwrap();
+        let products = destination_conn
+            .query_sync("SELECT count(*) AS count FROM products", &[])
+            .unwrap();
+        assert_eq!(projects[0].get_named::<i64>("count").unwrap(), 1);
+        assert_eq!(
+            products[0].get_named::<i64>("count").unwrap(),
+            0,
+            "a product committed after the first source read must not leak into the snapshot"
+        );
+        assert_eq!(
+            interleaving_reader
+                .inner
+                .query_sync("SELECT count(*) AS count FROM products", &[])
+                .unwrap()[0]
+                .get_named::<i64>("count")
+                .unwrap(),
+            1,
+            "the concurrent WAL commit must really have completed"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_snapshot_preserves_same_process_writer_lock() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_SHARE_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str =
+            "snapshot::tests::live_snapshot_preserves_same_process_writer_lock";
+        const CHILD_WITNESS: &str = "share-snapshot-child-observed-busy";
+
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            let contender = CanonicalDbConn::open_file(PathBuf::from(path).display().to_string())
+                .expect("child opens competing canonical connection");
+            contender
+                .execute_raw("PRAGMA busy_timeout = 0")
+                .expect("child disables busy retry");
+            let error = contender
+                .execute_raw("BEGIN IMMEDIATE")
+                .expect_err("separate process must not acquire the parent's reserved lock");
+            let error = error.to_string().to_ascii_lowercase();
+            assert!(
+                error.contains("busy") || error.contains("locked"),
+                "child must observe a lock refusal, not an unrelated error: {error}"
+            );
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        fn assert_child_observes_busy(path: &Path) {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("resolve current test executable"),
+            )
+            .arg(CHILD_TEST_NAME)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_PATH_ENV, path)
+            .output()
+            .expect("run competing child lock probe");
+            assert!(
+                output.status.success(),
+                "child lock probe failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(CHILD_WITNESS),
+                "child filter ran no causal lock probe: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("writer-lock.sqlite3");
+        let destination = dir.path().join("writer-lock-copy.sqlite3");
+        let seed = DbConn::open_file(source.display().to_string()).unwrap();
+        seed.execute_raw("PRAGMA journal_mode = DELETE").unwrap();
+        seed.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        seed.execute_raw("INSERT INTO projects VALUES (1, 'locked', '/locked', 0)")
+            .unwrap();
+        drop(seed);
+
+        let writer = DbConn::open_file(source.display().to_string()).unwrap();
+        writer.execute_raw("PRAGMA busy_timeout = 0").unwrap();
+        writer.execute_raw("BEGIN IMMEDIATE").unwrap();
+        let journal = PathBuf::from(format!("{}-journal", source.display()));
+        assert!(
+            !journal.exists(),
+            "BEGIN IMMEDIATE without a write must not create a rollback journal"
+        );
+
+        assert_child_observes_busy(&source);
+        create_sqlite_snapshot(&source, &destination, true)
+            .expect("guarded live snapshot coexists with a reserved writer");
+        assert_child_observes_busy(&source);
+
+        writer.execute_raw("ROLLBACK").unwrap();
+        let copy = CanonicalDbConn::open_file(destination.display().to_string()).unwrap();
+        let rows = copy
+            .query_sync("SELECT slug FROM projects WHERE id = 1", &[])
+            .unwrap();
+        assert_eq!(rows[0].get_named::<String>("slug").unwrap(), "locked");
     }
 
     #[test]

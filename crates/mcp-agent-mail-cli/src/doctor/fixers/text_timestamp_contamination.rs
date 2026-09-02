@@ -137,24 +137,29 @@ impl TextTimestampContaminationFinding {
 /// can't be opened (missing, corrupted, or schema doesn't have the
 /// table — different FMs handle those).
 pub fn detect(candidate_dbs: &[PathBuf]) -> Vec<TextTimestampContaminationFinding> {
+    let read_candidates = super::explicit_offline_db_read_candidates(
+        candidate_dbs,
+        "text-timestamp contamination detection",
+    );
+    detect_prepared(&read_candidates)
+}
+
+pub(crate) fn detect_prepared(
+    read_candidates: &[super::DoctorDbReadCandidate],
+) -> Vec<TextTimestampContaminationFinding> {
     let mut out = Vec::new();
-    for db in candidate_dbs {
-        if let Some(finding) = detect_one(db) {
+    for candidate in read_candidates {
+        if let Some(finding) = detect_one(candidate) {
             out.push(finding);
         }
     }
     out
 }
 
-fn detect_one(db_path: &std::path::Path) -> Option<TextTimestampContaminationFinding> {
-    // Pass-35-review Gemini F1 (P1): opening a WAL-mode DB with
-    // plain `read_only` flags can still create the `-shm`
-    // sidecar (SQLite uses shared-memory tracking for WAL read
-    // pointers). Use URI filename + `immutable=1` so SQLite
-    // treats the file as truly immutable: no locking, no -shm
-    // creation, no journal/WAL replay. This preserves the pure-
-    // detector contract.
-    let conn = super::open_immutable_sqlite(db_path).ok()?;
+fn detect_one(
+    candidate: &super::DoctorDbReadCandidate,
+) -> Option<TextTimestampContaminationFinding> {
+    let conn = candidate.connection()?;
 
     let mut contaminated = Vec::new();
     let mut total: i64 = 0;
@@ -203,7 +208,7 @@ fn detect_one(db_path: &std::path::Path) -> Option<TextTimestampContaminationFin
     }
 
     Some(TextTimestampContaminationFinding {
-        db_path: db_path.to_path_buf(),
+        db_path: candidate.target_path().to_path_buf(),
         contaminated_columns: contaminated,
         total_rows: total,
     })

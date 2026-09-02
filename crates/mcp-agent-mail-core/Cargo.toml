@@ -14,6 +14,8 @@ publish = false
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+serde_norway.workspace = true
+toml.workspace = true
 json5.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
@@ -26,11 +28,23 @@ shellexpand = "3"
 shlex = "2"
 sha1.workspace = true
 sha2.workspace = true
+hex.workspace = true
 fs2.workspace = true
 globset.workspace = true
 # `fs` feature provides `nix::sys::statvfs` for inode probes in `host_health`.
 nix = { workspace = true, features = ["fs"] }
+rustix.workspace = true
 tracing.workspace = true
+# Regular (not dev) dependency: `config::with_isolated_default_storage_root_for_test`
+# is compiled into the library so sibling crates' tests can redirect the
+# default storage root into a private tempdir (br-99aih). Windows already
+# needed it unconditionally.
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
+winsafe.workspace = true
 
 [features]
 # Optional local filesystem probes for installed coding-agent CLIs.

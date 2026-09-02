@@ -35,6 +35,7 @@ Commands:
   list-projects               List registered projects (optionally including their agents)
   macros                      Composite workflow macros (session boot, thread prep, reservation cycles, contact handshake)
   mail                        Send, read, search, reply to, and replay mailbox messages
+  mark-all-read               Bulk mark-read for an agent's project inbox (GH#273)
   migrate                     Migrate or check the on-disk database format (with backup/rollback)
   products                    Manage product records and link them to projects
   projects                    Manage projects: register, adopt, mark identity, and discovery

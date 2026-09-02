@@ -266,6 +266,54 @@ fn contact_blocked_error() -> McpError {
     )
 }
 
+fn agent_retired_error(agent: &mcp_agent_mail_db::AgentRow) -> McpError {
+    legacy_tool_error(
+        "AGENT_RETIRED",
+        format!(
+            "Agent '{}' is retired and cannot send or receive new messages. Use unretire_agent to restore it first.",
+            agent.name
+        ),
+        true,
+        json!({
+            "agent_name": agent.name,
+            "retired_at": agent.retired_at.map(micros_to_iso),
+        }),
+    )
+}
+
+fn agent_deregistered_error(agent: &mcp_agent_mail_db::AgentRow) -> McpError {
+    legacy_tool_error(
+        "AGENT_DEREGISTERED",
+        format!(
+            "Agent '{}' has been deregistered and can no longer send or receive new messages.",
+            agent.name
+        ),
+        false,
+        json!({ "agent_name": agent.name }),
+    )
+}
+
+async fn ensure_agent_accepts_new_messages(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    agent: &mcp_agent_mail_db::AgentRow,
+) -> McpResult<()> {
+    let agent_id = agent
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+    if db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent_deregistered_at(ctx.cx(), pool, agent_id).await,
+    )?
+    .is_some()
+    {
+        return Err(agent_deregistered_error(agent));
+    }
+    if agent.retired_at.is_some() {
+        return Err(agent_retired_error(agent));
+    }
+    Ok(())
+}
+
 /// Whether a failed auto-handshake attempt looks like transient engine/store
 /// contention (worth one bounded retry) rather than a policy or validation
 /// refusal that retrying cannot change. Under the fsqlite 0.3.4 registry
@@ -855,23 +903,49 @@ fn validate_reply_body_limit(config: &Config, body_md: &str) -> McpResult<()> {
     Ok(())
 }
 
-fn normalized_topic_argument(topic: Option<&str>) -> Option<&str> {
-    topic.map(str::trim).filter(|value| !value.is_empty())
-}
+fn normalize_topic_value(raw_topic: &str, argument: &'static str) -> McpResult<String> {
+    let topic = raw_topic.trim();
+    let mut chars = topic.chars();
+    let valid = (1..=64).contains(&topic.len())
+        && chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'));
+    if valid {
+        return Ok(topic.to_string());
+    }
 
-fn reject_unsupported_topic_argument(topic: Option<&str>, tool_name: &str) -> McpResult<()> {
-    let Some(topic_value) = normalized_topic_argument(topic) else {
-        return Ok(());
-    };
     Err(legacy_tool_error(
-        "INVALID_ARGUMENT",
-        format!("{tool_name} does not support the 'topic' argument yet. Omit 'topic' and retry."),
+        "INVALID_TOPIC",
+        format!(
+            "Topic must be 1-64 characters, start with a letter or digit, and contain only \
+             alphanumerics, '.', '_', or '-'. Got: {topic:?}"
+        ),
         true,
         json!({
-            "argument": "topic",
-            "value": topic_value,
+            "argument": argument,
+            "provided": topic,
         }),
     ))
+}
+
+fn normalize_topic_argument(topic: Option<&str>) -> McpResult<Option<String>> {
+    topic
+        .map(|topic| normalize_topic_value(topic, "topic"))
+        .transpose()
+}
+
+fn normalize_topic_filter(topic: Option<&str>) -> McpResult<Option<String>> {
+    let Some(topic) = topic else {
+        return Ok(None);
+    };
+    let topic = topic.trim();
+    if topic.is_empty() {
+        return Ok(None);
+    }
+    // Every persisted topic passes the same validation on write. Rejecting a
+    // lookup that can never match avoids needless database work and prevents
+    // an unbounded read-only argument from becoming an allocation/diagnostic
+    // amplification path.
+    normalize_topic_value(topic, "topic").map(Some)
 }
 
 const fn has_any_recipients(to: &[String], cc: &[String], bcc: &[String]) -> bool {
@@ -1137,6 +1211,7 @@ async fn push_recipient(
                 return Err(e);
             }
         };
+        ensure_agent_accepts_new_messages(ctx, pool, &agent).await?;
         let key = agent.name.to_lowercase();
         recipient_map.insert(key, agent.clone());
         agent
@@ -1450,6 +1525,7 @@ pub struct MessagePayload {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub body_md: String,
     pub importance: String,
@@ -1614,6 +1690,7 @@ pub struct InboxMessage {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub importance: String,
     pub ack_required: bool,
@@ -1630,6 +1707,24 @@ pub struct InboxMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ack_ts: Option<String>,
     pub kind: String,
+    pub attachments: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_md: Option<String>,
+}
+
+/// Project-scoped message returned by `fetch_topic`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicMessage {
+    pub id: i64,
+    pub project_id: i64,
+    pub sender_id: i64,
+    pub thread_id: Option<String>,
+    pub topic: Option<String>,
+    pub subject: String,
+    pub importance: String,
+    pub ack_required: bool,
+    pub from: String,
+    pub created_ts: Option<String>,
     pub attachments: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_md: Option<String>,
@@ -1662,6 +1757,7 @@ pub struct ReplyMessageResponse {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub importance: String,
     pub ack_required: bool,
@@ -1694,7 +1790,7 @@ pub struct ReplyMessageResponse {
 /// - `importance`: Message importance: low, normal, high, urgent (default: normal)
 /// - `ack_required`: Request acknowledgement (default: false)
 /// - `thread_id`: Associate with existing thread (optional; bare numerics must already exist)
-/// - `topic`: Reserved for future topic tags; non-blank values are currently rejected
+/// - `topic`: Optional 1-64 character case-insensitive topic tag
 /// - `auto_contact_if_blocked`: Auto-request contact if blocked (optional)
 /// - `sender_token`: Registration token for sender identity verification (optional by default; mandatory in the fail-closed profile)
 ///
@@ -1706,7 +1802,7 @@ pub struct ReplyMessageResponse {
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Reserved for future topic tags. Non-blank values are currently rejected until\n    topic persistence and filtering are implemented.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names fail fast; register them first.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
+    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names fail fast; register them first.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
 )]
 pub async fn send_message(
     ctx: &McpContext,
@@ -1735,6 +1831,7 @@ pub async fn send_message(
     let bcc = normalize_optional_agent_names(bcc);
     let idempotency_key =
         crate::idempotency::normalize_idempotency_key(idempotency_key.as_deref())?;
+    let topic = normalize_topic_argument(topic.as_deref())?;
     // Fingerprint the normalized request payload (only when a key was supplied)
     // so a retry with the same key must carry the same logical arguments; any
     // change is a typed conflict. Computed early from raw inputs, before body/
@@ -1759,6 +1856,7 @@ pub async fn send_message(
                 ("importance", importance.clone().unwrap_or_default()),
                 ("ack_required", ack_required.unwrap_or(false).to_string()),
                 ("thread_id", thread_id.clone().unwrap_or_default()),
+                ("topic", topic.clone().unwrap_or_default()),
                 ("attachments", atts.join("\u{1f}")),
                 (
                     "convert_images",
@@ -1805,8 +1903,6 @@ pub async fn send_message(
     let thread_id = thread_id
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
-    reject_unsupported_topic_argument(topic.as_deref(), "send_message")?;
-
     let config = &Config::get();
 
     // ── Per-message size limits (subject/body) before any DB/archive work ──
@@ -1897,6 +1993,7 @@ effective_free_bytes={free}"
         &project.human_key,
     )
     .await?;
+    ensure_agent_accepts_new_messages(ctx, &pool, &sender).await?;
     let sender_id = sender.id.unwrap_or(0);
 
     // The opt-in fail-closed profile rejects missing/unavailable proof before
@@ -2099,19 +2196,26 @@ effective_free_bytes={free}"
         if let Some(thread) = thread_id.as_deref() {
             let thread = thread.trim();
             if !thread.is_empty() {
-                let thread_rows = db_outcome_to_mcp_result(
-                    mcp_agent_mail_db::queries::list_thread_messages(
+                // GH#260: join-free, body-free participant lookup. The previous
+                // `list_thread_messages` + `list_message_recipient_names_for_messages`
+                // pair materialized full bodies and used OR-disjunct / IN+JOIN
+                // query shapes that FrankenSQLite executes as whole-table nested
+                // loops, so one send into a ≥500-message thread on a large
+                // mailbox burned CPU for minutes behind the global message-write
+                // serializer and wedged every other send.
+                let participants = db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::list_thread_participant_names(
                         ctx.cx(),
                         &pool,
                         project_id,
                         thread,
-                        Some(500),
+                        500,
                     )
                     .await,
                 )
                 .unwrap_or_else(|e| {
                     tracing::warn!(
-                        "contact enforcement: list_thread_messages failed (fail-open): {e}"
+                        "contact enforcement: list_thread_participant_names failed (fail-open): {e}"
                     );
                     mcp_agent_mail_core::global_metrics()
                         .tools
@@ -2119,31 +2223,7 @@ effective_free_bytes={free}"
                         .inc();
                     Vec::new()
                 });
-                let mut message_ids: Vec<i64> = Vec::with_capacity(thread_rows.len());
-                for row in &thread_rows {
-                    auto_ok_names.insert(row.from.clone());
-                    message_ids.push(row.id);
-                }
-                let recipients = db_outcome_to_mcp_result(
-                    mcp_agent_mail_db::queries::list_message_recipient_names_for_messages(
-                        ctx.cx(),
-                        &pool,
-                        project_id,
-                        &message_ids,
-                    )
-                    .await,
-                )
-                .unwrap_or_else(|e| {
-                    tracing::warn!(
-                        "contact enforcement: list_message_recipient_names failed (fail-open): {e}"
-                    );
-                    mcp_agent_mail_core::global_metrics()
-                        .tools
-                        .contact_enforcement_bypass_total
-                        .inc();
-                    Vec::new()
-                });
-                for name in recipients {
+                for name in participants {
                     auto_ok_names.insert(name);
                 }
             }
@@ -2425,7 +2505,7 @@ effective_free_bytes={free}"
             fingerprint,
         };
         match db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients_idempotent(
+            mcp_agent_mail_db::queries::create_message_with_recipients_idempotent_topic(
                 ctx.cx(),
                 &pool,
                 project_id,
@@ -2433,6 +2513,7 @@ effective_free_bytes={free}"
                 &subject,
                 &final_body,
                 thread_id.as_deref(),
+                topic.as_deref(),
                 &importance_val,
                 ack_required.unwrap_or(false),
                 &attachments_json,
@@ -2449,7 +2530,7 @@ effective_free_bytes={free}"
         }
     } else {
         let row = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients(
+            mcp_agent_mail_db::queries::create_message_with_recipients_topic(
                 ctx.cx(),
                 &pool,
                 project_id,
@@ -2457,6 +2538,7 @@ effective_free_bytes={free}"
                 &subject,
                 &final_body,
                 thread_id.as_deref(),
+                topic.as_deref(),
                 &importance_val,
                 ack_required.unwrap_or(false),
                 &attachments_json,
@@ -2565,6 +2647,7 @@ effective_free_bytes={free}"
                 "subject": &message.subject,
                 "created": micros_to_iso(message.created_ts),
                 "thread_id": &message.thread_id,
+                "topic": &message.topic,
                 "project": &project.human_key,
                 "project_slug": &project.slug,
                 "importance": &message.importance,
@@ -2609,6 +2692,7 @@ effective_free_bytes={free}"
             project_id,
             sender_id,
             thread_id: message.thread_id,
+            topic: message.topic,
             subject: message.subject,
             body_md: message.body_md,
             importance: message.importance,
@@ -2898,6 +2982,7 @@ effective_free_bytes={free}"
         &project.human_key,
     )
     .await?;
+    ensure_agent_accepts_new_messages(ctx, &pool, &sender).await?;
     let sender_id = sender.id.unwrap_or(0);
 
     // ── Sender identity verification (issue #42; GH#237 fail-closed) ──
@@ -3142,41 +3227,20 @@ effective_free_bytes={free}"
         let mut auto_ok_names: HashSet<String> = HashSet::new();
 
         if !thread_id.is_empty() {
-            let thread_rows = db_outcome_to_mcp_result(
-                mcp_agent_mail_db::queries::list_thread_messages(
+            // GH#260: see send_message — narrow join-free participant lookup.
+            let participants = db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::list_thread_participant_names(
                     ctx.cx(),
                     &pool,
                     project_id,
                     &thread_id,
-                    Some(500),
-                )
-                .await,
-            )
-            .unwrap_or_else(|e| {
-                tracing::warn!("contact enforcement: list_thread_messages failed (fail-open): {e}");
-                mcp_agent_mail_core::global_metrics()
-                    .tools
-                    .contact_enforcement_bypass_total
-                    .inc();
-                Vec::new()
-            });
-            let mut message_ids: Vec<i64> = Vec::with_capacity(thread_rows.len());
-            for row in &thread_rows {
-                auto_ok_names.insert(row.from.clone());
-                message_ids.push(row.id);
-            }
-            let recipients = db_outcome_to_mcp_result(
-                mcp_agent_mail_db::queries::list_message_recipient_names_for_messages(
-                    ctx.cx(),
-                    &pool,
-                    project_id,
-                    &message_ids,
+                    500,
                 )
                 .await,
             )
             .unwrap_or_else(|e| {
                 tracing::warn!(
-                    "contact enforcement: list_message_recipient_names failed (fail-open): {e}"
+                    "contact enforcement: list_thread_participant_names failed (fail-open): {e}"
                 );
                 mcp_agent_mail_core::global_metrics()
                     .tools
@@ -3184,7 +3248,7 @@ effective_free_bytes={free}"
                     .inc();
                 Vec::new()
             });
-            for name in recipients {
+            for name in participants {
                 auto_ok_names.insert(name);
             }
         }
@@ -3400,7 +3464,7 @@ effective_free_bytes={free}"
             fingerprint,
         };
         match db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients_idempotent(
+            mcp_agent_mail_db::queries::create_message_with_recipients_idempotent_topic(
                 ctx.cx(),
                 &pool,
                 project_id,
@@ -3408,6 +3472,7 @@ effective_free_bytes={free}"
                 &subject,
                 &final_body,
                 Some(&thread_id),
+                original.topic.as_deref(),
                 &importance_val,
                 ack_required.unwrap_or(original.ack_required != 0),
                 &attachments_json,
@@ -3424,7 +3489,7 @@ effective_free_bytes={free}"
         }
     } else {
         let row = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients(
+            mcp_agent_mail_db::queries::create_message_with_recipients_topic(
                 ctx.cx(),
                 &pool,
                 project_id,
@@ -3432,6 +3497,7 @@ effective_free_bytes={free}"
                 &subject,
                 &final_body,
                 Some(&thread_id),
+                original.topic.as_deref(),
                 &importance_val,
                 ack_required.unwrap_or(original.ack_required != 0),
                 &attachments_json,
@@ -3537,6 +3603,7 @@ effective_free_bytes={free}"
                 "subject": &reply.subject,
                 "created": micros_to_iso(reply.created_ts),
                 "thread_id": &thread_id,
+                "topic": &reply.topic,
                 "project": &project.human_key,
                 "project_slug": &project.slug,
                 "importance": &reply.importance,
@@ -3582,6 +3649,7 @@ effective_free_bytes={free}"
             project_id,
             sender_id,
             thread_id: Some(thread_id.clone()),
+            topic: reply.topic.clone(),
             subject: reply.subject.clone(),
             body_md: reply.body_md.clone(),
             importance: reply.importance.clone(),
@@ -3599,6 +3667,7 @@ effective_free_bytes={free}"
             project_id,
             sender_id,
             thread_id: Some(thread_id),
+            topic: reply.topic,
             subject: reply.subject,
             importance: reply.importance,
             ack_required: reply.ack_required != 0,
@@ -3646,7 +3715,7 @@ effective_free_bytes={free}"
 /// - `include_bodies`: Include full message bodies (default: false)
 /// - `unread_only`: Only messages not yet marked read (default: false)
 /// - `ack_overdue_only`: Only unacknowledged ack-required messages older than the SLA (default: false)
-/// - `topic`: Reserved for future topic filtering; non-blank values are currently rejected
+/// - `topic`: Exact case-insensitive topic filter
 /// - `mark_read`: Auto-mark returned messages read (default: true). Pass false
 ///   for a non-consuming peek — e.g. `am check-inbox` hooks (GH#207) — which
 ///   must never change read state.
@@ -3659,7 +3728,7 @@ effective_free_bytes={free}"
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Retrieve recent messages for an agent and mark returned messages read.\n\nFilters\n-------\n- `urgent_only`: only messages with importance in {high, urgent}\n- `unread_only`: only recipient rows whose read_ts is unset\n- `ack_overdue_only`: only ack-required rows with no ack_ts older than the 30-minute SLA\n- `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned\n- `limit`: max number of messages (default 20)\n- `include_bodies`: include full Markdown bodies in the payloads\n- `topic`: reserved for future topic filtering; non-blank values are currently rejected\n\nUsage patterns\n--------------\n- Poll after each editing step in an agent loop to pick up coordination messages.\n- Use `since_ts` with the timestamp from your last poll for efficient incremental fetches.\n- Combine with `acknowledge_message` if `ack_required` is true.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, read_ts?, ack_ts?, importance, ack_required, kind, [body_md] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"since_ts\":\"2025-10-23T00:00:00+00:00\"\n}}}\n```\n\nmark_read : Optional[bool]\n    Default true. Set false for a non-consuming peek that never changes read state (used by `am check-inbox` and other monitoring hooks)."
+    description = "Retrieve recent messages for an agent and mark returned messages read.\n\nFilters\n-------\n- `urgent_only`: only messages with importance in {high, urgent}\n- `unread_only`: only recipient rows whose read_ts is unset\n- `ack_overdue_only`: only ack-required rows with no ack_ts older than the 30-minute SLA\n- `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned\n- `limit`: max number of messages (default 20)\n- `include_bodies`: include full Markdown bodies in the payloads\n- `topic`: exact case-insensitive topic filter\n\nUsage patterns\n--------------\n- Poll after each editing step in an agent loop to pick up coordination messages.\n- Use `since_ts` with the timestamp from your last poll for efficient incremental fetches.\n- Combine with `acknowledge_message` if `ack_required` is true.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, topic?, from, created_ts, read_ts?, ack_ts?, importance, ack_required, kind, [body_md] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"since_ts\":\"2025-10-23T00:00:00+00:00\"\n}}}\n```\n\nmark_read : Optional[bool]\n    Default true. Set false for a non-consuming peek that never changes read state (used by `am check-inbox` and other monitoring hooks)."
 )]
 pub async fn fetch_inbox(
     ctx: &McpContext,
@@ -3705,7 +3774,7 @@ pub async fn fetch_inbox(
     let urgent = urgent_only.unwrap_or(false);
     let unread = unread_only.unwrap_or(false);
     let ack_overdue = ack_overdue_only.unwrap_or(false);
-    reject_unsupported_topic_argument(topic.as_deref(), "fetch_inbox")?;
+    let topic = normalize_topic_filter(topic.as_deref())?;
     phase.set_include_bodies(include_body);
     phase.mark("argument_validation");
 
@@ -3751,84 +3820,24 @@ pub async fn fetch_inbox(
         None
     };
 
-    let inbox_rows = db_outcome_to_mcp_result(match (include_body, ack_overdue, unread) {
-        (true, true, _) => {
-            let threshold = mcp_agent_mail_db::now_micros() - FETCH_INBOX_ACK_OVERDUE_THRESHOLD_US;
-            mcp_agent_mail_db::queries::fetch_inbox_ack_overdue(
-                ctx.cx(),
-                &read_pool,
-                project_id,
-                agent_id,
-                urgent,
-                since_micros,
-                msg_limit,
-                threshold,
-            )
-            .await
-        }
-        (false, true, _) => {
-            let threshold = mcp_agent_mail_db::now_micros() - FETCH_INBOX_ACK_OVERDUE_THRESHOLD_US;
-            mcp_agent_mail_db::queries::fetch_inbox_ack_overdue_metadata(
-                ctx.cx(),
-                &read_pool,
-                project_id,
-                agent_id,
-                urgent,
-                since_micros,
-                msg_limit,
-                threshold,
-            )
-            .await
-        }
-        (true, false, true) => {
-            mcp_agent_mail_db::queries::fetch_inbox_unread(
-                ctx.cx(),
-                &read_pool,
-                project_id,
-                agent_id,
-                urgent,
-                since_micros,
-                msg_limit,
-            )
-            .await
-        }
-        (false, false, true) => {
-            mcp_agent_mail_db::queries::fetch_inbox_unread_metadata(
-                ctx.cx(),
-                &read_pool,
-                project_id,
-                agent_id,
-                urgent,
-                since_micros,
-                msg_limit,
-            )
-            .await
-        }
-        (true, false, false) => {
-            mcp_agent_mail_db::queries::fetch_inbox(
-                ctx.cx(),
-                &read_pool,
-                project_id,
-                agent_id,
-                urgent,
-                since_micros,
-                msg_limit,
-            )
-            .await
-        }
-        (false, false, false) => {
-            mcp_agent_mail_db::queries::fetch_inbox_metadata(
-                ctx.cx(),
-                &read_pool,
-                project_id,
-                agent_id,
-                urgent,
-                since_micros,
-                msg_limit,
-            )
-            .await
-        }
-    })?;
+    let ack_overdue_before =
+        ack_overdue.then(|| mcp_agent_mail_db::now_micros() - FETCH_INBOX_ACK_OVERDUE_THRESHOLD_US);
+    let inbox_rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::fetch_inbox_filtered(
+            ctx.cx(),
+            &read_pool,
+            project_id,
+            agent_id,
+            urgent,
+            unread,
+            since_micros,
+            msg_limit,
+            ack_overdue_before,
+            topic.as_deref(),
+            include_body,
+        )
+        .await,
+    )?;
     phase.mark("sqlite_query");
 
     let mut messages: Vec<InboxMessage> = inbox_rows
@@ -3850,6 +3859,7 @@ pub async fn fetch_inbox(
                 project_id: row.message.project_id,
                 sender_id: row.message.sender_id,
                 thread_id: row.message.thread_id,
+                topic: row.message.topic,
                 subject: row.message.subject,
                 importance: row.message.importance,
                 ack_required: row.message.ack_required != 0,
@@ -3964,6 +3974,95 @@ pub async fn fetch_inbox(
     phase.mark("json_serialization");
     emit_tail_latency_evidence(&phase.finish("ok"));
     Ok(response)
+}
+
+/// Fetch all project messages carrying one exact topic tag.
+///
+/// This is intentionally project-scoped under the supported Rust contract: it
+/// is the topic-search counterpart to recipient-scoped
+/// `fetch_inbox(topic=...)`.
+#[tool(
+    description = "Fetch all messages in a project with a given topic tag, regardless of recipient.\n\nParameters\n----------\nproject_key : str\n    Project identifier.\ntopic_name : str\n    The topic tag to filter by (case-insensitive).\nlimit : int\n    Max number of messages to return (default 50).\ninclude_bodies : bool\n    Include full Markdown bodies in the payloads (default true).\nsince_ts : Optional[str]\n    ISO-8601 timestamp; only messages newer than this are returned.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, importance, topic, [body_md] }"
+)]
+pub async fn fetch_topic(
+    ctx: &McpContext,
+    project_key: String,
+    topic_name: String,
+    limit: Option<i32>,
+    include_bodies: Option<bool>,
+    since_ts: Option<String>,
+) -> McpResult<String> {
+    let topic = topic_name.trim();
+    if topic.is_empty() {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "topic_name must be a non-empty string",
+            true,
+            json!({ "argument": "topic_name" }),
+        ));
+    }
+    let topic = normalize_topic_value(topic, "topic_name")?;
+    let requested_limit = limit.unwrap_or(50).clamp(1, 1000);
+    let limit = usize::try_from(requested_limit).map_err(|_| {
+        legacy_tool_error(
+            "INVALID_LIMIT",
+            format!("limit exceeds supported range: {requested_limit}"),
+            true,
+            json!({ "provided": requested_limit, "min": 1, "max": 1000 }),
+        )
+    })?;
+    let include_bodies = include_bodies.unwrap_or(true);
+    let since_micros = if let Some(timestamp) = since_ts.as_deref() {
+        Some(mcp_agent_mail_db::iso_to_micros(timestamp).ok_or_else(|| {
+            legacy_tool_error(
+                "INVALID_TIMESTAMP",
+                format!("Invalid since_ts format: {timestamp:?}. Expected ISO-8601."),
+                true,
+                json!({
+                    "provided": timestamp,
+                    "expected_format": "YYYY-MM-DDTHH:MM:SS+HH:MM",
+                }),
+            )
+        })?)
+    } else {
+        None
+    };
+
+    let pool = get_coalescer_bypass_read_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::fetch_topic_messages(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            &topic,
+            since_micros,
+            limit,
+            include_bodies,
+        )
+        .await,
+    )?;
+
+    let messages = rows
+        .into_iter()
+        .map(|row| TopicMessage {
+            id: row.message.id.unwrap_or(0),
+            project_id: row.message.project_id,
+            sender_id: row.message.sender_id,
+            thread_id: row.message.thread_id,
+            topic: row.message.topic,
+            subject: row.message.subject,
+            importance: row.message.importance,
+            ack_required: row.message.ack_required != 0,
+            from: row.sender_name,
+            created_ts: Some(micros_to_iso(row.message.created_ts)),
+            attachments: parse_attachment_metadata_json(&row.message.attachments),
+            body_md: include_bodies.then_some(row.message.body_md),
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::to_string(&messages)
+        .map_err(|error| McpError::new(McpErrorCode::InternalError, error.to_string()))
 }
 
 /// Read durable, body-free inbox delivery events for a monitor.
@@ -4250,6 +4349,118 @@ pub async fn mark_message_read(
 
     serde_json::to_string(&response)
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+/// Default number of messages transitioned per `mark_all_read` call (GH#273).
+pub const MARK_ALL_READ_DEFAULT_LIMIT: usize = 500;
+
+/// Hard cap on messages transitioned per `mark_all_read` call (GH#273).
+pub const MARK_ALL_READ_MAX_LIMIT: usize = 1000;
+
+/// Bulk mark-read for one agent's inbox in one project (GH#273).
+///
+/// # Parameters
+/// - `project_key`: Project identifier (must already exist; never auto-created)
+/// - `agent_name`: Agent whose unread inbox rows transition to read
+/// - `older_than_days`: Only mark messages created at least this many days ago
+/// - `limit`: Max messages per call (default 500, capped at 1000)
+///
+/// # Returns
+/// `{ agent, marked_count, more, limit, older_than_days }` — `more=true` means
+/// eligible unread messages remain and the caller should call again.
+///
+/// # Conformance
+/// Rust-native (the legacy Python server only exposed bulk mark-read through
+/// the web dashboard).
+#[tool(
+    description = "Mark every unread message in an agent's project inbox as read, in bounded batches.\n\nWhat this does\n--------------\n- Sets read_ts for up to `limit` unread (agent, message) recipient rows in the project, oldest first\n- Acknowledgement state is never touched; ack_required mail still needs `acknowledge_message`\n- Does NOT delete anything; pair with MESSAGES_RETENTION_DAYS retention to bound old mail\n\nWhen to use\n-----------\n- Clearing the backlog of a departed/finished agent so its inbox stops counting as unread\n- Draining stale coordination or ATC liveness mail after a swarm winds down\n- Before enabling message retention pruning (only read+acked mail is ever pruned)\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`). The project must\n    already exist; a typo'd key is an error, never a newly minted project.\nagent_name : str\n    Agent whose inbox is being cleared. Any caller may clear any agent's backlog (operator tool).\nolder_than_days : Optional[int]\n    Only mark messages created at least this many days ago (default: no age filter).\n    Use this to keep fresh mail unread while draining aged backlog.\nlimit : Optional[int]\n    Maximum messages to transition in this call. Default 500, hard cap 1000 (larger values are\n    clamped). The response's `more` flag tells you whether another call is needed.\n\nReturns\n-------\ndict\n    { \"agent\": str, \"marked_count\": int, \"more\": bool, \"limit\": int, \"older_than_days\": int | null }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"8b\",\"method\":\"tools/call\",\"params\":{\"name\":\"mark_all_read\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"older_than_days\":7\n}}}\n```\n\nDo / Don't\n----------\nDo:\n- Loop while `more` is true to fully drain a large backlog (each call is bounded by design).\n- Use `older_than_days` when the agent is still active and fresh mail should stay unread.\nDon't:\n- Use this as a substitute for reading coordination mail an active agent still needs.\n- Expect acks: ack_required messages remain unacknowledged until `acknowledge_message`."
+)]
+pub async fn mark_all_read(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    older_than_days: Option<i64>,
+    limit: Option<i32>,
+) -> McpResult<String> {
+    let agent_name = normalize_agent_name_or_original(agent_name);
+
+    let effective_limit = match limit {
+        None => MARK_ALL_READ_DEFAULT_LIMIT,
+        Some(value) if value < 1 => {
+            return Err(legacy_tool_error(
+                "INVALID_LIMIT",
+                format!("limit must be at least 1, got {value}. Use a positive integer."),
+                true,
+                json!({ "provided": value, "min": 1, "max": MARK_ALL_READ_MAX_LIMIT }),
+            ));
+        }
+        Some(value) => usize::try_from(value)
+            .unwrap_or(MARK_ALL_READ_MAX_LIMIT)
+            .min(MARK_ALL_READ_MAX_LIMIT),
+    };
+
+    let older_than_us = match older_than_days {
+        None => None,
+        Some(days) if days < 0 => {
+            return Err(legacy_tool_error(
+                "INVALID_ARGUMENT",
+                format!("older_than_days must be >= 0, got {days}."),
+                true,
+                json!({ "field": "older_than_days", "provided": days }),
+            ));
+        }
+        Some(days) => Some(
+            mcp_agent_mail_db::now_micros()
+                .saturating_sub(days.saturating_mul(86_400).saturating_mul(1_000_000)),
+        ),
+    };
+
+    let pool = get_db_pool()?;
+    // Bulk mark-read is an operator/cleanup action: the project must already
+    // exist — a typo'd key must never mint a project.
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let project_id = project.id.unwrap_or(0);
+    let agent = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
+    let agent_id = agent.id.unwrap_or(0);
+
+    let outcome = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::mark_messages_read_bulk(
+            ctx.cx(),
+            &pool,
+            project_id,
+            agent_id,
+            older_than_us,
+            effective_limit,
+        )
+        .await,
+    )?;
+
+    tracing::info!(
+        project = %project.slug,
+        agent = %agent_name,
+        marked = outcome.marked,
+        more = outcome.more,
+        limit = effective_limit,
+        older_than_days = ?older_than_days,
+        "mark_all_read: bulk-marked inbox messages read"
+    );
+
+    serde_json::to_string(&json!({
+        "agent": agent_name,
+        "marked_count": outcome.marked,
+        "more": outcome.more,
+        "limit": effective_limit,
+        "older_than_days": older_than_days,
+    }))
+    .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
 // ── Durable ack intents (br-bvq1x.8.3 / H3) ──────────────────────────────────
@@ -5759,38 +5970,64 @@ mod tests {
     }
 
     #[test]
-    fn normalized_topic_argument_treats_blank_as_absent() {
-        assert_eq!(normalized_topic_argument(Some("   ")), None);
-        assert_eq!(normalized_topic_argument(None), None);
+    fn normalize_topic_argument_treats_omission_as_topicless() {
+        assert_eq!(normalize_topic_argument(None).unwrap(), None);
     }
 
     #[test]
-    fn normalized_topic_argument_trims_non_blank_topic() {
+    fn normalize_topic_argument_trims_and_accepts_hierarchical_bead_ids() {
         assert_eq!(
-            normalized_topic_argument(Some("  build-updates  ")),
-            Some("build-updates")
+            normalize_topic_argument(Some("  br-abc.1  ")).unwrap(),
+            Some("br-abc.1".to_string())
         );
     }
 
     #[test]
-    fn reject_unsupported_topic_argument_allows_blank_topic() {
-        reject_unsupported_topic_argument(Some("   "), "send_message")
-            .expect("blank topic should behave like an omitted topic");
-    }
-
-    #[test]
-    fn reject_unsupported_topic_argument_rejects_non_blank_topic() {
-        let err = reject_unsupported_topic_argument(Some("build-updates"), "fetch_inbox")
-            .expect_err("non-blank topic should be rejected until implemented");
-        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
-        assert_eq!(
-            err.message,
-            "fetch_inbox does not support the 'topic' argument yet. Omit 'topic' and retry."
-        );
+    fn normalize_topic_argument_rejects_blank_topic() {
+        let err = normalize_topic_argument(Some("   ")).expect_err("blank topic must be invalid");
         let data = err.data.expect("error payload");
-        assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
+        assert_eq!(data["error"]["type"], "INVALID_TOPIC");
         assert_eq!(data["error"]["data"]["argument"], "topic");
-        assert_eq!(data["error"]["data"]["value"], "build-updates");
+        assert_eq!(data["error"]["data"]["provided"], "");
+    }
+
+    #[test]
+    fn normalize_topic_filter_treats_blank_as_no_filter() {
+        assert_eq!(normalize_topic_filter(None).unwrap(), None);
+        assert_eq!(normalize_topic_filter(Some("   ")).unwrap(), None);
+        assert_eq!(
+            normalize_topic_filter(Some("  br-abc.1 ")).unwrap(),
+            Some("br-abc.1".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_topic_filter_rejects_values_that_cannot_exist() {
+        let err = normalize_topic_filter(Some("../never-stored"))
+            .expect_err("invalid topic lookup must fail before querying");
+        let data = err.data.expect("error payload");
+        assert_eq!(data["error"]["type"], "INVALID_TOPIC");
+        assert_eq!(data["error"]["data"]["argument"], "topic");
+    }
+
+    #[test]
+    fn normalize_topic_argument_rejects_unsafe_or_oversized_values() {
+        for invalid in [
+            ".",
+            "..",
+            "../foo",
+            ".hidden",
+            "a/b",
+            "has space",
+            "-leading",
+            "_leading",
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abc",
+        ] {
+            let err = normalize_topic_argument(Some(invalid))
+                .expect_err("invalid topic shape must be rejected");
+            let data = err.data.expect("error payload");
+            assert_eq!(data["error"]["type"], "INVALID_TOPIC", "{invalid}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -6325,6 +6562,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: None,
+            topic: None,
             subject: "test".into(),
             importance: "normal".into(),
             ack_required: false,
@@ -6350,6 +6588,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: Some("thread-1".into()),
+            topic: Some("br-abc.1".into()),
             subject: "test".into(),
             importance: "normal".into(),
             ack_required: true,
@@ -6401,6 +6640,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: Some("thread-1".into()),
+            topic: None,
             subject: "test".into(),
             importance: "normal".into(),
             ack_required: false,
@@ -6432,6 +6672,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 1,
                 thread_id: None,
+                topic: None,
                 subject: "new".into(),
                 importance: "normal".into(),
                 ack_required: false,
@@ -6451,6 +6692,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 1,
                 thread_id: None,
+                topic: None,
                 subject: "already-read".into(),
                 importance: "normal".into(),
                 ack_required: false,
@@ -6470,6 +6712,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 1,
                 thread_id: None,
+                topic: None,
                 subject: "not-updated".into(),
                 importance: "normal".into(),
                 ack_required: false,
@@ -6531,6 +6774,7 @@ mod tests {
             project_id: 1,
             sender_id: 2,
             thread_id: Some("t-1".into()),
+            topic: Some("br-abc.1".into()),
             subject: "Hello".into(),
             body_md: "# Content".into(),
             importance: "high".into(),
@@ -6552,6 +6796,7 @@ mod tests {
             [] as [serde_json::Value; 0]
         );
         assert_eq!(json["importance"], "high");
+        assert_eq!(json["topic"], "br-abc.1");
         assert_eq!(json["attachments"][0]["path"], "file.webp");
     }
 
@@ -6562,6 +6807,7 @@ mod tests {
             project_id: 1,
             sender_id: 2,
             thread_id: Some("t-1".into()),
+            topic: Some("br-abc.1".into()),
             subject: "Re: Hello".into(),
             importance: "normal".into(),
             ack_required: false,
@@ -7437,6 +7683,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 1,
                 thread_id: None,
+                topic: None,
                 subject: "test".into(),
                 body_md: "body".into(),
                 importance: "normal".into(),
@@ -7462,6 +7709,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: None,
+            topic: None,
             subject: "s".into(),
             body_md: "b".into(),
             importance: "low".into(),

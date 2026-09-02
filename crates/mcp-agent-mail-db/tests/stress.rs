@@ -1753,6 +1753,7 @@ fn cache_zipfian_thrashing() {
                 contact_policy: "open".to_string(),
                 reaper_exempt: 0,
                 registration_token: None,
+                retired_at: None,
             }
         })
         .collect();
@@ -1850,6 +1851,7 @@ fn cache_zipfian_within_capacity() {
             contact_policy: "open".to_string(),
             reaper_exempt: 0,
             registration_token: None,
+            retired_at: None,
         })
         .collect();
 
@@ -1921,6 +1923,7 @@ fn cache_concurrent_zipfian_access() {
                 contact_policy: "open".to_string(),
                 reaper_exempt: 0,
                 registration_token: None,
+                retired_at: None,
             })
             .collect(),
     );

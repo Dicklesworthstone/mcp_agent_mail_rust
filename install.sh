@@ -14,14 +14,14 @@
 #   --system           Install to /usr/local/bin (requires sudo)
 #   --easy-mode        Auto-update PATH in shell rc files
 #   --no-easy          Do not auto-update PATH, even for piped installs
-#   --verify           Run self-test after install
+#   --verify           Run an additional self-test after install
 #   --from-source      Build from source instead of downloading binary
 #   --quiet            Suppress non-error output
 #   --verbose          Enable detailed installer diagnostics
 #   --no-gum           Disable gum formatting even if available
-#   --no-verify        Skip checksum + signature verification (for testing only)
+#   --no-verify        UNSAFE: downloaded code executes without cryptographic verification
 #   --offline          Skip network preflight checks
-#   --force            Force reinstall even if already at version
+#   --force            Reinstall without probing the already-installed version
 #   --migrate          Force Python->Rust migration/displacement when Python install detected
 #   --no-migrate       Skip and remember Python->Rust migration/displacement
 #   --no-service       Do not install/modify/restart any background service
@@ -50,13 +50,31 @@ FROM_SOURCE=0
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 SIGSTORE_BUNDLE_URL="${SIGSTORE_BUNDLE_URL:-}"
-COSIGN_IDENTITY_RE="${COSIGN_IDENTITY_RE:-^https://github.com/${OWNER}/${REPO}/.github/workflows/dist.yml@refs/tags/.*$}"
-COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
+COSIGN_IDENTITY=""
+COSIGN_OIDC_ISSUER='https://token.actions.githubusercontent.com'
+COSIGN_BIN=""
+# Trust-model boundary. Releases at or above this core version are built and
+# published by the maintainer's own release infrastructure (dsr), not GitHub
+# Actions, so the Actions-workflow Sigstore identity used by older releases can
+# no longer be minted. Those releases are instead authenticated fail-closed by
+# a minisign signature over the SHA256SUMS manifest, made with a key the
+# maintainer controls (the same signing key used by the frankensqlite/dsr
+# release line). Older releases keep the original Sigstore/cosign path.
+MINISIGN_TRUST_MIN_VERSION='0.3.31'
+# Minisign signing epoch 2 public key.
+#   key id:  1BBD79B28BF718D0
+#   SHA-256: b72b704e17a786308623d43471a046c52d663ce5d5c58c512790952455bdfb78
+MINISIGN_PUBLIC_KEY='RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70'
+MINISIGN_BIN=""
+# "minisign" for releases >= MINISIGN_TRUST_MIN_VERSION, "sigstore" for older
+# releases. Set by establish_release_contract.
+RELEASE_TRUST_MODEL=""
+EXPECTED_RELEASE_VERSION=""
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/mcp-agent-mail-install.lock"
 SYSTEM=0
 NO_GUM=0
-NO_CHECKSUM=0
+NO_VERIFY=0
 FORCE_INSTALL=0
 FORCE_MIGRATE=0
 FORCE_NO_MIGRATE=0
@@ -159,6 +177,14 @@ init_verbose_log() {
 }
 
 verbose() {
+  # A dry-run must not create or truncate even the persistent diagnostic log.
+  # Verbose previews still surface diagnostics on stdout.
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    if [ "$VERBOSE" -eq 1 ] && [ "$QUIET" -eq 0 ]; then
+      echo "[VERBOSE] $*"
+    fi
+    return 0
+  fi
   init_verbose_log
   local ts msg
   ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -318,23 +344,53 @@ resolve_version() {
       fi
     fi
 
-    # Try git tags API as last resort (works even without releases)
-    local tags_url="https://api.github.com/repos/${OWNER}/${REPO}/tags?per_page=10"
-    if tag=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" "$tags_url" 2>/dev/null \
-         | grep '"name":' | head -1 | sed -E 's/.*"([^"]+)".*/\1/'); then
-      if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9] ]]; then
-        VERSION="$tag"
-        verbose "resolve_version:tags_api tag=${VERSION}"
-        info "Resolved latest version via tags: $VERSION"
-        return 0
-      fi
-    fi
-
-    VERSION="v0.1.0"
-    verbose "resolve_version:fallback_default tag=${VERSION}"
-    warn "Could not resolve latest version; defaulting to $VERSION"
+    err "Could not resolve the latest published GitHub release."
+    err "Check network/API access or pass an exact --version vX.Y.Z."
+    return 1
   fi
   verbose "resolve_version:done resolved=${VERSION}"
+}
+
+# Canonicalize the requested release into the exact tag/version contract used
+# by dist.yml. Build metadata is intentionally rejected because published tags
+# do not admit it. For legacy releases the Sigstore certificate identity is a
+# literal, not a cross-tag regular expression, so a valid bundle from another
+# release cannot authenticate the requested archive. The trust model for the
+# requested release (minisign vs legacy Sigstore) is also fixed here.
+establish_release_contract() {
+  local requested="$VERSION"
+  local release_pattern='^v?([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?)$'
+  local LC_ALL=C
+
+  if [[ ! "$requested" =~ $release_pattern ]]; then
+    err "Invalid release version: ${requested:-<empty>}"
+    err "Expected vX.Y.Z or vX.Y.Z-prerelease (a leading v is optional)."
+    return 1
+  fi
+
+  EXPECTED_RELEASE_VERSION="${BASH_REMATCH[1]}"
+  VERSION="v${EXPECTED_RELEASE_VERSION}"
+  COSIGN_IDENTITY="https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/${VERSION}"
+  establish_release_trust_model
+  verbose "release_contract:tag=${VERSION} version=${EXPECTED_RELEASE_VERSION} trust=${RELEASE_TRUST_MODEL} identity=${COSIGN_IDENTITY}"
+}
+
+# Decide which authenticity witness this release must present. The version
+# match in establish_release_contract guarantees a numeric X.Y.Z core, so the
+# arithmetic comparison below is well-defined. Pre-releases share the trust
+# model of their core version.
+establish_release_trust_model() {
+  local core="${EXPECTED_RELEASE_VERSION%%-*}"
+  local maj=0 min=0 pat=0 fmaj=0 fmin=0 fpat=0
+  IFS=. read -r maj min pat <<< "$core"
+  IFS=. read -r fmaj fmin fpat <<< "$MINISIGN_TRUST_MIN_VERSION"
+  if [ "$maj" -gt "$fmaj" ] || \
+     { [ "$maj" -eq "$fmaj" ] && [ "$min" -gt "$fmin" ]; } || \
+     { [ "$maj" -eq "$fmaj" ] && [ "$min" -eq "$fmin" ] && [ "$pat" -ge "$fpat" ]; }; then
+    RELEASE_TRUST_MODEL="minisign"
+  else
+    RELEASE_TRUST_MODEL="sigstore"
+  fi
 }
 
 detect_platform() {
@@ -362,8 +418,9 @@ detect_platform() {
   esac
 
   if [ -z "$TARGET" ] && [ "$FROM_SOURCE" -eq 0 ] && [ -z "$ARTIFACT_URL" ]; then
-    warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
-    FROM_SOURCE=1
+    err "No prebuilt artifact is defined for ${OS}/${ARCH}."
+    err "The installer will not execute a source build unless --from-source is explicit."
+    return 1
   fi
   verbose "detect_platform:normalized os=${OS} arch=${ARCH} target=${TARGET:-<none>} from_source=${FROM_SOURCE}"
 }
@@ -379,8 +436,9 @@ set_artifact_url() {
     elif [ -n "$TARGET" ]; then
       set_target_artifact "$TARGET"
     else
-      warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
-      FROM_SOURCE=1
+      err "No prebuilt artifact is defined for ${OS}/${ARCH}."
+      err "Pass --from-source explicitly to authorize a source build."
+      return 1
     fi
   fi
   verbose "set_artifact_url:done tar=${TAR:-<none>} url=${URL:-<none>} from_source=${FROM_SOURCE}"
@@ -530,13 +588,18 @@ capture_command_with_timeout() {
   shift
 
   CAPTURED_CMD_OUTPUT=""
+  CAPTURED_CMD_OUTPUT_EXACT=""
+  CAPTURED_CMD_OUTPUT_LOSSLESS=1
   CAPTURED_CMD_STATUS=0
 
   if command -v python3 >/dev/null 2>&1; then
     local output_file status_file tmp_root rc
     tmp_root="${TMP:-/tmp}"
-    output_file="${tmp_root}/am-install-capture.$$.$RANDOM.out"
-    status_file="${tmp_root}/am-install-capture.$$.$RANDOM.status"
+    output_file=$(mktemp "${tmp_root%/}/am-install-capture.XXXXXX") || return 1
+    status_file=$(mktemp "${tmp_root%/}/am-install-status.XXXXXX") || {
+      rm -f "$output_file" 2>/dev/null || true
+      return 1
+    }
 
     if python3 - "$timeout_secs" "$output_file" "$status_file" "$@" <<'PY'
 import subprocess
@@ -548,31 +611,51 @@ output_path = sys.argv[2]
 status_path = sys.argv[3]
 cmd = sys.argv[4:]
 
-proc = subprocess.Popen(
-    cmd,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT,
-    text=True,
-)
+with open(output_path, "wb") as output_handle:
+    proc = subprocess.Popen(
+        cmd,
+        stdout=output_handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
 
-deadline = time.time() + timeout_secs
-timed_out = False
-while time.time() < deadline:
-    if proc.poll() is not None:
-        break
-    time.sleep(0.05)
+    deadline = time.monotonic() + timeout_secs
+    timed_out = False
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
 
-if proc.poll() is None:
-    timed_out = True
-    proc.kill()
+    if proc.poll() is None:
+        timed_out = True
+        try:
+            import os
+            import signal
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            proc.kill()
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=1)
 
-output, _ = proc.communicate()
-with open(output_path, "w", encoding="utf-8") as handle:
-    handle.write(output or "")
+return_code = proc.returncode
+if timed_out:
+    shell_status = 124
+elif return_code is None:
+    shell_status = 125
+elif return_code < 0:
+    # subprocess uses negative values for signal termination; Bash `return`
+    # accepts only 0..255, so translate to the conventional 128 + signal.
+    shell_status = min(255, 128 - return_code)
+else:
+    shell_status = min(255, return_code)
+
 with open(status_path, "w", encoding="utf-8") as handle:
-    handle.write("124" if timed_out else str(proc.returncode))
+    handle.write(str(shell_status))
 
-sys.exit(124 if timed_out else proc.returncode)
+sys.exit(shell_status)
 PY
     then
       rc=0
@@ -580,7 +663,22 @@ PY
       rc=$?
     fi
 
-    [ -f "$output_file" ] && CAPTURED_CMD_OUTPUT=$(cat "$output_file")
+    if [ -f "$output_file" ]; then
+      # Command substitution normally strips every trailing newline. Preserve
+      # exact bytes behind a non-newline sentinel so version identity checks
+      # can accept one normal LF while rejecting extra blank lines. Bash cannot
+      # store NUL bytes, so compare byte counts and fail exact-output checks if
+      # command substitution discarded any bytes.
+      local raw_output_size captured_output_size
+      CAPTURED_CMD_OUTPUT_EXACT=$(cat "$output_file"; printf '\034')
+      CAPTURED_CMD_OUTPUT_EXACT="${CAPTURED_CMD_OUTPUT_EXACT%$'\034'}"
+      CAPTURED_CMD_OUTPUT=$(cat "$output_file")
+      raw_output_size=$(LC_ALL=C wc -c <"$output_file" 2>/dev/null | tr -d '[:space:]') || raw_output_size=""
+      captured_output_size=$(printf '%s' "$CAPTURED_CMD_OUTPUT_EXACT" | LC_ALL=C wc -c 2>/dev/null | tr -d '[:space:]') || captured_output_size=""
+      if [ -z "$raw_output_size" ] || [ "$raw_output_size" != "$captured_output_size" ]; then
+        CAPTURED_CMD_OUTPUT_LOSSLESS=0
+      fi
+    fi
     [ -f "$status_file" ] && CAPTURED_CMD_STATUS=$(cat "$status_file")
     rm -f "$output_file" "$status_file" 2>/dev/null || true
 
@@ -590,11 +688,39 @@ PY
     return "$CAPTURED_CMD_STATUS"
   fi
 
-  if CAPTURED_CMD_OUTPUT=$("$@" 2>&1); then
-    CAPTURED_CMD_STATUS=0
-    return 0
+  # Never turn a bounded probe into an unbounded one merely because Python is
+  # absent. GNU timeout is common on Linux; Homebrew installs it as gtimeout on
+  # macOS. Hosts with neither receive a fail-closed, actionable result.
+  local timeout_bin=""
+  if command -v timeout >/dev/null 2>&1; then
+    timeout_bin="timeout"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    timeout_bin="gtimeout"
+  else
+    CAPTURED_CMD_OUTPUT="No bounded command runner is available (requires python3, timeout, or gtimeout)."
+    CAPTURED_CMD_OUTPUT_EXACT="$CAPTURED_CMD_OUTPUT"
+    CAPTURED_CMD_OUTPUT_LOSSLESS=1
+    CAPTURED_CMD_STATUS=125
+    return 125
   fi
-  CAPTURED_CMD_STATUS=$?
+
+  local fallback_output_file fallback_rc raw_output_size captured_output_size
+  fallback_output_file=$(mktemp "${TMP:-/tmp}/am-install-capture.XXXXXX") || return 1
+  if "$timeout_bin" --signal=KILL "$timeout_secs" "$@" >"$fallback_output_file" 2>&1; then
+    fallback_rc=0
+  else
+    fallback_rc=$?
+  fi
+  CAPTURED_CMD_OUTPUT_EXACT=$(cat "$fallback_output_file"; printf '\034')
+  CAPTURED_CMD_OUTPUT_EXACT="${CAPTURED_CMD_OUTPUT_EXACT%$'\034'}"
+  CAPTURED_CMD_OUTPUT=$(cat "$fallback_output_file")
+  raw_output_size=$(LC_ALL=C wc -c <"$fallback_output_file" 2>/dev/null | tr -d '[:space:]') || raw_output_size=""
+  captured_output_size=$(printf '%s' "$CAPTURED_CMD_OUTPUT_EXACT" | LC_ALL=C wc -c 2>/dev/null | tr -d '[:space:]') || captured_output_size=""
+  if [ -z "$raw_output_size" ] || [ "$raw_output_size" != "$captured_output_size" ]; then
+    CAPTURED_CMD_OUTPUT_LOSSLESS=0
+  fi
+  rm -f "$fallback_output_file" 2>/dev/null || true
+  CAPTURED_CMD_STATUS="$fallback_rc"
   return "$CAPTURED_CMD_STATUS"
 }
 
@@ -1119,6 +1245,31 @@ read_env_assignment_value() {
   value=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$file" 2>/dev/null | tail -1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*//" || true)
   [ -n "$value" ] || return 0
   parse_env_assignment_rhs "$value"
+}
+
+# Match the Rust CLI's canonical config.env resolution exactly. Keeping this
+# in one helper prevents the installer, migration, and launchd repair paths
+# from silently reading $HOME/.config while `am setup` writes under XDG.
+rust_config_env_path() {
+  local config_home="${XDG_CONFIG_HOME:-}"
+  case "$config_home" in
+    /*) ;;
+    "") ;;
+    *)
+      verbose "rust_config_env_path:ignore_relative_xdg value=${config_home}"
+      config_home=""
+      ;;
+  esac
+  if [ -z "$config_home" ]; then
+    case "${HOME:-}" in
+      /*) config_home="${HOME}/.config" ;;
+      *)
+        warn "Cannot resolve an absolute config.env path: HOME is unset or relative."
+        return 1
+        ;;
+    esac
+  fi
+  printf '%s' "${config_home}/mcp-agent-mail/config.env"
 }
 
 python_db_format_needs_import() {
@@ -1686,13 +1837,32 @@ cat > "$tmpfile" <<EOF
 set -euo pipefail
 
 AM_RUST_BIN="${DEST}/${BIN_CLI}"
-AM_RUST_ENV_FILE_DEFAULT="${HOME}/.config/mcp-agent-mail/config.env"
+AM_HOME_CONFIG_HOME=""
+case "\${HOME:-}" in
+  /*) AM_HOME_CONFIG_HOME="\${HOME}/.config" ;;
+esac
+AM_XDG_CONFIG_HOME="\${XDG_CONFIG_HOME:-}"
+case "\$AM_XDG_CONFIG_HOME" in
+  /*) ;;
+  *)
+    if [ -n "\$AM_HOME_CONFIG_HOME" ]; then
+      AM_XDG_CONFIG_HOME="\$AM_HOME_CONFIG_HOME"
+    else
+        printf '%s\n' "Cannot resolve an absolute Agent Mail config.env path." >&2
+        exit 1
+    fi
+    ;;
+esac
+AM_RUST_ENV_FILE_DEFAULT="\${AM_XDG_CONFIG_HOME}/mcp-agent-mail/config.env"
 AM_RUST_ENV_FILE="\${AM_RUST_ENV_FILE:-\$AM_RUST_ENV_FILE_DEFAULT}"
-if [ ! -f "\$AM_RUST_ENV_FILE" ] && [ -f "\${HOME}/.config/mcp-agent-mail/config.env" ]; then
-  AM_RUST_ENV_FILE="\${HOME}/.config/mcp-agent-mail/config.env"
+if [ ! -f "\$AM_RUST_ENV_FILE" ] && [ -f "\${AM_XDG_CONFIG_HOME}/mcp-agent-mail/.env" ]; then
+  AM_RUST_ENV_FILE="\${AM_XDG_CONFIG_HOME}/mcp-agent-mail/.env"
 fi
-if [ ! -f "\$AM_RUST_ENV_FILE" ] && [ -f "\${HOME}/.config/mcp-agent-mail/.env" ]; then
-  AM_RUST_ENV_FILE="\${HOME}/.config/mcp-agent-mail/.env"
+if [ ! -f "\$AM_RUST_ENV_FILE" ] && [ -n "\$AM_HOME_CONFIG_HOME" ] && [ -f "\${AM_HOME_CONFIG_HOME}/mcp-agent-mail/config.env" ]; then
+  AM_RUST_ENV_FILE="\${AM_HOME_CONFIG_HOME}/mcp-agent-mail/config.env"
+fi
+if [ ! -f "\$AM_RUST_ENV_FILE" ] && [ -n "\$AM_HOME_CONFIG_HOME" ] && [ -f "\${AM_HOME_CONFIG_HOME}/mcp-agent-mail/.env" ]; then
+  AM_RUST_ENV_FILE="\${AM_HOME_CONFIG_HOME}/mcp-agent-mail/.env"
 fi
 
 trim_ascii_whitespace() {
@@ -1903,7 +2073,8 @@ resolve_database_path() {
 
   # If a Rust config already exists, prefer its DB/storage target so import
   # lands where `am` will actually read after installation.
-  local rust_env="$HOME/.config/mcp-agent-mail/config.env"
+  local rust_env
+  rust_env="$(rust_config_env_path)"
   if [ -f "$rust_env" ]; then
     local cfg_db_url cfg_db_path cfg_storage_root
     cfg_db_url=$(read_env_assignment_value "$rust_env" "DATABASE_URL")
@@ -2169,6 +2340,309 @@ resolve_database_path() {
 # T5.3: Migrate .env configuration from Python to Rust
 # Python .env may live in clone dir or storage root. Rust reads the same
 # env vars but DATABASE_URL format differs (no aiosqlite prefix).
+git_authority_probe() (
+  # Discovery-affecting Git variables belong to the caller's repository, not
+  # to this destination-path authority check. Leaving them set can hide a
+  # target worktree/bare repository or redirect the probe to unrelated state.
+  unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_CEILING_DIRECTORIES \
+    GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_PREFIX
+  LC_ALL=C command git "$@"
+)
+
+git_worktree_root_for_path() {
+  local candidate="$1"
+  local cursor="$candidate"
+  local root=""
+
+  [ -n "$candidate" ] || return 2
+  command -v git >/dev/null 2>&1 || return 2
+
+  # Git needs an existing directory. Walk to the deepest existing ancestor so
+  # a not-yet-created config below HOME still inherits that ancestor's worktree
+  # authority. A dangling/non-directory leaf is governed by its parent.
+  while [ ! -e "$cursor" ] && [ ! -L "$cursor" ]; do
+    local parent
+    parent=$(dirname "$cursor")
+    [ "$parent" != "$cursor" ] || break
+    cursor="$parent"
+  done
+  if [ ! -d "$cursor" ]; then
+    cursor=$(dirname "$cursor")
+  fi
+  [ -d "$cursor" ] && [ -r "$cursor" ] && [ -x "$cursor" ] || return 2
+
+  if root=$(git_authority_probe -C "$cursor" rev-parse --show-toplevel 2>/dev/null); then
+    [ -n "$root" ] && [ -d "$root" ] || return 2
+    printf '%s' "$root"
+    return 0
+  fi
+
+  # A bare repository is also an unsafe destination for token material even
+  # though it has no worktree root.
+  if [ "$(git_authority_probe -C "$cursor" rev-parse --is-bare-repository 2>/dev/null || true)" = "true" ]; then
+    return 2
+  fi
+
+  # A failed Git probe is an ordinary "not in a worktree" only when no parent
+  # advertises Git metadata. If metadata exists but Git could not resolve it
+  # (for example because of ownership or permissions), authority is
+  # indeterminate and secret migration must stop.
+  local parent
+  while :; do
+    if [ -e "$cursor/.git" ] || [ -L "$cursor/.git" ]; then
+      return 2
+    fi
+    parent=$(dirname "$cursor")
+    [ "$parent" != "$cursor" ] || break
+    cursor="$parent"
+  done
+  return 1
+}
+
+token_env_targets_outside_git_worktrees() {
+  local canonical_env="$1"
+  local compatibility_env="$2"
+  local target
+  local worktree_root
+  local worktree_rc
+
+  for target in "$canonical_env" "$compatibility_env"; do
+    if worktree_root=$(git_worktree_root_for_path "$target"); then
+      warn "Refusing to write a token-bearing env file inside a Git worktree: $target"
+      warn "Destination worktree: $worktree_root"
+      warn "Move HOME/config outside every checkout, then rerun the installer; no env migration bytes were written."
+      return 1
+    else
+      worktree_rc=$?
+    fi
+    if [ "$worktree_rc" -ne 1 ]; then
+      warn "Cannot establish Git authority for token-bearing env target: $target"
+      return 1
+    fi
+  done
+  return 0
+}
+
+# Return a mutation-sensitive identity for a regular, non-symlink file. The
+# checksum closes the same-size/same-mtime gap left by metadata alone; callers
+# compare the identity immediately before and after a copy or atomic replace.
+private_file_identity() {
+  local path="$1"
+  local metadata
+  local checksum
+
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  if metadata=$(stat -f '%d:%i:%z:%m:%c:%l' "$path" 2>/dev/null); then
+    :
+  elif metadata=$(stat -c '%d:%i:%s:%Y:%Z:%h' "$path" 2>/dev/null); then
+    :
+  else
+    return 1
+  fi
+  checksum=$(cksum < "$path") || return 1
+  printf '%s:%s' "$metadata" "$checksum"
+}
+
+private_file_link_count() {
+  local path="$1"
+  stat -f '%l' "$path" 2>/dev/null || stat -c '%h' "$path" 2>/dev/null
+}
+
+# Return one no-follow stat identity only for a mode-0600 regular file with a
+# single link. Including device and inode lets the atomic writer prove that the
+# file published by rename is the exact tempfile it validated beforehand. Both
+# BSD and GNU stat inspect the directory entry itself unless explicitly asked
+# to dereference it, so a swapped symlink fails the type check instead of being
+# followed.
+private_file_security_identity() {
+  local path="$1"
+  local metadata
+
+  if metadata=$(LC_ALL=C stat -f '%d:%i:%Lp:%l:%HT' "$path" 2>/dev/null); then
+    case "$metadata" in
+      *:600:1:Regular\ File)
+        printf '%s:regular' "${metadata%:*}"
+        return 0
+        ;;
+    esac
+  elif metadata=$(LC_ALL=C stat -c '%d:%i:%a:%h:%F' "$path" 2>/dev/null); then
+    case "$metadata" in
+      *:600:1:regular*file)
+        # GNU stat distinguishes an empty regular file from a non-empty one in
+        # %F. Normalize that descriptive suffix after validating the type so
+        # writing content does not spuriously look like an inode change.
+        printf '%s:regular' "${metadata%:*}"
+        return 0
+        ;;
+    esac
+  fi
+  return 1
+}
+
+ensure_private_file_target_path() {
+  local path="$1"
+  local label="$2"
+  local previous_umask
+  local rc
+
+  previous_umask=$(umask)
+  umask 077
+  if ensure_real_file_target_path "$path" "$label"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  umask "$previous_umask"
+  return "$rc"
+}
+
+# Create a mode-0600, same-directory temporary file with an unpredictable
+# name, verify that neither it nor the destination changed underneath us, and
+# atomically rename it into place. Failure leaves the private temporary file
+# for diagnosis; this installer never deletes it.
+write_private_file_atomic() {
+  local path="$1"
+  local label="$2"
+  local previous_umask
+  local target_existed=0
+  local target_identity=""
+  local current_identity=""
+  local tmpfile=""
+  local tmp_security_identity=""
+  local published_security_identity=""
+
+  ensure_private_file_target_path "$path" "$label" || return 1
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    target_existed=1
+    target_identity=$(private_file_identity "$path") || {
+      warn "$label is not a stable regular file; refusing to replace it: $path"
+      return 1
+    }
+  fi
+
+  previous_umask=$(umask)
+  umask 077
+  tmpfile=$(mktemp "${path}.tmp.mcp-agent-mail.XXXXXX") || {
+    umask "$previous_umask"
+    warn "Could not create a private temporary file for $label: $path"
+    return 1
+  }
+  tmp_security_identity=$(private_file_security_identity "$tmpfile") || {
+    umask "$previous_umask"
+    warn "Private temporary-file validation failed for $label: $tmpfile"
+    return 1
+  }
+  if ! command cat > "$tmpfile"; then
+    umask "$previous_umask"
+    warn "Could not write private temporary file for $label: $tmpfile"
+    return 1
+  fi
+  sync "$tmpfile" 2>/dev/null || sync 2>/dev/null || true
+
+  if ! ensure_private_file_target_path "$path" "$label"; then
+    umask "$previous_umask"
+    return 1
+  fi
+  if [ "$target_existed" -eq 1 ]; then
+    current_identity=$(private_file_identity "$path") || {
+      umask "$previous_umask"
+      warn "$label changed type before replacement; refusing to continue: $path"
+      return 1
+    }
+    if [ "$current_identity" != "$target_identity" ]; then
+      umask "$previous_umask"
+      warn "$label changed while its replacement was prepared; refusing to clobber it: $path"
+      return 1
+    fi
+  elif [ -e "$path" ] || [ -L "$path" ]; then
+    umask "$previous_umask"
+    warn "$label appeared while its replacement was prepared; refusing to clobber it: $path"
+    return 1
+  fi
+  current_identity=$(private_file_security_identity "$tmpfile") || {
+    umask "$previous_umask"
+    warn "Private temporary file changed before replacement: $tmpfile"
+    return 1
+  }
+  if [ "$current_identity" != "$tmp_security_identity" ]; then
+    umask "$previous_umask"
+    warn "Private temporary file identity changed before replacement: $tmpfile"
+    return 1
+  fi
+  if ! mv -f "$tmpfile" "$path"; then
+    umask "$previous_umask"
+    warn "Could not atomically replace $label: $path"
+    return 1
+  fi
+  published_security_identity=$(private_file_security_identity "$path") || {
+    umask "$previous_umask"
+    warn "Published $label is not a mode-600, single-link regular file: $path"
+    return 1
+  }
+  if [ "$published_security_identity" != "$tmp_security_identity" ]; then
+    umask "$previous_umask"
+    warn "Published $label is not the validated private temporary file: $path"
+    return 1
+  fi
+  umask "$previous_umask"
+  return 0
+}
+
+PRIVATE_BACKUP_PATH=""
+backup_envfile_if_present() {
+  local path="$1"
+  local label="$2"
+  local previous_umask
+  local before_identity
+  local after_identity
+  local backup
+
+  PRIVATE_BACKUP_PATH=""
+  [ -e "$path" ] || [ -L "$path" ] || return 0
+  ensure_private_file_target_path "$path" "$label" || return 1
+  before_identity=$(private_file_identity "$path") || {
+    warn "$label is not a stable regular file; refusing to back it up: $path"
+    return 1
+  }
+
+  previous_umask=$(umask)
+  umask 077
+  backup=$(mktemp "${path}.bak.mcp-agent-mail.XXXXXX") || {
+    umask "$previous_umask"
+    warn "Could not create a private backup for $label: $path"
+    return 1
+  }
+  if ! chmod 600 "$backup" \
+    || [ -L "$backup" ] \
+    || [ ! -f "$backup" ] \
+    || [ "$(private_file_link_count "$backup")" != "1" ]; then
+    umask "$previous_umask"
+    warn "Private backup validation failed for $label: $backup"
+    return 1
+  fi
+  if ! command cat "$path" > "$backup"; then
+    umask "$previous_umask"
+    warn "Could not back up $label: $path"
+    return 1
+  fi
+  sync "$backup" 2>/dev/null || sync 2>/dev/null || true
+  after_identity=$(private_file_identity "$path") || {
+    umask "$previous_umask"
+    warn "$label changed type while it was backed up: $path"
+    return 1
+  }
+  if [ "$after_identity" != "$before_identity" ] \
+    || ! cmp -s "$path" "$backup"; then
+    umask "$previous_umask"
+    warn "$label changed while it was backed up; refusing to continue: $path"
+    return 1
+  fi
+  umask "$previous_umask"
+  PRIVATE_BACKUP_PATH="$backup"
+  info "Backed up $path -> $backup"
+  return 0
+}
+
 migrate_env_config() {
   [ -z "${RUST_STORAGE_ROOT:-}" ] && RUST_STORAGE_ROOT="${STORAGE_ROOT:-$HOME/.mcp_agent_mail_git_mailbox_repo}"
   [ -z "${RUST_DB_PATH:-}" ] && RUST_DB_PATH="$RUST_STORAGE_ROOT/storage.sqlite3"
@@ -2191,26 +2665,23 @@ migrate_env_config() {
   done
 
   # Rust config location
-  local rust_config_dir="$HOME/.config/mcp-agent-mail"
-  local rust_env="$rust_config_dir/config.env"
+  local rust_env
+  rust_env="$(rust_config_env_path)"
+  local rust_config_dir
+  rust_config_dir="$(dirname "$rust_env")"
   local rust_env_compat="$rust_config_dir/.env"
-  mkdir -p "$rust_config_dir"
-
-  backup_envfile_if_present() {
-    local path="$1"
-    [ -f "$path" ] || return 0
-
-    local timestamp backup
-    timestamp=$(date +%Y%m%d_%H%M%S)
-    backup="${path}.bak.mcp-agent-mail-${timestamp}-${RANDOM}"
-    if ! cp -p "$path" "$backup"; then
-      warn "Failed to back up existing Rust config before rewrite: $path"
-      return 1
-    fi
-    info "Backed up $path -> $backup"
-  }
+  # This check precedes directory creation, backups, temp files, and both
+  # final writes. Every artifact produced below is a sibling of one of these
+  # two targets, so proving both outside every Git worktree keeps the entire
+  # token-bearing generation outside Git. Unknown authority fails closed.
+  token_env_targets_outside_git_worktrees "$rust_env" "$rust_env_compat" || return 1
+  ensure_private_file_target_path "$rust_env" "canonical Rust config env" || return 1
+  ensure_private_file_target_path "$rust_env_compat" "compatibility Rust env mirror" || return 1
 
   local source_env=""
+  local source_env_identity=""
+  local source_content=""
+  local rust_env_read_path="$rust_env"
   local updating_existing=0
   local legacy_http_bearer_token="${MIGRATED_BEARER_TOKEN:-}"
   if [ -f "$rust_env" ]; then
@@ -2223,27 +2694,59 @@ migrate_env_config() {
     source_env="$env_file"
   fi
 
-  if [ -n "$env_file" ]; then
-    info "Found Python .env at: $env_file"
-    if [ -z "$legacy_http_bearer_token" ]; then
-      legacy_http_bearer_token=$(read_env_assignment_value "$env_file" "HTTP_BEARER_TOKEN")
-    fi
-  fi
-  if [ -f "$rust_env" ] && [ -z "$legacy_http_bearer_token" ]; then
-    legacy_http_bearer_token=$(read_env_assignment_value "$rust_env" "HTTP_BEARER_TOKEN")
-  fi
-  MIGRATED_BEARER_TOKEN="$legacy_http_bearer_token"
-
   if [ "$updating_existing" -eq 1 ]; then
-    backup_envfile_if_present "$rust_env" || return 1
+    backup_envfile_if_present "$rust_env" "canonical Rust config env" || return 1
+    if [ -n "$PRIVATE_BACKUP_PATH" ]; then
+      rust_env_read_path="$PRIVATE_BACKUP_PATH"
+      if [ "$source_env" = "$rust_env" ]; then
+        source_env="$PRIVATE_BACKUP_PATH"
+      fi
+    fi
     if [ "$rust_env_compat" != "$rust_env" ]; then
-      backup_envfile_if_present "$rust_env_compat" || return 1
+      backup_envfile_if_present "$rust_env_compat" "compatibility Rust env mirror" || return 1
+      if [ -n "$PRIVATE_BACKUP_PATH" ] && [ "$source_env" = "$rust_env_compat" ]; then
+        source_env="$PRIVATE_BACKUP_PATH"
+      fi
     fi
     info "Updating Rust config at $rust_env to adopt legacy Python data paths"
   elif [ -n "$env_file" ]; then
     info "Migrating Python .env config into $rust_env"
   else
     info "Writing Rust config at $rust_env with adopted legacy data paths"
+  fi
+
+  if [ -n "$env_file" ]; then
+    info "Found Python .env at: $env_file"
+    source_env_identity=$(private_file_identity "$env_file") || {
+      warn "Legacy Python env input is not a stable regular file: $env_file"
+      return 1
+    }
+    if [ -z "$legacy_http_bearer_token" ]; then
+      legacy_http_bearer_token=$(read_env_assignment_value "$env_file" "HTTP_BEARER_TOKEN")
+    fi
+    if [ "$(private_file_identity "$env_file")" != "$source_env_identity" ]; then
+      warn "Legacy Python env input changed while it was read: $env_file"
+      return 1
+    fi
+  fi
+  if [ -f "$rust_env_read_path" ] && [ -z "$legacy_http_bearer_token" ]; then
+    legacy_http_bearer_token=$(read_env_assignment_value "$rust_env_read_path" "HTTP_BEARER_TOKEN")
+  fi
+  if [ -n "$source_env" ] && [ -z "$legacy_http_bearer_token" ]; then
+    legacy_http_bearer_token=$(read_env_assignment_value "$source_env" "HTTP_BEARER_TOKEN")
+  fi
+  MIGRATED_BEARER_TOKEN="$legacy_http_bearer_token"
+
+  if [ -n "$source_env" ]; then
+    source_env_identity=$(private_file_identity "$source_env") || {
+      warn "Env migration input is not a stable regular file: $source_env"
+      return 1
+    }
+    source_content=$(command cat "$source_env") || return 1
+    if [ "$(private_file_identity "$source_env")" != "$source_env_identity" ]; then
+      warn "Env migration input changed while it was read: $source_env"
+      return 1
+    fi
   fi
 
   # Python-only vars are skipped; non-Python settings are preserved so operator
@@ -2253,8 +2756,8 @@ migrate_env_config() {
   local seen_storage_root=0
   local seen_http_bearer_token=0
 
-  local tmpfile="${rust_env}.tmp.$$"
-  {
+  local migrated_content
+  migrated_content="$({
     if [ "$updating_existing" -eq 1 ]; then
       echo "# Updated by Rust installer to adopt legacy Python data paths"
     elif [ -n "$env_file" ]; then
@@ -2298,10 +2801,6 @@ migrate_env_config() {
 
       if [ "$key" = "HTTP_BEARER_TOKEN" ]; then
         seen_http_bearer_token=1
-        if [ -z "${legacy_http_bearer_token:-}" ]; then
-          legacy_http_bearer_token=$(strip_wrapping_quotes "$val")
-          MIGRATED_BEARER_TOKEN="$legacy_http_bearer_token"
-        fi
         if [ -n "${legacy_http_bearer_token:-}" ]; then
           echo "HTTP_BEARER_TOKEN=$legacy_http_bearer_token"
         else
@@ -2312,7 +2811,7 @@ migrate_env_config() {
 
       # Pass through compatible vars as-is
       echo "$line"
-    done < <(if [ -n "$source_env" ] && [ -f "$source_env" ]; then cat "$source_env"; fi)
+    done <<< "$source_content"
 
     if [ "$seen_database_url" -eq 0 ]; then
       echo "DATABASE_URL=sqlite:///$RUST_DB_PATH"
@@ -2323,18 +2822,17 @@ migrate_env_config() {
     if [ "$seen_http_bearer_token" -eq 0 ] && [ -n "${legacy_http_bearer_token:-}" ]; then
       echo "HTTP_BEARER_TOKEN=$legacy_http_bearer_token"
     fi
-  } > "$tmpfile"
+  })"
+  migrated_content+=$'\n'
 
-  if ! grep -qE '^[[:space:]]*HTTP_BEARER_TOKEN=' "$tmpfile" 2>/dev/null && [ -n "${legacy_http_bearer_token:-}" ]; then
-    printf '\nHTTP_BEARER_TOKEN=%s\n' "$legacy_http_bearer_token" >> "$tmpfile"
+  if ! printf '%s' "$migrated_content" \
+    | write_private_file_atomic "$rust_env" "canonical Rust config env"; then
+    return 1
   fi
-
-  mv "$tmpfile" "$rust_env"
-  chmod 600 "$rust_env"  # Restrict access (may contain tokens)
-  local compat_tmp="${rust_env_compat}.tmp.$$"
-  cp "$rust_env" "$compat_tmp"
-  mv "$compat_tmp" "$rust_env_compat"
-  chmod 600 "$rust_env_compat"
+  if ! printf '%s' "$migrated_content" \
+    | write_private_file_atomic "$rust_env_compat" "compatibility Rust env mirror"; then
+    return 1
+  fi
   if [ "$updating_existing" -eq 1 ]; then
     ok "Updated Rust config at $rust_env"
   else
@@ -2349,7 +2847,8 @@ resolve_migrated_bearer_token() {
     return 0
   fi
 
-  local rust_env="$HOME/.config/mcp-agent-mail/config.env"
+  local rust_env
+  rust_env="$(rust_config_env_path)"
   if [ -f "$rust_env" ]; then
     local token
     token=$(read_env_assignment_value "$rust_env" "HTTP_BEARER_TOKEN")
@@ -2360,38 +2859,1000 @@ resolve_migrated_bearer_token() {
   printf ''
 }
 
-# T2.3: Atomic binary installation (crash-safe)
-# Writes to a temp file, syncs, then renames atomically.
-# Cleans up stale tmp files from previous failed installs.
-atomic_install() {
-  local src="$1"
-  local dest="$2"
-  local tmp_dest="${dest}.tmp.$$"
+# Return one lowercase SHA-256 digest and nothing else. Release installation
+# uses this both before and after replacement so a same-version but byte-different
+# executable cannot satisfy the exact-artifact contract.
+file_sha256_hex() {
+  local file="$1"
+  local digest=""
 
-  # Clean up stale tmp files from previous failed installs
-  for stale in "${dest}".tmp.*; do
-    [ -f "$stale" ] && rm -f "$stale" 2>/dev/null
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest=$(sha256sum "$file" 2>/dev/null | awk '{print $1}') || return 1
+  elif command -v shasum >/dev/null 2>&1; then
+    digest=$(shasum -a 256 "$file" 2>/dev/null | awk '{print $1}') || return 1
+  else
+    return 1
+  fi
+  [[ "$digest" =~ ^[A-Fa-f0-9]{64}$ ]] || return 1
+  printf '%s' "$digest" | tr '[:upper:]' '[:lower:]'
+}
+
+# A pair install is a small write-ahead transaction. Its fixed active directory
+# is the only recovery authority; unique preparing/history directories are
+# retained evidence and are never treated as live state. All journal metadata
+# is immutable and all phase markers are append-only, so no journal write needs
+# to replace or delete an earlier entry.
+BINARY_TRANSACTION_ACTIVE_INSTALL_DIR=""
+BINARY_TRANSACTION_RECOVERY_ACTIVE=0
+BINARY_TRANSACTION_EXIT_RECOVERY_ATTEMPTED=0
+BINARY_TRANSACTION_LAST_ARCHIVE_PATH=""
+SOURCE_INSTALL_RECEIPT_ENABLED=0
+SOURCE_INSTALL_RELEASE_TAG=""
+SOURCE_INSTALL_COMMIT=""
+SOURCE_INSTALL_FRANKENSEARCH_COMMIT=""
+SOURCE_INSTALL_FAST_CMAES_COMMIT=""
+SOURCE_INSTALL_BEADS_RUST_COMMIT=""
+TXN_NONCE=""
+TXN_HAD_SERVER=""
+TXN_HAD_CLI=""
+TXN_OLD_SERVER_HASH=""
+TXN_OLD_CLI_HASH=""
+TXN_NEW_SERVER_HASH=""
+TXN_NEW_CLI_HASH=""
+TXN_SOURCE_RECEIPT_HASH=""
+TXN_METADATA_HASH=""
+TXN_FORWARD_PHASE=""
+TXN_HAS_ROLLBACK_PHASE=0
+TXN_TARGET_STATE=""
+
+installer_path_mode() {
+  local path="$1"
+  local mode=""
+  mode=$(stat -c '%a' -- "$path" 2>/dev/null) \
+    || mode=$(stat -f '%Lp' "$path" 2>/dev/null) \
+    || return 1
+  [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+  printf '%s' "$mode"
+}
+
+installer_path_link_count() {
+  local path="$1"
+  local count=""
+  count=$(stat -c '%h' -- "$path" 2>/dev/null) \
+    || count=$(stat -f '%l' "$path" 2>/dev/null) \
+    || return 1
+  [[ "$count" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$count"
+}
+
+installer_entry_exists() {
+  [ -e "$1" ] || [ -L "$1" ]
+}
+
+validate_installer_owned_regular_file() {
+  local path="$1"
+  local label="$2"
+  local required_mode="${3:-}"
+  local owner="" current_uid="" links="" mode=""
+
+  [ -f "$path" ] && [ ! -L "$path" ] || {
+    err "$label is not a non-symlink regular file: $path"
+    return 1
+  }
+  current_uid=$(id -u 2>/dev/null) || return 1
+  owner=$(installer_path_owner_uid "$path") || return 1
+  links=$(installer_path_link_count "$path") || return 1
+  if [ "$owner" != "$current_uid" ] || [ "$links" != "1" ]; then
+    err "$label has unsafe ownership or link count: $path"
+    return 1
+  fi
+  if [ -n "$required_mode" ]; then
+    mode=$(installer_path_mode "$path") || return 1
+    if [ "$mode" != "$required_mode" ]; then
+      err "$label has mode $mode; expected $required_mode: $path"
+      return 1
+    fi
+  fi
+}
+
+validate_binary_transaction_directory() {
+  local path="$1"
+  local owner="" current_uid="" mode=""
+  [ -d "$path" ] && [ ! -L "$path" ] || {
+    err "Binary transaction authority is not a non-symlink directory: $path"
+    return 1
+  }
+  current_uid=$(id -u 2>/dev/null) || return 1
+  owner=$(installer_path_owner_uid "$path") || return 1
+  mode=$(installer_path_mode "$path") || return 1
+  # No link-count constraint for directories: directories cannot be
+  # hardlinked, and st_nlink semantics for them are filesystem-defined
+  # (ext4/XFS report 2 + subdirectories, btrfs always reports 1, APFS
+  # reports 2 + every child entry), so any fixed expectation rejects valid
+  # transaction directories on some supported filesystem. Ownership, private
+  # mode, and the non-symlink check above carry the actual guarantees.
+  if [ "$owner" != "$current_uid" ] || [ "$mode" != "700" ]; then
+    err "Binary transaction authority has unsafe owner or mode: $path"
+    return 1
+  fi
+}
+
+# GNU sync accepts paths and fsyncs them. BSD sync accepts no operands, so the
+# fallback is a filesystem-wide durability barrier. Failure of both forms is
+# fatal: a transaction never advances on a best-effort flush.
+sync_installer_paths_durably() {
+  command -v sync >/dev/null 2>&1 || {
+    err "The sync utility is required for durable binary installation."
+    return 1
+  }
+  if [ "$#" -gt 0 ] && sync "$@" 2>/dev/null; then
+    return 0
+  fi
+  sync >/dev/null 2>&1
+}
+
+move_installer_entry_no_replace() {
+  local source="$1"
+  local destination="$2"
+  local label="$3"
+  installer_entry_exists "$source" || {
+    err "$label source is missing: $source"
+    return 1
+  }
+  if installer_entry_exists "$destination"; then
+    err "$label destination already exists: $destination"
+    return 1
+  fi
+  # Both GNU and BSD mv support -n. It may report success when it skips an
+  # occupied target, so the postconditions are authoritative.
+  mv -n "$source" "$destination" 2>/dev/null || return 1
+  if installer_entry_exists "$source" || ! installer_entry_exists "$destination"; then
+    err "$label was not moved without replacement."
+    return 1
+  fi
+}
+
+write_binary_transaction_file_exclusive() {
+  local destination="$1"
+  local mode="$2"
+  if installer_entry_exists "$destination"; then
+    err "Refusing to replace binary transaction entry: $destination"
+    return 1
+  fi
+  if ! (umask 077; set -o noclobber; exec 9>"$destination"; cat >&9); then
+    err "Could not create binary transaction entry exclusively: $destination"
+    return 1
+  fi
+  chmod "$mode" "$destination" || return 1
+  validate_installer_owned_regular_file "$destination" "Binary transaction entry" "$mode" || return 1
+  sync_installer_paths_durably "$destination" "$(dirname "$destination")"
+}
+
+validate_binary_transaction_hash() {
+  local path="$1"
+  local expected="$2"
+  local label="$3"
+  local actual=""
+  validate_installer_owned_regular_file "$path" "$label" || return 1
+  actual=$(file_sha256_hex "$path" 2>/dev/null || true)
+  if [ "$actual" != "$expected" ]; then
+    err "$label hash changed (expected $expected, got ${actual:-unavailable}): $path"
+    return 1
+  fi
+}
+
+binary_transaction_active_path() {
+  printf '%s/.mcp-agent-mail-install-transaction.active' "${1%/}"
+}
+
+persist_binary_transaction_phase() {
+  local journal="$1"
+  local phase="$2"
+  local partial_before_publish_for_test="${3:-0}"
+  local marker="$journal/phase.$phase"
+  local pending=""
+  case "$phase" in
+    00-prepared|10-preserve-server|20-preserve-cli|30-publish-server|40-publish-cli|45-rollback|50-commit-ready) ;;
+    *) err "Unknown binary transaction phase: $phase"; return 1 ;;
+  esac
+  if [ "${journal##*/}" = ".mcp-agent-mail-install-transaction.active" ]; then
+    pending="$(dirname "$journal")/.mcp-agent-mail-install-transaction.phase.${TXN_NONCE}.${phase}.preparing.$$.$RANDOM.$RANDOM"
+    if [ "$partial_before_publish_for_test" = "1" ]; then
+      printf 'phase=%s\nmetadata_sha' "$phase" \
+        | write_binary_transaction_file_exclusive "$pending" 600 || return 1
+      warn "Injected interruption with a partial non-authoritative phase marker."
+      return 97
+    fi
+    printf 'phase=%s\nmetadata_sha256=%s\n' "$phase" "$TXN_METADATA_HASH" \
+      | write_binary_transaction_file_exclusive "$pending" 600 || return 1
+    if [ "$partial_before_publish_for_test" = "2" ]; then
+      warn "Injected interruption at the phase-marker publication boundary."
+      return 98
+    fi
+    validate_binary_transaction_phase_file "$pending" "$phase" || return 1
+    move_installer_entry_no_replace "$pending" "$marker" "Publish binary transaction phase $phase" || return 1
+    sync_installer_paths_durably "$marker" "$journal" "$(dirname "$journal")" || return 1
+    validate_binary_transaction_phase_file "$marker" "$phase"
+    return $?
+  fi
+  # phase 00 is built inside a non-authoritative preparing directory; the
+  # directory itself is published atomically only after this file is durable.
+  printf 'phase=%s\nmetadata_sha256=%s\n' "$phase" "$TXN_METADATA_HASH" \
+    | write_binary_transaction_file_exclusive "$marker" 600
+}
+
+validate_binary_transaction_phase_file() {
+  local marker="$1"
+  local phase="$2"
+  local first="" second="" extra="" line_count=""
+  validate_installer_owned_regular_file "$marker" "Binary transaction phase marker" 600 || return 1
+  IFS= read -r first <"$marker" || return 1
+  second=$(sed -n '2p' "$marker") || return 1
+  extra=$(sed -n '3p' "$marker") || return 1
+  line_count=$(wc -l <"$marker" 2>/dev/null | tr -d '[:space:]') || return 1
+  if [ "$first" != "phase=$phase" ] || \
+     [ "$second" != "metadata_sha256=$TXN_METADATA_HASH" ] || \
+     [ -n "$extra" ] || [ "$line_count" != "2" ]; then
+    err "Binary transaction phase marker is malformed: $marker"
+    return 1
+  fi
+}
+
+validate_binary_transaction_phase_marker() {
+  local journal="$1"
+  local phase="$2"
+  validate_binary_transaction_phase_file "$journal/phase.$phase" "$phase"
+}
+
+validate_binary_transaction_source_receipt() {
+  local journal="$1"
+  local receipt="$journal/source-receipt"
+  local witness_file="$journal/source-receipt.sha256"
+  local witness="" extra="" actual="" witness_lines=""
+  local l1="" l2="" l3="" l4="" l5="" l6="" l7="" l8="" l9="" l10=""
+  local release_tag="" source_commit="" frankensearch_commit=""
+  local fast_cmaes_commit="" beads_rust_commit="" server_hash="" cli_hash=""
+
+  if [ "$TXN_SOURCE_RECEIPT_HASH" = "absent" ] && \
+     ! installer_entry_exists "$receipt" && ! installer_entry_exists "$witness_file"; then
+    return 0
+  fi
+  [[ "$TXN_SOURCE_RECEIPT_HASH" =~ ^[a-f0-9]{64}$ ]] || {
+    err "Binary transaction source receipt authority is inconsistent with metadata: $journal"
+    return 1
+  }
+  if ! installer_entry_exists "$receipt" || ! installer_entry_exists "$witness_file"; then
+    err "Binary transaction source receipt is incomplete: $journal"
+    return 1
+  fi
+  validate_installer_owned_regular_file "$receipt" "Binary transaction source receipt" 600 || return 1
+  validate_installer_owned_regular_file "$witness_file" \
+    "Binary transaction source receipt witness" 600 || return 1
+  IFS= read -r witness <"$witness_file" || return 1
+  extra=$(sed -n '2p' "$witness_file") || return 1
+  witness_lines=$(wc -l <"$witness_file" 2>/dev/null | tr -d '[:space:]') || return 1
+  [ "$witness" = "$TXN_SOURCE_RECEIPT_HASH" ] && [ -z "$extra" ] && \
+    [ "$witness_lines" = "1" ] || {
+    err "Binary transaction source receipt witness is malformed: $witness_file"
+    return 1
+  }
+  actual=$(file_sha256_hex "$receipt" 2>/dev/null || true)
+  if [ "$actual" != "$witness" ]; then
+    err "Binary transaction source receipt hash witness does not match: $receipt"
+    return 1
+  fi
+
+  {
+    IFS= read -r l1 || return 1
+    IFS= read -r l2 || return 1
+    IFS= read -r l3 || return 1
+    IFS= read -r l4 || return 1
+    IFS= read -r l5 || return 1
+    IFS= read -r l6 || return 1
+    IFS= read -r l7 || return 1
+    IFS= read -r l8 || return 1
+    IFS= read -r l9 || return 1
+    if IFS= read -r l10 || [ -n "$l10" ]; then return 1; fi
+  } <"$receipt"
+  [ "$l1" = "schema=1" ] || return 1
+  [ "$l2" = "install_method=exact-tag-source" ] || return 1
+  case "$l3" in release_tag=*) release_tag="${l3#release_tag=}" ;; *) return 1 ;; esac
+  case "$l4" in source_commit=*) source_commit="${l4#source_commit=}" ;; *) return 1 ;; esac
+  case "$l5" in frankensearch_commit=*) frankensearch_commit="${l5#frankensearch_commit=}" ;; *) return 1 ;; esac
+  case "$l6" in fast_cmaes_commit=*) fast_cmaes_commit="${l6#fast_cmaes_commit=}" ;; *) return 1 ;; esac
+  case "$l7" in beads_rust_commit=*) beads_rust_commit="${l7#beads_rust_commit=}" ;; *) return 1 ;; esac
+  case "$l8" in server_sha256=*) server_hash="${l8#server_sha256=}" ;; *) return 1 ;; esac
+  case "$l9" in cli_sha256=*) cli_hash="${l9#cli_sha256=}" ;; *) return 1 ;; esac
+
+  [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || return 1
+  [[ "$source_commit" =~ ^[a-f0-9]{40}$ ]] || return 1
+  [[ "$frankensearch_commit" =~ ^[a-f0-9]{40}$ ]] || return 1
+  [[ "$fast_cmaes_commit" =~ ^[a-f0-9]{40}$ ]] || return 1
+  [[ "$beads_rust_commit" =~ ^[a-f0-9]{40}$ ]] || return 1
+  [ "$server_hash" = "$TXN_NEW_SERVER_HASH" ] || return 1
+  [ "$cli_hash" = "$TXN_NEW_CLI_HASH" ] || return 1
+}
+
+write_binary_transaction_source_receipt() {
+  local journal="$1"
+  local receipt=""
+  local witness=""
+
+  [ "$SOURCE_INSTALL_RECEIPT_ENABLED" -eq 1 ] || return 0
+  [[ "$SOURCE_INSTALL_RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || return 1
+  [[ "$SOURCE_INSTALL_COMMIT" =~ ^[a-f0-9]{40}$ ]] || return 1
+  [[ "$SOURCE_INSTALL_FRANKENSEARCH_COMMIT" =~ ^[a-f0-9]{40}$ ]] || return 1
+  [[ "$SOURCE_INSTALL_FAST_CMAES_COMMIT" =~ ^[a-f0-9]{40}$ ]] || return 1
+  [[ "$SOURCE_INSTALL_BEADS_RUST_COMMIT" =~ ^[a-f0-9]{40}$ ]] || return 1
+
+  receipt="schema=1
+install_method=exact-tag-source
+release_tag=$SOURCE_INSTALL_RELEASE_TAG
+source_commit=$SOURCE_INSTALL_COMMIT
+frankensearch_commit=$SOURCE_INSTALL_FRANKENSEARCH_COMMIT
+fast_cmaes_commit=$SOURCE_INSTALL_FAST_CMAES_COMMIT
+beads_rust_commit=$SOURCE_INSTALL_BEADS_RUST_COMMIT
+server_sha256=$TXN_NEW_SERVER_HASH
+cli_sha256=$TXN_NEW_CLI_HASH"
+  printf '%s\n' "$receipt" \
+    | write_binary_transaction_file_exclusive "$journal/source-receipt" 600 || return 1
+  witness=$(file_sha256_hex "$journal/source-receipt") || return 1
+  TXN_SOURCE_RECEIPT_HASH="$witness"
+  printf '%s\n' "$witness" \
+    | write_binary_transaction_file_exclusive "$journal/source-receipt.sha256" 600 || return 1
+  validate_binary_transaction_source_receipt "$journal"
+}
+
+read_binary_transaction_metadata() {
+  local journal="$1"
+  local metadata="$journal/metadata"
+  local witness_file="$journal/metadata.sha256"
+  local witness="" extra="" actual="" witness_lines=""
+  local l1="" l2="" l3="" l4="" l5="" l6="" l7="" l8="" l9="" l10=""
+
+  validate_binary_transaction_directory "$journal" || return 1
+  validate_installer_owned_regular_file "$metadata" "Binary transaction metadata" 600 || return 1
+  validate_installer_owned_regular_file "$witness_file" "Binary transaction metadata witness" 600 || return 1
+  IFS= read -r witness <"$witness_file" || return 1
+  extra=$(sed -n '2p' "$witness_file") || return 1
+  witness_lines=$(wc -l <"$witness_file" 2>/dev/null | tr -d '[:space:]') || return 1
+  [[ "$witness" =~ ^[a-f0-9]{64}$ ]] && [ -z "$extra" ] && [ "$witness_lines" = "1" ] || {
+    err "Binary transaction metadata witness is malformed: $witness_file"
+    return 1
+  }
+  actual=$(file_sha256_hex "$metadata" 2>/dev/null || true)
+  if [ "$actual" != "$witness" ]; then
+    err "Binary transaction metadata hash witness does not match: $metadata"
+    return 1
+  fi
+
+  {
+    IFS= read -r l1 || return 1
+    IFS= read -r l2 || return 1
+    IFS= read -r l3 || return 1
+    IFS= read -r l4 || return 1
+    IFS= read -r l5 || return 1
+    IFS= read -r l6 || return 1
+    IFS= read -r l7 || return 1
+    IFS= read -r l8 || return 1
+    case "$l1" in
+      schema=1)
+        # Schema 1 is accepted only as crash-recovery authority written by
+        # the immediately preceding public installer. New transactions are
+        # always schema 2 and bind an explicit receipt-presence decision.
+        if IFS= read -r l9 || [ -n "$l9" ]; then return 1; fi
+        TXN_SOURCE_RECEIPT_HASH=absent
+        ;;
+      schema=2)
+        IFS= read -r l9 || return 1
+        if IFS= read -r l10 || [ -n "$l10" ]; then return 1; fi
+        ;;
+      *) return 1 ;;
+    esac
+  } <"$metadata"
+  case "$l2" in nonce=*) TXN_NONCE="${l2#nonce=}" ;; *) return 1 ;; esac
+  case "$l3" in had_server=*) TXN_HAD_SERVER="${l3#had_server=}" ;; *) return 1 ;; esac
+  case "$l4" in old_server_sha256=*) TXN_OLD_SERVER_HASH="${l4#old_server_sha256=}" ;; *) return 1 ;; esac
+  case "$l5" in had_cli=*) TXN_HAD_CLI="${l5#had_cli=}" ;; *) return 1 ;; esac
+  case "$l6" in old_cli_sha256=*) TXN_OLD_CLI_HASH="${l6#old_cli_sha256=}" ;; *) return 1 ;; esac
+  case "$l7" in new_server_sha256=*) TXN_NEW_SERVER_HASH="${l7#new_server_sha256=}" ;; *) return 1 ;; esac
+  case "$l8" in new_cli_sha256=*) TXN_NEW_CLI_HASH="${l8#new_cli_sha256=}" ;; *) return 1 ;; esac
+  if [ "$l1" = "schema=2" ]; then
+    case "$l9" in source_receipt_sha256=*) TXN_SOURCE_RECEIPT_HASH="${l9#source_receipt_sha256=}" ;; *) return 1 ;; esac
+  fi
+
+  [[ "$TXN_NONCE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || return 1
+  case "$TXN_HAD_SERVER:$TXN_OLD_SERVER_HASH" in
+    0:absent) ;;
+    1:*) [[ "$TXN_OLD_SERVER_HASH" =~ ^[a-f0-9]{64}$ ]] || return 1 ;;
+    *) return 1 ;;
+  esac
+  case "$TXN_HAD_CLI:$TXN_OLD_CLI_HASH" in
+    0:absent) ;;
+    1:*) [[ "$TXN_OLD_CLI_HASH" =~ ^[a-f0-9]{64}$ ]] || return 1 ;;
+    *) return 1 ;;
+  esac
+  [[ "$TXN_NEW_SERVER_HASH" =~ ^[a-f0-9]{64}$ ]] || return 1
+  [[ "$TXN_NEW_CLI_HASH" =~ ^[a-f0-9]{64}$ ]] || return 1
+  [ "$TXN_SOURCE_RECEIPT_HASH" = "absent" ] || \
+    [[ "$TXN_SOURCE_RECEIPT_HASH" =~ ^[a-f0-9]{64}$ ]] || return 1
+  TXN_METADATA_HASH="$witness"
+}
+
+validate_binary_transaction_inventory_and_phases() {
+  local journal="$1"
+  local entry="" name="" phase="" missing_phase=0 inventory_complete=0
+  local forward_phases=(
+    00-prepared 10-preserve-server 20-preserve-cli
+    30-publish-server 40-publish-cli 50-commit-ready
+  )
+
+  while IFS= read -r -d '' entry; do
+    if [ "$entry" = "__MCP_AGENT_MAIL_INVENTORY_COMPLETE__" ]; then
+      inventory_complete=1
+      continue
+    fi
+    name="${entry##*/}"
+    case "$name" in
+      metadata|metadata.sha256|source-receipt|source-receipt.sha256|new-server|new-cli|old-server|old-cli|rollback-new-server|rollback-new-cli|\
+      phase.00-prepared|phase.10-preserve-server|phase.20-preserve-cli|\
+      phase.30-publish-server|phase.40-publish-cli|phase.45-rollback|phase.50-commit-ready) ;;
+      *) err "Unexpected entry in binary transaction authority: $entry"; return 1 ;;
+    esac
+  done < <(
+    if find "$journal" -mindepth 1 -maxdepth 1 -print0 2>/dev/null; then
+      printf '__MCP_AGENT_MAIL_INVENTORY_COMPLETE__\0'
+    fi
+  )
+  if [ "$inventory_complete" -ne 1 ]; then
+    err "Could not enumerate the complete binary transaction inventory."
+    return 1
+  fi
+
+  TXN_FORWARD_PHASE=""
+  for phase in "${forward_phases[@]}"; do
+    if installer_entry_exists "$journal/phase.$phase"; then
+      if [ "$missing_phase" -eq 1 ]; then
+        err "Binary transaction phase sequence has a gap before $phase."
+        return 1
+      fi
+      validate_binary_transaction_phase_marker "$journal" "$phase" || return 1
+      TXN_FORWARD_PHASE="$phase"
+    else
+      missing_phase=1
+    fi
   done
+  [ -n "$TXN_FORWARD_PHASE" ] || {
+    err "Binary transaction has no prepared phase marker."
+    return 1
+  }
 
-  # Write to temp file
-  install -m 0755 "$src" "$tmp_dest"
+  TXN_HAS_ROLLBACK_PHASE=0
+  if installer_entry_exists "$journal/phase.45-rollback"; then
+    validate_binary_transaction_phase_marker "$journal" "45-rollback" || return 1
+    TXN_HAS_ROLLBACK_PHASE=1
+  fi
+  if [ "$TXN_HAS_ROLLBACK_PHASE" -eq 1 ] && [ "$TXN_FORWARD_PHASE" = "50-commit-ready" ]; then
+    err "Binary transaction contains both rollback and commit-ready markers."
+    return 1
+  fi
+}
 
-  # Sync to disk if available
-  sync "$tmp_dest" 2>/dev/null || sync 2>/dev/null || true
+inspect_binary_transaction_forward_target() {
+  local journal="$1"
+  local dest="$2"
+  local stem="$3"
+  local had_original="$4"
+  local old_hash="$5"
+  local new_hash="$6"
+  local staged="$journal/new-$stem"
+  local backup="$journal/old-$stem"
+  local quarantined="$journal/rollback-new-$stem"
+  local dest_hash=""
 
-  # Atomic rename
-  mv -f "$tmp_dest" "$dest"
+  if installer_entry_exists "$quarantined"; then
+    err "Rollback residue exists without a rollback phase: $quarantined"
+    return 1
+  fi
+  if installer_entry_exists "$staged"; then
+    validate_binary_transaction_hash "$staged" "${new_hash}" "Staged $stem binary" || return 1
+  fi
+  if installer_entry_exists "$backup"; then
+    [ "$had_original" = "1" ] || return 1
+    validate_binary_transaction_hash "$backup" "$old_hash" "Preserved $stem binary" || return 1
+  fi
+  if installer_entry_exists "$dest"; then
+    validate_installer_owned_regular_file "$dest" "$stem install target" || return 1
+    dest_hash=$(file_sha256_hex "$dest" 2>/dev/null || true)
+  fi
+
+  if installer_entry_exists "$staged"; then
+    if installer_entry_exists "$backup"; then
+      installer_entry_exists "$dest" && return 1
+      TXN_TARGET_STATE="preserved"
+    elif [ "$had_original" = "1" ]; then
+      [ "$dest_hash" = "$old_hash" ] || return 1
+      TXN_TARGET_STATE="original"
+    else
+      installer_entry_exists "$dest" && return 1
+      TXN_TARGET_STATE="absent-unpublished"
+    fi
+    return 0
+  fi
+
+  [ "$dest_hash" = "$new_hash" ] || return 1
+  if [ "$had_original" = "1" ]; then
+    installer_entry_exists "$backup" || return 1
+  else
+    installer_entry_exists "$backup" && return 1
+  fi
+  TXN_TARGET_STATE="published"
+}
+
+validate_binary_transaction_forward_window() {
+  local journal="$1"
+  local install_dir="$2"
+  local server_state="" cli_state=""
+  inspect_binary_transaction_forward_target "$journal" "$install_dir/$BIN_SERVER" \
+    server "$TXN_HAD_SERVER" "$TXN_OLD_SERVER_HASH" "$TXN_NEW_SERVER_HASH" || return 1
+  server_state="$TXN_TARGET_STATE"
+  inspect_binary_transaction_forward_target "$journal" "$install_dir/$BIN_CLI" \
+    cli "$TXN_HAD_CLI" "$TXN_OLD_CLI_HASH" "$TXN_NEW_CLI_HASH" || return 1
+  cli_state="$TXN_TARGET_STATE"
+
+  case "$TXN_FORWARD_PHASE" in
+    00-prepared)
+      [[ "$server_state" =~ ^(original|absent-unpublished)$ ]] &&
+        [[ "$cli_state" =~ ^(original|absent-unpublished)$ ]]
+      ;;
+    10-preserve-server)
+      [[ "$server_state" =~ ^(original|preserved|absent-unpublished)$ ]] &&
+        [[ "$cli_state" =~ ^(original|absent-unpublished)$ ]]
+      ;;
+    20-preserve-cli)
+      [[ "$server_state" =~ ^(preserved|absent-unpublished)$ ]] &&
+        [[ "$cli_state" =~ ^(original|preserved|absent-unpublished)$ ]]
+      ;;
+    30-publish-server)
+      [[ "$server_state" =~ ^(preserved|published|absent-unpublished)$ ]] &&
+        [[ "$cli_state" =~ ^(preserved|absent-unpublished)$ ]]
+      ;;
+    40-publish-cli)
+      [ "$server_state" = "published" ] &&
+        [[ "$cli_state" =~ ^(preserved|published|absent-unpublished)$ ]]
+      ;;
+    *) return 1 ;;
+  esac || {
+    err "Binary transaction contents do not match persisted phase $TXN_FORWARD_PHASE (server=$server_state cli=$cli_state)."
+    return 1
+  }
+}
+
+rollback_binary_transaction_target() {
+  local journal="$1"
+  local install_dir="$2"
+  local stem="$3"
+  local binary_name="$4"
+  local had_original="$5"
+  local old_hash="$6"
+  local new_hash="$7"
+  local dest="$install_dir/$binary_name"
+  local staged="$journal/new-$stem"
+  local backup="$journal/old-$stem"
+  local quarantined="$journal/rollback-new-$stem"
+  local dest_hash=""
+
+  if installer_entry_exists "$staged"; then
+    validate_binary_transaction_hash "$staged" "$new_hash" "Staged $stem binary" || return 1
+  fi
+  if installer_entry_exists "$backup"; then
+    [ "$had_original" = "1" ] || return 1
+    validate_binary_transaction_hash "$backup" "$old_hash" "Preserved $stem binary" || return 1
+  fi
+  if installer_entry_exists "$quarantined"; then
+    validate_binary_transaction_hash "$quarantined" "$new_hash" "Quarantined new $stem binary" || return 1
+    installer_entry_exists "$staged" && return 1
+  fi
+  if installer_entry_exists "$dest"; then
+    validate_installer_owned_regular_file "$dest" "$stem install target" || return 1
+    dest_hash=$(file_sha256_hex "$dest" 2>/dev/null || true)
+  fi
+
+  if ! installer_entry_exists "$staged" && ! installer_entry_exists "$quarantined"; then
+    [ "$dest_hash" = "$new_hash" ] || {
+      err "Rollback cannot identify the exact new $stem destination."
+      return 1
+    }
+    if [ "$had_original" = "1" ]; then
+      installer_entry_exists "$backup" || return 1
+    else
+      installer_entry_exists "$backup" && return 1
+    fi
+    move_installer_entry_no_replace "$dest" "$quarantined" "Quarantine new $stem binary" || return 1
+    sync_installer_paths_durably "$quarantined" "$journal" "$install_dir" || return 1
+    validate_binary_transaction_hash "$quarantined" "$new_hash" \
+      "Quarantined new $stem binary" || return 1
+    dest_hash=""
+  fi
+
+  if installer_entry_exists "$staged"; then
+    installer_entry_exists "$quarantined" && return 1
+    if installer_entry_exists "$backup"; then
+      installer_entry_exists "$dest" && return 1
+    elif [ "$had_original" = "1" ]; then
+      [ "$dest_hash" = "$old_hash" ] || return 1
+    else
+      installer_entry_exists "$dest" && return 1
+    fi
+  fi
+
+  if [ "$had_original" = "1" ]; then
+    if installer_entry_exists "$backup"; then
+      installer_entry_exists "$dest" && {
+        err "Rollback destination is occupied before restoring $stem."
+        return 1
+      }
+      move_installer_entry_no_replace "$backup" "$dest" "Restore old $stem binary" || return 1
+      sync_installer_paths_durably "$dest" "$journal" "$install_dir" || return 1
+      validate_binary_transaction_hash "$dest" "$old_hash" "Restored $stem binary" || return 1
+    else
+      validate_binary_transaction_hash "$dest" "$old_hash" "Restored $stem binary" || return 1
+    fi
+  elif installer_entry_exists "$backup" || installer_entry_exists "$dest"; then
+    err "Rollback expected no original $stem destination, but one is present."
+    return 1
+  fi
+}
+
+archive_binary_transaction() {
+  local journal="$1"
+  local install_dir="$2"
+  local outcome="$3"
+  local history="$install_dir/.mcp-agent-mail-install-transaction.${outcome}.${TXN_NONCE}"
+  case "$outcome" in committed|rolled-back) ;; *) return 1 ;; esac
+  if installer_entry_exists "$history"; then
+    err "Binary transaction history destination already exists: $history"
+    return 1
+  fi
+  move_installer_entry_no_replace "$journal" "$history" "Archive $outcome binary transaction" || return 1
+  sync_installer_paths_durably "$history" "$install_dir" || return 1
+  validate_binary_transaction_directory "$history" || return 1
+  validate_binary_transaction_source_receipt "$history" || return 1
+  BINARY_TRANSACTION_ACTIVE_INSTALL_DIR=""
+  BINARY_TRANSACTION_LAST_ARCHIVE_PATH="$history"
+}
+
+recover_binary_pair_transaction_impl() {
+  local install_dir="$1"
+  local inject_after_phase_for_test="${2:-}"
+  local journal=""
+  journal=$(binary_transaction_active_path "$install_dir")
+  if ! installer_entry_exists "$journal"; then
+    return 0
+  fi
+  read_binary_transaction_metadata "$journal" || return 1
+  validate_binary_transaction_inventory_and_phases "$journal" || return 1
+  validate_binary_transaction_source_receipt "$journal" || return 1
+
+  if [ "$TXN_FORWARD_PHASE" = "50-commit-ready" ]; then
+    installer_entry_exists "$journal/new-server" && return 1
+    installer_entry_exists "$journal/new-cli" && return 1
+    installer_entry_exists "$journal/rollback-new-server" && return 1
+    installer_entry_exists "$journal/rollback-new-cli" && return 1
+    validate_binary_transaction_hash "$install_dir/$BIN_SERVER" "$TXN_NEW_SERVER_HASH" \
+      "Committed server binary" || return 1
+    validate_binary_transaction_hash "$install_dir/$BIN_CLI" "$TXN_NEW_CLI_HASH" \
+      "Committed CLI binary" || return 1
+    if [ "$TXN_HAD_SERVER" = "1" ]; then
+      validate_binary_transaction_hash "$journal/old-server" "$TXN_OLD_SERVER_HASH" \
+        "Committed server backup" || return 1
+    elif installer_entry_exists "$journal/old-server"; then
+      return 1
+    fi
+    if [ "$TXN_HAD_CLI" = "1" ]; then
+      validate_binary_transaction_hash "$journal/old-cli" "$TXN_OLD_CLI_HASH" \
+        "Committed CLI backup" || return 1
+    elif installer_entry_exists "$journal/old-cli"; then
+      return 1
+    fi
+    archive_binary_transaction "$journal" "$install_dir" committed
+    return $?
+  fi
+
+  if [ "$TXN_HAS_ROLLBACK_PHASE" -eq 0 ]; then
+    validate_binary_transaction_forward_window "$journal" "$install_dir" || return 1
+    persist_binary_transaction_phase "$journal" "45-rollback" || return 1
+    TXN_HAS_ROLLBACK_PHASE=1
+    if [ "$inject_after_phase_for_test" = "rollback-ready" ]; then
+      warn "Injected interruption after durable rollback intent."
+      return 97
+    fi
+  fi
+
+  rollback_binary_transaction_target "$journal" "$install_dir" cli "$BIN_CLI" \
+    "$TXN_HAD_CLI" "$TXN_OLD_CLI_HASH" "$TXN_NEW_CLI_HASH" || return 1
+  rollback_binary_transaction_target "$journal" "$install_dir" server "$BIN_SERVER" \
+    "$TXN_HAD_SERVER" "$TXN_OLD_SERVER_HASH" "$TXN_NEW_SERVER_HASH" || return 1
+  archive_binary_transaction "$journal" "$install_dir" rolled-back
+}
+
+recover_binary_pair_transaction() {
+  local install_dir="$1"
+  local inject_after_phase_for_test="${2:-}"
+  local rc=0
+  if [ "$BINARY_TRANSACTION_RECOVERY_ACTIVE" -eq 1 ]; then
+    err "Binary transaction recovery is already active."
+    return 1
+  fi
+  BINARY_TRANSACTION_RECOVERY_ACTIVE=1
+  recover_binary_pair_transaction_impl "$install_dir" "$inject_after_phase_for_test" || rc=$?
+  BINARY_TRANSACTION_RECOVERY_ACTIVE=0
+  return "$rc"
+}
+
+preserve_binary_transaction_original() {
+  local journal="$1"
+  local install_dir="$2"
+  local stem="$3"
+  local binary_name="$4"
+  local had_original="$5"
+  local old_hash="$6"
+  local dest="$install_dir/$binary_name"
+  local backup="$journal/old-$stem"
+
+  if [ "$had_original" = "0" ]; then
+    installer_entry_exists "$dest" && {
+      err "A $stem destination appeared after transaction preparation."
+      return 1
+    }
+    return 0
+  fi
+  validate_binary_transaction_hash "$dest" "$old_hash" "Original $stem binary" || return 1
+  move_installer_entry_no_replace "$dest" "$backup" "Preserve old $stem binary" || return 1
+  sync_installer_paths_durably "$backup" "$journal" "$install_dir" || return 1
+  validate_binary_transaction_hash "$backup" "$old_hash" "Preserved $stem binary"
+}
+
+publish_binary_transaction_new() {
+  local journal="$1"
+  local install_dir="$2"
+  local stem="$3"
+  local binary_name="$4"
+  local new_hash="$5"
+  local staged="$journal/new-$stem"
+  local dest="$install_dir/$binary_name"
+  installer_entry_exists "$dest" && {
+    err "The $stem destination is occupied before publication."
+    return 1
+  }
+  validate_binary_transaction_hash "$staged" "$new_hash" "Staged $stem binary" || return 1
+  chmod 755 "$staged" || return 1
+  sync_installer_paths_durably "$staged" "$journal" || return 1
+  move_installer_entry_no_replace "$staged" "$dest" "Publish new $stem binary" || return 1
+  sync_installer_paths_durably "$dest" "$journal" "$install_dir" || return 1
+  validate_binary_transaction_hash "$dest" "$new_hash" "Published $stem binary"
+}
+
+prepare_binary_pair_transaction() {
+  local server_src="$1"
+  local cli_src="$2"
+  local install_dir="$3"
+  local nonce="$$.${RANDOM}.${RANDOM}"
+  local preparing="$install_dir/.mcp-agent-mail-install-transaction.preparing.${nonce}"
+  local active=""
+  local server_dest="$install_dir/$BIN_SERVER"
+  local cli_dest="$install_dir/$BIN_CLI"
+  local metadata="" source_path=""
+
+  active=$(binary_transaction_active_path "$install_dir")
+  installer_entry_exists "$active" && {
+    err "An unrecovered binary transaction already exists: $active"
+    return 1
+  }
+  installer_entry_exists "$preparing" && return 1
+  for source_path in "$server_src" "$cli_src"; do
+    if [ ! -f "$source_path" ] || [ -L "$source_path" ] || \
+       [ ! -s "$source_path" ] || [ ! -x "$source_path" ]; then
+      err "Binary transaction source is not a non-empty executable regular file: $source_path"
+      return 1
+    fi
+  done
+  ensure_real_file_target_path "$server_dest" "$BIN_SERVER install target" || return 1
+  ensure_real_file_target_path "$cli_dest" "$BIN_CLI install target" || return 1
+  validate_installer_owned_regular_file "$server_src" "Staged server source" || return 1
+  validate_installer_owned_regular_file "$cli_src" "Staged CLI source" || return 1
+
+  TXN_NONCE="$nonce"
+  TXN_NEW_SERVER_HASH=$(file_sha256_hex "$server_src") || return 1
+  TXN_NEW_CLI_HASH=$(file_sha256_hex "$cli_src") || return 1
+  TXN_SOURCE_RECEIPT_HASH=absent
+  TXN_HAD_SERVER=0
+  TXN_HAD_CLI=0
+  TXN_OLD_SERVER_HASH=absent
+  TXN_OLD_CLI_HASH=absent
+  if installer_entry_exists "$server_dest"; then
+    validate_installer_owned_regular_file "$server_dest" "Existing server binary" || return 1
+    TXN_HAD_SERVER=1
+    TXN_OLD_SERVER_HASH=$(file_sha256_hex "$server_dest") || return 1
+  fi
+  if installer_entry_exists "$cli_dest"; then
+    validate_installer_owned_regular_file "$cli_dest" "Existing CLI binary" || return 1
+    TXN_HAD_CLI=1
+    TXN_OLD_CLI_HASH=$(file_sha256_hex "$cli_dest") || return 1
+  fi
+
+  # Apply the private mode in the mkdir syscall itself; chmod alone would
+  # leave a caller-umask-dependent window where another user could enter the
+  # non-authoritative staging directory before it is published.
+  (umask 077; mkdir "$preparing") || return 1
+  chmod 700 "$preparing" || return 1
+  validate_binary_transaction_directory "$preparing" || return 1
+  sync_installer_paths_durably "$preparing" "$install_dir" || return 1
+  if ! (umask 077; set -o noclobber; exec 9>"$preparing/new-server"; cat "$server_src" >&9) || \
+     ! (umask 077; set -o noclobber; exec 9>"$preparing/new-cli"; cat "$cli_src" >&9); then
+    err "Could not stage both binaries in the durable transaction journal."
+    return 1
+  fi
+  chmod 700 "$preparing/new-server" "$preparing/new-cli" || return 1
+  validate_binary_transaction_hash "$preparing/new-server" "$TXN_NEW_SERVER_HASH" \
+    "Journaled server binary" || return 1
+  validate_binary_transaction_hash "$preparing/new-cli" "$TXN_NEW_CLI_HASH" \
+    "Journaled CLI binary" || return 1
+  sync_installer_paths_durably "$preparing/new-server" "$preparing/new-cli" "$preparing" || return 1
+
+  write_binary_transaction_source_receipt "$preparing" || return 1
+
+  metadata="schema=2
+nonce=$TXN_NONCE
+had_server=$TXN_HAD_SERVER
+old_server_sha256=$TXN_OLD_SERVER_HASH
+had_cli=$TXN_HAD_CLI
+old_cli_sha256=$TXN_OLD_CLI_HASH
+new_server_sha256=$TXN_NEW_SERVER_HASH
+new_cli_sha256=$TXN_NEW_CLI_HASH
+source_receipt_sha256=$TXN_SOURCE_RECEIPT_HASH"
+  printf '%s\n' "$metadata" | write_binary_transaction_file_exclusive "$preparing/metadata" 600 || return 1
+  TXN_METADATA_HASH=$(file_sha256_hex "$preparing/metadata") || return 1
+  printf '%s\n' "$TXN_METADATA_HASH" \
+    | write_binary_transaction_file_exclusive "$preparing/metadata.sha256" 600 || return 1
+  persist_binary_transaction_phase "$preparing" "00-prepared" || return 1
+  validate_binary_transaction_directory "$preparing" || return 1
+  move_installer_entry_no_replace "$preparing" "$active" "Publish binary transaction authority" || return 1
+  BINARY_TRANSACTION_ACTIVE_INSTALL_DIR="$install_dir"
+  sync_installer_paths_durably "$active" "$install_dir" || return 1
+  validate_binary_transaction_directory "$active" || return 1
+}
+
+abort_binary_pair_transaction() {
+  local install_dir="$1"
+  local reason="$2"
+  err "$reason"
+  if ! recover_binary_pair_transaction "$install_dir"; then
+    err "Binary transaction recovery failed closed; retained active journal for inspection."
+    BINARY_TRANSACTION_ACTIVE_INSTALL_DIR="$install_dir"
+    return 1
+  fi
+  return 1
+}
+
+# Replace the server and CLI as one durable rollback domain. The fourth
+# argument is test-only: it names a persisted phase after which the function
+# returns without recovery, simulating an uncatchable interruption.
+install_binary_pair_transactional() {
+  local server_src="$1"
+  local cli_src="$2"
+  local install_dir="$3"
+  local inject_after_phase_for_test="${4:-}"
+  local journal=""
+  local installed_server_hash="" installed_cli_hash=""
+
+  if ! recover_binary_pair_transaction "$install_dir"; then
+    err "Could not recover the previous binary transaction; refusing a new install."
+    return 1
+  fi
+  if ! prepare_binary_pair_transaction "$server_src" "$cli_src" "$install_dir"; then
+    if installer_entry_exists "$(binary_transaction_active_path "$install_dir")"; then
+      abort_binary_pair_transaction "$install_dir" "Binary transaction preparation failed after authority publication."
+    fi
+    return 1
+  fi
+  journal=$(binary_transaction_active_path "$install_dir")
+  if [ "$inject_after_phase_for_test" = "prepared" ]; then
+    warn "Injected interruption after durable prepared phase."
+    return 97
+  fi
+
+  if ! persist_binary_transaction_phase "$journal" "10-preserve-server"; then
+    abort_binary_pair_transaction "$install_dir" "Could not persist server-preservation intent."
+    return 1
+  fi
+  if [ "$inject_after_phase_for_test" = "preserve-server" ]; then return 97; fi
+  if ! preserve_binary_transaction_original "$journal" "$install_dir" server "$BIN_SERVER" \
+      "$TXN_HAD_SERVER" "$TXN_OLD_SERVER_HASH"; then
+    abort_binary_pair_transaction "$install_dir" "Could not preserve the existing server binary."
+    return 1
+  fi
+  if [ "$inject_after_phase_for_test" = "preserve-server-moved" ]; then return 97; fi
+
+  if ! persist_binary_transaction_phase "$journal" "20-preserve-cli"; then
+    abort_binary_pair_transaction "$install_dir" "Could not persist CLI-preservation intent."
+    return 1
+  fi
+  if [ "$inject_after_phase_for_test" = "preserve-cli" ]; then return 97; fi
+  if ! preserve_binary_transaction_original "$journal" "$install_dir" cli "$BIN_CLI" \
+      "$TXN_HAD_CLI" "$TXN_OLD_CLI_HASH"; then
+    abort_binary_pair_transaction "$install_dir" "Could not preserve the existing CLI binary."
+    return 1
+  fi
+  if [ "$inject_after_phase_for_test" = "preserve-cli-moved" ]; then return 97; fi
+
+  if ! persist_binary_transaction_phase "$journal" "30-publish-server"; then
+    abort_binary_pair_transaction "$install_dir" "Could not persist server-publication intent."
+    return 1
+  fi
+  if [ "$inject_after_phase_for_test" = "publish-server" ]; then return 97; fi
+  if ! publish_binary_transaction_new "$journal" "$install_dir" server "$BIN_SERVER" \
+      "$TXN_NEW_SERVER_HASH"; then
+    abort_binary_pair_transaction "$install_dir" "Could not publish the new server binary."
+    return 1
+  fi
+  if [ "$inject_after_phase_for_test" = "publish-server-moved" ]; then return 97; fi
+
+  if ! persist_binary_transaction_phase "$journal" "40-publish-cli"; then
+    abort_binary_pair_transaction "$install_dir" "Could not persist CLI-publication intent."
+    return 1
+  fi
+  if [ "$inject_after_phase_for_test" = "publish-cli" ]; then return 97; fi
+  if ! publish_binary_transaction_new "$journal" "$install_dir" cli "$BIN_CLI" \
+      "$TXN_NEW_CLI_HASH"; then
+    abort_binary_pair_transaction "$install_dir" "Could not publish the new CLI binary."
+    return 1
+  fi
+  if [ "$inject_after_phase_for_test" = "publish-cli-moved" ]; then return 97; fi
+
+  installed_server_hash=$(file_sha256_hex "$install_dir/$BIN_SERVER" 2>/dev/null || true)
+  installed_cli_hash=$(file_sha256_hex "$install_dir/$BIN_CLI" 2>/dev/null || true)
+  if [ "$installed_server_hash" != "$TXN_NEW_SERVER_HASH" ] || \
+     [ "$installed_cli_hash" != "$TXN_NEW_CLI_HASH" ] || \
+     ! verify_release_binaries_exact "$install_dir/$BIN_SERVER" "$install_dir/$BIN_CLI" "Installed"; then
+    abort_binary_pair_transaction "$install_dir" \
+      "Post-install verification failed; recovery will restore the previous binary pair."
+    return 1
+  fi
+  if ! sync_installer_paths_durably "$install_dir/$BIN_SERVER" "$install_dir/$BIN_CLI" "$install_dir"; then
+    abort_binary_pair_transaction "$install_dir" "Could not durably flush the verified binary pair."
+    return 1
+  fi
+  if ! persist_binary_transaction_phase "$journal" "50-commit-ready"; then
+    abort_binary_pair_transaction "$install_dir" "Could not persist binary transaction commit intent."
+    return 1
+  fi
+  if [ "$inject_after_phase_for_test" = "commit-ready" ]; then return 97; fi
+  archive_binary_transaction "$journal" "$install_dir" committed || return 1
+  return 0
 }
 
 # ── End Python detection & displacement ────────────────────────────────────
 
 preflight_checks() {
   info "Running preflight checks"
-  check_disk_space
-  check_write_permissions
-  check_existing_install
+  if [ "$FORCE_INSTALL" -eq 0 ]; then
+    check_existing_install
+  else
+    verbose "preflight_checks: skipping installed-binary probes because --force was requested"
+  fi
   check_network
   check_git_version_known_bad
+}
+
+# These checks can create the destination and therefore must run only after a
+# dry-run/confirmation boundary and while the installer lock is held. Keeping
+# them separate lets the read-only preflight above select the real artifact URL
+# before print_install_plan renders it.
+preflight_destination_checks() {
+  check_disk_space
+  check_write_permissions
 }
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -2690,6 +4151,41 @@ activate_mac_python_cli_compat_shell() {
   esac
 }
 
+trusted_system_directory_alias_target() {
+  local path="$1"
+  local expected
+  local platform="${OS:-}"
+  local resolved
+
+  # Match the Rust disk guard's macOS compatibility policy exactly: only the
+  # three root-owned aliases below may be followed, and only when their
+  # physical destination is the corresponding directory under /private.
+  # Every user-controlled or retargeted symlink remains a hard refusal.
+  if [ -z "$platform" ]; then
+    if [ -x /usr/bin/uname ]; then
+      platform=$(/usr/bin/uname -s 2>/dev/null) || return 1
+    elif [ -x /bin/uname ]; then
+      platform=$(/bin/uname -s 2>/dev/null) || return 1
+    else
+      return 1
+    fi
+  fi
+  case "$platform" in
+    Darwin|darwin) ;;
+    *) return 1 ;;
+  esac
+  case "$path" in
+    /var) expected="/private/var" ;;
+    /tmp) expected="/private/tmp" ;;
+    /etc) expected="/private/etc" ;;
+    *) return 1 ;;
+  esac
+
+  resolved=$(CDPATH= cd -P "$path" 2>/dev/null && pwd -P) || return 1
+  [ "$resolved" = "$expected" ] || return 1
+  printf '%s\n' "$resolved"
+}
+
 detect_mcp_configs() {
   local project_dir="${1:-$PWD}"
   local home_dir="${HOME:-}"
@@ -2700,15 +4196,23 @@ detect_mcp_configs() {
   local path
   local key
   local exists_flag
+  local omp_agent_component
+  local omp_agent_cursor
+  local omp_agent_resolved
+  local omp_agent_path_error=0
   local omp_config_name
+  local omp_config_component
+  local omp_config_cursor
+  local omp_config_path_error=0
   local omp_config_root
   local omp_profile
   local omp_profile_base
   local omp_profile_dir
   local omp_profiles_root
-  local profile_dir
-  local profile_name
+  local omp_profile_error=0
   local -a candidates=()
+  local -a omp_agent_components=()
+  local -a omp_config_components=()
 
   if [ -n "$home_dir" ]; then
     # Claude Desktop only. Claude Code does NOT read MCP server
@@ -2736,13 +4240,42 @@ detect_mcp_configs() {
 
     # Oh My Pi (OMP). Match its v18 directory resolver: OMP_PROFILE wins over
     # PI_PROFILE, PI_CONFIG_DIR replaces `.omp`, and PI_CODING_AGENT_DIR only
-    # applies to the default profile. Also inspect every existing named profile
-    # so an installer run repairs configs that are not currently active.
+    # applies to the default profile. Only the effective active profile is an
+    # authority: copying a live bearer into inactive profiles creates durable
+    # secret sprawl and does not affect the OMP process being configured.
     omp_config_name="${PI_CONFIG_DIR:-.omp}"
     while [ "${omp_config_name#/}" != "$omp_config_name" ]; do
       omp_config_name="${omp_config_name#/}"
     done
-    omp_config_root="${home_dir}/${omp_config_name}"
+    omp_config_cursor="${home_dir%/}"
+    [ -n "$omp_config_cursor" ] || omp_config_cursor="/"
+    IFS='/' read -r -a omp_config_components <<< "$omp_config_name"
+    for omp_config_component in "${omp_config_components[@]}"; do
+      case "$omp_config_component" in
+        "" | .) continue ;;
+        ..)
+          err "PI_CONFIG_DIR contains parent traversal; refusing OMP authority: ${PI_CONFIG_DIR}"
+          omp_config_path_error=2
+          break
+          ;;
+      esac
+      if [ "$omp_config_cursor" = "/" ]; then
+        omp_config_cursor="/${omp_config_component}"
+      else
+        omp_config_cursor="${omp_config_cursor}/${omp_config_component}"
+      fi
+      if [ -L "$omp_config_cursor" ]; then
+        err "PI_CONFIG_DIR contains a symlinked component; refusing OMP authority: ${omp_config_cursor}"
+        omp_config_path_error=2
+        break
+      fi
+      if [ -e "$omp_config_cursor" ] && [ ! -d "$omp_config_cursor" ]; then
+        err "PI_CONFIG_DIR contains a non-directory component; refusing OMP authority: ${omp_config_cursor}"
+        omp_config_path_error=2
+        break
+      fi
+    done
+    omp_config_root="$omp_config_cursor"
     omp_profiles_root="${omp_config_root}/profiles"
     omp_profile=""
     if [ "${OMP_PROFILE+x}" = "x" ]; then
@@ -2753,7 +4286,9 @@ detect_mcp_configs() {
     omp_profile="${omp_profile#"${omp_profile%%[![:space:]]*}"}"
     omp_profile="${omp_profile%"${omp_profile##*[![:space:]]}"}"
     omp_profile_base="${omp_profile%%.*}"
-    if [ -n "$omp_profile" ] \
+    if [ "$omp_config_path_error" -ne 0 ]; then
+      omp_profile_error=2
+    elif [ -n "$omp_profile" ] \
       && [ "$omp_profile" != "default" ] \
       && printf '%s\n' "$omp_profile" | LC_ALL=C grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$' \
       && ! printf '%s\n' "$omp_profile_base" | LC_ALL=C grep -Eiq '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$' \
@@ -2764,29 +4299,63 @@ detect_mcp_configs() {
         && [ ! -L "${omp_profile_dir}/agent" ]; then
         candidates+=("omp|${omp_profile_dir}/agent/mcp.json")
         candidates+=("omp|${omp_profile_dir}/agent/.mcp.json")
+      else
+        err "Active OMP profile path contains a symlink; refusing to configure it: ${omp_profile_dir}"
+        omp_profile_error=2
       fi
+    elif [ -n "$omp_profile" ] && [ "$omp_profile" != "default" ]; then
+      err "Invalid OMP profile \"${omp_profile}\". Profile names must match ^[a-z0-9][a-z0-9._-]{0,63}$ and cannot be '.', '..', end with '.', or use a Windows reserved device name."
+      omp_profile_error=2
     elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
-      candidates+=("omp|${PI_CODING_AGENT_DIR}/mcp.json")
-      candidates+=("omp|${PI_CODING_AGENT_DIR}/.mcp.json")
-    fi
-    candidates+=("omp|${omp_config_root}/agent/mcp.json")
-    candidates+=("omp|${omp_config_root}/agent/.mcp.json")
-    if [ ! -L "$omp_profiles_root" ]; then
-      for profile_dir in "${omp_profiles_root}"/*; do
-        if [ ! -d "$profile_dir" ] \
-          || [ -L "$profile_dir" ] \
-          || [ -L "${profile_dir}/agent" ]; then
-          continue
-        fi
-        profile_name="${profile_dir##*/}"
-        [ "$profile_name" != "default" ] || continue
-        omp_profile_base="${profile_name%%.*}"
-        printf '%s\n' "$profile_name" | LC_ALL=C grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$' || continue
-        printf '%s\n' "$omp_profile_base" | LC_ALL=C grep -Eiq '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$' && continue
-        [ "${profile_name%.}" = "$profile_name" ] || continue
-        candidates+=("omp|${profile_dir}/agent/mcp.json")
-        candidates+=("omp|${profile_dir}/agent/.mcp.json")
-      done
+      case "$PI_CODING_AGENT_DIR" in
+        /*)
+          omp_agent_cursor="/"
+          IFS='/' read -r -a omp_agent_components <<< "$PI_CODING_AGENT_DIR"
+          for omp_agent_component in "${omp_agent_components[@]}"; do
+            case "$omp_agent_component" in
+              "" | .) continue ;;
+              ..)
+                err "PI_CODING_AGENT_DIR contains parent traversal; refusing OMP authority: ${PI_CODING_AGENT_DIR}"
+                omp_agent_path_error=2
+                break
+                ;;
+            esac
+            if [ "$omp_agent_cursor" = "/" ]; then
+              omp_agent_cursor="/${omp_agent_component}"
+            else
+              omp_agent_cursor="${omp_agent_cursor}/${omp_agent_component}"
+            fi
+            if [ -L "$omp_agent_cursor" ]; then
+              if omp_agent_resolved=$(trusted_system_directory_alias_target "$omp_agent_cursor"); then
+                omp_agent_cursor="$omp_agent_resolved"
+                continue
+              else
+                err "PI_CODING_AGENT_DIR contains a symlinked component; refusing OMP authority: ${omp_agent_cursor}"
+                omp_agent_path_error=2
+                break
+              fi
+            fi
+            if [ -e "$omp_agent_cursor" ] && [ ! -d "$omp_agent_cursor" ]; then
+              err "PI_CODING_AGENT_DIR contains a non-directory component; refusing OMP authority: ${omp_agent_cursor}"
+              omp_agent_path_error=2
+              break
+            fi
+          done
+          if [ "$omp_agent_path_error" -eq 0 ]; then
+            candidates+=("omp|${PI_CODING_AGENT_DIR}/mcp.json")
+            candidates+=("omp|${PI_CODING_AGENT_DIR}/.mcp.json")
+          else
+            omp_profile_error=2
+          fi
+          ;;
+        *)
+          err "PI_CODING_AGENT_DIR must be absolute; refusing cwd-relative OMP authority: ${PI_CODING_AGENT_DIR}"
+          omp_profile_error=2
+          ;;
+      esac
+    else
+      candidates+=("omp|${omp_config_root}/agent/mcp.json")
+      candidates+=("omp|${omp_config_root}/agent/.mcp.json")
     fi
 
     # GitHub Copilot / VS Code settings
@@ -2853,17 +4422,33 @@ detect_mcp_configs() {
     fi
     printf '%s\t%s\t%s\n' "$tool" "$path" "$exists_flag"
   done
+  return "$omp_profile_error"
 }
 
 generate_bearer_token() {
+  local token=""
   if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 32
-  elif [ -r /dev/urandom ]; then
-    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
+    token="$(openssl rand -hex 32)" || {
+      warn "OpenSSL could not generate an HTTP bearer token."
+      return 1
+    }
+  elif [ -r /dev/urandom ] \
+    && command -v head >/dev/null 2>&1 \
+    && command -v od >/dev/null 2>&1 \
+    && command -v tr >/dev/null 2>&1; then
+    token="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" || {
+      warn "The operating-system random source could not generate an HTTP bearer token."
+      return 1
+    }
   else
-    # Fallback: use date-based hash (weak but functional)
-    printf '%s' "$(date +%s%N)$$" | sha256sum 2>/dev/null | cut -d' ' -f1 || echo "placeholder-token-replace-me"
+    warn "No cryptographically secure HTTP bearer-token generator is available."
+    return 1
   fi
+  if [ "${#token}" -ne 64 ] || [[ ! "$token" =~ ^[[:xdigit:]]{64}$ ]]; then
+    warn "The HTTP bearer-token generator returned invalid output."
+    return 1
+  fi
+  printf '%s' "$token"
 }
 
 normalize_mcp_http_path() {
@@ -3001,30 +4586,69 @@ service_setup_unavailable_failure() {
   printf '%s\n' "$output" | grep -qiE 'failed to run (systemctl|launchctl)|systemctl: command not found|launchctl: command not found|failed to connect (to )?(user scope )?bus|system has not been booted with systemd|could not find domain for'
 }
 
+# Emit the remote-client kinds that are actually present, one per line. This
+# is the single authority shared by readiness and install-failure admission:
+# binaries, the established user config roots, and the active-profile-aware
+# candidate scan all contribute. An invalid/unsafe OMP profile returns 2 and
+# emits nothing so callers cannot misclassify bad authority as simple absence.
+remote_http_client_target_tools() {
+  local codex_present=0
+  local omp_present=0
+  local home_dir="${HOME:-}"
+  local scan
+  local scan_rc
+
+  case "$home_dir" in
+    /*) ;;
+    *) home_dir="" ;;
+  esac
+
+  if command -v codex >/dev/null 2>&1 \
+    || { [ -n "$home_dir" ] && [ -d "${home_dir}/.codex" ]; } \
+    || { [ -n "$home_dir" ] && [ -d "${home_dir}/.config/codex" ]; }; then
+    codex_present=1
+  fi
+  if command -v omp >/dev/null 2>&1 \
+    || { [ -n "$home_dir" ] && [ -d "${home_dir}/.omp" ]; }; then
+    omp_present=1
+  fi
+
+  if scan=$(HOME="$home_dir" detect_mcp_configs "$PWD" 2>/dev/null); then
+    scan_rc=0
+  else
+    scan_rc=$?
+    return "$scan_rc"
+  fi
+
+  local tool path exists_flag
+  while IFS=$'\t' read -r tool path exists_flag; do
+    [ "$exists_flag" = "1" ] && [ -f "$path" ] || continue
+    case "$tool" in
+      codex) codex_present=1 ;;
+      omp) omp_present=1 ;;
+    esac
+  done <<< "$scan"
+
+  [ "$codex_present" -eq 1 ] && printf '%s\n' codex
+  [ "$omp_present" -eq 1 ] && printf '%s\n' omp
+  return 0
+}
+
 has_remote_http_client_targets() {
   if [ "${AM_INSTALL_SKIP_REMOTE_HTTP_READINESS:-0}" = "1" ]; then
     verbose "remote_http_readiness:skip reason=env_override"
     return 1
   fi
 
-  if command -v codex >/dev/null 2>&1 || [ -d "${HOME}/.codex" ] || [ -d "${HOME}/.config/codex" ]; then
-    return 0
+  local targets
+  local targets_rc
+  if targets=$(remote_http_client_target_tools); then
+    targets_rc=0
+  else
+    targets_rc=$?
+    return "$targets_rc"
   fi
-
-  local scan
-  scan="$(detect_mcp_configs "$PWD" 2>/dev/null || true)"
-  [ -z "$scan" ] && return 1
-
-  local tool path exists_flag
-  while IFS=$'\t' read -r tool path exists_flag; do
-    [ -z "${tool:-}" ] && continue
-    [ "$tool" = "codex" ] || continue
-    if [ "$exists_flag" = "1" ] && [ -f "$path" ]; then
-      return 0
-    fi
-  done <<< "$scan"
-
-  return 1
+  [ -n "$targets" ]
 }
 
 probe_remote_http_endpoint() {
@@ -3232,7 +4856,9 @@ EOF
   then
     return 1
   fi
-  chmod 644 "$tmp_plist" || return 1
+  # The plist embeds the HTTP bearer token, so it is a credential file even
+  # though launchd also treats it as service metadata.
+  chmod 600 "$tmp_plist" || return 1
   mv -f "$tmp_plist" "$plist_path" || return 1
 }
 
@@ -3249,11 +4875,12 @@ repair_launchd_service_env_from_rust_config() {
   local plist_path="$HOME/Library/LaunchAgents/com.agent-mail.plist"
   if [ -L "$plist_path" ]; then
     warn "LaunchAgent plist is a symlink; refusing to rewrite it automatically: $plist_path"
-    return 0
+    return 1
   fi
   [ -f "$plist_path" ] || return 0
 
-  local rust_env="$HOME/.config/mcp-agent-mail/config.env"
+  local rust_env
+  rust_env="$(rust_config_env_path)"
   local storage_root database_url bearer_token host port http_path
   storage_root="${RUST_STORAGE_ROOT:-}"
   [ -z "$storage_root" ] && storage_root=$(read_env_assignment_value "$rust_env" "STORAGE_ROOT")
@@ -3263,6 +4890,14 @@ repair_launchd_service_env_from_rust_config() {
   [ -z "$database_url" ] && database_url="sqlite:///$storage_root/storage.sqlite3"
 
   bearer_token=$(read_env_assignment_value "$rust_env" "HTTP_BEARER_TOKEN")
+  if [ -z "$bearer_token" ]; then
+    warn "Refusing to rewrite LaunchAgent without the durable bearer token from $rust_env"
+    return 1
+  fi
+  if [ -n "${HTTP_BEARER_TOKEN:-}" ] && [ "$bearer_token" != "$HTTP_BEARER_TOKEN" ]; then
+    warn "Refusing to rewrite LaunchAgent with a bearer token that differs from the installer-selected credential."
+    return 1
+  fi
   host=$(read_env_assignment_value "$rust_env" "HTTP_HOST")
   [ -z "$host" ] && host="$(desired_service_bind_host)"
   port=$(read_env_assignment_value "$rust_env" "HTTP_PORT")
@@ -3275,7 +4910,7 @@ repair_launchd_service_env_from_rust_config() {
   if ! write_launchd_service_plist "$plist_path" "$DEST/$BIN_CLI" "$HOME" "$storage_root" "$database_url" "$bearer_token" "$host" "$port" "$http_path"
   then
     warn "Failed to rewrite LaunchAgent plist with Rust config environment."
-    return 0
+    return 1
   fi
 
   local uid
@@ -3283,7 +4918,7 @@ repair_launchd_service_env_from_rust_config() {
   launchctl bootout "gui/${uid}" "$plist_path" >/dev/null 2>&1 || true
   if ! launchctl bootstrap "gui/${uid}" "$plist_path" >/dev/null 2>&1; then
     warn "LaunchAgent plist was updated, but launchctl could not restart it automatically."
-    return 0
+    return 1
   fi
 
   verbose "remote_http_readiness:launchd_env_repaired plist=${plist_path}"
@@ -3291,9 +4926,17 @@ repair_launchd_service_env_from_rust_config() {
 }
 
 ensure_remote_http_client_readiness() {
-  if ! has_remote_http_client_targets; then
-    verbose "remote_http_readiness:skip reason=no_codex_targets"
-    return 0
+  local target_rc
+  if has_remote_http_client_targets; then
+    target_rc=0
+  else
+    target_rc=$?
+    if [ "$target_rc" -eq 1 ]; then
+      verbose "remote_http_readiness:skip reason=no_remote_http_clients"
+      return 0
+    fi
+    err "Remote MCP client authority discovery failed; refusing to report readiness."
+    return "$target_rc"
   fi
 
   local desired_url
@@ -3344,7 +4987,10 @@ ensure_remote_http_client_readiness() {
     while IFS= read -r line; do
       [ -n "$line" ] && verbose "remote_http_readiness:service ${line}"
     done <<< "$service_output"
-    repair_launchd_service_env_from_rust_config
+    if ! repair_launchd_service_env_from_rust_config; then
+      err "LaunchAgent environment could not be bound to the durable installer credential."
+      return 1
+    fi
   else
     if service_setup_unavailable_failure "$service_output"; then
       warn "Automatic background service setup is not available in this environment."
@@ -3861,8 +5507,13 @@ else:
         doc[container_key] = {}
 
 container = doc[container_key]
+entry_names = (
+    ("mcp-agent-mail", "mcp_agent_mail", "agent-mail")
+    if tool == "omp"
+    else ("mcp-agent-mail", "mcp_agent_mail")
+)
 entry_key = "mcp-agent-mail"
-for candidate in ("mcp-agent-mail", "mcp_agent_mail"):
+for candidate in entry_names:
     value = container.get(candidate)
     if isinstance(value, dict):
         entry_key = candidate
@@ -3874,7 +5525,7 @@ if tool == "omp" and not isinstance(existing_entry, dict):
         legacy_container = doc.get(legacy_key)
         if not isinstance(legacy_container, dict):
             continue
-        for candidate in ("mcp-agent-mail", "mcp_agent_mail"):
+        for candidate in entry_names:
             candidate_entry = legacy_container.get(candidate)
             if isinstance(candidate_entry, dict):
                 existing_entry = candidate_entry
@@ -3884,20 +5535,32 @@ if tool == "omp" and not isinstance(existing_entry, dict):
 if not isinstance(existing_entry, dict):
     existing_entry = {}
 
+# OMP accepts arbitrary server names, but Agent Mail owns one canonical key.
+# Always migrate historical aliases instead of refreshing them in place and
+# leaving setup/status with multiple possible authorities.
+if tool == "omp":
+    entry_key = "mcp-agent-mail"
+
+managed_entry_keys = {
+    "command",
+    "args",
+    "cwd",
+    "environment",
+    "env",
+    "transport",
+    "httpUrl",
+    "http_headers",
+    "bearer_token_env_var",
+}
+if tool == "omp":
+    # OMP resolves explicit OAuth metadata after loading configured headers;
+    # a stale credential can therefore replace the bearer written below.
+    managed_entry_keys.update({"auth", "oauth"})
+
 new_entry = {
     key: value
     for key, value in existing_entry.items()
-    if key not in {
-        "command",
-        "args",
-        "cwd",
-        "environment",
-        "env",
-        "transport",
-        "httpUrl",
-        "http_headers",
-        "bearer_token_env_var",
-    }
+    if key not in managed_entry_keys
 }
 new_entry["type"] = "http"
 new_entry["url"] = desired_url
@@ -3922,7 +5585,7 @@ else:
     new_entry.pop("headers", None)
 
 container[entry_key] = new_entry
-for candidate in ("mcp-agent-mail", "mcp_agent_mail"):
+for candidate in entry_names:
     if candidate != entry_key:
         container.pop(candidate, None)
 
@@ -3931,17 +5594,33 @@ if tool == "omp":
         legacy_container = doc.get(legacy_key)
         if not isinstance(legacy_container, dict):
             continue
-        legacy_container.pop("mcp-agent-mail", None)
-        legacy_container.pop("mcp_agent_mail", None)
+        for candidate in entry_names:
+            legacy_container.pop(candidate, None)
     disabled_servers = doc.get("disabledServers")
     if disabled_servers is not None and not isinstance(disabled_servers, list):
         print("ERROR:disabled_servers_not_array")
         raise SystemExit(0)
     if isinstance(disabled_servers, list):
+        if any(not isinstance(name, str) for name in disabled_servers):
+            print("ERROR:disabled_servers_entries_not_strings")
+            raise SystemExit(0)
         doc["disabledServers"] = [
             name
             for name in disabled_servers
-            if name not in ("mcp-agent-mail", "mcp_agent_mail")
+            if name not in entry_names
+        ]
+    enabled_servers = doc.get("enabledServers")
+    if enabled_servers is not None and not isinstance(enabled_servers, list):
+        print("ERROR:enabled_servers_not_array")
+        raise SystemExit(0)
+    if isinstance(enabled_servers, list):
+        if any(not isinstance(name, str) for name in enabled_servers):
+            print("ERROR:enabled_servers_entries_not_strings")
+            raise SystemExit(0)
+        doc["enabledServers"] = [
+            name
+            for name in enabled_servers
+            if name == entry_key or name not in entry_names
         ]
 new_text = dump_json(doc)
 effective_mode = 0o600 if existing_mode is None else existing_mode & 0o600
@@ -4375,17 +6054,136 @@ setup_claude_code_mcp_via_cli() {
   return 2
 }
 
+# Return success only when `candidate` resolves inside `root`. Return 2 when
+# containment cannot be established so credential-bearing callers can fail
+# closed instead of guessing that the path is safe.
+path_resolves_within_directory() {
+  local candidate="$1"
+  local root="$2"
+  local verdict
+
+  [ -n "$candidate" ] && [ -n "$root" ] || return 2
+  command -v python3 >/dev/null 2>&1 || return 2
+
+  if verdict=$(python3 - "$candidate" "$root" <<'PY'
+import os
+import sys
+
+candidate, root = sys.argv[1:3]
+try:
+    candidate_lexical = os.path.abspath(candidate)
+    root_lexical = os.path.abspath(root)
+    candidate_resolved = os.path.realpath(candidate_lexical)
+    root_resolved = os.path.realpath(root_lexical)
+
+    # `commonpath` is string-based. On a case-insensitive filesystem, two
+    # spellings of the same directory can compare unequal, so also walk the
+    # candidate's existing ancestry by file identity. This covers missing
+    # leaf paths because their deepest existing parent still identifies the
+    # directory that would receive the write.
+    candidate_ancestor = candidate_lexical
+    while not os.path.lexists(candidate_ancestor):
+        parent = os.path.dirname(candidate_ancestor)
+        if parent == candidate_ancestor:
+            break
+        candidate_ancestor = parent
+    physically_inside = False
+    while os.path.lexists(candidate_ancestor):
+        if os.path.samefile(candidate_ancestor, root_lexical):
+            physically_inside = True
+            break
+        parent = os.path.dirname(candidate_ancestor)
+        if parent == candidate_ancestor:
+            break
+        candidate_ancestor = parent
+
+    inside = (
+        os.path.commonpath((candidate_lexical, root_lexical)) == root_lexical
+        or os.path.commonpath((candidate_resolved, root_resolved)) == root_resolved
+        or physically_inside
+    )
+except (OSError, ValueError):
+    raise SystemExit(2)
+print("inside" if inside else "outside")
+PY
+  )
+  then
+    case "$verdict" in
+      inside) return 0 ;;
+      outside) return 1 ;;
+      *) return 2 ;;
+    esac
+  fi
+
+  # Only the script's exact successful "outside" verdict permits the shell
+  # writer. An interpreter failure can itself exit with any small status, so
+  # an exit-code sentinel is not an authoritative containment result.
+  return 2
+}
+
+# The shell writers embed bearer credentials but cannot establish the native
+# setup command's Git tracked/ignore protections. Never let them write a config
+# inside the current project. OMP needs extra handling because user-path
+# overrides can be relative to the checkout and inactive named profiles may
+# also live beneath it; only the canonical project config is handled by native
+# setup, while the other project-local OMP candidates stay untouched.
+mcp_config_must_skip_shell_write() {
+  local tool="$1"
+  local path="$2"
+  local project_dir="$3"
+  local containment_rc
+
+  if [ "$tool" = "omp" ]; then
+    case "$path" in
+      "$project_dir/.omp/mcp.json")
+        verbose "setup_mcp_configs:defer tool=omp path=${path} reason=native_setup_secures_gitignore"
+        return 0
+        ;;
+      */.mcp.json)
+        verbose "setup_mcp_configs:skip tool=omp path=${path} reason=secondary_authority_is_read_only"
+        return 0
+        ;;
+      "$project_dir/mcp.json")
+        verbose "setup_mcp_configs:skip tool=omp path=${path} reason=portable_fallback_left_untouched"
+        return 0
+        ;;
+    esac
+  fi
+
+  if path_resolves_within_directory "$path" "$project_dir"; then
+    verbose "setup_mcp_configs:defer tool=${tool} path=${path} reason=project_local_path_requires_native_git_protection"
+    return 0
+  else
+    containment_rc=$?
+  fi
+  if [ "$containment_rc" -eq 2 ]; then
+    verbose "setup_mcp_configs:skip tool=${tool} path=${path} reason=project_containment_unknown"
+    return 0
+  fi
+  return 1
+}
+
 # Set up MCP configs for all detected tools.
 # For fresh installs: create configs where missing, insert entries where absent.
 setup_mcp_configs() {
   local binary_path="$1"
   local scan
-  scan=$(detect_mcp_configs "$PWD" || true)
+  local scan_rc
+  if scan=$(detect_mcp_configs "$PWD"); then
+    scan_rc=0
+  else
+    scan_rc=$?
+    warn "MCP config discovery failed; no fallback client writers will run."
+    return "$scan_rc"
+  fi
 
   local bearer_token
   bearer_token="$(resolve_setup_http_bearer_token)"
   if [ -z "$bearer_token" ]; then
-    bearer_token="$(generate_bearer_token)"
+    if ! bearer_token="$(generate_bearer_token)"; then
+      warn "Refusing to update MCP clients without a cryptographically secure bearer token."
+      return 1
+    fi
     verbose "setup_mcp_configs:selected_token source=generated len=${#bearer_token}"
   else
     verbose "setup_mcp_configs:selected_token source=existing len=${#bearer_token}"
@@ -4415,7 +6213,17 @@ setup_mcp_configs() {
   # surface in the candidate scan any more. Pass the same $bearer_token the
   # rest of this function writes into other tools' configs so every MCP
   # client in this install agrees on the same Authorization header.
-  if setup_claude_code_mcp_via_cli "$bearer_token"; then
+  # `claude mcp add --scope user` writes $HOME/.claude.json itself. Apply the
+  # same project-containment boundary before invoking that external writer;
+  # when HOME is relative, project-local, or unavailable, native setup owns the
+  # eventual write and its Git protection.
+  local claude_code_config_path=""
+  if [ -n "${HOME:-}" ]; then
+    claude_code_config_path="${HOME}/.claude.json"
+  fi
+  if mcp_config_must_skip_shell_write "claude" "$claude_code_config_path" "$PWD"; then
+    verbose "setup_claude_code_mcp:defer reason=project_containment_requires_native_setup"
+  elif setup_claude_code_mcp_via_cli "$bearer_token"; then
     configured=$((configured + 1))
   fi
 
@@ -4431,15 +6239,15 @@ setup_mcp_configs() {
     [ -z "${tool:-}" ] && continue
     [ "$exists_flag" != "1" ] && continue
 
-    # Most tools have one authoritative config, but OMP can have multiple
-    # existing named-profile configs. Refresh every existing OMP file; the
-    # second pass still sees `omp` in configured_tools and will not proliferate
-    # new files across inactive profiles.
-    if [ "$tool" != "omp" ]; then
-      case "|${configured_tools}|" in
-        *"|${tool}|"*) continue ;;
-      esac
+    if mcp_config_must_skip_shell_write "$tool" "$path" "$PWD"; then
+      continue
     fi
+
+    # OMP's secondary `.mcp.json` authority is filtered above; like every
+    # other tool, only its first writable canonical config is updated.
+    case "|${configured_tools}|" in
+      *"|${tool}|"*) continue ;;
+    esac
 
     if setup_single_mcp_config "$tool" "$path" "$binary_path" "$bearer_token" "$storage_root"; then
       ok "[$tool] Configured MCP entry in $path"
@@ -4465,6 +6273,10 @@ setup_mcp_configs() {
     [ -z "${tool:-}" ] && continue
     [ "$exists_flag" = "1" ] && continue
 
+    if mcp_config_must_skip_shell_write "$tool" "$path" "$PWD"; then
+      continue
+    fi
+
     # Skip if already configured
     case "|${configured_tools}|" in
       *"|${tool}|"*) continue ;;
@@ -4481,6 +6293,15 @@ setup_mcp_configs() {
         ok "[$tool] Created fresh MCP config at $path"
         configured=$((configured + 1))
         configured_tools="${configured_tools}|${tool}"
+      else
+        local rc=$?
+        if [ "$rc" -eq 1 ]; then
+          skipped=$((skipped + 1))
+          configured_tools="${configured_tools}|${tool}"
+        else
+          failed=$((failed + 1))
+          warn "[$tool] Failed to create MCP config at $path"
+        fi
       fi
     fi
   done <<< "$scan"
@@ -4492,12 +6313,20 @@ setup_mcp_configs() {
     info "$skipped MCP config(s) already had mcp-agent-mail entry"
   fi
   verbose "setup_mcp_configs:done configured=${configured} skipped=${skipped} failed=${failed}"
+  [ "$failed" -eq 0 ]
 }
 
 sync_codex_http_configs() {
   local binary_path="$1"
   local scan
-  scan=$(detect_mcp_configs "$PWD" || true)
+  local scan_rc
+  if scan=$(detect_mcp_configs "$PWD"); then
+    scan_rc=0
+  else
+    scan_rc=$?
+    warn "MCP config discovery failed; Codex HTTP sync will not run."
+    return "$scan_rc"
+  fi
   [ -z "$scan" ] && return 0
 
   local synced=0
@@ -4507,6 +6336,13 @@ sync_codex_http_configs() {
   while IFS=$'\t' read -r tool path exists_flag; do
     [ -z "${tool:-}" ] && continue
     [ "$tool" != "codex" ] && continue
+
+    # The TOML/JSON writers resolve HTTP_BEARER_TOKEN internally even though
+    # this sync call passes empty legacy stdio arguments. Preserve the same
+    # pre-native Git boundary used by setup_mcp_configs.
+    if mcp_config_must_skip_shell_write "$tool" "$path" "$PWD"; then
+      continue
+    fi
 
     if [ "$exists_flag" != "1" ]; then
       local parent_dir
@@ -4534,7 +6370,9 @@ sync_codex_http_configs() {
   fi
   if [ "$failed" -gt 0 ]; then
     warn "[codex] Failed to sync $failed HTTP MCP config(s)"
+    return 1
   fi
+  return 0
 }
 
 # Update existing MCP configs that point to Python to use the Rust binary.
@@ -4555,29 +6393,48 @@ update_mcp_configs() {
       verbose "update_mcp_configs:skip reason=no_am_cli"
       warn "Could not find 'am' CLI to update MCP configs."
       warn "Run 'am setup run' manually after installation."
-      return 0
+      return 1
     fi
   fi
 
   verbose "update_mcp_configs:start binary=${binary_path} cli=${am_cli}"
 
-  # Check that setup subcommand exists (graceful degradation for older builds)
+  # A native setup pass is the credential-persistence admission gate for all
+  # shell fallback writers. An older binary without this surface must not let
+  # the installer publish a bearer token only into client configs.
   if ! AM_INTERFACE_MODE=cli "$am_cli" setup --help >/dev/null 2>&1; then
     verbose "update_mcp_configs:skip reason=no_setup_subcommand"
-    return 0
+    warn "The installed 'am' binary has no setup subcommand; MCP client configs were not changed."
+    return 1
   fi
 
-  set +e
+  local persisted_env
+  persisted_env="$(rust_config_env_path)"
+  # This must precede the native setup call: `am setup` writes the token before
+  # its config actions, so a project-contained XDG_CONFIG_HOME would otherwise
+  # create a credential artifact before the installer could validate it.
+  if ! token_env_targets_outside_git_worktrees "$persisted_env" "$persisted_env"; then
+    warn "Canonical token authority is not safely outside every Git worktree: $persisted_env"
+    return 1
+  fi
+
   local setup_out
+  local setup_rc
   local setup_token
   setup_token="$(resolve_setup_http_bearer_token)"
   if [ -n "$setup_token" ]; then
-    setup_out=$(AM_INTERFACE_MODE=cli HTTP_BEARER_TOKEN="$setup_token" "$am_cli" setup run --yes --no-hooks 2>&1)
+    if setup_out=$(AM_INTERFACE_MODE=cli HTTP_BEARER_TOKEN="$setup_token" "$am_cli" setup run --yes --no-hooks 2>&1); then
+      setup_rc=0
+    else
+      setup_rc=$?
+    fi
   else
-    setup_out=$(AM_INTERFACE_MODE=cli "$am_cli" setup run --yes --no-hooks 2>&1)
+    if setup_out=$(AM_INTERFACE_MODE=cli "$am_cli" setup run --yes --no-hooks 2>&1); then
+      setup_rc=0
+    else
+      setup_rc=$?
+    fi
   fi
-  local setup_rc=$?
-  set -e
 
   verbose "update_mcp_configs:result rc=${setup_rc}"
   if [ -n "$setup_out" ]; then
@@ -4585,6 +6442,38 @@ update_mcp_configs() {
   fi
 
   if [ "$setup_rc" -eq 0 ]; then
+    local persisted_token persisted_mode
+    if [ -L "$persisted_env" ] || [ ! -f "$persisted_env" ]; then
+      warn "Native MCP setup did not produce a regular canonical token file: $persisted_env"
+      warn "No shell MCP fallback writers will run."
+      return 1
+    fi
+    persisted_token="$(read_env_assignment_value "$persisted_env" "HTTP_BEARER_TOKEN")"
+    if [ -z "$persisted_token" ]; then
+      warn "Native MCP setup returned success without a durable bearer token in $persisted_env"
+      warn "No shell MCP fallback writers will run."
+      return 1
+    fi
+    if [ -n "$setup_token" ] && [ "$persisted_token" != "$setup_token" ]; then
+      warn "Native MCP setup persisted a different bearer token than the installer selected."
+      warn "No shell MCP fallback writers will run."
+      return 1
+    fi
+    if stat -f '%Lp' "$persisted_env" >/dev/null 2>&1; then
+      persisted_mode="$(stat -f '%Lp' "$persisted_env")"
+    else
+      persisted_mode="$(stat -c '%a' "$persisted_env" 2>/dev/null || true)"
+    fi
+    if [ "$persisted_mode" != "600" ]; then
+      warn "Canonical token file must have mode 600, found ${persisted_mode:-unknown}: $persisted_env"
+      warn "No shell MCP fallback writers will run."
+      return 1
+    fi
+    # The CLI may have generated the token when no prior source existed.
+    # Publish only the exact durable value to subsequent fallback writers and
+    # service installation phases.
+    export HTTP_BEARER_TOKEN="$persisted_token"
+
     # Parse counts from output (e.g., "7 config files processed: 2 created, 1 updated, 4 unchanged")
     local counts_line created updated
     counts_line=$(echo "$setup_out" | command grep "config files processed" 2>/dev/null || true)
@@ -4605,7 +6494,63 @@ update_mcp_configs() {
   else
     warn "MCP config update returned exit code $setup_rc"
     warn "Run 'am setup run' manually to configure MCP integrations."
+    return 1
   fi
+  return 0
+}
+
+configure_mcp_clients() {
+  local binary_path="$1"
+  local am_cli="$2"
+
+  if ! update_mcp_configs "$binary_path" "$am_cli"; then
+    warn "Skipping shell MCP fallback writers because native setup did not prove durable token continuity."
+    return 1
+  fi
+  if ! setup_mcp_configs "$binary_path"; then
+    warn "One or more MCP fallback configuration writes failed."
+    return 1
+  fi
+  if ! sync_codex_http_configs "$binary_path"; then
+    warn "One or more Codex HTTP synchronization writes failed."
+    return 1
+  fi
+  return 0
+}
+
+# Run the production MCP configuration phase with a failure policy derived
+# from the same target authority as readiness. A clean host with no target
+# may legitimately have `am setup run` perform no work and leave no token file;
+# preserve that non-fatal install contract. Once a remote client is present,
+# however, any native or fallback setup failure means the detected client was
+# not proven usable and must fail the installer instead of being hidden.
+configure_mcp_clients_for_install() {
+  local binary_path="$1"
+  local am_cli="$2"
+  local targets
+  local targets_rc
+
+  if targets=$(remote_http_client_target_tools); then
+    targets_rc=0
+  else
+    targets_rc=$?
+    err "MCP client authority discovery failed; refusing to continue installation."
+    return "$targets_rc"
+  fi
+
+  if configure_mcp_clients "$binary_path" "$am_cli"; then
+    return 0
+  fi
+  if [ -n "$targets" ]; then
+    err "Detected remote MCP client setup failed; installation cannot report success."
+    err "Affected client kind(s): $(printf '%s' "$targets" | tr '\n' ' ')"
+    err "Resolve the MCP configuration error above, then rerun the installer."
+    return 1
+  fi
+
+  warn "MCP client setup did not complete, but no remote MCP client target was detected."
+  warn "The binaries remain installed; run 'am setup run' after installing a supported client."
+  return 0
 }
 
 record_uninstall_summary() {
@@ -5099,7 +7044,67 @@ ensure_rust() {
   rustup component add rustfmt clippy || true
 }
 
-# Verify SHA256 checksum of a file
+checkout_exact_release_source() {
+  local repository_url="$1"
+  local destination="$2"
+  local release_tag="$3"
+  local fetched_revision="" remote_revision=""
+
+  git init --quiet "$destination" || return 1
+  git -C "$destination" remote add origin "$repository_url" || return 1
+  git -C "$destination" fetch --quiet --depth 1 origin "refs/tags/${release_tag}" || return 1
+  git -C "$destination" checkout --quiet --detach FETCH_HEAD || return 1
+  fetched_revision=$(git -C "$destination" rev-parse HEAD 2>/dev/null || true)
+  remote_revision=$(git -C "$destination" ls-remote origin "refs/tags/${release_tag}^{}" \
+    | awk 'NR == 1 {print $1}')
+  if [ -z "$remote_revision" ]; then
+    remote_revision=$(git -C "$destination" ls-remote origin "refs/tags/${release_tag}" \
+      | awk 'NR == 1 {print $1}')
+  fi
+  if ! [[ "$fetched_revision" =~ ^[0-9a-f]{40}$ ]] || \
+     [ "$remote_revision" != "$fetched_revision" ]; then
+    err "Release tag ${release_tag} resolved to ${remote_revision:-missing}, not fetched ${fetched_revision:-missing}."
+    return 1
+  fi
+  verbose "source_checkout:tag=${release_tag} revision=${fetched_revision}"
+}
+
+release_dependency_pin() {
+  local source_root="$1"
+  local key="$2"
+  local workflow="$source_root/.github/workflows/dist.yml"
+  local matches="" count=0 pin=""
+
+  [ -f "$workflow" ] || return 1
+  matches=$(awk -v key="${key}:" '$1 == key { print $2 }' "$workflow")
+  if [ -n "$matches" ]; then
+    count=$(printf '%s\n' "$matches" | grep -c . || true)
+  fi
+  [ "$count" -eq 1 ] || return 1
+  pin="$matches"
+  [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s' "$pin"
+}
+
+checkout_pinned_dependency() {
+  local repository_url="$1"
+  local destination="$2"
+  local expected_revision="$3"
+  local actual_revision=""
+
+  git init --quiet "$destination" || return 1
+  git -C "$destination" remote add origin "$repository_url" || return 1
+  git -C "$destination" fetch --quiet --depth 1 origin "$expected_revision" || return 1
+  git -C "$destination" checkout --quiet --detach FETCH_HEAD || return 1
+  actual_revision=$(git -C "$destination" rev-parse HEAD 2>/dev/null || true)
+  if [ "$actual_revision" != "$expected_revision" ]; then
+    err "Pinned dependency at $destination resolved to ${actual_revision:-missing}, expected $expected_revision."
+    return 1
+  fi
+}
+
+# Verify the SHA256 checksum of a file. Verification is fail-closed: callers
+# must use --no-verify explicitly if this host cannot compute SHA256.
 verify_checksum() {
   local file="$1"
   local expected="$2"
@@ -5113,16 +7118,37 @@ verify_checksum() {
     return 1
   fi
 
-  if command -v sha256sum &>/dev/null; then
-    actual=$(sha256sum "$file" | cut -d' ' -f1)
-  elif command -v shasum &>/dev/null; then
-    actual=$(shasum -a 256 "$file" | cut -d' ' -f1)
-  else
-    warn "No SHA256 tool found (sha256sum or shasum), skipping verification"
-    return 0
+  if ! [[ "$expected" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+    err "Invalid SHA256 checksum witness: expected exactly 64 hexadecimal characters."
+    err "Re-download the release checksum, or use --no-verify only for a trusted local artifact."
+    return 1
   fi
 
-  if [ "$actual" != "$expected" ]; then
+  if command -v sha256sum &>/dev/null; then
+    if ! actual=$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1); then
+      err "sha256sum failed while hashing $file"
+      return 1
+    fi
+  elif command -v shasum &>/dev/null; then
+    if ! actual=$(shasum -a 256 "$file" 2>/dev/null | cut -d' ' -f1); then
+      err "shasum failed while hashing $file"
+      return 1
+    fi
+  else
+    err "No SHA256 implementation found (requires sha256sum or shasum)."
+    err "Install a SHA256 tool, or use --no-verify only for a trusted local artifact."
+    return 1
+  fi
+
+  if ! [[ "$actual" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+    err "SHA256 implementation returned an invalid digest for $file"
+    return 1
+  fi
+
+  local expected_normalized actual_normalized
+  expected_normalized=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
+  actual_normalized=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
+  if [ "$actual_normalized" != "$expected_normalized" ]; then
     verbose "verify_checksum:failed actual=${actual}"
     err "Checksum verification FAILED!"
     err "Expected: $expected"
@@ -5141,16 +7167,123 @@ verify_checksum() {
   return 0
 }
 
-# Verify Sigstore/cosign bundle for a file (best-effort)
+# Resolve an archive checksum witness and verify it before any extraction.
+resolve_and_verify_archive_checksum() {
+  local archive_file="$1"
+  local artifact_url="$2"
+  local artifact_name="$3"
+  local expected_checksum="$CHECKSUM"
+  local checksum_file="$TMP/checksum.sha256"
+  local checksum_resolved=0
+
+  if [ -n "$expected_checksum" ]; then
+    checksum_resolved=1
+    verbose "checksum:using_explicit_value"
+  fi
+
+  # Strategy 1: an explicit checksum URL supplied by the caller.
+  if [ "$checksum_resolved" -eq 0 ] && [ -n "$CHECKSUM_URL" ]; then
+    info "Fetching checksum from ${CHECKSUM_URL}"
+    if download_to_file "$CHECKSUM_URL" "$checksum_file" "checksum-download" && [ -s "$checksum_file" ]; then
+      expected_checksum=$(awk '{print $1; exit}' "$checksum_file")
+      [ -n "$expected_checksum" ] && checksum_resolved=1
+    fi
+  fi
+
+  # Strategy 2: the consolidated release manifest.
+  if [ "$checksum_resolved" -eq 0 ]; then
+    local sha256sums_url sha256sums_file
+    sha256sums_url="$(dirname "$artifact_url")/SHA256SUMS"
+    sha256sums_file="$TMP/SHA256SUMS"
+    verbose "checksum:trying_sha256sums url=${sha256sums_url}"
+    info "Fetching checksum manifest from ${sha256sums_url}"
+    if download_to_file "$sha256sums_url" "$sha256sums_file" "sha256sums-download" && [ -s "$sha256sums_file" ]; then
+      expected_checksum=$(awk -v artifact="$artifact_name" '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1; exit}' "$sha256sums_file")
+      if [ -n "$expected_checksum" ]; then
+        checksum_resolved=1
+      else
+        verbose "checksum:SHA256SUMS_no_match artifact=${artifact_name}"
+      fi
+    fi
+  fi
+
+  # Strategy 3: the per-archive sidecar retained by older/manual releases.
+  if [ "$checksum_resolved" -eq 0 ] && [ -z "$CHECKSUM_URL" ]; then
+    local sidecar_url="${artifact_url}.sha256"
+    verbose "checksum:trying_sidecar url=${sidecar_url}"
+    info "Trying per-artifact checksum sidecar ${sidecar_url}"
+    if download_to_file "$sidecar_url" "$checksum_file" "checksum-download" && [ -s "$checksum_file" ]; then
+      expected_checksum=$(awk '{print $1; exit}' "$checksum_file")
+      [ -n "$expected_checksum" ] && checksum_resolved=1
+    fi
+  fi
+
+  if [ "$checksum_resolved" -eq 0 ]; then
+    err "No SHA256 checksum witness is available for ${artifact_name}."
+    err "Release archives are not extracted without a checksum unless --no-verify is explicit."
+    return 1
+  fi
+
+  verify_checksum "$archive_file" "$expected_checksum"
+}
+
+# LEGACY PATH (releases < MINISIGN_TRUST_MIN_VERSION only): verify the
+# standardized Sigstore bundle for a file. cosign is the parser and verifier
+# for the bundle, certificate identity, issuer, and transparency proof; any
+# missing dependency or invalid evidence is fatal before extraction. Releases
+# >= v0.3.31 never enter this path — see verify_minisign_signed_checksum.
+require_safe_cosign() {
+  local version_output="" parsed_versions="" version_count=0 version=""
+  local major=0 minor=0 patch=0
+
+  COSIGN_BIN=$(type -P cosign 2>/dev/null || true)
+  if [ -z "$COSIGN_BIN" ] || [ ! -x "$COSIGN_BIN" ]; then
+    err "cosign is required to verify legacy (< v${MINISIGN_TRUST_MIN_VERSION}) release archives but was not found."
+    err "Install cosign v3.1.3 or newer in the v3 line, or use --no-verify only for a trusted local artifact."
+    return 1
+  fi
+  if ! capture_command_with_timeout 3 "$COSIGN_BIN" version; then
+    err "Could not determine the installed cosign version with a bounded probe (status ${CAPTURED_CMD_STATUS})."
+    err "Release verification requires a parseable stable cosign v3.1.3 or newer, below v4."
+    return 1
+  fi
+  if [ "$CAPTURED_CMD_OUTPUT_LOSSLESS" -ne 1 ]; then
+    err "Could not determine the installed cosign version without losing output bytes."
+    err "Release verification requires a parseable stable cosign v3.1.3 or newer, below v4."
+    return 1
+  fi
+  version_output="$CAPTURED_CMD_OUTPUT_EXACT"
+
+  parsed_versions=$(printf '%s\n' "$version_output" | sed -n \
+    's/^[[:space:]]*GitVersion:[[:space:]]*v\{0,1\}\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)[[:space:]]*$/\1/p')
+  if [ -n "$parsed_versions" ]; then
+    version_count=$(printf '%s\n' "$parsed_versions" | grep -c . || true)
+  fi
+  if [ "$version_count" -ne 1 ]; then
+    err "Could not parse exactly one stable GitVersion from cosign version output."
+    err "Release verification requires cosign >=3.1.3 and <4.0.0."
+    return 1
+  fi
+
+  version="$parsed_versions"
+  IFS=. read -r major minor patch <<< "$version"
+  if [ "$major" -ne 3 ] || \
+     { [ "$minor" -lt 1 ] || { [ "$minor" -eq 1 ] && [ "$patch" -lt 3 ]; }; }; then
+    err "Unsafe or unsupported cosign version v${version}; require >=v3.1.3 and <v4.0.0."
+    err "Older versions are affected by identity-policy bypasses for attacker-supplied legacy bundles."
+    return 1
+  fi
+
+  verbose "verify_sigstore_bundle:cosign_bin=${COSIGN_BIN} cosign_version=v${version}"
+  return 0
+}
+
 verify_sigstore_bundle() {
   local file="$1"
   local artifact_url="$2"
   verbose "verify_sigstore_bundle:start file=${file} artifact_url=${artifact_url}"
 
-  if ! command -v cosign &>/dev/null; then
-    warn "cosign not found; skipping signature verification (install cosign for stronger authenticity checks)"
-    return 0
-  fi
+  require_safe_cosign || return 1
 
   local bundle_url="$SIGSTORE_BUNDLE_URL"
   if [ -z "$bundle_url" ]; then
@@ -5158,57 +7291,44 @@ verify_sigstore_bundle() {
   fi
 
   local bundle_file
-  bundle_file="$TMP/$(basename "$bundle_url")"
+  bundle_file="$TMP/release.sigstore.json"
   info "Fetching sigstore bundle from ${bundle_url}"
   if ! download_to_file "$bundle_url" "$bundle_file" "sigstore-bundle"; then
-    warn "Sigstore bundle not found; skipping signature verification"
+    err "Sigstore bundle not found at ${bundle_url}."
+    err "Release archives are not extracted without a signature unless --no-verify is explicit."
     verbose "verify_sigstore_bundle:bundle_missing url=${bundle_url}"
-    return 0
+    return 1
   fi
 
   # Guard: verify the bundle file actually exists and is non-empty after download
   if [ ! -f "$bundle_file" ]; then
-    warn "Sigstore bundle file missing after download; skipping signature verification"
+    err "Sigstore bundle file is missing after download: ${bundle_file}"
     verbose "verify_sigstore_bundle:file_missing_after_download path=${bundle_file}"
-    return 0
+    return 1
   fi
   if [ ! -s "$bundle_file" ]; then
-    warn "Sigstore bundle file is empty; skipping signature verification"
+    err "Sigstore bundle file is empty: ${bundle_file}"
     verbose "verify_sigstore_bundle:file_empty path=${bundle_file}"
-    return 0
+    return 1
   fi
 
-  # Our releases ship the new standardized Sigstore protobuf bundle
-  # (.sigstore.json). cosign 2.x can verify it but only with an explicit
-  # --new-bundle-format; cosign 3.x enables that format by default. Passing the
-  # flag to a 3.x build is harmless (it still exists), but to avoid depending on
-  # the flag's continued presence we only add it for the 2.x line. For an
-  # unparseable version we add it: every cosign that can verify a .sigstore.json
-  # bundle at all (2.4+) accepts the flag, so this is the safe default.
-  local nbf_flag=""
-  case "$bundle_file" in
-    *.sigstore.json|*.sigstore)
-      local cosign_major
-      cosign_major="$(cosign version 2>/dev/null \
-        | sed -n 's/.*GitVersion:[[:space:]]*v\{0,1\}\([0-9][0-9]*\).*/\1/p' \
-        | head -n1)"
-      # Add the flag unless cosign is a known v3+ (where the new format is the
-      # default). Empty/non-numeric version (e.g. "devel") falls through to the
-      # safe default of adding it.
-      if ! printf '%s' "$cosign_major" | grep -qE '^[0-9]+$' || [ "$cosign_major" -lt 3 ]; then
-        nbf_flag="--new-bundle-format"
-      fi
-      verbose "verify_sigstore_bundle:cosign_major=${cosign_major:-unknown} new_bundle_format=${nbf_flag:-off}"
-      ;;
-  esac
-
-  if ! cosign verify-blob \
-    ${nbf_flag:+$nbf_flag} \
+  # Force standardized-bundle parsing even though v3 defaults to it. This makes
+  # a substituted legacy JSON bundle fail closed instead of entering a legacy
+  # parser. Clear every documented custom-trust override so the release policy
+  # is anchored in Sigstore's public-good trust root, not caller-supplied roots.
+  if ! env \
+    -u SIGSTORE_ROOT_FILE \
+    -u SIGSTORE_REKOR_PUBLIC_KEY \
+    -u SIGSTORE_CT_LOG_PUBLIC_KEY_FILE \
+    "$COSIGN_BIN" verify-blob \
+    --new-bundle-format \
     --bundle "$bundle_file" \
-    --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
+    --certificate-identity "$COSIGN_IDENTITY" \
     --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
     "$file"; then
-    verbose "verify_sigstore_bundle:cosign_failed bundle=${bundle_file} new_bundle_format=${nbf_flag:-off}"
+    verbose "verify_sigstore_bundle:cosign_failed bundle=${bundle_file} new_bundle_format=on"
+    err "Sigstore verification failed for ${file}."
+    err "The bundle must be valid and signed by ${COSIGN_IDENTITY} via ${COSIGN_OIDC_ISSUER}."
     return 1
   fi
 
@@ -5217,35 +7337,189 @@ verify_sigstore_bundle() {
   return 0
 }
 
-# Check if installed version matches target
-check_installed_version() {
-  local target_version="$1"
-  if [ ! -x "$DEST/$BIN_CLI" ]; then
+# Minisign is the verifier for releases >= MINISIGN_TRUST_MIN_VERSION. The
+# authenticity witness is a detached minisign signature over the SHA256SUMS
+# manifest, checked against the public key pinned in this script. A missing
+# minisign binary is fatal: verification never silently degrades to
+# checksum-only.
+require_minisign() {
+  MINISIGN_BIN=$(type -P minisign 2>/dev/null || true)
+  if [ -z "$MINISIGN_BIN" ] || [ ! -x "$MINISIGN_BIN" ]; then
+    err "minisign is required to verify release authenticity but was not found."
+    err "Install it (Debian/Ubuntu: apt install minisign; macOS: brew install minisign;"
+    err "other: https://jedisct1.github.io/minisign/), or use --no-verify only for a trusted local artifact."
+    return 1
+  fi
+  verbose "require_minisign:bin=${MINISIGN_BIN}"
+  return 0
+}
+
+# Fetch the release SHA256SUMS manifest plus its .minisig, verify the
+# signature over the exact manifest bytes with the pinned public key, then
+# verify the archive against the checksum recorded in the now-authenticated
+# manifest. Fail-closed at every step.
+verify_minisign_signed_checksum() {
+  local archive_file="$1"
+  local artifact_url="$2"
+  local artifact_name="$3"
+  local release_base sha256sums_url sha256sums_file sig_url sig_file
+  local expected_checksum
+
+  require_minisign || return 1
+
+  release_base="$(dirname "$artifact_url")"
+  sha256sums_url="${release_base}/SHA256SUMS"
+  sha256sums_file="$TMP/SHA256SUMS"
+  sig_url="${release_base}/SHA256SUMS.minisig"
+  sig_file="$TMP/SHA256SUMS.minisig"
+
+  info "Fetching checksum manifest from ${sha256sums_url}"
+  if ! download_to_file "$sha256sums_url" "$sha256sums_file" "sha256sums-download" || [ ! -s "$sha256sums_file" ]; then
+    err "Release checksum manifest not found at ${sha256sums_url}."
+    err "Release archives are not extracted without an authenticated checksum unless --no-verify is explicit."
     return 1
   fi
 
-  local installed_version
-  if capture_command_with_timeout 3 "$DEST/$BIN_CLI" --version; then
-    installed_version=$(printf '%s\n' "$CAPTURED_CMD_OUTPUT" | head -1 | sed 's/.*\([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/')
-  else
-    if [ "$CAPTURED_CMD_STATUS" -eq 124 ]; then
-      verbose "check_installed_version:timeout path=${DEST}/$BIN_CLI"
+  info "Fetching manifest signature from ${sig_url}"
+  if ! download_to_file "$sig_url" "$sig_file" "minisig-download" || [ ! -s "$sig_file" ]; then
+    err "Release manifest signature not found at ${sig_url}."
+    err "Releases v${MINISIGN_TRUST_MIN_VERSION} and later must publish SHA256SUMS.minisig."
+    err "Release archives are not extracted without a signature unless --no-verify is explicit."
+    return 1
+  fi
+
+  if ! "$MINISIGN_BIN" -Vm "$sha256sums_file" -x "$sig_file" -P "$MINISIGN_PUBLIC_KEY" >/dev/null; then
+    verbose "verify_minisign:failed manifest=${sha256sums_file} sig=${sig_file}"
+    err "Minisign verification FAILED for the release checksum manifest."
+    err "The manifest must be signed by the maintainer release key (id 1BBD79B28BF718D0)."
+    err "The release may be corrupted or tampered with; do not install it."
+    error_support_hint
+    return 1
+  fi
+  ok "Release manifest signature verified (minisign)"
+  verbose "verify_minisign:ok manifest=${sha256sums_file}"
+
+  expected_checksum=$(awk -v artifact="$artifact_name" '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1; exit}' "$sha256sums_file")
+  if [ -z "$expected_checksum" ]; then
+    err "The authenticated SHA256SUMS manifest has no entry for ${artifact_name}."
+    err "The release asset inventory is incomplete; do not install it."
+    error_support_hint
+    return 1
+  fi
+
+  verify_checksum "$archive_file" "$expected_checksum"
+}
+
+verify_release_archive() {
+  local archive_file="$1"
+  local artifact_url="$2"
+  local artifact_name="$3"
+
+  if [ "$RELEASE_TRUST_MODEL" = "minisign" ]; then
+    # Releases >= MINISIGN_TRUST_MIN_VERSION: the SHA256 witness and the
+    # authenticity witness are one artifact — a minisign-signed SHA256SUMS.
+    # The Sigstore/cosign path is not consulted for these releases (GitHub
+    # Actions no longer builds them, so its workflow identity cannot exist).
+    verify_minisign_signed_checksum "$archive_file" "$artifact_url" "$artifact_name" || return 1
+    if [ -n "$CHECKSUM" ] || [ -n "$CHECKSUM_URL" ]; then
+      # An explicitly supplied checksum witness is honored in addition to,
+      # never instead of, the signed manifest.
+      resolve_and_verify_archive_checksum "$archive_file" "$artifact_url" "$artifact_name" || return 1
     fi
-    return 1
-  fi
-
-  if [ -z "$installed_version" ]; then
-    return 1
-  fi
-
-  local target_clean="${target_version#v}"
-  local installed_clean="${installed_version#v}"
-
-  if [ "$target_clean" = "$installed_clean" ]; then
+    if [ -n "$SIGSTORE_BUNDLE_URL" ]; then
+      warn "SIGSTORE_BUNDLE_URL is ignored for releases >= v${MINISIGN_TRUST_MIN_VERSION} (minisign trust model)."
+    fi
     return 0
   fi
 
-  return 1
+  resolve_and_verify_archive_checksum "$archive_file" "$artifact_url" "$artifact_name" || return 1
+  verify_sigstore_bundle "$archive_file" "$artifact_url" || return 1
+  return 0
+}
+
+# Verify the archive inventory without extracting it. Release archives are
+# deliberately flat and contain exactly two non-empty regular files. This gate
+# remains mandatory under --no-verify: that flag bypasses cryptographic witness
+# verification, not archive-shape safety or release-version identity.
+verify_archive_members_exact() {
+  local archive_file="$1"
+  local members_file="$TMP/release-archive-members.txt"
+  local details_file="$TMP/release-archive-members.verbose.txt"
+  local actual_members expected_members member_count regular_count
+
+  if ! tar -tf "$archive_file" >"$members_file"; then
+    err "Could not read release archive inventory: $archive_file"
+    return 1
+  fi
+
+  actual_members=$(LC_ALL=C sort "$members_file")
+  expected_members=$(printf '%s\n' "$BIN_CLI" "$BIN_SERVER" | LC_ALL=C sort)
+  member_count=$(wc -l <"$members_file" | tr -d '[:space:]')
+  if [ "$member_count" != "2" ] || [ "$actual_members" != "$expected_members" ]; then
+    err "Release archive members are invalid."
+    err "Expected exactly the flat files: $BIN_CLI and $BIN_SERVER"
+    return 1
+  fi
+
+  if ! tar -tvf "$archive_file" >"$details_file"; then
+    err "Could not inspect release archive member types: $archive_file"
+    return 1
+  fi
+  regular_count=$(awk 'substr($0, 1, 1) == "-" { count++ } END { print count + 0 }' "$details_file")
+  if [ "$regular_count" != "2" ]; then
+    err "Release archive must contain exactly two regular files (no links or directories)."
+    return 1
+  fi
+
+  return 0
+}
+
+binary_version_matches_exact() {
+  local binary_path="$1"
+  local expected_output="$2"
+
+  CAPTURED_CMD_OUTPUT=""
+  CAPTURED_CMD_OUTPUT_EXACT=""
+  CAPTURED_CMD_OUTPUT_LOSSLESS=1
+  CAPTURED_CMD_STATUS=0
+  [ -x "$binary_path" ] || return 1
+  capture_command_with_timeout 3 "$binary_path" --version || return 1
+  [ "$CAPTURED_CMD_OUTPUT_LOSSLESS" -eq 1 ] || return 1
+  [ "$CAPTURED_CMD_OUTPUT_EXACT" = "$expected_output" ] || \
+    [ "$CAPTURED_CMD_OUTPUT_EXACT" = "${expected_output}"$'\n' ]
+}
+
+verify_release_binaries_exact() {
+  local server_path="$1"
+  local cli_path="$2"
+  local phase="$3"
+  local expected_cli="am ${EXPECTED_RELEASE_VERSION}"
+  local expected_server="mcp-agent-mail ${EXPECTED_RELEASE_VERSION}"
+
+  if ! binary_version_matches_exact "$cli_path" "$expected_cli"; then
+    err "${phase} $BIN_CLI has the wrong release version."
+    err "Expected exactly: $expected_cli"
+    err "Observed: ${CAPTURED_CMD_OUTPUT:-<no version output>}"
+    return 1
+  fi
+  if ! binary_version_matches_exact "$server_path" "$expected_server"; then
+    err "${phase} $BIN_SERVER has the wrong release version."
+    err "Expected exactly: $expected_server"
+    err "Observed: ${CAPTURED_CMD_OUTPUT:-<no version output>}"
+    return 1
+  fi
+
+  ok "${phase} binaries match release ${VERSION}"
+  return 0
+}
+
+# Check if installed version matches target
+check_installed_version() {
+  local target_version="$1"
+  local target_clean="${target_version#v}"
+
+  binary_version_matches_exact "$DEST/$BIN_CLI" "am ${target_clean}" || return 1
+  binary_version_matches_exact "$DEST/$BIN_SERVER" "mcp-agent-mail ${target_clean}"
 }
 
 EXISTING_INSTALL_REPAIR_REASON=""
@@ -5461,14 +7735,20 @@ Options:
   --system           Install to /usr/local/bin (requires sudo)
   --easy-mode        Auto-update PATH in shell rc files
   --no-easy          Do not auto-update PATH in shell rc files
-  --verify           Run self-test after install
+  --verify           Run an additional self-test after install
+                     (archive verification is already required by default)
   --from-source      Build from source instead of downloading binary
   --quiet            Suppress non-error output
   --verbose          Enable detailed installer diagnostics
   --offline          Skip network preflight checks
   --no-gum           Disable gum formatting even if available
-  --no-verify        Skip checksum + signature verification (for testing only)
-  --force            Force reinstall even if same version is installed
+  --no-verify        UNSAFE: skip checksum + signature checks (minisign for
+                     releases >= v0.3.31, Sigstore/cosign for older releases);
+                     archive shape and exact staged/installed version checks
+                     remain mandatory. Downloaded binaries execute during those
+                     version probes; malicious bytes can run arbitrary code
+                     (trusted artifacts only)
+  --force            Reinstall without probing the already-installed version
   --migrate          Force Python->Rust migration/displacement when Python install is detected
   --no-migrate       Skip and remember Python->Rust migration/displacement
   --no-service       Do not install/modify/restart any background service
@@ -5484,8 +7764,6 @@ EOFU
 
 trap 'on_error $LINENO' ERR
 trap early_exit_dump EXIT
-init_verbose_log
-verbose "argv=${ORIGINAL_ARGS[*]:-(none)}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -5538,7 +7816,7 @@ while [ $# -gt 0 ]; do
     --verbose) VERBOSE=1; shift;;
     --offline) OFFLINE=1; shift;;
     --no-gum) NO_GUM=1; shift;;
-    --no-verify) NO_CHECKSUM=1; shift;;
+    --no-verify) NO_VERIFY=1; shift;;
     --force) FORCE_INSTALL=1; shift;;
     --migrate) FORCE_MIGRATE=1; shift;;
     --no-migrate) FORCE_NO_MIGRATE=1; shift;;
@@ -5556,6 +7834,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Initialize persistent diagnostics only after option parsing establishes that
+# this is not a dry-run. verbose() remains stdout-only for dry-run previews.
+verbose "argv=${ORIGINAL_ARGS[*]:-(none)}"
+
 if [ "$FORCE_MIGRATE" -eq 1 ] && [ "$FORCE_NO_MIGRATE" -eq 1 ]; then
   err "Cannot combine --migrate and --no-migrate"
   err "Choose one behavior: --migrate (force migration) OR --no-migrate (skip migration)."
@@ -5563,7 +7845,13 @@ if [ "$FORCE_MIGRATE" -eq 1 ] && [ "$FORCE_NO_MIGRATE" -eq 1 ]; then
   exit 2
 fi
 
-verbose "config VERSION=${VERSION:-latest} DEST=${DEST} SYSTEM=${SYSTEM} EASY=${EASY} VERIFY=${VERIFY} FROM_SOURCE=${FROM_SOURCE} QUIET=${QUIET} VERBOSE=${VERBOSE} OFFLINE=${OFFLINE} FORCE_INSTALL=${FORCE_INSTALL} FORCE_MIGRATE=${FORCE_MIGRATE} FORCE_NO_MIGRATE=${FORCE_NO_MIGRATE} NO_SERVICE=${NO_SERVICE} UNINSTALL=${UNINSTALL} ASSUME_YES=${ASSUME_YES} PURGE=${PURGE} DRY_RUN=${DRY_RUN}"
+if [ "$UNINSTALL" -eq 1 ] && [ "$DRY_RUN" -eq 1 ]; then
+  err "--dry-run does not yet provide a complete uninstall preview; refusing to uninstall."
+  err "No uninstall changes were made. Re-run with --uninstall only when removal is intended."
+  exit 2
+fi
+
+verbose "config VERSION=${VERSION:-latest} DEST=${DEST} SYSTEM=${SYSTEM} EASY=${EASY} VERIFY=${VERIFY} NO_VERIFY=${NO_VERIFY} FROM_SOURCE=${FROM_SOURCE} QUIET=${QUIET} VERBOSE=${VERBOSE} OFFLINE=${OFFLINE} FORCE_INSTALL=${FORCE_INSTALL} FORCE_MIGRATE=${FORCE_MIGRATE} FORCE_NO_MIGRATE=${FORCE_NO_MIGRATE} NO_SERVICE=${NO_SERVICE} UNINSTALL=${UNINSTALL} ASSUME_YES=${ASSUME_YES} PURGE=${PURGE} DRY_RUN=${DRY_RUN}"
 
 if [ "$UNINSTALL" -eq 1 ]; then
   uninstall
@@ -5588,33 +7876,40 @@ if [ "$QUIET" -eq 0 ]; then
   fi
 fi
 
-resolve_version
-detect_platform
-set_artifact_url
-
-# Ensure the destination directory hierarchy exists before preflight checks
-mkdir -p "$DEST" 2>/dev/null || true
+if ! resolve_version; then
+  error_usage_hint
+  exit 1
+fi
+if ! establish_release_contract; then
+  error_usage_hint
+  exit 2
+fi
+if ! detect_platform; then
+  error_usage_hint
+  exit 1
+fi
+if ! set_artifact_url; then
+  error_usage_hint
+  exit 1
+fi
 
 preflight_checks
 
 # Detect existing Python installation (T1.1, T1.2, T1.3)
 detect_python
 
-# Check if already at target version (skip download if so, unless --force)
+# A self-reported version is not proof that installed bytes came from the
+# authenticated release. Unless --force suppresses this informational probe,
+# report the match but continue through download, verification, and replacement.
 if [ "$FORCE_INSTALL" -eq 0 ] && check_installed_version "$VERSION"; then
   if existing_install_can_skip; then
-    if [ "$PYTHON_DETECTED" -eq 1 ] && [ "$FORCE_NO_MIGRATE" -eq 1 ] && \
-       [ "$FORCE_MIGRATE" -ne 1 ] && [ ! -f "$PYTHON_MIGRATION_SKIP_MARKER" ]; then
-      write_python_migration_skip_marker "explicit --no-migrate"
-    fi
-    ok "mcp-agent-mail $VERSION is already installed at $DEST"
-    info "Use --force to reinstall"
-    exit 0
+    info "mcp-agent-mail $VERSION already reports the requested version at $DEST."
+    info "Continuing with authenticated download and byte-for-byte replacement; a version string alone is not release provenance."
+  else
+    warn "Installed version matches $VERSION, but the existing install still needs repair."
+    [ -n "$EXISTING_INSTALL_REPAIR_REASON" ] && warn "  Reason: $EXISTING_INSTALL_REPAIR_REASON"
+    info "Continuing with reinstall/remediation instead of exiting early."
   fi
-
-  warn "Installed version matches $VERSION, but the existing install still needs repair."
-  [ -n "$EXISTING_INSTALL_REPAIR_REASON" ] && warn "  Reason: $EXISTING_INSTALL_REPAIR_REASON"
-  info "Continuing with reinstall/remediation instead of exiting early."
 fi
 
 # ── Install plan preview / dry-run / piped confirmation ─────────────────────
@@ -5639,6 +7934,14 @@ print_install_plan() {
   else
     echo "  Method:     Download pre-built binary"
     [ -n "${URL:-}" ] && echo "  URL:        $URL"
+    if [ "$NO_VERIFY" -eq 1 ]; then
+      echo "  Integrity:  UNSAFE cryptographic verification bypass (--no-verify)"
+    elif [ "$RELEASE_TRUST_MODEL" = "minisign" ]; then
+      echo "  Integrity:  required SHA256 + minisign-signed manifest before extraction"
+    else
+      echo "  Integrity:  required SHA256 + Sigstore/cosign before extraction"
+    fi
+    echo "  Release:    exact archive members + staged/installed version required"
   fi
   echo ""
 
@@ -5756,16 +8059,48 @@ if [ "$EASY" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ] && [ -t 1 ] && [ -e /dev/tty ]; 
   esac
 fi
 
+installer_path_owner_uid() {
+  local path="$1"
+  local owner=""
+  owner=$(stat -c '%u' -- "$path" 2>/dev/null) \
+    || owner=$(stat -f '%u' "$path" 2>/dev/null) \
+    || return 1
+  [[ "$owner" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$owner"
+}
+
 remove_installer_lock_dir() {
   local lock_dir="$1"
+  local expected_pid="${2:-}"
+  local lock_owner="" current_uid="" observed_pid=""
   [ -n "$lock_dir" ] || return 0
-  [ -d "$lock_dir" ] || return 0
+  if [ -L "$lock_dir" ]; then
+    warn "Installer lock path is a symlink; refusing cleanup: ${lock_dir}"
+    return 1
+  fi
+  if [ ! -e "$lock_dir" ]; then
+    return 0
+  fi
+  if [ ! -d "$lock_dir" ]; then
+    warn "Installer lock path is not a directory; refusing cleanup: ${lock_dir}"
+    return 1
+  fi
   case "$lock_dir" in
     "/"|"$HOME"|"/tmp"|"/var/tmp")
       warn "Refusing unsafe installer lock cleanup path: ${lock_dir}"
       return 1
       ;;
   esac
+
+  current_uid=$(id -u 2>/dev/null) || return 1
+  lock_owner=$(installer_path_owner_uid "$lock_dir") || {
+    warn "Could not verify installer lock ownership; refusing cleanup: ${lock_dir}"
+    return 1
+  }
+  if [ "$lock_owner" != "$current_uid" ]; then
+    warn "Installer lock belongs to uid ${lock_owner}, not current uid ${current_uid}; refusing cleanup: ${lock_dir}"
+    return 1
+  fi
 
   local unexpected
   unexpected=$(find "$lock_dir" -mindepth 1 ! -name pid -print -quit 2>/dev/null || true)
@@ -5774,12 +8109,25 @@ remove_installer_lock_dir() {
     return 1
   fi
 
-  if [ -e "$lock_dir/pid" ]; then
-    if [ ! -f "$lock_dir/pid" ] && [ ! -L "$lock_dir/pid" ]; then
+  if [ -e "$lock_dir/pid" ] || [ -L "$lock_dir/pid" ]; then
+    if [ -L "$lock_dir/pid" ] || [ ! -f "$lock_dir/pid" ]; then
       warn "Installer lock ${lock_dir}/pid is not a regular file; refusing automatic cleanup"
       return 1
     fi
+    if [ -n "$expected_pid" ]; then
+      if ! observed_pid=$(cat "$lock_dir/pid" 2>/dev/null); then
+        warn "Could not re-read installer lock ownership; refusing cleanup: ${lock_dir}/pid"
+        return 1
+      fi
+      if [ "$observed_pid" != "$expected_pid" ]; then
+        warn "Installer lock owner changed from pid ${expected_pid} to ${observed_pid:-<empty>}; refusing cleanup"
+        return 1
+      fi
+    fi
     rm -f "$lock_dir/pid" || return 1
+  elif [ -n "$expected_pid" ]; then
+    warn "Installer lock pid disappeared before cleanup; refusing to remove the directory: ${lock_dir}"
+    return 1
   fi
   rmdir "$lock_dir"
 }
@@ -5816,39 +8164,39 @@ PY
   rmdir "$tmp_dir"
 }
 
-# Cross-platform locking using mkdir (atomic on all POSIX systems)
-LOCK_DIR="${LOCK_FILE}.d"
-LOCKED=0
-if mkdir "$LOCK_DIR" 2>/dev/null; then
-  LOCKED=1
-  echo $$ > "$LOCK_DIR/pid"
-else
-  if [ -f "$LOCK_DIR/pid" ]; then
-    OLD_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
-    if [ -n "$OLD_PID" ] && ! kill -0 "$OLD_PID" 2>/dev/null; then
-      remove_installer_lock_dir "$LOCK_DIR" || true
-      if mkdir "$LOCK_DIR" 2>/dev/null; then
-        LOCKED=1
-        echo $$ > "$LOCK_DIR/pid"
-      fi
+handle_binary_transaction_signal() {
+  local signal_name="$1"
+  local signal_exit="$2"
+  # A second signal must not recursively enter recovery. SIGKILL and power
+  # loss remain next-run recovery cases by construction.
+  trap - HUP INT QUIT TERM
+  BINARY_TRANSACTION_EXIT_RECOVERY_ATTEMPTED=1
+  if [ -n "${BINARY_TRANSACTION_ACTIVE_INSTALL_DIR:-}" ] && \
+     [ "${BINARY_TRANSACTION_RECOVERY_ACTIVE:-0}" -eq 0 ]; then
+    if ! recover_binary_pair_transaction "$BINARY_TRANSACTION_ACTIVE_INSTALL_DIR"; then
+      err "Recovery after $signal_name failed closed; the active journal was retained."
     fi
   fi
-  if [ "$LOCKED" -eq 0 ]; then
-    err "Another installer is running (lock $LOCK_DIR)"
-    err "Wait for the other install to finish, or remove a stale lock after confirming no installer is active."
-    err "Check lock owner with: cat \"$LOCK_DIR/pid\" && ps -p \"\$(cat \"$LOCK_DIR/pid\" 2>/dev/null)\""
-    err "Stale-lock cleanup: rmdir \"$LOCK_DIR\""
-    exit 1
-  fi
-fi
+  exit "$signal_exit"
+}
 
 cleanup() {
   local rc=$?
+  trap - HUP INT QUIT TERM
+  if [ -n "${BINARY_TRANSACTION_ACTIVE_INSTALL_DIR:-}" ] && \
+     [ "${BINARY_TRANSACTION_RECOVERY_ACTIVE:-0}" -eq 0 ] && \
+     [ "${BINARY_TRANSACTION_EXIT_RECOVERY_ATTEMPTED:-0}" -eq 0 ]; then
+    BINARY_TRANSACTION_EXIT_RECOVERY_ATTEMPTED=1
+    if ! recover_binary_pair_transaction "$BINARY_TRANSACTION_ACTIVE_INSTALL_DIR"; then
+      err "Exit-time binary transaction recovery failed closed; the active journal was retained."
+      [ "$rc" -ne 0 ] || rc=1
+    fi
+  fi
   if [ -n "${TMP:-}" ]; then
     remove_installer_tmp_dir "$TMP" || true
   fi
   if [ "${LOCKED:-0}" -eq 1 ]; then
-    remove_installer_lock_dir "${LOCK_DIR:-}" || true
+    remove_installer_lock_dir "${LOCK_DIR:-}" "$$" || true
   fi
   if [ "$rc" -ne 0 ]; then
     dump_verbose_tail
@@ -5856,9 +8204,85 @@ cleanup() {
   return "$rc"
 }
 
+# Cross-platform locking using mkdir (atomic on all POSIX systems). Install the
+# cleanup trap before acquisition so every later preflight failure releases a
+# lock this invocation actually owns.
+LOCK_DIR="${LOCK_FILE}.d"
+LOCKED=0
+TMP=""
+trap cleanup EXIT
+trap 'handle_binary_transaction_signal HUP 129' HUP
+trap 'handle_binary_transaction_signal INT 130' INT
+trap 'handle_binary_transaction_signal QUIT 131' QUIT
+trap 'handle_binary_transaction_signal TERM 143' TERM
+
+publish_installer_lock_pid() {
+  chmod 700 "$LOCK_DIR" || return 1
+  (umask 077; printf '%s\n' "$$" >"$LOCK_DIR/pid")
+}
+
+if mkdir "$LOCK_DIR" 2>/dev/null; then
+  LOCKED=1
+  if ! publish_installer_lock_pid; then
+    err "Could not publish installer lock ownership at $LOCK_DIR"
+    exit 1
+  fi
+else
+  lock_owner=""
+  current_uid=$(id -u 2>/dev/null || printf '')
+  if [ ! -L "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ]; then
+    lock_owner=$(installer_path_owner_uid "$LOCK_DIR" 2>/dev/null || printf '')
+  fi
+  if [ -n "$current_uid" ] && [ "$lock_owner" = "$current_uid" ] && \
+     [ -f "$LOCK_DIR/pid" ] && [ ! -L "$LOCK_DIR/pid" ]; then
+    OLD_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || printf '')
+    case "$OLD_PID" in
+      ''|0|*[!0-9]*) ;;
+      *)
+        if ! kill -0 "$OLD_PID" 2>/dev/null; then
+          if remove_installer_lock_dir "$LOCK_DIR" "$OLD_PID" && mkdir "$LOCK_DIR" 2>/dev/null; then
+            LOCKED=1
+            if ! publish_installer_lock_pid; then
+              err "Could not publish installer lock ownership at $LOCK_DIR"
+              exit 1
+            fi
+          fi
+        fi
+        ;;
+    esac
+  fi
+  if [ "$LOCKED" -eq 0 ]; then
+    err "Another installer is running or the lock authority is unsafe (lock $LOCK_DIR)"
+    err "Wait for the other install to finish, or inspect the stale lock without following symlinks."
+    err "Check lock owner with: ls -ld \"$LOCK_DIR\" \"$LOCK_DIR/pid\""
+    exit 1
+  fi
+fi
+
+# Persistent install-state writes begin only after dry-run/confirmation and
+# while the installer lock is held.
+if ! ensure_real_directory_tree "$DEST" "install destination"; then
+  err "Install destination contains traversal, a symlink, or a non-directory component: $DEST"
+  exit 1
+fi
+# Only the fixed active path is authoritative. A crash before its no-replace
+# publication can leave `.preparing.*` evidence, but those unique directories
+# neither trigger recovery nor block a later transaction.
+BINARY_TRANSACTION_ACTIVE_INSTALL_DIR="$DEST"
+if ! recover_binary_pair_transaction "$DEST"; then
+  err "A previous binary transaction is ambiguous or user-modified; refusing to continue."
+  err "Inspect $(binary_transaction_active_path "$DEST") without moving or deleting its evidence."
+  exit 1
+fi
+BINARY_TRANSACTION_ACTIVE_INSTALL_DIR=""
+preflight_destination_checks
+
 TMP_PARENT="${TMPDIR:-/tmp}"
 TMP=$(mktemp -d "${TMP_PARENT%/}/mcp-agent-mail-install.XXXXXX")
-trap cleanup EXIT
+
+SERVER_BIN=""
+CLI_BIN=""
+INSTALL_METHOD_LABEL="release archive"
 
 if [ "$FROM_SOURCE" -eq 0 ]; then
   info "Downloading $URL"
@@ -5876,229 +8300,165 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
   fi
   if [ "$binary_download_failed" -eq 1 ]; then
     # If we preferred a musl artifact that isn't published for this release
-    # (older tags only shipped gnu), fall back to the gnu artifact before
-    # giving up and attempting a source build.
+    # (older tags only shipped gnu), fall back to the gnu artifact. A failed
+    # release download never changes into a source build: that would discard
+    # the caller's exact artifact-selection and verification intent.
     if linux_x86_64_gnu_fallback_allowed; then
       warn "musl artifact not available for $VERSION; falling back to gnu artifact"
       verbose "binary-download:musl_fallback_to_gnu version=${VERSION} url=${URL}"
       select_linux_x86_64_gnu_artifact
       info "Downloading $URL"
-      if ! download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
+      if download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
+        binary_download_failed=0
+      else
         if select_same_target_gzip_artifact; then
           warn "gnu tar.xz artifact not available for $VERSION; trying gnu tar.gz"
           verbose "binary-download:gnu_tar_gz_fallback version=${VERSION} url=${URL}"
           info "Downloading $URL"
-          if ! download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
-            warn "Binary download failed (release may not exist for $VERSION)"
-            warn "Attempting build from source as fallback..."
-            verbose "binary-download:fallback_to_source version=${VERSION} url=${URL}"
-            FROM_SOURCE=1
+          if download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
+            binary_download_failed=0
           fi
-        else
-          warn "Binary download failed (release may not exist for $VERSION)"
-          warn "Attempting build from source as fallback..."
-          verbose "binary-download:fallback_to_source version=${VERSION} url=${URL}"
-          FROM_SOURCE=1
         fi
       fi
-    else
-      warn "Binary download failed (release may not exist for $VERSION)"
-      warn "Attempting build from source as fallback..."
-      verbose "binary-download:fallback_to_source version=${VERSION} url=${URL}"
-      FROM_SOURCE=1
     fi
+  fi
+  if [ "$binary_download_failed" -eq 1 ]; then
+    err "Could not download an exact release archive for $VERSION."
+    err "The installer will not silently substitute a source build."
+    err "Retry the release download, choose another --version, or pass --from-source explicitly."
+    error_support_hint
+    exit 1
   fi
 fi
 
 if [ "$FROM_SOURCE" -eq 1 ]; then
-  info "Building from source (requires git, rust nightly, and all local dependencies)"
+  INSTALL_METHOD_LABEL="exact-tag source build"
+  info "Building exact release tag $VERSION from source"
   ensure_rust
-  git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
+  source_repository_url="https://github.com/${OWNER}/${REPO}.git"
+  source_commit=""
+  if ! checkout_exact_release_source "$source_repository_url" "$TMP/src" "$VERSION"; then
+    err "Could not check out and verify exact release tag $VERSION."
+    err "Source installation never builds an unverified default branch."
+    exit 1
+  fi
+  source_commit=$(git -C "$TMP/src" rev-parse HEAD 2>/dev/null || true)
+  if ! [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
+    err "Could not resolve one exact source commit for release tag $VERSION."
+    exit 1
+  fi
 
-  # Cargo.toml path-depends on ../frankensearch and path-patches beads_rust to
-  # ../beads_rust (registry 0.3.2 pins an older asupersync); everything else
-  # resolves from crates.io. Provision those siblings next to the checkout.
-  # fast_cmaes is a member of frankensearch's workspace and is needed for
-  # workspace-wide cargo metadata there.
-  for sibling in frankensearch fast_cmaes beads_rust; do
-    if ! git clone --depth 1 "https://github.com/Dicklesworthstone/${sibling}.git" "$TMP/$sibling"; then
-      err "Build from source requires a sibling checkout of ${sibling}, and cloning it failed."
-      err ""
-      err "For end-user installation, use pre-built release binaries:"
-      err "  curl -fsSL ${INSTALL_SCRIPT_URL} | bash"
-      err ""
-      err "If no release exists yet, check https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases"
-      exit 1
-    fi
-  done
+  if ! frankensearch_commit=$(release_dependency_pin "$TMP/src" FRANKENSEARCH_COMMIT) || \
+     ! fast_cmaes_commit=$(release_dependency_pin "$TMP/src" FAST_CMAES_COMMIT) || \
+     ! beads_rust_commit=$(release_dependency_pin "$TMP/src" BEADS_RUST_COMMIT); then
+    err "Release tag $VERSION does not contain one exact full-SHA pin for every source-build sibling."
+    err "Expected FRANKENSEARCH_COMMIT, FAST_CMAES_COMMIT, and BEADS_RUST_COMMIT in dist.yml."
+    exit 1
+  fi
 
-  if ! (cd "$TMP/src" && cargo build --release -p mcp-agent-mail -p mcp-agent-mail-cli); then
+  if ! checkout_pinned_dependency \
+      "https://github.com/Dicklesworthstone/frankensearch.git" \
+      "$TMP/frankensearch-rel-0332" "$frankensearch_commit" || \
+     ! checkout_pinned_dependency \
+      "https://github.com/Dicklesworthstone/fast_cmaes.git" \
+      "$TMP/fast_cmaes" "$fast_cmaes_commit" || \
+     ! checkout_pinned_dependency \
+      "https://github.com/Dicklesworthstone/beads_rust.git" \
+      "$TMP/beads_rust" "$beads_rust_commit"; then
+    err "Could not check out an exact pinned source-build dependency."
+    exit 1
+  fi
+
+  SOURCE_INSTALL_RECEIPT_ENABLED=1
+  SOURCE_INSTALL_RELEASE_TAG="$VERSION"
+  SOURCE_INSTALL_COMMIT="$source_commit"
+  SOURCE_INSTALL_FRANKENSEARCH_COMMIT="$frankensearch_commit"
+  SOURCE_INSTALL_FAST_CMAES_COMMIT="$fast_cmaes_commit"
+  SOURCE_INSTALL_BEADS_RUST_COMMIT="$beads_rust_commit"
+
+  source_target_dir="$TMP/source-target"
+  if ! (cd "$TMP/src" && \
+      CARGO_TARGET_DIR="$source_target_dir" \
+      cargo build --locked --release -p mcp-agent-mail -p mcp-agent-mail-cli); then
     err "Build failed. Check compiler output above for details."
     error_support_hint
     exit 1
   fi
-  local_server="$TMP/src/target/release/$BIN_SERVER"
-  local_cli="$TMP/src/target/release/$BIN_CLI"
-  [ -x "$local_server" ] || {
+  SERVER_BIN="$source_target_dir/release/$BIN_SERVER"
+  CLI_BIN="$source_target_dir/release/$BIN_CLI"
+  [ -x "$SERVER_BIN" ] || {
     err "Build failed: $BIN_SERVER not found"
     err "Retry with --verbose and ensure cargo build completed successfully."
     error_support_hint
     exit 1
   }
-  [ -x "$local_cli" ] || {
+  [ -x "$CLI_BIN" ] || {
     err "Build failed: $BIN_CLI not found"
     err "Retry with --verbose and ensure cargo build completed successfully."
     error_support_hint
     exit 1
   }
-  atomic_install "$local_server" "$DEST/$BIN_SERVER"
-  atomic_install "$local_cli" "$DEST/$BIN_CLI"
-  ok "Installed to $DEST (source build)"
-  ok "  $DEST/$BIN_SERVER"
-  ok "  $DEST/$BIN_CLI"
-  maybe_add_path
-  install_local_bin_links
-  if [ "$VERIFY" -eq 1 ]; then
-    "$DEST/$BIN_CLI" --version || true
-    ok "Self-test complete"
-  fi
-  exit 0
-fi
-
-# Checksum verification (can be skipped with --no-verify for testing)
-if [ "$NO_CHECKSUM" -eq 1 ]; then
-  warn "Verification skipped (--no-verify)"
 else
-  if [ -z "$CHECKSUM" ]; then
-    CHECKSUM_FILE="$TMP/checksum.sha256"
-    CHECKSUM_RESOLVED=0
-
-    # Strategy 1: explicit checksum URL when the caller supplied one.
-    if [ -n "$CHECKSUM_URL" ]; then
-      info "Fetching checksum from ${CHECKSUM_URL}"
-      if download_to_file "$CHECKSUM_URL" "$CHECKSUM_FILE" "checksum-download" && [ -f "$CHECKSUM_FILE" ]; then
-        CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
-        if [ -n "$CHECKSUM" ]; then
-          CHECKSUM_RESOLVED=1
-          verbose "checksum:resolved_via_explicit_url sha256=${CHECKSUM}"
-        fi
-      fi
-    fi
-
-    # Strategy 2: consolidated SHA256SUMS file from release (default path).
-    if [ "$CHECKSUM_RESOLVED" -eq 0 ]; then
-      SHA256SUMS_URL="$(dirname "$URL")/SHA256SUMS"
-      SHA256SUMS_FILE="$TMP/SHA256SUMS"
-      verbose "checksum:trying_sha256sums url=${SHA256SUMS_URL}"
-      info "Fetching checksum manifest from ${SHA256SUMS_URL}"
-      if download_to_file "$SHA256SUMS_URL" "$SHA256SUMS_FILE" "sha256sums-download" && [ -f "$SHA256SUMS_FILE" ]; then
-        CHECKSUM=$(awk -v artifact="$TAR" '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1; exit}' "$SHA256SUMS_FILE")
-        if [ -n "$CHECKSUM" ]; then
-          CHECKSUM_RESOLVED=1
-          verbose "checksum:resolved_via_SHA256SUMS sha256=${CHECKSUM}"
-        else
-          verbose "checksum:SHA256SUMS_no_match artifact=${TAR}"
-          warn "SHA256SUMS file found but no entry for ${TAR}"
-        fi
-      fi
-    fi
-
-    # Strategy 3: per-artifact .sha256 sidecar (older/manual release layouts).
-    if [ "$CHECKSUM_RESOLVED" -eq 0 ] && [ -z "$CHECKSUM_URL" ]; then
-      CHECKSUM_URL="${URL}.sha256"
-      verbose "checksum:trying_sidecar url=${CHECKSUM_URL}"
-      info "Trying per-artifact checksum sidecar ${CHECKSUM_URL}"
-      if download_to_file "$CHECKSUM_URL" "$CHECKSUM_FILE" "checksum-download" && [ -f "$CHECKSUM_FILE" ]; then
-        CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
-        if [ -n "$CHECKSUM" ]; then
-          CHECKSUM_RESOLVED=1
-          verbose "checksum:resolved_via_sidecar sha256=${CHECKSUM}"
-        fi
-      fi
-    fi
-
-    if [ "$CHECKSUM_RESOLVED" -eq 0 ]; then
-      warn "Checksum file not available; skipping verification"
-      warn "Use --checksum <hex> to provide one manually"
-      CHECKSUM=""
-    fi
-  fi
-
-  if [ -n "$CHECKSUM" ]; then
-    if ! verify_checksum "$TMP/$TAR" "$CHECKSUM"; then
-      err "Installation aborted due to checksum failure"
-      err "Re-run the installer to fetch a fresh artifact and checksum."
-      exit 1
-    fi
-  fi
-
-  if ! verify_sigstore_bundle "$TMP/$TAR" "$URL"; then
-    err "Signature verification failed"
-    err "The downloaded file may be corrupted or tampered with."
-    err "Retry with a fresh download, or use --no-verify only for trusted local testing."
+  # Release archive verification is mandatory unless the caller explicitly
+  # accepts the risk with --no-verify. This gate always runs before extraction.
+  if [ "$NO_VERIFY" -eq 1 ]; then
+    warn "UNSAFE: archive checksum and signature verification skipped (--no-verify)"
+    warn "The archive's binaries will execute for version checks before installation."
+    warn "Archive-member and exact-version checks remain mandatory."
+  elif ! verify_release_archive "$TMP/$TAR" "$URL" "$TAR"; then
+    err "Archive verification failed; aborting before extraction or installation."
+    err "Retry with a fresh release, install the required verification tools, or use --no-verify only for a trusted local artifact."
     error_support_hint
     exit 1
   fi
+
+  if ! verify_archive_members_exact "$TMP/$TAR"; then
+    err "Archive member verification failed; aborting before extraction or installation."
+    error_support_hint
+    exit 1
+  fi
+
+  info "Extracting"
+  EXTRACT_DIR="$TMP/extract"
+  mkdir "$EXTRACT_DIR"
+  tar -xf "$TMP/$TAR" -C "$EXTRACT_DIR"
+  SERVER_BIN="$EXTRACT_DIR/$BIN_SERVER"
+  CLI_BIN="$EXTRACT_DIR/$BIN_CLI"
 fi
 
-info "Extracting"
-tar -xf "$TMP/$TAR" -C "$TMP"
-
-# Nested-archive detection: some releases accidentally nest a second archive
-# inside the outer archive. If we find one after the first extraction, unpack it too.
-shopt -s nullglob
-for nested in "$TMP"/*.tar.gz "$TMP"/mcp-agent-mail-*/*.tar.gz; do
-  if [ -f "$nested" ]; then
-    verbose "extract:nested_archive detected=${nested}"
-    warn "Nested archive detected (${nested##*/}); extracting inner archive"
-    tar -xzf "$nested" -C "$(dirname "$nested")"
-    rm -f "$nested"
+for staged_binary in "$SERVER_BIN" "$CLI_BIN"; do
+  if [ ! -f "$staged_binary" ] || [ -L "$staged_binary" ] || \
+     [ ! -s "$staged_binary" ] || [ ! -x "$staged_binary" ]; then
+    err "Staged $INSTALL_METHOD_LABEL binary is not a non-empty executable regular file: $staged_binary"
+    error_support_hint
+    exit 1
   fi
 done
-for nested in "$TMP"/*.tar.xz "$TMP"/mcp-agent-mail-*/*.tar.xz; do
-  # Skip the original download artifact itself
-  [ "$nested" = "$TMP/$TAR" ] && continue
-  if [ -f "$nested" ]; then
-    verbose "extract:nested_archive detected=${nested}"
-    warn "Nested archive detected (${nested##*/}); extracting inner archive"
-    tar -xJf "$nested" -C "$(dirname "$nested")"
-    rm -f "$nested"
-  fi
-done
-shopt -u nullglob
 
-# Find binaries in the extracted archive
-find_bin() {
-  local name="$1"
-  local bin="$TMP/$name"
-  if [ -x "$bin" ]; then echo "$bin"; return 0; fi
-  bin="$TMP/mcp-agent-mail-${TARGET}/$name"
-  if [ -x "$bin" ]; then echo "$bin"; return 0; fi
-  bin=$(find "$TMP" -maxdepth 3 -type f -name "$name" -perm -111 | head -n 1)
-  if [ -x "$bin" ]; then echo "$bin"; return 0; fi
-  return 1
-}
-
-SERVER_BIN=$(find_bin "$BIN_SERVER") || {
-  err "Binary $BIN_SERVER not found in archive"
-  err "The release artifact may be malformed or incomplete."
-  err "Re-run installer with a cache buster or pin a different --version."
+if ! verify_release_binaries_exact "$SERVER_BIN" "$CLI_BIN" "Staged"; then
+  err "Staged $INSTALL_METHOD_LABEL version verification failed; existing binaries were not replaced."
   error_support_hint
   exit 1
-}
-CLI_BIN=$(find_bin "$BIN_CLI") || {
-  err "Binary $BIN_CLI not found in archive"
-  err "The release artifact may be malformed or incomplete."
-  err "Re-run installer with a cache buster or pin a different --version."
+fi
+
+if ! install_binary_pair_transactional "$SERVER_BIN" "$CLI_BIN" "$DEST"; then
+  err "Binary pair installation failed."
   error_support_hint
   exit 1
-}
-
-atomic_install "$SERVER_BIN" "$DEST/$BIN_SERVER"
-atomic_install "$CLI_BIN" "$DEST/$BIN_CLI"
-ok "Installed to $DEST"
+fi
+ok "Installed to $DEST ($INSTALL_METHOD_LABEL)"
 ok "  $DEST/$BIN_SERVER"
 ok "  $DEST/$BIN_CLI"
+if [ "$FROM_SOURCE" -eq 1 ]; then
+  source_receipt_path="$BINARY_TRANSACTION_LAST_ARCHIVE_PATH/source-receipt"
+  if [ -z "$BINARY_TRANSACTION_LAST_ARCHIVE_PATH" ] || \
+     ! validate_binary_transaction_source_receipt "$BINARY_TRANSACTION_LAST_ARCHIVE_PATH"; then
+    err "The exact-tag source build committed without a readable source receipt."
+    err "Inspect retained transaction history under $DEST before trusting this install."
+    exit 1
+  fi
+  ok "  Source receipt: $source_receipt_path"
+fi
 maybe_add_path
 install_local_bin_links
 
@@ -6247,27 +8607,19 @@ if [ "$QUIET" -eq 0 ] && [ -n "$MCP_CONFIG_SCAN" ]; then
   done <<< "$MCP_CONFIG_SCAN"
 fi
 
-# Set up MCP configs for fresh installs (non-interactive, auto-detect).
-# Codex is written directly in HTTP URL mode here so the one-liner does not
-# depend on a particular released `am setup` implementation.
-if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ] && [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
-  setup_mcp_configs "$DEST/$BIN_SERVER"
-fi
-
-# Update existing MCP configs via the newly-installed `am setup run`.
-# This still handles the broader non-Codex migration work:
+# First run native setup so its atomic, Git-aware token writer durably commits
+# the one credential every subsequent client and service phase will use.
+# This also handles the broader non-Codex migration work:
 #   - Python→Rust command rewriting
 #   - env var preservation (bearer token, storage root)
 #   - BOM/JSONC/trailing-comma tolerance
 #   - Backup before modification
 if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ] && [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
-  update_mcp_configs "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI"
-fi
-
-# Re-sync Codex last so an older released `am` cannot leave Codex in stdio or
-# mixed transport mode after the installer has already chosen HTTP.
-if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ] && [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
-  sync_codex_http_configs "$DEST/$BIN_SERVER"
+  if ! configure_mcp_clients_for_install "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI"; then
+    err "MCP client configuration failed."
+    error_support_hint
+    exit 1
+  fi
 fi
 
 collect_migration_counts() {
@@ -7254,14 +9606,22 @@ verify_installation() {
     issues=$((issues + 1))
   fi
 
-  # 2. Check version output
-  local version_out
-  version_out=$("$DEST/$BIN_CLI" --version 2>&1 || true)
-  if [ -z "$version_out" ]; then
-    warn "VERIFY: 'am --version' produced no output"
+  # 2. Re-check the exact requested release for both installed binaries.
+  local expected_cli="am ${EXPECTED_RELEASE_VERSION}"
+  local expected_server="mcp-agent-mail ${EXPECTED_RELEASE_VERSION}"
+  if ! binary_version_matches_exact "$DEST/$BIN_CLI" "$expected_cli"; then
+    warn "VERIFY: '$BIN_CLI --version' did not equal '$expected_cli'"
+    warn "  Observed: ${CAPTURED_CMD_OUTPUT:-<no version output>}"
     issues=$((issues + 1))
   else
-    ok "VERIFY: $version_out"
+    ok "VERIFY: $expected_cli"
+  fi
+  if ! binary_version_matches_exact "$DEST/$BIN_SERVER" "$expected_server"; then
+    warn "VERIFY: '$BIN_SERVER --version' did not equal '$expected_server'"
+    warn "  Observed: ${CAPTURED_CMD_OUTPUT:-<no version output>}"
+    issues=$((issues + 1))
+  else
+    ok "VERIFY: $expected_server"
   fi
 
   # 3. Check binary command surfaces (prevents swapped/mispackaged installs)

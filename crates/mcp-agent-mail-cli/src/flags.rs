@@ -16,6 +16,9 @@ pub enum FlagsCommand {
         /// Only show experimental flags.
         #[arg(long, default_value_t = false)]
         experimental: bool,
+        /// Only show flags owned by this subsystem (e.g. `atc`, `tui`, `messaging`).
+        #[arg(long, value_name = "name")]
+        subsystem: Option<String>,
         /// Output format: table, json, or toon.
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
@@ -74,6 +77,7 @@ pub fn handle_flags(action: FlagsCommand) -> CliResult<()> {
         FlagsCommand::List {
             set,
             experimental,
+            subsystem,
             format,
             json,
         } => {
@@ -85,6 +89,10 @@ pub fn handle_flags(action: FlagsCommand) -> CliResult<()> {
             }
             if experimental {
                 snapshots.retain(|snapshot| snapshot.stability == "experimental");
+            }
+            if let Some(subsystem) = subsystem {
+                let wanted = subsystem.trim().to_ascii_lowercase();
+                snapshots.retain(|snapshot| snapshot.subsystem.eq_ignore_ascii_case(&wanted));
             }
             render_flag_list(&snapshots, fmt)
         }
@@ -103,22 +111,26 @@ pub fn handle_flags(action: FlagsCommand) -> CliResult<()> {
         FlagsCommand::On { name, format, json } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
             let config = Config::from_env();
-            let snapshot =
-                core_flags::toggle_bool_flag(&config, &name, true).map_err(|error| {
-                    map_flag_error(error, &name)
-                })?;
+            let snapshot = core_flags::toggle_bool_flag(&config, &name, true)
+                .map_err(|error| map_flag_error(error, &name))?;
             render_flag_mutation(&snapshot, "enabled", fmt)
         }
         FlagsCommand::Off { name, format, json } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
             let config = Config::from_env();
-            let snapshot =
-                core_flags::toggle_bool_flag(&config, &name, false).map_err(|error| {
-                    map_flag_error(error, &name)
-                })?;
+            let snapshot = core_flags::toggle_bool_flag(&config, &name, false)
+                .map_err(|error| map_flag_error(error, &name))?;
             render_flag_mutation(&snapshot, "disabled", fmt)
         }
     }
+}
+
+/// Render every registered flag owned by `subsystem` (used by `am config atc`).
+pub fn render_subsystem_flags(subsystem: &str, fmt: output::CliOutputFormat) -> CliResult<()> {
+    let config = Config::from_env();
+    let mut snapshots = core_flags::flag_snapshots(&config);
+    snapshots.retain(|snapshot| snapshot.subsystem.eq_ignore_ascii_case(subsystem));
+    render_flag_list(&snapshots, fmt)
 }
 
 fn resolve_snapshot(config: &Config, name: &str) -> CliResult<FlagSnapshot> {
@@ -141,8 +153,9 @@ fn render_flag_list(snapshots: &[FlagSnapshot], fmt: output::CliOutputFormat) ->
         output::CliOutputFormat::Json => {
             ftui_runtime::ftui_println!(
                 "{}",
-                serde_json::to_string_pretty(snapshots)
-                    .map_err(|error| CliError::Other(format!("failed to serialize flags: {error}")))?
+                serde_json::to_string_pretty(snapshots).map_err(|error| CliError::Other(
+                    format!("failed to serialize flags: {error}")
+                ))?
             );
             Ok(())
         }
@@ -191,13 +204,7 @@ fn render_flag_list(snapshots: &[FlagSnapshot], fmt: output::CliOutputFormat) ->
                 }
 
                 let table = table.get_or_insert_with(|| {
-                    output::CliTable::new(vec![
-                        "NAME",
-                        "VALUE",
-                        "SOURCE",
-                        "STABILITY",
-                        "DYNAMIC",
-                    ])
+                    output::CliTable::new(vec!["NAME", "VALUE", "SOURCE", "STABILITY", "DYNAMIC"])
                 });
                 table.add_row(vec![
                     snapshot.name.clone(),
@@ -291,13 +298,19 @@ fn render_flag_explain(snapshot: &FlagSnapshot, fmt: output::CliOutputFormat) ->
             table.add_row(vec!["Source".to_string(), snapshot.source.clone()]);
             table.add_row(vec!["Default".to_string(), snapshot.default_value.clone()]);
             table.add_row(vec!["Kind".to_string(), snapshot.kind.clone()]);
-            table.add_row(vec!["Allowed".to_string(), snapshot.allowed_values.join(" | ")]);
+            table.add_row(vec![
+                "Allowed".to_string(),
+                snapshot.allowed_values.join(" | "),
+            ]);
             table.add_row(vec!["Stability".to_string(), snapshot.stability.clone()]);
             table.add_row(vec![
                 "Dynamic toggle".to_string(),
                 dynamic_display(snapshot).to_string(),
             ]);
-            table.add_row(vec!["Config path".to_string(), snapshot.config_path.clone()]);
+            table.add_row(vec![
+                "Config path".to_string(),
+                snapshot.config_path.clone(),
+            ]);
             table.add_row(vec![
                 "Subsystems".to_string(),
                 snapshot.affected_subsystems.join(", "),
@@ -462,12 +475,14 @@ mod tests {
                     FlagsCommand::List {
                         set,
                         experimental,
+                        subsystem,
                         format,
                         json,
                     },
             } => {
                 assert!(set);
                 assert!(experimental);
+                assert_eq!(subsystem, None, "no --subsystem was passed");
                 assert_eq!(format, Some(output::CliOutputFormat::Json));
                 assert!(!json);
             }
@@ -519,7 +534,9 @@ mod tests {
         .expect_err("unknown flag should fail");
 
         assert!(
-            error.to_string().contains("Did you mean: ATC_LEARNING_DISABLED"),
+            error
+                .to_string()
+                .contains("Did you mean: ATC_LEARNING_DISABLED"),
             "unexpected error: {error}"
         );
     }

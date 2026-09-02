@@ -235,6 +235,7 @@ am mail send \
   --subject "[${THREAD_ID}] Action required" \
   --body "Please stop new edits and reply in-thread." \
   --thread-id "$THREAD_ID" \
+  --topic "release.blocker" \
   --importance urgent \
   --ack-required \
   --format toon
@@ -242,6 +243,11 @@ am mail send \
 
 **Expected output:** A delivery summary showing the message was queued for the
 explicit recipient and attached to the requested thread.
+
+`--topic` is optional. Use it when several threads belong to one stable work
+stream: topics are case-insensitive, 1-64 safe ASCII characters, and replies
+inherit the original topic. Use `--thread-id` for conversation identity and
+`--topic` for cross-thread grouping; they are deliberately separate fields.
 
 **Sender token (proving identity):** `am mail send` accepts a per-agent
 `sender_token`. If `--from` was registered with `am agents register` or

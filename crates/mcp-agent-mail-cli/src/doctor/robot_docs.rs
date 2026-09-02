@@ -21,6 +21,64 @@ pub fn handbook() -> &'static str {
     HANDBOOK_TEXT
 }
 
+/// Markdown section documenting every Air Traffic Control (`AM_ATC_*`)
+/// variable: name, kind, accepted values, default, restart requirement, and
+/// meaning. Generated from `mcp_agent_mail_core::flags::FLAG_REGISTRY` so the
+/// handbook and the binary cannot disagree (GH#290). Defaults are printed
+/// rather than effective values because this text is meant to be pasted into
+/// agent context; run `am config atc` for the live effective configuration.
+#[must_use]
+pub fn atc_configuration_section() -> String {
+    use mcp_agent_mail_core::flags::{FlagKind, flag_registry};
+    use std::fmt::Write as _;
+
+    let mut out = String::from(
+        "## Air Traffic Control (ATC) configuration\n\n\
+ATC reviews agent liveness, detects reservation deadlocks, and can send probe/advisory \
+mail or reclaim reservations. It is on by default, but the executor defaults to `shadow`, \
+so nothing durable is written unless `AM_ATC_EXECUTOR_MODE` is set to `canary`/`live`. \
+All variables are read at server startup unless noted. Inspect effective values and their \
+sources with `am config atc` (alias: `am flags list --subsystem atc`); `am flags explain <VAR>` \
+prints one variable in full.\n\n\
+| Variable | Kind | Accepted | Default | Restart | Meaning |\n\
+|---|---|---|---|---|---|\n",
+    );
+    for flag in flag_registry()
+        .iter()
+        .filter(|flag| flag.subsystem == "atc" || flag.env_var == "ATC_LEARNING_DISABLED")
+    {
+        let accepted = match flag.kind {
+            FlagKind::Bool | FlagKind::Enum(_) => flag.kind.allowed_values().join(" / "),
+            FlagKind::Integer => "integer (see meaning for floor/ceiling)".to_string(),
+            FlagKind::Float => "finite float (see meaning for range)".to_string(),
+            FlagKind::Path => "filesystem path".to_string(),
+            FlagKind::Text => "text".to_string(),
+        };
+        let restart = if flag.restart_required { "yes" } else { "no" };
+        let mut meaning = flag.doc.replace('|', "\\|");
+        if let Some(notes) = flag.notes {
+            let _ = write!(meaning, " Notes: {}", notes.replace('|', "\\|"));
+        }
+        let _ = writeln!(
+            out,
+            "| `{}` | {} | {} | `{}` | {} | {} |",
+            flag.env_var,
+            flag.kind.label(),
+            accepted,
+            flag.default_value,
+            restart,
+            meaning
+        );
+    }
+    out.push_str(
+        "\nSetting `AM_ATC_ENABLED=false` means \"passive liveness only\": the engine ignores \
+every hook and the operator loop never starts, so there are no probes, advisories, reservation \
+releases, or experience rows; liveness views fall back to the database `last_active_ts` that \
+ordinary tool calls write, and reservations of crashed agents expire only by TTL.\n",
+    );
+    out
+}
+
 const HANDBOOK_TEXT: &str = r#"# `am doctor` — Agent Handbook
 
 You are an AI coding agent. The Agent Mail mailbox you depend on may have
@@ -41,9 +99,9 @@ quarantines via rename.
 
 | Verb | Purpose | Mutates? | Default exit |
 |------|---------|----------|--------------|
-| `am doctor` (or `check`) | Run all detectors. Read-only. | No | 0 healthy / 1 findings |
-| `am doctor --fix` | Run detectors + apply fixers. Backups first. | Yes (via `mutate()`) | 0 / 2 / 3 / 4 |
-| `am doctor --dry-run --fix` | Print the fix plan; do not execute. | No | 0 |
+| `am doctor check` (`--json`) | Run all detectors. Read-only. | No | 0 healthy / 1 findings |
+| `am doctor fix --yes` | Run detectors + apply fixers. Backups first. | Yes (via `mutate()`) | 0 / 2 / 3 / 4 |
+| `am doctor fix --dry-run` | Print the fix plan; do not execute. | No | 0 |
 | `am doctor fix --only <fm-id>` | Run a single registered FM through the chokepoint. | Yes (via `mutate()`) | 0 / 3 / 4 / 64 |
 | `am doctor fix --only <fm-id> --list` | Detect a single FM only — no chokepoint. | No | 0 |
 | `am doctor fix --list` | Detect every registered FM in one round-trip. | No | 0 |
@@ -336,6 +394,33 @@ mod tests {
         ] {
             assert!(h.contains(s), "handbook missing subsystem: {}", s);
         }
+    }
+
+    #[test]
+    fn atc_configuration_section_lists_every_registered_atc_variable() {
+        let section = atc_configuration_section();
+        assert!(section.contains("## Air Traffic Control (ATC) configuration"));
+        assert!(section.contains("passive liveness only"));
+        for flag in mcp_agent_mail_core::flags::flag_registry()
+            .iter()
+            .filter(|flag| flag.subsystem == "atc")
+        {
+            let row_prefix = format!("| `{}` |", flag.env_var);
+            assert!(
+                section.contains(&row_prefix),
+                "ATC section missing {}",
+                flag.env_var
+            );
+            assert!(
+                section.contains(&format!("| `{}` |", flag.default_value)),
+                "ATC section missing default for {}",
+                flag.env_var
+            );
+        }
+        assert!(section.contains(
+            "| `AM_ATC_EXECUTOR_MODE` | enum | shadow / dry_run / canary / live | `shadow` | yes |"
+        ));
+        assert!(section.contains("| `ATC_LEARNING_DISABLED` |"));
     }
 
     #[test]

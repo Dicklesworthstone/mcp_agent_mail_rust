@@ -486,14 +486,14 @@ pub fn classify_backup_file(file_name: &str) -> Option<BackupKind> {
 
     // Only files named like the storage DB (or its WAL/SHM siblings) are
     // eligible. This is the primary guard against touching unrelated files.
-    let stem_prefixes = [
-        "storage.sqlite3.",
-        "storage.sqlite3-wal.",
-        "storage.sqlite3-shm.",
+    let stem_families = [
+        ("storage.sqlite3", "storage.sqlite3."),
+        ("storage.sqlite3-wal", "storage.sqlite3-wal."),
+        ("storage.sqlite3-shm", "storage.sqlite3-shm."),
     ];
-    let after_stem = stem_prefixes
-        .iter()
-        .find_map(|prefix| file_name.strip_prefix(prefix))?;
+    let (family_stem, after_stem) = stem_families
+        .into_iter()
+        .find_map(|(stem, prefix)| file_name.strip_prefix(prefix).map(|suffix| (stem, suffix)))?;
 
     // `archive-reconcile-` covers the bare, `-failed-*`, and `-restore-*`
     // variants in one check (they all share the prefix).
@@ -513,11 +513,18 @@ pub fn classify_backup_file(file_name: &str) -> Option<BackupKind> {
     // / `bak.<ts>` legacy variant. Using a bare `starts_with("bak")` would
     // false-positive future filenames like `backup-plan.txt` that happen to
     // share the prefix — match exact variants only.
-    if after_stem.starts_with("manual-backup-")
-        || after_stem == "bak"
-        || after_stem.starts_with("bak.")
-        || after_stem.starts_with("bak-")
-    {
+    let strict_bak = mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(
+        std::ffi::OsStr::new(family_stem),
+        std::ffi::OsStr::new(file_name),
+    )
+    .is_some_and(|candidate| {
+        matches!(
+            candidate.kind(),
+            mcp_agent_mail_core::disk::SqliteRecoveryCandidateKind::ProactiveBak
+                | mcp_agent_mail_core::disk::SqliteRecoveryCandidateKind::TimestampedBak
+        )
+    });
+    if after_stem.starts_with("manual-backup-") || strict_bak {
         return Some(BackupKind::ManualBackup);
     }
     if after_stem.starts_with("pre-migrate")

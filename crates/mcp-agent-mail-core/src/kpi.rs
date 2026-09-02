@@ -1622,8 +1622,8 @@ mod tests {
     use super::*;
     use crate::metrics::{
         AtcMetricsSnapshot, CanaryMetricsSnapshot, CorruptionMetricsSnapshot, DbMetricsSnapshot,
-        GlobalMetricsSnapshot, HistogramSnapshot, HttpMetricsSnapshot, SearchMetricsSnapshot,
-        StorageMetricsSnapshot, SystemMetricsSnapshot, ToolsMetricsSnapshot,
+        GlobalMetricsSnapshot, HistogramSnapshot, HttpMetricsSnapshot, RecentHistogramSnapshot,
+        SearchMetricsSnapshot, StorageMetricsSnapshot, SystemMetricsSnapshot, ToolsMetricsSnapshot,
     };
     use std::sync::Mutex;
     use std::thread;
@@ -1707,6 +1707,7 @@ mod tests {
                 wbq_peak_depth: 50,
                 wbq_over_80_since_us: 0,
                 wbq_queue_latency_us: make_histogram(100, 500, 1000),
+                wbq_queue_latency_recent_us: RecentHistogramSnapshot::default(),
                 wbq_last_unrecoverable_error_us: 0,
                 wbq_unrecoverable_errors_total: 0,
                 wbq_respawn_salvaged_total: 0,
@@ -1725,6 +1726,7 @@ mod tests {
                 commit_peak_pending_requests: 20,
                 commit_over_80_since_us: 0,
                 commit_queue_latency_us: make_histogram(300, 1500, 4000),
+                commit_queue_latency_recent_us: RecentHistogramSnapshot::default(),
 
                 needs_reindex_total: 0,
 

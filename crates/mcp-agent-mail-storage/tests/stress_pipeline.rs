@@ -30,7 +30,7 @@
     clippy::missing_const_for_fn
 )]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -160,6 +160,20 @@ fn make_large_pool(tmp: &TempDir) -> DbPool {
         cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     DbPool::new(&config).expect("create large pool")
+}
+
+fn assert_mailbox_integrity_after_pool_close(db_path: &Path) {
+    match mcp_agent_mail_db::pool::sqlite_file_is_healthy_without_family_cleanup(db_path) {
+        Ok(true) => {}
+        Ok(false) => panic!(
+            "post-soak engine and canonical integrity checks rejected {}",
+            db_path.display()
+        ),
+        Err(error) => panic!(
+            "post-soak integrity checks failed for {}: {error}",
+            db_path.display()
+        ),
+    }
 }
 
 /// RSS memory in KB (Linux only, returns 0 elsewhere).
@@ -614,7 +628,7 @@ fn stress_commit_coalescer_batching_100_writes() {
                 // Write a file to disk
                 let file_name = format!("stress-file-{i}.txt");
                 let file_path = archive_root.join(&file_name);
-                let rel_path = format!("projects/coalesce-stress/{}", file_name);
+                let rel_path = format!("projects/coalesce-stress/{file_name}");
 
                 if let Err(e) = std::fs::write(&file_path, format!("content-{i}")) {
                     eprintln!("  file write error {i}: {e}");
@@ -653,7 +667,7 @@ fn stress_commit_coalescer_batching_100_writes() {
         adaptive_target_ms,
         adaptive_effective_ms,
     ) = repo_stats
-        .map(|s| {
+        .map_or((0, 0, 0, 0, 0), |s| {
             (
                 s.enqueued_total,
                 s.commits_total,
@@ -661,8 +675,7 @@ fn stress_commit_coalescer_batching_100_writes() {
                 s.adaptive_flush_target_ms,
                 s.adaptive_flush_effective_ms,
             )
-        })
-        .unwrap_or((0, 0, 0, 0, 0));
+        });
 
     eprintln!("\n=== stress_commit_coalescer_batching_100_writes ===");
     eprintln!("  Writes enqueued: {n_writes}");
@@ -1310,6 +1323,7 @@ fn stress_sustained_mixed_workload_30s() {
     let tmp = TempDir::new().unwrap();
     let config = test_config(tmp.path());
     let pool = make_large_pool(&tmp);
+    let db_path = PathBuf::from(pool.sqlite_path());
 
     let n_agents = 30;
     wbq_start();
@@ -1575,7 +1589,7 @@ fn stress_sustained_mixed_workload_30s() {
     );
     eprintln!("  Total ops: {total}, Success: {total_ok}, Errors: {total_err}");
     eprintln!("  Actual RPS: {:.0}", total as f64 / elapsed.as_secs_f64());
-    eprintln!("  RSS: {} KB", rss);
+    eprintln!("  RSS: {rss} KB");
     report.print("Mixed workload");
 
     let wbq = wbq_stats();
@@ -1606,6 +1620,8 @@ fn stress_sustained_mixed_workload_30s() {
         total_ok > (duration_secs * target_rps / 4),
         "too few successful ops ({total_ok}) for {duration_secs}s at {target_rps} RPS"
     );
+    drop(pool);
+    assert_mailbox_integrity_after_pool_close(&db_path);
 }
 
 // ===========================================================================
@@ -1704,7 +1720,7 @@ fn stress_agent_registration_thundering_herd() {
     eprintln!("  Threads: {n_threads}, Agent: {agent_name_str}");
     eprintln!("  IDs returned: {}, unique: {}", ids.len(), {
         let mut sorted = ids.clone();
-        sorted.sort();
+        sorted.sort_unstable();
         sorted.dedup();
         sorted.len()
     });
@@ -2013,8 +2029,7 @@ fn stress_150_agent_message_storm() {
                         let thread_id = format!("s150-{i}-{msg_idx}");
                         let subject = format!("Storm msg {msg_idx} from agent {i}");
                         let body = format!(
-                            "Message body from agent {} to agent {} number {}",
-                            i, recipient_idx, msg_idx
+                            "Message body from agent {i} to agent {recipient_idx} number {msg_idx}"
                         );
 
                         // DB write with retry
@@ -3488,8 +3503,7 @@ fn stress_sustained_100_agents_60s() {
     let rss_growth_kb = rss_after.saturating_sub(rss_before);
     assert!(
         rss_growth_kb < 500_000,
-        "RSS grew by {} KB — possible memory leak",
-        rss_growth_kb,
+        "RSS grew by {rss_growth_kb} KB — possible memory leak",
     );
 
     // Check for latency degradation: last interval avg should not be >3x first interval
@@ -3515,4 +3529,6 @@ fn stress_sustained_100_agents_60s() {
             last_avg / 1000.0,
         );
     }
+    drop(pool);
+    assert_mailbox_integrity_after_pool_close(&db_path);
 }

@@ -728,7 +728,7 @@ fn generate_github_pages_plan(
     steps.push(PlanStep {
         index: 7,
         id: "git_push".to_string(),
-        description: format!("Push to {} branch", branch),
+        description: format!("Push to {branch} branch"),
         command: Some(format!(
             "git -C {} push origin {}",
             quote_path(&repo_root),
@@ -1051,6 +1051,7 @@ fn generate_custom_plan(
 }
 
 /// Format a plan as human-readable text.
+#[must_use]
 pub fn format_plan_human(plan: &DeploymentPlan) -> String {
     let mut output = String::new();
 
@@ -1693,7 +1694,7 @@ mod tests {
 
         let plan = generate_s3_plan(&inputs, &env, bundle.path()).unwrap();
         assert!(plan.steps.iter().any(|s| s.id == "cloudfront_invalidate"));
-        assert!(plan.warnings.is_empty());
+        assert_eq!(plan.warnings, [] as [std::string::String; 0]);
     }
 
     #[test]
