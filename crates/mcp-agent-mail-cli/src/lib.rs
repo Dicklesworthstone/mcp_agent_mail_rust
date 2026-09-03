@@ -40817,7 +40817,9 @@ mod mail_server_cli_bridge_tests {
             "fixture requires a missing configured relative target"
         );
 
-        let database_url = format!("sqlite:///{}", relative_path.display());
+        // Explicit CWD-relative spelling; three slashes alone would name the
+        // absolute decoy by contract (br-z73au).
+        let database_url = format!("sqlite:///./{}", relative_path.display());
         let cli_path = resolve_mailbox_activity_sqlite_path(&database_url)
             .expect("resolve CLI mailbox activity authority");
         let runtime_path = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&database_url)
@@ -44943,7 +44945,7 @@ http_headers = { Authorization = "Bearer secret" }
                 for stmt in [
                     "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
                     "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
-                    "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts INTEGER NOT NULL, recipients_json TEXT NOT NULL DEFAULT '{}', attachments TEXT NOT NULL DEFAULT '[]')",
+                    "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts INTEGER NOT NULL, recipients_json TEXT NOT NULL DEFAULT '{}', attachments TEXT NOT NULL DEFAULT '[]', topic TEXT)",
                     "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
                     "INSERT INTO projects (id, slug, human_key) VALUES (1, 'p', '/tmp/p')",
                     "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'Sender')",
@@ -44956,7 +44958,21 @@ http_headers = { Authorization = "Bearer secret" }
             },
         );
 
+        // The legacy absolute fallback applies only when the configured
+        // relative file exists and is unhealthy while `/<same path>` is
+        // healthy (a missing relative target is a fresh-start authority and
+        // is never replaced by an absolute decoy). Anchor the relative
+        // spelling inside this tempdir and plant the malformed relative file
+        // there, so the fallback selects the healthy absolute database and
+        // the direct read must follow the actually opened path.
+        let _cwd = CwdGuard::chdir(dir.path());
         let malformed_relative = absolute_db_str.trim_start_matches('/').to_string();
+        let malformed_relative_path = PathBuf::from(&malformed_relative);
+        if let Some(parent) = malformed_relative_path.parent() {
+            std::fs::create_dir_all(parent).expect("create malformed relative parent");
+        }
+        std::fs::write(&malformed_relative_path, b"not-a-database")
+            .expect("write malformed relative db");
         let database_url = format!("sqlite://{malformed_relative}");
         let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[
@@ -51608,6 +51624,14 @@ http_headers = { Authorization = "Bearer secret" }
 
         let absolute_db = root.path().join("mailbox.sqlite3");
         seed_mailbox_db(&absolute_db);
+        let decoy_projects_before = {
+            let conn = mcp_agent_mail_db::DbConn::open_file(absolute_db.to_string_lossy().as_ref())
+                .expect("open absolute decoy");
+            conn.query_sync("SELECT COUNT(*) AS count FROM projects", &[])
+                .expect("count decoy projects")[0]
+                .get_named::<i64>("count")
+                .unwrap_or(0)
+        };
         let relative_db = PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
         assert!(
             !relative_db.exists(),
@@ -51627,6 +51651,8 @@ http_headers = { Authorization = "Bearer secret" }
                 || error.to_string().contains("requires an existing"),
             "unexpected missing-source error: {error}"
         );
+        // The decoy is untouched: the seed's project rows are still all there
+        // (the helper seeds two), nothing was scoped, scrubbed, or rebuilt.
         let conn = mcp_agent_mail_db::DbConn::open_file(absolute_db.to_string_lossy().as_ref())
             .expect("reopen absolute decoy");
         assert_eq!(
@@ -51634,7 +51660,8 @@ http_headers = { Authorization = "Bearer secret" }
                 .expect("query absolute decoy")[0]
                 .get_named::<i64>("count")
                 .unwrap_or(0),
-            1
+            decoy_projects_before,
+            "the absolute decoy must not be touched by a save against a missing relative source"
         );
     }
 
@@ -61782,6 +61809,14 @@ startup_timeout_sec = 42
             .to_string_lossy()
             .trim_start_matches('/')
             .to_string();
+        // The relative spelling is a fresh-start target anchored to the
+        // current directory: keep it inside this tempdir (with an existing
+        // parent, as any real relative target would have) so the dry run
+        // reports it instead of refusing a parent that never existed.
+        let _cwd = CwdGuard::chdir(tmp.path());
+        if let Some(parent) = Path::new(&relative_db).parent() {
+            std::fs::create_dir_all(parent).expect("create relative parent");
+        }
         assert!(
             !Path::new(&relative_db).exists(),
             "fixture requires a missing configured relative target"
@@ -61804,7 +61839,7 @@ startup_timeout_sec = 42
 
         assert!(
             result.is_ok(),
-            "doctor reconstruct dry-run failed: {output}"
+            "doctor reconstruct dry-run failed: {result:?}; output: {output}"
         );
         assert!(
             output.contains(&format!("Database path: {relative_db}")),
@@ -71310,7 +71345,9 @@ startup_timeout_sec = 42
         );
 
         let mut config = Config::from_env();
-        config.database_url = format!("sqlite:///{}", relative_path.display());
+        // Explicit CWD-relative spelling; three slashes alone would name the
+        // absolute decoy by contract (br-z73au).
+        config.database_url = format!("sqlite:///./{}", relative_path.display());
 
         let resolved = resolve_auto_clear_db_blockers_sqlite_path(&config)
             .expect("resolve auto-clear sqlite path");
