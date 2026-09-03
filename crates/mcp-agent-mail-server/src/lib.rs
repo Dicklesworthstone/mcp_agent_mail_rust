@@ -12649,7 +12649,7 @@ to skip auth for local requests.</p>
         };
 
         let id = request.id.clone();
-        let method = request.method.clone();
+        let method = dispatch_method_label(&request);
 
         // Admission control: reject early when blocking dispatch is saturated
         // so timed-out threads don't accumulate unboundedly.
@@ -16720,6 +16720,20 @@ impl std::fmt::Display for RequestKind {
             Self::Resources => write!(f, "resources"),
             Self::Other => write!(f, "other"),
         }
+    }
+}
+
+/// Label a dispatch for admission, timeout and zombie diagnostics.
+///
+/// The JSON-RPC method alone ("tools/call") cannot say which tool ignored
+/// cancellation and is now a retained zombie; carry the tool name so the
+/// timeout error text and the hard-grace log line attribute it (GH#298).
+fn dispatch_method_label(request: &JsonRpcRequest) -> String {
+    match classify_request(request) {
+        (RequestKind::Tools, Some(tool)) if request.method == "tools/call" => {
+            format!("tools/call:{tool}")
+        }
+        _ => request.method.clone(),
     }
 }
 
