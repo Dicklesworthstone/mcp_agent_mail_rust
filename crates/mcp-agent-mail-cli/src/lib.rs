@@ -14403,8 +14403,12 @@ fn sqlite_absolute_candidate_path(path: &str) -> Option<String> {
     Some(absolute_candidate.to_string_lossy().into_owned())
 }
 
+/// The spelling the CLI opens and validates: the legacy absolute fallback
+/// applies, but an explicit relative path stays relative and a symlink is
+/// not followed (so no-symlink policy sees the configured spelling). Registry
+/// keys use `normalize_sqlite_path_for_pool_key`, never this.
 fn resolve_sqlite_runtime_path(path: &str) -> String {
-    mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(path)
+    mcp_agent_mail_db::pool::resolve_sqlite_runtime_path_spelling(path)
 }
 
 /// Decide whether a normal CLI open must enter durable recovery admission

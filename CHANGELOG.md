@@ -130,6 +130,21 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ### Fixed
 
+- **Database-path policy sees the configured spelling again.** Since the
+  mailbox-identity work, the shared path helpers the cli and the server
+  used for opening and validating the database returned the frozen identity
+  (symlinks followed, relative spellings anchored to the current directory),
+  so the startup probes' "must not be a symlink" checks and the cli's
+  regular-file checks were validating the resolved target instead of what
+  the operator configured, and explicit relative spellings were rewritten.
+  `ResolvedMailboxSqlitePath` now carries `selected_path` (spelling after
+  only the legacy absolute fallback) beside `canonical_path` (identity), and
+  the cli runtime resolver and the server URL resolver use the spelling.
+  Registry keys still use the identity. The pool likewise freezes the
+  configured storage-root spelling beside its identity and hands the
+  spelling to archive recovery and reconcile, so a symlinked storage root is
+  refused as archive authority again instead of being followed to wherever
+  the link points.
 - **`DATABASE_POOL_TIMEOUT` means seconds everywhere (GH#245 follow-up).** The
   tool-call pools parsed the variable as milliseconds while the server
   readiness path and the operator runbook treated it as seconds, so

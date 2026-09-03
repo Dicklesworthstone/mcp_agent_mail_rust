@@ -43,9 +43,22 @@ struct SampledMessage {
     created_ts_iso: String,
 }
 
+/// The SQLite file a `DATABASE_URL` names, in two spellings.
+///
+/// `selected_path` is the configured spelling after only the legacy
+/// absolute fallback (`resolve_sqlite_path_with_absolute_fallback`): a
+/// relative path stays relative and a symlink stays a symlink. It is the
+/// path to open, display, and validate against no-symlink / no-traversal
+/// policy, because policy must see what the operator configured, not what
+/// the kernel resolved it to. `canonical_path` is the frozen identity the
+/// pool registers under (deepest existing prefix canonicalized, relative
+/// spellings anchored to the current directory); use it only to compare or
+/// key mailbox identities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedMailboxSqlitePath {
     pub configured_path: String,
+    #[serde(default)]
+    pub selected_path: String,
     pub canonical_path: String,
     pub used_absolute_fallback: bool,
 }
@@ -2900,7 +2913,13 @@ pub struct DbPool {
     /// retirement. `None` is the `:memory:` sentinel.
     sqlite_identity: Option<PathBuf>,
     sqlite_path: String,
+    /// Frozen archive-root identity (deepest existing prefix canonicalized).
+    /// Registry keys, init gates, and identity digests use this.
     storage_root: PathBuf,
+    /// The archive root as configured (absolute, lexical, symlinks not
+    /// followed). Archive recovery, reconcile, and allocator scans use this,
+    /// so a symlinked storage root is still refused as archive authority.
+    storage_root_alias: PathBuf,
     /// Per-transaction ceiling for raw ATC experience rows in the isolated
     /// telemetry sidecar. Captured when the pool is created so the hot write
     /// path does not reparse process configuration for every experience.
@@ -2941,7 +2960,10 @@ pub struct DbPool {
 struct DbPoolAuthority {
     sqlite_identity: Option<PathBuf>,
     sqlite_path: String,
+    /// Frozen archive-root identity (see [`DbPool::storage_root`]).
     storage_root: PathBuf,
+    /// The configured archive-root spelling (see [`DbPool::storage_root_alias`]).
+    storage_root_alias: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3226,6 +3248,7 @@ impl DbPool {
             sqlite_identity: authority.sqlite_identity,
             sqlite_path: authority.sqlite_path,
             storage_root: authority.storage_root,
+            storage_root_alias: authority.storage_root_alias,
             atc_experience_max_rows,
             init_sql,
             journal_size_limit_state,
@@ -3283,6 +3306,7 @@ impl DbPool {
             sqlite_identity: authority.sqlite_identity,
             sqlite_path: authority.sqlite_path,
             storage_root: authority.storage_root,
+            storage_root_alias: authority.storage_root_alias,
             atc_experience_max_rows,
             init_sql,
             journal_size_limit_state,
@@ -3380,9 +3404,18 @@ impl DbPool {
         self.atc_experience_max_rows
     }
 
+    /// Frozen archive-root identity: use for registry keys and digests.
     #[must_use]
     pub fn storage_root(&self) -> &std::path::Path {
         &self.storage_root
+    }
+
+    /// The archive root as configured (symlinks not followed). This is the
+    /// path archive recovery and reconcile must see, because a symlinked
+    /// storage root is never archive authority.
+    #[must_use]
+    pub fn storage_root_alias(&self) -> &std::path::Path {
+        &self.storage_root_alias
     }
 
     /// Return the frozen SQLite authority after proving its path has not
@@ -3447,7 +3480,12 @@ impl DbPool {
                 message: error.to_string(),
             }
         })?;
-        Ok(&self.storage_root)
+        validate_frozen_storage_root_alias(&self.storage_root_alias, &self.storage_root, context)
+            .map_err(|error| DbError::InvalidArgument {
+            field: "storage_root",
+            message: error.to_string(),
+        })?;
+        Ok(&self.storage_root_alias)
     }
 
     #[must_use]
@@ -3547,6 +3585,7 @@ impl DbPool {
         let sqlite_path = self.sqlite_path.clone();
         let sqlite_identity = self.sqlite_identity.clone();
         let storage_root = self.storage_root.clone();
+        let storage_root_alias = self.storage_root_alias.clone();
         let init_sql = self.init_sql.clone();
         let run_migrations = self.run_migrations;
         let skip_startup_init = self.skip_startup_init;
@@ -3559,9 +3598,12 @@ impl DbPool {
                 let sqlite_path = sqlite_path.clone();
                 let sqlite_identity = sqlite_identity.clone();
                 let storage_root = storage_root.clone();
-                // Owned copy for the per-connection recovery path below; the primary
-                // `storage_root` binding is moved into the one-time init-gate closure.
-                let storage_root_for_recovery = storage_root.clone();
+                // Archive recovery and reconcile see the configured spelling,
+                // never the resolved identity: a symlinked storage root must
+                // keep being refused as archive authority. The identity keys
+                // the init gate only.
+                let storage_root_alias = storage_root_alias.clone();
+                let storage_root_for_recovery = storage_root_alias.clone();
                 let init_sql = init_sql.clone();
                 let cx2 = cx2.clone();
                 async move {
@@ -3613,7 +3655,7 @@ impl DbPool {
                                     &cx2,
                                     &sqlite_path,
                                     run_migrations,
-                                    &storage_root,
+                                    &storage_root_alias,
                                 )
                                 .await;
                                 match init_out {
@@ -5291,6 +5333,7 @@ impl DbPoolAuthority {
             sqlite_identity,
             sqlite_path,
             storage_root,
+            storage_root_alias,
         })
     }
 }
@@ -5340,6 +5383,27 @@ fn validate_frozen_storage_root_authority(
         "{context}: frozen storage-root path {} now resolves to {}; refusing to cross archive authority",
         storage_root.display(),
         observed.display(),
+    )))
+}
+
+/// The configured archive-root spelling must still resolve to the identity
+/// that was frozen at pool construction; a re-pointed link or a replaced
+/// prefix would otherwise route recovery into a different archive.
+#[allow(clippy::result_large_err)]
+fn validate_frozen_storage_root_alias(
+    storage_root_alias: &Path,
+    storage_root_identity: &Path,
+    context: &'static str,
+) -> Result<(), SqlError> {
+    let observed = normalize_sqlite_identity_path_buf(storage_root_alias);
+    if observed == storage_root_identity {
+        return Ok(());
+    }
+    Err(SqlError::Custom(format!(
+        "{context}: configured storage-root path {} now resolves to {} instead of the frozen archive identity {}; refusing to cross archive authority",
+        storage_root_alias.display(),
+        observed.display(),
+        storage_root_identity.display(),
     )))
 }
 
@@ -10202,6 +10266,18 @@ pub fn normalize_sqlite_path_for_pool_key(sqlite_path: &str) -> String {
     sqlite_open_path_for_identity(&absolute_alias, &identity).unwrap_or(selected)
 }
 
+/// Resolve a configured SQLite path to the spelling the runtime should open.
+///
+/// Only the legacy absolute fallback applies (a malformed relative spelling
+/// whose absolute sibling is healthy); an explicit relative path stays
+/// relative and a symlink is not followed. This is the resolver for opening,
+/// displaying, and policy-validating a database path. Identity comparisons
+/// and registry keys use [`normalize_sqlite_path_for_pool_key`] instead.
+#[must_use]
+pub fn resolve_sqlite_runtime_path_spelling(sqlite_path: &str) -> String {
+    resolve_sqlite_path_with_absolute_fallback(sqlite_path)
+}
+
 pub fn resolve_mailbox_sqlite_path(database_url: &str) -> DbResult<ResolvedMailboxSqlitePath> {
     let config = DbPoolConfig {
         database_url: database_url.to_string(),
@@ -10220,6 +10296,7 @@ pub fn resolve_mailbox_sqlite_path(database_url: &str) -> DbResult<ResolvedMailb
     Ok(ResolvedMailboxSqlitePath {
         used_absolute_fallback: selected_path != configured_path,
         configured_path,
+        selected_path,
         canonical_path,
     })
 }
@@ -23716,6 +23793,88 @@ mod tests {
         assert_eq!(
             pool.sqlite_path, mailbox_path.canonical_path,
             "the shared resolver and actual pool must freeze one fresh-start authority"
+        );
+    }
+
+    /// The spelling resolver is what policy and opens must see: an explicit
+    /// relative spelling stays relative and a symlinked leaf is not followed,
+    /// while `canonical_path` still freezes the identity the pool registers.
+    #[cfg(unix)]
+    #[test]
+    fn resolved_mailbox_selected_path_keeps_spelling_while_canonical_path_freezes_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_db = dir.path().join("real.sqlite3");
+        let linked_db = dir.path().join("linked.sqlite3");
+        std::fs::write(&real_db, b"seed").expect("seed");
+        std::os::unix::fs::symlink(&real_db, &linked_db).expect("symlink");
+
+        let linked_url = format!("sqlite:///{}", linked_db.display());
+        let resolved = resolve_mailbox_sqlite_path(&linked_url).expect("resolve symlinked url");
+        assert_eq!(
+            Path::new(&resolved.selected_path),
+            linked_db.as_path(),
+            "selected_path must keep the symlink spelling"
+        );
+        assert_eq!(
+            resolved.canonical_path,
+            normalize_sqlite_identity_path_buf(&linked_db)
+                .to_string_lossy()
+                .into_owned(),
+            "canonical_path is the frozen identity"
+        );
+        assert_eq!(
+            resolve_sqlite_runtime_path_spelling(linked_db.to_string_lossy().as_ref()),
+            linked_db.to_string_lossy(),
+        );
+
+        let explicit_relative = "./relative/never-created.sqlite3";
+        let resolved = resolve_mailbox_sqlite_path(&format!("sqlite:///{explicit_relative}"))
+            .expect("resolve explicit relative url");
+        assert_eq!(resolved.selected_path, explicit_relative);
+        assert!(!resolved.used_absolute_fallback);
+        assert!(
+            Path::new(&resolved.canonical_path).is_absolute(),
+            "canonical_path anchors the relative spelling: {}",
+            resolved.canonical_path
+        );
+    }
+
+    /// A symlinked storage root is frozen twice: the identity keys registries
+    /// and gates, the configured spelling is what archive recovery sees (so
+    /// the archive-authority refusal of symlinked roots still fires).
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_storage_root_keeps_its_spelling_for_archive_recovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_root = dir.path().join("real-storage");
+        let linked_root = dir.path().join("linked-storage");
+        std::fs::create_dir_all(&real_root).expect("real root");
+        std::os::unix::fs::symlink(&real_root, &linked_root).expect("symlink root");
+        let db_path = dir.path().join("mailbox.sqlite3");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(linked_root.clone()),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..DbPoolConfig::default()
+        };
+        let authority = DbPoolAuthority::resolve(&config).expect("resolve authority");
+        assert_eq!(authority.storage_root_alias, linked_root);
+        assert_eq!(
+            authority.storage_root,
+            normalize_sqlite_identity_path_buf(&real_root)
+        );
+        assert_ne!(authority.storage_root, authority.storage_root_alias);
+
+        let pool = DbPool::new(&config).expect("construct pool");
+        assert_eq!(pool.storage_root_alias(), linked_root.as_path());
+        assert_eq!(pool.storage_root(), authority.storage_root.as_path());
+        assert_eq!(
+            pool.validated_storage_root("test")
+                .expect("alias still resolves to the frozen identity"),
+            linked_root.as_path()
         );
     }
 
