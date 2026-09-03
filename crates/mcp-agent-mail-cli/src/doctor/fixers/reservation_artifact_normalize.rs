@@ -269,6 +269,14 @@ pub(crate) fn fix_prepared(
     Ok(outcome)
 }
 
+/// The current DB generation of a read candidate, for callers that need to
+/// explain a skipped detection (GH#299).
+pub(crate) fn read_current_generation_of(
+    candidate: &super::DoctorDbReadCandidate,
+) -> Option<String> {
+    candidate.connection().and_then(read_current_generation)
+}
+
 fn read_current_generation(conn: &SqliteConnection) -> Option<String> {
     let rows = conn
         .query_sync(

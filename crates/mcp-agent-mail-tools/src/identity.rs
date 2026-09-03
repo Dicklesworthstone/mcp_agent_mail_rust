@@ -1224,7 +1224,11 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
 ///
 /// Uses the write-behind queue when available. If the queue is unavailable,
 /// falls back to the direct storage path before giving up.
-fn try_write_agent_profile(config: &Config, project_slug: &str, agent_json: &serde_json::Value) {
+pub(crate) fn try_write_agent_profile(
+    config: &Config,
+    project_slug: &str,
+    agent_json: &serde_json::Value,
+) {
     let op = mcp_agent_mail_storage::WriteOp::AgentProfile {
         project_slug: project_slug.to_string(),
         config: config.clone(),
@@ -1239,7 +1243,7 @@ fn try_write_agent_profile(config: &Config, project_slug: &str, agent_json: &ser
 /// Serialize the durable, non-secret portion of an agent profile for the Git
 /// archive. Keeping lifecycle fields in the profile makes reconstruction
 /// preserve routing state without ever archiving the registration token.
-fn agent_archive_profile_json(
+pub(crate) fn agent_archive_profile_json(
     agent: &mcp_agent_mail_db::AgentRow,
     deregistered_at: Option<i64>,
 ) -> serde_json::Value {
@@ -1347,6 +1351,21 @@ pub struct HealthCheckResponse {
     /// point directly at the failing subsystem.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub failing_verdicts: Vec<String>,
+    /// Every input that can raise `health_level` beyond the verdict roll-up
+    /// (GH#300): the roll-up itself, live pressure, archive materialization
+    /// lag, commit-coalescer tail latency, and a deleted owning executable.
+    /// A red `health_level` is always explained by one of these rows even
+    /// when no decomposed verdict is red.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub health_level_contributors: Vec<HealthLevelContributor>,
+}
+
+/// One input to the effective `health_level` (GH#300).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthLevelContributor {
+    pub name: String,
+    pub level: String,
+    pub detail: String,
 }
 
 /// Active recovery state surfaced in `health_check` when the mailbox is degraded or recovering.
@@ -1807,6 +1826,59 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // functional degradation so an all-zero pool snapshot cannot hide it.
     effective_level = effective_level.max(coalescer_latency_level);
     let failing_verdicts = verdicts.failing_names();
+    // GH#300: name every input behind the effective level so a red or yellow
+    // top level that no decomposed verdict explains (live pressure, archive
+    // lag, coalescer tail) is visible in the payload instead of looking like
+    // nondeterministic aggregation.
+    let archive_lag_level = if archive_lag_oldest_us >= archive_lag_critical_us {
+        mcp_agent_mail_core::HealthLevel::Red
+    } else if archive_lag_oldest_us >= archive_lag_warn_us {
+        mcp_agent_mail_core::HealthLevel::Yellow
+    } else {
+        mcp_agent_mail_core::HealthLevel::Green
+    };
+    let mut health_level_contributors = vec![
+        HealthLevelContributor {
+            name: "verdicts".to_string(),
+            level: verdicts.rollup_level().to_string(),
+            detail: if failing_verdicts.is_empty() {
+                "all critical verdicts green".to_string()
+            } else {
+                format!("not green: {}", failing_verdicts.join(", "))
+            },
+        },
+        HealthLevelContributor {
+            name: "pressure".to_string(),
+            level: pressure_level.to_string(),
+            detail: "live pool/queue pressure level".to_string(),
+        },
+        HealthLevelContributor {
+            name: "archive_lag".to_string(),
+            level: archive_lag_level.to_string(),
+            detail: format!(
+                "oldest unmaterialized archive op {} ms (warn {} ms, critical {} ms)",
+                archive_lag_oldest_us / 1_000,
+                archive_lag_warn_us / 1_000,
+                archive_lag_critical_us / 1_000
+            ),
+        },
+        HealthLevelContributor {
+            name: "coalescer_latency".to_string(),
+            level: coalescer_latency_level.to_string(),
+            detail: format!(
+                "commit coalescer p99 {} ms (degraded at {} ms)",
+                metrics.storage.commit_queue_latency_us.p99 / 1_000,
+                config.health_commit_coalescer_p99_degraded_ms
+            ),
+        },
+    ];
+    if recovery.as_ref().is_some_and(|r| r.executable_deleted) {
+        health_level_contributors.push(HealthLevelContributor {
+            name: "executable_deleted".to_string(),
+            level: mcp_agent_mail_core::HealthLevel::Yellow.to_string(),
+            detail: "the executable owning the mailbox locks was deleted or replaced".to_string(),
+        });
+    }
 
     let response = HealthCheckResponse {
         status: if critical_red {
@@ -1949,6 +2021,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         recovery,
         verdicts,
         failing_verdicts,
+        health_level_contributors,
     };
 
     serde_json::to_string(&response)
@@ -3602,6 +3675,7 @@ mod tests {
             recovery: None,
             verdicts: green_test_verdicts(),
             failing_verdicts: vec![],
+            health_level_contributors: vec![],
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
@@ -4147,6 +4221,7 @@ mod tests {
             recovery: None,
             verdicts: green_test_verdicts(),
             failing_verdicts: vec![],
+            health_level_contributors: vec![],
         };
         // Assert on the top-level KEYS, not substrings: verdict labels in the
         // always-present `verdicts` array legitimately mention these words

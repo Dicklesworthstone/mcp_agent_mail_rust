@@ -573,74 +573,94 @@ async fn resolve_or_register_agent(
     let agent_name_norm = mcp_agent_mail_core::models::normalize_agent_name(agent_name)
         .unwrap_or_else(|| agent_name.to_string());
 
-    let agent =
-        match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, &agent_name_norm)
-            .await
+    let agent = match mcp_agent_mail_db::queries::get_agent(
+        ctx.cx(),
+        pool,
+        project_id,
+        &agent_name_norm,
+    )
+    .await
+    {
+        Outcome::Ok(agent) => Ok(agent),
+        Outcome::Err(DbError::NotFound { .. })
+            if config.messaging_auto_register_recipients
+                && !config.messaging_fail_closed_send_profile =>
         {
-            Outcome::Ok(agent) => Ok(agent),
-            Outcome::Err(DbError::NotFound { .. })
-                if config.messaging_auto_register_recipients
-                    && !config.messaging_fail_closed_send_profile =>
+            // Proof gate (fail-closed): auto-registering an unknown recipient
+            // here cannot carry a signed `registration_proof` bundle, so when
+            // the gate is enabled we refuse instead of minting an unproven
+            // identity (program/model="unknown"). Without this, `send_message`
+            // to a non-existent recipient was a side door around the gate.
+            // Disabled gate = no-op, so default auto-register behavior is
+            // preserved exactly.
+            crate::proof_gate::reject_auto_registration_if_enabled(
+                "send_message auto-registration of recipient",
+            )?;
+            match mcp_agent_mail_db::queries::register_agent(
+                ctx.cx(),
+                pool,
+                project_id,
+                &agent_name_norm,
+                "unknown",
+                "unknown",
+                None,
+                None,
+                None,
+            )
+            .await
             {
-                // Proof gate (fail-closed): auto-registering an unknown recipient
-                // here cannot carry a signed `registration_proof` bundle, so when
-                // the gate is enabled we refuse instead of minting an unproven
-                // identity (program/model="unknown"). Without this, `send_message`
-                // to a non-existent recipient was a side door around the gate.
-                // Disabled gate = no-op, so default auto-register behavior is
-                // preserved exactly.
-                crate::proof_gate::reject_auto_registration_if_enabled(
-                    "send_message auto-registration of recipient",
-                )?;
-                match mcp_agent_mail_db::queries::register_agent(
-                    ctx.cx(),
-                    pool,
-                    project_id,
-                    &agent_name_norm,
-                    "unknown",
-                    "unknown",
-                    None,
-                    None,
-                    None,
-                )
-                .await
+                Outcome::Ok(_) => {}
+                Outcome::Err(DbError::Sqlite(message))
+                    if is_agent_unique_constraint_error(&message) =>
                 {
-                    Outcome::Ok(_) => {}
-                    Outcome::Err(DbError::Sqlite(message))
-                        if is_agent_unique_constraint_error(&message) =>
-                    {
-                        tracing::debug!(
-                            project_id,
-                            agent = %agent_name,
-                            "auto-register race detected; loading existing agent row"
-                        );
-                    }
-                    Outcome::Err(e) => return Err(db_error_to_mcp_error(e)),
-                    Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-                    Outcome::Panicked(p) => {
-                        return Err(McpError::internal_error(format!(
-                            "Internal panic: {}",
-                            p.message()
-                        )));
-                    }
-                }
-                db_outcome_to_mcp_result(
-                    mcp_agent_mail_db::queries::get_agent(
-                        ctx.cx(),
-                        pool,
+                    tracing::debug!(
                         project_id,
-                        &agent_name_norm,
-                    )
-                    .await,
-                )
+                        agent = %agent_name,
+                        "auto-register race detected; loading existing agent row"
+                    );
+                }
+                Outcome::Err(e) => return Err(db_error_to_mcp_error(e)),
+                Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+                Outcome::Panicked(p) => {
+                    return Err(McpError::internal_error(format!(
+                        "Internal panic: {}",
+                        p.message()
+                    )));
+                }
             }
-            Outcome::Err(e) => Err(db_error_to_mcp_error(e)),
-            Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
-            Outcome::Panicked(p) => Err(McpError::internal_error(format!(
-                "Internal panic: {}",
-                p.message()
-            ))),
-        }?;
+            let row = db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, &agent_name_norm)
+                    .await,
+            )?;
+            // GH#301: an implicitly registered recipient must exist in the
+            // archive too, or DB and archive identity inventories drift
+            // (db agents = archive agents + 1) and a reconstruct cannot
+            // recreate the placeholder. Archive the same profile shape
+            // register_agent writes (best-effort, write-behind).
+            if let Outcome::Ok(project) =
+                mcp_agent_mail_db::queries::get_project_by_id(ctx.cx(), pool, project_id).await
+            {
+                crate::identity::try_write_agent_profile(
+                    config,
+                    &project.slug,
+                    &crate::identity::agent_archive_profile_json(&row, None),
+                );
+            } else {
+                tracing::warn!(
+                    project_id,
+                    agent = %row.name,
+                    "auto-registered recipient: project row unavailable; archive profile not written"
+                );
+            }
+            Ok(row)
+        }
+        Outcome::Err(e) => Err(db_error_to_mcp_error(e)),
+        Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
+        Outcome::Panicked(p) => Err(McpError::internal_error(format!(
+            "Internal panic: {}",
+            p.message()
+        ))),
+    }?;
     enqueue_agent_semantic_index(&agent);
     Ok(agent)
 }
@@ -1802,7 +1822,7 @@ pub struct ReplyMessageResponse {
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names fail fast; register them first.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
+    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names in the same project are auto-registered as placeholder agents (program/model `unknown`, profile archived) while MESSAGING_AUTO_REGISTER_RECIPIENTS is on (default) and the registration proof gate is off; otherwise the send fails fast. Register recipients first when they need a real identity.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
 )]
 pub async fn send_message(
     ctx: &McpContext,

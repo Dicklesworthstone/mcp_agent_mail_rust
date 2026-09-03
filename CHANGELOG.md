@@ -130,6 +130,41 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ### Fixed
 
+- **The pre-commit guard no longer honors a superseded foreign-generation
+  reservation artifact (GH#299).** After a mailbox rebuild the archive can hold
+  `id-<id>-g<old>.json` with `released_ts: null` from the previous database
+  generation next to `id-<id>-g<current>.json` released under the current one.
+  The guard treated the old artifact as an active reservation and refused
+  unrelated commits until its `expires_ts` passed (100+ ids on one recovered
+  archive). A same-id released artifact from another generation that is at
+  least as recent now supersedes the unreleased twin; an old-generation
+  artifact with no released twin stays active. `am doctor archive-normalize`
+  already quarantines foreign-generation artifacts when it can read the
+  live database's generation; when that diagnostic open is refused or the
+  database carries no generation it now says so (a warning and a
+  `reservation_artifact_detection_skipped` list in `--json`) instead of
+  reporting zero reservation actions as if there were nothing to do.
+- **Doctor's file-sanity failure says which probe failed (GH#300).** The
+  staged health probes answered "unhealthy" without a reason, so
+  `am doctor check` reported an opaque `possible corruption` and recommended
+  stop-and-reconstruct. Each probe branch now records its reason (the primary
+  engine's leading integrity rows, the canonical compatibility probe's error,
+  a failed open, a missing or non-regular family member), the staged probe
+  re-keys it under the live path and marks it as a private-copy probe, and the
+  doctor detail includes it with a pointer to confirm with `am doctor health`
+  before reconstructing. `health_check` also lists every input behind its
+  `health_level` (`health_level_contributors`: verdict roll-up, live
+  pressure, archive lag, coalescer tail latency, deleted executable), so a
+  red top level that no decomposed verdict explains is attributable instead
+  of looking like flapping aggregation.
+- **Auto-registered recipients get an archived profile, and the
+  `send_message` description says so (GH#301).** A send to an unregistered
+  recipient in the same project auto-registers a placeholder agent
+  (program/model `unknown`) when `MESSAGING_AUTO_REGISTER_RECIPIENTS` is on and
+  the registration proof gate is off. The placeholder was DB-only, so DB and
+  archive agent inventories drifted by one and a reconstruct could not recreate
+  it. The same profile shape `register_agent` archives is now written for it,
+  and the tool description no longer claims unknown recipients fail fast.
 - **`am` reads no longer refuse a mailbox that lacks FrankenSQLite namespace
   sidecars (br-vhxdc).** The CLI's live read-only opener (startup banner,
   pre-open health probe, sync mailbox reads, doctor source selection, robot

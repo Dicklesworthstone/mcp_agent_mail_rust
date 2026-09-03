@@ -735,6 +735,30 @@ pub fn extract_check_details(rows: &[Row], kind: CheckKind) -> Vec<String> {
     details
 }
 
+/// The first `limit` detail rows joined for a one-line diagnostic.
+///
+/// Integrity output can run to hundreds of rows (one per orphaned page); a
+/// verdict detail only needs the leading ones, plus a count of the rest.
+#[must_use]
+pub fn first_detail_rows(details: &[String], limit: usize) -> String {
+    let shown: Vec<&str> = details
+        .iter()
+        .map(|row| row.trim())
+        .filter(|row| !row.is_empty())
+        .take(limit)
+        .collect();
+    let total = details.iter().filter(|row| !row.trim().is_empty()).count();
+    if shown.is_empty() {
+        return "(no detail rows)".to_string();
+    }
+    let mut text = shown.join("; ");
+    if total > shown.len() {
+        use std::fmt::Write as _;
+        let _ = write!(text, " (+{} more)", total - shown.len());
+    }
+    text
+}
+
 #[must_use]
 pub fn details_indicate_ok(details: &[String]) -> bool {
     details.len() == 1 && details[0].trim().eq_ignore_ascii_case("ok")

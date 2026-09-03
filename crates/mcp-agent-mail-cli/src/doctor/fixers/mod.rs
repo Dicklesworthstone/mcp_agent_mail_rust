@@ -446,6 +446,12 @@ impl DoctorDbReadCandidate {
         &self.target_path
     }
 
+    /// Why this candidate has no connection, when the open was refused or
+    /// failed (`None` for an opened candidate).
+    pub(crate) fn open_error(&self) -> Option<&str> {
+        self.open_error.as_deref()
+    }
+
     pub(crate) fn connection(&self) -> Option<&sqlmodel_sqlite::SqliteConnection> {
         self.connection.as_ref()
     }

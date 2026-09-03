@@ -1057,21 +1057,55 @@ pub(crate) struct ArchiveNormalizeReservationArtifactOutcome {
 /// Detect generation-keyed reservation archive artifacts for the
 /// `archive-normalize` compatibility verb. Kept separate from the mutation so
 /// the command can include these actions in its single confirmation prompt.
+///
+/// Returns the findings and, separately, the reasons detection could not run
+/// for a database (GH#299): a refused or failed diagnostic open used to
+/// yield a silent `reservation_artifact_actions: 0`, indistinguishable from
+/// "nothing to do".
 pub(crate) fn detect_archive_normalize_reservation_artifacts(
     storage_root: &Path,
     database_path: Option<&Path>,
-) -> Vec<fixers::reservation_artifact_normalize::ReservationArtifactNormalizeFinding> {
-    let candidates = database_path.map_or_else(Vec::new, |path| vec![path.to_path_buf()]);
-    let read_candidates: Vec<_> = candidates
-        .iter()
-        .map(|path| {
-            fixers::DoctorDbReadCandidate::open_live_or_explicit_offline(
-                path,
-                "archive-normalize reservation artifact detection",
-            )
-        })
-        .collect();
-    fixers::reservation_artifact_normalize::detect_prepared(Some(storage_root), &read_candidates)
+) -> (
+    Vec<fixers::reservation_artifact_normalize::ReservationArtifactNormalizeFinding>,
+    Vec<String>,
+) {
+    let Some(database_path) = database_path else {
+        return (
+            Vec::new(),
+            vec![
+                "reservation artifact detection skipped: DATABASE_URL does not name a SQLite file"
+                    .to_string(),
+            ],
+        );
+    };
+    let read_candidates = vec![
+        fixers::DoctorDbReadCandidate::open_live_or_explicit_offline(
+            database_path,
+            "archive-normalize reservation artifact detection",
+        ),
+    ];
+    let mut skipped = Vec::new();
+    for candidate in &read_candidates {
+        if let Some(error) = candidate.open_error() {
+            skipped.push(format!(
+                "reservation artifact detection skipped for {}: {error}",
+                candidate.target_path().display()
+            ));
+        } else if candidate.connection().is_some()
+            && fixers::reservation_artifact_normalize::read_current_generation_of(candidate)
+                .is_none()
+        {
+            skipped.push(format!(
+                "reservation artifact detection skipped for {}: the database carries no db_identity generation (pre-generation mailbox)",
+                candidate.target_path().display()
+            ));
+        }
+    }
+    let findings = fixers::reservation_artifact_normalize::detect_prepared(
+        Some(storage_root),
+        &read_candidates,
+    );
+    (findings, skipped)
 }
 
 /// Apply a pre-confirmed `archive-normalize` reservation artifact plan.

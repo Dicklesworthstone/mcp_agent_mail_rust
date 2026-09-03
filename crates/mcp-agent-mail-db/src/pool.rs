@@ -7705,6 +7705,18 @@ fn sqlite_primary_check_is_ok_with_canonical_fallback(
     if matches!(primary_result, Ok(true)) {
         return Ok(true);
     }
+    // GH#300: whatever the canonical fallback decides below, the primary
+    // engine's own complaint is the diagnostic worth surfacing.
+    note_unhealthy_reason(
+        path,
+        match &primary_details {
+            Ok(details) => format!(
+                "primary engine {kind} reported: {}",
+                integrity::first_detail_rows(details, 3)
+            ),
+            Err(error) => format!("primary engine {kind} failed: {error}"),
+        },
+    );
 
     match sqlite_canonical_file_check_is_ok(path, kind) {
         Ok(true) => {
@@ -9102,9 +9114,17 @@ fn sqlite_file_is_healthy_canonical(path: &Path) -> Result<bool, SqlError> {
     let conn = crate::CanonicalDbConn::open_file(sqlite_path_as_utf8(path)?)?;
 
     if !sqlite_canonical_quick_check_is_ok(&conn)? {
+        note_unhealthy_reason(path, "canonical SQLite quick_check reported problems");
         return Ok(false);
     }
-    sqlite_canonical_incremental_check_is_ok(&conn)
+    let incremental_ok = sqlite_canonical_incremental_check_is_ok(&conn)?;
+    if !incremental_ok {
+        note_unhealthy_reason(
+            path,
+            "canonical SQLite incremental integrity check reported problems",
+        );
+    }
+    Ok(incremental_ok)
 }
 
 #[allow(clippy::result_large_err)]
@@ -9174,6 +9194,7 @@ fn sqlite_primary_read_path_is_healthy_direct_with_cleanup(
     allow_family_cleanup: bool,
 ) -> Result<bool, SqlError> {
     if !path.exists() {
+        note_unhealthy_reason(path, "the database file is missing");
         return Ok(false);
     }
     // A directory, FIFO, device, or symlink in a SQLite sidecar slot cannot
@@ -9184,6 +9205,10 @@ fn sqlite_primary_read_path_is_healthy_direct_with_cleanup(
         std::fs::symlink_metadata(sqlite_sidecar_path(path, suffix))
             .is_ok_and(|metadata| !metadata.file_type().is_file())
     }) {
+        note_unhealthy_reason(
+            path,
+            "a SQLite sidecar slot holds a non-regular file (directory, device, FIFO, or symlink)",
+        );
         return Ok(false);
     }
     let path_str = sqlite_path_as_utf8(path)?;
@@ -9200,10 +9225,17 @@ fn sqlite_primary_read_path_is_healthy_direct_with_cleanup(
             let msg = first_err.to_string();
             if is_corruption_error_message(&msg) || is_sqlite_snapshot_conflict_error_message(&msg)
             {
+                note_unhealthy_reason(path, format!("primary engine open failed: {msg}"));
                 return Ok(false);
             }
             if is_sqlite_recovery_error_message(&msg) {
                 if !allow_family_cleanup {
+                    note_unhealthy_reason(
+                        path,
+                        format!(
+                            "primary engine open needs family cleanup that is not allowed here: {msg}"
+                        ),
+                    );
                     return Ok(false);
                 }
                 let _ = apply_classified_sqlite_family_cleanup(path)?;
@@ -9215,6 +9247,12 @@ fn sqlite_primary_read_path_is_healthy_direct_with_cleanup(
                             || is_sqlite_recovery_error_message(&retry_msg)
                             || is_sqlite_snapshot_conflict_error_message(&retry_msg)
                         {
+                            note_unhealthy_reason(
+                                path,
+                                format!(
+                                    "primary engine open failed after family cleanup: {retry_msg}"
+                                ),
+                            );
                             return Ok(false);
                         }
                         return Err(retry_err);
@@ -9349,6 +9387,7 @@ fn normalize_compatibility_probe_result(
         Err(e) => {
             let msg = e.to_string();
             if is_corruption_error_message(&msg) || is_sqlite_recovery_error_message(&msg) {
+                note_unhealthy_reason(path, format!("canonical SQLite compatibility probe: {msg}"));
                 return Ok(false);
             }
             if is_lock_error(&msg) {
@@ -9363,6 +9402,58 @@ fn normalize_compatibility_probe_result(
             }
         }
     }
+}
+
+// ============================================================================
+// Last unhealthy-probe reason (GH#300)
+// ============================================================================
+//
+// The staged health probes answer `Ok(false)` without saying why: the exact
+// failing check lives only in tracing output, and `am doctor check` turned
+// that into an opaque "possible corruption" verdict with a stop-and-reconstruct
+// recommendation. Each branch that decides "unhealthy" now leaves a short
+// reason keyed by the probed path, and the staged probe re-keys it under the
+// live path it stood in for, so callers can report which probe failed and
+// that it ran on a private staged copy.
+
+static UNHEALTHY_PROBE_REASONS: std::sync::OnceLock<Mutex<HashMap<PathBuf, String>>> =
+    std::sync::OnceLock::new();
+
+fn unhealthy_probe_reasons() -> &'static Mutex<HashMap<PathBuf, String>> {
+    UNHEALTHY_PROBE_REASONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn note_unhealthy_reason(path: &Path, reason: impl Into<String>) {
+    let reason = reason.into();
+    if let Ok(mut reasons) = unhealthy_probe_reasons().lock() {
+        reasons.insert(path.to_path_buf(), reason);
+    }
+}
+
+/// Re-key a reason recorded for a staged private copy under the live path it
+/// stood in for, so the caller who probed the live path can read it.
+fn transfer_unhealthy_reason(from: &Path, to: &Path) {
+    if let Ok(mut reasons) = unhealthy_probe_reasons().lock()
+        && let Some(reason) = reasons.remove(from)
+    {
+        reasons.insert(
+            to.to_path_buf(),
+            format!("staged private-copy probe: {reason}"),
+        );
+    }
+}
+
+/// The reason the most recent health probe of `path` decided "unhealthy".
+///
+/// Recorded reasons are consumed on read. `None` when the last probe was
+/// healthy, was answered from the healthy-verdict cache, or refused before
+/// probing.
+#[must_use]
+pub fn take_last_unhealthy_reason(path: &Path) -> Option<String> {
+    unhealthy_probe_reasons()
+        .lock()
+        .ok()
+        .and_then(|mut reasons| reasons.remove(path))
 }
 
 // ============================================================================
@@ -9560,11 +9651,17 @@ pub fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
         return Ok(true);
     }
     let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
+        note_unhealthy_reason(
+            path,
+            "the SQLite family could not be staged for a health probe",
+        );
         return Ok(false);
     };
     let healthy = sqlite_file_is_healthy_staged(&staged.path, true)?;
     if healthy {
         remember_healthy_verdict(path, HealthVerdictVariant::WithFamilyCleanup, fingerprint);
+    } else {
+        transfer_unhealthy_reason(&staged.path, path);
     }
     Ok(healthy)
 }
@@ -23931,6 +24028,39 @@ mod tests {
             pool.validated_storage_root("test")
                 .expect("alias still resolves to the frozen identity"),
             linked_root.as_path()
+        );
+    }
+
+    /// GH#300: a staged health probe that decides "unhealthy" leaves the
+    /// failing probe's reason behind, re-keyed under the live path, so doctor
+    /// output can say which check failed and that it ran on a staged copy.
+    #[test]
+    fn unhealthy_staged_probe_records_its_reason_under_the_live_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("garbage.sqlite3");
+        std::fs::write(&db_path, vec![b'x'; 4096]).expect("write garbage");
+        assert!(
+            !sqlite_file_is_healthy(&db_path).expect("probe runs"),
+            "a garbage file is not healthy"
+        );
+        let reason = take_last_unhealthy_reason(&db_path).expect("reason recorded");
+        assert!(
+            reason.starts_with("staged private-copy probe: "),
+            "the reason names the staged probe: {reason}"
+        );
+        assert!(
+            take_last_unhealthy_reason(&db_path).is_none(),
+            "the reason is consumed on read"
+        );
+
+        let ok_path = dir.path().join("fine.sqlite3");
+        let conn = DbConn::open_file(ok_path.to_string_lossy().as_ref()).expect("open");
+        conn.execute_raw("CREATE TABLE t(x)").expect("schema");
+        crate::close_db_conn(conn, "seed");
+        assert!(sqlite_file_is_healthy(&ok_path).expect("probe runs"));
+        assert!(
+            take_last_unhealthy_reason(&ok_path).is_none(),
+            "a healthy probe leaves no reason"
         );
     }
 

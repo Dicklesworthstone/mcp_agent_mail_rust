@@ -1933,6 +1933,79 @@ fn is_real_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
 
+/// Unreleased reservation artifacts plus, per reservation id, the newest
+/// released artifact seen (GH#299).
+type ReservationArtifactScan = (
+    Vec<(std::path::PathBuf, serde_json::Value)>,
+    std::collections::HashMap<u64, ReservationArtifactStamp>,
+);
+
+fn scan_reservation_artifacts(reservations_dir: &Path) -> GuardResult<ReservationArtifactScan> {
+    // GH#299: after a mailbox rebuild the archive can hold two generation
+    // stamped artifacts for one reservation id: `id-<id>-g<old>.json` with
+    // `released_ts: null` from the previous database generation and
+    // `id-<id>-g<current>.json` released under the current one. The old
+    // artifact is history, not an active reservation. Track, per id, the
+    // newest released artifact so a superseded foreign-generation active
+    // twin is skipped below.
+    let mut candidates: Vec<(std::path::PathBuf, serde_json::Value)> = Vec::new();
+    let mut released_by_id: std::collections::HashMap<u64, ReservationArtifactStamp> =
+        std::collections::HashMap::new();
+
+    let entries = std::fs::read_dir(reservations_dir)?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+
+        // Only process .json files
+        if !file_type.is_file()
+            || file_type.is_symlink()
+            || path.extension().and_then(|e| e.to_str()) != Some("json")
+        {
+            continue;
+        }
+
+        // Defend against arbitrary large files in the archive causing OOM in the pre-commit hook.
+        let metadata = entry.metadata().ok();
+        if let Some(meta) = &metadata
+            && meta.len() > 1024 * 1024
+        {
+            // 1MB limit for reservation JSON
+            continue;
+        }
+
+        // Skip unreadable files and invalid JSON.
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+
+        // Skip released reservations, remembering them per reservation id.
+        // Older archive artifacts sometimes persisted zero-like sentinels for
+        // still-active reservations, and the DB layer still treats those as active.
+        if released_ts_marks_record_released(&val["released_ts"]) {
+            if let Some(stamp) = reservation_artifact_stamp(&path, &val, metadata.as_ref()) {
+                released_by_id
+                    .entry(stamp.id)
+                    .and_modify(|existing| {
+                        if stamp.modified > existing.modified {
+                            *existing = stamp.clone();
+                        }
+                    })
+                    .or_insert(stamp);
+            }
+            continue;
+        }
+        candidates.push((path, val));
+    }
+    Ok((candidates, released_by_id))
+}
+
 /// Read active file reservations from the archive's `file_reservations/` directory.
 ///
 /// Parses each `*.json` file and returns records that are:
@@ -1950,43 +2023,18 @@ fn read_active_reservations_from_archive(
 
     let now = chrono::Utc::now();
     let mut records = Vec::new();
+    let (candidates, released_by_id) = scan_reservation_artifacts(&reservations_dir)?;
 
-    let entries = std::fs::read_dir(&reservations_dir)?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-
-        // Only process .json files
-        if !file_type.is_file()
-            || file_type.is_symlink()
-            || path.extension().and_then(|e| e.to_str()) != Some("json")
+    for (path, val) in candidates {
+        // GH#299: an unreleased artifact from another database generation is
+        // superseded by a released twin of the same id that is at least as
+        // recent (the current generation's release), and never blocks delivery.
+        if let Some(stamp) =
+            reservation_artifact_stamp(&path, &val, std::fs::metadata(&path).ok().as_ref())
+            && let Some(released) = released_by_id.get(&stamp.id)
+            && released.generation != stamp.generation
+            && released.modified >= stamp.modified
         {
-            continue;
-        }
-
-        // Defend against arbitrary large files in the archive causing OOM in the pre-commit hook.
-        if let Ok(meta) = entry.metadata()
-            && meta.len() > 1024 * 1024
-        {
-            // 1MB limit for reservation JSON
-            continue;
-        }
-
-        // Skip unreadable files and invalid JSON.
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else {
-            continue;
-        };
-
-        // Skip released reservations.
-        // Older archive artifacts sometimes persisted zero-like sentinels for
-        // still-active reservations, and the DB layer still treats those as active.
-        if released_ts_marks_record_released(&val["released_ts"]) {
             continue;
         }
 
@@ -2059,6 +2107,45 @@ fn read_active_reservations_from_archive(
     }
 
     Ok(records)
+}
+
+/// Identity of one reservation artifact: numeric reservation id, the
+/// database generation it was written under (from the `id-<id>-g<gen>.json`
+/// name, else the record's `db_generation`, else none), and its mtime.
+#[derive(Clone, Debug)]
+struct ReservationArtifactStamp {
+    id: u64,
+    generation: Option<String>,
+    modified: std::time::SystemTime,
+}
+
+fn reservation_artifact_stamp(
+    path: &Path,
+    record: &serde_json::Value,
+    metadata: Option<&std::fs::Metadata>,
+) -> Option<ReservationArtifactStamp> {
+    let stem = path.file_stem()?.to_str()?;
+    let rest = stem.strip_prefix("id-")?;
+    let (id_text, name_generation) = match rest.split_once("-g") {
+        Some((id, generation)) if !generation.is_empty() => (id, Some(generation.to_string())),
+        _ => (rest, None),
+    };
+    let id = id_text.parse::<u64>().ok()?;
+    let generation = name_generation.or_else(|| {
+        record["db_generation"]
+            .as_str()
+            .map(str::trim)
+            .filter(|generation| !generation.is_empty())
+            .map(str::to_string)
+    });
+    let modified = metadata
+        .and_then(|meta| meta.modified().ok())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    Some(ReservationArtifactStamp {
+        id,
+        generation,
+        modified,
+    })
 }
 
 fn released_ts_marks_record_released(value: &serde_json::Value) -> bool {
@@ -2862,6 +2949,59 @@ mod tests {
             normalized_pattern: normalize_path(pattern, false),
             has_glob: contains_glob(pattern),
         }
+    }
+
+    /// GH#299: after a mailbox rebuild, an unreleased artifact from the previous
+    /// database generation must not block delivery when the same reservation
+    /// id has a released artifact under the current generation.
+    #[test]
+    fn foreign_generation_active_artifact_is_superseded_by_released_current_twin() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let archive = td.path().join("archive");
+        let res_dir = archive.join("file_reservations");
+        std::fs::create_dir_all(&res_dir).expect("mkdir");
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+
+        // Old generation: still "active" on disk.
+        let old = serde_json::json!({
+            "path_pattern": "src/lib.rs",
+            "agent_name": "OtherAgent",
+            "exclusive": true,
+            "expires_ts": future,
+            "released_ts": null,
+            "db_generation": "oldgen00"
+        });
+        std::fs::write(res_dir.join("id-123-goldgen00.json"), old.to_string()).expect("write");
+        // Current generation: released. Written afterwards, so at least as recent.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let current = serde_json::json!({
+            "path_pattern": "src/lib.rs",
+            "agent_name": "OtherAgent",
+            "exclusive": true,
+            "expires_ts": future,
+            "released_ts": "2026-09-02T00:00:00Z",
+            "db_generation": "curgen11"
+        });
+        std::fs::write(res_dir.join("id-123-gcurgen11.json"), current.to_string()).expect("write");
+        // A different id with only an old-generation active artifact stays active:
+        // nothing in the current generation says it was released.
+        let lone = serde_json::json!({
+            "path_pattern": "src/other.rs",
+            "agent_name": "OtherAgent",
+            "exclusive": true,
+            "expires_ts": future,
+            "released_ts": null,
+            "db_generation": "oldgen00"
+        });
+        std::fs::write(res_dir.join("id-124-goldgen00.json"), lone.to_string()).expect("write");
+
+        let active = read_active_reservations_from_archive(&archive, false).expect("read");
+        let patterns: Vec<&str> = active.iter().map(|r| r.path_pattern.as_str()).collect();
+        assert_eq!(
+            patterns,
+            vec!["src/other.rs"],
+            "the superseded foreign-generation artifact must be skipped: {patterns:?}"
+        );
     }
 
     #[test]

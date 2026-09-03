@@ -13612,10 +13612,14 @@ where
         ));
     }
 
+    // GH#300: say which probe failed and that it ran on a private staged
+    // copy, instead of an opaque "possible corruption" verdict.
+    let reason = mcp_agent_mail_db::pool::take_last_unhealthy_reason(selected_path.as_path())
+        .map_or_else(String::new, |reason| format!("; {reason}"));
     Ok((
         false,
         format!(
-            "Health probes failed for {} (possible corruption)",
+            "Health probes failed for {} (possible corruption{reason}); confirm with `am doctor health` before reconstructing",
             selected_path.display()
         ),
         used_absolute_fallback,
@@ -28772,6 +28776,9 @@ struct DoctorArchiveNormalizeResult {
     reservation_artifact_actions: usize,
     reservation_artifacts_quarantined: usize,
     reservation_artifact_normalize_run: Option<String>,
+    /// GH#299: why reservation-artifact detection could not run for the
+    /// database (empty when it ran).
+    reservation_artifact_detection_skipped: Vec<String>,
     unresolved_project_metadata_files: usize,
     unresolved_malformed_message_files: usize,
     unresolved_suspicious_projects: usize,
@@ -82681,10 +82688,14 @@ fn handle_doctor_archive_normalize(
     let _mailbox_storage_root_lock =
         acquire_doctor_mailbox_activity_lock_for_storage_root(&storage_root, dry_run)?;
     let reservation_artifact_db = sqlite_file_path_from_database_url(&config.database_url);
-    let reservation_artifact_findings = doctor::detect_archive_normalize_reservation_artifacts(
-        &storage_root,
-        reservation_artifact_db.as_deref(),
-    );
+    let (reservation_artifact_findings, reservation_artifact_detection_skipped) =
+        doctor::detect_archive_normalize_reservation_artifacts(
+            &storage_root,
+            reservation_artifact_db.as_deref(),
+        );
+    for reason in &reservation_artifact_detection_skipped {
+        output::warn(reason);
+    }
     let reservation_artifact_actions_planned = reservation_artifact_findings
         .iter()
         .map(|finding| finding.to_finding().remediation.estimated_actions)
@@ -82920,6 +82931,7 @@ fn handle_doctor_archive_normalize(
     )?;
     result.reservation_artifact_actions = reservation_artifact_outcome.actions_taken;
     result.reservation_artifacts_quarantined = reservation_artifact_outcome.quarantined_paths.len();
+    result.reservation_artifact_detection_skipped = reservation_artifact_detection_skipped;
     result.reservation_artifact_normalize_run = reservation_artifact_outcome
         .run_dir
         .as_ref()
