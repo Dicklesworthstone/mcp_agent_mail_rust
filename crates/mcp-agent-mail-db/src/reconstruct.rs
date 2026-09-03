@@ -2104,38 +2104,12 @@ fn reconstruct_from_archive_with_salvage(
     let mut salvage_for_merge: Option<&Path> = None;
     let mut unreadable_salvage: Option<String> = None;
     if let Some(salvage_db_path) = salvage_db_path {
-        match probe_salvage_database_for_merge(salvage_db_path) {
-            Ok(()) => match crate::pool::sqlite_file_passes_full_integrity_check(salvage_db_path) {
-                Ok(true) => salvage_for_merge = Some(salvage_db_path),
-                Ok(false) => {
-                    unreadable_salvage = Some(format!(
-                        "salvage source {} failed full integrity_check",
-                        salvage_db_path.display()
-                    ));
-                }
-                Err(health_error) => {
-                    let message = health_error.to_string();
-                    if crate::pool::is_corruption_error_message(&message) {
-                        unreadable_salvage = Some(message);
-                    } else {
-                        return Err(DbError::Sqlite(format!(
-                            "reconstruct salvage source {} failed validation; refusing an archive-only candidate because DB-only coordination state could be lost: {health_error}",
-                            salvage_db_path.display()
-                        )));
-                    }
-                }
-            },
-            Err(error) => {
-                let message = error.to_string();
-                if crate::pool::is_corruption_error_message(&message) {
-                    unreadable_salvage = Some(message);
-                } else {
-                    return Err(DbError::Sqlite(format!(
-                        "reconstruct salvage source {} failed validation; refusing an archive-only candidate because DB-only coordination state could be lost: {error}",
-                        salvage_db_path.display()
-                    )));
-                }
+        match classify_salvage_source(salvage_db_path) {
+            SalvageSourceVerdict::Mergeable => salvage_for_merge = Some(salvage_db_path),
+            SalvageSourceVerdict::DegradesToArchiveOnly(reason) => {
+                unreadable_salvage = Some(reason);
             }
+            SalvageSourceVerdict::Refuses(reason) => return Err(DbError::Sqlite(reason)),
         }
     }
 
@@ -2168,6 +2142,62 @@ fn reconstruct_from_archive_with_salvage(
         }
     }
     Ok(stats)
+}
+
+/// How a reconstruct will treat a salvage source (GH#302).
+///
+/// Exposed so `am doctor reconstruct --dry-run` can run the *same* validation
+/// the real command runs instead of promising a recovery the real command then
+/// refuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SalvageSourceVerdict {
+    /// The source validates; its DB-only rows will be merged into the rebuild.
+    Mergeable,
+    /// The source is unreadable or corrupt. The rebuild proceeds archive-only
+    /// and records this reason as a warning on the promotable candidate.
+    DegradesToArchiveOnly(String),
+    /// The source could not be validated for a non-corruption reason, so the
+    /// rebuild refuses rather than silently dropping DB-only coordination
+    /// state. The string is the exact error the real run would return.
+    Refuses(String),
+}
+
+/// Classify a salvage source exactly as [`reconstruct_from_archive_with_private_salvage`] will.
+///
+/// Read-only: it probes the candidate and runs a full integrity check on it.
+#[must_use]
+pub fn classify_salvage_source(salvage_db_path: &Path) -> SalvageSourceVerdict {
+    let refusal = |detail: &str| {
+        SalvageSourceVerdict::Refuses(format!(
+            "reconstruct salvage source {} failed validation; refusing an archive-only candidate because DB-only coordination state could be lost: {detail}",
+            salvage_db_path.display()
+        ))
+    };
+    match probe_salvage_database_for_merge(salvage_db_path) {
+        Ok(()) => match crate::pool::sqlite_file_passes_full_integrity_check(salvage_db_path) {
+            Ok(true) => SalvageSourceVerdict::Mergeable,
+            Ok(false) => SalvageSourceVerdict::DegradesToArchiveOnly(format!(
+                "salvage source {} failed full integrity_check",
+                salvage_db_path.display()
+            )),
+            Err(health_error) => {
+                let message = health_error.to_string();
+                if crate::pool::is_corruption_error_message(&message) {
+                    SalvageSourceVerdict::DegradesToArchiveOnly(message)
+                } else {
+                    refusal(&message)
+                }
+            }
+        },
+        Err(error) => {
+            let message = error.to_string();
+            if crate::pool::is_corruption_error_message(&message) {
+                SalvageSourceVerdict::DegradesToArchiveOnly(message)
+            } else {
+                refusal(&message)
+            }
+        }
+    }
 }
 
 fn probe_salvage_database_for_merge(path: &Path) -> DbResult<()> {

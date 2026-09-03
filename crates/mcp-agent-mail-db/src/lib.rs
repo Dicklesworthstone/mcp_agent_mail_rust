@@ -332,12 +332,13 @@ pub use queries::{LeaseOutcome, MvccRetryMetrics, RollupSnapshot, mvcc_retry_met
 pub use reconstruct::{
     ArchiveDeltaApplyOutcome, ArchiveDeltaApplyStats, ArchiveDriftReport, ArchiveDriftReportSchema,
     ArchiveMessageInventory, MailboxProjectIdentity, ProjectIdentityMismatch, ReconstructStats,
-    apply_archive_ahead_delta, archive_delta_apply_max_messages,
-    archive_missing_project_identities, collect_db_message_ids, collect_db_project_identities,
-    compute_archive_drift_report, mailbox_project_identity_matches_db,
-    neutralize_private_salvage_artifact, reconstruct_from_archive,
-    reconstruct_from_archive_with_live_salvage, reconstruct_from_archive_with_private_salvage,
-    scan_archive_message_ids, scan_archive_message_inventory,
+    SalvageSourceVerdict, apply_archive_ahead_delta, archive_delta_apply_max_messages,
+    archive_missing_project_identities, classify_salvage_source, collect_db_message_ids,
+    collect_db_project_identities, compute_archive_drift_report,
+    mailbox_project_identity_matches_db, neutralize_private_salvage_artifact,
+    reconstruct_from_archive, reconstruct_from_archive_with_live_salvage,
+    reconstruct_from_archive_with_private_salvage, scan_archive_message_ids,
+    scan_archive_message_inventory,
 };
 pub use retry::{
     CIRCUIT_BREAKER, CIRCUIT_DB, CIRCUIT_GIT, CIRCUIT_LLM, CIRCUIT_SIGNAL, CircuitBreaker,

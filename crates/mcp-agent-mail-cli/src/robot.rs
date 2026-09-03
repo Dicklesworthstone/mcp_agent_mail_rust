@@ -7845,13 +7845,17 @@ fn summarize_db_file_sanity_probe(database_url: &str) -> HealthProbeAssessment {
     }
 
     match crate::sqlite_doctor_file_sanity(&sqlite_path) {
-        Ok((healthy, detail, used_absolute_fallback, _fallback_due_to_missing_configured_path)) => {
-            let (status, unhealthy, degraded) = if healthy {
-                if used_absolute_fallback {
+        Ok(sanity) => {
+            let (status, unhealthy, degraded) = if sanity.healthy {
+                if sanity.used_absolute_fallback {
                     ("warn", false, true)
                 } else {
                     ("ok", false, false)
                 }
+            } else if sanity.inconclusive {
+                // GH#300: the probe could not answer; that is degraded
+                // visibility, not a proven unhealthy mailbox.
+                ("warn", false, true)
             } else {
                 ("fail", true, false)
             };
@@ -7860,7 +7864,7 @@ fn summarize_db_file_sanity_probe(database_url: &str) -> HealthProbeAssessment {
                     name: "db_file_sanity".into(),
                     status: status.into(),
                     latency_ms: 0.0,
-                    detail,
+                    detail: sanity.detail,
                 },
                 unhealthy,
                 degraded,

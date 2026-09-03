@@ -473,19 +473,42 @@ pub fn resolve_identity_with_binding(
         return Some(hit);
     }
 
-    // 1b. If pane_id is a composite key, try legacy bare $TMUX_PANE canonical path.
-    //     A composite key contains `:`, e.g., `main:0:2`. The bare pane env var
-    //     is something like `%3`. We check the env so we can find files written
-    //     before the composite key migration.
-    if pane_id.contains(':')
-        && let Some(bare) = tmux_pane_env()
-    {
-        let bare = bare.trim().to_string();
-        if !bare.is_empty() {
-            let legacy_canonical = canonical_identity_path(project_key, &bare);
-            if let Some(hit) = resolver.consider(legacy_canonical) {
-                return Some(hit);
+    // The bare pane ids a composite key may be keyed under, most authoritative
+    // first. A composite key contains `:`, e.g. `main:0:2` (or tmux's own
+    // `main:0.2`); the bare id is something like `%3`.
+    //
+    // GH#270: ask tmux which pane the composite actually names. The previous
+    // code only consulted the CALLER's `$TMUX_PANE`, so an explicit
+    // `resolve_pane_identity` / `am agents resolve-pane` for someone else's
+    // pane — the documented composite form — missed a bare-keyed identity
+    // file entirely and failed closed, while the bare form for the same live
+    // pane resolved. The env value is still tried afterwards for callers that
+    // ask about their own pane on a host where tmux is not reachable.
+    let bare_candidates: Vec<String> = if pane_id.contains(':') {
+        let mut candidates = Vec::new();
+        if let Some(bare) = bare_for_composite_pane(pane_id)
+            && bare != pane_id
+        {
+            candidates.push(bare);
+        }
+        if let Some(env_bare) = tmux_pane_env() {
+            let env_bare = env_bare.trim().to_string();
+            if !env_bare.is_empty() && !candidates.contains(&env_bare) {
+                candidates.push(env_bare);
             }
+        }
+        candidates
+    } else {
+        Vec::new()
+    };
+
+    // 1b. Composite key: try the canonical path keyed by the bare pane id, for
+    //     identity files written before the composite-key migration (or by a
+    //     writer that only had `$TMUX_PANE`).
+    for bare in &bare_candidates {
+        let legacy_canonical = canonical_identity_path(project_key, bare);
+        if let Some(hit) = resolver.consider(legacy_canonical) {
+            return Some(hit);
         }
     }
 
@@ -517,10 +540,8 @@ pub fn resolve_identity_with_binding(
         }
 
         // 2b. If composite key, also try bare pane ID for legacy Claude Code path
-        if pane_id.contains(':')
-            && let Some(bare) = tmux_pane_env()
-        {
-            let bare_sanitized = sanitize_pane_id(bare.trim());
+        for bare in &bare_candidates {
+            let bare_sanitized = sanitize_pane_id(bare);
             if bare_sanitized != sanitized {
                 let legacy_claude_bare = home
                     .join(".claude")
@@ -542,10 +563,8 @@ pub fn resolve_identity_with_binding(
     }
 
     // 3b. If composite key, also try bare pane ID for legacy NTM path
-    if pane_id.contains(':')
-        && let Some(bare) = tmux_pane_env()
-    {
-        let bare_sanitized = sanitize_pane_id(bare.trim());
+    for bare in &bare_candidates {
+        let bare_sanitized = sanitize_pane_id(bare);
         if bare_sanitized != sanitized {
             let legacy_ntm_bare =
                 legacy_ntm_root().join(format!("agent-mail-name.{hash}.{bare_sanitized}"));
@@ -1608,6 +1627,26 @@ fn composite_for_bare_pane(pane_id: &str) -> Option<String> {
     composite.contains(':').then_some(composite)
 }
 
+/// Ask tmux for the bare pane id (`%97`) the composite key `pane_id` names.
+///
+/// The inverse of [`composite_for_bare_pane`] (GH#270). The key is turned into
+/// a tmux target by [`pane_target_for`], so both the documented
+/// `session:window:pane` form and tmux's own `session:window.pane` form
+/// resolve. Returns `None` when tmux is unavailable, the pane does not exist,
+/// or the answer is not a bare `%N` pane id.
+fn bare_for_composite_pane(pane_id: &str) -> Option<String> {
+    let target = pane_target_for(pane_id)?;
+    let output = tmux_command()
+        .args(["display-message", "-t", &target, "-p", "#{pane_id}"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let bare = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    bare.starts_with('%').then_some(bare)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2361,6 +2400,69 @@ mod tests {
                 );
                 // A bare pane tmux doesn't know still returns None (no false match).
                 assert_eq!(resolve_identity(&project, "%99"), None);
+            },
+        );
+        drop(config);
+    }
+
+    /// GH#270: the documented composite form (`session:window:pane`) and
+    /// tmux's own `session:window.pane` form must resolve the same live
+    /// identity as the bare pane id, even when the caller's own `$TMUX_PANE`
+    /// is unset or names a different pane. Identity files written by a process
+    /// that only had `$TMUX_PANE` are keyed by the bare id, so the composite
+    /// lookup has to ask tmux which pane it names.
+    #[cfg(unix)]
+    #[test]
+    fn composite_pane_key_resolves_a_bare_keyed_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("supervisor");
+
+        // The identity file is keyed by the BARE pane id.
+        write_identity(&project, "%97", "BlueLake").expect("write bare identity");
+
+        let temp = tempfile::tempdir().expect("tmux stub tempdir");
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create bin dir");
+        let tmux_path = bin_dir.join("tmux");
+        // Fake tmux: both composite spellings target `main:14.1` -> `%97`.
+        let script = "#!/bin/sh\n\
+             tgt=\"\"; prev=\"\"\n\
+             for a in \"$@\"; do if [ \"$prev\" = \"-t\" ]; then tgt=\"$a\"; fi; prev=\"$a\"; done\n\
+             if [ \"$tgt\" = \"main:14.1\" ]; then printf '%%97\\n'; exit 0; fi\n\
+             exit 1\n";
+        std::fs::write(&tmux_path, script).expect("write tmux stub");
+        let mut perms = std::fs::metadata(&tmux_path)
+            .expect("tmux stub metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tmux_path, perms).expect("chmod tmux stub");
+        let tmux_bin = tmux_path.to_string_lossy().into_owned();
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", tmux_bin.as_str()), ("TMUX_PANE", "")],
+            || {
+                assert_eq!(
+                    resolve_identity(&project, "%97").as_deref(),
+                    Some("BlueLake"),
+                    "the bare form must keep working"
+                );
+                assert_eq!(
+                    resolve_identity(&project, "main:14:1").as_deref(),
+                    Some("BlueLake"),
+                    "the documented composite form must resolve the same identity"
+                );
+                assert_eq!(
+                    resolve_identity(&project, "main:14.1").as_deref(),
+                    Some("BlueLake"),
+                    "tmux's own session:window.pane form must resolve too"
+                );
+                assert_eq!(
+                    resolve_identity(&project, "main:99:1"),
+                    None,
+                    "a composite tmux does not know must still fail closed"
+                );
             },
         );
         drop(config);

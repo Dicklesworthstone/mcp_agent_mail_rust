@@ -13496,10 +13496,61 @@ fn sqlite_file_is_healthy_read_only(path: &Path) -> CliResult<bool> {
     sqlite_file_is_healthy(path)
 }
 
+/// Outcome of the doctor's SQLite file-sanity probe.
+#[derive(Debug, Clone)]
+pub(crate) struct DoctorFileSanity {
+    /// The probe proved the file healthy.
+    pub(crate) healthy: bool,
+    /// Operator-facing sentence for the check row.
+    pub(crate) detail: String,
+    /// The probe ran against the absolute fallback path, not the configured one.
+    pub(crate) used_absolute_fallback: bool,
+    /// The configured path was missing, which is why the fallback was used.
+    pub(crate) fallback_due_to_missing_configured_path: bool,
+    /// GH#300: `healthy` is false but nothing about the LIVE database was
+    /// established — the probe ran on a private staged copy that could not be
+    /// staged or opened, hit a transient conflict, or answered without saying
+    /// which check failed. Such a result must never be reported as corruption
+    /// or drive a reconstruct recommendation; the live-path checks
+    /// (`pool_init`, `foreign_key_integrity`, `archive_db_parity`) decide.
+    pub(crate) inconclusive: bool,
+}
+
+impl DoctorFileSanity {
+    fn healthy(
+        detail: String,
+        used_absolute_fallback: bool,
+        fallback_due_to_missing_configured_path: bool,
+    ) -> Self {
+        Self {
+            healthy: true,
+            detail,
+            used_absolute_fallback,
+            fallback_due_to_missing_configured_path,
+            inconclusive: false,
+        }
+    }
+
+    /// A conclusive failure: the probe observed a defect in the file itself.
+    fn failed(
+        detail: String,
+        used_absolute_fallback: bool,
+        fallback_due_to_missing_configured_path: bool,
+    ) -> Self {
+        Self {
+            healthy: false,
+            detail,
+            used_absolute_fallback,
+            fallback_due_to_missing_configured_path,
+            inconclusive: false,
+        }
+    }
+}
+
 fn sqlite_doctor_sanity_with_health_probe<F>(
     db_path: &str,
     mut health_probe: F,
-) -> CliResult<(bool, String, bool, bool)>
+) -> CliResult<DoctorFileSanity>
 where
     F: FnMut(&Path) -> CliResult<bool>,
 {
@@ -13513,8 +13564,7 @@ where
             used_absolute_fallback = true;
             fallback_due_to_missing_configured_path = true;
         } else {
-            return Ok((
-                false,
+            return Ok(DoctorFileSanity::failed(
                 format!("Database file does not exist: {}", selected_path.display()),
                 false,
                 false,
@@ -13522,11 +13572,16 @@ where
         }
     }
 
+    // GH#300: a probe that answered "unhealthy" by erroring out on a transient
+    // conflict or a recovery-class family artifact never looked at the live
+    // b-tree. Remember that so the caller does not report corruption.
+    let mut probe_error_was_inconclusive = false;
     let mut healthy = match health_probe(selected_path.as_path()) {
         Ok(v) => v,
         Err(e) => {
             let msg = e.to_string();
             if is_snapshot_conflict_cli_error(&e) || is_sqlite_recovery_error_message(&msg) {
+                probe_error_was_inconclusive = true;
                 false
             } else if mcp_agent_mail_db::is_lock_error(&msg) {
                 return Err(sqlite_doctor_busy_error(selected_path.as_path(), &msg));
@@ -13574,8 +13629,7 @@ where
         ))
     })?;
     if file_size == 0 {
-        return Ok((
-            false,
+        return Ok(DoctorFileSanity::failed(
             "Database file is 0 bytes (empty/corrupt)".to_string(),
             used_absolute_fallback,
             fallback_due_to_missing_configured_path,
@@ -13597,41 +13651,56 @@ where
                     file_size,
                 )
             };
-            return Ok((
-                true,
+            return Ok(DoctorFileSanity::healthy(
                 detail,
                 used_absolute_fallback,
                 fallback_due_to_missing_configured_path,
             ));
         }
-        return Ok((
-            true,
+        return Ok(DoctorFileSanity::healthy(
             format!("quick_check OK ({file_size} bytes)"),
             used_absolute_fallback,
             fallback_due_to_missing_configured_path,
         ));
     }
 
-    // GH#300: say which probe failed and that it ran on a private staged
-    // copy, instead of an opaque "possible corruption" verdict.
-    let reason = mcp_agent_mail_db::pool::take_last_unhealthy_reason(selected_path.as_path())
-        .map_or_else(String::new, |reason| format!("; {reason}"));
-    Ok((
-        false,
+    // GH#300: say which probe failed and that it ran on a private staged copy,
+    // instead of an opaque "possible corruption" verdict — and only call it
+    // corruption when the probe actually saw damage in the file's content.
+    // An unrecorded reason is the most opaque case of all: the probe answered
+    // "not healthy" without saying why, so it is inconclusive too.
+    let reason = mcp_agent_mail_db::pool::take_last_unhealthy_reason(selected_path.as_path());
+    let inconclusive =
+        probe_error_was_inconclusive || reason.as_ref().is_none_or(|reason| !reason.conclusive);
+    let because = reason.map_or_else(
+        || "; the probe did not record which check failed".to_string(),
+        |reason| format!("; {reason}"),
+    );
+    let detail = if inconclusive {
         format!(
-            "Health probes failed for {} (possible corruption{reason}); confirm with `am doctor health` before reconstructing",
+            "Health probes could not verify {} (inconclusive{because}); the live-path checks below decide. Do not reconstruct on this result alone — confirm with `am doctor health`",
             selected_path.display()
-        ),
+        )
+    } else {
+        format!(
+            "Health probes failed for {} (possible corruption{because}); confirm with `am doctor health` before reconstructing",
+            selected_path.display()
+        )
+    };
+    Ok(DoctorFileSanity {
+        healthy: false,
+        detail,
         used_absolute_fallback,
         fallback_due_to_missing_configured_path,
-    ))
+        inconclusive,
+    })
 }
 
-fn sqlite_doctor_file_sanity(db_path: &str) -> CliResult<(bool, String, bool, bool)> {
+fn sqlite_doctor_file_sanity(db_path: &str) -> CliResult<DoctorFileSanity> {
     sqlite_doctor_sanity_with_health_probe(db_path, sqlite_file_is_healthy)
 }
 
-fn sqlite_doctor_file_sanity_read_only(db_path: &str) -> CliResult<(bool, String, bool, bool)> {
+fn sqlite_doctor_file_sanity_read_only(db_path: &str) -> CliResult<DoctorFileSanity> {
     sqlite_doctor_sanity_with_health_probe(db_path, sqlite_file_is_healthy_read_only)
 }
 
@@ -29165,7 +29234,19 @@ fn build_doctor_check_summary(
         .unwrap_or("ok");
     let primary_issue = primary_check.map_or(serde_json::Value::Null, |check| {
         let check_name = doctor_check_value_str(check, "check").unwrap_or_default();
-        if DOCTOR_DATABASE_INCIDENT_CHECKS.contains(&check_name) {
+        // GH#300: a probe that could not answer is an operator warning, never a
+        // live mailbox incident — the class that carries a repair/reconstruct
+        // next action.
+        if check["inconclusive"] == serde_json::Value::Bool(true) {
+            doctor_issue_summary_value(
+                check,
+                "probe_inconclusive",
+                Some(
+                    "Confirm with `am doctor health`; the live-path checks (pool_init, foreign_key_integrity, archive_db_parity) decide. Do not reconstruct on an inconclusive probe."
+                        .to_string(),
+                ),
+            )
+        } else if DOCTOR_DATABASE_INCIDENT_CHECKS.contains(&check_name) {
             doctor_issue_summary_value(
                 check,
                 "live_mailbox_incident",
@@ -29205,6 +29286,8 @@ fn build_doctor_check_summary(
         .filter(|c| {
             let name = doctor_check_value_str(c, "check").unwrap_or_default();
             doctor_check_category(name) == "live_incident"
+                // GH#300: an inconclusive probe is not a live-incident finding.
+                && c["inconclusive"] != serde_json::Value::Bool(true)
                 && matches!(
                     doctor_check_value_str(c, "status"),
                     Some("fail") | Some("warn")
@@ -31896,7 +31979,20 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     };
 
     match file_sanity {
-        Ok((false, detail, _, _)) => {
+        // GH#300: an inconclusive staged-copy probe proves nothing about the
+        // live database. Fall through to the live-path probes below (open,
+        // required tables, canonical integrity, relational consistency) and let
+        // them establish a verdict; never turn "could not answer" into a
+        // reconstruct recommendation.
+        Ok(sanity) if !sanity.healthy && sanity.inconclusive => {
+            tracing::info!(
+                path = %resolved.display(),
+                detail = %sanity.detail,
+                "doctor: the SQLite file-sanity probe was inconclusive; deferring to the live-path probes"
+            );
+        }
+        Ok(sanity) if !sanity.healthy => {
+            let detail = sanity.detail;
             let verdict = if archive_reconstruct_available {
                 DoctorDatabaseFixStrategy::Reconstruct(format!(
                     "{detail}; archive recovery is available under {}",
@@ -31933,7 +32029,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
             // entry-point chokepoint proves the DB healthy; return it raw here.
             return Ok(verdict);
         }
-        Ok((true, _, _, _)) => {}
+        Ok(_) => {}
     }
 
     if !cleanup_truncated_wal {
@@ -33164,24 +33260,30 @@ fn handle_doctor_check_with_target(
                 Ok(db_path) => {
                     if db_path != ":memory:" {
                         match sqlite_doctor_file_sanity_read_only(&db_path) {
-                            Ok((
-                                qc_ok,
-                                detail,
-                                used_absolute_fallback,
-                                _fallback_due_to_missing_configured_path,
-                            )) => {
-                                if !qc_ok {
+                            Ok(sanity) => {
+                                // GH#300: an inconclusive probe is a warning,
+                                // not a corruption finding. It must not gate
+                                // the live-path checks that can actually
+                                // establish whether the mailbox is damaged.
+                                if !sanity.healthy && !sanity.inconclusive {
                                     db_file_sanity_failed = true;
                                 }
-                                let status = if qc_ok {
-                                    if used_absolute_fallback { "warn" } else { "ok" }
+                                let status = if sanity.healthy {
+                                    if sanity.used_absolute_fallback {
+                                        "warn"
+                                    } else {
+                                        "ok"
+                                    }
+                                } else if sanity.inconclusive {
+                                    "warn"
                                 } else {
                                     "fail"
                                 };
                                 checks.push(serde_json::json!({
                                     "check": "db_file_sanity",
                                     "status": status,
-                                    "detail": detail,
+                                    "detail": sanity.detail,
+                                    "inconclusive": !sanity.healthy && sanity.inconclusive,
                                 }));
                             }
                             Err(e) => {
@@ -62765,14 +62867,50 @@ startup_timeout_sec = 42
         .expect("snapshot conflicts should be classified as unhealthy, not fatal");
 
         assert!(
-            !result.0,
-            "snapshot conflict should force repair/reconstruct"
+            !result.healthy,
+            "snapshot conflict should not report a healthy database"
+        );
+        // GH#300: a snapshot conflict is a race with a live writer, not proof
+        // of on-disk damage. It must be reported as inconclusive, without a
+        // corruption claim and without a reconstruct recommendation.
+        assert!(
+            result.inconclusive,
+            "snapshot conflict should be inconclusive: {}",
+            result.detail
         );
         assert!(
-            result.1.contains("Health probes failed"),
+            result.detail.contains("Health probes could not verify"),
             "unexpected detail: {}",
-            result.1
+            result.detail
         );
+        assert!(
+            !result.detail.contains("possible corruption"),
+            "an inconclusive probe must not claim corruption: {}",
+            result.detail
+        );
+    }
+
+    /// GH#300: an inconclusive `db_file_sanity` row must not be summarized as a
+    /// live mailbox incident, and must not carry a repair/reconstruct action.
+    #[test]
+    fn inconclusive_db_file_sanity_is_not_a_live_mailbox_incident() {
+        let checks = vec![serde_json::json!({
+            "check": "db_file_sanity",
+            "status": "warn",
+            "detail": "Health probes could not verify /db (inconclusive; staged private-copy probe: the SQLite family could not be staged for a health probe)",
+            "inconclusive": true,
+        })];
+        let strategy = DoctorDatabaseFixStrategy::Reconstruct("would reconstruct".to_string());
+        let summary = build_doctor_check_summary(&checks, Some(&strategy), None);
+        assert_eq!(summary["primary_issue"]["class"], "probe_inconclusive");
+        let next_action = summary["primary_issue"]["next_action"]
+            .as_str()
+            .expect("next action");
+        assert!(
+            !next_action.contains("reconstruct --dry-run"),
+            "inconclusive probes must not recommend reconstruct: {next_action}"
+        );
+        assert_eq!(summary["category_breakdown"]["live_incident_findings"], 0);
     }
 
     #[test]
@@ -72255,15 +72393,16 @@ startup_timeout_sec = 42
         .expect("insert orphaned recipient");
         drop(conn);
 
-        let (healthy, detail, _used_absolute_fallback, _fallback_due_to_missing_path) =
-            sqlite_doctor_file_sanity(&db_path_str).expect("doctor file sanity");
+        let sanity = sqlite_doctor_file_sanity(&db_path_str).expect("doctor file sanity");
         assert!(
-            healthy,
-            "orphaned foreign keys with WAL sidecars should not fail db file sanity: {detail}"
+            sanity.healthy,
+            "orphaned foreign keys with WAL sidecars should not fail db file sanity: {}",
+            sanity.detail
         );
         assert!(
-            detail.contains("quick_check OK"),
-            "expected quick_check success detail, got: {detail}"
+            sanity.detail.contains("quick_check OK"),
+            "expected quick_check success detail, got: {}",
+            sanity.detail
         );
     }
 
@@ -80122,12 +80261,13 @@ fn handle_doctor_repair_with_options(
     // 1. File sanity check via the runtime probe plus canonical fallback so doctor
     // repair does not misclassify healthy databases as corrupt. In dry-run the
     // probe runs read-only against the temporary copy (GH#215).
-    let (integrity_ok, integrity_detail, _used_absolute_fallback, _missing_configured_path) =
-        if dry_run {
-            sqlite_doctor_file_sanity_read_only(&reconstruct_db_path.display().to_string())?
-        } else {
-            sqlite_doctor_file_sanity(&reconstruct_db_path.display().to_string())?
-        };
+    let file_sanity = if dry_run {
+        sqlite_doctor_file_sanity_read_only(&reconstruct_db_path.display().to_string())?
+    } else {
+        sqlite_doctor_file_sanity(&reconstruct_db_path.display().to_string())?
+    };
+    let integrity_ok = file_sanity.healthy;
+    let integrity_detail = file_sanity.detail;
 
     ftui_runtime::ftui_println!(
         "  quick_check_ok: {} ({})",
@@ -81708,6 +81848,103 @@ where
     operation()
 }
 
+/// What `am doctor reconstruct -y` would do with the salvage source (GH#302).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DoctorReconstructSalvagePreview {
+    /// No candidate exists; the rebuild is archive-only by construction.
+    NoCandidate,
+    /// A candidate exists but could not be materialized for reading.
+    NotMaterializable(String),
+    /// The candidate validates and its DB-only rows would be merged.
+    WouldMerge(PathBuf),
+    /// The candidate is corrupt/unreadable; the rebuild degrades to
+    /// archive-only and still promotes.
+    WouldDegradeToArchiveOnly { source: PathBuf, detail: String },
+    /// The real command would refuse on this candidate.
+    WouldRefuse { source: PathBuf, detail: String },
+}
+
+impl DoctorReconstructSalvagePreview {
+    fn status(&self) -> &'static str {
+        match self {
+            Self::NoCandidate => "no_candidate",
+            Self::NotMaterializable(_) => "not_materializable",
+            Self::WouldMerge(_) => "would_merge",
+            Self::WouldDegradeToArchiveOnly { .. } => "would_degrade_to_archive_only",
+            Self::WouldRefuse { .. } => "would_refuse",
+        }
+    }
+
+    fn summary(&self) -> String {
+        match self {
+            Self::NoCandidate => {
+                "no salvage candidate; the rebuild would be archive-only".to_string()
+            }
+            Self::NotMaterializable(detail) => {
+                format!("salvage candidate could not be read ({detail}); the rebuild would be archive-only")
+            }
+            Self::WouldMerge(source) => {
+                format!("would merge DB-only rows from {}", source.display())
+            }
+            Self::WouldDegradeToArchiveOnly { source, detail } => format!(
+                "would skip {} and rebuild archive-only ({detail})",
+                source.display()
+            ),
+            Self::WouldRefuse { source, detail } => format!(
+                "WOULD REFUSE on {}: {detail}",
+                source.display()
+            ),
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let (source, detail) = match self {
+            Self::NoCandidate => (None, None),
+            Self::NotMaterializable(detail) => (None, Some(detail.clone())),
+            Self::WouldMerge(source) => (Some(source.display().to_string()), None),
+            Self::WouldDegradeToArchiveOnly { source, detail }
+            | Self::WouldRefuse { source, detail } => {
+                (Some(source.display().to_string()), Some(detail.clone()))
+            }
+        };
+        serde_json::json!({
+            "status": self.status(),
+            "source": source,
+            "detail": detail,
+            "would_refuse": matches!(self, Self::WouldRefuse { .. }),
+        })
+    }
+}
+
+/// Run the real command's salvage selection and validation without writing
+/// anything, so `--dry-run` and `-y` cannot disagree about whether a recovery
+/// is possible (GH#302).
+fn doctor_reconstruct_salvage_preview(db_path: &Path) -> DoctorReconstructSalvagePreview {
+    let candidates = doctor_salvage_artifact_candidates(db_path);
+    if candidates.is_empty() {
+        return DoctorReconstructSalvagePreview::NoCandidate;
+    }
+    match attempt_best_doctor_salvage_artifact_from_candidates(db_path, candidates) {
+        DoctorSalvageAttempt::Failed(detail) => {
+            DoctorReconstructSalvagePreview::NotMaterializable(detail)
+        }
+        DoctorSalvageAttempt::Succeeded(artifact) => {
+            let source = artifact.db_path.clone();
+            match mcp_agent_mail_db::classify_salvage_source(&source) {
+                mcp_agent_mail_db::SalvageSourceVerdict::Mergeable => {
+                    DoctorReconstructSalvagePreview::WouldMerge(source)
+                }
+                mcp_agent_mail_db::SalvageSourceVerdict::DegradesToArchiveOnly(detail) => {
+                    DoctorReconstructSalvagePreview::WouldDegradeToArchiveOnly { source, detail }
+                }
+                mcp_agent_mail_db::SalvageSourceVerdict::Refuses(detail) => {
+                    DoctorReconstructSalvagePreview::WouldRefuse { source, detail }
+                }
+            }
+        }
+    }
+}
+
 fn handle_doctor_reconstruct_with(
     db_path_override: Option<&Path>,
     storage_root_override: Option<&Path>,
@@ -81808,6 +82045,10 @@ fn handle_doctor_reconstruct_with(
         // Walk the archive to report what would be recovered, without writing.
         ftui_runtime::ftui_println!("Dry run — scanning archive at {}", storage_root.display());
         let stats = scan_archive_stats(&storage_root);
+        // GH#302: run the SAME salvage validation the real command runs. The
+        // dry run used to skip it entirely and promise a recovery that the
+        // real `am doctor reconstruct -y` then refused on the salvage source.
+        let salvage_preview = doctor_reconstruct_salvage_preview(&db_path);
         if json {
             ftui_runtime::ftui_println!(
                 "{}",
@@ -81824,7 +82065,8 @@ fn handle_doctor_reconstruct_with(
                         "duplicate_canonical_message_ids": stats.duplicate_canonical_message_ids,
                         "thread_digests": stats.thread_digests,
                         "unparseable_canonical_message_files": stats.unparseable_canonical_message_files,
-                    }
+                    },
+                    "salvage": salvage_preview.to_json(),
                 })
             );
         } else {
@@ -81850,7 +82092,13 @@ fn handle_doctor_reconstruct_with(
                 );
             }
             ftui_runtime::ftui_println!("  Database path: {}", db_path.display());
+            ftui_runtime::ftui_println!("  Salvage:       {}", salvage_preview.summary());
             ftui_runtime::ftui_println!("No changes made.");
+        }
+        if let DoctorReconstructSalvagePreview::WouldRefuse { detail, .. } = &salvage_preview {
+            output::warn(&format!(
+                "`am doctor reconstruct -y` would REFUSE with: {detail}"
+            ));
         }
         return Ok(());
     }

@@ -7707,16 +7707,22 @@ fn sqlite_primary_check_is_ok_with_canonical_fallback(
     }
     // GH#300: whatever the canonical fallback decides below, the primary
     // engine's own complaint is the diagnostic worth surfacing.
-    note_unhealthy_reason(
-        path,
-        match &primary_details {
-            Ok(details) => format!(
+    match &primary_details {
+        // Detail rows are the engine's own complaint about the file's content.
+        Ok(details) => note_conclusive_unhealthy_reason(
+            path,
+            format!(
                 "primary engine {kind} reported: {}",
                 integrity::first_detail_rows(details, 3)
             ),
-            Err(error) => format!("primary engine {kind} failed: {error}"),
-        },
-    );
+        ),
+        // The check could not be run to completion; that is a probe
+        // limitation, not proof of on-disk damage.
+        Err(error) => note_inconclusive_unhealthy_reason(
+            path,
+            format!("primary engine {kind} failed: {error}"),
+        ),
+    }
 
     match sqlite_canonical_file_check_is_ok(path, kind) {
         Ok(true) => {
@@ -9114,12 +9120,12 @@ fn sqlite_file_is_healthy_canonical(path: &Path) -> Result<bool, SqlError> {
     let conn = crate::CanonicalDbConn::open_file(sqlite_path_as_utf8(path)?)?;
 
     if !sqlite_canonical_quick_check_is_ok(&conn)? {
-        note_unhealthy_reason(path, "canonical SQLite quick_check reported problems");
+        note_conclusive_unhealthy_reason(path, "canonical SQLite quick_check reported problems");
         return Ok(false);
     }
     let incremental_ok = sqlite_canonical_incremental_check_is_ok(&conn)?;
     if !incremental_ok {
-        note_unhealthy_reason(
+        note_conclusive_unhealthy_reason(
             path,
             "canonical SQLite incremental integrity check reported problems",
         );
@@ -9194,7 +9200,7 @@ fn sqlite_primary_read_path_is_healthy_direct_with_cleanup(
     allow_family_cleanup: bool,
 ) -> Result<bool, SqlError> {
     if !path.exists() {
-        note_unhealthy_reason(path, "the database file is missing");
+        note_conclusive_unhealthy_reason(path, "the database file is missing");
         return Ok(false);
     }
     // A directory, FIFO, device, or symlink in a SQLite sidecar slot cannot
@@ -9205,7 +9211,7 @@ fn sqlite_primary_read_path_is_healthy_direct_with_cleanup(
         std::fs::symlink_metadata(sqlite_sidecar_path(path, suffix))
             .is_ok_and(|metadata| !metadata.file_type().is_file())
     }) {
-        note_unhealthy_reason(
+        note_conclusive_unhealthy_reason(
             path,
             "a SQLite sidecar slot holds a non-regular file (directory, device, FIFO, or symlink)",
         );
@@ -9225,12 +9231,18 @@ fn sqlite_primary_read_path_is_healthy_direct_with_cleanup(
             let msg = first_err.to_string();
             if is_corruption_error_message(&msg) || is_sqlite_snapshot_conflict_error_message(&msg)
             {
-                note_unhealthy_reason(path, format!("primary engine open failed: {msg}"));
+                // A corruption signature is evidence; a snapshot conflict is a
+                // transient race against a concurrent writer and is not.
+                note_unhealthy_reason_with(
+                    path,
+                    format!("primary engine open failed: {msg}"),
+                    is_corruption_error_message(&msg),
+                );
                 return Ok(false);
             }
             if is_sqlite_recovery_error_message(&msg) {
                 if !allow_family_cleanup {
-                    note_unhealthy_reason(
+                    note_inconclusive_unhealthy_reason(
                         path,
                         format!(
                             "primary engine open needs family cleanup that is not allowed here: {msg}"
@@ -9247,11 +9259,12 @@ fn sqlite_primary_read_path_is_healthy_direct_with_cleanup(
                             || is_sqlite_recovery_error_message(&retry_msg)
                             || is_sqlite_snapshot_conflict_error_message(&retry_msg)
                         {
-                            note_unhealthy_reason(
+                            note_unhealthy_reason_with(
                                 path,
                                 format!(
                                     "primary engine open failed after family cleanup: {retry_msg}"
                                 ),
+                                is_corruption_error_message(&retry_msg),
                             );
                             return Ok(false);
                         }
@@ -9387,7 +9400,14 @@ fn normalize_compatibility_probe_result(
         Err(e) => {
             let msg = e.to_string();
             if is_corruption_error_message(&msg) || is_sqlite_recovery_error_message(&msg) {
-                note_unhealthy_reason(path, format!("canonical SQLite compatibility probe: {msg}"));
+                // Only a corruption signature is evidence here; a
+                // recovery-class error (truncated WAL header and friends) is a
+                // repairable family artifact, not a damaged b-tree.
+                note_unhealthy_reason_with(
+                    path,
+                    format!("canonical SQLite compatibility probe: {msg}"),
+                    is_corruption_error_message(&msg),
+                );
                 return Ok(false);
             }
             if is_lock_error(&msg) {
@@ -9416,15 +9436,59 @@ fn normalize_compatibility_probe_result(
 // live path it stood in for, so callers can report which probe failed and
 // that it ran on a private staged copy.
 
-static UNHEALTHY_PROBE_REASONS: std::sync::OnceLock<Mutex<HashMap<PathBuf, String>>> =
+/// Why a health probe answered "unhealthy", and whether that answer is
+/// evidence about the live database (GH#300).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnhealthyProbeReason {
+    /// Short operator-facing sentence naming the check that failed.
+    pub detail: String,
+    /// `true` only when the probe observed damage in the database's own
+    /// content: an integrity/quick_check complaint, or an open that failed
+    /// with a corruption signature, or a filesystem defect in the live
+    /// family. `false` when the probe could not answer — staging failed, the
+    /// engine refused, a recovery-class open error, a snapshot conflict.
+    /// Such an answer says nothing about the live file and must never be
+    /// promoted to a corruption verdict or a reconstruct recommendation.
+    pub conclusive: bool,
+    /// `true` when the failing check ran against a private staged copy of the
+    /// SQLite family rather than against the live path.
+    pub staged_copy: bool,
+}
+
+impl std::fmt::Display for UnhealthyProbeReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.staged_copy {
+            write!(f, "staged private-copy probe: {}", self.detail)
+        } else {
+            f.write_str(&self.detail)
+        }
+    }
+}
+
+static UNHEALTHY_PROBE_REASONS: std::sync::OnceLock<Mutex<HashMap<PathBuf, UnhealthyProbeReason>>> =
     std::sync::OnceLock::new();
 
-fn unhealthy_probe_reasons() -> &'static Mutex<HashMap<PathBuf, String>> {
+fn unhealthy_probe_reasons() -> &'static Mutex<HashMap<PathBuf, UnhealthyProbeReason>> {
     UNHEALTHY_PROBE_REASONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn note_unhealthy_reason(path: &Path, reason: impl Into<String>) {
-    let reason = reason.into();
+/// Record a reason that proves the probed database's own content is damaged.
+fn note_conclusive_unhealthy_reason(path: &Path, detail: impl Into<String>) {
+    note_unhealthy_reason_with(path, detail, true);
+}
+
+/// Record a reason the probe could not turn into evidence about the database
+/// (staging refused, engine limitation, transient conflict).
+fn note_inconclusive_unhealthy_reason(path: &Path, detail: impl Into<String>) {
+    note_unhealthy_reason_with(path, detail, false);
+}
+
+fn note_unhealthy_reason_with(path: &Path, detail: impl Into<String>, conclusive: bool) {
+    let reason = UnhealthyProbeReason {
+        detail: detail.into(),
+        conclusive,
+        staged_copy: false,
+    };
     if let Ok(mut reasons) = unhealthy_probe_reasons().lock() {
         reasons.insert(path.to_path_buf(), reason);
     }
@@ -9434,12 +9498,10 @@ fn note_unhealthy_reason(path: &Path, reason: impl Into<String>) {
 /// stood in for, so the caller who probed the live path can read it.
 fn transfer_unhealthy_reason(from: &Path, to: &Path) {
     if let Ok(mut reasons) = unhealthy_probe_reasons().lock()
-        && let Some(reason) = reasons.remove(from)
+        && let Some(mut reason) = reasons.remove(from)
     {
-        reasons.insert(
-            to.to_path_buf(),
-            format!("staged private-copy probe: {reason}"),
-        );
+        reason.staged_copy = true;
+        reasons.insert(to.to_path_buf(), reason);
     }
 }
 
@@ -9447,9 +9509,10 @@ fn transfer_unhealthy_reason(from: &Path, to: &Path) {
 ///
 /// Recorded reasons are consumed on read. `None` when the last probe was
 /// healthy, was answered from the healthy-verdict cache, or refused before
-/// probing.
+/// probing. A `None` answer is itself inconclusive: the caller learned
+/// nothing about the live database and must treat the verdict accordingly.
 #[must_use]
-pub fn take_last_unhealthy_reason(path: &Path) -> Option<String> {
+pub fn take_last_unhealthy_reason(path: &Path) -> Option<UnhealthyProbeReason> {
     unhealthy_probe_reasons()
         .lock()
         .ok()
@@ -9651,7 +9714,7 @@ pub fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
         return Ok(true);
     }
     let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
-        note_unhealthy_reason(
+        note_inconclusive_unhealthy_reason(
             path,
             "the SQLite family could not be staged for a health probe",
         );
@@ -24045,7 +24108,11 @@ mod tests {
         );
         let reason = take_last_unhealthy_reason(&db_path).expect("reason recorded");
         assert!(
-            reason.starts_with("staged private-copy probe: "),
+            reason.staged_copy,
+            "the reason is marked as coming from the staged copy: {reason:?}"
+        );
+        assert!(
+            reason.to_string().starts_with("staged private-copy probe: "),
             "the reason names the staged probe: {reason}"
         );
         assert!(
@@ -24061,6 +24128,38 @@ mod tests {
         assert!(
             take_last_unhealthy_reason(&ok_path).is_none(),
             "a healthy probe leaves no reason"
+        );
+    }
+
+    /// GH#300: a probe that could not answer must stay marked inconclusive all
+    /// the way to the caller, including across the staged-copy re-key. Only a
+    /// conclusive reason may drive a corruption verdict.
+    #[test]
+    fn probe_reason_conclusiveness_survives_the_staged_copy_rekey() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = dir.path().join("staged.sqlite3");
+        let live = dir.path().join("live.sqlite3");
+
+        note_inconclusive_unhealthy_reason(&staged, "the SQLite family could not be staged");
+        transfer_unhealthy_reason(&staged, &live);
+        let reason = take_last_unhealthy_reason(&live).expect("reason recorded");
+        assert!(!reason.conclusive, "staging failure is not evidence");
+        assert!(reason.staged_copy);
+        assert_eq!(
+            reason.to_string(),
+            "staged private-copy probe: the SQLite family could not be staged"
+        );
+
+        note_conclusive_unhealthy_reason(&staged, "canonical SQLite quick_check reported problems");
+        transfer_unhealthy_reason(&staged, &live);
+        let reason = take_last_unhealthy_reason(&live).expect("reason recorded");
+        assert!(
+            reason.conclusive,
+            "an integrity complaint is evidence about the file's content"
+        );
+        assert!(
+            take_last_unhealthy_reason(&staged).is_none(),
+            "the staged key is emptied by the transfer"
         );
     }
 
