@@ -750,7 +750,9 @@ fn reconstruct_quarantines_unusable_atc_sidecar_instead_of_wedging_recovery() {
     mcp_agent_mail_db::promote_recovery_candidate(&db_path, &candidate_path, &storage_root)
         .expect("promotion must succeed despite a corrupt ATC sidecar");
 
-    // The unusable sidecar was quarantined by rename (never deleted)...
+    // The unusable sidecar was quarantined by rename (never deleted). Its
+    // whole SQLite family moves together under the family-aware
+    // `atc.sqlite3.atc-quarantined-<ts>` name that reconstruct allocates.
     let quarantined: Vec<_> = std::fs::read_dir(dir.path())
         .expect("read dir")
         .flatten()
@@ -758,7 +760,7 @@ fn reconstruct_quarantines_unusable_atc_sidecar_instead_of_wedging_recovery() {
             entry
                 .file_name()
                 .to_string_lossy()
-                .starts_with("atc.sqlite3.quarantined-")
+                .starts_with("atc.sqlite3.atc-quarantined-")
         })
         .collect();
     assert_eq!(

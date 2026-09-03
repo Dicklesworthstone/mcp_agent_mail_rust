@@ -13248,6 +13248,12 @@ fn acquire_doctor_mailbox_activity_lock_for_sqlite_path(
 struct CliMailboxReadLocks {
     _storage_root_lock: Option<mcp_agent_mail_server::MailboxActivityLockGuard>,
     _sqlite_lock: Option<mcp_agent_mail_server::MailboxActivityLockGuard>,
+    /// A no-follow descriptor on the live main file, held from the header
+    /// pre-flight until after the read connection has closed: closing a
+    /// descriptor for a live inode can release classic process-wide `fcntl`
+    /// locks held by another same-process connection, so it must outlive
+    /// the connection it pre-flighted. Declared last so it drops last.
+    _live_source_header_probe: Option<std::fs::File>,
 }
 
 struct CliMailboxMutationLocks {
@@ -13300,11 +13306,51 @@ fn acquire_cli_mailbox_read_locks_for_paths(
     Ok(CliMailboxReadLocks {
         _storage_root_lock: storage_root_lock,
         _sqlite_lock: sqlite_lock,
+        _live_source_header_probe: None,
     })
 }
 
-fn acquire_cli_mailbox_read_locks_for_sqlite_path(
+/// Pre-flight a live SQLite source for a one-shot CLI read before this
+/// process holds any mailbox activity lock or connection for it.
+///
+/// Taking the shared activity lock first leaves a `<db>.activity.lock`
+/// artifact beside a file that turns out not to be a database at all, so the
+/// metadata and header checks run before the lock. The header is read
+/// through a no-follow descriptor that the caller then keeps open in
+/// [`CliMailboxReadLocks`] until its read connection has closed (see the
+/// hazard documented on [`require_existing_regular_private_sqlite_source`]);
+/// the only early close is the error path, where no connection of ours
+/// exists yet.
+fn preflight_live_sqlite_source_header(path: &Path, context: &str) -> CliResult<std::fs::File> {
+    require_existing_regular_sqlite_path_metadata(path, context)?;
+    let mut file = doctor::platform::open_regular_file_no_follow(path).map_err(|error| {
+        CliError::Other(format!(
+            "{context} failed to read SQLite source header {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut header = [0_u8; SQLITE_DATABASE_HEADER_BYTES];
+    std::io::Read::read_exact(&mut file, &mut header).map_err(|error| {
+        CliError::Other(format!(
+            "{context} failed to read SQLite source header {}: {error}",
+            path.display()
+        ))
+    })?;
+    if &header[..16] != b"SQLite format 3\0" {
+        return Err(CliError::Other(format!(
+            "{context} refused: {} does not have a valid SQLite database header",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+/// Shared read locks for a live source that
+/// [`preflight_live_sqlite_source_header`] already validated; the probe
+/// descriptor rides along so it outlives the read connection.
+fn acquire_cli_mailbox_read_locks_for_preflighted_sqlite_path(
     sqlite_path: &Path,
+    header_probe: std::fs::File,
 ) -> CliResult<CliMailboxReadLocks> {
     let sqlite_lock = acquire_cli_mailbox_activity_lock_for_sqlite_path(
         sqlite_path,
@@ -13313,6 +13359,7 @@ fn acquire_cli_mailbox_read_locks_for_sqlite_path(
     Ok(CliMailboxReadLocks {
         _storage_root_lock: None,
         _sqlite_lock: sqlite_lock,
+        _live_source_header_probe: Some(header_probe),
     })
 }
 
@@ -13333,6 +13380,7 @@ fn acquire_cli_mailbox_read_locks(
     Ok(CliMailboxReadLocks {
         _storage_root_lock: None,
         _sqlite_lock: sqlite_lock,
+        _live_source_header_probe: None,
     })
 }
 
@@ -15953,7 +16001,12 @@ fn open_atc_simulate_read_pool_with_database_url(
     let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
     let source_candidate =
         resolve_existing_sqlite_source_candidate_with_database_url(database_url, "ATC simulate")?;
-    let mailbox_read_locks = acquire_cli_mailbox_read_locks_for_sqlite_path(&source_candidate)?;
+    // Validate before locking so an invalid source gains no lock artifact.
+    let header_probe = preflight_live_sqlite_source_header(&source_candidate, "ATC simulate")?;
+    let mailbox_read_locks = acquire_cli_mailbox_read_locks_for_preflighted_sqlite_path(
+        &source_candidate,
+        header_probe,
+    )?;
     let opened_path = validated_live_sqlite_snapshot_source_path_from_candidate(
         &source_candidate,
         "ATC simulate",
@@ -15998,7 +16051,12 @@ fn open_atc_simulate_read_pool_with_database_url(
 fn open_atc_explain_read_db_with_database_url(database_url: &str) -> CliResult<CanonicalReadDb> {
     let source_candidate =
         resolve_existing_sqlite_source_candidate_with_database_url(database_url, "ATC explain")?;
-    let mailbox_read_locks = acquire_cli_mailbox_read_locks_for_sqlite_path(&source_candidate)?;
+    // Validate before locking so an invalid source gains no lock artifact.
+    let header_probe = preflight_live_sqlite_source_header(&source_candidate, "ATC explain")?;
+    let mailbox_read_locks = acquire_cli_mailbox_read_locks_for_preflighted_sqlite_path(
+        &source_candidate,
+        header_probe,
+    )?;
     let opened_path = validated_live_sqlite_snapshot_source_path_from_candidate(
         &source_candidate,
         "ATC explain",
@@ -72232,7 +72290,12 @@ startup_timeout_sec = 42
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("sidecar_health.sqlite3");
         let db_path_str = db_path.to_string_lossy().into_owned();
-        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
+        // Seed through canonical SQLite: the runtime engine leaves its
+        // `-wal-cert` / `-wal-cert-head` certification sidecars behind after a
+        // clean close, and those are live state by design (GH#364), so a
+        // runtime-engine-created file is never the "no live sidecars" fixture.
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(db_path_str.as_str()).expect("open db");
         conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY)")
             .expect("create table");
         drop(conn);

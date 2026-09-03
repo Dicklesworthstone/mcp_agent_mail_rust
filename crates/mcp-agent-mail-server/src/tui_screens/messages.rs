@@ -8069,6 +8069,7 @@ first body
             "CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
                 subject TEXT,
+                topic TEXT,
                 body_md TEXT,
                 thread_id TEXT,
                 importance TEXT,

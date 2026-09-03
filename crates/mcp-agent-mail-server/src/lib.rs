@@ -10881,16 +10881,30 @@ fn fetch_dashboard_db_stats_cached(
 
 fn fetch_dashboard_db_stats_from_conn(conn: &DbConn) -> DashboardDbStats {
     let now_micros = mcp_agent_mail_db::timestamps::now_micros();
+    // The dashboard observes whatever schema the mailbox has: a degraded or
+    // pre-v28 database may lack `agents.retired_at` or the deregistration
+    // ledger, and its rows must still be listed rather than dropped by a
+    // query that references columns it does not have.
+    let mut agent_filters: Vec<&str> = Vec::new();
+    if dashboard_has_column(conn, "agents", "retired_at") {
+        agent_filters.push("retired_at IS NULL");
+    }
+    if dashboard_has_table(conn, "agent_deregistrations") {
+        agent_filters.push(
+            "NOT EXISTS (SELECT 1 FROM agent_deregistrations d WHERE d.agent_id = agents.id)",
+        );
+    }
+    let agent_where = if agent_filters.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", agent_filters.join(" AND "))
+    };
+    let agents_sql = format!(
+        "SELECT id, name, program, last_active_ts FROM agents{agent_where} \
+         ORDER BY last_active_ts DESC LIMIT 10"
+    );
     let agents_list = conn
-        .query_sync(
-            "SELECT id, name, program, last_active_ts FROM agents \
-             WHERE retired_at IS NULL \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM agent_deregistrations d WHERE d.agent_id = agents.id \
-               ) \
-             ORDER BY last_active_ts DESC LIMIT 10",
-            &[],
-        )
+        .query_sync(&agents_sql, &[])
         .ok()
         .map(|rows| {
             rows.into_iter()
@@ -10945,22 +10959,30 @@ fn fetch_dashboard_db_stats_from_conn(conn: &DbConn) -> DashboardDbStats {
     }
 }
 
-fn dashboard_has_release_ledger_table(conn: &DbConn) -> bool {
+fn dashboard_has_table(conn: &DbConn, table: &str) -> bool {
     conn.query_sync(
-        "SELECT 1 AS present FROM sqlite_master \
-         WHERE type = 'table' AND name = 'file_reservation_releases' \
-         LIMIT 1",
-        &[],
+        "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+        &[mcp_agent_mail_db::sqlmodel_core::Value::Text(
+            table.to_string(),
+        )],
     )
     .is_ok_and(|rows| !rows.is_empty())
 }
 
-fn dashboard_has_reservation_released_ts_column(conn: &DbConn) -> bool {
-    conn.query_sync("PRAGMA table_info(file_reservations)", &[])
+fn dashboard_has_column(conn: &DbConn, table: &str, column: &str) -> bool {
+    conn.query_sync(&format!("PRAGMA table_info({table})"), &[])
         .is_ok_and(|rows| {
             rows.iter()
-                .any(|row| row.get_named::<String>("name").ok().as_deref() == Some("released_ts"))
+                .any(|row| row.get_named::<String>("name").ok().as_deref() == Some(column))
         })
+}
+
+fn dashboard_has_release_ledger_table(conn: &DbConn) -> bool {
+    dashboard_has_table(conn, "file_reservation_releases")
+}
+
+fn dashboard_has_reservation_released_ts_column(conn: &DbConn) -> bool {
+    dashboard_has_column(conn, "file_reservations", "released_ts")
 }
 
 fn dashboard_active_file_reservations(conn: &DbConn, now_micros: i64) -> u64 {

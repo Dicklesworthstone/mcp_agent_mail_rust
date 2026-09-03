@@ -141,6 +141,16 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   (`schema::init_schema_sql_base_deferring_column_dependent_indexes`) and
   the deferred migrations create the indexes once the columns exist. The
   base DDL and the recorded migration ids are unchanged.
+- **ATC explain and simulate validate a source before taking the mailbox
+  activity lock.** Both readers acquired the shared SQLite activity lock
+  first, so pointing them at a file that is not a database left a
+  `<db>.activity.lock` artifact beside it. The metadata and header checks
+  now run before the lock, through a no-follow descriptor that stays open
+  until the read connection has closed.
+- **The startup dashboard lists agents from a degraded or pre-v28 mailbox.**
+  Its agents query referenced `agents.retired_at` and the deregistration
+  ledger unconditionally, so a database lacking either returned no agents
+  at all; the query now includes each filter only when the schema has it.
 - **The CLI's explicit project lookup no longer attaches a distinct path to
   a slug-colliding project.** The database human-key lookup gained a
   stable-slug fallback for absolute keys (so reads find the row

@@ -4782,6 +4782,11 @@ body
     fn health_check_direct_sqlite_probe_uses_mailbox_runtime_engine() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("health-check-engine.sqlite3");
+        // The probe opens an existing mailbox read-only and never creates one.
+        let seed = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("seed db");
+        seed.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(seed);
 
         let conn = open_health_check_sync_db_connection(&db_path)
             .expect("health_check direct probe should open sqlite");
