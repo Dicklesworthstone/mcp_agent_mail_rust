@@ -13248,6 +13248,12 @@ fn acquire_doctor_mailbox_activity_lock_for_sqlite_path(
 struct CliMailboxReadLocks {
     _storage_root_lock: Option<mcp_agent_mail_server::MailboxActivityLockGuard>,
     _sqlite_lock: Option<mcp_agent_mail_server::MailboxActivityLockGuard>,
+    /// A no-follow descriptor on the live main file, held from the header
+    /// pre-flight until after the read connection has closed: closing a
+    /// descriptor for a live inode can release classic process-wide `fcntl`
+    /// locks held by another same-process connection, so it must outlive
+    /// the connection it pre-flighted. Declared last so it drops last.
+    _live_source_header_probe: Option<std::fs::File>,
 }
 
 struct CliMailboxMutationLocks {
@@ -13300,11 +13306,51 @@ fn acquire_cli_mailbox_read_locks_for_paths(
     Ok(CliMailboxReadLocks {
         _storage_root_lock: storage_root_lock,
         _sqlite_lock: sqlite_lock,
+        _live_source_header_probe: None,
     })
 }
 
-fn acquire_cli_mailbox_read_locks_for_sqlite_path(
+/// Pre-flight a live SQLite source for a one-shot CLI read before this
+/// process holds any mailbox activity lock or connection for it.
+///
+/// Taking the shared activity lock first leaves a `<db>.activity.lock`
+/// artifact beside a file that turns out not to be a database at all, so the
+/// metadata and header checks run before the lock. The header is read
+/// through a no-follow descriptor that the caller then keeps open in
+/// [`CliMailboxReadLocks`] until its read connection has closed (see the
+/// hazard documented on [`require_existing_regular_private_sqlite_source`]);
+/// the only early close is the error path, where no connection of ours
+/// exists yet.
+fn preflight_live_sqlite_source_header(path: &Path, context: &str) -> CliResult<std::fs::File> {
+    require_existing_regular_sqlite_path_metadata(path, context)?;
+    let mut file = doctor::platform::open_regular_file_no_follow(path).map_err(|error| {
+        CliError::Other(format!(
+            "{context} failed to read SQLite source header {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut header = [0_u8; SQLITE_DATABASE_HEADER_BYTES];
+    std::io::Read::read_exact(&mut file, &mut header).map_err(|error| {
+        CliError::Other(format!(
+            "{context} failed to read SQLite source header {}: {error}",
+            path.display()
+        ))
+    })?;
+    if &header[..16] != b"SQLite format 3\0" {
+        return Err(CliError::Other(format!(
+            "{context} refused: {} does not have a valid SQLite database header",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+/// Shared read locks for a live source that
+/// [`preflight_live_sqlite_source_header`] already validated; the probe
+/// descriptor rides along so it outlives the read connection.
+fn acquire_cli_mailbox_read_locks_for_preflighted_sqlite_path(
     sqlite_path: &Path,
+    header_probe: std::fs::File,
 ) -> CliResult<CliMailboxReadLocks> {
     let sqlite_lock = acquire_cli_mailbox_activity_lock_for_sqlite_path(
         sqlite_path,
@@ -13313,6 +13359,7 @@ fn acquire_cli_mailbox_read_locks_for_sqlite_path(
     Ok(CliMailboxReadLocks {
         _storage_root_lock: None,
         _sqlite_lock: sqlite_lock,
+        _live_source_header_probe: Some(header_probe),
     })
 }
 
@@ -13333,6 +13380,7 @@ fn acquire_cli_mailbox_read_locks(
     Ok(CliMailboxReadLocks {
         _storage_root_lock: None,
         _sqlite_lock: sqlite_lock,
+        _live_source_header_probe: None,
     })
 }
 
@@ -14882,7 +14930,13 @@ fn init_schema_sqlite_canonical(path: &str) -> CliResult<()> {
                     &e.to_string(),
                 )
             })?;
-        let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
+        // The base DDL runs as one blob before the migrations below; its two
+        // column-dependent indexes (messages.topic, agents.retired_at) must
+        // wait for the v27/v28 column migrations or a legacy database fails
+        // here with "no such column". The deferred index migrations recreate
+        // them afterwards.
+        let init_sql =
+            mcp_agent_mail_db::schema::init_schema_sql_base_deferring_column_dependent_indexes();
         conn.execute_raw(&init_sql).map_err(|e| {
             sqlite_retryable_error(
                 format!("schema init failed for {path} during canonical schema init: {e}"),
@@ -15268,14 +15322,35 @@ enum CanonicalSnapshotSourceKind {
     LiveSqlite,
     LiveSnapshot,
     ArchiveSnapshot,
+    /// A private no-follow copy of the whole live family, settled by canonical
+    /// SQLite. Used when the guarded live open refuses the family for a
+    /// recovery-classified sidecar (a truncated or header-only WAL, a stale
+    /// SHM) and no archive authority exists: the live family stays untouched
+    /// and the copy is read through canonical SQLite.
+    StagedFamilyCopy,
 }
 
-#[derive(Debug)]
 struct CanonicalSnapshotSource {
     actual_path: PathBuf,
     reported_path: PathBuf,
     kind: CanonicalSnapshotSourceKind,
     _snapshot_dir: Option<tempfile::TempDir>,
+    _staged_family: Option<mcp_agent_mail_db::pool::SqliteHealthProbeSource>,
+}
+
+impl std::fmt::Debug for CanonicalSnapshotSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CanonicalSnapshotSource")
+            .field("actual_path", &self.actual_path)
+            .field("reported_path", &self.reported_path)
+            .field("kind", &self.kind)
+            .field(
+                "snapshot_dir",
+                &self._snapshot_dir.as_ref().map(tempfile::TempDir::path),
+            )
+            .field("staged_family", &self._staged_family.is_some())
+            .finish()
+    }
 }
 
 fn canonical_snapshot_tempdir(prefix: &str, context: &str) -> CliResult<tempfile::TempDir> {
@@ -15305,6 +15380,7 @@ impl CanonicalSnapshotSource {
             actual_path: path.clone(),
             reported_path: path,
             kind: CanonicalSnapshotSourceKind::LiveSqlite,
+            _staged_family: None,
             _snapshot_dir: None,
         }
     }
@@ -15336,6 +15412,7 @@ impl CanonicalSnapshotSource {
             actual_path,
             reported_path,
             kind: CanonicalSnapshotSourceKind::ArchiveSnapshot,
+            _staged_family: None,
             _snapshot_dir: Some(snapshot_dir),
         })
     }
@@ -15352,7 +15429,59 @@ impl CanonicalSnapshotSource {
             actual_path,
             reported_path,
             kind: CanonicalSnapshotSourceKind::LiveSnapshot,
+            _staged_family: None,
             _snapshot_dir: Some(snapshot_dir),
+        })
+    }
+
+    /// Stage the whole live family into a private no-follow copy and settle
+    /// it with canonical SQLite, for a family the guarded live open refuses on
+    /// a recovery-classified sidecar. The live family is never opened, written,
+    /// or cleaned; the copy carries whatever committed frames its WAL held and
+    /// discards junk state.
+    fn staged_family_copy(reported_path: PathBuf, context: &str) -> CliResult<Self> {
+        let staged = mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(&reported_path)
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "{context} staged family copy of {} failed: {error}",
+                    reported_path.display()
+                ))
+            })?
+            .ok_or_else(|| {
+                CliError::Other(format!(
+                    "{context} staged family copy is unavailable for {}: source is missing or is not a regular SQLite family",
+                    reported_path.display()
+                ))
+            })?;
+        let actual_path = staged.path().to_path_buf();
+        let staged_text = sqlite_snapshot_path_text(&actual_path, context, "staged family copy")?;
+        let settle =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(staged_text).map_err(|error| {
+                CliError::Other(format!(
+                    "{context} cannot open the staged family copy of {}: {error}",
+                    reported_path.display()
+                ))
+            })?;
+        settle
+            .execute_raw("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "{context} cannot settle the staged family copy of {}: {error}",
+                    reported_path.display()
+                ))
+            })?;
+        drop(settle);
+        tracing::warn!(
+            operation = context,
+            source = %reported_path.display(),
+            "reading a private staged copy of the live family because its guarded live open was refused"
+        );
+        Ok(Self {
+            actual_path,
+            reported_path,
+            kind: CanonicalSnapshotSourceKind::StagedFamilyCopy,
+            _snapshot_dir: None,
+            _staged_family: Some(staged),
         })
     }
 
@@ -15382,7 +15511,8 @@ impl CanonicalSnapshotSource {
                 scrub_preset,
             ),
             CanonicalSnapshotSourceKind::LiveSnapshot
-            | CanonicalSnapshotSourceKind::ArchiveSnapshot => {
+            | CanonicalSnapshotSourceKind::ArchiveSnapshot
+            | CanonicalSnapshotSourceKind::StagedFamilyCopy => {
                 share::create_private_canonical_snapshot_context(
                     &self.actual_path,
                     snapshot_path,
@@ -15412,6 +15542,29 @@ impl CanonicalSnapshotSource {
                 open_private_sqlite_read_only(&self.actual_path, context)
                     .map(mcp_agent_mail_db::pool::GuardedReadOnlyConn::Franken)
             }
+            CanonicalSnapshotSourceKind::StagedFamilyCopy => {
+                // The copy was settled by canonical SQLite; read it the same way
+                // so leftover engine namespace state in the copy is irrelevant.
+                let path =
+                    sqlite_snapshot_path_text(&self.actual_path, context, "staged family copy")?;
+                let conn =
+                    mcp_agent_mail_db::CanonicalDbConn::open_file(path).map_err(|error| {
+                        CliError::Other(format!(
+                            "{context} cannot open the staged family copy {}: {error}",
+                            self.actual_path.display()
+                        ))
+                    })?;
+                conn.execute_raw("PRAGMA query_only = ON; PRAGMA busy_timeout = 20000;")
+                    .map_err(|error| {
+                        CliError::Other(format!(
+                            "{context} cannot configure the staged family copy {}: {error}",
+                            self.actual_path.display()
+                        ))
+                    })?;
+                Ok(mcp_agent_mail_db::pool::GuardedReadOnlyConn::Canonical(
+                    conn,
+                ))
+            }
         }
     }
 
@@ -15430,6 +15583,7 @@ impl CanonicalSnapshotSource {
             self.kind,
             CanonicalSnapshotSourceKind::ArchiveSnapshot
                 | CanonicalSnapshotSourceKind::LiveSnapshot
+                | CanonicalSnapshotSourceKind::StagedFamilyCopy
         ) {
             return Ok(self);
         }
@@ -15700,7 +15854,31 @@ fn resolve_canonical_snapshot_source_path(
                 context,
             )
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            // No archive authority to fall back to. A family the guarded live
+            // open refuses only for a recovery-classified sidecar (truncated
+            // or header-only WAL, stale SHM) is still readable through a
+            // private staged copy without touching the live inode; anything
+            // else stays an error.
+            let message = error.to_string();
+            if is_sqlite_recovery_error_message(&message)
+                || message.contains("refusing live read-only")
+            {
+                tracing::warn!(
+                    operation = context,
+                    source = candidate_display,
+                    error = %error,
+                    "live sqlite source refused read-only; reading a private staged family copy"
+                );
+                return CanonicalSnapshotSource::staged_family_copy(candidate_path, context)
+                    .map_err(|staged_error| {
+                        CliError::Other(format!(
+                            "{error}; staged family copy failed: {staged_error}"
+                        ))
+                    });
+            }
+            Err(error)
+        }
     }
 }
 
@@ -15892,7 +16070,12 @@ fn open_atc_simulate_read_pool_with_database_url(
     let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
     let source_candidate =
         resolve_existing_sqlite_source_candidate_with_database_url(database_url, "ATC simulate")?;
-    let mailbox_read_locks = acquire_cli_mailbox_read_locks_for_sqlite_path(&source_candidate)?;
+    // Validate before locking so an invalid source gains no lock artifact.
+    let header_probe = preflight_live_sqlite_source_header(&source_candidate, "ATC simulate")?;
+    let mailbox_read_locks = acquire_cli_mailbox_read_locks_for_preflighted_sqlite_path(
+        &source_candidate,
+        header_probe,
+    )?;
     let opened_path = validated_live_sqlite_snapshot_source_path_from_candidate(
         &source_candidate,
         "ATC simulate",
@@ -15937,7 +16120,12 @@ fn open_atc_simulate_read_pool_with_database_url(
 fn open_atc_explain_read_db_with_database_url(database_url: &str) -> CliResult<CanonicalReadDb> {
     let source_candidate =
         resolve_existing_sqlite_source_candidate_with_database_url(database_url, "ATC explain")?;
-    let mailbox_read_locks = acquire_cli_mailbox_read_locks_for_sqlite_path(&source_candidate)?;
+    // Validate before locking so an invalid source gains no lock artifact.
+    let header_probe = preflight_live_sqlite_source_header(&source_candidate, "ATC explain")?;
+    let mailbox_read_locks = acquire_cli_mailbox_read_locks_for_preflighted_sqlite_path(
+        &source_candidate,
+        header_probe,
+    )?;
     let opened_path = validated_live_sqlite_snapshot_source_path_from_candidate(
         &source_candidate,
         "ATC explain",
@@ -50267,12 +50455,27 @@ http_headers = { Authorization = "Bearer secret" }
             "live-db",
             "live database should remain untouched when staged backup validation fails"
         );
+        // A rejected stage is preserved under a `reconstruct-failed` (cli) or
+        // `.cleanup-quarantine-rejected-` (pool) name rather than deleted
+        // (doctor never deletes); no active staging name may remain.
+        let preserved = |name: &str| {
+            name.contains("reconstruct-failed") || name.contains("cleanup-quarantine-rejected")
+        };
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
         assert!(
-            std::fs::read_dir(dir.path())
-                .expect("read dir")
-                .flatten()
-                .all(|entry| !entry.file_name().to_string_lossy().contains(".restore-")),
-            "staged restore artifacts should be cleaned up after failure"
+            names
+                .iter()
+                .filter(|name| !preserved(name))
+                .all(|name| !name.contains(".restore-")),
+            "no active staged restore artifact may remain after failure: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| preserved(name)),
+            "the rejected stage must be preserved under a failed/quarantine name: {names:?}"
         );
     }
 
@@ -60157,11 +60360,15 @@ startup_timeout_sec = 42
                 let value: serde_json::Value =
                     serde_json::from_str(payload).expect("parse reconstruct json output");
                 assert_eq!(value["salvage"]["status"], "ok");
+                // A Franken-admitted current database (namespace pair present)
+                // is exported through a guarded private snapshot; a family
+                // without namespace authority is read directly. Either way
+                // the current database, not a backup, is the salvage source.
+                let salvage_detail = value["salvage"]["detail"].as_str().unwrap_or_default();
                 assert!(
-                    value["salvage"]["detail"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .contains("Using readable current database"),
+                    salvage_detail.contains("Using readable current database")
+                        || salvage_detail
+                            .contains("guarded private snapshot of live current database"),
                     "unexpected salvage detail: {payload}"
                 );
 
@@ -61275,7 +61482,10 @@ startup_timeout_sec = 42
         let salvage = attempt_best_doctor_salvage_artifact(&db_path);
         match salvage {
             DoctorSalvageAttempt::Succeeded(artifact) => {
-                assert_eq!(artifact.db_path, backup_path);
+                // The backup is read through a private staged family copy (its WAL
+                // frames and namespace pair travel with it); the salvage source it
+                // reports is the backup itself.
+                assert_eq!(artifact.reported_path, backup_path);
                 assert!(
                     artifact.detail.contains("backup candidate"),
                     "unexpected salvage detail: {}",
@@ -61316,7 +61526,10 @@ startup_timeout_sec = 42
         let salvage = attempt_best_doctor_salvage_artifact(&db_path);
         match salvage {
             DoctorSalvageAttempt::Succeeded(artifact) => {
-                assert_eq!(artifact.db_path, backup_path);
+                // The backup is read through a private staged family copy (its WAL
+                // frames and namespace pair travel with it); the salvage source it
+                // reports is the backup itself.
+                assert_eq!(artifact.reported_path, backup_path);
                 assert!(
                     artifact.detail.contains("backup candidate"),
                     "unexpected salvage detail: {}",
@@ -61361,7 +61574,10 @@ startup_timeout_sec = 42
         let salvage = attempt_best_doctor_salvage_artifact(&db_path);
         match salvage {
             DoctorSalvageAttempt::Succeeded(artifact) => {
-                assert_eq!(artifact.db_path, backup_path);
+                // The backup is read through a private staged family copy (its WAL
+                // frames and namespace pair travel with it); the salvage source it
+                // reports is the backup itself.
+                assert_eq!(artifact.reported_path, backup_path);
                 assert!(
                     artifact.detail.contains("backup candidate"),
                     "unexpected salvage detail: {}",
@@ -61406,7 +61622,10 @@ startup_timeout_sec = 42
         let salvage = attempt_best_doctor_salvage_artifact(&db_path);
         match salvage {
             DoctorSalvageAttempt::Succeeded(artifact) => {
-                assert_eq!(artifact.db_path, backup_path);
+                // The backup is read through a private staged family copy (its WAL
+                // frames and namespace pair travel with it); the salvage source it
+                // reports is the backup itself.
+                assert_eq!(artifact.reported_path, backup_path);
                 assert!(
                     artifact.detail.contains("backup candidate"),
                     "unexpected salvage detail: {}",
@@ -72209,7 +72428,12 @@ startup_timeout_sec = 42
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("sidecar_health.sqlite3");
         let db_path_str = db_path.to_string_lossy().into_owned();
-        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
+        // Seed through canonical SQLite: the runtime engine leaves its
+        // `-wal-cert` / `-wal-cert-head` certification sidecars behind after a
+        // clean close, and those are live state by design (GH#364), so a
+        // runtime-engine-created file is never the "no live sidecars" fixture.
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(db_path_str.as_str()).expect("open db");
         conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY)")
             .expect("create table");
         drop(conn);
@@ -74051,8 +74275,13 @@ startup_timeout_sec = 42
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("STORAGE_ROOT", &__storage_root_str)],
             || {
-                let seed_conn =
-                    mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open seed db");
+                // A Python-era mailbox was written by C SQLite, whose stored
+                // table text carries the canonical `CREATE TABLE <name>` prefix
+                // that canonical `ALTER TABLE ... ADD COLUMN` later splices
+                // into; the runtime engine keeps `IF NOT EXISTS` verbatim and
+                // is not the engine that produced such files.
+                let seed_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(db_path_str.as_str())
+                    .expect("open seed db");
                 let seed_sql = [
                     "PRAGMA foreign_keys = OFF",
                     "CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL, created_at DATETIME NOT NULL)",
@@ -81504,7 +81733,29 @@ fn attempt_readable_sqlite_salvage_source(
                 }
             }
         }
-        DoctorSalvageSourceKind::PrivateCanonical => None,
+        DoctorSalvageSourceKind::PrivateCanonical => {
+            // A backup the runtime engine wrote can still carry committed
+            // frames in its WAL (and its namespace pair). Reading the main
+            // file alone would miss them, so a non-standalone candidate is
+            // staged as a whole private family, settled by canonical SQLite,
+            // and read from the copy; the candidate itself is never opened.
+            if mcp_agent_mail_db::sqlite_recovery_candidate_is_standalone(sqlite_path) {
+                None
+            } else {
+                match CanonicalSnapshotSource::staged_family_copy(
+                    sqlite_path.to_path_buf(),
+                    "doctor salvage family staging",
+                ) {
+                    Ok(source) => Some(source),
+                    Err(error) => {
+                        return DoctorSalvageAttempt::Failed(format!(
+                            "{label} {} could not be staged as a private family copy: {error}",
+                            sqlite_path.display()
+                        ));
+                    }
+                }
+            }
+        }
     };
     let readable_path = snapshot_source
         .as_ref()
@@ -81710,7 +81961,10 @@ fn doctor_salvage_artifact_candidates(
     };
     push_candidate("current database", current_db.to_path_buf(), current_kind);
 
-    for candidate in sqlite_backup_candidates(current_db) {
+    // A salvage reads the candidate through a private canonical copy, so a
+    // backup the runtime engine wrote (namespace pair beside it) is usable
+    // even though restore would not promote it as-is.
+    for candidate in mcp_agent_mail_db::pool::sqlite_salvage_read_candidates(current_db) {
         push_candidate(
             "backup candidate",
             candidate,
@@ -85725,6 +85979,14 @@ async fn get_product_by_key(
     }
 }
 
+/// Resolve a project for an explicit CLI identifier (slug or absolute path).
+///
+/// Absolute paths use the exact human-key lookup: the stable-slug fallback
+/// that ordinary reads apply would attach a distinct path to a slug-colliding
+/// project (`/x/repo/a/b` vs `/x/repo/a-b`, or a case variant on a
+/// case-sensitive filesystem), which the linking and destructive verbs
+/// behind this resolver must never do. The slug lookup below stays behind an
+/// identity match for the same reason.
 async fn get_project_record(
     cx: &asupersync::Cx,
     pool: &mcp_agent_mail_db::DbPool,
@@ -85741,7 +86003,8 @@ async fn get_project_record(
     let slug = mcp_agent_mail_core::compute_project_slug(&canonical);
 
     if path.is_absolute() {
-        let out = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, &canonical).await;
+        let out =
+            mcp_agent_mail_db::queries::get_project_by_human_key_exact(cx, pool, &canonical).await;
         match out {
             asupersync::Outcome::Ok(row) => return Ok(row),
             asupersync::Outcome::Err(_) => {}
@@ -85754,7 +86017,8 @@ async fn get_project_record(
         }
 
         if canonical != raw {
-            let out = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, raw).await;
+            let out =
+                mcp_agent_mail_db::queries::get_project_by_human_key_exact(cx, pool, raw).await;
             match out {
                 asupersync::Outcome::Ok(row) => return Ok(row),
                 asupersync::Outcome::Err(_) => {}
@@ -85790,7 +86054,8 @@ async fn get_project_record(
     }
 
     if !path.is_absolute() {
-        let out = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, &canonical).await;
+        let out =
+            mcp_agent_mail_db::queries::get_project_by_human_key_exact(cx, pool, &canonical).await;
         match out {
             asupersync::Outcome::Ok(row) => return Ok(row),
             asupersync::Outcome::Err(_) => {}
@@ -85803,7 +86068,8 @@ async fn get_project_record(
         }
 
         if canonical != raw {
-            let out = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, raw).await;
+            let out =
+                mcp_agent_mail_db::queries::get_project_by_human_key_exact(cx, pool, raw).await;
             match out {
                 asupersync::Outcome::Ok(row) => return Ok(row),
                 asupersync::Outcome::Err(_) => {}

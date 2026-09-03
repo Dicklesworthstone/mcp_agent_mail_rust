@@ -130,6 +130,61 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ### Fixed
 
+- **Canonical schema init no longer fails on a pre-v27/v28 database.** The
+  CLI ran the whole base DDL blob before migrations, so on a Python-era or
+  pre-v27/v28 mailbox it created `idx_messages_project_topic` and
+  `idx_agents_project_active` before the v27/v28 migrations could add
+  `messages.topic` and `agents.retired_at`, and stopped with "no such
+  column". The migration ledger already defers those two derived index
+  statements behind their column migrations; canonical init now executes
+  the base DDL without them
+  (`schema::init_schema_sql_base_deferring_column_dependent_indexes`) and
+  the deferred migrations create the indexes once the columns exist. The
+  base DDL and the recorded migration ids are unchanged.
+- **ATC explain and simulate validate a source before taking the mailbox
+  activity lock.** Both readers acquired the shared SQLite activity lock
+  first, so pointing them at a file that is not a database left a
+  `<db>.activity.lock` artifact beside it. The metadata and header checks
+  now run before the lock, through a no-follow descriptor that stays open
+  until the read connection has closed.
+- **The startup dashboard lists agents from a degraded or pre-v28 mailbox.**
+  Its agents query referenced `agents.retired_at` and the deregistration
+  ledger unconditionally, so a database lacking either returned no agents
+  at all; the query now includes each filter only when the schema has it.
+- **The CLI's explicit project lookup no longer attaches a distinct path to
+  a slug-colliding project.** The database human-key lookup gained a
+  stable-slug fallback for absolute keys (so reads find the row
+  `ensure_project` would reuse), which silently defeated the identity guard
+  in `get_project_record`: `am products link --project /x/repo/a/b` resolved
+  the registered `/x/repo/a-b`, and a case variant of a registered path
+  resolved on a case-sensitive filesystem. The lookup is now layered
+  (`queries::get_project_by_human_key_exact` without the fallback, and
+  `get_project_by_human_key` with it); the CLI's explicit lookup uses the
+  exact layer.
+- **Doctor salvage considers a backup the runtime engine wrote.** Salvage
+  candidate discovery reused the restore rule that requires a standalone
+  main file, which excluded a `.bak` carrying its FrankenSQLite namespace
+  pair; the current database's failure was then reported as the only
+  candidate. Salvage reads through a private canonical copy, so only
+  journal/WAL companions disqualify a candidate now
+  (`pool::sqlite_salvage_read_candidates`).
+- **Archive save and share export read a family whose live open is refused
+  for a damaged sidecar.** When the guarded live open refused a mailbox for
+  a recovery-classified sidecar (truncated or header-only WAL, stale SHM) and
+  no archive authority existed, the command failed. The snapshot source now
+  falls back to a private no-follow copy of the whole family, settled and
+  read through canonical SQLite; the live family is never opened, written,
+  or cleaned.
+- **Backup restore lands again when a sidecar slot holds junk.** A directory,
+  device, FIFO, or symlink squatting in the live family's `-wal`, `-shm`,
+  `-journal`, or namespace slot made `am doctor restore` (and every other
+  recovery promotion) fail with "source is missing or its SQLite family
+  contains a non-regular object": the recovery receipt stages the source
+  generation before promotion and is deliberately fail-closed on a
+  non-regular family member. Promotion now retires such objects by rename
+  (the usual `<sidecar>.corrupt-<timestamp>` quarantine name, never deleted)
+  before the receipt looks, while regular sidecars stay in place for the
+  receipt to account for.
 - **The pre-commit guard no longer honors a superseded foreign-generation
   reservation artifact (GH#299).** After a mailbox rebuild the archive can hold
   `id-<id>-g<old>.json` with `released_ts: null` from the previous database

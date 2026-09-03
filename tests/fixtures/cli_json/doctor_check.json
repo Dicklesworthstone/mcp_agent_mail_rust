@@ -223,8 +223,8 @@
     {
       "category": "environment",
       "check": "wal_mode",
-      "detail": "WAL mode not enabled. Fix: run `am migrate` or restart the server",
-      "status": "warn"
+      "detail": "WAL mode enabled",
+      "status": "ok"
     },
     {
       "category": "environment",
@@ -259,8 +259,8 @@
     "finding_counts": {
       "critical": 0,
       "info": 0,
-      "total": 18,
-      "warning": 18
+      "total": 17,
+      "warning": 17
     },
     "generated_at": "<GENERATED_AT>",
     "headline": "All doctor checks passed.",
@@ -289,7 +289,7 @@
       "generated_at": "<GENERATED_AT>",
       "schema_version": "0",
       "search_index_generation": {
-        "db_identity": "<TMP_ROOT>/mailbox.sqlite3@1",
+        "db_identity": "<TMP_ROOT>/mailbox.sqlite3",
         "index_dir": "<SEARCH_INDEX_ROOT>/<HASH>",
         "indexed_messages": 0,
         "last_backfill_at_micros": null,
@@ -316,7 +316,7 @@
     "archive_hygiene": null,
     "category_breakdown": {
       "archive_hygiene_findings": 4,
-      "environment_findings": 8,
+      "environment_findings": 7,
       "live_incident_findings": 6
     },
     "database_fix_strategy": null,
@@ -329,6 +329,6 @@
       "status": "warn"
     },
     "secondary_fail_count": 0,
-    "secondary_warning_count": 17
+    "secondary_warning_count": 16
   }
 }
