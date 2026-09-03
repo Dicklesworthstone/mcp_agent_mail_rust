@@ -141,6 +141,16 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   (`schema::init_schema_sql_base_deferring_column_dependent_indexes`) and
   the deferred migrations create the indexes once the columns exist. The
   base DDL and the recorded migration ids are unchanged.
+- **The CLI's explicit project lookup no longer attaches a distinct path to
+  a slug-colliding project.** The database human-key lookup gained a
+  stable-slug fallback for absolute keys (so reads find the row
+  `ensure_project` would reuse), which silently defeated the identity guard
+  in `get_project_record`: `am products link --project /x/repo/a/b` resolved
+  the registered `/x/repo/a-b`, and a case variant of a registered path
+  resolved on a case-sensitive filesystem. The lookup is now layered
+  (`queries::get_project_by_human_key_exact` without the fallback, and
+  `get_project_by_human_key` with it); the CLI's explicit lookup uses the
+  exact layer.
 - **Doctor salvage considers a backup the runtime engine wrote.** Salvage
   candidate discovery reused the restore rule that requires a standalone
   main file, which excluded a `.bak` carrying its FrankenSQLite namespace

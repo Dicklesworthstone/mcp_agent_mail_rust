@@ -85668,6 +85668,14 @@ async fn get_product_by_key(
     }
 }
 
+/// Resolve a project for an explicit CLI identifier (slug or absolute path).
+///
+/// Absolute paths use the exact human-key lookup: the stable-slug fallback
+/// that ordinary reads apply would attach a distinct path to a slug-colliding
+/// project (`/x/repo/a/b` vs `/x/repo/a-b`, or a case variant on a
+/// case-sensitive filesystem), which the linking and destructive verbs
+/// behind this resolver must never do. The slug lookup below stays behind an
+/// identity match for the same reason.
 async fn get_project_record(
     cx: &asupersync::Cx,
     pool: &mcp_agent_mail_db::DbPool,
@@ -85684,7 +85692,8 @@ async fn get_project_record(
     let slug = mcp_agent_mail_core::compute_project_slug(&canonical);
 
     if path.is_absolute() {
-        let out = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, &canonical).await;
+        let out =
+            mcp_agent_mail_db::queries::get_project_by_human_key_exact(cx, pool, &canonical).await;
         match out {
             asupersync::Outcome::Ok(row) => return Ok(row),
             asupersync::Outcome::Err(_) => {}
@@ -85697,7 +85706,8 @@ async fn get_project_record(
         }
 
         if canonical != raw {
-            let out = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, raw).await;
+            let out =
+                mcp_agent_mail_db::queries::get_project_by_human_key_exact(cx, pool, raw).await;
             match out {
                 asupersync::Outcome::Ok(row) => return Ok(row),
                 asupersync::Outcome::Err(_) => {}
@@ -85733,7 +85743,8 @@ async fn get_project_record(
     }
 
     if !path.is_absolute() {
-        let out = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, &canonical).await;
+        let out =
+            mcp_agent_mail_db::queries::get_project_by_human_key_exact(cx, pool, &canonical).await;
         match out {
             asupersync::Outcome::Ok(row) => return Ok(row),
             asupersync::Outcome::Err(_) => {}
@@ -85746,7 +85757,8 @@ async fn get_project_record(
         }
 
         if canonical != raw {
-            let out = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, raw).await;
+            let out =
+                mcp_agent_mail_db::queries::get_project_by_human_key_exact(cx, pool, raw).await;
             match out {
                 asupersync::Outcome::Ok(row) => return Ok(row),
                 asupersync::Outcome::Err(_) => {}

@@ -4464,8 +4464,15 @@ pub async fn get_project_by_slug(
     }
 }
 
-/// Get project by `human_key` (cache-first)
-pub async fn get_project_by_human_key(
+/// Look up a project by its exact `human_key`, then by the filesystem alias
+/// inventory (a different spelling of the same on-disk object).
+///
+/// This never falls back to the slug. A caller that must not attach a
+/// distinct path to a slug-colliding project (the CLI's explicit project
+/// lookups behind destructive or linking verbs) uses this;
+/// [`get_project_by_human_key`] layers the stable-slug fallback on top so
+/// ordinary reads stay consistent with what [`ensure_project`] would reuse.
+pub async fn get_project_by_human_key_exact(
     cx: &Cx,
     pool: &DbPool,
     human_key: &str,
@@ -4512,38 +4519,7 @@ pub async fn get_project_by_human_key(
                         crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
                         Outcome::Ok(row)
                     }
-                    Outcome::Ok(None) => {
-                        // GH-mined fix (PR #267 idea): `ensure_project` keys a
-                        // project's identity on the *stable slug* derived by
-                        // `resolve_project_identity` (which canonicalizes e.g.
-                        // GitHub owner case), while `human_key` records one
-                        // historical spelling. Reads must apply the same
-                        // identity fallback: otherwise a canonical key whose
-                        // path does not exist on disk (so no filesystem alias
-                        // matches) finds nothing by exact `human_key` even
-                        // though a write through `ensure_project` would reuse
-                        // the existing row via its slug. Only absolute keys
-                        // are eligible — relative identifiers are handled by
-                        // slug/alias resolution above.
-                        if Path::new(human_key).is_absolute() {
-                            let slug =
-                                mcp_agent_mail_core::resolve_project_identity(human_key).slug;
-                            // Release this connection before re-entering the
-                            // pool so the slug retry cannot deadlock a
-                            // single-connection pool. (`tracked` is not Drop;
-                            // moving it into `_` ends its borrow of `conn`.)
-                            let _ = tracked;
-                            drop(conn);
-                            match get_project_by_slug(cx, pool, &slug).await {
-                                Outcome::Ok(row) => return Outcome::Ok(row),
-                                Outcome::Err(DbError::NotFound { .. }) => {}
-                                Outcome::Err(e) => return Outcome::Err(e),
-                                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                                Outcome::Panicked(p) => return Outcome::Panicked(p),
-                            }
-                        }
-                        Outcome::Err(DbError::not_found("Project", human_key))
-                    }
+                    Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", human_key)),
                     Outcome::Err(e) => Outcome::Err(e),
                     Outcome::Cancelled(r) => Outcome::Cancelled(r),
                     Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -4553,6 +4529,39 @@ pub async fn get_project_by_human_key(
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Look up a project by `human_key`, with the stable-slug fallback.
+///
+/// GH-mined fix (PR #267 idea): `ensure_project` keys a project's identity
+/// on the *stable slug* derived by `resolve_project_identity` (which
+/// canonicalizes e.g. GitHub owner case), while `human_key` records one
+/// historical spelling. Reads apply the same identity fallback: otherwise a
+/// canonical key whose path does not exist on disk (so no filesystem alias
+/// matches) finds nothing by exact `human_key` even though a write through
+/// `ensure_project` would reuse the existing row via its slug. Only absolute
+/// keys are eligible; a relative identifier is a slug and its caller resolves
+/// it with [`get_project_by_slug`] first.
+pub async fn get_project_by_human_key(
+    cx: &Cx,
+    pool: &DbPool,
+    human_key: &str,
+) -> Outcome<ProjectRow, DbError> {
+    match get_project_by_human_key_exact(cx, pool, human_key).await {
+        Outcome::Err(DbError::NotFound { .. }) if Path::new(human_key).is_absolute() => {
+            // The exact lookup has released its connection, so this retry
+            // cannot deadlock a single-connection pool.
+            let slug = mcp_agent_mail_core::resolve_project_identity(human_key).slug;
+            match get_project_by_slug(cx, pool, &slug).await {
+                Outcome::Ok(row) => Outcome::Ok(row),
+                Outcome::Err(DbError::NotFound { .. }) => {
+                    Outcome::Err(DbError::not_found("Project", human_key))
+                }
+                other => other,
+            }
+        }
+        other => other,
     }
 }
 
@@ -24016,6 +24025,49 @@ mod tests {
             .await
             .into_result();
             assert!(unrelated.is_err(), "unrelated key must stay NotFound");
+        });
+    }
+
+    #[test]
+    fn get_project_by_human_key_exact_never_falls_back_to_the_slug() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("slug-fallback-exact");
+        let historical_key = "/repos/github.com/Dicklesworthstone/some_nonexistent_repo";
+        let canonical_key = "/repos/github.com/dicklesworthstone/some_nonexistent_repo";
+
+        rt.block_on(async {
+            let seeded = ensure_project(&cx, &pool, historical_key)
+                .await
+                .into_result()
+                .expect("seed project under historical spelling");
+
+            let exact = get_project_by_human_key_exact(&cx, &pool, canonical_key)
+                .await
+                .into_result();
+            assert!(
+                matches!(
+                    exact,
+                    Err(asupersync::OutcomeError::Err(DbError::NotFound { .. }))
+                ),
+                "exact lookup must not attach a case alias through the slug: {exact:?}"
+            );
+
+            let same = get_project_by_human_key_exact(&cx, &pool, historical_key)
+                .await
+                .into_result()
+                .expect("exact spelling resolves");
+            assert_eq!(same.id, seeded.id);
+
+            let lenient = get_project_by_human_key(&cx, &pool, canonical_key)
+                .await
+                .into_result()
+                .expect("lenient lookup keeps the stable-slug fallback");
+            assert_eq!(lenient.id, seeded.id);
         });
     }
 
