@@ -637,21 +637,20 @@ fn schema_invariants_detect_ack_before_read_and_bad_reservation_ttl() {
 
     let conn = fresh_conn(&pool);
     allow_corruption_fixture(&conn);
-    // fsqlite 0.3.4 (via sqlmodel-frankensqlite): an UPDATE whose WHERE clause
-    // carries MORE THAN ONE bound parameter matches zero rows on this table,
-    // while the identical literal SQL — and the same two params on a SELECT —
-    // match correctly (br-fsq2p). Seed the drift with literal SQL until the
-    // upstream binding bug is fixed; the assert keeps the seed honest.
+    // fsqlite (still on 0.3.14, via sqlmodel-frankensqlite's sync path): an
+    // UPDATE whose WHERE clause carries MORE THAN ONE bound parameter matches
+    // zero rows on this table, while the identical literal SQL — and the same
+    // two params on a SELECT — match correctly (br-orjjt, formerly br-fsq2p).
+    // e9969ae0 re-parameterized this seed and the drift silently stopped
+    // landing; seed with literal SQL until the upstream binding bug is fixed.
+    // The assert keeps the seed honest.
     let drift_rows = conn
         .execute_sync(
-            "UPDATE message_recipients SET read_ts = ?, ack_ts = ? \
-             WHERE message_id = ? AND agent_id = ?",
-            &[
-                Value::BigInt(200),
-                Value::BigInt(100),
-                Value::BigInt(message_id),
-                Value::BigInt(recipient_id),
-            ],
+            &format!(
+                "UPDATE message_recipients SET read_ts = 200, ack_ts = 100 \
+                 WHERE message_id = {message_id} AND agent_id = {recipient_id}"
+            ),
+            &[],
         )
         .expect("force ack-before-read drift");
     assert_eq!(
