@@ -7143,13 +7143,6 @@ fn sqlite_pragma_check_details(
 }
 
 #[allow(clippy::result_large_err)]
-fn sqlite_pragma_check_is_ok(conn: &DbConn, kind: integrity::CheckKind) -> Result<bool, SqlError> {
-    let details = sqlite_pragma_check_details(conn, kind)?;
-    Ok(integrity::details_indicate_ok(&details)
-        || integrity::integrity_details_are_suspect(&details))
-}
-
-#[allow(clippy::result_large_err)]
 fn sqlite_pragma_check_details_canonical(
     conn: &crate::CanonicalDbConn,
     kind: integrity::CheckKind,
@@ -7302,7 +7295,7 @@ fn sqlite_family_carries_franken_namespace(path: &Path) -> bool {
         .any(|suffix| path_is_occupied(&sqlite_sidecar_path(path, suffix)))
 }
 
-/// Run one canonical SQLite read-only diagnostic against the family at `path`.
+/// Run a canonical diagnostic directly or on a staged copy.
 ///
 /// A family without namespace authority is opened directly through the
 /// guarded canonical read-only opener, which proves the live physical b-tree.
@@ -7313,8 +7306,6 @@ fn sqlite_family_carries_franken_namespace(path: &Path) -> bool {
 /// `am robot health` trusts. Before this seam the admitted case was simply
 /// refused, which left every runtime second opinion on a live mailbox
 /// unanswerable and a primary-engine false positive unrefutable (GH#293).
-///
-/// Run a canonical diagnostic directly or on a staged copy.
 ///
 /// Returns the probe's value plus whether it ran on a staged copy, so callers
 /// that fold a boolean verdict can refuse to trust a *rejection* of a copy
@@ -7353,7 +7344,9 @@ fn with_canonical_diagnostic_conn(
     probe: impl FnOnce(&crate::CanonicalDbConn) -> Result<bool, SqlError>,
 ) -> Result<bool, SqlError> {
     match with_canonical_diagnostic_conn_raw(path, context, probe)? {
-        (true, _) | (false, false) => Ok(true),
+        // A direct open (no namespace authority) is authoritative either way.
+        (verdict, false) => Ok(verdict),
+        (true, true) => Ok(true),
         (false, true) => Err(SqlError::Custom(format!(
             "{CANONICAL_SECOND_OPINION_INCONCLUSIVE}: {context} could only inspect a private \
              staged copy of the live family at {} and that copy did not pass; the copy may be \
@@ -7542,14 +7535,26 @@ fn sqlite_primary_check_is_ok_with_canonical_fallback(
     conn: &DbConn,
     kind: integrity::CheckKind,
 ) -> Result<bool, SqlError> {
-    let primary_result = sqlite_pragma_check_is_ok(conn, kind);
+    // Keep the primary probe's detail rows: the primary engine reports a
+    // collated-index order complaint as `Ok(rows)` ("database disk image is
+    // malformed: index `…` entries are out of order …"), not as an error, so
+    // the false-positive classifier must see the rows, not just an `Err`.
+    let primary_details = sqlite_pragma_check_details(conn, kind);
+    let primary_result: Result<bool, SqlError> = match &primary_details {
+        Ok(details) => Ok(integrity::details_indicate_ok(details)
+            || integrity::integrity_details_are_suspect(details)),
+        Err(error) => Err(SqlError::Custom(error.to_string())),
+    };
     if matches!(primary_result, Ok(true)) {
         return Ok(true);
     }
 
     match sqlite_canonical_file_check_is_ok(path, kind) {
         Ok(true) => {
-            let primary_error_msg = primary_result.as_ref().err().map(ToString::to_string);
+            let primary_error_msg = match &primary_details {
+                Ok(details) => Some(details.join("; ")),
+                Err(error) => Some(error.to_string()),
+            };
             let schema_only_mailbox = match canonical_mailbox_has_no_durable_rows(path) {
                 Ok(is_empty) => is_empty,
                 Err(error) => {
@@ -7563,11 +7568,21 @@ fn sqlite_primary_check_is_ok_with_canonical_fallback(
                 }
             };
 
-            let known_false_positive = primary_error_msg.as_deref().is_some_and(|message| {
-                is_known_collated_index_false_positive(message, |index_name| {
-                    canonical_index_declares_collation(path, index_name)
-                })
-            });
+            let index_declares_collation = |index_name: &str| {
+                canonical_index_declares_collation(path, index_name)
+                    .unwrap_or_else(|| index_name.to_ascii_lowercase().contains("nocase"))
+            };
+            let known_false_positive = match &primary_details {
+                // Every row must be a collated-index order/lookup complaint
+                // (no count mismatch, no page damage) on a collated index.
+                Ok(details) => integrity::collated_index_disagreement_index_names(details)
+                    .is_some_and(|names| names.iter().all(|name| index_declares_collation(name))),
+                Err(error) => {
+                    is_known_collated_index_false_positive(&error.to_string(), |index_name| {
+                        canonical_index_declares_collation(path, index_name)
+                    })
+                }
+            };
             if primary_canonical_disagreement_is_safe_for_schema_only_mailbox(
                 known_false_positive,
                 schema_only_mailbox,
@@ -23125,6 +23140,47 @@ mod tests {
         );
         assert!(sqlite_file_is_healthy(&path).expect("health probe"));
         assert!(sqlite_file_is_healthy_without_family_cleanup(&path).expect("fail-open probe"));
+    }
+
+    /// A direct canonical rejection of a sidecarless file is authoritative:
+    /// only a *staged copy's* rejection is demoted to inconclusive.
+    #[test]
+    fn canonical_second_opinion_keeps_direct_rejection_of_malformed_btree() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("malformed.sqlite3");
+        {
+            let conn = crate::CanonicalDbConn::open_file(sqlite_path_as_utf8(&path).unwrap())
+                .expect("canonical open");
+            conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+                .unwrap();
+            let filler = "x".repeat(600);
+            for i in 1..=600_i64 {
+                conn.execute_raw(&format!("INSERT INTO t(id, body) VALUES ({i}, '{filler}')"))
+                    .unwrap();
+            }
+            conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        let raw = u16::from_be_bytes([bytes[16], bytes[17]]);
+        let page_size = if raw == 1 { 65_536 } else { usize::from(raw) };
+        assert!(
+            bytes.len() > page_size * 3,
+            "fixture must span several pages"
+        );
+        for byte in bytes.iter_mut().skip(page_size) {
+            *byte = 0xA5;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        match sqlite_canonical_file_check_is_ok(&path, integrity::CheckKind::Full) {
+            Ok(false) => {}
+            Ok(true) => panic!("canonical SQLite's direct rejection of a torn b-tree must stand"),
+            Err(error) => assert!(
+                is_corruption_error_message(&error.to_string()),
+                "a torn b-tree may only fail the canonical probe as corruption: {error}"
+            ),
+        }
+        assert!(!sqlite_file_is_healthy(&path).expect("health probe"));
     }
 
     /// The collated-index class never absorbs a real entry-count mismatch.

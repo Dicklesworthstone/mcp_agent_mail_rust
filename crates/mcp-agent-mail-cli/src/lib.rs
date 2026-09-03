@@ -15195,19 +15195,6 @@ impl CanonicalSnapshotSource {
         })
     }
 
-    fn live_snapshot(reported_path: PathBuf, source_path: &Path, context: &str) -> CliResult<Self> {
-        let snapshot_dir = canonical_snapshot_tempdir("canonical-mailbox-live-snapshot-", context)?;
-        let actual_path = snapshot_dir.path().join("mailbox.sqlite3");
-        mcp_agent_mail_share::create_sqlite_snapshot(source_path, &actual_path, false)
-            .map_err(|e| CliError::Other(format!("{context} live sqlite snapshot failed: {e}")))?;
-        Ok(Self {
-            actual_path,
-            reported_path,
-            kind: CanonicalSnapshotSourceKind::LiveSnapshot,
-            _snapshot_dir: Some(snapshot_dir),
-        })
-    }
-
     fn live_full_sqlite_snapshot(
         reported_path: PathBuf,
         source_path: &Path,
@@ -57036,7 +57023,7 @@ startup_timeout_sec = 42
         // Admit the family through the runtime engine so it carries the
         // persistent namespace pair a live mailbox carries.
         {
-            let conn = mcp_agent_mail_db::DbConn::open_file(&db_path.display().to_string())
+            let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
                 .expect("admit fixture through the runtime engine");
             conn.query_sync("SELECT COUNT(*) AS n FROM projects", &[])
                 .expect("read through the runtime engine");

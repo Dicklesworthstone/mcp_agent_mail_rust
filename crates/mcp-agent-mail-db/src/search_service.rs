@@ -5029,6 +5029,10 @@ mod tests {
             "INSERT OR REPLACE INTO db_identity(singleton, generation_id) VALUES (0, '{generation}')"
         ))
         .expect("generation row");
+        // Fold the WAL into the main file so a plain file copy of this
+        // database (the snapshot fixtures) carries the row too.
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint generation db");
         crate::close_db_conn(conn, "seed generation db");
     }
 
@@ -5717,7 +5721,19 @@ mod tests {
         seed_generation_db(&live_path, "gen-297");
         let snapshot_path = root.path().join("live-snapshot").join("mailbox.sqlite3");
         std::fs::create_dir_all(snapshot_path.parent().expect("snapshot dir")).expect("mkdir");
-        std::fs::copy(&live_path, &snapshot_path).expect("snapshot copy");
+        // Materialize the snapshot the way the CLI does: a `VACUUM INTO`
+        // image through the engine that owns the family (a raw file copy
+        // would leave the rows behind in the runtime engine's WAL).
+        {
+            let conn = crate::DbConn::open_file(live_path.to_str().expect("utf8 live path"))
+                .expect("open live for snapshot");
+            conn.execute_raw(&format!(
+                "VACUUM INTO '{}'",
+                snapshot_path.to_str().expect("utf8 snapshot path")
+            ))
+            .expect("vacuum into snapshot");
+            crate::close_db_conn(conn, "snapshot source");
+        }
         let live_pool = temp_file_pool(root.path(), "storage.sqlite3");
         let snapshot_pool = crate::DbPool::new(&crate::DbPoolConfig {
             database_url: format!("sqlite:///{}", snapshot_path.display()),
