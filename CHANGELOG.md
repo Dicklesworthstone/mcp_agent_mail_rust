@@ -130,6 +130,13 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ### Fixed
 
+- **`DATABASE_POOL_TIMEOUT` means seconds everywhere (GH#245 follow-up).** The
+  tool-call pools parsed the variable as milliseconds while the server
+  readiness path and the operator runbook treated it as seconds, so
+  `DATABASE_POOL_TIMEOUT=30` gave every tool-call pool a 30 ms acquire wait.
+  Both paths now share one interpretation: seconds, with values of 1000 or
+  more read as milliseconds so a setting that followed the old code comment
+  keeps its meaning. The runbook default is corrected to the shipped 10 s.
 - **`am doctor` reads a resting WAL family without touching it (br-s9d8a).**
   A database left with WAL/SHM sidecars by a canonical or Python-era writer
   and no live owner could not be read by the guarded read-only canonical

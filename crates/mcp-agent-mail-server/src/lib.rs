@@ -16528,11 +16528,10 @@ fn readiness_check_with_integrity(
     }
 
     let pool_timeout_ms = if run_integrity_check {
-        config
-            .database_pool_timeout
-            .map_or(mcp_agent_mail_db::pool::DEFAULT_POOL_TIMEOUT_MS, |v| {
-                v.saturating_mul(1000)
-            })
+        config.database_pool_timeout.map_or(
+            mcp_agent_mail_db::pool::DEFAULT_POOL_TIMEOUT_MS,
+            mcp_agent_mail_db::pool::pool_timeout_ms_from_setting,
+        )
     } else {
         // Quick check: use a much shorter timeout (2s) to avoid delaying startup
         // if the DB is busy with a long backfill or migration.

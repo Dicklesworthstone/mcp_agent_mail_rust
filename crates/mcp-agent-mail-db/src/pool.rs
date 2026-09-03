@@ -2485,8 +2485,9 @@ pub fn evaluate_write_route(
 /// off by it, so a slow first-time init still completes. Waiters on that init
 /// are bounded separately by [`SqliteInitGate`].
 ///
-/// Override via `DATABASE_POOL_TIMEOUT` (ms); sizing via `DATABASE_POOL_SIZE` /
-/// `DATABASE_MAX_OVERFLOW` env vars.
+/// Override via `DATABASE_POOL_TIMEOUT` (seconds; values of 1000 or more are read
+/// as milliseconds, see [`pool_timeout_ms_from_setting`]); sizing via
+/// `DATABASE_POOL_SIZE` / `DATABASE_MAX_OVERFLOW` env vars.
 pub const DEFAULT_POOL_SIZE: usize = 25;
 pub const DEFAULT_MAX_OVERFLOW: usize = 75;
 pub const DEFAULT_POOL_TIMEOUT_MS: u64 = 10_000;
@@ -2498,6 +2499,25 @@ const _: () = assert!(
      acquire timeouts surface as attributed errors (GH#245)"
 );
 pub const DEFAULT_POOL_RECYCLE_MS: u64 = 30 * 60 * 1000; // 30 minutes
+
+/// Interpret a `DATABASE_POOL_TIMEOUT` setting as milliseconds.
+///
+/// The documented contract (operator runbook, legacy Python defaults) is
+/// **seconds**. The pool's env parser historically read the same variable as
+/// milliseconds while the server readiness path multiplied it by 1000, so
+/// `DATABASE_POOL_TIMEOUT=30` meant 30 s at readiness and a 30 ms acquire wait
+/// for every tool-call pool (GH#245 follow-up). Values below 1000 are seconds;
+/// values of 1000 or more are taken as milliseconds, so an operator who
+/// followed the old code comment keeps the timeout they configured (no one
+/// wants a pool acquire wait of a thousand seconds or more).
+#[must_use]
+pub const fn pool_timeout_ms_from_setting(value: u64) -> u64 {
+    if value >= 1000 {
+        value
+    } else {
+        value.saturating_mul(1000)
+    }
+}
 
 /// Auto-detect a reasonable pool size from available CPU parallelism.
 ///
@@ -2598,8 +2618,8 @@ impl DbPoolConfig {
             infra_env_value("DATABASE_URL").unwrap_or_else(|| core_config.database_url.clone());
 
         let pool_timeout = env_value("DATABASE_POOL_TIMEOUT")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_POOL_TIMEOUT_MS);
+            .and_then(|s| s.parse::<u64>().ok())
+            .map_or(DEFAULT_POOL_TIMEOUT_MS, pool_timeout_ms_from_setting);
 
         // Determine pool sizing: explicit, auto, or default constants.
         let pool_size_raw = env_value("DATABASE_POOL_SIZE");
@@ -18157,6 +18177,19 @@ mod tests {
              typed error instead of an unattributed dispatch timeout (GH#245)",
             mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS,
         );
+    }
+
+    /// GH#245 follow-up: `DATABASE_POOL_TIMEOUT` is documented in seconds, but
+    /// the pool parsed it as milliseconds while the server readiness path
+    /// multiplied by 1000. Both now share one interpretation.
+    #[test]
+    fn pool_timeout_setting_is_seconds_unless_it_already_looks_like_milliseconds() {
+        assert_eq!(pool_timeout_ms_from_setting(15), 15_000);
+        assert_eq!(pool_timeout_ms_from_setting(30), 30_000);
+        assert_eq!(pool_timeout_ms_from_setting(999), 999_000);
+        assert_eq!(pool_timeout_ms_from_setting(1_000), 1_000);
+        assert_eq!(pool_timeout_ms_from_setting(10_000), 10_000);
+        assert_eq!(pool_timeout_ms_from_setting(u64::MAX), u64::MAX);
     }
 
     /// Verify auto-sizing picks reasonable values based on CPU count.
