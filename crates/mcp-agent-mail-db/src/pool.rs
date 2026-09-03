@@ -7450,10 +7450,21 @@ fn is_known_collated_index_false_positive(
         return false;
     }
     let Some(index_name) = primary_complaint_index_name(message) else {
+        tracing::debug!(
+            primary_error = %message,
+            "collated-index classifier: complaint names no index; not a known false positive"
+        );
         return false;
     };
-    index_declares_collation(&index_name)
-        .unwrap_or_else(|| index_name.to_ascii_lowercase().contains("nocase"))
+    let declared = index_declares_collation(&index_name);
+    let accepted = declared.unwrap_or_else(|| index_name.to_ascii_lowercase().contains("nocase"));
+    tracing::info!(
+        index = %index_name,
+        schema_declares_collation = ?declared,
+        accepted,
+        "collated-index classifier verdict for a primary integrity complaint (GH#293)"
+    );
+    accepted
 }
 
 /// Whether a `CREATE TABLE` / `CREATE INDEX` statement declares any collation
