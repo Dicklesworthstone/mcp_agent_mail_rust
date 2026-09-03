@@ -59,6 +59,11 @@ pub struct ResolvedMailboxSqlitePath {
     pub configured_path: String,
     #[serde(default)]
     pub selected_path: String,
+    /// `selected_path` anchored to the current directory and lexically
+    /// normalized, with symlinks still not followed: the spelling frozen
+    /// against later `cwd` changes. `:memory:` stays `:memory:`.
+    #[serde(default)]
+    pub absolute_alias_path: PathBuf,
     pub canonical_path: String,
     pub used_absolute_fallback: bool,
 }
@@ -10285,18 +10290,20 @@ pub fn resolve_mailbox_sqlite_path(database_url: &str) -> DbResult<ResolvedMailb
     };
     let configured_path = config.sqlite_path()?;
     let selected_path = resolve_sqlite_path_with_absolute_fallback(&configured_path);
-    let canonical_path = if selected_path == ":memory:" {
-        ":memory:".to_string()
+    let (absolute_alias_path, canonical_path) = if selected_path == ":memory:" {
+        (PathBuf::from(":memory:"), ":memory:".to_string())
     } else {
         let absolute_alias =
             absolute_lexical_authority_path(Path::new(&selected_path), "database_url")?;
         let identity = normalize_sqlite_identity_path_buf(&absolute_alias);
-        sqlite_open_path_for_identity(&absolute_alias, &identity)?
+        let canonical_path = sqlite_open_path_for_identity(&absolute_alias, &identity)?;
+        (absolute_alias, canonical_path)
     };
     Ok(ResolvedMailboxSqlitePath {
         used_absolute_fallback: selected_path != configured_path,
         configured_path,
         selected_path,
+        absolute_alias_path,
         canonical_path,
     })
 }
@@ -23816,6 +23823,10 @@ mod tests {
             "selected_path must keep the symlink spelling"
         );
         assert_eq!(
+            resolved.absolute_alias_path, linked_db,
+            "absolute_alias_path must not follow the symlink"
+        );
+        assert_eq!(
             resolved.canonical_path,
             normalize_sqlite_identity_path_buf(&linked_db)
                 .to_string_lossy()
@@ -23832,6 +23843,13 @@ mod tests {
             .expect("resolve explicit relative url");
         assert_eq!(resolved.selected_path, explicit_relative);
         assert!(!resolved.used_absolute_fallback);
+        assert_eq!(
+            resolved.absolute_alias_path,
+            std::env::current_dir()
+                .expect("cwd")
+                .join("relative/never-created.sqlite3"),
+            "absolute_alias_path anchors the spelling without resolving symlinks"
+        );
         assert!(
             Path::new(&resolved.canonical_path).is_absolute(),
             "canonical_path anchors the relative spelling: {}",

@@ -2668,12 +2668,14 @@ pub(crate) fn resolve_server_database_url_sqlite_path(
         return None;
     }
 
-    // The spelling, not the frozen identity: startup probes validate this
-    // path against the no-symlink policy and opens go through the same
-    // spelling the operator configured. Identity keys are computed by the
+    // The spelling anchored to the current directory, not the frozen
+    // identity: startup probes validate this path against the no-symlink
+    // policy and opens go through the same spelling the operator configured,
+    // while a relative target is frozen against later `cwd` changes exactly
+    // like the pool's own runtime path. Identity keys are computed by the
     // pool itself and by `resolve_server_sync_sqlite_path`.
     let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(database_url).ok()?;
-    Some(std::path::PathBuf::from(resolved.selected_path))
+    Some(resolved.absolute_alias_path)
 }
 
 pub(crate) fn resolve_server_sync_sqlite_path(path: &str) -> String {
