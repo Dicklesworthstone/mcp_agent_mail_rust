@@ -130,6 +130,17 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ### Fixed
 
+- **`am` reads no longer refuse a mailbox that lacks FrankenSQLite namespace
+  sidecars (br-vhxdc).** The CLI's live read-only opener (startup banner,
+  pre-open health probe, sync mailbox reads, doctor source selection, robot
+  mailbox and attachment reads, migration format detection, agent-start
+  reservation checks) now goes through the engine-dispatching guarded opener:
+  FrankenSQLite when the family carries its namespace pair, canonical
+  SQLite's true read-only flags otherwise. A mailbox last written by canonical
+  SQLite, restored from a `.bak`, or produced by archive reconstruction was
+  previously refused with "a complete pre-existing namespace sidecar pair is
+  required". The schema, health, project, and timestamp-format probes on
+  those paths are generic over the connection engine.
 - **Database-path policy sees the configured spelling again.** Since the
   mailbox-identity work, the shared path helpers the cli and the server
   used for opening and validating the database returned the frozen identity

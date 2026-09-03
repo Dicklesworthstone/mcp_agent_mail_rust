@@ -267,7 +267,7 @@ pub fn update_message_thread_id(
 }
 
 pub fn fetch_inbox_rows_from_conn(
-    conn: &DbConn,
+    conn: &impl crate::pool::SyncQuery,
     project_id: i64,
     agent_id: i64,
     urgent_only: bool,
@@ -295,7 +295,7 @@ pub fn fetch_inbox_rows_from_conn(
 
 #[allow(clippy::too_many_arguments)]
 pub fn fetch_inbox_metadata_rows_from_conn(
-    conn: &DbConn,
+    conn: &impl crate::pool::SyncQuery,
     project_id: i64,
     agent_id: i64,
     urgent_only: bool,
@@ -406,7 +406,7 @@ pub fn fetch_inbox_filtered_rows_from_conn(
 }
 
 fn fetch_inbox_rows_from_conn_impl(
-    conn: &DbConn,
+    conn: &impl crate::pool::SyncQuery,
     project_id: i64,
     agent_id: i64,
     since_ts: Option<i64>,
@@ -544,7 +544,7 @@ fn fetch_inbox_rows_from_conn_impl(
 /// Rows are ordered oldest-first so a consumer can safely persist
 /// `next_cursor` after processing each page.
 pub fn inbox_delivery_events_from_conn(
-    conn: &DbConn,
+    conn: &impl crate::pool::SyncQuery,
     project_id: i64,
     agent_id: i64,
     after: Option<i64>,

@@ -3273,7 +3273,10 @@ fn parse_agent_health_threshold(
 use mcp_agent_mail_db::DbConn;
 
 /// Resolve a project by slug or human_key.
-fn resolve_project_sync(conn: &DbConn, key: &str) -> Result<(i64, String), CliError> {
+fn resolve_project_sync(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+    key: &str,
+) -> Result<(i64, String), CliError> {
     let project = crate::context::resolve_project(conn, key)?;
     Ok((project.id, project.slug))
 }
@@ -3283,7 +3286,7 @@ fn normalize_project_lookup_path(path: &Path) -> String {
 }
 
 fn find_project_for_path_or_ancestors(
-    conn: &DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
     path: &Path,
 ) -> Result<(i64, String), CliError> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -3314,7 +3317,9 @@ fn project_human_key_sync(conn: &DbConn, project_id: i64) -> Result<Option<Strin
 }
 
 /// Find the project for the current working directory.
-fn find_project_for_cwd(conn: &DbConn) -> Result<(i64, String), CliError> {
+fn find_project_for_cwd(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+) -> Result<(i64, String), CliError> {
     let cwd =
         std::env::current_dir().map_err(|e| CliError::Other(format!("cannot get CWD: {e}")))?;
     find_project_for_path_or_ancestors(conn, &cwd)
@@ -3333,7 +3338,10 @@ fn resolved_project_flag_or_env(flag: Option<&str>) -> Option<String> {
 }
 
 /// Resolve project from --project flag or CWD.
-fn resolve_project(conn: &DbConn, flag: Option<&str>) -> Result<(i64, String), CliError> {
+fn resolve_project(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+    flag: Option<&str>,
+) -> Result<(i64, String), CliError> {
     if let Some(key) = resolved_project_flag_or_env(flag) {
         resolve_project_sync(conn, &key)
     } else {
@@ -7879,7 +7887,9 @@ fn summarize_db_file_sanity_probe(database_url: &str) -> HealthProbeAssessment {
     }
 }
 
-fn summarize_db_schema_probe(conn: Option<&DbConn>) -> HealthProbeAssessment {
+fn summarize_db_schema_probe(
+    conn: Option<&impl mcp_agent_mail_db::pool::SyncQuery>,
+) -> HealthProbeAssessment {
     let Some(conn) = conn else {
         return HealthProbeAssessment {
             probe: HealthProbe {
@@ -7931,7 +7941,7 @@ fn summarize_db_schema_probe(conn: Option<&DbConn>) -> HealthProbeAssessment {
 }
 
 fn summarize_archive_db_parity_probe(
-    conn: Option<&DbConn>,
+    conn: Option<&impl mcp_agent_mail_db::pool::SyncQuery>,
     storage_root: &Path,
 ) -> HealthProbeAssessment {
     let projects_root = storage_root.join("projects");
@@ -15137,8 +15147,16 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             })?;
             let (project_id, project_slug) =
                 resolve_project(read_db.conn(), args.project.as_deref())?;
+            // The search stack is typed to the runtime engine; a family served
+            // by canonical SQLite (no namespace pair) is reported, not guessed.
+            let search_conn = read_db.conn().as_franken().ok_or_else(|| {
+                CliError::Other(
+                    "robot search requires the mailbox runtime engine; this family is served by canonical SQLite (no FrankenSQLite namespace pair)"
+                        .to_string(),
+                )
+            })?;
             let data = build_search(
-                read_db.conn(),
+                search_conn,
                 read_db.pool(),
                 project_id,
                 &query,
@@ -15303,7 +15321,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         RobotSubcommand::Health { include_host } => {
             let mut probes: Vec<HealthProbe> = Vec::new();
             let config = mcp_agent_mail_core::Config::from_env();
-            let mut db_conn: Option<DbConn> = None;
+            let mut db_conn: Option<mcp_agent_mail_db::pool::GuardedReadOnlyConn> = None;
             // J3 (br-bvq1x.10.3): capture the *effective* DB file that was actually
             // opened so the runtime-identity block can name it (path/version
             // confusion: agents could not tell which mailbox `am` resolved).

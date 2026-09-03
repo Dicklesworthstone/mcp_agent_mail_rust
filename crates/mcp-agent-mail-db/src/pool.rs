@@ -11932,6 +11932,17 @@ impl GuardedReadOnlyConn {
         }
     }
 
+    /// Take the underlying FrankenSQLite connection, when the family was
+    /// Franken-admitted. `None` for a canonical-served family; callers whose
+    /// next step needs the runtime engine fall back to their full open path.
+    #[must_use]
+    pub fn into_franken(self) -> Option<DbConn> {
+        match self {
+            Self::Franken(conn) => Some(conn),
+            Self::Canonical(_) => None,
+        }
+    }
+
     /// Prepare and execute a query, returning every row.
     #[allow(clippy::result_large_err)]
     pub fn query_sync(
@@ -11967,11 +11978,20 @@ pub trait SyncQuery {
     /// Prepare and execute a query, returning every row.
     #[allow(clippy::result_large_err)]
     fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, SqlError>;
+
+    /// Execute SQL without parameter binding (connection PRAGMAs on a
+    /// read-only handle).
+    #[allow(clippy::result_large_err)]
+    fn execute_raw(&self, sql: &str) -> Result<(), SqlError>;
 }
 
 impl SyncQuery for DbConn {
     fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, SqlError> {
         Self::query_sync(self, sql, params)
+    }
+
+    fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
+        Self::execute_raw(self, sql)
     }
 }
 
@@ -11979,11 +11999,29 @@ impl SyncQuery for crate::CanonicalDbConn {
     fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, SqlError> {
         Self::query_sync(self, sql, params)
     }
+
+    fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
+        Self::execute_raw(self, sql)
+    }
 }
 
 impl SyncQuery for GuardedReadOnlyConn {
     fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, SqlError> {
         Self::query_sync(self, sql, params)
+    }
+
+    fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
+        Self::execute_raw(self, sql)
+    }
+}
+
+impl SyncQuery for crate::DbConnGuard {
+    fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, SqlError> {
+        DbConn::query_sync(self, sql, params)
+    }
+
+    fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
+        DbConn::execute_raw(self, sql)
     }
 }
 

@@ -202,7 +202,7 @@ fn unsupported_storage_class_error(
 }
 
 fn scan_column_types(
-    conn: &DbConn,
+    conn: &impl crate::pool::SyncQuery,
     table: &str,
     column: &str,
 ) -> Result<ColumnTypeScan, sqlmodel_core::Error> {
@@ -239,7 +239,9 @@ fn scan_column_types(
 /// # Errors
 ///
 /// Returns `MigrationError::Query` if any SQL query fails.
-pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, MigrationError> {
+pub fn detect_timestamp_format(
+    conn: &impl crate::pool::SyncQuery,
+) -> Result<TimestampFormat, MigrationError> {
     let mut saw_integer = false;
     let mut saw_text = false;
     let mut saw_real = false;

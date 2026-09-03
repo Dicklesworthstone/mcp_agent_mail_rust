@@ -9551,7 +9551,9 @@ pub async fn fetch_inbox_delivery_events(
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
-    match crate::sync::inbox_delivery_events_from_conn(&conn, project_id, agent_id, after, limit) {
+    let db_conn: &crate::DbConn = &conn;
+    match crate::sync::inbox_delivery_events_from_conn(db_conn, project_id, agent_id, after, limit)
+    {
         Ok(page) => Outcome::Ok(page),
         Err(crate::sync::InboxDeliveryEventError::Database(error)) => Outcome::Err(error),
         Err(crate::sync::InboxDeliveryEventError::CursorExpired {

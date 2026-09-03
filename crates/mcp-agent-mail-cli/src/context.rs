@@ -142,7 +142,7 @@ fn orphaned_project_placeholder(project_id: i64, created_at: i64) -> ResolvedPro
 }
 
 fn query_project_by_slug(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
     slug: &str,
 ) -> CliResult<Option<ResolvedProject>> {
     let rows = conn
@@ -165,7 +165,7 @@ fn query_project_by_slug(
 }
 
 fn query_project_by_human_key(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
     human_key: &str,
 ) -> CliResult<Option<ResolvedProject>> {
     let rows = conn
@@ -187,7 +187,9 @@ fn query_project_by_human_key(
         .transpose()
 }
 
-fn list_project_inventory(conn: &mcp_agent_mail_db::DbConn) -> CliResult<Vec<ResolvedProject>> {
+fn list_project_inventory(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+) -> CliResult<Vec<ResolvedProject>> {
     let project_rows = conn
         .query_sync(
             "SELECT id, slug, human_key, created_at FROM projects ORDER BY created_at ASC, id ASC",
@@ -305,7 +307,10 @@ fn project_matches_absolute_lookup(
 /// For absolute filesystem paths, prefer exact/canonical `human_key` matching
 /// before accepting a slug hit so slug collisions cannot resolve to the wrong
 /// project.
-pub fn resolve_project(conn: &mcp_agent_mail_db::DbConn, key: &str) -> CliResult<ResolvedProject> {
+pub fn resolve_project(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+    key: &str,
+) -> CliResult<ResolvedProject> {
     let key = key.trim();
     if Path::new(key).is_absolute() {
         let requested = resolve_project_identity(key);
@@ -358,7 +363,7 @@ pub struct ResolvedAgent {
 /// matching row. Legacy databases may still contain case-duplicate rows before
 /// `am migrate`; in that case, fail instead of guessing which agent was meant.
 pub fn resolve_agent(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
     project_id: i64,
     agent_name: &str,
 ) -> CliResult<ResolvedAgent> {

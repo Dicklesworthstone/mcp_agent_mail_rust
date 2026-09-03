@@ -6672,7 +6672,7 @@ struct PreflightBannerStats {
 }
 
 fn query_preflight_banner_stats_batched(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
 ) -> Option<PreflightBannerStats> {
     let sql = "SELECT \
                (SELECT COUNT(*) FROM projects) AS projects_count, \
@@ -11222,7 +11222,7 @@ where
 }
 
 fn sqlite_conn_check_ok(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
     kind: mcp_agent_mail_db::CheckKind,
 ) -> CliResult<bool> {
     let rows = sqlite_query_check_rows(
@@ -11285,11 +11285,11 @@ fn sqlite_conn_check_ok_with_private_canonical_corroboration(
     )
 }
 
-fn sqlite_conn_quick_check_ok(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
+fn sqlite_conn_quick_check_ok(conn: &impl mcp_agent_mail_db::pool::SyncQuery) -> CliResult<bool> {
     sqlite_conn_check_ok(conn, mcp_agent_mail_db::CheckKind::Quick)
 }
 
-fn sqlite_conn_is_healthy(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
+fn sqlite_conn_is_healthy(conn: &impl mcp_agent_mail_db::pool::SyncQuery) -> CliResult<bool> {
     retry_sync_sqlite_lock(|| match sqlite_conn_quick_check_ok(conn) {
         Ok(ok) => Ok(ok),
         Err(e) => {
@@ -11334,7 +11334,7 @@ const SQLITE_BASE_INIT_COLUMNS: [(&str, &str); 14] = [
 ];
 
 fn sqlite_conn_has_column(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
     table: &str,
     column: &str,
 ) -> CliResult<bool> {
@@ -11347,7 +11347,10 @@ fn sqlite_conn_has_column(
         .any(|name| name == column))
 }
 
-fn sqlite_conn_has_table(conn: &mcp_agent_mail_db::DbConn, table: &str) -> CliResult<bool> {
+fn sqlite_conn_has_table(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+    table: &str,
+) -> CliResult<bool> {
     let rows = conn
         .query_sync(&format!("PRAGMA table_info({table})"), &[])
         .map_err(|e| CliError::Other(format!("PRAGMA table_info({table}) failed: {e}")))?;
@@ -11355,7 +11358,7 @@ fn sqlite_conn_has_table(conn: &mcp_agent_mail_db::DbConn, table: &str) -> CliRe
 }
 
 fn sqlite_conn_supports_required_reads(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
     tables: &[&str],
     columns: &[(&str, &str)],
 ) -> CliResult<bool> {
@@ -11414,7 +11417,9 @@ fn sqlite_conn_supports_required_reads_canonical(
     Ok(true)
 }
 
-fn sqlite_conn_requires_canonical_init(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
+fn sqlite_conn_requires_canonical_init(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+) -> CliResult<bool> {
     sqlite_conn_supports_required_reads(conn, &SQLITE_BASE_INIT_TABLES, &SQLITE_BASE_INIT_COLUMNS)
         .map(|supported| !supported)
 }
@@ -11515,11 +11520,15 @@ const SQLITE_ROBOT_ATTACHMENTS_READ_COLUMNS: [(&str, &str); 11] = [
     ("messages", "created_ts"),
 ];
 
-fn sqlite_conn_supports_robot_reads(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
+fn sqlite_conn_supports_robot_reads(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+) -> CliResult<bool> {
     sqlite_conn_supports_required_reads(conn, &SQLITE_ROBOT_READ_TABLES, &SQLITE_ROBOT_READ_COLUMNS)
 }
 
-fn sqlite_conn_supports_mail_inbox_reads(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
+fn sqlite_conn_supports_mail_inbox_reads(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+) -> CliResult<bool> {
     sqlite_conn_supports_required_reads(
         conn,
         &SQLITE_MAIL_INBOX_READ_TABLES,
@@ -11528,7 +11537,7 @@ fn sqlite_conn_supports_mail_inbox_reads(conn: &mcp_agent_mail_db::DbConn) -> Cl
 }
 
 fn sqlite_conn_supports_robot_attachment_reads(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
 ) -> CliResult<bool> {
     sqlite_conn_supports_required_reads(
         conn,
@@ -14485,10 +14494,16 @@ fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn
     open_sqlite_with_fallback_and_storage_root(path, None)
 }
 
+/// Open the live mailbox database read-only through the engine-dispatching
+/// guarded opener (br-vhxdc): FrankenSQLite when the family carries its
+/// namespace pair, canonical SQLite's true read-only flags otherwise. A
+/// family last written by canonical SQLite, restored from a `.bak`, or
+/// produced by archive reconstruction is readable here instead of being
+/// refused for lacking a namespace pair.
 fn open_live_sqlite_read_only(
     path: &str,
     context: &str,
-) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
+) -> CliResult<(mcp_agent_mail_db::pool::GuardedReadOnlyConn, String)> {
     let conn = if path == ":memory:" {
         let conn = mcp_agent_mail_db::DbConn::open_memory().map_err(|error| {
             CliError::Other(format!("{context}: cannot open in-memory DB: {error}"))
@@ -14499,17 +14514,15 @@ fn open_live_sqlite_read_only(
                     "{context}: cannot configure in-memory read-only connection: {error}"
                 ))
             })?;
-        conn
+        mcp_agent_mail_db::pool::GuardedReadOnlyConn::Franken(conn)
     } else {
-        let conn = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
-            Path::new(path),
-            context,
-        )
-        .map_err(|error| {
-            CliError::Other(format!(
-                "{context}: cannot open DB at {path} read-only: {error}"
-            ))
-        })?;
+        let conn =
+            mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(Path::new(path), context)
+                .map_err(|error| {
+                CliError::Other(format!(
+                    "{context}: cannot open DB at {path} read-only: {error}"
+                ))
+            })?;
         conn.execute_raw("PRAGMA busy_timeout = 20000;")
             .map_err(|error| {
                 CliError::Other(format!(
@@ -15140,7 +15153,7 @@ fn open_db_sync_while_holding_mailbox_lock() -> CliResult<mcp_agent_mail_db::DbC
 
 fn open_db_sync_read_only_with_database_url_and_path(
     database_url: &str,
-) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
+) -> CliResult<(mcp_agent_mail_db::pool::GuardedReadOnlyConn, String)> {
     let cfg = mcp_agent_mail_db::DbPoolConfig {
         database_url: database_url.to_string(),
         ..Default::default()
@@ -15154,7 +15167,7 @@ fn open_db_sync_read_only_with_database_url_and_path(
 
 fn open_db_sync_read_only_with_database_url(
     database_url: &str,
-) -> CliResult<mcp_agent_mail_db::DbConn> {
+) -> CliResult<mcp_agent_mail_db::pool::GuardedReadOnlyConn> {
     open_db_sync_read_only_with_database_url_and_path(database_url).map(|(conn, _opened_path)| conn)
 }
 
@@ -15307,7 +15320,10 @@ impl CanonicalSnapshotSource {
         }
     }
 
-    fn open_read_only(&self, context: &str) -> CliResult<mcp_agent_mail_db::DbConn> {
+    fn open_read_only(
+        &self,
+        context: &str,
+    ) -> CliResult<mcp_agent_mail_db::pool::GuardedReadOnlyConn> {
         match self.kind {
             CanonicalSnapshotSourceKind::LiveSqlite => {
                 let path = self.actual_path.to_str().ok_or_else(|| {
@@ -15321,6 +15337,7 @@ impl CanonicalSnapshotSource {
             CanonicalSnapshotSourceKind::LiveSnapshot
             | CanonicalSnapshotSourceKind::ArchiveSnapshot => {
                 open_private_sqlite_read_only(&self.actual_path, context)
+                    .map(mcp_agent_mail_db::pool::GuardedReadOnlyConn::Franken)
             }
         }
     }
@@ -15630,13 +15647,13 @@ fn resolve_canonical_snapshot_source_with_database_url(
 }
 
 struct CanonicalReadDb {
-    conn: mcp_agent_mail_db::DbConn,
+    conn: mcp_agent_mail_db::pool::GuardedReadOnlyConn,
     _source: CanonicalSnapshotSource,
     _mailbox_read_locks: CliMailboxReadLocks,
 }
 
 impl CanonicalReadDb {
-    fn conn(&self) -> &mcp_agent_mail_db::DbConn {
+    fn conn(&self) -> &mcp_agent_mail_db::pool::GuardedReadOnlyConn {
         &self.conn
     }
 }
@@ -15654,14 +15671,14 @@ impl CanonicalReadPool {
 }
 
 struct CanonicalReadDbPool {
-    conn: mcp_agent_mail_db::DbConn,
+    conn: mcp_agent_mail_db::pool::GuardedReadOnlyConn,
     pool: mcp_agent_mail_db::DbPool,
     _source: CanonicalSnapshotSource,
     _mailbox_read_locks: CliMailboxReadLocks,
 }
 
 impl CanonicalReadDbPool {
-    fn conn(&self) -> &mcp_agent_mail_db::DbConn {
+    fn conn(&self) -> &mcp_agent_mail_db::pool::GuardedReadOnlyConn {
         &self.conn
     }
 
@@ -15870,7 +15887,7 @@ struct CanonicalReadInboxDb {
 }
 
 impl CanonicalReadInboxDb {
-    fn conn(&self) -> &mcp_agent_mail_db::DbConn {
+    fn conn(&self) -> &mcp_agent_mail_db::pool::GuardedReadOnlyConn {
         self.read_db.conn()
     }
 }
@@ -15910,7 +15927,14 @@ fn open_db_sync_robot_best_effort_with_database_url(
     let path = resolve_sqlite_runtime_path(&path);
     let (conn, _opened_path) = open_live_sqlite_read_only(&path, "robot mailbox read")?;
     if sqlite_conn_supports_robot_reads(&conn)? {
-        return Ok(conn);
+        // The robot read path is typed to the runtime engine; a family served
+        // by canonical SQLite takes the caller's full open path instead.
+        return conn.into_franken().ok_or_else(|| {
+            CliError::Other(
+                "robot read fallback requires the runtime engine connection; the family is served by canonical SQLite"
+                    .to_string(),
+            )
+        });
     }
     Err(CliError::Other(
         "robot read fallback requires the full robot command schema".to_string(),
@@ -15930,7 +15954,12 @@ fn open_db_sync_robot_attachments_best_effort_with_database_url(
     let path = resolve_sqlite_runtime_path(&path);
     let (conn, _opened_path) = open_live_sqlite_read_only(&path, "robot attachment mailbox read")?;
     if sqlite_conn_supports_robot_attachment_reads(&conn)? {
-        return Ok(conn);
+        return conn.into_franken().ok_or_else(|| {
+            CliError::Other(
+                "robot attachments fallback requires the runtime engine connection; the family is served by canonical SQLite"
+                    .to_string(),
+            )
+        });
     }
     Err(CliError::Other(
         "robot attachments fallback requires the attachments read schema".to_string(),
@@ -19024,7 +19053,7 @@ fn active_reservation_candidate_predicate_sql(table_ref: &str) -> String {
 /// active-view CLI queries can subtract them in Rust (a single-column scan,
 /// cheap in any engine) instead of relying on the slow `NOT IN` anti-join.
 fn cli_released_reservation_ids(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
 ) -> CliResult<std::collections::HashSet<i64>> {
     let rows = conn
         .query_sync(
@@ -19065,7 +19094,7 @@ fn cli_reservation_target_matches(
 }
 
 fn resolve_project_for_cli_best_effort(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
     identifier: &str,
 ) -> CliResult<Option<crate::context::ResolvedProject>> {
     match crate::context::resolve_project(conn, identifier) {
@@ -19076,7 +19105,7 @@ fn resolve_project_for_cli_best_effort(
 }
 
 fn handle_file_reservations_with_conn(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
     action: FileReservationsCommand,
 ) -> CliResult<()> {
     let now_us = mcp_agent_mail_db::timestamps::now_micros();
@@ -19669,7 +19698,10 @@ fn saturating_age_minutes_since(now_us: i64, created_ts: i64) -> i64 {
     now_us.saturating_sub(created_ts).max(0) / CLI_MICROS_PER_MINUTE
 }
 
-fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) -> CliResult<()> {
+fn handle_acks_with_conn(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+    action: AcksCommand,
+) -> CliResult<()> {
     let now_us = mcp_agent_mail_db::timestamps::now_micros();
 
     match action {
@@ -19864,7 +19896,13 @@ fn handle_contacts(action: ContactsCommand) -> CliResult<()> {
         Some(&config.storage_root),
         "contacts",
     )?;
-    handle_contacts_with_conn(opened.conn(), action)
+    let conn = opened.conn().as_franken().ok_or_else(|| {
+        CliError::Other(
+            "contacts mutations require the mailbox runtime engine; this family is served by canonical SQLite (no FrankenSQLite namespace pair)"
+                .to_string(),
+        )
+    })?;
+    handle_contacts_with_conn(conn, action)
 }
 
 fn handle_contacts_with_conn(
@@ -20988,7 +21026,7 @@ fn handle_list_acks(project_key: &str, agent_name: &str, limit: i64) -> CliResul
 }
 
 fn handle_list_acks_with_conn(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
     project_key: &str,
     agent_name: &str,
     limit: i64,
@@ -25166,7 +25204,13 @@ fn handle_projects_adopt(
         Some(&config.storage_root),
         "projects adopt dry-run",
     )?;
-    handle_projects_adopt_with_conn(opened.conn(), config, source, target, dry_run, apply)
+    let conn = opened.conn().as_franken().ok_or_else(|| {
+        CliError::Other(
+            "projects adopt requires the mailbox runtime engine; this family is served by canonical SQLite (no FrankenSQLite namespace pair)"
+                .to_string(),
+        )
+    })?;
+    handle_projects_adopt_with_conn(conn, config, source, target, dry_run, apply)
 }
 
 fn handle_doctor_check(
@@ -26771,7 +26815,7 @@ fn doctor_foreign_key_violations_from_rows(
 }
 
 fn doctor_foreign_key_violations(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
 ) -> CliResult<Vec<DoctorForeignKeyViolation>> {
     let rows = conn
         .query_sync("PRAGMA foreign_key_check", &[])
@@ -29889,7 +29933,9 @@ where
         .collect())
 }
 
-fn doctor_required_tables(conn: &mcp_agent_mail_db::DbConn) -> CliResult<Vec<String>> {
+fn doctor_required_tables(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+) -> CliResult<Vec<String>> {
     doctor_required_tables_from_query(|sql| conn.query_sync(sql, &[]).map_err(|e| e.to_string()))
 }
 
@@ -30677,7 +30723,9 @@ where
     })
 }
 
-fn collect_doctor_db_inventory(conn: &mcp_agent_mail_db::DbConn) -> CliResult<DoctorDbInventory> {
+fn collect_doctor_db_inventory(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+) -> CliResult<DoctorDbInventory> {
     collect_doctor_db_inventory_from_query(|sql| {
         conn.query_sync(sql, &[]).map_err(|e| e.to_string())
     })
@@ -36277,7 +36325,10 @@ fn archive_mail_status_counts(storage_root: &Path, slug: &str) -> Option<(i64, i
     Some((message_count, agent_count))
 }
 
-fn handle_mail_status_sync(conn: &mcp_agent_mail_db::DbConn, action: MailCommand) -> CliResult<()> {
+fn handle_mail_status_sync(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+    action: MailCommand,
+) -> CliResult<()> {
     let MailCommand::Status { project_path } = action else {
         unreachable!()
     };
@@ -65061,7 +65112,9 @@ startup_timeout_sec = 42
             (
                 "garbage",
                 vec![b'x'; SQLITE_DATABASE_HEADER_BYTES],
-                "invalid SQLite header",
+                // The engine-dispatching opener refuses a headerless file in
+                // its strict query-only open (br-vhxdc).
+                "does not have a valid SQLite database header",
             ),
         ];
 
@@ -73271,6 +73324,61 @@ startup_timeout_sec = 42
             sqlite_conn_requires_canonical_init(&conn).expect("schema probe"),
             "legacy columns should force canonical bootstrap"
         );
+    }
+
+    /// br-vhxdc: the CLI's live read-only opener dispatches on the family's
+    /// engine authority. A mailbox last written by canonical SQLite carries no
+    /// FrankenSQLite namespace pair; it must be served by the canonical
+    /// opener instead of being refused for lacking one, and the engine-generic
+    /// schema probes must run on that connection unchanged.
+    #[test]
+    fn open_live_sqlite_read_only_serves_a_sidecarless_canonical_family() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("canonical-written.sqlite3");
+        let db_str = db_path.to_string_lossy().into_owned();
+        {
+            let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&db_str)
+                .expect("open canonical writer");
+            conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_BASE_SQL)
+                .expect("canonical init pragmas");
+            conn.execute_raw(mcp_agent_mail_db::schema::CREATE_TABLES_SQL)
+                .expect("canonical schema");
+            conn.execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) VALUES ('proj', '/tmp/proj', 1)",
+            )
+            .expect("seed project");
+        }
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use", "-wal", "-shm"] {
+            assert!(
+                !sqlite_sidecar_path(&db_path, suffix).exists(),
+                "fixture must be a sidecarless canonical family ({suffix})"
+            );
+        }
+
+        let (conn, opened_path) =
+            open_live_sqlite_read_only(&db_str, "sidecarless canonical read").expect("open");
+        assert_eq!(opened_path, db_str);
+        assert_eq!(
+            conn.engine(),
+            mcp_agent_mail_db::pool::GuardedReadOnlyEngine::Canonical,
+            "a family without a namespace pair is served by canonical SQLite"
+        );
+        assert!(
+            sqlite_conn_supports_required_reads(&conn, &["projects"], &[("projects", "slug")])
+                .expect("schema probe"),
+            "the generic schema probe must read table and column metadata through canonical SQLite"
+        );
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS count FROM projects", &[])
+            .expect("count projects");
+        assert_eq!(rows[0].get_named::<i64>("count").expect("count"), 1);
+        drop(conn);
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use", "-wal", "-shm"] {
+            assert!(
+                !sqlite_sidecar_path(&db_path, suffix).exists(),
+                "a canonical read-only open must not create {suffix} beside the family"
+            );
+        }
     }
 
     #[test]
@@ -84536,7 +84644,7 @@ pub struct CheckInboxDirectConfig {
 }
 
 fn resolve_agent_id_for_inbox_check(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
     project_id: i64,
     agent_name: &str,
 ) -> CliResult<i64> {
@@ -88547,7 +88655,9 @@ fn search_index_has_content(index_root: &std::path::Path) -> bool {
         .any(|entry| entry.file_type().is_file())
 }
 
-fn query_existing_search_fts_triggers(conn: &mcp_agent_mail_db::DbConn) -> CliResult<Vec<String>> {
+fn query_existing_search_fts_triggers(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+) -> CliResult<Vec<String>> {
     let sql = "\
         SELECT name \
           FROM sqlite_master \
