@@ -90,6 +90,30 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   shipped CLI surface the way they had (8 documented doctor verbs of 28,
   robot counted as 16/17/18, 5 themes of 42).
 
+- **`am doctor vacuum` — supported in-DB reclaim for orphaned pages (GH#289).**
+  An archive reconstruct could leave the promoted database with a majority of
+  its pages orphaned (`Page N: never used`, `freelist_count=0`) — pure
+  space-accounting waste with no supported way to reclaim it, so a successful
+  recovery ended in a permanently unhealthy-looking mailbox. The new verb runs
+  the same supervised-owner protocol as `repair` (drain first, `--take-ownership`
+  for provably dead owners, `--allow-live-owner` escape hatch), VACUUMs and
+  ANALYZEs the mailbox in place, and reports before/after page counts and the
+  typed integrity class. `--dry-run` previews read-only (allowed while a live
+  owner holds the mailbox); structural damage refuses the vacuum and routes to
+  `reconstruct` instead.
+
+- **Typed integrity classes in doctor health/triage (GH#286).** `am doctor
+  health` and `triage` reported one identical P0 "needs reconstruct" verdict
+  for a database with only leaked/orphaned pages (every b-tree and index
+  intact, every row readable) and for genuine structural damage, so alert
+  rules were either permanently noisy or blind. Integrity-check failures now
+  classify as `leaked_pages_only` / `index_only` / `structural` (with
+  `leaked_pages`, `structural_errors`, and `first_structural_error` fields on
+  the triage finding). Leaked-pages-only reports as a distinct **degraded**
+  P2 finding (`live-mailbox-leaked-pages`) recommending `am doctor vacuum`,
+  and `am doctor health` exits 0 for it; structural damage keeps the P0
+  reconstruct verdict, now annotated with the class counts.
+
 ### Fixed
 
 - **`am doctor` reads a resting WAL family without touching it (br-s9d8a).**
@@ -326,32 +350,6 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   lexical tier only. VISION.md carries dated reality notes for the two
   claims the code contradicts (C SQLite is statically bundled for
   verification cross-checks; tool-prose parity is Rust-owned, not gated).
-
-- **`am doctor vacuum` — supported in-DB reclaim for orphaned pages (GH#289).**
-  An archive reconstruct could leave the promoted database with a majority of
-  its pages orphaned (`Page N: never used`, `freelist_count=0`) — pure
-  space-accounting waste with no supported way to reclaim it, so a successful
-  recovery ended in a permanently unhealthy-looking mailbox. The new verb runs
-  the same supervised-owner protocol as `repair` (drain first, `--take-ownership`
-  for provably dead owners, `--allow-live-owner` escape hatch), VACUUMs and
-  ANALYZEs the mailbox in place, and reports before/after page counts and the
-  typed integrity class. `--dry-run` previews read-only (allowed while a live
-  owner holds the mailbox); structural damage refuses the vacuum and routes to
-  `reconstruct` instead.
-
-- **Typed integrity classes in doctor health/triage (GH#286).** `am doctor
-  health` and `triage` reported one identical P0 "needs reconstruct" verdict
-  for a database with only leaked/orphaned pages (every b-tree and index
-  intact, every row readable) and for genuine structural damage, so alert
-  rules were either permanently noisy or blind. Integrity-check failures now
-  classify as `leaked_pages_only` / `index_only` / `structural` (with
-  `leaked_pages`, `structural_errors`, and `first_structural_error` fields on
-  the triage finding). Leaked-pages-only reports as a distinct **degraded**
-  P2 finding (`live-mailbox-leaked-pages`) recommending `am doctor vacuum`,
-  and `am doctor health` exits 0 for it; structural damage keeps the P0
-  reconstruct verdict, now annotated with the class counts.
-
-### Fixed
 
 - **Doctor advice consults the recovery breaker before recommending
   reconstruct (GH#287).** `triage` recommended `am doctor reconstruct
