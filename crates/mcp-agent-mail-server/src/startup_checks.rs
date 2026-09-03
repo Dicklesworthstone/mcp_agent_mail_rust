@@ -3883,8 +3883,14 @@ mod tests {
     fn run_http_startup_preflight_probes_omits_port_check() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let port = listener.local_addr().expect("listener addr").port();
+        // Private mailbox paths: the probes really run, and the default
+        // relative database/storage paths are shared with every other test
+        // in this binary that also leaves them at their defaults.
+        let dir = tempfile::tempdir().expect("tempdir");
         let mut config = default_config();
         config.http_port = port;
+        config.database_url = format!("sqlite:///{}", dir.path().join("storage.sqlite3").display());
+        config.storage_root = dir.path().join("storage");
 
         let report = run_http_startup_preflight_probes(&config);
         assert!(
