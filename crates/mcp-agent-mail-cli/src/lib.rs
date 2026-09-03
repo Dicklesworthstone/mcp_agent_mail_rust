@@ -50165,12 +50165,27 @@ http_headers = { Authorization = "Bearer secret" }
             "live-db",
             "live database should remain untouched when staged backup validation fails"
         );
+        // A rejected stage is preserved under a `reconstruct-failed` (cli) or
+        // `.cleanup-quarantine-rejected-` (pool) name rather than deleted
+        // (doctor never deletes); no active staging name may remain.
+        let preserved = |name: &str| {
+            name.contains("reconstruct-failed") || name.contains("cleanup-quarantine-rejected")
+        };
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
         assert!(
-            std::fs::read_dir(dir.path())
-                .expect("read dir")
-                .flatten()
-                .all(|entry| !entry.file_name().to_string_lossy().contains(".restore-")),
-            "staged restore artifacts should be cleaned up after failure"
+            names
+                .iter()
+                .filter(|name| !preserved(name))
+                .all(|name| !name.contains(".restore-")),
+            "no active staged restore artifact may remain after failure: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| preserved(name)),
+            "the rejected stage must be preserved under a failed/quarantine name: {names:?}"
         );
     }
 

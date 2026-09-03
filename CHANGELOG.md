@@ -130,6 +130,16 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ### Fixed
 
+- **Backup restore lands again when a sidecar slot holds junk.** A directory,
+  device, FIFO, or symlink squatting in the live family's `-wal`, `-shm`,
+  `-journal`, or namespace slot made `am doctor restore` (and every other
+  recovery promotion) fail with "source is missing or its SQLite family
+  contains a non-regular object": the recovery receipt stages the source
+  generation before promotion and is deliberately fail-closed on a
+  non-regular family member. Promotion now retires such objects by rename
+  (the usual `<sidecar>.corrupt-<timestamp>` quarantine name, never deleted)
+  before the receipt looks, while regular sidecars stay in place for the
+  receipt to account for.
 - **The pre-commit guard no longer honors a superseded foreign-generation
   reservation artifact (GH#299).** After a mailbox rebuild the archive can hold
   `id-<id>-g<old>.json` with `released_ts: null` from the previous database

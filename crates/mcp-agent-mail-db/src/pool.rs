@@ -13637,6 +13637,14 @@ where
             )),
         ));
     }
+    // A directory, device, FIFO, or symlink in a sidecar slot is never part of
+    // a SQLite generation. The receipt below stages the source family to
+    // fingerprint the generation being replaced and is deliberately
+    // fail-closed on a non-regular family member, so retire such objects
+    // (by rename, never unlink) before it looks; a regular sidecar stays,
+    // since it may carry committed frames the receipt must account for.
+    quarantine_non_regular_sidecar_objects(primary_path, timestamp)
+        .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
     let prepared = crate::forensics::prepare_recovery_receipt(
         storage_root,
         primary_path,
@@ -13898,6 +13906,37 @@ fn quarantine_sidecar_with_label(
 #[allow(clippy::result_large_err)]
 fn quarantine_sidecar(primary_path: &Path, suffix: &str, timestamp: &str) -> Result<(), SqlError> {
     quarantine_sidecar_with_label(primary_path, suffix, "corrupt", timestamp)
+}
+
+/// Retire (by rename) every non-regular object occupying one of the
+/// primary's sidecar slots: a directory, device, FIFO, or symlink there
+/// cannot belong to a SQLite generation, and the recovery receipt's source
+/// staging refuses the family while one is present. Regular sidecars are
+/// left in place.
+#[allow(clippy::result_large_err)]
+fn quarantine_non_regular_sidecar_objects(
+    primary_path: &Path,
+    timestamp: &str,
+) -> Result<(), SqlError> {
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .iter()
+        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+    {
+        let sidecar = sqlite_sidecar_path(primary_path, suffix);
+        let non_regular = std::fs::symlink_metadata(&sidecar)
+            .is_ok_and(|metadata| !metadata.file_type().is_file());
+        if !non_regular {
+            continue;
+        }
+        tracing::warn!(
+            path = %sidecar.display(),
+            "retiring a non-regular object from a SQLite sidecar slot before recovery promotion"
+        );
+        // Same `.corrupt-<timestamp>` convention as every other retired
+        // sidecar, so operators and doctor scans see one naming scheme.
+        quarantine_sidecar(primary_path, suffix, timestamp)?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]
@@ -20413,15 +20452,28 @@ mod tests {
             b"primary-wal-cert-witness",
             "primary WAL certificate must remain byte-identical when the replacement is rejected"
         );
-        let restoring_artifacts = std::fs::read_dir(dir.path())
+        // A rejected stage is quarantined under a `.cleanup-quarantine-rejected-`
+        // name rather than deleted; no active staging name may remain.
+        let names = std::fs::read_dir(dir.path())
             .unwrap()
             .flatten()
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.contains(".restoring-"))
+            .collect::<Vec<_>>();
+        let active_staging = names
+            .iter()
+            .filter(|name| {
+                name.contains(".restoring-") && !name.contains("cleanup-quarantine-rejected")
+            })
             .collect::<Vec<_>>();
         assert!(
-            restoring_artifacts.is_empty(),
-            "staged restore artifacts should be cleaned up after failure: {restoring_artifacts:?}"
+            active_staging.is_empty(),
+            "no active staged restore artifact may remain after failure: {active_staging:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.contains("cleanup-quarantine-rejected")),
+            "the rejected stage must be preserved under a quarantine name: {names:?}"
         );
         assert!(
             std::fs::read_dir(dir.path())
@@ -24061,6 +24113,49 @@ mod tests {
         assert!(
             take_last_unhealthy_reason(&ok_path).is_none(),
             "a healthy probe leaves no reason"
+        );
+    }
+
+    /// A directory squatting in the `-wal` slot is not part of any SQLite
+    /// generation. Promotion retires it before the recovery receipt stages the
+    /// source family (which refuses non-regular members), so a validated
+    /// candidate still lands and the directory is preserved under a
+    /// quarantine name.
+    #[test]
+    fn promotion_retires_a_directory_in_the_wal_slot_before_the_receipt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("storage root");
+        let primary = dir.path().join("storage.sqlite3");
+        let candidate = dir
+            .path()
+            .join("storage.sqlite3.restoring-20260903_000000_000");
+        write_marker_db(&primary, "live-db");
+        write_marker_db(&candidate, "backup-db");
+        let wal_slot = sqlite_sidecar_path(&primary, "-wal");
+        if wal_slot.exists() {
+            std::fs::remove_file(&wal_slot).expect("clear auto-created wal");
+        }
+        std::fs::create_dir(&wal_slot).expect("directory in the wal slot");
+
+        promote_recovery_candidate(&primary, &candidate, &storage_root)
+            .expect("promotion retires the non-regular sidecar and lands the candidate");
+
+        assert_eq!(sqlite_marker_value(&primary).as_deref(), Some("backup-db"));
+        assert!(
+            std::fs::symlink_metadata(&wal_slot)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "the directory must be gone from the wal slot"
+        );
+        let retired: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("-wal.corrupt-"))
+            .collect();
+        assert!(
+            retired.iter().any(|name| dir.path().join(name).is_dir()),
+            "the directory must be preserved under the retired-sidecar quarantine name: {retired:?}"
         );
     }
 
