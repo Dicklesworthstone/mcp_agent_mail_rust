@@ -424,6 +424,44 @@ pub fn init_schema_sql_base() -> String {
     base.to_string()
 }
 
+/// Base-DDL index statements that depend on a column a later migration adds.
+///
+/// `messages.topic` arrives with v27 and `agents.retired_at` with v28.
+/// [`schema_migrations`] defers these ids behind their column migrations; an
+/// init path that executes the base DDL as one blob before migrations must
+/// skip them the same way, or a pre-v27/v28 database fails with
+/// "no such column".
+pub const COLUMN_DEPENDENT_INDEX_MIGRATION_IDS: &[&str] = &[
+    "v1_create_index_idx_agents_project_active",
+    "v1_create_index_idx_messages_project_topic",
+];
+
+/// [`init_schema_sql_base`] without the column-dependent index statements.
+///
+/// For init paths that run the base DDL directly and then apply
+/// [`schema_migrations`]: the deferred index migrations recreate those
+/// indexes once their columns exist, so nothing is lost on a fresh database
+/// and a legacy database no longer fails base init.
+#[must_use]
+pub fn init_schema_sql_base_deferring_column_dependent_indexes() -> String {
+    let base = init_schema_sql_base();
+    let mut kept = Vec::new();
+    for chunk in base.split(';') {
+        let stmt = chunk.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        let deferred = derive_migration_id_and_description(stmt)
+            .is_some_and(|(id, _)| COLUMN_DEPENDENT_INDEX_MIGRATION_IDS.contains(&id.as_str()));
+        if !deferred {
+            kept.push(chunk.trim_end());
+        }
+    }
+    let mut sql = kept.join(";");
+    sql.push_str(";\n");
+    sql
+}
+
 /// Schema version for migrations
 pub const SCHEMA_VERSION: i32 = 1;
 
@@ -564,11 +602,7 @@ pub fn schema_migrations() -> Vec<Migration> {
         };
 
         let migration = Migration::new(id, desc, stmt.to_string(), String::new());
-        if matches!(
-            migration.id.as_str(),
-            "v1_create_index_idx_agents_project_active"
-                | "v1_create_index_idx_messages_project_topic"
-        ) {
+        if COLUMN_DEPENDENT_INDEX_MIGRATION_IDS.contains(&migration.id.as_str()) {
             deferred_column_dependent_indexes.push(migration);
         } else {
             migrations.push(migration);
@@ -4917,6 +4951,120 @@ mod tests {
                 "{column_migration_id} must precede {index_migration_id}"
             );
         }
+    }
+
+    #[test]
+    fn deferring_base_sql_initializes_a_legacy_canonical_db_before_migrations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.sqlite3");
+        let path = path.to_string_lossy().to_string();
+        let conn = crate::CanonicalDbConn::open_file(&path).expect("open canonical connection");
+        // The Python-era shapes of the two tables: every column the base DDL
+        // indexes except `messages.topic` (v27) and `agents.retired_at` (v28).
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, \
+             human_key TEXT NOT NULL, created_at DATETIME NOT NULL); \
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, \
+             name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, \
+             task_description TEXT NOT NULL, inception_ts DATETIME NOT NULL, \
+             last_active_ts DATETIME NOT NULL, \
+             attachments_policy TEXT NOT NULL DEFAULT 'auto', \
+             contact_policy TEXT NOT NULL DEFAULT 'auto', \
+             reaper_exempt INTEGER NOT NULL DEFAULT 0, registration_token TEXT); \
+             CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, \
+             sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, \
+             body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, \
+             created_ts DATETIME NOT NULL, attachments TEXT NOT NULL DEFAULT '[]');",
+        )
+        .expect("legacy tables");
+
+        // Planted negative: the whole base blob trips over the missing columns.
+        let full = conn
+            .execute_raw(&init_schema_sql_base())
+            .expect_err("full base DDL must fail on a pre-v27 schema")
+            .to_string();
+        assert!(full.contains("no such column"), "unexpected error: {full}");
+
+        let deferred = init_schema_sql_base_deferring_column_dependent_indexes();
+        assert!(!deferred.contains("idx_messages_project_topic"));
+        assert!(!deferred.contains("idx_agents_project_active"));
+        let statements = |sql: &str| sql.split(';').filter(|s| !s.trim().is_empty()).count();
+        assert_eq!(
+            statements(&init_schema_sql_base()),
+            statements(&deferred) + COLUMN_DEPENDENT_INDEX_MIGRATION_IDS.len(),
+            "only the column-dependent indexes may be dropped from the blob"
+        );
+        conn.execute_raw(&deferred)
+            .expect("deferring base DDL initializes a legacy database");
+
+        // The column migrations run first and the deferred index migrations follow.
+        for migration in schema_migrations_base() {
+            if let Err(error) = conn.execute_raw(&migration.up) {
+                let text = error.to_string().to_ascii_lowercase();
+                assert!(
+                    text.contains("already exists")
+                        || text.contains("duplicate column name")
+                        || text.contains("duplicate trigger name"),
+                    "migration {} failed: {text}",
+                    migration.id
+                );
+            }
+        }
+        let indexes = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type = 'index' \
+                 AND name IN ('idx_messages_project_topic', 'idx_agents_project_active')",
+                &[],
+            )
+            .expect("list indexes");
+        assert_eq!(
+            indexes.len(),
+            2,
+            "both deferred indexes exist after migrations"
+        );
+    }
+
+    /// Canonical `ALTER TABLE ... ADD COLUMN` splices the new column into the
+    /// stored `CREATE TABLE` text at an offset computed from the canonical
+    /// `CREATE TABLE <name>` prefix. FrankenSQLite 0.3.11 stores the statement
+    /// as written, `IF NOT EXISTS` included, so canonical SQLite corrupts the
+    /// text ("near NUL: syntax error") when it adds a column to a table the
+    /// runtime engine created that way. Real Python-era mailboxes were
+    /// written by C SQLite and carry the canonical prefix; this pins the
+    /// engine gap until FrankenSQLite normalizes the stored text (br-l1q6z
+    /// engine class).
+    #[test]
+    #[ignore = "FrankenSQLite 0.3.11 stores CREATE TABLE IF NOT EXISTS verbatim; canonical ADD COLUMN then fails"]
+    fn runtime_engine_created_table_text_is_alterable_by_canonical_sqlite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("engine-ddl.sqlite3");
+        let path = path.to_string_lossy().to_string();
+        let engine = crate::DbConn::open_file(&path).expect("open runtime engine connection");
+        engine
+            .execute_raw(
+                "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, \
+                 project_id INTEGER NOT NULL, attachments TEXT NOT NULL DEFAULT '[]')",
+            )
+            .expect("create table through the runtime engine");
+        drop(engine);
+
+        let conn = crate::CanonicalDbConn::open_file(&path).expect("open canonical connection");
+        let rows = conn
+            .query_sync(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+                &[],
+            )
+            .expect("read stored table text");
+        let stored: String = rows
+            .first()
+            .and_then(|row| row.get_named::<String>("sql").ok())
+            .expect("stored CREATE TABLE text");
+        assert!(
+            stored.starts_with("CREATE TABLE messages"),
+            "stored table text must use the canonical prefix, got: {stored}"
+        );
+        conn.execute_raw("ALTER TABLE messages ADD COLUMN topic TEXT COLLATE NOCASE")
+            .expect("canonical ADD COLUMN on a runtime-engine-created table");
     }
 
     #[test]

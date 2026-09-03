@@ -29526,6 +29526,13 @@ first body
     fn dashboard_open_connection_uses_best_effort_busy_timeout() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("dashboard-busy-timeout.db");
+        // The dashboard is an observer: it opens an existing mailbox and never
+        // creates one, so seed the file first.
+        let seed = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("seed dashboard db");
+        seed.execute_raw("CREATE TABLE seed(x)")
+            .expect("seed schema");
+        mcp_agent_mail_db::close_db_conn(seed, "seed dashboard db");
         let database_url = format!("sqlite:///{}", db_path.display());
         let conn = dashboard_open_connection(&database_url, dir.path()).expect("open");
 

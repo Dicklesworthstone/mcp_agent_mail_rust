@@ -10197,6 +10197,35 @@ fn sqlite_sidecar_occupancy(path: &Path) -> (bool, Option<u64>) {
 }
 
 pub(crate) fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
+    sqlite_backup_candidates_with(primary_path, sqlite_recovery_candidate_is_standalone)
+}
+
+/// Backup candidates a read-only salvage may draw from.
+///
+/// Restore promotes one main file, so [`sqlite_backup_candidates`] requires a
+/// standalone artifact. A salvage only *reads* the candidate, staging a
+/// non-standalone family (a backup the runtime engine wrote, with its WAL
+/// frames and namespace pair beside it) into a private copy first, so any
+/// candidate whose family members are regular files is usable.
+#[must_use]
+pub fn sqlite_salvage_read_candidates(primary_path: &Path) -> Vec<PathBuf> {
+    sqlite_backup_candidates_with(primary_path, sqlite_salvage_candidate_family_is_regular)
+}
+
+fn sqlite_salvage_candidate_family_is_regular(path: &Path) -> bool {
+    SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .iter()
+        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+        .all(|suffix| {
+            let sidecar = sqlite_sidecar_path(path, suffix);
+            match std::fs::symlink_metadata(&sidecar) {
+                Ok(metadata) => metadata.file_type().is_file(),
+                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            }
+        })
+}
+
+fn sqlite_backup_candidates_with(primary_path: &Path, eligible: fn(&Path) -> bool) -> Vec<PathBuf> {
     let mut candidates: Vec<(SqliteRecoveryCandidateName, SystemTime, PathBuf)> = Vec::new();
     let Some(file_name) = primary_path.file_name() else {
         return Vec::new();
@@ -10209,7 +10238,7 @@ pub(crate) fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
     };
 
     let bak = primary_path.with_file_name(os_string_with_suffix(file_name, ".bak"));
-    if is_real_file(&bak) && sqlite_recovery_candidate_is_standalone(&bak) {
+    if is_real_file(&bak) && eligible(&bak) {
         let modified = bak
             .metadata()
             .and_then(|meta| meta.modified())
@@ -10244,7 +10273,7 @@ pub(crate) fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
                 // main DB file, so either family could silently lose state.
                 continue;
             }
-            if !sqlite_recovery_candidate_is_standalone(&path) {
+            if !eligible(&path) {
                 continue;
             }
             let modified = entry
