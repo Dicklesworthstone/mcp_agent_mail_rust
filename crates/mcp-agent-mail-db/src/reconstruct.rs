@@ -6274,6 +6274,297 @@ fn extract_id_from_rows(rows: &[sqlmodel_core::Row]) -> Option<i64> {
     }
 }
 
+// ============================================================================
+// Bounded incremental apply of a small archive-ahead delta (GH#284)
+// ============================================================================
+//
+// When the Git archive is a few messages ahead of a canonically healthy
+// database, a full archive reconstruct (rebuild every project, agent, message
+// and reservation into a candidate, then promote it) is the wrong tool: it is
+// slow on a large mailbox, and its promotion guard can refuse for reasons that
+// have nothing to do with the delta (GH#271). This path ingests only the
+// archive messages whose canonical ids the database lacks, plus any project or
+// agent rows they need, through the runtime engine inside one write
+// transaction on the live database. It refuses (and leaves the database
+// untouched) whenever the delta is not the simple case: too many messages,
+// archive files that do not parse, or a canonical id already held by a
+// different message.
+
+/// What a bounded incremental apply did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArchiveDeltaApplyStats {
+    /// Canonical archive message ids the database lacked before the apply.
+    pub missing_message_ids: usize,
+    /// Messages inserted (always equal to `missing_message_ids` on success).
+    pub messages_applied: usize,
+    /// Archive project directories visited.
+    pub projects_visited: usize,
+    /// Archive files skipped as exact duplicates of a message already present.
+    pub duplicate_files_skipped: usize,
+}
+
+/// Outcome of [`apply_archive_ahead_delta`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchiveDeltaApplyOutcome {
+    /// The delta was applied and committed.
+    Applied(ArchiveDeltaApplyStats),
+    /// The delta is not the simple case; nothing was written. The caller
+    /// falls back to a full reconstruct.
+    NotApplicable(String),
+}
+
+/// Default upper bound on the number of missing messages the incremental
+/// path applies; larger deltas reconstruct. `AM_ARCHIVE_DELTA_APPLY_MAX_MESSAGES`
+/// overrides it and `0` disables the path.
+pub const DEFAULT_ARCHIVE_DELTA_APPLY_MAX_MESSAGES: usize = 64;
+
+#[must_use]
+pub fn archive_delta_apply_max_messages() -> usize {
+    mcp_agent_mail_core::config::process_env_value("AM_ARCHIVE_DELTA_APPLY_MAX_MESSAGES")
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_ARCHIVE_DELTA_APPLY_MAX_MESSAGES)
+}
+
+/// Apply the archive messages the database at `db_path` lacks, if the delta
+/// is small and unambiguous.
+///
+/// The caller must already have established that the database is healthy and
+/// that it holds the promotion barrier / mutation admission for the file; this
+/// function only writes through the runtime engine in one `BEGIN IMMEDIATE`
+/// transaction and rolls back on any doubt.
+///
+/// # Errors
+///
+/// Returns an error only for database failures (open, transaction, or query
+/// errors). A delta that must not be applied is reported as
+/// [`ArchiveDeltaApplyOutcome::NotApplicable`], not as an error.
+pub fn apply_archive_ahead_delta(
+    db_path: &Path,
+    storage_root: &Path,
+    max_messages: usize,
+) -> DbResult<ArchiveDeltaApplyOutcome> {
+    if max_messages == 0 {
+        return Ok(ArchiveDeltaApplyOutcome::NotApplicable(
+            "incremental apply disabled (AM_ARCHIVE_DELTA_APPLY_MAX_MESSAGES=0)".to_string(),
+        ));
+    }
+    let (archive_ids, archive_parse_errors) = scan_archive_message_ids(storage_root);
+    if archive_parse_errors > 0 {
+        return Ok(ArchiveDeltaApplyOutcome::NotApplicable(format!(
+            "{archive_parse_errors} archive message file(s) failed to parse; a partial delta must not be applied"
+        )));
+    }
+    let db_ids = collect_db_message_ids(db_path)
+        .map_err(|e| DbError::Sqlite(format!("incremental apply: collect db message ids: {e}")))?;
+    let missing: BTreeSet<i64> = archive_ids.difference(&db_ids).copied().collect();
+    if missing.is_empty() {
+        return Ok(ArchiveDeltaApplyOutcome::NotApplicable(
+            "the database already holds every canonical archive message id".to_string(),
+        ));
+    }
+    if missing.len() > max_messages {
+        return Ok(ArchiveDeltaApplyOutcome::NotApplicable(format!(
+            "{} archive messages are missing from the database, above the incremental bound of {max_messages}",
+            missing.len()
+        )));
+    }
+
+    let projects_dir = storage_root.join("projects");
+    let mut project_dirs: Vec<(String, PathBuf)> = Vec::new();
+    if is_real_directory(&projects_dir)
+        && let Ok(entries) = std::fs::read_dir(&projects_dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !is_real_directory(&path) {
+                continue;
+            }
+            let Some(slug) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            project_dirs.push((slug.to_string(), path));
+        }
+    }
+    project_dirs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let db_str = db_path.to_str().ok_or_else(|| {
+        DbError::Sqlite(format!(
+            "incremental apply refuses non-UTF-8 database path {}",
+            db_path.display()
+        ))
+    })?;
+    let conn = DbConn::open_file(db_str)
+        .map_err(|e| DbError::Sqlite(format!("incremental apply: open {db_str}: {e}")))?;
+    conn.execute_raw("PRAGMA busy_timeout=60000;")
+        .map_err(|e| DbError::Sqlite(format!("incremental apply: busy_timeout: {e}")))?;
+    conn.execute_raw("BEGIN IMMEDIATE;")
+        .map_err(|e| DbError::Sqlite(format!("incremental apply: begin transaction: {e}")))?;
+
+    let outcome = apply_delta_in_transaction(&conn, &project_dirs, &missing);
+    match outcome {
+        Ok(ArchiveDeltaApplyOutcome::Applied(stats)) => {
+            conn.execute_raw("COMMIT;")
+                .map_err(|e| DbError::Sqlite(format!("incremental apply: commit: {e}")))?;
+            Ok(ArchiveDeltaApplyOutcome::Applied(stats))
+        }
+        Ok(ArchiveDeltaApplyOutcome::NotApplicable(reason)) => {
+            let _ = conn.execute_raw("ROLLBACK;");
+            Ok(ArchiveDeltaApplyOutcome::NotApplicable(reason))
+        }
+        Err(error) => {
+            let _ = conn.execute_raw("ROLLBACK;");
+            Err(error)
+        }
+    }
+}
+
+fn apply_delta_in_transaction(
+    conn: &DbConn,
+    project_dirs: &[(String, PathBuf)],
+    missing: &BTreeSet<i64>,
+) -> DbResult<ArchiveDeltaApplyOutcome> {
+    let mut stats = ReconstructStats::default();
+    let mut agent_ids: HashMap<(i64, String), i64> = HashMap::new();
+    let mut deferred: Vec<DeferredCollisionMessage> = Vec::new();
+    let mut projects_visited = 0usize;
+    let mut candidate_files: Vec<(i64, PathBuf, i64, String)> = Vec::new();
+
+    for (slug, project_path) in project_dirs {
+        let messages_dir = project_path.join("messages");
+        let mut project_files = Vec::new();
+        collect_message_files_with_ids(&messages_dir, missing, &mut project_files)?;
+        if project_files.is_empty() {
+            continue;
+        }
+        projects_visited += 1;
+        let now = crate::now_micros();
+        let human_key = read_project_human_key(project_path, slug, &mut stats);
+        conn.execute_sync(
+            "INSERT OR IGNORE INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
+            &[
+                Value::Text(slug.clone()),
+                Value::Text(human_key),
+                Value::BigInt(now),
+            ],
+        )
+        .map_err(|e| DbError::Sqlite(format!("incremental apply: insert project {slug}: {e}")))?;
+        let pid = query_last_insert_or_existing_id(conn, "projects", "slug", slug)?;
+        let agents_dir = project_path.join("agents");
+        if is_real_directory(&agents_dir) {
+            discover_agents(conn, &agents_dir, pid, &mut agent_ids, &mut stats)?;
+        }
+        for (id, file) in project_files {
+            candidate_files.push((id, file, pid, slug.clone()));
+        }
+    }
+
+    let expected = missing.len();
+    let found: BTreeSet<i64> = candidate_files.iter().map(|(id, ..)| *id).collect();
+    if found.len() != expected {
+        return Ok(ArchiveDeltaApplyOutcome::NotApplicable(format!(
+            "only {} of the {expected} missing canonical ids map to a single archive file",
+            found.len()
+        )));
+    }
+    candidate_files.sort_by(|a, b| a.1.cmp(&b.1));
+    for (_, file_path, pid, slug) in &candidate_files {
+        parse_and_insert_message(
+            conn,
+            file_path,
+            *pid,
+            slug,
+            &mut agent_ids,
+            &mut stats,
+            Some(&mut deferred),
+        )?;
+    }
+    if !deferred.is_empty() {
+        return Ok(ArchiveDeltaApplyOutcome::NotApplicable(format!(
+            "{} archive message(s) carry a canonical id already held by a different live message; refusing an ambiguous partial apply",
+            deferred.len()
+        )));
+    }
+    if stats.parse_errors > 0 {
+        return Ok(ArchiveDeltaApplyOutcome::NotApplicable(format!(
+            "{} archive message file(s) failed to parse during the apply",
+            stats.parse_errors
+        )));
+    }
+    let mut applied = 0usize;
+    for id in missing {
+        let rows = conn
+            .query_sync(
+                "SELECT 1 AS present FROM messages WHERE id = ?",
+                &[Value::BigInt(*id)],
+            )
+            .map_err(|e| DbError::Sqlite(format!("incremental apply: verify id {id}: {e}")))?;
+        if !rows.is_empty() {
+            applied += 1;
+        }
+    }
+    if applied != expected {
+        return Ok(ArchiveDeltaApplyOutcome::NotApplicable(format!(
+            "only {applied} of {expected} missing messages were applied; refusing a partial result"
+        )));
+    }
+    Ok(ArchiveDeltaApplyOutcome::Applied(ArchiveDeltaApplyStats {
+        missing_message_ids: expected,
+        messages_applied: applied,
+        projects_visited,
+        duplicate_files_skipped: stats.duplicate_canonical_message_files,
+    }))
+}
+
+/// Every `messages/YYYY/MM/*.md` file whose frontmatter id is in `wanted`.
+fn collect_message_files_with_ids(
+    messages_dir: &Path,
+    wanted: &BTreeSet<i64>,
+    out: &mut Vec<(i64, PathBuf)>,
+) -> DbResult<()> {
+    if !is_real_directory(messages_dir) {
+        return Ok(());
+    }
+    let Ok(years) = std::fs::read_dir(messages_dir) else {
+        return Ok(());
+    };
+    for year in years.flatten() {
+        let year_path = year.path();
+        if !is_real_directory(&year_path) {
+            continue;
+        }
+        let Ok(months) = std::fs::read_dir(&year_path) else {
+            continue;
+        };
+        for month in months.flatten() {
+            let month_path = month.path();
+            if !is_real_directory(&month_path) {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(&month_path) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let file_path = file.path();
+                let Ok(file_type) = file.file_type() else {
+                    continue;
+                };
+                if !file_type.is_file()
+                    || file_type.is_symlink()
+                    || file_path.extension().is_none_or(|e| e != "md")
+                {
+                    continue;
+                }
+                if let Some(id) = scan_archive_message_id(&file_path)?
+                    && wanted.contains(&id)
+                {
+                    out.push((id, file_path));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

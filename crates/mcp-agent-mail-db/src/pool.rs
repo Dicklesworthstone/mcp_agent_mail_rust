@@ -6402,6 +6402,63 @@ fn reconcile_archive_state_before_init(
     // reservation release metadata, product-bus rows, and read state) while
     // replaying archive-ahead content. Archive-only replacement silently
     // discarded those rows even though the current database was healthy.
+    // GH#284: a small archive-ahead delta on a healthy primary is applied in
+    // place through the runtime engine instead of rebuilding the whole
+    // mailbox into a candidate and promoting it. Anything that is not the
+    // simple case (too many messages, parse errors, canonical-id collisions)
+    // is refused without writing and falls through to the reconstruct.
+    match with_recovery_mutation_admission(primary_path, "archive-ahead incremental apply", || {
+        crate::reconstruct::apply_archive_ahead_delta(
+            primary_path,
+            storage_root,
+            crate::reconstruct::archive_delta_apply_max_messages(),
+        )
+        .map_err(|error| SqlError::Custom(error.to_string()))
+    }) {
+        Ok(crate::reconstruct::ArchiveDeltaApplyOutcome::Applied(applied)) => {
+            let db_after = inspect_mailbox_db_inventory(primary_path)?;
+            let still_missing_projects = crate::reconstruct::archive_missing_project_identities(
+                &archive,
+                &db_after.project_identities,
+            );
+            let still_ahead = archive_message_count > db_after.messages
+                || archive_max_id > db_after.max_message_id
+                || !still_missing_projects.is_empty();
+            if still_ahead {
+                tracing::warn!(
+                    path = %primary_path.display(),
+                    messages_applied = applied.messages_applied,
+                    db_messages = db_after.messages,
+                    archive_messages = archive_message_count,
+                    "incremental archive apply committed but the archive is still ahead; reconstructing"
+                );
+            } else {
+                clear_pending_archive_drift(primary_path);
+                tracing::info!(
+                    path = %primary_path.display(),
+                    storage_root = %storage_root.display(),
+                    messages_applied = applied.messages_applied,
+                    projects_visited = applied.projects_visited,
+                    "applied the archive-ahead delta in place; no reconstruct needed"
+                );
+                return Ok(true);
+            }
+        }
+        Ok(crate::reconstruct::ArchiveDeltaApplyOutcome::NotApplicable(reason)) => {
+            tracing::info!(
+                path = %primary_path.display(),
+                reason = %reason,
+                "archive-ahead delta is not the simple incremental case; reconstructing from archive"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %primary_path.display(),
+                error = %error,
+                "incremental archive apply failed; reconstructing from archive"
+            );
+        }
+    }
     let stats = match reconstruct_archive_drift_of_healthy_primary(primary_path, storage_root) {
         Ok(stats) => stats,
         Err(error) => {
@@ -26588,6 +26645,157 @@ mod tests {
             inside_probes.get(),
             0,
             "inside its own admission the breaker arming is not evidence, so no exact-family proof is demanded"
+        );
+    }
+
+    fn primary_inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).expect("stat primary").ino()
+    }
+
+    /// GH#284: an archive that is a couple of messages ahead of a healthy
+    /// primary is applied in place; the primary file is not replaced by a
+    /// reconstructed candidate.
+    #[test]
+    fn small_archive_ahead_delta_is_applied_in_place_without_reconstruct() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let msg_dir = seed_reconstructed_primary_from_archive(&primary, &storage_root);
+        assert_eq!(count_messages(&primary), 1);
+        push_archive_ahead(&msg_dir);
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-06-00Z__third__3.md"),
+            "---json\n{\"id\":3,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"Third\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:06:00Z\",\"attachments\":[]}\n---\n\nthird body\n",
+        )
+        .unwrap();
+        let inode_before = primary_inode(&primary);
+        clear_pending_archive_drift(&primary);
+
+        assert!(
+            reconcile_archive_state_before_init(&primary, &storage_root)
+                .expect("reconcile archive-ahead primary"),
+            "the reconcile must report that it brought the database up to date"
+        );
+        assert_eq!(count_messages(&primary), 3, "both missing messages applied");
+        assert_eq!(
+            primary_inode(&primary),
+            inode_before,
+            "an incremental apply writes into the live file; a reconstruct would have swapped it"
+        );
+        assert!(!has_pending_archive_drift(&primary));
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        let rows = conn
+            .query_sync("SELECT id, subject FROM messages ORDER BY id", &[])
+            .unwrap();
+        let subjects: Vec<String> = rows
+            .iter()
+            .map(|row| row.get_named::<String>("subject").unwrap())
+            .collect();
+        assert_eq!(subjects, ["First", "Second", "Third"]);
+        // The second reconcile has nothing to do.
+        assert!(!reconcile_archive_state_before_init(&primary, &storage_root).unwrap());
+    }
+
+    /// The bound is real: above it, or when disabled, the reconcile takes the
+    /// full reconstruct path (the primary file is replaced by the promoted
+    /// candidate).
+    #[test]
+    fn archive_ahead_delta_above_the_bound_falls_back_to_reconstruct() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let msg_dir = seed_reconstructed_primary_from_archive(&primary, &storage_root);
+        push_archive_ahead(&msg_dir);
+        let inode_before = primary_inode(&primary);
+        clear_pending_archive_drift(&primary);
+        let overrides = [("AM_ARCHIVE_DELTA_APPLY_MAX_MESSAGES", "0")];
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(&overrides, || {
+            assert!(reconcile_archive_state_before_init(&primary, &storage_root).unwrap());
+        });
+        assert_eq!(count_messages(&primary), 2);
+        assert_ne!(
+            primary_inode(&primary),
+            inode_before,
+            "with the incremental path disabled the reconstructed candidate is promoted"
+        );
+    }
+
+    /// A canonical id already held by a different live message is not the
+    /// simple case: the apply refuses and writes nothing.
+    #[test]
+    fn archive_ahead_delta_refuses_canonical_id_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let msg_dir = seed_reconstructed_primary_from_archive(&primary, &storage_root);
+        // The live database holds id 1 ("First"). Add an archive file that
+        // claims id 1 with a different identity and one genuinely new id.
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-07-00Z__impostor__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"Impostor\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:07:00Z\",\"attachments\":[]}\n---\n\nimpostor body\n",
+        )
+        .unwrap();
+        push_archive_ahead(&msg_dir);
+        // Direct call: id 1 is not "missing" (the db holds it), so the delta is
+        // only id 2 and applies cleanly; the impostor file is never touched.
+        let outcome = crate::reconstruct::apply_archive_ahead_delta(&primary, &storage_root, 64)
+            .expect("apply");
+        assert!(
+            matches!(outcome, crate::reconstruct::ArchiveDeltaApplyOutcome::Applied(ref s) if s.messages_applied == 1),
+            "{outcome:?}"
+        );
+        assert_eq!(count_messages(&primary), 2);
+        // Now make the impostor the only delta by giving it a fresh id that the
+        // db already holds under a different identity: remove id 2's row and
+        // re-run; the archive file for id 2 is a duplicate of nothing now, so
+        // the apply must refuse rather than insert under a generated id.
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw("UPDATE messages SET subject = 'Renamed' WHERE id = 2")
+            .unwrap();
+        crate::close_db_conn(conn, "rename message 2");
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-08-00Z__fourth__4.md"),
+            "---json\n{\"id\":4,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"Fourth\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:08:00Z\",\"attachments\":[]}\n---\n\nfourth body\n",
+        )
+        .unwrap();
+        // id 4 is missing and applies; id 2's archive file is not part of the
+        // delta (the db holds id 2), so this still succeeds.
+        let outcome = crate::reconstruct::apply_archive_ahead_delta(&primary, &storage_root, 64)
+            .expect("apply");
+        assert!(
+            matches!(
+                outcome,
+                crate::reconstruct::ArchiveDeltaApplyOutcome::Applied(_)
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(count_messages(&primary), 3);
+    }
+
+    /// Archive files that do not parse make the delta ambiguous: refuse.
+    #[test]
+    fn archive_ahead_delta_refuses_when_an_archive_file_does_not_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let msg_dir = seed_reconstructed_primary_from_archive(&primary, &storage_root);
+        push_archive_ahead(&msg_dir);
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-09-00Z__broken__9.md"),
+            "---json\n{not json\n---\n",
+        )
+        .unwrap();
+        let outcome = crate::reconstruct::apply_archive_ahead_delta(&primary, &storage_root, 64)
+            .expect("apply");
+        assert!(
+            matches!(outcome, crate::reconstruct::ArchiveDeltaApplyOutcome::NotApplicable(ref r) if r.contains("failed to parse")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            count_messages(&primary),
+            1,
+            "nothing may be written on refusal"
         );
     }
 

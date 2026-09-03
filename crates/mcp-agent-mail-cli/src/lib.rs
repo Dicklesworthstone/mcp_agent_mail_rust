@@ -7600,6 +7600,50 @@ where
                     auto_reclaim_recovery_debris_after_heal(database_url, storage_root);
                     return Ok(());
                 }
+                // GH#284: a healthy live database that is only a few messages
+                // behind the archive is brought up to date in place through
+                // the runtime engine; the full reconstruct (and its promotion
+                // guard) stays for real damage or large deltas.
+                if matches!(
+                    mcp_agent_mail_db::pool::sqlite_file_is_healthy(&recovery_db_path),
+                    Ok(true)
+                ) {
+                    match mcp_agent_mail_db::apply_archive_ahead_delta(
+                        &recovery_db_path,
+                        storage_root,
+                        mcp_agent_mail_db::archive_delta_apply_max_messages(),
+                    ) {
+                        Ok(mcp_agent_mail_db::ArchiveDeltaApplyOutcome::Applied(applied))
+                            if matches!(
+                                startup_database_self_heal_action(database_url, storage_root),
+                                Ok(StartupDatabaseSelfHealAction::None(_))
+                            ) =>
+                        {
+                            output::info(&format!(
+                                "Startup applied {} archive message(s) to the healthy live database in place ({} project(s) visited); archive reconstruction skipped; continuing startup",
+                                applied.messages_applied, applied.projects_visited
+                            ));
+                            auto_reclaim_recovery_debris_after_heal(database_url, storage_root);
+                            return Ok(());
+                        }
+                        Ok(mcp_agent_mail_db::ArchiveDeltaApplyOutcome::Applied(applied)) => {
+                            output::warn(&format!(
+                                "Startup applied {} archive message(s) in place but the mailbox still needs recovery; reconstructing from archive",
+                                applied.messages_applied
+                            ));
+                        }
+                        Ok(mcp_agent_mail_db::ArchiveDeltaApplyOutcome::NotApplicable(reason)) => {
+                            output::info(&format!(
+                                "Archive delta is not the simple incremental case ({reason}); reconstructing from archive"
+                            ));
+                        }
+                        Err(error) => {
+                            output::warn(&format!(
+                                "Incremental archive apply failed ({error}); reconstructing from archive"
+                            ));
+                        }
+                    }
+                }
                 output::info(&format!(
                     "Startup detected mailbox database issues; reconstructing from archive ({detail})"
                 ));
@@ -57873,6 +57917,10 @@ startup_timeout_sec = 42
             &[
                 ("AM_RECOVERY_BREAKER_MAX_CONSECUTIVE_FAILURES", "1"),
                 ("AM_RECOVERY_BREAKER_COOLDOWN_SECS", "86400"),
+                // This scenario is about promotion refusal on a healthy primary;
+                // opt out of the GH#284 incremental apply, which would otherwise
+                // bring the one-message archive delta in without any reconstruct.
+                ("AM_ARCHIVE_DELTA_APPLY_MAX_MESSAGES", "0"),
             ],
             || {
                 let refuse_promotion = |_: &Path| {

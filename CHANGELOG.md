@@ -39,6 +39,20 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ### Added
 
+- **Small archive-ahead deltas are applied in place instead of rebuilding the
+  mailbox (GH#284).** When the Git archive is a few messages ahead of a
+  canonically healthy database, startup used to reconstruct the entire
+  mailbox into a candidate and promote it, which on a large mailbox was a
+  full rebuild for a one-row difference and could trip the promotion guard
+  for unrelated reasons (GH#271). The pool's archive-ahead reconcile and the
+  cli startup self-heal now first ingest only the missing archive messages
+  (with any project or agent rows they need) through the runtime engine in
+  one transaction on the live file, reusing the reconstruct's importers and
+  its canonical-id free-slot checks. The path refuses without writing when
+  the delta is not the simple case: more than
+  `AM_ARCHIVE_DELTA_APPLY_MAX_MESSAGES` missing messages (default 64, `0`
+  disables), an archive file that does not parse, or a canonical id already
+  held by a different live message; those cases still reconstruct.
 - **`resource://tooling/recent/{window_seconds}` returns real activity.** The
   server's tool dispatch wrapper now records every finished call (tool,
   `project_key`, `agent_name`, latency, ok/error/rejected) into a bounded
