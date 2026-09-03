@@ -48,6 +48,11 @@ const LIVENESS_PROBE_FORMAT: &str = "#{session_name}\t#{pane_pid}\t#{pane_curren
 const TARGET_FACTS_FORMAT: &str =
     "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{socket_path}";
 
+/// tmux format that reports only the bare pane id (`%97`) of a target pane.
+// A tmux format placeholder, not a Rust one.
+#[allow(clippy::literal_string_with_formatting_args)]
+const PANE_ID_FORMAT: &str = "#{pane_id}";
+
 /// Plain interactive shells. A pane whose foreground command is one of these
 /// (or empty) has no agent running in it — the agent exited back to its shell —
 /// so it fails liveness check (c). Runtime wrappers (`node`, `bun`, `python`,
@@ -1637,7 +1642,7 @@ fn composite_for_bare_pane(pane_id: &str) -> Option<String> {
 fn bare_for_composite_pane(pane_id: &str) -> Option<String> {
     let target = pane_target_for(pane_id)?;
     let output = tmux_command()
-        .args(["display-message", "-t", &target, "-p", "#{pane_id}"])
+        .args(["display-message", "-t", &target, "-p", PANE_ID_FORMAT])
         .output()
         .ok()?;
     if !output.status.success() {
