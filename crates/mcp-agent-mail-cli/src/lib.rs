@@ -13658,6 +13658,7 @@ where
             Err(e) => {
                 let msg = e.to_string();
                 if is_snapshot_conflict_cli_error(&e) || is_sqlite_recovery_error_message(&msg) {
+                    probe_error_was_inconclusive = true;
                 } else if mcp_agent_mail_db::is_lock_error(&msg) {
                     return Err(sqlite_doctor_busy_error(selected_path.as_path(), &msg));
                 } else {
@@ -33467,12 +33468,15 @@ fn handle_doctor_check_with_target(
                                 } else {
                                     "fail"
                                 };
-                                checks.push(serde_json::json!({
+                                let mut check = serde_json::json!({
                                     "check": "db_file_sanity",
                                     "status": status,
                                     "detail": sanity.detail,
-                                    "inconclusive": !sanity.healthy && sanity.inconclusive,
-                                }));
+                                });
+                                if !sanity.healthy && sanity.inconclusive {
+                                    check["inconclusive"] = serde_json::Value::Bool(true);
+                                }
+                                checks.push(check);
                             }
                             Err(e) => {
                                 db_file_sanity_failed = true;
