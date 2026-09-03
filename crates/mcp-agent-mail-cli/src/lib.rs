@@ -13159,10 +13159,15 @@ fn mailbox_activity_lock_cli_error(err: std::io::Error) -> CliError {
     }
 }
 
+/// The mailbox activity authority: the configured spelling anchored to the
+/// current directory, symlinks not followed. This is the same path the
+/// server's startup probes and the pool's frozen authority use, so CLI and
+/// daemon lock the same file, and a missing relative target is never
+/// replaced by an absolute decoy.
 fn resolve_mailbox_activity_sqlite_path(database_url: &str) -> CliResult<PathBuf> {
     let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(database_url)
         .map_err(|error| CliError::Other(format!("bad database URL: {error}")))?;
-    Ok(PathBuf::from(resolved.canonical_path))
+    Ok(resolved.absolute_alias_path)
 }
 
 fn acquire_cli_mailbox_activity_lock_for_storage_root(
@@ -14064,6 +14069,12 @@ fn recover_sqlite_file_with_storage_root(
     path: &Path,
     storage_root_override: Option<&Path>,
 ) -> CliResult<()> {
+    // Path policy runs before durable admission: a symlinked destination (or
+    // parent) is refused without consuming a recovery attempt or touching
+    // breaker authority beside the link target.
+    if path.exists() {
+        validate_real_file_target_path(path, "recovery destination")?;
+    }
     let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
     match mcp_agent_mail_db::pool::with_automatic_recovery_admission(
         path,
@@ -40814,7 +40825,12 @@ mod mail_server_cli_bridge_tests {
 
         assert_eq!(cli_path, PathBuf::from(&runtime_path.canonical_path));
         assert_eq!(
-            cli_path, relative_path,
+            cli_path,
+            std::env::current_dir().expect("cwd").join(&relative_path),
+            "the CLI activity authority is the relative target anchored to the current directory"
+        );
+        assert_ne!(
+            cli_path, absolute_db,
             "a missing relative runtime target must not be hijacked by an unrelated absolute decoy"
         );
         assert_eq!(std::fs::read(&absolute_db).unwrap(), decoy_bytes);
@@ -71298,9 +71314,14 @@ startup_timeout_sec = 42
 
         let resolved = resolve_auto_clear_db_blockers_sqlite_path(&config)
             .expect("resolve auto-clear sqlite path");
+        let anchored = std::env::current_dir().expect("cwd").join(&relative_path);
         assert_eq!(
-            resolved, relative_path,
+            resolved, anchored,
             "auto-clear must inspect the same missing relative authority that DbPool will initialize"
+        );
+        assert_ne!(
+            resolved, absolute_db,
+            "a missing relative target must not be hijacked by the absolute decoy"
         );
         assert_eq!(std::fs::read(&absolute_db).unwrap(), decoy_bytes);
     }
