@@ -11576,6 +11576,17 @@ fn strict_offline_canonical_target_precheck(
 /// primary bytes, breaker authority is unreadable, or the generation sidecar
 /// family is structurally suspect, the private exact-family copy must pass
 /// before the canonical read-only open is allowed.
+/// Whether an existing WAL sidecar is provably frameless: present, a regular
+/// readable file, and exactly 0 bytes.
+///
+/// GH#304: a 0-byte WAL has no 32-byte header, hence no committed frames, hence
+/// nothing that a WAL index (SHM) would be needed to interpret. It is the only
+/// WAL shape a missing SHM cannot make ambiguous. An unreadable/non-regular WAL
+/// pathname reports `wal_bytes == None` and is deliberately NOT frameless here.
+fn sqlite_wal_sidecar_is_frameless_empty(sidecars: &MailboxSidecarState) -> bool {
+    sidecars.wal_exists && sidecars.wal_bytes == Some(0)
+}
+
 #[allow(clippy::result_large_err)]
 fn preflight_guarded_offline_canonical_sqlite_family(
     sqlite_path: &Path,
@@ -11657,7 +11668,19 @@ where
     // engine-specific WAL certificate binding that can make a missing SHM
     // unambiguous. Refuse before the exact-family probe can materialize a new
     // SHM and accidentally turn a malformed source family into a green proof.
-    if sidecars.wal_exists && !sidecars.shm_exists {
+    //
+    // GH#304: a 0-BYTE WAL is the one unambiguous exception. It has no header
+    // and therefore no committed frames, so there is nothing a WAL index could
+    // reveal and nothing a missing SHM could be hiding — the main file alone is
+    // the complete database. Refusing it made `am doctor health` warn forever
+    // about a perfectly healthy ATC sidecar, because a clean start recreates
+    // exactly that shape (empty WAL, no SHM) while ATC writes are disabled.
+    // The open below treats this family as sidecar-free and opens it
+    // `immutable=1`, so no new WAL/SHM is materialized beside the source.
+    if sidecars.wal_exists
+        && !sidecars.shm_exists
+        && !sqlite_wal_sidecar_is_frameless_empty(&sidecars)
+    {
         return Err(SqlError::Custom(format!(
             "{context}: refusing canonical read-only SQLite open for {} because a WAL sidecar exists without its required SHM companion",
             sqlite_path.display()
@@ -12065,9 +12088,13 @@ pub fn open_guarded_read_only_canonical_sqlite_file(
     // that does carry a WAL keeps the read-only-SHM open so committed WAL
     // frames stay visible; when its SHM is missing or stale the open fails
     // eagerly below and callers fall back to a private staged copy.
-    let sidecar_free = ["-wal", "-shm"]
-        .iter()
-        .all(|suffix| !path_is_occupied(&sqlite_sidecar_path(&stable_path, suffix)));
+    // GH#304: a 0-byte WAL beside a missing SHM carries no committed frames,
+    // so it is treated exactly like the no-sidecar case: `immutable=1` ignores
+    // it and — crucially — keeps SQLite from creating a WAL/SHM pair beside the
+    // source just to satisfy a WAL-mode header on a read-only open.
+    let stable_sidecars = inspect_mailbox_sidecar_state(&stable_path);
+    let sidecar_free = !stable_sidecars.shm_exists
+        && (!stable_sidecars.wal_exists || sqlite_wal_sidecar_is_frameless_empty(&stable_sidecars));
     let conn = if sidecar_free {
         open_canonical_sqlite_file_immutable_with_lock_retry(sqlite_path_str).map_err(|error| {
             SqlError::Custom(format!(
@@ -31646,6 +31673,95 @@ mod tests {
             health.primary_size_bytes.saturating_add(health.size_bytes)
         );
         assert!(matches!(health.size_share_basis_points, Some(1..=9_999)));
+    }
+
+    #[test]
+    fn sqlite_wal_sidecar_is_frameless_empty_only_for_a_readable_zero_byte_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("frameless.sqlite3");
+        std::fs::write(&db_path, b"primary").expect("write primary");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+
+        assert!(
+            !sqlite_wal_sidecar_is_frameless_empty(&inspect_mailbox_sidecar_state(&db_path)),
+            "an absent WAL is not a frameless WAL"
+        );
+
+        std::fs::write(&wal_path, []).expect("write empty WAL");
+        assert!(sqlite_wal_sidecar_is_frameless_empty(
+            &inspect_mailbox_sidecar_state(&db_path)
+        ));
+
+        std::fs::write(&wal_path, [0u8; 32]).expect("write header-sized WAL");
+        assert!(
+            !sqlite_wal_sidecar_is_frameless_empty(&inspect_mailbox_sidecar_state(&db_path)),
+            "a 32-byte WAL header is not frameless-empty"
+        );
+    }
+
+    /// GH#304: a clean restart recreates a 0-byte `atc.sqlite3-wal` with no
+    /// SHM companion. That shape has no committed frames, so the read-only
+    /// health probe must inspect the standalone main file instead of refusing
+    /// forever — and it must not materialize a WAL/SHM pair while doing so.
+    #[test]
+    fn inspect_atc_sidecar_health_accepts_zero_byte_wal_without_shm() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let primary_str = primary.to_string_lossy().into_owned();
+        let sidecar = atc_sidecar_sqlite_path(&primary_str);
+        write_sidecar_fixture(&sidecar);
+
+        let sidecar_path = PathBuf::from(&sidecar);
+        let wal_path = sqlite_sidecar_path(&sidecar_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&sidecar_path, "-shm");
+        std::fs::write(&wal_path, []).expect("recreate the 0-byte WAL a clean start leaves");
+        assert!(!shm_path.exists(), "fixture must start without an SHM");
+
+        let health = inspect_atc_sidecar_health(&primary_str);
+
+        assert!(health.present);
+        assert_eq!(
+            health.quick_check_ok,
+            Some(true),
+            "a 0-byte WAL must not block the sidecar quick_check: {}",
+            health.detail
+        );
+        assert_eq!(health.experience_rows, Some(1));
+        assert_eq!(health.detail, "");
+        assert_eq!(
+            std::fs::metadata(&wal_path)
+                .expect("WAL still present")
+                .len(),
+            0,
+            "the read-only probe must leave the 0-byte WAL untouched"
+        );
+        assert!(
+            !shm_path.exists(),
+            "the read-only probe must not materialize an SHM beside the source"
+        );
+    }
+
+    /// The refusal itself is still load-bearing for a WAL that could carry
+    /// frames: only the provably frameless 0-byte shape is excused.
+    #[test]
+    fn guarded_read_only_open_still_refuses_a_framed_wal_without_shm() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("framed.sqlite3");
+        let conn =
+            crate::CanonicalDbConn::open_file(db_path.to_str().expect("utf-8 path")).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER);")
+            .expect("create table");
+        drop(conn);
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        std::fs::write(&wal_path, vec![0u8; 4096]).expect("write a WAL that could carry frames");
+
+        let error = open_guarded_read_only_canonical_sqlite_file(&db_path, "test")
+            .expect_err("a non-empty WAL without SHM stays ambiguous and must be refused");
+
+        assert!(
+            error.to_string().contains("required SHM companion"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
