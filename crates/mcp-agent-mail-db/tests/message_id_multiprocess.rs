@@ -41,16 +41,20 @@ fn wait_for_go(go_gate: &str, name: &str) {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
-
 fn run_worker(db_path: &str) {
     let name = std::env::var("MAGENTAROBIN_ID_WORKER_NAME").unwrap_or_else(|_| "A".to_string());
     let gate = std::env::var("MAGENTAROBIN_ID_WORKER_GATE").expect("worker gate path");
-    let storage_root =
-        std::path::PathBuf::from(std::env::var("MAGENTAROBIN_ID_WORKER_STORAGE").unwrap_or_default());
+    let storage_root = std::path::PathBuf::from(
+        std::env::var("MAGENTAROBIN_ID_WORKER_STORAGE").unwrap_or_default(),
+    );
     let go_gate = format!("{gate}.go");
     // The mailbox validates agent names as adjective+noun; pick two valid
     // deterministic identities.
-    let agent_name = if name == "A" { "CalmOtter" } else { "KeenHeron" };
+    let agent_name = if name == "A" {
+        "BlueLake"
+    } else {
+        "GreenStone"
+    };
 
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
@@ -240,7 +244,13 @@ fn run_parent() {
     // at the filename level, not just the integer level.
     let file_a = storage_root.join(format!("projects/p/messages/2026/07/{id_a:06}__elected.md"));
     let file_b = storage_root.join(format!("projects/p/messages/2026/07/{id_b:06}__elected.md"));
-    assert!(file_a.exists(), "worker A canonical file missing: {file_a:?}");
-    assert!(file_b.exists(), "worker B canonical file missing: {file_b:?}");
+    assert!(
+        file_a.exists(),
+        "worker A canonical file missing: {file_a:?}"
+    );
+    assert!(
+        file_b.exists(),
+        "worker B canonical file missing: {file_b:?}"
+    );
     assert_ne!(file_a, file_b, "canonical filenames collided");
 }
