@@ -1462,10 +1462,11 @@ pub enum E2eCommand {
         #[arg(long, short = 't')]
         tag: Vec<String>,
         /// Write the aggregated release-readiness scorecard
-        /// (`tests/artifacts/release_scorecard/<ts>/release_scorecard.json`)
+        /// (`tests/artifacts/release_scorecard/run-<id>/release_scorecard.json`)
         /// after the run: per-suite rows plus per-incident-class rows from
         /// the incident_corpus suite's scorecard, with a combined
-        /// release_ready verdict.
+        /// release_ready verdict. Exits nonzero when required evidence is
+        /// missing, incomplete, or belongs to another invocation.
         #[arg(long)]
         release_scorecard: bool,
         /// Output format: table, json, or toon (default: auto-detect).
@@ -3743,9 +3744,9 @@ fn doctor_command_is_read_only(action: &DoctorCommand) -> bool {
         // `Check`, `Locks`, and `Drain` are detector-only and MUST run while a
         // live owner holds the mailbox without entering init-time recovery or
         // archive reconciliation. Reporting the live state is their purpose.
-        DoctorCommand::Check { .. }
-        | DoctorCommand::Locks { .. }
-        | DoctorCommand::Drain { .. } => true,
+        DoctorCommand::Check { .. } | DoctorCommand::Locks { .. } | DoctorCommand::Drain { .. } => {
+            true
+        }
         // `am doctor fix --list` (with or without `--only <fm-id>`) is a
         // detector-only inventory surface: the dispatcher routes it to
         // `handle_fix_only_list` / `handle_fix_list_all`, which call
@@ -24682,6 +24683,7 @@ fn handle_e2e(action: E2eCommand) -> CliResult<()> {
                 artifact_dir: artifacts,
                 keep_tmp,
                 force_build,
+                release_scorecard,
                 timeout: Some(std::time::Duration::from_secs(timeout)),
                 ..Default::default()
             };
@@ -24717,10 +24719,16 @@ fn handle_e2e(action: E2eCommand) -> CliResult<()> {
             });
 
             if release_scorecard {
-                let path =
+                let scorecard =
                     e2e_runner::write_release_scorecard(&report, runner.registry(), &project_root)?;
                 // stderr keeps stdout parseable for --format json consumers.
-                eprintln!("Release scorecard: {}", path.display());
+                eprintln!("Release scorecard: {}", scorecard.path.display());
+                if !scorecard.release_ready {
+                    for problem in &scorecard.problems {
+                        eprintln!("Release evidence: {problem}");
+                    }
+                    return Err(CliError::ExitCode(1));
+                }
             }
 
             if report.success() {
@@ -65044,6 +65052,83 @@ startup_timeout_sec = 42
             }
             other => panic!("expected e2e run, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn e2e_release_scorecard_cli_rejects_green_process_without_receipt() {
+        // A real shell child succeeds. Only the release-evidence gate may
+        // reject it. The fixture is a CLI contract test, not mailbox evidence.
+        let root = tempfile::TempDir::new().unwrap().keep();
+        let project = root.join("mail");
+        let sibling = root.join("frankensearch-rel-0332");
+        for dir in [&project, &sibling] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("Cargo.lock"), "fixture lock\n").unwrap();
+            std::fs::write(dir.join("Cargo.toml"), "fixture manifest\n").unwrap();
+            std::fs::write(dir.join("rust-toolchain.toml"), "fixture toolchain\n").unwrap();
+            for args in [
+                vec!["init", "--initial-branch=main"],
+                vec!["add", "Cargo.lock", "Cargo.toml", "rust-toolchain.toml"],
+                vec![
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "-m",
+                    "Fixture source identity",
+                ],
+            ] {
+                let output = mcp_agent_mail_core::git_cmd::GitCmd::new(dir)
+                    .args(args)
+                    .run()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        let suites = project.join("tests/e2e");
+        std::fs::create_dir_all(&suites).unwrap();
+        std::fs::write(
+            suites.join("test_green.sh"),
+            "#!/bin/bash\necho 'Pass: 1  Fail: 0  Skip: 0'\n",
+        )
+        .unwrap();
+        for (extra, succeeds) in [
+            (vec!["green"], true),
+            (vec!["green", "--release-scorecard"], false),
+            (vec!["--include", "unselected"], false),
+            (vec!["unknown"], false),
+        ] {
+            let mut args = vec!["am", "e2e", "run", "--project", project.to_str().unwrap()];
+            args.extend(extra);
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Some(Commands::E2e { action }) = cli.command else {
+                panic!("e2e command")
+            };
+            let result = handle_e2e(action);
+            if succeeds {
+                result.unwrap();
+            } else {
+                assert!(matches!(result, Err(CliError::ExitCode(1))), "{result:?}");
+            }
+        }
+        let artifacts = project.join("tests/artifacts/release_scorecard");
+        let run = std::fs::read_dir(artifacts)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(run.join("release_scorecard.json")).unwrap())
+                .unwrap();
+        assert_eq!(value["run"]["suites_passed"], 1);
+        assert_eq!(value["run"]["suites_failed"], 0);
+        assert_eq!(value["release_ready"], false);
     }
 
     #[test]

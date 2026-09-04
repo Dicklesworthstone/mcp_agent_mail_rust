@@ -88,6 +88,10 @@ run_cargo_fixture() {
     local min="$2"
     shift 2
     e2e_run_cargo "$@" 2>&1 | tee "${log}" >/dev/null
+    local cargo_status=${PIPESTATUS[0]}
+    if [ "${cargo_status}" -ne 0 ]; then
+        return 1
+    fi
     local passed
     passed=$(grep -oP 'test result: ok\. \K\d+(?= passed)' "${log}" \
         | awk '{s+=$1} END {print s+0}')
@@ -338,6 +342,8 @@ fi
 if python3 - "${SCORECARD_ROWS}" "${MANIFEST}" "${SCORECARD_JSON}" \
     "${CARGO_MODE}" "${MIXED_TMPDIR}" <<'PY'
 import json
+import hashlib
+import os
 import sys
 
 rows_path, manifest_path, out_path, cargo_mode, mixed_tmpdir = sys.argv[1:6]
@@ -407,13 +413,37 @@ scorecard = {
     "summary": summary,
     "skipped_classes": sorted(r["id"] for r in rows if r["status"] == "skip"),
     "failed_classes": sorted(r["id"] for r in rows if r["status"] == "fail"),
-    "release_ready": summary["fail"] == 0 and not problems,
+    "release_ready": summary["total"] > 0 and summary["fail"] == 0 and summary["skip"] == 0 and not problems,
     "consistency_problems": problems,
 }
 
-with open(out_path, "w") as f:
+with open(out_path + ".pending", "x") as f:
     json.dump(scorecard, f, indent=2)
     f.write("\n")
+    f.flush()
+    os.fsync(f.fileno())
+os.link(out_path + ".pending", out_path)
+
+# The parent accepts only this terminal producer's exact bytes and invocation.
+# Keep the staged file: publication never overwrites or removes old evidence.
+release_run = os.environ.get("AM_E2E_RELEASE_RUN")
+if release_run:
+    with open(out_path, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    receipt = {
+        "schema_version": 1,
+        "run": json.loads(release_run),
+        "scorecard_path": os.path.realpath(out_path),
+        "scorecard_sha256": digest,
+    }
+    receipt_path = os.environ["AM_E2E_RELEASE_RECEIPT"]
+    with open(receipt_path + ".pending", "x") as f:
+        json.dump(receipt, f)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.link(receipt_path + ".pending", receipt_path)
+    print("AM_E2E_RELEASE_RECEIPT " + json.dumps(receipt), flush=True)
 
 width = max((len(r["id"]) for r in rows), default=10)
 for r in rows:

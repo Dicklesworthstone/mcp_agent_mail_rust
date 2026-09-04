@@ -172,7 +172,7 @@ else
 fi
 
 # Artifact directory for this run
-E2E_ARTIFACT_DIR="${E2E_PROJECT_ROOT}/tests/artifacts/${E2E_SUITE}/${E2E_TIMESTAMP}"
+E2E_ARTIFACT_DIR="${AM_E2E_ARTIFACT_DIR:-${E2E_PROJECT_ROOT}/tests/artifacts/${E2E_SUITE}/${E2E_TIMESTAMP}}"
 
 # Run timing (used for artifact bundle metadata/metrics)
 E2E_RUN_ENDED_AT=""

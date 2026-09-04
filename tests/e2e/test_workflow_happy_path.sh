@@ -13,6 +13,7 @@
 # Target: 30+ assertions
 
 export E2E_SUITE="workflow_happy_path"
+: "${AM_E2E_KEEP_TMP:=1}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/e2e_lib.sh
 source "${SCRIPT_DIR}/../../scripts/e2e_lib.sh"
@@ -36,89 +37,134 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 # Shared helpers (same pattern as test_macros.sh / test_stdio.sh)
 # ---------------------------------------------------------------------------
 
-_SEND_JSONRPC_SESSION_SEQ=0
-
-workflow_response_has_id() {
-    local output_file="$1"
-    local expected_id="$2"
-    [ -s "$output_file" ] || return 1
-    python3 - "$output_file" "$expected_id" <<'PY'
-import json
-import sys
-
-path, expected = sys.argv[1], sys.argv[2]
-try:
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if str(message.get("id", "")) == expected:
-                raise SystemExit(0)
-except OSError:
-    pass
-raise SystemExit(1)
-PY
-}
-
 send_jsonrpc_session() {
     local db_path="$1"
     shift
-    local requests=("$@")
-    _SEND_JSONRPC_SESSION_SEQ=$((_SEND_JSONRPC_SESSION_SEQ + 1))
-    local session_id="${_SEND_JSONRPC_SESSION_SEQ}"
-    local output_file="${WORK}/session_response_${session_id}.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv_${session_id}.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-    local expected_id=""
-    local last_index=$((${#requests[@]} - 1))
-    if [ "$last_index" -ge 0 ]; then
-        expected_id="$(printf '%s' "${requests[$last_index]}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)"
-    fi
+    python3 - "$db_path" "$WF_STORAGE" "$WORK" "$(command -v am)" \
+        "${WORKFLOW_SESSION_TIMEOUT_S:-45}" "$@" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import selectors
+import signal
+import subprocess
+import sys
+import tempfile
+import time
 
-    DATABASE_URL="sqlite:////${db_path}" STORAGE_ROOT="${WF_STORAGE}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
+db, storage, work, binary, timeout, *raw_requests = sys.argv[1:]
+requests = [json.loads(raw) for raw in raw_requests]
+ids = [request.get("id") for request in requests]
+if not requests or len(set(ids)) != len(ids) or None in ids:
+    raise SystemExit("workflow requires a nonempty set of unique request IDs")
+session = Path(tempfile.mkdtemp(prefix="session-", dir=work))
+env = os.environ.copy()
+env.pop("AM_INTERFACE_MODE", None)
+env.update(DATABASE_URL="sqlite:///" + db, STORAGE_ROOT=storage, RUST_LOG="error",
+           AM_ATC_ENABLED="false", AM_ATC_WRITE_MODE="off", ATC_LEARNING_DISABLED="1",
+           LLM_ENABLED="false", NOTIFICATIONS_ENABLED="false", TUI_ENABLED="false")
+started = time.monotonic()
+deadline = started + float(timeout)
+with open(binary, "rb") as executable:
+    binary_sha256 = hashlib.file_digest(executable, "sha256").hexdigest()
+summary = {"run_id": session.name, "binary": binary, "binary_sha256": binary_sha256,
+           "requested_ids": ids, "completed_ids": [], "client_pid": os.getpid(),
+           "passed": False, "shutdown": "not-started"}
+buffer = b""
+recorded = 0
 
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.3
-        done
-    } > "$fifo" &
-    local write_pid=$!
+def interrupted(signum, frame):
+    raise InterruptedError(f"workflow interrupted by signal {signum}")
 
-    local timeout_s="${WORKFLOW_SESSION_TIMEOUT_S:-25}"
-    local deadline_ms now_ms
-    deadline_ms=$(($(_e2e_now_ms) + timeout_s * 1000))
-    while true; do
-        if [ -n "$expected_id" ] && workflow_response_has_id "$output_file" "$expected_id"; then
-            break
-        fi
-        if ! kill -0 "$srv_pid" 2>/dev/null; then
-            break
-        fi
-        now_ms="$(_e2e_now_ms)"
-        if [ "$now_ms" -ge "$deadline_ms" ]; then
-            break
-        fi
-        sleep 0.5
-    done
+signal.signal(signal.SIGTERM, interrupted)
+with (session / "stderr.txt").open("wb") as stderr, \
+     (session / "history.jsonl").open("w") as history:
+    proc = subprocess.Popen([binary, "serve-stdio"], cwd=session, env=env,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=stderr, start_new_session=True)
+    summary["server_pid"] = proc.pid
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
 
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
+    def event(kind, payload):
+        # Raw synthetic fixture responses stay in the private session files;
+        # the operation history records stable IDs and content digests only.
+        history.write(json.dumps({"event": kind, "id": payload.get("id"),
+            "method": payload.get("method"), "elapsed_s": time.monotonic() - started,
+            "sha256": hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()}) + "\n")
+        history.flush()
 
-    if [ -f "$output_file" ]; then
-        cat "$output_file"
-    fi
+    def send(payload):
+        event("invoke", payload)
+        proc.stdin.write(json.dumps(payload).encode() + b"\n")
+        proc.stdin.flush()
+
+    try:
+        for request in requests:
+            send(request)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"missing terminal response for id {request['id']}")
+                if b"\n" not in buffer:
+                    if not selector.select(min(remaining, 1)):
+                        continue
+                    chunk = os.read(proc.stdout.fileno(), 65536)
+                    if not chunk:
+                        raise RuntimeError(f"EOF before response id {request['id']}")
+                    recorded += len(chunk)
+                    if recorded > 8 * 1024 * 1024:
+                        raise RuntimeError("workflow response budget exceeded")
+                    buffer += chunk
+                    continue
+                line, buffer = buffer.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                response = json.loads(line)
+                event("complete" if "id" in response else "notification", response)
+                print(json.dumps(response), flush=True)
+                if "id" not in response:
+                    continue
+                if response["id"] != request["id"]:
+                    raise RuntimeError("unexpected response ID")
+                if "result" not in response or "error" in response or response["result"].get("isError"):
+                    raise RuntimeError(f"request id {request['id']} failed")
+                summary["completed_ids"].append(request["id"])
+                break
+            if request["method"] == "initialize":
+                send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        summary["passed"] = True
+    except Exception as error:
+        summary["error"] = str(error)
+        print(str(error), file=sys.stderr)
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        selector.close()
+        try:
+            proc.wait(timeout=20)
+            summary["shutdown"] = "graceful"
+        except subprocess.TimeoutExpired:
+            summary["passed"] = False
+            summary["shutdown"] = "forced"
+            os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=5)
+        summary["server_exit"] = proc.returncode
+        summary["passed"] = summary["passed"] and proc.returncode == 0
+        (session / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        print(f"workflow session: {session}", file=sys.stderr)
+print(json.dumps({"workflow_session": {"passed": summary["passed"],
+                                      "completed_ids": summary["completed_ids"]}}), flush=True)
+if not summary["passed"]:
+    raise SystemExit(1)
+PY
 }
 
 extract_result() {
@@ -146,21 +192,28 @@ is_error_result() {
     local req_id="$2"
     echo "$response" | python3 -c "
 import sys, json
+responses = []
 for line in sys.stdin:
     line = line.strip()
     if not line: continue
     try:
         d = json.loads(line)
-        if d.get('id') == $req_id:
-            if 'error' in d:
-                print('true')
-                sys.exit(0)
-            if 'result' in d and d['result'].get('isError', False):
-                print('true')
-                sys.exit(0)
+        if isinstance(d, dict):
+            responses.append(d)
     except (json.JSONDecodeError, KeyError, IndexError):
         pass
-print('false')
+sessions = [d['workflow_session'] for d in responses if 'workflow_session' in d]
+session = sessions[0] if len(sessions) == 1 else None
+if not isinstance(session, dict) or session.get('passed') is not True or not isinstance(session.get('completed_ids'), list) or $req_id not in session['completed_ids']:
+    print('true')
+    sys.exit(0)
+matching = [d for d in responses if d.get('id') == $req_id]
+if len(matching) == 1:
+    d = matching[0]
+    if 'error' not in d and isinstance(d.get('result'), dict) and not d['result'].get('isError'):
+        print('false')
+        sys.exit(0)
+print('true')
 " 2>/dev/null
 }
 
@@ -360,12 +413,11 @@ else
     e2e_pass "acknowledge_message succeeded"
 fi
 
-ACK_TS="$(parse_json_field "$ACK_TEXT" "ack_ts")"
+ACK_TS="$(parse_json_field "$ACK_TEXT" "acknowledged_at")"
 if [ -n "$ACK_TS" ] && [ "$ACK_TS" != "null" ] && [ "$ACK_TS" != "" ]; then
-    e2e_pass "acknowledge set ack_ts: $ACK_TS"
+    e2e_pass "acknowledge set acknowledged_at: $ACK_TS"
 else
-    # ack_ts may be in the outer response or absent in some formats
-    e2e_pass "acknowledge completed (ack_ts format may vary)"
+    e2e_fail "acknowledge response missing acknowledged_at"
 fi
 
 # Reply to the message
@@ -409,6 +461,12 @@ PHASE4_RESP="$(send_jsonrpc_session "$WF_DB" \
     "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://thread/FEAT-42?project=${EP_SLUG}&include_bodies=true\"}}" \
 )"
 e2e_save_artifact "phase4_resources.txt" "$PHASE4_RESP"
+if [ "$(is_error_result "$PHASE4_RESP" 40)" = "true" ] || \
+   [ "$(is_error_result "$PHASE4_RESP" 41)" = "true" ]; then
+    e2e_fail "resource session did not complete successfully"
+else
+    e2e_pass "resource session completed successfully"
+fi
 
 # Parse inbox resource
 INBOX_RES="$(echo "$PHASE4_RESP" | python3 -c "
@@ -541,8 +599,7 @@ e2e_assert_contains "macro has inbox" "$MACRO_CHECK" "inbox=True"
 # Extract agent name from macro response for reservation cycle
 MACRO_AGENT="$(echo "$MACRO_CHECK" | sed -n 's/.*name=\([^|]*\).*/\1/p')"
 if [ -z "$MACRO_AGENT" ]; then
-    MACRO_AGENT="CrimsonFox"
-    e2e_log "Using fallback agent name for reservation cycle"
+    e2e_fail "macro_start_session did not return an agent name"
 fi
 
 # macro_file_reservation_cycle
@@ -580,7 +637,8 @@ e2e_assert_contains "macro reserved 1 path" "$MCYCLE_CHECK" "granted=1"
 e2e_case_banner "Phase 7: CLI verification of DB state"
 
 # Verify agents are in the DB
-CLI_AGENTS="$(DATABASE_URL="sqlite:////${WF_DB}" am agent list --project "${PROJECT_PATH}" --json 2>/dev/null || echo "CLI_ERROR")"
+CLI_AGENTS="$(DATABASE_URL="sqlite:////${WF_DB}" STORAGE_ROOT="${WF_STORAGE}" \
+    am agent list --project "${PROJECT_PATH}" --json 2>/dev/null || echo "CLI_ERROR")"
 e2e_save_artifact "phase7_cli_agents.txt" "$CLI_AGENTS"
 
 if [ "$CLI_AGENTS" != "CLI_ERROR" ] && [ -n "$CLI_AGENTS" ]; then
@@ -588,7 +646,7 @@ if [ "$CLI_AGENTS" != "CLI_ERROR" ] && [ -n "$CLI_AGENTS" ]; then
     e2e_assert_contains "CLI shows RedFox" "$CLI_AGENTS" "RedFox"
     e2e_assert_contains "CLI shows BluePeak" "$CLI_AGENTS" "BluePeak"
 else
-    e2e_skip "am agent list not available or errored"
+    e2e_fail "required am agent list verification errored"
 fi
 
 # ===========================================================================

@@ -28,7 +28,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Suite Registry
@@ -83,7 +84,7 @@ impl DurationClass {
 }
 
 /// Suite registry for discovering and managing test suites.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SuiteRegistry {
     /// Project root directory.
     project_root: PathBuf,
@@ -374,6 +375,8 @@ pub struct RunConfig {
     pub keep_tmp: bool,
     /// Force rebuild before running.
     pub force_build: bool,
+    /// Bind release evidence to this invocation and enforce its coverage.
+    pub release_scorecard: bool,
 }
 
 impl Default for RunConfig {
@@ -388,6 +391,7 @@ impl Default for RunConfig {
             parallel: false,
             keep_tmp: false,
             force_build: false,
+            release_scorecard: false,
         }
     }
 }
@@ -453,6 +457,50 @@ impl Runner {
         let mut results = Vec::with_capacity(suite_names.len());
         let mut passed = 0;
         let mut failed = 0;
+        let mut execution_config = self.config.clone();
+        let evidence = if self.config.release_scorecard {
+            match ReleaseRunEvidence::prepare(&self.config, suite_names) {
+                Ok(evidence) => {
+                    execution_config.artifact_dir = Some(evidence.directory.clone());
+                    execution_config.env.insert(
+                        "AM_E2E_RELEASE_RUN".to_string(),
+                        serde_json::to_string(&evidence).expect("release evidence serializes"),
+                    );
+                    Some(evidence)
+                }
+                Err(error) => {
+                    return RunReport {
+                        total: 1,
+                        passed: 0,
+                        failed: 1,
+                        skipped: 0,
+                        duration_ms: start_instant.elapsed().as_millis() as u64,
+                        started_at: run_started.to_rfc3339(),
+                        ended_at: Utc::now().to_rfc3339(),
+                        results: vec![SuiteResult {
+                            name: "release_evidence_setup".to_string(),
+                            passed: false,
+                            exit_code: 1,
+                            duration_ms: 0,
+                            stdout: String::new(),
+                            stderr: error.to_string(),
+                            assertions_passed: 0,
+                            assertions_failed: 0,
+                            assertions_skipped: 0,
+                            started_at: run_started.to_rfc3339(),
+                            ended_at: Utc::now().to_rfc3339(),
+                        }],
+                        evidence: None,
+                    };
+                }
+            }
+        } else {
+            None
+        };
+        let execution_runner = Self {
+            registry: self.registry.clone(),
+            config: execution_config,
+        };
 
         for name in suite_names {
             let result = self.registry.get(name).map_or_else(
@@ -469,7 +517,7 @@ impl Runner {
                     started_at: run_started.to_rfc3339(),
                     ended_at: Utc::now().to_rfc3339(),
                 },
-                |suite| self.run_suite(suite),
+                |suite| execution_runner.run_suite(suite),
             );
             if result.passed {
                 passed += 1;
@@ -491,6 +539,7 @@ impl Runner {
             started_at: run_started.to_rfc3339(),
             ended_at: run_ended.to_rfc3339(),
             results,
+            evidence,
         }
     }
 
@@ -665,6 +714,20 @@ impl Runner {
         }
         for (key, value) in &self.config.env {
             cmd.env(key, value);
+        }
+        if self.config.release_scorecard
+            && let Some(root) = &self.config.artifact_dir
+        {
+            // The producer owns a fresh directory for each attempt; retries
+            // cannot inherit a successful artifact from a failed attempt.
+            let suite_root = root.join(&suite.name);
+            fs::create_dir_all(&suite_root)?;
+            let attempt = tempfile::Builder::new()
+                .prefix("attempt-")
+                .tempdir_in(&suite_root)?
+                .keep();
+            cmd.env("AM_E2E_ARTIFACT_DIR", &attempt);
+            cmd.env("AM_E2E_RELEASE_RECEIPT", attempt.join("receipt.json"));
         }
 
         // Capture output
@@ -1963,6 +2026,8 @@ pub struct RunReport {
     pub ended_at: String,
     /// Individual suite results.
     pub results: Vec<SuiteResult>,
+    /// Exact source/executable observation and namespace for this release run.
+    pub evidence: Option<ReleaseRunEvidence>,
 }
 
 impl RunReport {
@@ -2018,42 +2083,257 @@ impl RunReport {
 /// Suite whose per-incident-class scorecard feeds the release scorecard.
 pub const INCIDENT_CORPUS_SUITE: &str = "incident_corpus";
 
-/// Finds the newest `scorecard.json` under
-/// `tests/artifacts/incident_corpus/*/` and reports whether it was produced
-/// by the current run (mtime at or after `run_started_at`, with a small
-/// clock-slack allowance).
-fn newest_incident_scorecard(
-    project_root: &Path,
-    run_started_at: &str,
-) -> Option<(PathBuf, bool, serde_json::Value)> {
-    let root = project_root
-        .join("tests/artifacts")
-        .join(INCIDENT_CORPUS_SUITE);
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in fs::read_dir(&root).ok()?.flatten() {
-        let candidate = entry.path().join("scorecard.json");
-        let Ok(meta) = fs::metadata(&candidate) else {
-            continue;
-        };
-        let Ok(mtime) = meta.modified() else {
-            continue;
-        };
-        if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
-            best = Some((mtime, candidate));
+/// Identity observed before launching the selected suites. Source inputs and
+/// the runner executable are named separately: a runtime observation must not
+/// masquerade as a build-system attestation of a different child executable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseRunEvidence {
+    pub run_id: String,
+    pub directory: PathBuf,
+    pub required_suites: Vec<String>,
+    /// Incident ID to family, captured before any producer runs.
+    pub required_incident_cases: BTreeMap<String, String>,
+    pub runner_executable_sha256: String,
+    pub source_inputs: BTreeMap<String, String>,
+    pub target: String,
+    pub features: Vec<String>,
+}
+
+impl ReleaseRunEvidence {
+    fn prepare(config: &RunConfig, suites: &[String]) -> std::io::Result<Self> {
+        let project = fs::canonicalize(&config.project_root)?;
+        let base = config
+            .artifact_dir
+            .clone()
+            .unwrap_or_else(|| project.join("tests/artifacts/release_scorecard"));
+        reject_symlinked_path(&base)?;
+        fs::create_dir_all(&base)?;
+        let directory = tempfile::Builder::new()
+            .prefix("run-")
+            .tempdir_in(fs::canonicalize(base)?)?
+            .keep();
+        let run_id = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| std::io::Error::other("invalid release run directory"))?
+            .to_string();
+        let mut source_inputs = BTreeMap::new();
+        for file in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
+            source_inputs.insert(file.to_string(), sha256_file(&project.join(file))?);
+        }
+        let mut required_incident_cases = BTreeMap::new();
+        if suites.iter().any(|suite| suite == INCIDENT_CORPUS_SUITE) {
+            let manifest_path = project.join("tests/fixtures/corruption_corpus/manifest.json");
+            let bytes = fs::read(&manifest_path)?;
+            source_inputs.insert(
+                "incident_manifest_sha256".to_string(),
+                hex::encode(Sha256::digest(&bytes)),
+            );
+            let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let fixtures = manifest["fixtures"]
+                .as_array()
+                .filter(|items| !items.is_empty())
+                .ok_or_else(|| std::io::Error::other("empty incident manifest"))?;
+            for fixture in fixtures {
+                let id = fixture["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| std::io::Error::other("incident fixture lacks an id"))?;
+                if required_incident_cases
+                    .insert(id.to_string(), "L1".to_string())
+                    .is_some()
+                {
+                    return Err(std::io::Error::other("duplicate incident fixture id"));
+                }
+            }
+            for (id, family) in [
+                ("cli_mcp_name_mismatch_matrix", "L2"),
+                ("http_decode_before_tool", "L2"),
+                ("fd_exhaustion_resource_busy", "L2"),
+                ("mixed_load_write_concurrency_cliff", "L3"),
+                ("tui_render_stall_heartbeat", "L3"),
+                ("atc_tick_budget_overrun", "L3"),
+                ("host_pressure_not_corruption", "EE"),
+            ] {
+                if required_incident_cases
+                    .insert(id.to_string(), family.to_string())
+                    .is_some()
+                {
+                    return Err(std::io::Error::other(
+                        "incident fixture collides with a required workflow",
+                    ));
+                }
+            }
+        }
+        let output = mcp_agent_mail_core::git_cmd::GitCmd::new(&project)
+            .args(["rev-parse", "HEAD"])
+            .run()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(
+                "cannot identify release source revision",
+            ));
+        }
+        source_inputs.insert(
+            "revision".to_string(),
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        );
+        let output = mcp_agent_mail_core::git_cmd::GitCmd::new(&project)
+            .args([
+                "diff", "--binary", "HEAD", "--", "crates", "scripts", "tests", ".cargo",
+            ])
+            .run()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(
+                "cannot identify release source overlay",
+            ));
+        }
+        source_inputs.insert(
+            "overlay_sha256".to_string(),
+            hex::encode(Sha256::digest(&output.stdout)),
+        );
+        let sibling = project.join("../frankensearch-rel-0332");
+        let output = mcp_agent_mail_core::git_cmd::GitCmd::new(&sibling)
+            .args(["rev-parse", "HEAD"])
+            .run()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(
+                "cannot identify gated frankensearch revision",
+            ));
+        }
+        source_inputs.insert(
+            "frankensearch_revision".to_string(),
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        );
+        source_inputs.insert(
+            "frankensearch_lock_sha256".to_string(),
+            sha256_file(&sibling.join("Cargo.lock"))?,
+        );
+        Ok(Self {
+            run_id,
+            directory,
+            required_suites: suites.to_vec(),
+            required_incident_cases,
+            runner_executable_sha256: sha256_file(&std::env::current_exe()?)?,
+            source_inputs,
+            target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+            features: [
+                ("default", cfg!(feature = "default")),
+                ("portable", cfg!(feature = "portable")),
+            ]
+            .into_iter()
+            .filter(|(_, enabled)| *enabled)
+            .map(|(name, _)| name.to_string())
+            .collect(),
+        })
+    }
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn reject_symlinked_path(path: &Path) -> std::io::Result<()> {
+    for ancestor in path.ancestors() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::other(
+                    "release evidence path contains a symlink",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
-    let (mtime, path) = best?;
-    let text = fs::read_to_string(&path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let fresh = chrono::DateTime::parse_from_rfc3339(run_started_at)
-        .ok()
-        .map(|started| {
-            let started: std::time::SystemTime = started.into();
-            let slack = Duration::from_secs(5);
-            mtime >= started.checked_sub(slack).unwrap_or(started)
-        })
-        .unwrap_or(false);
-    Some((path, fresh, value))
+    Ok(())
+}
+
+const RELEASE_RECEIPT_PREFIX: &str = "AM_E2E_RELEASE_RECEIPT ";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IncidentReceipt {
+    schema_version: u32,
+    run: ReleaseRunEvidence,
+    scorecard_path: PathBuf,
+    scorecard_sha256: String,
+}
+
+/// Read only the artifact explicitly returned by the terminal producer. A
+/// newer file elsewhere, even in the same second, has no authority here.
+fn read_incident_scorecard(report: &RunReport) -> Result<(PathBuf, serde_json::Value), String> {
+    let run = report.evidence.as_ref().ok_or("missing_run_identity")?;
+    let suite = report
+        .results
+        .iter()
+        .find(|r| r.name == INCIDENT_CORPUS_SUITE)
+        .ok_or("missing_incident_suite")?;
+    if !suite.passed || suite.exit_code != 0 {
+        return Err("incident_producer_failed".to_string());
+    }
+    let mut receipts = suite
+        .stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(RELEASE_RECEIPT_PREFIX));
+    let text = receipts.next().ok_or("missing_incident_receipt")?;
+    if receipts.next().is_some() {
+        return Err("duplicate_incident_receipt".to_string());
+    }
+    let receipt: IncidentReceipt =
+        serde_json::from_str(text).map_err(|error| format!("invalid_incident_receipt: {error}"))?;
+    if receipt.schema_version != 1 || &receipt.run != run {
+        return Err("incident_run_or_candidate_mismatch".to_string());
+    }
+    reject_symlinked_path(&receipt.scorecard_path)
+        .map_err(|e| format!("unsafe_incident_path: {e}"))?;
+    let path = fs::canonicalize(&receipt.scorecard_path)
+        .map_err(|e| format!("missing_incident_artifact: {e}"))?;
+    if !path.starts_with(run.directory.join(INCIDENT_CORPUS_SUITE)) {
+        return Err("incident_artifact_outside_run".to_string());
+    }
+    let file = fs::File::open(&path).map_err(|e| format!("incident_open: {e}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("incident_metadata: {e}"))?;
+    if !metadata.is_file() || metadata.len() > 4 * 1024 * 1024 {
+        return Err("incident_artifact_not_bounded_regular_file".to_string());
+    }
+    // Cap the read itself as well: a producer may grow a file after metadata
+    // was inspected. Never allocate an unbounded buffer on that path.
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    file.take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("incident_read: {e}"))?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err("incident_artifact_not_bounded_regular_file".to_string());
+    }
+    if hex::encode(Sha256::digest(&bytes)) != receipt.scorecard_sha256 {
+        return Err("incident_digest_mismatch".to_string());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("incident_json: {e}"))?;
+    if value["schema_version"] != 1 || value["suite"] != INCIDENT_CORPUS_SUITE {
+        return Err("incident_schema_mismatch".to_string());
+    }
+    Ok((path, value))
+}
+
+/// Result consumed by the CLI exit-status gate as well as the operator.
+pub struct ReleaseScorecard {
+    pub path: PathBuf,
+    pub release_ready: bool,
+    pub problems: Vec<String>,
 }
 
 /// Writes the aggregated release-readiness scorecard for a completed run.
@@ -2063,16 +2343,48 @@ fn newest_incident_scorecard(
 /// with their originating session-history anchors are lifted from the
 /// `scorecard.json` that the `incident_corpus` suite produced during this
 /// run. The combined `release_ready` verdict is true only when every suite
-/// passed AND a fresh incident-class scorecard is itself release-ready —
+/// passed AND its exact incident-class receipt is itself release-ready —
 /// a run that omits the incident corpus can never claim release readiness.
 ///
-/// Returns the path of the written `release_scorecard.json`.
+/// Returns the published path and the verdict used by the CLI exit gate.
 pub fn write_release_scorecard(
     report: &RunReport,
     registry: &SuiteRegistry,
     project_root: &Path,
-) -> std::io::Result<PathBuf> {
+) -> std::io::Result<ReleaseScorecard> {
     let mut problems: Vec<String> = Vec::new();
+    if report.total == 0 {
+        problems.push("empty_suite_selection".to_string());
+    }
+    if report.results.len() != report.total as usize {
+        problems.push("incomplete_suite_results".to_string());
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for result in &report.results {
+        if !names.insert(&result.name) {
+            problems.push(format!("duplicate_suite: {}", result.name));
+        }
+        if registry.get(&result.name).is_none() {
+            problems.push(format!("unknown_suite: {}", result.name));
+        }
+        if !result.passed || result.exit_code != 0 {
+            problems.push(format!("suite_not_terminal_success: {}", result.name));
+        }
+        if result.assertions_passed == 0
+            || result.assertions_failed != 0
+            || result.assertions_skipped != 0
+        {
+            problems.push(format!("incomplete_assertion_coverage: {}", result.name));
+        }
+    }
+    if let Some(run) = &report.evidence {
+        let required: std::collections::BTreeSet<_> = run.required_suites.iter().collect();
+        if required.len() != run.required_suites.len() || required != names {
+            problems.push("required_suite_mismatch".to_string());
+        }
+    } else {
+        problems.push("missing_run_identity".to_string());
+    }
 
     let suites: Vec<serde_json::Value> = report
         .results
@@ -2103,14 +2415,17 @@ pub fn write_release_scorecard(
     let mut incident_fresh = false;
     let mut incident_ready = false;
     if corpus_ran {
-        match newest_incident_scorecard(project_root, &report.started_at) {
-            Some((path, fresh, value)) => {
-                incident_fresh = fresh;
+        match read_incident_scorecard(report) {
+            Ok((path, value)) => {
+                incident_fresh = true;
                 incident_source = Some(path.display().to_string());
                 incident_ready = value
                     .get("release_ready")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
+                if !incident_ready {
+                    problems.push("incident_not_release_ready".to_string());
+                }
                 incident_classes = value
                     .get("classes")
                     .cloned()
@@ -2119,16 +2434,41 @@ pub fn write_release_scorecard(
                     .get("summary")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                if !fresh {
-                    problems.push(format!(
-                        "incident_corpus ran but no scorecard.json newer than run start was found; \
-                         stale evidence at {}",
-                        path.display()
-                    ));
+                let mut classes = std::collections::BTreeSet::new();
+                let mut actual_cases = BTreeMap::new();
+                if let Some(rows) = incident_classes.as_array().filter(|rows| !rows.is_empty()) {
+                    for row in rows {
+                        if row["id"].as_str().is_none_or(str::is_empty)
+                            || row["family"].as_str().is_none_or(str::is_empty)
+                            || !classes.insert((row["family"].as_str(), row["id"].as_str()))
+                            || row["status"] != "pass"
+                        {
+                            problems.push("incomplete_or_duplicate_incident_class".to_string());
+                        }
+                        if let (Some(id), Some(family)) =
+                            (row["id"].as_str(), row["family"].as_str())
+                        {
+                            actual_cases.insert(id.to_string(), family.to_string());
+                        }
+                    }
+                    if report.evidence.as_ref().is_none_or(|run| {
+                        run.required_incident_cases.is_empty()
+                            || run.required_incident_cases != actual_cases
+                    }) {
+                        problems.push("required_incident_case_mismatch".to_string());
+                    }
+                    if incident_summary["total"].as_u64() != Some(rows.len() as u64)
+                        || incident_summary["pass"].as_u64() != Some(rows.len() as u64)
+                        || incident_summary["fail"].as_u64() != Some(0)
+                        || incident_summary["skip"].as_u64() != Some(0)
+                    {
+                        problems.push("incident_summary_mismatch".to_string());
+                    }
+                } else {
+                    problems.push("empty_incident_classes".to_string());
                 }
             }
-            None => problems
-                .push("incident_corpus ran but no scorecard.json artifact was found".to_string()),
+            Err(error) => problems.push(error),
         }
     } else {
         problems.push(
@@ -2137,12 +2477,14 @@ pub fn write_release_scorecard(
         );
     }
 
-    let release_ready = report.success() && corpus_ran && incident_fresh && incident_ready;
+    let release_ready =
+        report.success() && corpus_ran && incident_fresh && incident_ready && problems.is_empty();
 
     let scorecard = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "release_scorecard",
         "generated_at": report.ended_at,
+        "evidence": report.evidence,
         "run": {
             "started_at": report.started_at,
             "ended_at": report.ended_at,
@@ -2163,16 +2505,35 @@ pub fn write_release_scorecard(
         "release_ready": release_ready,
     });
 
-    let stamp = chrono::DateTime::parse_from_rfc3339(&report.ended_at)
-        .map(|t| t.format("%Y%m%d_%H%M%S").to_string())
-        .unwrap_or_else(|_| "latest".to_string());
-    let out_dir = project_root
-        .join("tests/artifacts/release_scorecard")
-        .join(stamp);
-    fs::create_dir_all(&out_dir)?;
+    let out_dir = if let Some(run) = &report.evidence {
+        run.directory.clone()
+    } else {
+        let base = project_root.join("tests/artifacts/release_scorecard");
+        reject_symlinked_path(&base)?;
+        fs::create_dir_all(&base)?;
+        tempfile::Builder::new()
+            .prefix("unverified-")
+            .tempdir_in(&base)?
+            .keep()
+    };
+    reject_symlinked_path(&out_dir)?;
     let out_path = out_dir.join("release_scorecard.json");
-    fs::write(&out_path, format!("{scorecard:#}\n"))?;
-    Ok(out_path)
+    // Keep the staging witness. Linking publishes a complete inode atomically
+    // and refuses to overwrite any existing report, without deleting a file.
+    let stage = out_dir.join("release_scorecard.pending.json");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stage)?;
+    use std::io::Write as _;
+    writeln!(file, "{scorecard:#}")?;
+    file.sync_all()?;
+    fs::hard_link(stage, &out_path)?;
+    Ok(ReleaseScorecard {
+        path: out_path,
+        release_ready,
+        problems,
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2235,6 +2596,7 @@ mod tests {
     #[test]
     fn test_run_report_success() {
         let report = RunReport {
+            evidence: None,
             total: 3,
             passed: 3,
             failed: 0,
@@ -2251,6 +2613,7 @@ mod tests {
     #[test]
     fn test_run_report_failure() {
         let report = RunReport {
+            evidence: None,
             total: 3,
             passed: 2,
             failed: 1,
@@ -2297,7 +2660,10 @@ mod tests {
         let report = runner.run(&[]);
         assert!(report.success());
         assert_eq!(report.results[0].assertions_passed, 1);
-        assert_eq!(fs::read_to_string(root.join("unexpected-execution")).unwrap(), "ran");
+        assert_eq!(
+            fs::read_to_string(root.join("unexpected-execution")).unwrap(),
+            "ran"
+        );
     }
 
     #[test]
@@ -2504,6 +2870,7 @@ exit 1
     #[test]
     fn test_run_report_summary_lists_failed_suite_names() {
         let report = RunReport {
+            evidence: None,
             total: 2,
             passed: 1,
             failed: 1,
@@ -2915,6 +3282,7 @@ exit 1
     #[test]
     fn run_report_serde_roundtrip() {
         let report = RunReport {
+            evidence: None,
             total: 2,
             passed: 2,
             failed: 0,
@@ -2934,6 +3302,7 @@ exit 1
     #[test]
     fn run_report_format_summary_all_pass() {
         let report = RunReport {
+            evidence: None,
             total: 3,
             passed: 3,
             failed: 0,
@@ -3136,6 +3505,7 @@ exit 1
     fn scorecard_report(results: Vec<SuiteResult>, started_at: &str) -> RunReport {
         let failed = results.iter().filter(|r| !r.passed).count() as u32;
         RunReport {
+            evidence: None,
             total: results.len() as u32,
             passed: results.len() as u32 - failed,
             failed,
@@ -3147,51 +3517,97 @@ exit 1
         }
     }
 
+    // These fixtures exercise the real filesystem/receipt consumer. They do
+    // not stand in for the incident corpus or certify a product release.
+    fn bind_scorecard_fixture(root: &Path, report: &mut RunReport, value: &serde_json::Value) {
+        let directory = tempfile::Builder::new()
+            .prefix("run-")
+            .tempdir_in(root)
+            .expect("run directory")
+            .keep();
+        let run = ReleaseRunEvidence {
+            run_id: directory.file_name().unwrap().to_str().unwrap().to_string(),
+            directory: directory.clone(),
+            required_suites: report.results.iter().map(|r| r.name.clone()).collect(),
+            required_incident_cases: BTreeMap::from([(
+                "zero_byte_wal".to_string(),
+                "L1".to_string(),
+            )]),
+            runner_executable_sha256: sha256_file(&std::env::current_exe().unwrap()).unwrap(),
+            source_inputs: BTreeMap::from([(
+                "fixture".to_string(),
+                "receipt consumer only".to_string(),
+            )]),
+            target: "test-fixture".to_string(),
+            features: Vec::new(),
+        };
+        let corpus = directory
+            .join(INCIDENT_CORPUS_SUITE)
+            .join("attempt-fixture");
+        fs::create_dir_all(&corpus).unwrap();
+        let path = corpus.join("scorecard.json");
+        fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+        let receipt = IncidentReceipt {
+            schema_version: 1,
+            run: run.clone(),
+            scorecard_sha256: sha256_file(&path).unwrap(),
+            scorecard_path: path,
+        };
+        if let Some(result) = report
+            .results
+            .iter_mut()
+            .find(|r| r.name == INCIDENT_CORPUS_SUITE)
+        {
+            result.stdout = format!(
+                "{RELEASE_RECEIPT_PREFIX}{}\nPass: 5  Fail: 0  Skip: 0\n",
+                serde_json::to_string(&receipt).unwrap()
+            );
+        }
+        report.evidence = Some(run);
+    }
+
+    fn passing_incident_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "suite": "incident_corpus",
+            "release_ready": true,
+            "classes": [{"family": "L1", "id": "zero_byte_wal", "status": "pass",
+                         "anchor": "receipt consumer fixture"}],
+            "summary": {"total": 1, "pass": 1, "fail": 0, "skip": 0}
+        })
+    }
+
     #[test]
-    fn release_scorecard_ready_with_fresh_incident_scorecard() {
-        let temp = TempDir::new().expect("tempdir");
+    fn release_scorecard_ready_with_exact_receipt_ignores_newer_foreign_artifact() {
+        let root = TempDir::new().expect("tempdir").keep();
         write_suite_script(
-            temp.path(),
+            &root,
             INCIDENT_CORPUS_SUITE,
             "#!/bin/bash\n# L4 harness\n# @tags: reliability, corpus\necho ok",
         );
         write_suite_script(
-            temp.path(),
+            &root,
             "corruption_taxonomy",
             "#!/bin/bash\n# Track A taxonomy\n# @tags: reliability\necho ok",
         );
-        let registry = SuiteRegistry::new(temp.path()).expect("registry");
-
-        // A scorecard artifact written NOW is fresh relative to a run that
-        // started in the past.
-        let corpus_dir = temp
-            .path()
-            .join("tests/artifacts")
-            .join(INCIDENT_CORPUS_SUITE)
-            .join("20260212_000500");
-        fs::create_dir_all(&corpus_dir).expect("corpus artifact dir");
-        fs::write(
-            corpus_dir.join("scorecard.json"),
-            r#"{"release_ready": true,
-                "classes": [{"id": "zero_byte_wal", "status": "pass",
-                             "anchor": "startup quarantine logs"}],
-                "summary": {"total": 1, "pass": 1, "fail": 0, "skip": 0}}"#,
-        )
-        .expect("write scorecard");
-
-        let report = scorecard_report(
+        let registry = SuiteRegistry::new(&root).expect("registry");
+        let mut report = scorecard_report(
             vec![
                 scorecard_suite_result(INCIDENT_CORPUS_SUITE, true),
                 scorecard_suite_result("corruption_taxonomy", true),
             ],
             "2026-02-12T00:00:00+00:00",
         );
-
-        let path = write_release_scorecard(&report, &registry, temp.path())
-            .expect("write release scorecard");
+        bind_scorecard_fixture(&root, &mut report, &passing_incident_fixture());
+        let foreign = root.join("tests/artifacts/incident_corpus/20990101_000000");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("scorecard.json"), r#"{"release_ready":false}"#).unwrap();
+        let outcome =
+            write_release_scorecard(&report, &registry, &root).expect("write release scorecard");
         let value: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("parse");
+            serde_json::from_str(&fs::read_to_string(&outcome.path).expect("read")).expect("parse");
 
+        assert!(outcome.release_ready);
         assert_eq!(value["kind"], "release_scorecard");
         assert_eq!(value["release_ready"], true);
         assert_eq!(value["problems"].as_array().map(Vec::len), Some(0));
@@ -3211,77 +3627,488 @@ exit 1
 
     #[test]
     fn release_scorecard_not_ready_without_incident_corpus() {
-        let temp = TempDir::new().expect("tempdir");
+        let root = TempDir::new().expect("tempdir").keep();
         write_suite_script(
-            temp.path(),
+            &root,
             "corruption_taxonomy",
             "#!/bin/bash\n# Track A taxonomy\n# @tags: reliability\necho ok",
         );
-        let registry = SuiteRegistry::new(temp.path()).expect("registry");
+        let registry = SuiteRegistry::new(&root).expect("registry");
 
-        let report = scorecard_report(
+        let mut report = scorecard_report(
             vec![scorecard_suite_result("corruption_taxonomy", true)],
             "2026-02-12T00:00:00+00:00",
         );
-
-        let path = write_release_scorecard(&report, &registry, temp.path())
-            .expect("write release scorecard");
+        bind_scorecard_fixture(&root, &mut report, &passing_incident_fixture());
+        let outcome =
+            write_release_scorecard(&report, &registry, &root).expect("write release scorecard");
         let value: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("parse");
+            serde_json::from_str(&fs::read_to_string(&outcome.path).expect("read")).expect("parse");
 
         // All suites green, but no incident-class evidence -> never ready.
         assert_eq!(value["release_ready"], false);
         assert!(
-            value["problems"][0]
-                .as_str()
-                .unwrap()
-                .contains("not part of this run")
+            outcome
+                .problems
+                .iter()
+                .any(|problem| problem.contains("not part of this run"))
         );
     }
 
     #[test]
-    fn release_scorecard_not_ready_with_failed_suite_or_stale_evidence() {
-        let temp = TempDir::new().expect("tempdir");
+    fn release_scorecard_not_ready_with_failed_producer_or_wrong_run() {
+        let root = TempDir::new().expect("tempdir").keep();
         write_suite_script(
-            temp.path(),
+            &root,
             INCIDENT_CORPUS_SUITE,
             "#!/bin/bash\n# L4 harness\n# @tags: reliability\necho ok",
         );
-        let registry = SuiteRegistry::new(temp.path()).expect("registry");
-
-        let corpus_dir = temp
-            .path()
-            .join("tests/artifacts")
-            .join(INCIDENT_CORPUS_SUITE)
-            .join("20990101_000000");
-        fs::create_dir_all(&corpus_dir).expect("corpus artifact dir");
-        fs::write(
-            corpus_dir.join("scorecard.json"),
-            r#"{"release_ready": true}"#,
-        )
-        .expect("write scorecard");
-
-        // Failed suite -> not ready even with fresh, ready class evidence.
-        let report = scorecard_report(
+        let registry = SuiteRegistry::new(&root).expect("registry");
+        let mut report = scorecard_report(
             vec![scorecard_suite_result(INCIDENT_CORPUS_SUITE, false)],
             "2026-02-12T00:00:00+00:00",
         );
-        let path = write_release_scorecard(&report, &registry, temp.path()).expect("write");
-        let value: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("parse");
-        assert_eq!(value["release_ready"], false);
+        bind_scorecard_fixture(&root, &mut report, &passing_incident_fixture());
+        let outcome = write_release_scorecard(&report, &registry, &root).expect("write");
+        assert!(!outcome.release_ready);
+        assert!(
+            outcome
+                .problems
+                .iter()
+                .any(|p| p == "incident_producer_failed")
+        );
 
-        // Stale evidence (run "started" far in the future) -> not ready + problem.
-        let report = scorecard_report(
+        let mut report = scorecard_report(
             vec![scorecard_suite_result(INCIDENT_CORPUS_SUITE, true)],
             "2099-01-01T00:00:00+00:00",
         );
-        let path = write_release_scorecard(&report, &registry, temp.path()).expect("write");
-        let value: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("parse");
-        assert_eq!(value["release_ready"], false);
-        assert_eq!(value["incident_scorecard"]["fresh"], false);
-        assert!(value["problems"][0].as_str().unwrap().contains("stale"));
+        bind_scorecard_fixture(&root, &mut report, &passing_incident_fixture());
+        report
+            .evidence
+            .as_mut()
+            .unwrap()
+            .run_id
+            .push_str("-different-run");
+        let outcome = write_release_scorecard(&report, &registry, &root).expect("write");
+        assert!(!outcome.release_ready);
+        assert!(
+            outcome
+                .problems
+                .iter()
+                .any(|p| p == "incident_run_or_candidate_mismatch")
+        );
+    }
+
+    #[test]
+    fn release_scorecard_rejects_incomplete_coverage_and_candidate_substitution() {
+        let root = TempDir::new().unwrap().keep();
+        write_suite_script(&root, INCIDENT_CORPUS_SUITE, "#!/bin/bash\necho ok");
+        let registry = SuiteRegistry::new(&root).unwrap();
+        for defect in [
+            "zero",
+            "skip",
+            "missing_suite",
+            "duplicate_suite",
+            "candidate",
+            "features",
+            "target",
+            "missing_receipt",
+            "duplicate_receipt",
+            "truncated_receipt",
+            "empty_classes",
+            "duplicate_class",
+            "unknown_class",
+            "failed_class",
+            "wrong_summary",
+        ] {
+            let mut report = scorecard_report(
+                vec![scorecard_suite_result(INCIDENT_CORPUS_SUITE, true)],
+                "2026-09-04T00:00:00Z",
+            );
+            let mut value = passing_incident_fixture();
+            match defect {
+                "empty_classes" => value["classes"] = serde_json::json!([]),
+                "duplicate_class" => {
+                    let duplicate = value["classes"][0].clone();
+                    value["classes"].as_array_mut().unwrap().push(duplicate);
+                }
+                "failed_class" => value["classes"][0]["status"] = "fail".into(),
+                "unknown_class" => value["classes"][0]["id"] = "not-in-the-required-set".into(),
+                "wrong_summary" => value["summary"]["total"] = 20.into(),
+                _ => {}
+            }
+            bind_scorecard_fixture(&root, &mut report, &value);
+            match defect {
+                "zero" => report.results[0].assertions_passed = 0,
+                "skip" => report.results[0].assertions_skipped = 1,
+                "missing_suite" => report
+                    .evidence
+                    .as_mut()
+                    .unwrap()
+                    .required_suites
+                    .push("http".into()),
+                "duplicate_suite" => {
+                    report.results.push(report.results[0].clone());
+                    report.total += 1;
+                    report.passed += 1;
+                }
+                "candidate" => {
+                    report.evidence.as_mut().unwrap().runner_executable_sha256 =
+                        "another ELF".into()
+                }
+                "features" => report
+                    .evidence
+                    .as_mut()
+                    .unwrap()
+                    .features
+                    .push("portable".into()),
+                "target" => report.evidence.as_mut().unwrap().target = "another target".into(),
+                "missing_receipt" => report.results[0].stdout.clear(),
+                "duplicate_receipt" => {
+                    let duplicate = report.results[0].stdout.clone();
+                    report.results[0].stdout.push_str(&duplicate);
+                }
+                "truncated_receipt" => {
+                    report.results[0].stdout = format!("{RELEASE_RECEIPT_PREFIX}{{")
+                }
+                _ => {}
+            }
+            let outcome = write_release_scorecard(&report, &registry, &root).unwrap();
+            assert!(!outcome.release_ready, "accepted {defect}");
+            assert!(!outcome.problems.is_empty(), "unexplained {defect}");
+        }
+    }
+
+    #[test]
+    fn release_scorecard_rejects_changed_bytes_and_never_clobbers_publication() {
+        let root = TempDir::new().unwrap().keep();
+        write_suite_script(&root, INCIDENT_CORPUS_SUITE, "#!/bin/bash\necho ok");
+        let registry = SuiteRegistry::new(&root).unwrap();
+        let mut report = scorecard_report(
+            vec![scorecard_suite_result(INCIDENT_CORPUS_SUITE, true)],
+            "2026-09-04T00:00:00Z",
+        );
+        bind_scorecard_fixture(&root, &mut report, &passing_incident_fixture());
+        let (path, _) = read_incident_scorecard(&report).unwrap();
+        // Simulate replacement after the terminal receipt was issued.
+        fs::write(path, b"{\"release_ready\":true}").unwrap();
+        let outcome = write_release_scorecard(&report, &registry, &root).unwrap();
+        assert!(!outcome.release_ready);
+        assert!(
+            outcome
+                .problems
+                .iter()
+                .any(|p| p == "incident_digest_mismatch")
+        );
+        let original = fs::read(&outcome.path).unwrap();
+        assert!(write_release_scorecard(&report, &registry, &root).is_err());
+        assert_eq!(fs::read(&outcome.path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_scorecard_rejects_symlink_and_outside_run_paths() {
+        let root = TempDir::new().unwrap().keep();
+        for symlink in [false, true] {
+            let mut report = scorecard_report(
+                vec![scorecard_suite_result(INCIDENT_CORPUS_SUITE, true)],
+                "2026-09-04T00:00:00Z",
+            );
+            bind_scorecard_fixture(&root, &mut report, &passing_incident_fixture());
+            let (path, _) = read_incident_scorecard(&report).unwrap();
+            let foreign = tempfile::Builder::new()
+                .prefix("foreign-")
+                .tempdir_in(&root)
+                .unwrap()
+                .keep();
+            let replacement = foreign.join("scorecard.json");
+            if symlink {
+                std::os::unix::fs::symlink(&path, &replacement).unwrap();
+            } else {
+                fs::copy(&path, &replacement).unwrap();
+            }
+            let receipt = IncidentReceipt {
+                schema_version: 1,
+                run: report.evidence.clone().unwrap(),
+                scorecard_sha256: sha256_file(&replacement).unwrap(),
+                scorecard_path: replacement,
+            };
+            report.results[0].stdout = format!(
+                "{RELEASE_RECEIPT_PREFIX}{}",
+                serde_json::to_string(&receipt).unwrap()
+            );
+            let error = read_incident_scorecard(&report).unwrap_err();
+            assert!(
+                error.starts_with(if symlink {
+                    "unsafe_incident_path"
+                } else {
+                    "incident_artifact_outside_run"
+                }),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_scorecard_concurrent_opposite_verdicts_stay_with_their_runs() {
+        let root = TempDir::new().unwrap().keep();
+        write_suite_script(&root, INCIDENT_CORPUS_SUITE, "#!/bin/bash\necho ok");
+        let registry = SuiteRegistry::new(&root).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = [false, true]
+                .into_iter()
+                .map(|ready| {
+                    let root = &root;
+                    let registry = &registry;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let mut report = scorecard_report(
+                            vec![scorecard_suite_result(INCIDENT_CORPUS_SUITE, true)],
+                            "2026-09-04T00:00:00Z",
+                        );
+                        let mut value = passing_incident_fixture();
+                        value["release_ready"] = ready.into();
+                        bind_scorecard_fixture(root, &mut report, &value);
+                        barrier.wait();
+                        let outcome = write_release_scorecard(&report, registry, root).unwrap();
+                        assert_eq!(outcome.release_ready, ready);
+                        outcome.path
+                    })
+                })
+                .collect();
+            let paths: Vec<_> = workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect();
+            assert_ne!(paths[0], paths[1]);
+        });
+    }
+
+    #[test]
+    fn release_scorecard_actual_incident_producer_publishes_terminal_receipt() {
+        let root = TempDir::new().unwrap().keep();
+        let script = include_str!("../../../tests/e2e/test_incident_corpus.sh");
+        let producer = script
+            .split_once("if python3 - \"${SCORECARD_ROWS}\"")
+            .unwrap()
+            .1
+            .split_once("<<'PY'\n")
+            .unwrap()
+            .1
+            .split_once("\nPY\n")
+            .unwrap()
+            .0;
+        let manifest = root.join("manifest.json");
+        fs::write(
+            &manifest,
+            r#"{"corpus_id":"producer-contract-test","fixtures":[{"id":"zero_byte_wal"}]}"#,
+        )
+        .unwrap();
+        for skip in [false, true] {
+            let run_dir = tempfile::Builder::new()
+                .prefix("producer-")
+                .tempdir_in(&root)
+                .unwrap()
+                .keep();
+            let rows = run_dir.join("rows.tsv");
+            let mut contents = "L1\tzero_byte_wal\tfixture\tpass\tfixture\tfixture\n".to_string();
+            for id in [
+                "cli_mcp_name_mismatch_matrix",
+                "http_decode_before_tool",
+                "fd_exhaustion_resource_busy",
+                "mixed_load_write_concurrency_cliff",
+                "tui_render_stall_heartbeat",
+                "atc_tick_budget_overrun",
+                "host_pressure_not_corruption",
+            ] {
+                let status = if skip && id == "atc_tick_budget_overrun" {
+                    "skip"
+                } else {
+                    "pass"
+                };
+                contents.push_str(&format!("L2\t{id}\tfixture\t{status}\tfixture\tfixture\n"));
+            }
+            fs::write(&rows, contents).unwrap();
+            let scorecard = run_dir.join("scorecard.json");
+            let receipt = run_dir.join("receipt.json");
+            let output = Command::new("python3")
+                .arg("-c")
+                .arg(producer)
+                .arg(&rows)
+                .arg(&manifest)
+                .arg(&scorecard)
+                .args(["test-fixture", ""])
+                .env(
+                    "AM_E2E_RELEASE_RUN",
+                    r#"{"run_id":"producer-contract-test"}"#,
+                )
+                .env("AM_E2E_RELEASE_RECEIPT", &receipt)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&scorecard).unwrap()).unwrap();
+            assert_eq!(value["release_ready"], !skip);
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+            assert_eq!(value["scorecard_sha256"], sha256_file(&scorecard).unwrap());
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.starts_with(RELEASE_RECEIPT_PREFIX))
+            );
+        }
+    }
+
+    #[test]
+    fn release_scorecard_incident_fixture_requires_terminal_cargo_success() {
+        let root = TempDir::new().unwrap().keep();
+        let script = include_str!("../../../tests/e2e/test_incident_corpus.sh");
+        let body = script
+            .split_once("run_cargo_fixture() {\n")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        for (exit, count, expected) in [(0, 5, true), (7, 5, false), (0, 0, false)] {
+            // Fault injection at the cargo subprocess boundary checks the
+            // actual shell validator; these are not product conformance rows.
+            let command = format!(
+                "e2e_run_cargo() {{ printf 'test result: ok. {count} passed; 0 failed;\\n'; return {exit}; }}\nrun_cargo_fixture() {{\n{body}\n}}\nrun_cargo_fixture case-{exit}-{count}.log 1"
+            );
+            let output = Command::new("bash")
+                .args(["-c", &command])
+                .env("E2E_ARTIFACT_DIR", &root)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.success(), expected, "{exit}/{count}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_driver_orders_handshake_and_rejects_incomplete_children() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = TempDir::new().unwrap().keep();
+        let source = include_str!("../../../tests/e2e/test_workflow_happy_path.sh");
+        let driver = source
+            .split_once("send_jsonrpc_session() {\n")
+            .unwrap()
+            .1
+            .split_once("<<'PY'\n")
+            .unwrap()
+            .1
+            .split_once("\nPY\n")
+            .unwrap()
+            .0;
+        let binary = root.join("protocol_fixture.py");
+        // An adversarial protocol peer checks this driver's ordering and
+        // lifecycle. Product conformance still requires the actual am binary.
+        fs::write(
+            &binary,
+            r#"#!/usr/bin/env python3
+import json, os, sys, time
+initialized = False
+mode = os.environ['WORKFLOW_DRIVER_MODE']
+for line in sys.stdin:
+    req = json.loads(line)
+    if req['method'] == 'notifications/initialized':
+        initialized = True
+        continue
+    if req['method'] != 'initialize' and not initialized:
+        sys.exit(9)
+    if req['method'] != 'initialize':
+        if mode == 'eof': sys.exit(0)
+        if mode == 'hang': time.sleep(60)
+    response_id = 999 if mode == 'wrong_id' else req['id']
+    print(json.dumps({'jsonrpc':'2.0','id':response_id,'result':{}}), flush=True)
+sys.exit(7 if mode == 'unclean' else 0)
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        for mode in ["complete", "eof", "wrong_id", "unclean", "hang"] {
+            let work = root.join(mode);
+            fs::create_dir(&work).unwrap();
+            let timeout = if mode == "hang" { "0.2" } else { "10" };
+            let output = Command::new("python3")
+                .args(["-c", driver])
+                .arg(work.join("mailbox.sqlite3"))
+                .arg(work.join("archive"))
+                .arg(&work)
+                .arg(&binary)
+                .arg(timeout)
+                .args([
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}}"#,
+                ])
+                .env("WORKFLOW_DRIVER_MODE", mode)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.success(),
+                mode == "complete",
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let records: Vec<serde_json::Value> = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let terminal = &records.last().unwrap()["workflow_session"];
+            assert_eq!(terminal["passed"], mode == "complete", "{mode}");
+            if mode == "complete" {
+                assert_eq!(terminal["completed_ids"], serde_json::json!([1, 2]));
+            }
+        }
+    }
+
+    #[test]
+    fn workflow_response_validator_requires_reply_and_terminal_session() {
+        let source = include_str!("../../../tests/e2e/test_workflow_happy_path.sh");
+        let body = source
+            .split_once("is_error_result() {\n")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        let command = format!("is_error_result() {{\n{body}\n}}\nis_error_result \"$1\" 2");
+        let reply = r#"{"jsonrpc":"2.0","id":2,"result":{}}"#;
+        let terminal = r#"{"workflow_session":{"passed":true,"completed_ids":[1,2]}}"#;
+        for (payload, expected) in [
+            (format!("{reply}\n{terminal}"), "false"),
+            (reply.to_string(), "true"),
+            (terminal.to_string(), "true"),
+            (format!("{reply}\n{reply}\n{terminal}"), "true"),
+            (
+                format!("{reply}\n{{\"workflow_session\":{{\"passed\":false}}}}"),
+                "true",
+            ),
+            (format!("{reply}\n{{\"workflow_session\":null}}"), "true"),
+            (
+                format!("{reply}\n{{\"workflow_session\":{{\"passed\":true,\"completed_ids\":\"12\"}}}}"),
+                "true",
+            ),
+            (String::new(), "true"),
+        ] {
+            let output = Command::new("bash")
+                .args(["-c", &command, "workflow-validator", &payload])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+        }
     }
 
     // ── write_dual_mode_step_artifact: pass case ─────────────────────────
@@ -3343,6 +4170,7 @@ exit 1
     #[test]
     fn run_report_exit_code_zero_on_success() {
         let r = RunReport {
+            evidence: None,
             total: 1,
             passed: 1,
             failed: 0,
@@ -3358,6 +4186,7 @@ exit 1
     #[test]
     fn run_report_exit_code_one_on_failure() {
         let r = RunReport {
+            evidence: None,
             total: 2,
             passed: 1,
             failed: 1,
