@@ -6759,20 +6759,31 @@ pub struct CanonicalSnapshotTempDir {
     canonical_path: PathBuf,
 }
 
+/// The directory temporary staging areas are created in.
+///
+/// The first non-empty `TMPDIR` / `TEMP` / `TMP` wins, falling back to the
+/// platform temp directory. Nothing here is ever hardcoded to `/tmp`: that is
+/// simply what `std::env::temp_dir()` answers on Unix when none of those
+/// variables is set.
+#[must_use]
+pub fn snapshot_temp_root() -> PathBuf {
+    for key in ["TMPDIR", "TEMP", "TMP"] {
+        let Some(value) = env_value(key) else {
+            continue;
+        };
+        let base = PathBuf::from(value);
+        if base.as_os_str().is_empty() {
+            continue;
+        }
+        return base;
+    }
+
+    std::env::temp_dir()
+}
+
 impl CanonicalSnapshotTempDir {
     pub fn new(prefix: &str) -> std::io::Result<Self> {
-        for key in ["TMPDIR", "TEMP", "TMP"] {
-            let Some(value) = env_value(key) else {
-                continue;
-            };
-            let base = PathBuf::from(value);
-            if base.as_os_str().is_empty() {
-                continue;
-            }
-            return Self::new_in(prefix, &base);
-        }
-
-        Self::from_guard(tempfile::Builder::new().prefix(prefix).tempdir()?)
+        Self::new_in(prefix, &snapshot_temp_root())
     }
 
     pub fn new_in(prefix: &str, base: &Path) -> std::io::Result<Self> {
@@ -9074,8 +9085,176 @@ impl SqliteHealthProbeSource {
     }
 }
 
+/// Name prefix of every staged health-probe directory.
+const HEALTH_PROBE_DIR_PREFIX: &str = ".mcp-agent-mail-health-probe-";
+
+/// Name stem of every file staged inside a health-probe directory. The main
+/// database uses it verbatim; the sidecars append their own suffix to it.
+const HEALTH_PROBE_STAGED_STEM: &str = "health-probe.sqlite3";
+
+/// Fallback age bound for a staged probe directory whose owning PID cannot be
+/// read, or is currently held by some live process (PID reuse). Generous enough
+/// that a slow probe over a very large mailbox is never swept out from under
+/// itself; an orphan whose owner is provably gone does not wait for it.
+const STALE_HEALTH_PROBE_MAX_AGE: Duration = Duration::from_mins(60);
+
+/// The staging-directory name prefix for this process: the shared prefix plus
+/// our PID, so the sweep can tell an orphan from a probe still in flight.
+fn health_probe_dir_prefix_for_this_process() -> String {
+    format!("{HEALTH_PROBE_DIR_PREFIX}{}-", std::process::id())
+}
+
+/// The PID recorded in a staged probe directory's name, if it carries one.
+///
+/// Names are `<prefix><pid>-<random>`; anything else (including a directory
+/// left by an older release, which had no PID segment) yields `None` and falls
+/// back to the age bound.
+fn health_probe_dir_owner_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix(HEALTH_PROBE_DIR_PREFIX)?;
+    let (pid, random) = rest.split_once('-')?;
+    if random.is_empty() {
+        return None;
+    }
+    pid.parse::<u32>().ok()
+}
+
+/// Whether `path` holds nothing but this probe's own staged files.
+///
+/// An empty directory qualifies: a probe killed before its first copy landed.
+/// Anything else — a single unrecognized entry, or a directory that cannot be
+/// read — disqualifies it, so the sweep can only ever remove artifacts the
+/// probe itself wrote.
+fn is_health_probe_staging_dir(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        if !name.starts_with(HEALTH_PROBE_STAGED_STEM) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Reclaim staged health-probe directories left behind by killed invocations.
+///
+/// The staging guard removes its directory on drop, which covers a clean exit,
+/// an early return, and an unwinding panic — but not `SIGKILL` (GH#308). A
+/// supervisor polling `am health` on a tick shorter than the probe's worst-case
+/// latency then leaves one full-size copy of the mailbox behind per killed run,
+/// with nothing to reclaim it.
+///
+/// The sweep is deliberately narrow. It looks only in the directory the next
+/// probe would itself stage into, one level deep, and removes an entry only
+/// when all of the following hold: the name carries the probe's own prefix
+/// followed by a suffix; the entry is a real directory, not a symlink (so a
+/// link planted in a shared temp root cannot redirect the removal); it contains
+/// nothing but this probe's own staged files; it is not owned by this process;
+/// and its owning PID is provably gone — or, when that cannot be established,
+/// it has not been modified for `max_age`. Every error is ignored: reclaiming
+/// disk is best effort and must never fail a health check.
+///
+/// The PID gate is what keeps the leak bounded in the reported scenario. A
+/// supervisor polling on a short tick would otherwise accumulate one full-size
+/// copy per killed run for the whole fallback window; instead the very next
+/// invocation sees the killed PID is gone and reclaims immediately.
+///
+/// Returns the number of directories reclaimed.
+fn sweep_stale_health_probe_dirs_in(root: &Path, max_age: Duration, now: SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+
+    let self_pid = std::process::id();
+    let mut reclaimed = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // The prefix alone is not enough: a suffix must follow, so a directory
+        // named exactly like the prefix is left alone.
+        if !name.starts_with(HEALTH_PROBE_DIR_PREFIX) || name.len() == HEALTH_PROBE_DIR_PREFIX.len()
+        {
+            continue;
+        }
+
+        let owner = health_probe_dir_owner_pid(name);
+        if owner == Some(self_pid) {
+            // Our own staging directory, in use right now.
+            continue;
+        }
+        // An owner that is gone proves the directory is an orphan whatever its
+        // age. Otherwise — no PID in the name, or a PID some live process
+        // currently holds — fall back to the age bound.
+        let owner_is_gone = owner.is_some_and(|pid| !pid_is_alive(pid));
+
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        if !owner_is_gone {
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            // `duration_since` fails on a future timestamp; leave those alone.
+            let Ok(age) = now.duration_since(modified) else {
+                continue;
+            };
+            if age < max_age {
+                continue;
+            }
+        }
+        if !is_health_probe_staging_dir(&path) {
+            continue;
+        }
+
+        if std::fs::remove_dir_all(&path).is_ok() {
+            reclaimed += 1;
+            tracing::debug!(
+                path = %path.display(),
+                "reclaimed orphaned health-probe staging directory"
+            );
+        }
+    }
+
+    reclaimed
+}
+
+/// Run [`sweep_stale_health_probe_dirs_in`] at most once per process, against
+/// the root the next probe will stage into.
+fn sweep_stale_health_probe_dirs_once() {
+    static SWEPT: OnceLock<()> = OnceLock::new();
+    SWEPT.get_or_init(|| {
+        sweep_stale_health_probe_dirs_in(
+            &snapshot_temp_root(),
+            STALE_HEALTH_PROBE_MAX_AGE,
+            SystemTime::now(),
+        );
+    });
+}
+
 fn stage_sqlite_family_for_health_probe_once(
     source: &Path,
+) -> std::io::Result<Option<SqliteHealthProbeSource>> {
+    stage_sqlite_family_for_health_probe_once_in(source, None)
+}
+
+/// [`stage_sqlite_family_for_health_probe_once`], staging into an explicit
+/// root instead of the shared [`snapshot_temp_root`].
+fn stage_sqlite_family_for_health_probe_once_in(
+    source: &Path,
+    root: Option<&Path>,
 ) -> std::io::Result<Option<SqliteHealthProbeSource>> {
     match std::fs::symlink_metadata(source) {
         Ok(metadata) if metadata.file_type().is_file() => {}
@@ -9088,8 +9267,16 @@ fn stage_sqlite_family_for_health_probe_once(
     // no sidecars. A normal writable SQLite open can create WAL/SHM merely by
     // probing a cold live database; the health API promises source-byte
     // neutrality and must never perform that open against the authority path.
-    let directory = CanonicalSnapshotTempDir::new(".mcp-agent-mail-health-probe-")?;
-    let staged_path = directory.path().join("health-probe.sqlite3");
+    //
+    // The guard removes the directory when this value is dropped: on the
+    // success path when the caller is done with the copy, and on every early
+    // return and unwinding panic below.
+    let prefix = health_probe_dir_prefix_for_this_process();
+    let directory = match root {
+        Some(root) => CanonicalSnapshotTempDir::new_in(&prefix, root)?,
+        None => CanonicalSnapshotTempDir::new(&prefix)?,
+    };
+    let staged_path = directory.path().join(HEALTH_PROBE_STAGED_STEM);
     copy_file_without_overwrite(source, &staged_path)?;
 
     for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
@@ -9130,6 +9317,9 @@ pub fn stage_sqlite_family_for_health_probe(
     validate_sqlite_target_path(source, "SQLite health-probe source")?;
     #[cfg(test)]
     note_health_probe_staging_for_test(source);
+    // Reclaim copies left behind by earlier invocations that were killed before
+    // their staging guard could run (GH#308).
+    sweep_stale_health_probe_dirs_once();
     let mut last_not_found = None;
     for _ in 0..3 {
         match stage_sqlite_family_for_health_probe_once(source) {
@@ -10586,7 +10776,7 @@ pub fn inspect_mailbox_recovery_lock(db_path: &Path) -> MailboxRecoveryLockState
             .and_then(|content| content.trim().parse::<u32>().ok())
         {
             Some(pid) => {
-                if recovery_lock_pid_is_alive(pid) {
+                if pid_is_alive(pid) {
                     MailboxRecoveryLockState {
                         lock_path: lock_path.display().to_string(),
                         exists: true,
@@ -10633,14 +10823,16 @@ pub fn inspect_mailbox_recovery_lock(db_path: &Path) -> MailboxRecoveryLockState
     }
 }
 
-/// Probe a recovery-lock owner without assuming Linux's `/proc` filesystem.
+/// Probe whether a PID is live, without assuming Linux's `/proc` filesystem.
 ///
 /// `kill(pid, 0)` does not signal the process: it asks the kernel whether the
 /// PID exists and whether the caller may address it. Permission denial still
 /// proves that a process owns the PID. Unexpected probe failures are treated
-/// as live so recovery never steals a lock whose owner could not be disproved.
+/// as live, so a caller never claims something it could not disprove is
+/// abandoned — a recovery lock whose owner is unknown, or a staged probe
+/// directory whose owner might still be writing into it.
 #[cfg(unix)]
-fn recovery_lock_pid_is_alive(pid: u32) -> bool {
+fn pid_is_alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
     };
@@ -10654,10 +10846,10 @@ fn recovery_lock_pid_is_alive(pid: u32) -> bool {
     }
 }
 
-/// Without a safe native process probe, fail closed: a non-zero lock owner is
-/// considered live rather than risking concurrent recovery mutation.
+/// Without a safe native process probe, fail closed: a non-zero owner is
+/// considered live rather than risking concurrent mutation of what it owns.
 #[cfg(not(unix))]
-const fn recovery_lock_pid_is_alive(pid: u32) -> bool {
+const fn pid_is_alive(pid: u32) -> bool {
     pid != 0
 }
 
@@ -28905,6 +29097,286 @@ mod tests {
             );
             recovery_admission().reset();
         }
+    }
+
+    // ---- GH#308: staged health-probe copies must not outlive their probe. ----
+
+    /// Directories in `root` that carry the probe's staging prefix.
+    fn probe_dirs_in(root: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(root)
+            .expect("read staging root")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(HEALTH_PROBE_DIR_PREFIX))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn health_probe_staging_dir_is_removed_when_the_probe_is_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("staging");
+        std::fs::create_dir_all(&root).expect("create staging root");
+        let source = dir.path().join("probe-drop.sqlite3");
+        std::fs::write(&source, b"source bytes").expect("write source");
+
+        let staged = stage_sqlite_family_for_health_probe_once_in(&source, Some(&root))
+            .expect("stage probe copy")
+            .expect("source is a regular file");
+        let staged_dir = staged
+            .path()
+            .parent()
+            .expect("staged copy has a parent")
+            .to_path_buf();
+        assert!(staged.path().is_file(), "the copy must exist while held");
+        assert_eq!(probe_dirs_in(&root).len(), 1);
+
+        drop(staged);
+        assert!(
+            !staged_dir.exists(),
+            "dropping the probe must remove its staged copy"
+        );
+        assert_eq!(probe_dirs_in(&root), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn health_probe_staging_dir_is_removed_on_an_early_return() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("staging");
+        std::fs::create_dir_all(&root).expect("create staging root");
+        let source = dir.path().join("probe-early.sqlite3");
+        std::fs::write(&source, b"source bytes").expect("write source");
+        // A sidecar slot holding a directory aborts staging *after* the
+        // staging directory and the main copy already exist.
+        std::fs::create_dir(sqlite_sidecar_path(&source, "-wal")).expect("sidecar directory");
+
+        let staged = stage_sqlite_family_for_health_probe_once_in(&source, Some(&root))
+            .expect("staging must not error");
+        assert!(staged.is_none(), "a non-file sidecar aborts the probe");
+        assert_eq!(
+            probe_dirs_in(&root),
+            Vec::<PathBuf>::new(),
+            "an aborted probe must leave no staged copy behind"
+        );
+    }
+
+    #[test]
+    fn health_probe_staging_dirs_are_uniquely_named() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("staging");
+        std::fs::create_dir_all(&root).expect("create staging root");
+        let source = dir.path().join("probe-unique.sqlite3");
+        std::fs::write(&source, b"source bytes").expect("write source");
+
+        let first = stage_sqlite_family_for_health_probe_once_in(&source, Some(&root))
+            .expect("stage first")
+            .expect("source is a regular file");
+        let second = stage_sqlite_family_for_health_probe_once_in(&source, Some(&root))
+            .expect("stage second")
+            .expect("source is a regular file");
+        assert_ne!(
+            first.path().parent(),
+            second.path().parent(),
+            "concurrent probes must not share a staging directory"
+        );
+        assert_eq!(probe_dirs_in(&root).len(), 2);
+    }
+
+    /// A PID that no live process can hold, so the sweep's owner probe answers
+    /// "gone". `0` is never a real process id.
+    const DEAD_OWNER_PID: &str = "0";
+
+    #[test]
+    fn probe_dir_names_carry_their_owner_pid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("staging");
+        std::fs::create_dir_all(&root).expect("create staging root");
+        let source = dir.path().join("probe-owner.sqlite3");
+        std::fs::write(&source, b"source bytes").expect("write source");
+
+        let staged = stage_sqlite_family_for_health_probe_once_in(&source, Some(&root))
+            .expect("stage probe copy")
+            .expect("source is a regular file");
+        let name = staged
+            .path()
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .expect("staged directory name")
+            .to_string();
+
+        assert_eq!(
+            health_probe_dir_owner_pid(&name),
+            Some(std::process::id()),
+            "a staged directory must record the process that owns it: {name}"
+        );
+        assert_eq!(health_probe_dir_owner_pid("unrelated-directory"), None);
+        assert_eq!(
+            health_probe_dir_owner_pid(&format!("{HEALTH_PROBE_DIR_PREFIX}legacyname")),
+            None,
+            "a directory from a release without the PID segment falls back to age"
+        );
+    }
+
+    #[test]
+    fn stale_probe_sweep_reclaims_a_dead_owner_immediately() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+
+        let orphan = root.join(format!("{HEALTH_PROBE_DIR_PREFIX}{DEAD_OWNER_PID}-abc123"));
+        std::fs::create_dir(&orphan).expect("create orphan");
+        std::fs::write(orphan.join(HEALTH_PROBE_STAGED_STEM), b"copy").expect("staged main");
+
+        // Owned by this process: in flight, never reclaimed.
+        let ours = root.join(format!(
+            "{}xyz789",
+            health_probe_dir_prefix_for_this_process()
+        ));
+        std::fs::create_dir(&ours).expect("create our own staging dir");
+        std::fs::write(ours.join(HEALTH_PROBE_STAGED_STEM), b"copy").expect("staged main");
+
+        // Brand new, so the age bound alone would spare both.
+        assert_eq!(
+            sweep_stale_health_probe_dirs_in(&root, Duration::from_secs(3600), SystemTime::now()),
+            1,
+            "an orphan whose owner is gone does not wait out the age bound"
+        );
+        assert!(!orphan.exists(), "the dead owner's copy must be reclaimed");
+        assert!(ours.exists(), "a probe still in flight must be left alone");
+    }
+
+    #[test]
+    fn stale_probe_sweep_matches_only_its_own_dirs_and_honors_the_age_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+
+        // The one thing the sweep may reclaim. No PID segment, so only the age
+        // bound decides.
+        let orphan = root.join(format!("{HEALTH_PROBE_DIR_PREFIX}abc123"));
+        std::fs::create_dir(&orphan).expect("create orphan");
+        std::fs::write(orphan.join(HEALTH_PROBE_STAGED_STEM), b"copy").expect("staged main");
+        std::fs::write(
+            orphan.join(format!("{HEALTH_PROBE_STAGED_STEM}-wal")),
+            b"wal",
+        )
+        .expect("staged wal");
+
+        // An orphan killed before its first copy landed.
+        let empty_orphan = root.join(format!("{HEALTH_PROBE_DIR_PREFIX}def456"));
+        std::fs::create_dir(&empty_orphan).expect("create empty orphan");
+
+        // Same prefix, but holds something the probe never wrote.
+        let impostor = root.join(format!("{HEALTH_PROBE_DIR_PREFIX}ghi789"));
+        std::fs::create_dir(&impostor).expect("create impostor");
+        std::fs::write(impostor.join("irreplaceable.txt"), b"keep me").expect("impostor payload");
+
+        // The prefix with no random component at all.
+        let bare_prefix = root.join(HEALTH_PROBE_DIR_PREFIX);
+        std::fs::create_dir(&bare_prefix).expect("create bare prefix dir");
+
+        // An unrelated neighbour in the same temp root.
+        let neighbour = root.join("some-other-tempdir");
+        std::fs::create_dir(&neighbour).expect("create neighbour");
+        std::fs::write(neighbour.join("data.txt"), b"keep me").expect("neighbour payload");
+
+        // A regular file wearing the prefix.
+        let file = root.join(format!("{HEALTH_PROBE_DIR_PREFIX}notadir"));
+        std::fs::write(&file, b"keep me").expect("write prefixed file");
+
+        let now = SystemTime::now();
+        let max_age = Duration::from_secs(3600);
+
+        assert_eq!(
+            sweep_stale_health_probe_dirs_in(&root, max_age, now),
+            0,
+            "a probe younger than the age bound is still in use"
+        );
+        assert!(orphan.exists(), "the age bound must be respected");
+
+        let later = now + max_age + Duration::from_secs(1);
+        assert_eq!(
+            sweep_stale_health_probe_dirs_in(&root, max_age, later),
+            2,
+            "only the probe's own stale directories are reclaimed"
+        );
+        assert!(!orphan.exists(), "the stale staged copy must be reclaimed");
+        assert!(!empty_orphan.exists(), "an empty orphan is still an orphan");
+        assert!(impostor.exists(), "a foreign payload is never removed");
+        assert!(impostor.join("irreplaceable.txt").exists());
+        assert!(bare_prefix.exists(), "the bare prefix is not a probe dir");
+        assert!(neighbour.exists(), "unrelated neighbours are never touched");
+        assert!(neighbour.join("data.txt").exists());
+        assert!(
+            file.exists(),
+            "a file wearing the prefix is not a probe dir"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_probe_sweep_never_follows_a_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).expect("create root");
+
+        let victim = dir.path().join("victim");
+        std::fs::create_dir(&victim).expect("create victim");
+        std::fs::write(victim.join(HEALTH_PROBE_STAGED_STEM), b"not ours").expect("victim payload");
+
+        let link = root.join(format!("{HEALTH_PROBE_DIR_PREFIX}link"));
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+
+        let later = SystemTime::now() + Duration::from_secs(7200);
+        assert_eq!(
+            sweep_stale_health_probe_dirs_in(&root, Duration::from_secs(3600), later),
+            0
+        );
+        assert!(link.exists(), "the symlink itself is left in place");
+        assert!(
+            victim.join(HEALTH_PROBE_STAGED_STEM).exists(),
+            "a symlink must never redirect the sweep at another directory"
+        );
+    }
+
+    #[test]
+    fn probe_staging_lands_under_the_configured_temp_root() {
+        // `/tmp` is never a literal in the staging path: the root comes from
+        // `TMPDIR`/`TEMP`/`TMP` and only otherwise from the platform default.
+        let root = snapshot_temp_root();
+        assert!(
+            root.is_absolute(),
+            "the staging root must be absolute: {}",
+            root.display()
+        );
+        let canonical_root = root.canonicalize().expect("staging root must exist");
+
+        let staged =
+            CanonicalSnapshotTempDir::new(HEALTH_PROBE_DIR_PREFIX).expect("stage under the root");
+        assert!(
+            staged.path().starts_with(&canonical_root),
+            "staging must land under the configured temp root: {} not under {}",
+            staged.path().display(),
+            canonical_root.display()
+        );
+
+        // An explicit root is honored verbatim.
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let explicit = CanonicalSnapshotTempDir::new_in(HEALTH_PROBE_DIR_PREFIX, elsewhere.path())
+            .expect("stage under an explicit root");
+        assert!(
+            explicit.path().starts_with(
+                elsewhere
+                    .path()
+                    .canonicalize()
+                    .expect("canonical elsewhere")
+            ),
+            "an explicit staging root must be used as given"
+        );
     }
 
     #[test]
