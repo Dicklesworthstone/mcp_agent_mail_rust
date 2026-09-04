@@ -19610,20 +19610,19 @@ mod tests {
 
         let replacement_allocator = replacement.message_id_allocator();
         let storage_root = config.resolved_storage_root();
-        let barrier = Arc::new(std::sync::Barrier::new(3));
-        let old_barrier = Arc::clone(&barrier);
+        // Retirement is checked at election entry, so the old and replacement
+        // seeds need no ordering: the old handle must fail closed whenever it
+        // runs, and the replacement must seed independently.
         let old_storage_root = storage_root.clone();
         let old_handle = std::thread::spawn(move || {
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
                 .build()
                 .expect("build old allocator runtime");
-            old_barrier.wait();
             runtime.block_on(async move {
                 let cx = Cx::current().expect("runtime installs allocator context");
                 old_allocator.archive_seed(&cx, &old_storage_root).await
             })
         });
-        let replacement_barrier = Arc::clone(&barrier);
         let replacement_handle = std::thread::spawn(move || {
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
                 .build()
@@ -19633,7 +19632,6 @@ mod tests {
                 replacement_allocator.archive_seed(&cx, &storage_root).await
             })
         });
-        barrier.wait();
 
         assert!(matches!(
             old_handle.join().expect("join old allocator"),

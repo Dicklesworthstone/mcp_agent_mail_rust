@@ -9,9 +9,9 @@
 //! failure mode that motivated the bead.
 
 use asupersync::Cx;
+use mcp_agent_mail_db::create_pool;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::queries;
-use mcp_agent_mail_db::create_pool;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
@@ -114,10 +114,10 @@ fn run_parent() {
 fn run_worker(db_path: &str) {
     let name = std::env::var("MAGENTAROBIN_ID_WORKER_NAME").unwrap_or_else(|_| "A".to_string());
     let gate = std::env::var("MAGENTAROBIN_ID_WORKER_GATE").expect("worker gate path");
-    let storage_root =
-        std::env::var("MAGENTAROBIN_ID_WORKER_STORAGE").expect("worker storage root");
+    let storage_root = std::path::PathBuf::from(
+        std::env::var("MAGENTAROBIN_ID_WORKER_STORAGE").expect("worker storage root"),
+    );
     let go_gate = format!("{gate}.go");
-
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .expect("build worker runtime");
@@ -125,7 +125,7 @@ fn run_worker(db_path: &str) {
         let cx = Cx::current().expect("runtime installs worker context");
         let cfg = DbPoolConfig {
             database_url: format!("sqlite:///{db_path}"),
-            storage_root: Some(storage_root.clone()),
+            run_migrations: true,
             min_connections: 1,
             max_connections: 1,
             warmup_connections: 0,
