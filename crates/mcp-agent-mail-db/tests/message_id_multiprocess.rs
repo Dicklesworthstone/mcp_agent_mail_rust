@@ -41,6 +41,29 @@ fn wait_for_go(go_gate: &str, name: &str) {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
+
+fn write_worker_result(storage_root: &std::path::Path, name: &str, id: i64) {
+    // Project the elected id into a canonical-shaped archive filename so
+    // the parent can prove filename-level distinctness.
+    let canonical = storage_root
+        .join("projects/p/messages/2026/07")
+        .join(format!("{id:06}__elected.md"));
+    if let Some(parent) = canonical.parent() {
+        std::fs::create_dir_all(parent).expect("create canonical directory");
+    }
+    std::fs::write(&canonical, format!("---json\n{{\"id\": {id}}}\n---\n"))
+        .expect("write canonical marker");
+
+    std::fs::write(
+        storage_root
+            .parent()
+            .expect("storage parent")
+            .join(format!("result-{name}.txt")),
+        format!("{id}\n"),
+    )
+    .expect("write worker result");
+}
+
 fn run_worker(db_path: &str) {
     let name = std::env::var("MAGENTAROBIN_ID_WORKER_NAME").unwrap_or_else(|_| "A".to_string());
     let gate = std::env::var("MAGENTAROBIN_ID_WORKER_GATE").expect("worker gate path");
@@ -144,25 +167,7 @@ fn run_worker(db_path: &str) {
         .expect("worker message creation");
         let id = message.id.expect("elected message id");
 
-        // Project the elected id into a canonical-shaped archive filename so
-        // the parent can prove filename-level distinctness.
-        let canonical = storage_root
-            .join("projects/p/messages/2026/07")
-            .join(format!("{id:06}__elected.md"));
-        if let Some(parent) = canonical.parent() {
-            std::fs::create_dir_all(parent).expect("create canonical directory");
-        }
-        std::fs::write(&canonical, format!("---json\n{{\"id\": {id}}}\n---\n"))
-            .expect("write canonical marker");
-
-        std::fs::write(
-            storage_root
-                .parent()
-                .expect("storage parent")
-                .join(format!("result-{name}.txt")),
-            format!("{id}\n"),
-        )
-        .expect("write worker result");
+        write_worker_result(&storage_root, &name, id);
     });
 }
 
@@ -246,11 +251,13 @@ fn run_parent() {
     let file_b = storage_root.join(format!("projects/p/messages/2026/07/{id_b:06}__elected.md"));
     assert!(
         file_a.exists(),
-        "worker A canonical file missing: {file_a:?}"
+        "worker A canonical file missing: {}",
+        file_a.display()
     );
     assert!(
         file_b.exists(),
-        "worker B canonical file missing: {file_b:?}"
+        "worker B canonical file missing: {}",
+        file_b.display()
     );
     assert_ne!(file_a, file_b, "canonical filenames collided");
 }
