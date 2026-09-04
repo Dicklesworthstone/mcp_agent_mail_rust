@@ -3740,9 +3740,12 @@ fn contacts_command_is_read_only(action: &ContactsCommand) -> bool {
 
 fn doctor_command_is_read_only(action: &DoctorCommand) -> bool {
     match action {
-        // `Drain` is read-only and MUST run even while a live owner holds the
-        // mailbox — reporting the supervised drain protocol is its whole purpose.
-        DoctorCommand::Locks { .. } | DoctorCommand::Drain { .. } => true,
+        // `Check`, `Locks`, and `Drain` are detector-only and MUST run while a
+        // live owner holds the mailbox without entering init-time recovery or
+        // archive reconciliation. Reporting the live state is their purpose.
+        DoctorCommand::Check { .. }
+        | DoctorCommand::Locks { .. }
+        | DoctorCommand::Drain { .. } => true,
         // `am doctor fix --list` (with or without `--only <fm-id>`) is a
         // detector-only inventory surface: the dispatcher routes it to
         // `handle_fix_only_list` / `handle_fix_list_all`, which call
@@ -54965,6 +54968,19 @@ http_headers = { Authorization = "Bearer secret" }
             }
             other => panic!("expected Doctor Locks, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn doctor_check_is_read_only() {
+        let check = Commands::Doctor {
+            action: DoctorCommand::Check {
+                project: Some("/tmp/mailbox".to_string()),
+                verbose: false,
+                format: None,
+                json: true,
+            },
+        };
+        assert!(command_is_read_only(&check));
     }
 
     #[test]
