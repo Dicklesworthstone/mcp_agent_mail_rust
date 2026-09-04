@@ -1017,6 +1017,45 @@ enum RecoveryAdmissionOutcomePolicy {
     GuardMutationOnly,
 }
 
+/// Pure-read refusal for a malformed or currently tripped durable recovery
+/// breaker.
+///
+/// [`with_automatic_recovery_admission_using_clock`] performs this same check
+/// before it opens the election lock file. A mutation path that must quiesce
+/// this process's writers first calls it ahead of the drain, so a breaker
+/// that would refuse anyway never parks healthy writers, and the drain itself
+/// can run before any election artifact exists beside the family: a refusal
+/// for an active writer then leaves the directory namespace exactly
+/// unchanged. Admission re-evaluates under the lock afterwards.
+#[allow(clippy::result_large_err)]
+fn refuse_untrusted_or_tripped_recovery_breaker(
+    primary_path: &Path,
+    action: &str,
+) -> Result<(), SqlError> {
+    if crate::recovery_breaker::RecoveryBreakerBypassGuard::is_active() {
+        return Ok(());
+    }
+    let prior = crate::recovery_breaker::load(primary_path).map_err(|error| {
+        SqlError::Custom(format!(
+            "{action} for {} was refused because durable recovery-breaker state could not be trusted: {error}. Run `am doctor repair` or `am doctor reconstruct` for an operator-supervised bypass",
+            primary_path.display()
+        ))
+    })?;
+    let fingerprint = recovery_breaker_fingerprint(primary_path, prior.as_ref());
+    let verdict = crate::recovery_breaker::evaluate(
+        prior.as_ref(),
+        &fingerprint,
+        crate::recovery_breaker::config_from_env(),
+        recovery_breaker_now_unix(),
+    );
+    if let Some(error) =
+        automatic_recovery_breaker_refusal::<SqlError>(primary_path, action, &verdict)
+    {
+        return flatten_automatic_recovery_result(Err(error));
+    }
+    Ok(())
+}
+
 #[allow(clippy::result_large_err)]
 fn with_recovery_mutation_admission<T, F>(
     primary_path: &Path,
@@ -8435,18 +8474,20 @@ fn cleanup_truncated_wal_sidecar_with_timeout(
         return Ok(SqliteFamilyCleanupOutcome::NotNeeded);
     }
 
+    // A malformed or tripped durable breaker is authoritative and refuses
+    // immediately (a pure read) rather than parking healthy writers behind an
+    // operation that cannot run. The writer drain then runs BEFORE admission
+    // opens the persistent election file, so a refusal for an active writer
+    // leaves the family directory exactly unchanged; admission re-evaluates
+    // the breaker under its lock, and the owned/foreign-holder refusal still
+    // precedes any change to a sidecar namespace entry.
+    refuse_untrusted_or_tripped_recovery_breaker(sqlite_path, "automatic SQLite-family cleanup")?;
+    let _promotion_barrier = acquire_recovery_promotion_barrier(
+        sqlite_path,
+        "automatic SQLite-family cleanup",
+        writer_drain_timeout,
+    )?;
     with_recovery_mutation_admission(sqlite_path, "automatic SQLite-family cleanup", || {
-        // Recovery admission must precede writer drain: a malformed or tripped
-        // durable breaker is authoritative and should refuse immediately rather
-        // than parking healthy writers behind an operation that cannot run.
-        // Once admitted, quiesce this process's write paths and refuse any
-        // external mailbox or foreign file holder before changing a sidecar
-        // namespace entry.
-        let _promotion_barrier = acquire_recovery_promotion_barrier(
-            sqlite_path,
-            "automatic SQLite-family cleanup",
-            writer_drain_timeout,
-        )?;
         refuse_sqlite_family_cleanup_while_owned(sqlite_path)?;
         apply_classified_sqlite_family_cleanup(sqlite_path)
     })

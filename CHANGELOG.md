@@ -141,6 +141,12 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   (`schema::init_schema_sql_base_deferring_column_dependent_indexes`) and
   the deferred migrations create the indexes once the columns exist. The
   base DDL and the recorded migration ids are unchanged.
+- **Automatic SQLite-family cleanup drains writers before it opens the
+  recovery-breaker election file.** A cleanup refused because this process's
+  writers did not drain left a `<db>.am-recovery-breaker.lock` beside a
+  family it never touched. The tripped-breaker refusal stays first as a
+  pure read, the writer drain runs next, and only then does admission open
+  the election lock and re-evaluate the breaker under it.
 - **ATC explain and simulate validate a source before taking the mailbox
   activity lock.** Both readers acquired the shared SQLite activity lock
   first, so pointing them at a file that is not a database left a
