@@ -515,6 +515,39 @@ CREATE TABLE IF NOT EXISTS projects (
   human_key TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS agents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  program TEXT NOT NULL,
+  model TEXT NOT NULL,
+  task_description TEXT NOT NULL DEFAULT '',
+  inception_ts DATETIME NOT NULL,
+  last_active_ts DATETIME NOT NULL,
+  attachments_policy TEXT NOT NULL DEFAULT 'auto',
+  contact_policy TEXT NOT NULL DEFAULT 'auto',
+  UNIQUE(project_id, name)
+);
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  sender_id INTEGER NOT NULL,
+  thread_id TEXT,
+  subject TEXT NOT NULL,
+  body_md TEXT NOT NULL,
+  importance TEXT NOT NULL DEFAULT 'normal',
+  ack_required INTEGER NOT NULL DEFAULT 0,
+  created_ts DATETIME NOT NULL,
+  attachments TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS message_recipients (
+  message_id INTEGER NOT NULL,
+  agent_id INTEGER NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'to',
+  read_ts DATETIME,
+  ack_ts DATETIME,
+  PRIMARY KEY(message_id, agent_id)
+);
 INSERT INTO projects (id, slug, human_key, created_at)
 VALUES (1, 'legacy-install-smoke', '/tmp/legacy-install-smoke', '2026-03-01 12:34:56.123456');
 SQL
@@ -1805,7 +1838,15 @@ EOF
 
     legacy_private_mode() {
       local path="$1"
-      stat -f '%Lp' "$path" 2>/dev/null || stat -c '%a' "$path" 2>/dev/null
+      local mode
+      # Branch, never concatenate: on GNU coreutils the BSD probe exits
+      # nonzero while still printing a filesystem-status block, so an
+      # `A || B` capture would yield multi-line garbage instead of a mode.
+      if mode=$(stat -f '%Lp' "$path" 2>/dev/null); then
+        printf '%s' "$mode"
+      elif mode=$(stat -c '%a' "$path" 2>/dev/null); then
+        printf '%s' "$mode"
+      fi
     }
     e2e_assert_eq "outside canonical env is private" \
       "600" "$(legacy_private_mode "${LEGACY_OUTSIDE_CONFIG}")"
