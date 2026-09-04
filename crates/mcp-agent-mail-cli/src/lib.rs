@@ -13551,10 +13551,10 @@ pub(crate) struct DoctorFileSanity {
     pub(crate) healthy: bool,
     /// Operator-facing sentence for the check row.
     pub(crate) detail: String,
-    /// The probe ran against the absolute fallback path, not the configured one.
+    /// The probe ran against the absolute fallback path, not the configured
+    /// one. Whether the configured path was outright missing is already
+    /// spelled out in `detail`.
     pub(crate) used_absolute_fallback: bool,
-    /// The configured path was missing, which is why the fallback was used.
-    pub(crate) fallback_due_to_missing_configured_path: bool,
     /// GH#300: `healthy` is false but nothing about the LIVE database was
     /// established — the probe ran on a private staged copy that could not be
     /// staged or opened, hit a transient conflict, or answered without saying
@@ -13565,31 +13565,21 @@ pub(crate) struct DoctorFileSanity {
 }
 
 impl DoctorFileSanity {
-    fn healthy(
-        detail: String,
-        used_absolute_fallback: bool,
-        fallback_due_to_missing_configured_path: bool,
-    ) -> Self {
+    fn healthy(detail: String, used_absolute_fallback: bool) -> Self {
         Self {
             healthy: true,
             detail,
             used_absolute_fallback,
-            fallback_due_to_missing_configured_path,
             inconclusive: false,
         }
     }
 
     /// A conclusive failure: the probe observed a defect in the file itself.
-    fn failed(
-        detail: String,
-        used_absolute_fallback: bool,
-        fallback_due_to_missing_configured_path: bool,
-    ) -> Self {
+    fn failed(detail: String, used_absolute_fallback: bool) -> Self {
         Self {
             healthy: false,
             detail,
             used_absolute_fallback,
-            fallback_due_to_missing_configured_path,
             inconclusive: false,
         }
     }
@@ -13614,7 +13604,6 @@ where
         } else {
             return Ok(DoctorFileSanity::failed(
                 format!("Database file does not exist: {}", selected_path.display()),
-                false,
                 false,
             ));
         }
@@ -13681,7 +13670,6 @@ where
         return Ok(DoctorFileSanity::failed(
             "Database file is 0 bytes (empty/corrupt)".to_string(),
             used_absolute_fallback,
-            fallback_due_to_missing_configured_path,
         ));
     }
 
@@ -13700,16 +13688,11 @@ where
                     file_size,
                 )
             };
-            return Ok(DoctorFileSanity::healthy(
-                detail,
-                used_absolute_fallback,
-                fallback_due_to_missing_configured_path,
-            ));
+            return Ok(DoctorFileSanity::healthy(detail, used_absolute_fallback));
         }
         return Ok(DoctorFileSanity::healthy(
             format!("quick_check OK ({file_size} bytes)"),
             used_absolute_fallback,
-            fallback_due_to_missing_configured_path,
         ));
     }
 
@@ -13740,7 +13723,6 @@ where
         healthy: false,
         detail,
         used_absolute_fallback,
-        fallback_due_to_missing_configured_path,
         inconclusive,
     })
 }
@@ -82139,7 +82121,9 @@ impl DoctorReconstructSalvagePreview {
                 "no salvage candidate; the rebuild would be archive-only".to_string()
             }
             Self::NotMaterializable(detail) => {
-                format!("salvage candidate could not be read ({detail}); the rebuild would be archive-only")
+                format!(
+                    "salvage candidate could not be read ({detail}); the rebuild would be archive-only"
+                )
             }
             Self::WouldMerge(source) => {
                 format!("would merge DB-only rows from {}", source.display())
@@ -82148,10 +82132,9 @@ impl DoctorReconstructSalvagePreview {
                 "would skip {} and rebuild archive-only ({detail})",
                 source.display()
             ),
-            Self::WouldRefuse { source, detail } => format!(
-                "WOULD REFUSE on {}: {detail}",
-                source.display()
-            ),
+            Self::WouldRefuse { source, detail } => {
+                format!("WOULD REFUSE on {}: {detail}", source.display())
+            }
         }
     }
 

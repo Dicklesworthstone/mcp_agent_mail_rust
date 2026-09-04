@@ -24193,7 +24193,9 @@ mod tests {
             "the reason is marked as coming from the staged copy: {reason:?}"
         );
         assert!(
-            reason.to_string().starts_with("staged private-copy probe: "),
+            reason
+                .to_string()
+                .starts_with("staged private-copy probe: "),
             "the reason names the staged probe: {reason}"
         );
         assert!(
