@@ -7542,23 +7542,20 @@ pub async fn create_message(
 
     let tracked = tracked(&*conn);
 
-    // mcp_agent_mail#176: allocate the canonical id from the process-wide
-    // monotonic allocator (see `create_message_with_recipients` for the full
-    // rationale) and insert it explicitly, so it can never be re-issued even
-    // when the live SQLite's durable AUTOINCREMENT fails to advance.
+    // mcp_agent_mail#176 / br-sa58k: the canonical id is elected durably
+    // inside the insert transaction below (see `create_message_with_recipients`
+    // for the full rationale), so it can never be re-issued — by this process,
+    // by another OS process attached to the same mailbox, or by a recovery
+    // generation racing an older pool. The archive seed is the allocator's
+    // once-per-process scan; it only matters before pool warmup has repaired
+    // the durable floor in this process.
     let id_allocator = pool.message_id_allocator();
-    let db_floor = match read_messages_id_floor(cx, &tracked).await {
-        Outcome::Ok(floor) => floor,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
     let storage_root = match pool.validated_storage_root("message creation archive allocator") {
         Ok(storage_root) => storage_root,
         Err(error) => return Outcome::Err(error),
     };
-    let message_id = match id_allocator.allocate(cx, db_floor, storage_root).await {
-        Outcome::Ok(id) => id,
+    let archive_seed = match id_allocator.archive_seed(cx, storage_root).await {
+        Outcome::Ok(seed) => seed,
         Outcome::Err(error) => return Outcome::Err(error),
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
@@ -7566,6 +7563,11 @@ pub async fn create_message(
 
     let row = match run_with_mvcc_retry(cx, "create_message", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        let message_id = try_in_tx!(
+            cx,
+            &tracked,
+            elect_message_id_in_tx(cx, &tracked, archive_seed).await
+        );
 
         // Insert message with an explicit id (mcp_agent_mail#176).
         let sql = "INSERT INTO messages \
@@ -7664,65 +7666,135 @@ fn index_created_message_best_effort(
     crate::search_v3::index_message(&message)
 }
 
-/// Read the messages-table allocator floor: the larger of `MAX(id)` and the
-/// maximum `sqlite_sequence` row for `messages`.
+/// Elect the next canonical message id durably inside the caller's write
+/// transaction (br-sa58k).
 ///
-/// Used to seed/advance the process-wide [`MessageIdAllocator`](crate::id_floor::MessageIdAllocator)
-/// (mcp_agent_mail#176). A missing `sqlite_sequence` row is represented by the
-/// aggregate as `0`; a missing table, query failure, cancellation, panic, or
-/// malformed aggregate result is propagated rather than silently publishing a
-/// lower allocator floor.
-async fn read_messages_id_floor(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<i64, DbError> {
-    // This read runs OUTSIDE the caller's retried write transaction, and the
-    // fsqlite 0.3.4 registry engine can answer a bare read with
-    // "database is busy" while concurrent writers hold the store (the
-    // pre-registry engine never surfaced busy on this path). Give it the same
-    // bounded contention retry the write body gets, so a transient busy here
-    // cannot fail message creation before the transaction even begins.
-    let outcome = run_with_mvcc_retry(cx, "read_messages_id_floor", || async {
+/// The durable allocator state is `sqlite_sequence['messages']` — the same row
+/// pool warmup repairs against the archive floor
+/// ([`crate::id_floor::advance_messages_id_floor`]). Advancing it inside the
+/// transaction that inserts the message puts the read-modify-write under the
+/// transaction's writer reservation: independent OS processes serialize on
+/// the same write lock, so two installers attached to one mailbox can never
+/// elect the same id, and a crash or cancellation between election and insert
+/// rolls the reservation back instead of burning or duplicating an id. Every
+/// election also re-bases on the live `MAX(messages.id)`, which keeps the
+/// #176 degraded-engine failure mode (a live engine that stops advancing
+/// `sqlite_sequence` per write) reuse-proof without per-process memory.
+///
+/// `archive_seed` is the caller's once-per-process canonical archive scan
+/// ([`crate::id_floor::MessageIdAllocator::archive_seed`]); it is consulted
+/// only while the elected floor would otherwise start below what the archive
+/// already considers canonical — the window before pool warmup has run in
+/// this process.
+///
+/// Returns an id strictly greater than the durable sequence, the live
+/// `MAX(messages.id)`, and the archive seed. Exhausting the positive i64
+/// row-id range fails closed with the whole transaction rolled back.
+async fn elect_message_id_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    archive_seed: i64,
+) -> Outcome<i64, DbError> {
+    let max_id_rows = try_in_tx!(
+        cx,
+        tracked,
         map_sql_outcome(
             traw_query(
                 cx,
                 tracked,
-                "SELECT MAX(v) AS v FROM (\
-                    SELECT COALESCE(MAX(id), 0) AS v FROM messages \
-                    UNION ALL \
-                    SELECT COALESCE(MAX(seq), 0) AS v \
-                      FROM sqlite_sequence WHERE name = 'messages'\
-                 )",
+                "SELECT COALESCE(MAX(id), 0) AS max_id FROM messages",
                 &[],
             )
-            .await,
+            .await
         )
-    })
-    .await;
-    decode_messages_id_floor_outcome(outcome)
-}
-
-fn decode_messages_id_floor_outcome(
-    outcome: Outcome<Vec<SqlRow>, DbError>,
-) -> Outcome<i64, DbError> {
-    let rows = match outcome {
-        Outcome::Ok(rows) => rows,
-        Outcome::Err(error) => return Outcome::Err(error),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    );
+    let Some(max_id) = max_id_rows.first().and_then(row_first_i64) else {
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(DbError::Internal(
+            "message id election: MAX(id) aggregate returned no decodable row".to_string(),
+        ));
     };
-    if rows.len() != 1 {
+
+    // Ensure the durable allocator row exists, seeded once per database
+    // lifetime from the live MAX(id) and the archive scan. The statement is
+    // idempotent under the writer reservation.
+    let seed_floor = max_id.max(archive_seed).max(0);
+    let inserted = try_in_tx!(
+        cx,
+        tracked,
+        map_sql_outcome(
+            traw_execute(
+                cx,
+                tracked,
+                "INSERT INTO sqlite_sequence (name, seq) \
+                 SELECT 'messages', ?1 \
+                 WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'messages')",
+                &[Value::BigInt(seed_floor)],
+            )
+            .await
+        )
+    );
+    if inserted > 1 {
+        rollback_tx(cx, tracked).await;
         return Outcome::Err(DbError::Internal(format!(
-            "read_messages_id_floor: aggregate returned {} rows instead of exactly one",
-            rows.len()
+            "message id election: allocator seed matched {inserted} rows"
         )));
     }
-    match rows.first().and_then(row_first_i64) {
-        Some(floor) if floor >= 0 => Outcome::Ok(floor),
-        Some(floor) => Outcome::Err(DbError::Internal(format!(
-            "read_messages_id_floor: aggregate returned negative floor {floor}"
-        ))),
-        None => Outcome::Err(DbError::Internal(
-            "read_messages_id_floor: aggregate row did not contain an i64 floor".to_string(),
-        )),
+
+    let seq_rows = try_in_tx!(
+        cx,
+        tracked,
+        map_sql_outcome(
+            traw_query(
+                cx,
+                tracked,
+                "SELECT COALESCE(MAX(seq), 0) AS seq \
+                 FROM sqlite_sequence WHERE name = 'messages'",
+                &[],
+            )
+            .await
+        )
+    );
+    let Some(durable_seq) = seq_rows.first().and_then(row_first_i64) else {
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(DbError::Internal(
+            "message id election: allocator sequence aggregate returned no decodable row"
+                .to_string(),
+        ));
+    };
+
+    let Some(elected) = durable_seq
+        .max(max_id)
+        .max(archive_seed)
+        .max(0)
+        .checked_add(1)
+    else {
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(DbError::Internal(
+            "message id election exhausted the positive i64 row-id range".to_string(),
+        ));
+    };
+
+    let updated = try_in_tx!(
+        cx,
+        tracked,
+        map_sql_outcome(
+            traw_execute(
+                cx,
+                tracked,
+                "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'messages'",
+                &[Value::BigInt(elected)],
+            )
+            .await
+        )
+    );
+    if updated != 1 {
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(DbError::Internal(format!(
+            "message id election: allocator row update matched {updated} rows"
+        )));
     }
+    Outcome::Ok(elected)
 }
 
 /// Create a message AND insert all recipients in a single `SQLite` transaction.
@@ -7958,32 +8030,28 @@ async fn create_message_with_recipients_impl(
 
         let tracked = tracked(&*conn);
 
-        // mcp_agent_mail#176: allocate the canonical message id from the
-        // process-wide monotonic allocator rather than relying on the live
-        // SQLite's AUTOINCREMENT. While the database is held suspect
+        // mcp_agent_mail#176 / br-sa58k: the canonical message id is elected
+        // durably inside the insert transaction (see
+        // `create_message_with_recipients_tx`) rather than relying on the
+        // live SQLite's AUTOINCREMENT. While the database is held suspect
         // (canonical-fallback mode, the #151 NOCASE family), the durable
         // allocator can fail to advance per-write and re-issue an id the
         // archive already considers canonical — the duplicate-canonical-file
         // reject (#130) then trips a non-clearable durability latch. The
-        // allocator derives the next id as
-        // `max(in_memory_high_water, db_floor, archive_max) + 1` atomically,
-        // so consecutive creations can never collide regardless of which
-        // surface is authoritative. We compute it once here (under the global
-        // MESSAGE_WRITE_SERIALIZER) so MVCC retries of the transaction reuse a
-        // stable id.
+        // in-transaction election re-bases on the durable
+        // `sqlite_sequence` row, the live `MAX(messages.id)`, and this
+        // process's once-per-lifetime archive scan, so consecutive creations
+        // can never collide across processes or recovery generations
+        // regardless of which surface is authoritative. MVCC retries re-elect
+        // inside the retried transaction, so a rolled-back attempt never
+        // burns an id.
         let id_allocator = pool.message_id_allocator();
-        let db_floor = match read_messages_id_floor(cx, &tracked).await {
-            Outcome::Ok(floor) => floor,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        };
         let storage_root = match pool.validated_storage_root("message creation archive allocator") {
             Ok(storage_root) => storage_root,
             Err(error) => return Outcome::Err(error),
         };
-        let message_id = match id_allocator.allocate(cx, db_floor, storage_root).await {
-            Outcome::Ok(id) => id,
+        let archive_seed = match id_allocator.archive_seed(cx, storage_root).await {
+            Outcome::Ok(seed) => seed,
             Outcome::Err(error) => return Outcome::Err(error),
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
@@ -8005,7 +8073,7 @@ async fn create_message_with_recipients_impl(
                     attachments,
                     recipients,
                     now,
-                    message_id,
+                    archive_seed,
                     idempotency,
                     idempotency_expires_ts,
                 )
@@ -8261,7 +8329,7 @@ async fn create_message_with_recipients_tx(
     attachments: &str,
     recipients: &[(i64, &str)],
     now: i64,
-    message_id: i64,
+    archive_seed: i64,
     idempotency: Option<IdempotencyClaim<'_>>,
     idempotency_expires_ts: i64,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
@@ -8310,6 +8378,18 @@ async fn create_message_with_recipients_tx(
         cx,
         tracked,
         ensure_message_participants_active_in_tx(cx, tracked, sender_id, recipients).await
+    );
+
+    // Elect the canonical id durably inside this transaction, AFTER the
+    // idempotency gate so a replayed key never burns a fresh id, and BEFORE
+    // any write that references it. br-sa58k: this is what makes the election
+    // atomic across independent OS processes — the transaction's writer
+    // reservation serializes every attach process on the same durable
+    // `sqlite_sequence` row.
+    let message_id = try_in_tx!(
+        cx,
+        tracked,
+        elect_message_id_in_tx(cx, tracked, archive_seed).await
     );
 
     // Fetch recipient names to build recipients_json
@@ -19635,67 +19715,186 @@ mod tests {
     }
 
     #[test]
-    fn messages_id_floor_uses_maximum_across_duplicate_sequence_rows() {
+    fn message_id_election_starts_above_sequence_and_live_max() {
         use asupersync::runtime::RuntimeBuilder;
 
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("message-id-floor-duplicate-sequence.db");
+        let (cx, pool, _dir) = setup_test_pool("message-id-election-first.db");
         rt.block_on(async {
             let conn = acquire_conn(&cx, &pool)
                 .await
                 .into_result()
                 .expect("acquire connection");
-            conn.execute_raw(
-                "DELETE FROM sqlite_sequence WHERE name = 'messages'; \
-                 INSERT INTO sqlite_sequence(name, seq) VALUES ('messages', 7); \
-                 INSERT INTO sqlite_sequence(name, seq) VALUES ('messages', 42); \
-                 INSERT INTO sqlite_sequence(name, seq) VALUES ('messages', 19);",
-            )
-            .expect("seed duplicate sequence rows");
             let tracked = tracked(&*conn);
 
-            let outcome = read_messages_id_floor(&cx, &tracked).await;
-            assert!(
-                matches!(&outcome, Outcome::Ok(42)),
-                "the aggregate must use MAX(seq) across every duplicate row; got {outcome:?}"
+            try_in_tx!(&cx, &tracked, begin_concurrent_tx(&cx, &tracked).await);
+            let first = try_in_tx!(
+                &cx,
+                &tracked,
+                elect_message_id_in_tx(&cx, &tracked, 0).await
             );
+            let second = try_in_tx!(
+                &cx,
+                &tracked,
+                elect_message_id_in_tx(&cx, &tracked, 0).await
+            );
+            try_in_tx!(&cx, &tracked, commit_tx(&cx, &tracked).await);
+
+            assert_eq!(first, 1, "an empty mailbox elects id 1");
+            assert_eq!(second, 2, "each election advances the durable row by one");
+            Outcome::Ok(())
         });
     }
 
     #[test]
-    fn messages_id_floor_never_coerces_failure_outcomes_or_empty_rows_to_zero() {
-        let error = decode_messages_id_floor_outcome(Outcome::Err(DbError::Sqlite(
-            "injected floor query failure".to_string(),
-        )));
-        assert!(matches!(
-            error,
-            Outcome::Err(DbError::Sqlite(message))
-                if message == "injected floor query failure"
-        ));
+    fn message_id_election_rebases_on_live_max_id_and_archive_seed() {
+        use asupersync::runtime::RuntimeBuilder;
 
-        let expected_cancel = CancelReason::user("injected floor cancellation");
-        let cancelled =
-            decode_messages_id_floor_outcome(Outcome::Cancelled(expected_cancel.clone()));
-        assert!(matches!(
-            cancelled,
-            Outcome::Cancelled(reason) if reason == expected_cancel
-        ));
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("message-id-election-rebase.db");
+        rt.block_on(async {
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            // Model the #176 degraded engine with foreign keys disabled: the
+            // fixture rows reference projects/senders that were never seeded.
+            conn.execute_raw("PRAGMA foreign_keys = OFF;")
+                .expect("disable foreign keys for fixture");
+            // Model the #176 degraded engine: an explicit-id row is durable
+            // but the engine failed to advance sqlite_sequence for it.
+            conn.execute_raw(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, \
+                     importance, ack_required, created_ts, attachments) \
+                 VALUES (100, 1, 1, 'degraded', 'body', 'normal', 0, 1, '[]');",
+            )
+            .expect("seed explicit-id row");
+            let tracked = tracked(&*conn);
 
-        let expected_panic = asupersync::PanicPayload::new("injected floor panic");
-        let panicked = decode_messages_id_floor_outcome(Outcome::Panicked(expected_panic.clone()));
-        assert!(matches!(
-            panicked,
-            Outcome::Panicked(payload) if payload == expected_panic
-        ));
+            try_in_tx!(&cx, &tracked, begin_concurrent_tx(&cx, &tracked).await);
+            let with_lagging_sequence = try_in_tx!(
+                &cx,
+                &tracked,
+                elect_message_id_in_tx(&cx, &tracked, 0).await
+            );
+            // A fresh connection in the same process has not scanned any
+            // archive: the seed input must still lift the floor above 250.
+            let with_archive_seed = try_in_tx!(
+                &cx,
+                &tracked,
+                elect_message_id_in_tx(&cx, &tracked, 250).await
+            );
+            try_in_tx!(&cx, &tracked, commit_tx(&cx, &tracked).await);
 
-        let empty = decode_messages_id_floor_outcome(Outcome::Ok(Vec::new()));
-        assert!(
-            matches!(empty, Outcome::Err(DbError::Internal(message)) if message.contains(
-                "exactly one"
-            ))
-        );
+            assert_eq!(
+                with_lagging_sequence, 101,
+                "the election must re-base on the live MAX(id), not the stale sequence"
+            );
+            assert_eq!(
+                with_archive_seed, 251,
+                "the archive seed must lift the floor while the archive is ahead"
+            );
+            Outcome::Ok(())
+        });
+    }
+
+    #[test]
+    fn message_id_election_fails_closed_at_row_id_exhaustion() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("message-id-election-exhaustion.db");
+        rt.block_on(async {
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            // The allocator row must already exist: an absent row would be
+            // (re)seeded from MAX(id)=0 and the election would succeed.
+            conn.execute_raw(
+                "DELETE FROM sqlite_sequence WHERE name = 'messages'; \
+                 INSERT INTO sqlite_sequence (name, seq) \
+                 VALUES ('messages', 9223372036854775807);",
+            )
+            .expect("seed exhausted allocator row");
+            conn.execute_raw(
+                "UPDATE sqlite_sequence SET seq = 9223372036854775807 \
+                 WHERE name = 'messages';",
+            )
+            .expect("advance seeded allocator row to exhaustion");
+            let tracked = tracked(&*conn);
+
+            try_in_tx!(&cx, &tracked, begin_concurrent_tx(&cx, &tracked).await);
+            let outcome = elect_message_id_in_tx(&cx, &tracked, 0).await;
+            assert!(matches!(
+                &outcome,
+                Outcome::Err(error)
+                    if error.to_string().contains("exhausted the positive i64 row-id range")
+            ));
+            // The failure must have rolled the transaction back: the durable
+            // row stays untouched and no partial election commits.
+            let seq_rows = traw_query(
+                &cx,
+                &tracked,
+                "SELECT COALESCE(MAX(seq), 0) AS seq FROM sqlite_sequence WHERE name = 'messages'",
+                &[],
+            )
+            .await;
+            let Outcome::Ok(rows) = seq_rows else {
+                panic!("post-rollback sequence read must succeed")
+            };
+            assert_eq!(rows[0].get_named::<i64>("seq").unwrap(), i64::MAX);
+            Outcome::Ok(())
+        });
+    }
+
+    #[test]
+    fn message_id_election_rolls_back_with_its_transaction() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("message-id-election-rollback.db");
+        rt.block_on(async {
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            let tracked = tracked(&*conn);
+
+            try_in_tx!(&cx, &tracked, begin_concurrent_tx(&cx, &tracked).await);
+            let elected = try_in_tx!(
+                &cx,
+                &tracked,
+                elect_message_id_in_tx(&cx, &tracked, 0).await
+            );
+            assert_eq!(elected, 1);
+            rollback_tx(&cx, &tracked).await;
+
+            let seq_rows = traw_query(
+                &cx,
+                &tracked,
+                "SELECT COUNT(*) AS row_count FROM sqlite_sequence WHERE name = 'messages'",
+                &[],
+            )
+            .await;
+            let Outcome::Ok(rows) = seq_rows else {
+                panic!("post-rollback sequence read must succeed")
+            };
+            assert_eq!(
+                rows[0].get_named::<i64>("row_count").unwrap(),
+                0,
+                "a rolled-back election must not persist the allocator row"
+            );
+            Outcome::Ok(())
+        });
     }
 
     fn setup_test_pool(db_name: &str) -> (Cx, DbPool, tempfile::TempDir) {

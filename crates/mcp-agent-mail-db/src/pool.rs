@@ -19449,21 +19449,12 @@ mod tests {
             "normalized aliases of one SQLite file must share an allocator"
         );
 
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-        let first_allocator = first_pool.message_id_allocator();
-        let first_id = rt.block_on(async {
-            let cx = Cx::current().expect("runtime installs allocator context");
-            first_allocator.allocate(&cx, 0, &storage_root).await
-        });
-        let second_allocator = second_pool.message_id_allocator();
-        let second_id = rt.block_on(async {
-            let cx = Cx::current().expect("runtime installs allocator context");
-            second_allocator.allocate(&cx, 0, &storage_root).await
-        });
-        assert!(matches!(first_id, Outcome::Ok(1)));
-        assert!(matches!(second_id, Outcome::Ok(2)));
+        // Registry sharing still matters: both pools funnel their archive
+        // seeds through one allocator Arc. Distinct *elected ids* across
+        // independent pools/processes are proven by the in-transaction
+        // election (`elect_message_id_in_tx`) and the multi-process
+        // integration test, which exercise the durable `sqlite_sequence`
+        // authority rather than process-local state.
     }
 
     #[cfg(unix)]
@@ -19629,7 +19620,7 @@ mod tests {
             old_barrier.wait();
             runtime.block_on(async move {
                 let cx = Cx::current().expect("runtime installs allocator context");
-                old_allocator.allocate(&cx, 0, &old_storage_root).await
+                old_allocator.archive_seed(&cx, &old_storage_root).await
             })
         });
         let replacement_barrier = Arc::clone(&barrier);
@@ -19637,10 +19628,9 @@ mod tests {
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
                 .build()
                 .expect("build replacement allocator runtime");
-            replacement_barrier.wait();
             runtime.block_on(async move {
                 let cx = Cx::current().expect("runtime installs allocator context");
-                replacement_allocator.allocate(&cx, 0, &storage_root).await
+                replacement_allocator.archive_seed(&cx, &storage_root).await
             })
         });
         barrier.wait();
@@ -19653,7 +19643,7 @@ mod tests {
             replacement_handle
                 .join()
                 .expect("join replacement allocator"),
-            Outcome::Ok(1)
+            Outcome::Ok(0)
         ));
     }
 
@@ -19716,10 +19706,27 @@ mod tests {
             .into_result()
             .expect("first message");
             assert_eq!(first.id, Some(1));
-            // The allocator handed out id 1 and tracks it — proving the create
-            // path routes through it rather than relying solely on the live
-            // SQLite's AUTOINCREMENT.
-            assert_eq!(pool.message_id_allocator().current_high_water(), 1);
+            // The in-transaction election advanced the durable allocator row
+            // (`sqlite_sequence['messages']`) — proving the create path
+            // routes through the durable election rather than relying on the
+            // live SQLite's AUTOINCREMENT.
+            let pooled = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("acquire connection to read the durable allocator row");
+            let seq_rows = pooled
+                .query_sync(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'messages'",
+                    &[],
+                )
+                .expect("read durable allocator row");
+            assert_eq!(seq_rows.len(), 1, "exactly one allocator row");
+            assert_eq!(
+                seq_rows[0].get_named::<i64>("seq").expect("seq value"),
+                1,
+                "the election advanced the durable row to the committed id"
+            );
 
             let second = crate::queries::create_message(
                 &cx, &pool, project_id, sender_id, "two", "body", None, "normal", false, "{}",
@@ -19728,15 +19735,33 @@ mod tests {
             .into_result()
             .expect("second message");
             assert_eq!(second.id, Some(2));
-            // Tracked on the wrapper that shares the same Arc — proving the
-            // high-water is process-wide for this database, not per-wrapper.
-            assert_eq!(pool2.message_id_allocator().current_high_water(), 2);
+            // Tracked on the wrapper that shares the same Arc — the durable
+            // election row is database state, so every wrapper observes the
+            // same allocator authority.
+            let pooled_via_wrapper = pool2
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("acquire connection via shared wrapper");
+            let seq_rows_via_wrapper = pooled_via_wrapper
+                .query_sync(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'messages'",
+                    &[],
+                )
+                .expect("read durable allocator row via shared wrapper");
+            assert_eq!(seq_rows_via_wrapper.len(), 1);
+            assert_eq!(
+                seq_rows_via_wrapper[0]
+                    .get_named::<i64>("seq")
+                    .expect("seq value"),
+                2
+            );
 
-            // The allocator's reuse-proofness when the durable sequence
-            // regresses (the actual #176 suspect-mode failure) is covered by
-            // the `id_floor::tests::allocator_reuse_proof_when_durable_floor_regresses`
-            // unit test; here we have established that message creation routes
-            // through that same shared allocator.
+            // The election's reuse-proofness when the durable sequence
+            // regresses or another OS process races the same mailbox is
+            // covered by the id_floor unit tests and the multi-process
+            // integration test; here we established that message creation
+            // routes through the durable election inside its transaction.
         });
     }
 

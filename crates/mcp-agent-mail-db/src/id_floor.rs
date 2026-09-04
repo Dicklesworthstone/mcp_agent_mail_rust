@@ -22,7 +22,7 @@ use std::future::Future;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use asupersync::runtime::JoinError;
 use asupersync::sync::{LockError, Mutex as AsyncMutex, OnceCell, OwnedMutexGuard};
@@ -475,8 +475,8 @@ where
     Ok(Some(persisted_floor))
 }
 
-/// Process-wide, per-database monotonic message-id allocator
-/// (mcp_agent_mail#176).
+/// Process-wide, per-database canonical archive seed for message-id election
+/// (mcp_agent_mail#176, br-sa58k).
 ///
 /// # Why this exists
 ///
@@ -493,25 +493,31 @@ where
 /// `__<id>.md` file, and the sticky durability latch refuses all further
 /// writes — a *non-terminating* recovery.
 ///
-/// This allocator makes id allocation reuse-proof regardless of which surface
-/// is authoritative. It derives the next id as
-/// `max(in_memory_high_water, db_floor, archive_max) + 1` **atomically per
-/// allocation** (the fix direction the issue recommends), so two consecutive
-/// allocations in one process can never collide even when the live SQLite's
-/// durable state fails to advance between them.
+/// Ids are therefore elected by advancing the durable
+/// `sqlite_sequence['messages']` allocator **inside the message-insert
+/// transaction** (see `elect_message_id_in_tx` in `queries.rs`): the
+/// transaction's writer reservation makes the read-modify-write atomic across
+/// independent OS processes, and the elected value commits or rolls back with
+/// the message row itself. The durable row is additionally re-based on the
+/// live `MAX(id)` at every election, so the degraded-engine mode stays
+/// reuse-proof without per-process memory.
+///
+/// This struct's remaining job is the one input the database cannot know on
+/// its own: the canonical archive's high-water mark. The scan is deduplicated
+/// per process with a cancel-aware `OnceCell` (concurrent first callers wait
+/// without spinning; a failed, cancelled, or panicked scan stays retryable)
+/// and is consumed only while the durable election floor would otherwise
+/// start below what the archive already considers canonical.
 ///
 /// File-backed allocators are keyed by normalized SQLite identity (see
 /// [`DbPool::message_id_allocator`](crate::DbPool::message_id_allocator)), so
-/// independent pools for the same live database share one high-water mark.
+/// independent pools for the same live database share one scan.
 /// In-memory databases remain scoped to their underlying pool `Arc`.
 pub struct MessageIdAllocator {
-    /// The largest id this process has handed out for this database.
-    /// `0` means "no id allocated yet" (the first allocation seeds it).
-    high_water: AtomicI64,
     /// Terminal invalidation published before recovery exposes a replacement
     /// allocator. Surviving wrappers of an independently constructed old pool
-    /// retain this allocator, so they must fail closed instead of diverging
-    /// from the replacement's high-water authority.
+    /// retain this allocator, so they must fail closed instead of electing
+    /// ids into or beside the replacement generation.
     retired: AtomicBool,
     /// The authoritative archive floor. `OnceCell::get_or_try_init` gives
     /// concurrent async callers a non-spinning wait, and resets to uninitialized
@@ -528,7 +534,6 @@ impl std::fmt::Debug for MessageIdAllocator {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("MessageIdAllocator")
-            .field("high_water", &self.current_high_water())
             .field("retired", &self.is_retired())
             .field("archive_floor", &self.archive_floor.get().copied())
             .finish_non_exhaustive()
@@ -604,23 +609,22 @@ async fn scan_archive_floor(cx: &Cx, storage_root: PathBuf) -> Outcome<i64, DbEr
 }
 
 impl MessageIdAllocator {
-    /// Create a fresh allocator with no ids handed out yet. Callers should
+    /// Create a fresh allocator with no archive seed yet. Callers should
     /// resolve a *shared* allocator per database via
     /// [`DbPool::message_id_allocator`](crate::DbPool::message_id_allocator)
     /// rather than constructing one directly.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            high_water: AtomicI64::new(0),
             retired: AtomicBool::new(false),
             archive_floor: OnceCell::new(),
             archive_init_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 
-    /// Whether the archive max still needs to be folded into the high-water
-    /// mark. This is exposed for diagnostics; callers should let
-    /// [`MessageIdAllocator::allocate`] decide whether to invoke its archive
+    /// Whether the canonical archive still needs to be scanned to seed the
+    /// durable election row. This is exposed for diagnostics; callers should
+    /// let [`MessageIdAllocator::archive_seed`] decide whether to invoke the
     /// scanner so scan completion cannot be published prematurely.
     #[must_use]
     pub fn needs_archive_seed(&self) -> bool {
@@ -646,12 +650,28 @@ impl MessageIdAllocator {
         self.retired.load(Ordering::Acquire)
     }
 
-    async fn allocate_with<F, Fut>(
-        &self,
-        cx: &Cx,
-        db_floor: i64,
-        archive_scan: F,
-    ) -> Outcome<i64, DbError>
+    /// Produce the once-per-process canonical archive seed used to start the
+    /// durable election row (see `elect_message_id_in_tx` in `queries.rs`).
+    ///
+    /// The scan runs at most once successfully; concurrent first callers wait
+    /// without spinning, and a failed, cancelled, or panicked scan remains
+    /// retryable. Recovery can retire the allocator while a scan is awaited —
+    /// a retired allocator never publishes a seed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the archive scan error without publishing a floor. Cancellation
+    /// and panic retain their exact [`Outcome`] variants.
+    pub async fn archive_seed(&self, cx: &Cx, storage_root: &Path) -> Outcome<i64, DbError> {
+        let storage_root = storage_root.to_path_buf();
+        self.archive_seed_with(
+            cx,
+            || async move { scan_archive_floor(cx, storage_root).await },
+        )
+        .await
+    }
+
+    async fn archive_seed_with<F, Fut>(&self, cx: &Cx, archive_scan: F) -> Outcome<i64, DbError>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Outcome<i64, DbError>>,
@@ -659,141 +679,62 @@ impl MessageIdAllocator {
         if self.is_retired() {
             return Outcome::Err(Self::retired_error());
         }
-        if let Some(reason) = cancellation_reason(cx, "message id allocation cancelled") {
+        if let Some(reason) = cancellation_reason(cx, "message id archive scan cancelled") {
             return Outcome::Cancelled(reason);
         }
-        let archive_floor = if let Some(floor) = self.archive_floor.get() {
-            *floor
-        } else {
-            let _init_guard =
-                match OwnedMutexGuard::lock(Arc::clone(&self.archive_init_lock), cx).await {
-                    Ok(guard) => guard,
-                    Err(LockError::Cancelled) => {
-                        return Outcome::Cancelled(cx.cancel_reason().unwrap_or_else(|| {
-                            CancelReason::user("message id archive initialization cancelled")
-                        }));
-                    }
-                    Err(LockError::TimedOut(_)) => {
-                        return Outcome::Cancelled(
-                            cx.cancel_reason().unwrap_or_else(CancelReason::deadline),
-                        );
-                    }
-                    Err(error) => {
-                        return Outcome::Err(DbError::Internal(format!(
-                            "message id archive initialization lock failed: {error}"
-                        )));
-                    }
-                };
-            if self.is_retired() {
-                return Outcome::Err(Self::retired_error());
+        if let Some(floor) = self.archive_floor.get() {
+            return Outcome::Ok(*floor);
+        }
+        let _init_guard = match OwnedMutexGuard::lock(Arc::clone(&self.archive_init_lock), cx).await
+        {
+            Ok(guard) => guard,
+            Err(LockError::Cancelled) => {
+                return Outcome::Cancelled(cx.cancel_reason().unwrap_or_else(|| {
+                    CancelReason::user("message id archive initialization cancelled")
+                }));
             }
-            if let Some(reason) = cancellation_reason(cx, "message id allocation cancelled") {
-                return Outcome::Cancelled(reason);
+            Err(LockError::TimedOut(_)) => {
+                return Outcome::Cancelled(
+                    cx.cancel_reason().unwrap_or_else(CancelReason::deadline),
+                );
             }
-            match self
-                .archive_floor
-                .get_or_try_init(|| async {
-                    match archive_scan().await {
-                        Outcome::Ok(floor) => Ok(floor.max(0)),
-                        Outcome::Err(error) => Err(ArchiveFloorInitError::Db(Box::new(error))),
-                        Outcome::Cancelled(reason) => Err(ArchiveFloorInitError::Cancelled(reason)),
-                        Outcome::Panicked(payload) => Err(ArchiveFloorInitError::Panicked(payload)),
-                    }
-                })
-                .await
-            {
-                Ok(floor) => *floor,
-                Err(ArchiveFloorInitError::Db(error)) => return Outcome::Err(*error),
-                Err(ArchiveFloorInitError::Cancelled(reason)) => {
-                    return Outcome::Cancelled(reason);
-                }
-                Err(ArchiveFloorInitError::Panicked(payload)) => {
-                    return Outcome::Panicked(payload);
-                }
+            Err(error) => {
+                return Outcome::Err(DbError::Internal(format!(
+                    "message id archive initialization lock failed: {error}"
+                )));
             }
         };
-        // Recovery can retire the allocator while its one-time archive scan is
-        // awaited. Never let that stale initialization publish a post-recovery
-        // message id.
         if self.is_retired() {
             return Outcome::Err(Self::retired_error());
         }
-        if let Some(reason) = cancellation_reason(cx, "message id allocation cancelled") {
+        if let Some(reason) = cancellation_reason(cx, "message id archive scan cancelled") {
             return Outcome::Cancelled(reason);
         }
-
-        let mut current = self.high_water.load(Ordering::Acquire);
-        loop {
-            if self.is_retired() {
-                return Outcome::Err(Self::retired_error());
-            }
-            let base = current.max(db_floor).max(archive_floor).max(0);
-            let Some(next) = base.checked_add(1) else {
-                return Outcome::Err(DbError::Internal(
-                    "message id allocator exhausted the positive i64 row-id range".to_string(),
-                ));
-            };
-            match self.high_water.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    // Linearize invalidation against the successful CAS. If
-                    // recovery retired this allocator concurrently, burn the
-                    // tentative local high-water value but never return it to
-                    // a caller that could write through the old pool.
-                    if self.is_retired() {
-                        return Outcome::Err(Self::retired_error());
-                    }
-                    return Outcome::Ok(next);
+        match self
+            .archive_floor
+            .get_or_try_init(|| async {
+                match archive_scan().await {
+                    Outcome::Ok(floor) => Ok(floor.max(0)),
+                    Outcome::Err(error) => Err(ArchiveFloorInitError::Db(Box::new(error))),
+                    Outcome::Cancelled(reason) => Err(ArchiveFloorInitError::Cancelled(reason)),
+                    Outcome::Panicked(payload) => Err(ArchiveFloorInitError::Panicked(payload)),
                 }
-                Err(observed) => {
-                    if let Some(reason) = cancellation_reason(cx, "message id allocation cancelled")
-                    {
-                        return Outcome::Cancelled(reason);
-                    }
-                    current = observed;
+            })
+            .await
+        {
+            Ok(floor) => {
+                // Recovery can retire the allocator while its one-time archive
+                // scan is awaited. Never publish a seed from a retired
+                // allocator: the replacement generation rescans for itself.
+                if self.is_retired() {
+                    return Outcome::Err(Self::retired_error());
                 }
+                Outcome::Ok(*floor)
             }
+            Err(ArchiveFloorInitError::Db(error)) => Outcome::Err(*error),
+            Err(ArchiveFloorInitError::Cancelled(reason)) => Outcome::Cancelled(reason),
+            Err(ArchiveFloorInitError::Panicked(payload)) => Outcome::Panicked(payload),
         }
-    }
-
-    /// Allocate the next message id.
-    ///
-    /// `db_floor` is the maximum of the live `messages.id` and every
-    /// `sqlite_sequence.seq` row for `messages`. The archive is scanned at
-    /// most once successfully; concurrent first allocations wait without
-    /// spinning, and a failed/cancelled/panicked scan remains retryable.
-    ///
-    /// Returns an id strictly greater than `db_floor`, the archive floor, and
-    /// every id previously handed out by this allocator. The returned id must
-    /// be used for both the DB row and canonical archive filename.
-    ///
-    /// # Errors
-    ///
-    /// Returns the archive scan error without publishing a floor, or
-    /// [`DbError::Internal`] when the positive SQLite row-id range is
-    /// exhausted. Cancellation and panic retain their exact [`Outcome`]
-    /// variants.
-    pub async fn allocate(
-        &self,
-        cx: &Cx,
-        db_floor: i64,
-        storage_root: &Path,
-    ) -> Outcome<i64, DbError> {
-        let storage_root = storage_root.to_path_buf();
-        self.allocate_with(cx, db_floor, || async move {
-            scan_archive_floor(cx, storage_root).await
-        })
-        .await
-    }
-
-    /// The largest id handed out so far (`0` if none). Test/diagnostic use.
-    #[must_use]
-    pub fn current_high_water(&self) -> i64 {
-        self.high_water.load(Ordering::Acquire)
     }
 }
 
@@ -1221,210 +1162,78 @@ mod tests {
             .block_on(future)
     }
 
-    fn allocate_from_archive(
+    fn seed_from_archive(
         allocator: &MessageIdAllocator,
-        db_floor: i64,
         storage_root: &Path,
     ) -> Outcome<i64, DbError> {
         block_on(async {
             let cx = Cx::current().expect("runtime installs allocator context");
-            allocator.allocate(&cx, db_floor, storage_root).await
+            allocator.archive_seed(&cx, storage_root).await
         })
     }
 
-    fn expect_allocated(outcome: Outcome<i64, DbError>) -> i64 {
+    fn expect_seeded(outcome: Outcome<i64, DbError>) -> i64 {
         match outcome {
-            Outcome::Ok(id) => id,
-            other => panic!("expected successful allocation, got {other:?}"),
+            Outcome::Ok(floor) => floor,
+            other => panic!("expected successful archive seed, got {other:?}"),
         }
     }
 
     #[test]
-    fn allocator_hands_out_strictly_increasing_ids() {
-        let alloc = MessageIdAllocator::new();
-        let cx = Cx::for_testing();
-        // First allocation seeds from the larger of db_floor / archive_seed.
-        assert_eq!(
-            expect_allocated(block_on(
-                alloc.allocate_with(&cx, 1128, || async { Outcome::Ok(1128) })
-            )),
-            1129
-        );
-        // db_floor stays at 1128 (the durable allocator failed to advance,
-        // exactly the #176 suspect-mode scenario), but the in-memory
-        // high-water carries forward so the next id is still fresh. The scan
-        // closure must not run after the authoritative floor is published.
-        assert_eq!(
-            expect_allocated(block_on(alloc.allocate_with(&cx, 1128, || async {
-                panic!("published archive floor must be reused")
-            }))),
-            1130
-        );
-        assert_eq!(
-            expect_allocated(block_on(alloc.allocate_with(&cx, 1128, || async {
-                panic!("published archive floor must be reused")
-            }))),
-            1131
-        );
-        assert_eq!(alloc.current_high_water(), 1131);
-    }
-
-    #[test]
-    fn allocator_reuse_proof_when_durable_floor_regresses() {
-        let alloc = MessageIdAllocator::new();
-        let cx = Cx::for_testing();
-        let first = expect_allocated(block_on(
-            alloc.allocate_with(&cx, 1128, || async { Outcome::Ok(1128) }),
-        ));
-        assert_eq!(first, 1129);
-        let second = expect_allocated(block_on(alloc.allocate_with(&cx, 1000, || async {
-            panic!("archive floor must already be initialized")
-        })));
-        assert!(
-            second > first,
-            "allocator re-issued or regressed: first={first} second={second}"
-        );
-        assert_eq!(second, 1130);
-    }
-
-    #[test]
-    fn allocator_starts_at_one_for_empty_db_and_archive() {
-        let alloc = MessageIdAllocator::new();
-        let cx = Cx::for_testing();
-        assert_eq!(
-            expect_allocated(block_on(
-                alloc.allocate_with(&cx, 0, || async { Outcome::Ok(0) })
-            )),
-            1
-        );
-        assert_eq!(
-            expect_allocated(block_on(alloc.allocate_with(&cx, 0, || async {
-                panic!("archive floor must already be initialized")
-            }))),
-            2
-        );
-    }
-
-    #[test]
-    fn allocator_archive_seed_gate_flips_once() {
-        let alloc = MessageIdAllocator::new();
-        let cx = Cx::for_testing();
-        assert!(alloc.needs_archive_seed());
-        assert_eq!(
-            expect_allocated(block_on(
-                alloc.allocate_with(&cx, 0, || async { Outcome::Ok(0) })
-            )),
-            1
-        );
-        assert!(!alloc.needs_archive_seed());
-    }
-
-    #[test]
-    fn allocator_scans_archive_only_until_floor_is_published() {
+    fn archive_seed_scans_once_and_retains_floor() {
         let alloc = MessageIdAllocator::new();
         let cx = Cx::for_testing();
         let scans = std::cell::Cell::new(0_u32);
-        let first = expect_allocated(block_on(alloc.allocate_with(&cx, 10, || async {
+        let first = expect_seeded(block_on(alloc.archive_seed_with(&cx, || async {
             scans.set(scans.get() + 1);
             Outcome::Ok(50)
         })));
-        let second = expect_allocated(block_on(alloc.allocate_with(&cx, 10, || async {
-            scans.set(scans.get() + 1);
-            Outcome::Ok(100)
+        let second = expect_seeded(block_on(alloc.archive_seed_with(&cx, || async {
+            panic!("published archive floor must be reused")
         })));
 
-        assert_eq!(first, 51);
-        assert_eq!(second, 52);
-        assert_eq!(scans.get(), 1);
-    }
-
-    #[test]
-    fn concurrent_allocator_initializes_once_and_allocates_unique_ids() {
-        let alloc = std::sync::Arc::new(MessageIdAllocator::new());
-        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
-        let scans = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (scan_started_tx, scan_started_rx) = std::sync::mpsc::channel();
-        let (release_scan_tx, release_scan_rx) = std::sync::mpsc::sync_channel(0);
-        let release_scan_rx = std::sync::Arc::new(std::sync::Mutex::new(release_scan_rx));
-
-        let mut handles = Vec::new();
-        for _ in 0..2 {
-            let alloc = std::sync::Arc::clone(&alloc);
-            let start = std::sync::Arc::clone(&start);
-            let scans = std::sync::Arc::clone(&scans);
-            let scan_started_tx = scan_started_tx.clone();
-            let release_scan_rx = std::sync::Arc::clone(&release_scan_rx);
-            handles.push(std::thread::spawn(move || {
-                let cx = Cx::for_testing();
-                start.wait();
-                block_on(alloc.allocate_with(&cx, 0, || async move {
-                    scans.fetch_add(1, Ordering::SeqCst);
-                    scan_started_tx.send(()).unwrap();
-                    release_scan_rx.lock().unwrap().recv().unwrap();
-                    Outcome::Ok(100)
-                }))
-            }));
-        }
-        drop(scan_started_tx);
-        start.wait();
-        scan_started_rx.recv().unwrap();
-        release_scan_tx.send(()).unwrap();
-
-        let mut ids = handles
-            .into_iter()
-            .map(|handle| expect_allocated(handle.join().unwrap()))
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        assert_eq!(ids, vec![101, 102]);
-        assert_eq!(
-            scans.load(Ordering::SeqCst),
-            1,
-            "concurrent first allocations must share one archive scan"
-        );
-    }
-
-    #[test]
-    fn allocator_fails_closed_when_row_id_space_is_exhausted() {
-        let alloc = MessageIdAllocator::new();
-        let cx = Cx::for_testing();
-        let outcome = block_on(alloc.allocate_with(&cx, i64::MAX, || async { Outcome::Ok(0) }));
-        let Outcome::Err(error) = outcome else {
-            panic!("row-id exhaustion must return an error")
-        };
-        assert!(
-            error.to_string().contains("exhausted"),
-            "unexpected exhaustion error: {error}"
-        );
-        assert_eq!(alloc.current_high_water(), 0);
+        assert_eq!(first, 50);
+        assert_eq!(second, 50);
+        assert_eq!(scans.get(), 1, "the archive scan must run exactly once");
         assert!(!alloc.needs_archive_seed());
     }
 
     #[test]
-    fn allocator_retries_real_archive_scan_after_frontmatter_error() {
+    fn archive_seed_clamps_negative_scan_results_to_zero() {
+        let alloc = MessageIdAllocator::new();
+        let cx = Cx::for_testing();
+        assert_eq!(
+            expect_seeded(block_on(
+                alloc.archive_seed_with(&cx, || async { Outcome::Ok(-7) })
+            )),
+            0,
+            "a scan can never publish a negative floor"
+        );
+        assert!(!alloc.needs_archive_seed());
+    }
+
+    #[test]
+    fn archive_seed_retries_real_scan_after_frontmatter_error() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("projects/proj/messages/2026/05/01__40.md");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "not canonical frontmatter").unwrap();
         let alloc = MessageIdAllocator::new();
-        let first = allocate_from_archive(&alloc, 0, dir.path());
+        let first = seed_from_archive(&alloc, dir.path());
         let Outcome::Err(error) = first else {
-            panic!("malformed archive must fail allocation")
+            panic!("malformed archive must fail the seed")
         };
         assert!(error.to_string().contains("frontmatter"));
         assert!(alloc.needs_archive_seed());
-        assert_eq!(alloc.current_high_water(), 0);
 
         fs::write(&path, "---json\n{\"id\":40}\n---\n").unwrap();
-        assert_eq!(
-            expect_allocated(allocate_from_archive(&alloc, 0, dir.path())),
-            41
-        );
+        assert_eq!(expect_seeded(seed_from_archive(&alloc, dir.path())), 40);
         assert!(!alloc.needs_archive_seed());
     }
 
     #[cfg(unix)]
     #[test]
-    fn allocator_retries_after_canonical_symlink_scan_error() {
+    fn archive_seed_retries_after_canonical_symlink_scan_error() {
         use std::os::unix::fs::symlink;
 
         let bad = tempdir().unwrap();
@@ -1437,18 +1246,14 @@ mod tests {
         let good = tempdir().unwrap();
         write_canonical_message(good.path(), "proj", "2026", "05", "01__88.md", 88);
         let alloc = MessageIdAllocator::new();
-        let first = allocate_from_archive(&alloc, 0, bad.path());
+        let first = seed_from_archive(&alloc, bad.path());
         assert!(matches!(
             first,
             Outcome::Err(error) if error.to_string().contains("symlinks are not authoritative")
         ));
         assert!(alloc.needs_archive_seed());
-        assert_eq!(alloc.current_high_water(), 0);
 
-        assert_eq!(
-            expect_allocated(allocate_from_archive(&alloc, 0, good.path())),
-            89
-        );
+        assert_eq!(expect_seeded(seed_from_archive(&alloc, good.path())), 88);
         assert!(!alloc.needs_archive_seed());
     }
 
@@ -1463,18 +1268,17 @@ mod tests {
         let alloc = MessageIdAllocator::new();
         let cx = Cx::for_testing();
 
-        let first = block_on(alloc.allocate(&cx, 0, dir.path()));
+        let seeded = block_on(alloc.archive_seed(&cx, dir.path()));
         assert_eq!(
-            expect_allocated(first),
-            89,
+            expect_seeded(seeded),
+            88,
             "inline scan must seed the archive floor"
         );
         assert!(!alloc.needs_archive_seed());
-        assert_eq!(alloc.current_high_water(), 89);
     }
 
     #[test]
-    fn retirement_during_awaited_archive_seed_prevents_id_publication() {
+    fn retirement_during_awaited_archive_seed_prevents_publication() {
         let alloc = Arc::new(MessageIdAllocator::new());
         let worker_alloc = Arc::clone(&alloc);
         let scan_started = Arc::new(std::sync::Barrier::new(2));
@@ -1483,7 +1287,7 @@ mod tests {
         let worker_release = Arc::clone(&scan_release);
         let handle = std::thread::spawn(move || {
             let cx = Cx::for_testing();
-            block_on(worker_alloc.allocate_with(&cx, 0, || async move {
+            block_on(worker_alloc.archive_seed_with(&cx, || async move {
                 worker_started.wait();
                 worker_release.wait();
                 Outcome::Ok(90)
@@ -1500,16 +1304,15 @@ mod tests {
             handle.join().expect("join allocator worker"),
             Outcome::Err(error) if error.to_string().contains("retired after database recovery")
         ));
-        assert_eq!(alloc.current_high_water(), 0);
         assert!(!alloc.needs_archive_seed());
     }
 
     #[test]
-    fn allocator_preserves_cancelled_outcome_and_retries_seed() {
+    fn archive_seed_preserves_cancelled_outcome_and_retries() {
         let alloc = MessageIdAllocator::new();
         let cx = Cx::for_testing();
         let expected = CancelReason::user("injected archive cancellation");
-        let first = block_on(alloc.allocate_with(&cx, 0, || {
+        let first = block_on(alloc.archive_seed_with(&cx, || {
             let expected = expected.clone();
             async move { Outcome::Cancelled(expected) }
         }));
@@ -1519,19 +1322,19 @@ mod tests {
         assert_eq!(observed, expected);
         assert!(alloc.needs_archive_seed());
         assert_eq!(
-            expect_allocated(block_on(
-                alloc.allocate_with(&cx, 0, || async { Outcome::Ok(40) })
+            expect_seeded(block_on(
+                alloc.archive_seed_with(&cx, || async { Outcome::Ok(40) })
             )),
-            41
+            40
         );
     }
 
     #[test]
-    fn allocator_preserves_panicked_outcome_and_retries_seed() {
+    fn archive_seed_preserves_panicked_outcome_and_retries() {
         let alloc = MessageIdAllocator::new();
         let cx = Cx::for_testing();
         let expected = PanicPayload::new("injected archive panic");
-        let first = block_on(alloc.allocate_with(&cx, 0, || {
+        let first = block_on(alloc.archive_seed_with(&cx, || {
             let expected = expected.clone();
             async move { Outcome::Panicked(expected) }
         }));
@@ -1541,10 +1344,10 @@ mod tests {
         assert_eq!(observed, expected);
         assert!(alloc.needs_archive_seed());
         assert_eq!(
-            expect_allocated(block_on(
-                alloc.allocate_with(&cx, 0, || async { Outcome::Ok(40) })
+            expect_seeded(block_on(
+                alloc.archive_seed_with(&cx, || async { Outcome::Ok(40) })
             )),
-            41
+            40
         );
     }
 }
