@@ -5067,7 +5067,7 @@ setup_single_toml_config() {
   local bearer_token
   bearer_token="$(resolve_setup_http_bearer_token)"
   local desired_auth_header=""
-  local tmp_file="${config_path}.tmp.mcp-agent-mail.$$"
+  local tmp_file=""
   local backup=""
 
   if [ -n "$bearer_token" ]; then
@@ -5075,23 +5075,167 @@ setup_single_toml_config() {
   fi
 
   if [ ! -f "$config_path" ]; then
-    # File doesn't exist — create it with just the MCP section
-    local parent_dir
-    parent_dir=$(dirname "$config_path")
-    mkdir -p "$parent_dir" 2>/dev/null || true
-
-    cat > "$config_path" <<TOMLEOF
-${section_header}
-url = "${desired_url}"
-startup_timeout_sec = ${desired_startup_timeout_sec}
-TOMLEOF
-    if [ -n "$desired_auth_header" ]; then
-      cat >> "$config_path" <<TOMLEOF
-http_headers = { Authorization = "${desired_auth_header}" }
-TOMLEOF
+    # File doesn't exist — create it with just the MCP section. Never open
+    # the destination through its pathname: a pre-existing leaf symlink or
+    # a hard link aliasing a tracked project file would receive the bearer
+    # token. Create through no-follow, component-verified, atomic
+    # replacement instead; without python3 that authority cannot be
+    # established, so fail closed.
+    if ! command -v python3 >/dev/null 2>&1; then
+      verbose "setup_toml_config:skip_no_python3 tool=${tool} path=${config_path}"
+      return 2
     fi
-    verbose "setup_toml_config:created tool=${tool} path=${config_path}"
-    return 0
+    local create_result
+    create_result=$(python3 - "$config_path" "$section_header" "$desired_url" "$desired_startup_timeout_sec" "$desired_auth_header" <<'PY'
+import os
+import stat
+import sys
+import time
+
+config_path, section_header, desired_url, desired_startup_timeout_sec, desired_auth_header = sys.argv[1:6]
+
+
+def path_has_symlink_component(path: str) -> bool:
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component:
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode):
+            return True
+    return False
+
+
+def ensure_real_directory_tree(path: str) -> None:
+    _, raw_tail = os.path.splitdrive(path)
+    if any(component == ".." for component in raw_tail.split(os.sep)):
+        raise OSError(f"refusing parent traversal in config directory: {path}")
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component or component == ".":
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            try:
+                os.mkdir(current)
+            except FileExistsError:
+                # Another process may have created the component after the
+                # lstat. Re-inspect it instead of assuming it is a directory.
+                pass
+            metadata = os.lstat(current)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise OSError(f"refusing symlinked config parent: {current}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError(f"config parent component is not a directory: {current}")
+
+
+def sync_parent_directory(path: str) -> None:
+    if os.name != "posix":
+        return
+    parent = os.path.dirname(path) or "."
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(parent, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_config_atomic(path: str, text: str, mode: int) -> None:
+    parent = os.path.dirname(path) or "."
+    ensure_real_directory_tree(parent)
+
+    basename = os.path.basename(path)
+    temp_path = ""
+    for attempt in range(1024):
+        candidate = os.path.join(
+            parent,
+            f".{basename}.{os.getpid()}.{time.time_ns()}.{attempt}.tmp",
+        )
+        try:
+            fd = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+            )
+        except FileExistsError:
+            continue
+        temp_path = candidate
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        break
+    if not temp_path:
+        raise OSError(f"could not create a unique temporary config next to {path}")
+
+    try:
+        target_metadata = os.lstat(path)
+    except FileNotFoundError:
+        target_metadata = None
+    if target_metadata is not None and not stat.S_ISREG(target_metadata.st_mode):
+        raise OSError(f"refusing non-regular config target: {path}")
+    if path_has_symlink_component(parent):
+        raise OSError(f"refusing symlinked config parent: {parent}")
+    # Renaming onto the target replaces the directory entry itself, so a
+    # hard link aliasing the previous inode keeps its original bytes and
+    # metadata untouched.
+    os.replace(temp_path, path)
+    sync_parent_directory(path)
+
+
+if path_has_symlink_component(config_path):
+    print("ERROR:symlink_path")
+    raise SystemExit(0)
+lines = [
+    section_header,
+    f'url = "{desired_url}"',
+    f"startup_timeout_sec = {desired_startup_timeout_sec}",
+]
+if desired_auth_header:
+    lines.append(f'http_headers = {{ Authorization = "{desired_auth_header}" }}')
+try:
+    ensure_real_directory_tree(os.path.dirname(config_path) or ".")
+except OSError:
+    print("ERROR:unsafe_parent")
+    raise SystemExit(0)
+write_config_atomic(config_path, "\n".join(lines) + "\n", 0o600)
+print("OK:created")
+PY
+) || true
+    case "$create_result" in
+      OK:created)
+        verbose "setup_toml_config:created tool=${tool} path=${config_path}"
+        return 0
+        ;;
+      ERROR:*)
+        verbose "setup_toml_config:create_refused tool=${tool} path=${config_path} ${create_result}"
+        return 2
+        ;;
+      *)
+        verbose "setup_toml_config:unknown_create_result tool=${tool} result=${create_result}"
+        return 2
+        ;;
+    esac
+  fi
+
+  # The awk rewrite lands on a private, O_EXCL-created temporary in the
+  # destination directory; a predictable name could be pre-created as a
+  # symlink so the credential-bearing rewrite flows into someone else's
+  # inode. The final mv below is a rename, which never follows a leaf.
+  if ! tmp_file=$(mktemp "${config_path}.tmp.mcp-agent-mail.XXXXXX"); then
+    verbose "setup_toml_config:error tool=${tool} path=${config_path} reason=tmp_create_failed"
+    return 2
   fi
 
   if ! awk \
@@ -5703,8 +5847,9 @@ setup_single_opencode_json_config() {
 import json
 import os
 import re
-import shutil
+import stat
 import sys
+import time
 from datetime import datetime, timezone
 
 config_path, desired_url, desired_auth_header = sys.argv[1:4]
@@ -5712,16 +5857,151 @@ config_path, desired_url, desired_auth_header = sys.argv[1:4]
 ENTRY_NAMES = ("mcp-agent-mail", "mcp_agent_mail")
 
 
-def load_text(path: str) -> str:
+def path_has_symlink_component(path: str) -> bool:
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component:
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode):
+            return True
+    return False
+
+
+def ensure_real_directory_tree(path: str) -> None:
+    _, raw_tail = os.path.splitdrive(path)
+    if any(component == ".." for component in raw_tail.split(os.sep)):
+        raise OSError(f"refusing parent traversal in config directory: {path}")
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component or component == ".":
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            try:
+                os.mkdir(current)
+            except FileExistsError:
+                # Another process may have created the component after the
+                # lstat. Re-inspect it instead of assuming it is a directory.
+                pass
+            metadata = os.lstat(current)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise OSError(f"refusing symlinked config parent: {current}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError(f"config parent component is not a directory: {current}")
+
+
+def load_config_bytes(path: str):
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return handle.read()
+        # O_NONBLOCK prevents a hostile or accidental FIFO target from
+        # hanging the installer before we can reject its file type.
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        fd = os.open(path, flags)
     except FileNotFoundError:
-        return ""
+        return b"", None
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(fd)
+        raise ValueError("config target is not a regular file")
+    with os.fdopen(fd, "rb") as handle:
+        raw = handle.read()
+    return raw, stat.S_IMODE(metadata.st_mode)
+
+
+def sync_parent_directory(path: str) -> None:
+    if os.name != "posix":
+        return
+    parent = os.path.dirname(path) or "."
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(parent, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_backup(path: str, raw: bytes, mode: int) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    for attempt in range(1024):
+        suffix = time.time_ns()
+        backup = f"{path}.{stamp}.{suffix}.{attempt}.bak"
+        try:
+            fd = os.open(
+                backup,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+            )
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        sync_parent_directory(backup)
+        return backup
+    raise OSError(f"could not create a unique backup for {path}")
+
+
+def write_config_atomic(path: str, text: str, mode: int) -> None:
+    parent = os.path.dirname(path) or "."
+    ensure_real_directory_tree(parent)
+
+    basename = os.path.basename(path)
+    temp_path = ""
+    for attempt in range(1024):
+        candidate = os.path.join(
+            parent,
+            f".{basename}.{os.getpid()}.{time.time_ns()}.{attempt}.tmp",
+        )
+        try:
+            fd = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+            )
+        except FileExistsError:
+            continue
+        temp_path = candidate
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        break
+    if not temp_path:
+        raise OSError(f"could not create a unique temporary config next to {path}")
+
+    try:
+        target_metadata = os.lstat(path)
+    except FileNotFoundError:
+        target_metadata = None
+    if target_metadata is not None and not stat.S_ISREG(target_metadata.st_mode):
+        raise OSError(f"refusing non-regular config target: {path}")
+    if path_has_symlink_component(parent):
+        raise OSError(f"refusing symlinked config parent: {parent}")
+    # Renaming onto the target replaces the directory entry itself, so a
+    # hard link aliasing the previous inode keeps its original bytes and
+    # metadata untouched while the credential-bearing payload lands on a
+    # fresh inode that no tracked project file can alias.
+    os.replace(temp_path, path)
+    sync_parent_directory(path)
 
 
 def parse_json(text: str):
-    if text.startswith("﻿"):
+    if text.startswith("\ufeff"):
         text = text[1:]
     if not text.strip():
         return {}
@@ -5738,8 +6018,28 @@ def dump_json(doc) -> str:
     return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
 
 
-text = load_text(config_path)
-doc = parse_json(text)
+if path_has_symlink_component(config_path):
+    print("ERROR:symlink_path")
+    raise SystemExit(0)
+
+try:
+    raw, existing_mode = load_config_bytes(config_path)
+except ValueError:
+    print("ERROR:non_regular_target")
+    raise SystemExit(0)
+except OSError as error:
+    print(f"ERROR:read_failed_{error.errno}")
+    raise SystemExit(0)
+try:
+    text = raw.decode("utf-8")
+except UnicodeDecodeError:
+    print("ERROR:not_utf8")
+    raise SystemExit(0)
+try:
+    doc = parse_json(text)
+except json.JSONDecodeError:
+    print("ERROR:invalid_json")
+    raise SystemExit(0)
 if not isinstance(doc, dict):
     print("ERROR:not_object")
     raise SystemExit(0)
@@ -5802,15 +6102,20 @@ if new_text == dump_json(parse_json(text)):
 
 parent_dir = os.path.dirname(config_path)
 if parent_dir:
-    os.makedirs(parent_dir, exist_ok=True)
-if os.path.exists(config_path):
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    backup = f"{config_path}.{stamp}.bak"
-    shutil.copy2(config_path, backup)
+    try:
+        ensure_real_directory_tree(parent_dir)
+    except OSError:
+        print("ERROR:unsafe_parent")
+        raise SystemExit(0)
+if path_has_symlink_component(config_path):
+    print("ERROR:symlink_path")
+    raise SystemExit(0)
+effective_mode = 0o600 if existing_mode is None else existing_mode & 0o600
+if existing_mode is not None:
+    backup = write_backup(config_path, raw, effective_mode)
 else:
     backup = ""
-with open(config_path, "w", encoding="utf-8") as handle:
-    handle.write(new_text)
+write_config_atomic(config_path, new_text, effective_mode)
 
 if backup:
     print(f"OK:updated backup={backup}")
@@ -5890,92 +6195,390 @@ setup_single_mcp_config() {
   fi
 
   if [ ! -f "$config_path" ]; then
-    # Create a new config file
-    local parent_dir
-    parent_dir=$(dirname "$config_path")
-    mkdir -p "$parent_dir" 2>/dev/null || true
-
-    if command -v python3 >/dev/null 2>&1; then
-      python3 -c "
-import json, sys
-entry = json.loads(sys.argv[1])
-doc = {'mcpServers': {'mcp-agent-mail': entry}}
-print(json.dumps(doc, indent=2))
-" "$entry_json" > "$config_path"
-    else
-      cat > "$config_path" <<MCPEOF
-{
-  "mcpServers": {
-    "mcp-agent-mail": ${entry_json}
-  }
-}
-MCPEOF
+    # Create a new config file. Never open the destination through its
+    # pathname: a pre-existing leaf symlink, or a hard link aliasing a
+    # tracked project file, would receive the credential-bearing bytes
+    # despite an "outside" project-containment verdict. Create through
+    # no-follow, component-verified, atomic replacement instead; without
+    # python3 that authority cannot be established, so fail closed.
+    if ! command -v python3 >/dev/null 2>&1; then
+      verbose "setup_mcp_config:skip_no_python3 tool=${tool} path=${config_path}"
+      return 2
     fi
-    verbose "setup_mcp_config:created tool=${tool} path=${config_path}"
-    return 0
+    local create_result
+    create_result=$(python3 - "$config_path" "$entry_json" <<'PY'
+import json
+import os
+import stat
+import sys
+import time
+
+config_path, entry_json = sys.argv[1:3]
+
+
+def path_has_symlink_component(path: str) -> bool:
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component:
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode):
+            return True
+    return False
+
+
+def ensure_real_directory_tree(path: str) -> None:
+    _, raw_tail = os.path.splitdrive(path)
+    if any(component == ".." for component in raw_tail.split(os.sep)):
+        raise OSError(f"refusing parent traversal in config directory: {path}")
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component or component == ".":
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            try:
+                os.mkdir(current)
+            except FileExistsError:
+                # Another process may have created the component after the
+                # lstat. Re-inspect it instead of assuming it is a directory.
+                pass
+            metadata = os.lstat(current)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise OSError(f"refusing symlinked config parent: {current}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError(f"config parent component is not a directory: {current}")
+
+
+def sync_parent_directory(path: str) -> None:
+    if os.name != "posix":
+        return
+    parent = os.path.dirname(path) or "."
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(parent, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_config_atomic(path: str, text: str, mode: int) -> None:
+    parent = os.path.dirname(path) or "."
+    ensure_real_directory_tree(parent)
+
+    basename = os.path.basename(path)
+    temp_path = ""
+    for attempt in range(1024):
+        candidate = os.path.join(
+            parent,
+            f".{basename}.{os.getpid()}.{time.time_ns()}.{attempt}.tmp",
+        )
+        try:
+            fd = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+            )
+        except FileExistsError:
+            continue
+        temp_path = candidate
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        break
+    if not temp_path:
+        raise OSError(f"could not create a unique temporary config next to {path}")
+
+    try:
+        target_metadata = os.lstat(path)
+    except FileNotFoundError:
+        target_metadata = None
+    if target_metadata is not None and not stat.S_ISREG(target_metadata.st_mode):
+        raise OSError(f"refusing non-regular config target: {path}")
+    if path_has_symlink_component(parent):
+        raise OSError(f"refusing symlinked config parent: {parent}")
+    # Renaming onto the target replaces the directory entry itself, so a
+    # hard link aliasing the previous inode keeps its original bytes and
+    # metadata untouched.
+    os.replace(temp_path, path)
+    sync_parent_directory(path)
+
+
+if path_has_symlink_component(config_path):
+    print("ERROR:symlink_path")
+    raise SystemExit(0)
+try:
+    entry = json.loads(entry_json)
+except json.JSONDecodeError:
+    print("ERROR:bad_entry")
+    raise SystemExit(0)
+try:
+    ensure_real_directory_tree(os.path.dirname(config_path) or ".")
+except OSError:
+    print("ERROR:unsafe_parent")
+    raise SystemExit(0)
+doc = {"mcpServers": {"mcp-agent-mail": entry}}
+write_config_atomic(config_path, json.dumps(doc, indent=2) + "\n", 0o600)
+print("OK:created")
+PY
+) || true
+    case "$create_result" in
+      OK:created)
+        verbose "setup_mcp_config:created tool=${tool} path=${config_path}"
+        return 0
+        ;;
+      ERROR:*)
+        verbose "setup_mcp_config:create_refused tool=${tool} path=${config_path} ${create_result}"
+        return 2
+        ;;
+      *)
+        verbose "setup_mcp_config:unknown_create_result tool=${tool} result=${create_result}"
+        return 2
+        ;;
+    esac
   fi
 
   # File exists — check if mcp-agent-mail entry already present
   if command -v python3 >/dev/null 2>&1; then
     local result
-    result=$(python3 -c "
-import json, sys, os
+    result=$(python3 - "$config_path" "$entry_json" <<'PY'
+import json
+import os
+import re
+import stat
+import sys
+import time
+from datetime import datetime, timezone
 
-config_path = sys.argv[1]
-entry_json = sys.argv[2]
+config_path, entry_json = sys.argv[1:3]
 
-with open(config_path, 'r') as f:
-    text = f.read()
+
+def path_has_symlink_component(path: str) -> bool:
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component:
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode):
+            return True
+    return False
+
+
+def ensure_real_directory_tree(path: str) -> None:
+    _, raw_tail = os.path.splitdrive(path)
+    if any(component == ".." for component in raw_tail.split(os.sep)):
+        raise OSError(f"refusing parent traversal in config directory: {path}")
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component or component == ".":
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            try:
+                os.mkdir(current)
+            except FileExistsError:
+                # Another process may have created the component after the
+                # lstat. Re-inspect it instead of assuming it is a directory.
+                pass
+            metadata = os.lstat(current)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise OSError(f"refusing symlinked config parent: {current}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError(f"config parent component is not a directory: {current}")
+
+
+def load_config_bytes(path: str):
+    try:
+        # O_NONBLOCK prevents a hostile or accidental FIFO target from
+        # hanging the installer before we can reject its file type.
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return b"", None
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(fd)
+        raise ValueError("config target is not a regular file")
+    with os.fdopen(fd, "rb") as handle:
+        raw = handle.read()
+    return raw, stat.S_IMODE(metadata.st_mode)
+
+
+def sync_parent_directory(path: str) -> None:
+    if os.name != "posix":
+        return
+    parent = os.path.dirname(path) or "."
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(parent, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_backup(path: str, raw: bytes, mode: int) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    for attempt in range(1024):
+        suffix = time.time_ns()
+        backup = f"{path}.{stamp}.{suffix}.{attempt}.bak"
+        try:
+            fd = os.open(
+                backup,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+            )
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        sync_parent_directory(backup)
+        return backup
+    raise OSError(f"could not create a unique backup for {path}")
+
+
+def write_config_atomic(path: str, text: str, mode: int) -> None:
+    parent = os.path.dirname(path) or "."
+    ensure_real_directory_tree(parent)
+
+    basename = os.path.basename(path)
+    temp_path = ""
+    for attempt in range(1024):
+        candidate = os.path.join(
+            parent,
+            f".{basename}.{os.getpid()}.{time.time_ns()}.{attempt}.tmp",
+        )
+        try:
+            fd = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+            )
+        except FileExistsError:
+            continue
+        temp_path = candidate
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        break
+    if not temp_path:
+        raise OSError(f"could not create a unique temporary config next to {path}")
+
+    try:
+        target_metadata = os.lstat(path)
+    except FileNotFoundError:
+        target_metadata = None
+    if target_metadata is not None and not stat.S_ISREG(target_metadata.st_mode):
+        raise OSError(f"refusing non-regular config target: {path}")
+    if path_has_symlink_component(parent):
+        raise OSError(f"refusing symlinked config parent: {parent}")
+    # Renaming onto the target replaces the directory entry itself, so a
+    # hard link aliasing the previous inode keeps its original bytes and
+    # metadata untouched.
+    os.replace(temp_path, path)
+    sync_parent_directory(path)
+
+
+if path_has_symlink_component(config_path):
+    print("ERROR:symlink_path")
+    raise SystemExit(0)
+try:
+    raw, existing_mode = load_config_bytes(config_path)
+except ValueError:
+    print("ERROR:non_regular_target")
+    raise SystemExit(0)
+except OSError as error:
+    print(f"ERROR:read_failed_{error.errno}")
+    raise SystemExit(0)
+try:
+    text = raw.decode("utf-8")
+except UnicodeDecodeError:
+    print("ERROR:not_utf8")
+    raise SystemExit(0)
 
 # Strip BOM
-if text.startswith('\ufeff'):
+if text.startswith("\ufeff"):
     text = text[1:]
 
 try:
     doc = json.loads(text)
 except json.JSONDecodeError:
     # Try stripping comments and trailing commas (basic JSON5 compat)
-    import re
-    cleaned = re.sub(r'//.*?\n', '\n', text)
-    cleaned = re.sub(r'/\*.*?\*/', '', cleaned, flags=re.DOTALL)
-    cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)
+    cleaned = re.sub(r"//.*?\n", "\n", text)
+    cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
     doc = json.loads(cleaned)
 
 if not isinstance(doc, dict):
-    print('ERROR:not_object')
-    sys.exit(0)
+    print("ERROR:not_object")
+    raise SystemExit(0)
 
 # Find existing server container
 container_key = None
-for key in ['mcpServers', 'servers', 'mcp', 'mcp_servers']:
+for key in ["mcpServers", "servers", "mcp", "mcp_servers"]:
     if key in doc and isinstance(doc[key], dict):
         container_key = key
         break
 
-if container_key and 'mcp-agent-mail' in doc[container_key]:
-    print('SKIP:already_present')
-    sys.exit(0)
-
-# Backup
-import shutil
-from datetime import datetime
-stamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-backup = config_path + '.' + stamp + '.bak'
-shutil.copy2(config_path, backup)
+if container_key and "mcp-agent-mail" in doc[container_key]:
+    print("SKIP:already_present")
+    raise SystemExit(0)
 
 # Insert entry
-entry = json.loads(entry_json)
+try:
+    entry = json.loads(entry_json)
+except json.JSONDecodeError:
+    print("ERROR:bad_entry")
+    raise SystemExit(0)
 if container_key is None:
-    container_key = 'mcpServers'
+    container_key = "mcpServers"
     doc[container_key] = {}
-doc[container_key]['mcp-agent-mail'] = entry
+doc[container_key]["mcp-agent-mail"] = entry
 
-with open(config_path, 'w') as f:
-    json.dump(doc, f, indent=2)
-    f.write('\n')
+parent_dir = os.path.dirname(config_path)
+if parent_dir:
+    try:
+        ensure_real_directory_tree(parent_dir)
+    except OSError:
+        print("ERROR:unsafe_parent")
+        raise SystemExit(0)
+if path_has_symlink_component(config_path):
+    print("ERROR:symlink_path")
+    raise SystemExit(0)
+effective_mode = 0o600 if existing_mode is None else existing_mode & 0o600
+backup = write_backup(config_path, raw, effective_mode)
+write_config_atomic(config_path, json.dumps(doc, indent=2) + "\n", effective_mode)
 
-print('OK:inserted backup=' + backup)
-" "$config_path" "$entry_json" 2>&1) || true
+print("OK:inserted backup=" + backup)
+PY
+) || true
 
     case "$result" in
       SKIP:already_present)
@@ -6121,6 +6724,40 @@ PY
   return 2
 }
 
+# The external `claude` CLI rewrites ~/.claude.json through its own write
+# seam, which this installer cannot make no-follow or atomic. A hard link
+# from that path into a tracked project file would let the CLI's bearer
+# token flow through the aliased inode into Git despite an "outside"
+# containment verdict, and a non-regular target cannot be given any write
+# authority at all. Fail closed: defer to native setup whenever the target
+# exists with more than one link, is not a regular file, or link authority
+# cannot be established.
+config_target_is_hardlink_aliased() {
+  local path="$1"
+  [ -n "$path" ] || return 0
+  if [ ! -e "$path" ]; then
+    return 1
+  fi
+  command -v python3 >/dev/null 2>&1 || return 0
+  if python3 - "$path" <<'PY'
+import os
+import stat
+import sys
+
+try:
+    metadata = os.lstat(sys.argv[1])
+except OSError:
+    raise SystemExit(1)
+if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+  then
+    return 0
+  fi
+  return 1
+}
+
 # The shell writers embed bearer credentials but cannot establish the native
 # setup command's Git tracked/ignore protections. Never let them write a config
 # inside the current project. OMP needs extra handling because user-path
@@ -6223,6 +6860,8 @@ setup_mcp_configs() {
   fi
   if mcp_config_must_skip_shell_write "claude" "$claude_code_config_path" "$PWD"; then
     verbose "setup_claude_code_mcp:defer reason=project_containment_requires_native_setup"
+  elif config_target_is_hardlink_aliased "$claude_code_config_path"; then
+    verbose "setup_claude_code_mcp:defer reason=aliased_or_nonregular_target_requires_native_setup"
   elif setup_claude_code_mcp_via_cli "$bearer_token"; then
     configured=$((configured + 1))
   fi
