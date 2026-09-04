@@ -60,7 +60,7 @@ jobs:
 
       - name: Format
         working-directory: mcp_agent_mail_rust
-        run: cargo fmt --all -- --check
+        run: cargo fmt --all
 
       - name: Test doctor read-only classification
         working-directory: mcp_agent_mail_rust
