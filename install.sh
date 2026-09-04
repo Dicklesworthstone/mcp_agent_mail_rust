@@ -2445,7 +2445,18 @@ private_file_identity() {
 
 private_file_link_count() {
   local path="$1"
-  stat -f '%l' "$path" 2>/dev/null || stat -c '%h' "$path" 2>/dev/null
+  local links
+  # Branch, never concatenate: on GNU coreutils the BSD probe prints a
+  # filesystem-status block to stdout and still exits nonzero (its format
+  # word is parsed as a missing operand), so an `A || B` capture would yield
+  # a multi-line value that can never equal a single link count.
+  if links=$(stat -f '%l' "$path" 2>/dev/null); then
+    printf '%s' "$links"
+  elif links=$(stat -c '%h' "$path" 2>/dev/null); then
+    printf '%s' "$links"
+  else
+    return 1
+  fi
 }
 
 # Return one no-follow stat identity only for a mode-0600 regular file with a

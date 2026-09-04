@@ -2,5 +2,5 @@
 # nightly-2026-08-25 matches the fastmcp 0.6.0 registry release
 # (rust-version = 1.100 floors across its crates) and the fastmcp_rust
 # sibling's own pin.
-channel = "nightly-2026-08-25"
+channel = "nightly-2026-08-31"
 components = ["rustfmt", "clippy"]

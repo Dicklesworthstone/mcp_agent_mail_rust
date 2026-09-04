@@ -5026,7 +5026,7 @@ mod tests {
 
     /// Canonical `ALTER TABLE ... ADD COLUMN` splices the new column into the
     /// stored `CREATE TABLE` text at an offset computed from the canonical
-    /// `CREATE TABLE <name>` prefix. FrankenSQLite 0.3.14 stores the statement
+    /// prefix. FrankenSQLite through 0.3.16 stores the statement
     /// as written, `IF NOT EXISTS` included, so canonical SQLite corrupts the
     /// text ("near NUL: syntax error") when it adds a column to a table the
     /// runtime engine created that way. Real Python-era mailboxes were
@@ -5034,7 +5034,7 @@ mod tests {
     /// engine gap until FrankenSQLite normalizes the stored text (br-l1q6z
     /// engine class).
     #[test]
-    #[ignore = "FrankenSQLite 0.3.14 stores CREATE TABLE IF NOT EXISTS verbatim; canonical ADD COLUMN then fails"]
+    #[ignore = "FrankenSQLite through 0.3.16 stores CREATE TABLE IF NOT EXISTS verbatim; canonical ADD COLUMN then fails (re-probed on 0.3.16 2026-09-04)"]
     fn runtime_engine_created_table_text_is_alterable_by_canonical_sqlite() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("engine-ddl.sqlite3");
