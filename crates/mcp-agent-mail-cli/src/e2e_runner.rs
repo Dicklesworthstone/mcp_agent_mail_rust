@@ -437,25 +437,40 @@ impl Runner {
 
     /// Runs the specified suites (or all if empty).
     pub fn run(&self, suite_names: &[String]) -> RunReport {
+        let selected = if suite_names.is_empty() {
+            self.registry.suite_names()
+        } else {
+            suite_names.to_vec()
+        };
+        self.run_selected(&selected)
+    }
+
+    /// Executes an already resolved selection. An empty selection must stay
+    /// empty: treating it as "all" would undo an explicit filter.
+    fn run_selected(&self, suite_names: &[String]) -> RunReport {
         let run_started = Utc::now();
         let start_instant = Instant::now();
-
-        // Determine which suites to run
-        let suites: Vec<&Suite> = if suite_names.is_empty() {
-            self.registry.suites()
-        } else {
-            suite_names
-                .iter()
-                .filter_map(|name| self.registry.get(name))
-                .collect()
-        };
-
-        let mut results = Vec::with_capacity(suites.len());
+        let mut results = Vec::with_capacity(suite_names.len());
         let mut passed = 0;
         let mut failed = 0;
 
-        for suite in &suites {
-            let result = self.run_suite(suite);
+        for name in suite_names {
+            let result = self.registry.get(name).map_or_else(
+                || SuiteResult {
+                    name: name.clone(),
+                    passed: false,
+                    exit_code: 2,
+                    duration_ms: 0,
+                    stdout: String::new(),
+                    stderr: format!("Suite not found: {name}"),
+                    assertions_passed: 0,
+                    assertions_failed: 0,
+                    assertions_skipped: 0,
+                    started_at: run_started.to_rfc3339(),
+                    ended_at: Utc::now().to_rfc3339(),
+                },
+                |suite| self.run_suite(suite),
+            );
             if result.passed {
                 passed += 1;
             } else {
@@ -468,7 +483,7 @@ impl Runner {
         let elapsed = start_instant.elapsed();
 
         RunReport {
-            total: suites.len() as u32,
+            total: suite_names.len() as u32,
             passed,
             failed,
             skipped: 0,
@@ -488,7 +503,7 @@ impl Runner {
     ) -> RunReport {
         let suites = self.registry.filter(include, exclude, tags);
         let suite_names: Vec<String> = suites.iter().map(|s| s.name.clone()).collect();
-        self.run(&suite_names)
+        self.run_selected(&suite_names)
     }
 
     /// Runs a single suite.
@@ -1951,10 +1966,11 @@ pub struct RunReport {
 }
 
 impl RunReport {
-    /// Returns true if all suites passed.
+    /// Returns true if a nonempty selection completed without a failed or
+    /// skipped suite. An empty run is not successful verification.
     #[must_use]
     pub fn success(&self) -> bool {
-        self.failed == 0
+        self.total > 0 && self.failed == 0 && self.skipped == 0 && self.passed == self.total
     }
 
     /// Returns the exit code (0 = success, 1 = failures).
@@ -2246,6 +2262,74 @@ mod tests {
         };
         assert!(!report.success());
         assert_eq!(report.exit_code(), 1);
+    }
+
+    #[test]
+    fn runner_empty_filter_does_not_execute_unselected_suite() {
+        let root = TempDir::new().expect("tempdir").keep();
+        write_suite_script(
+            &root,
+            "available",
+            "#!/bin/sh\nprintf ran > unexpected-execution\necho 'Pass: 1  Fail: 0  Skip: 0'\n",
+        );
+        let runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                ..Default::default()
+            },
+        )
+        .expect("runner");
+
+        for report in [
+            runner.run_filtered(Some(&["missing".to_string()]), None, None),
+            runner.run_filtered(None, Some(&["*".to_string()]), None),
+            runner.run_filtered(None, None, Some(&["absent-tag".to_string()])),
+        ] {
+            assert_eq!(report.total, 0);
+            assert!(report.results.is_empty());
+            assert!(!report.success());
+            assert_eq!(report.exit_code(), 1);
+            assert!(!root.join("unexpected-execution").exists());
+        }
+
+        // The unfiltered command must still execute the requested real script.
+        let report = runner.run(&[]);
+        assert!(report.success());
+        assert_eq!(report.results[0].assertions_passed, 1);
+        assert_eq!(fs::read_to_string(root.join("unexpected-execution")).unwrap(), "ran");
+    }
+
+    #[test]
+    fn runner_unknown_suite_is_an_explicit_failure_even_with_a_passing_suite() {
+        let root = TempDir::new().expect("tempdir").keep();
+        write_suite_script(
+            &root,
+            "available",
+            "#!/bin/sh\necho 'Pass: 1  Fail: 0  Skip: 0'\n",
+        );
+        let runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                ..Default::default()
+            },
+        )
+        .expect("runner");
+
+        for selection in [
+            vec!["missing".to_string()],
+            vec!["available".to_string(), "missing".to_string()],
+        ] {
+            let report = runner.run(&selection);
+            assert_eq!(report.total as usize, selection.len());
+            assert_eq!(report.failed, 1);
+            assert!(!report.success());
+            let missing = report.results.last().unwrap();
+            assert_eq!(missing.name, "missing");
+            assert_eq!(missing.exit_code, 2);
+            assert!(missing.stderr.contains("Suite not found"));
+        }
     }
 
     #[test]
