@@ -6454,6 +6454,45 @@ fn expected_entry_for_action(action: &ConfigAction) -> Value {
     }
 }
 
+/// MCP config paths where `am setup` deliberately writes the Agent Mail entry
+/// **without** an `Authorization` header, for this setup configuration.
+///
+/// GH#307: `am doctor`'s bearer-token sub-check and `am setup` must share one
+/// notion of a correct config. Several user-level configs (Cursor's
+/// `~/.cursor/mcp.json`, Gemini's `~/.gemini/settings.json`, Factory Droid's
+/// `~/.factory/mcp.json`, …) are written mode `0644` and are therefore
+/// deliberately token-free: a shared, world-readable file is the wrong place
+/// for a bearer secret, so the project-local `0600` config is the one that
+/// carries it. Doctor asks this function which files setup intends to leave
+/// header-free instead of warning that every one of them "is missing a bearer
+/// token" and telling the operator to run `am setup` — which would rewrite the
+/// exact same header-free entry.
+///
+/// The answer is derived from the real [`ConfigAction`] list, so it cannot
+/// drift from what setup actually writes. Only the *absence* of a header is
+/// excused; a config carrying the WRONG token is still drift.
+#[must_use]
+pub fn config_paths_without_expected_bearer_token(params: &SetupParams) -> Vec<PathBuf> {
+    let platforms = params
+        .agents
+        .clone()
+        .unwrap_or_else(|| AgentPlatform::ALL.to_vec());
+    let mut paths = Vec::new();
+    for platform in platforms {
+        for action in platform.config_actions(params) {
+            if matches!(action.content, ConfigContent::HooksMerge { .. }) {
+                continue;
+            }
+            if expected_authorization_for_action(&action, &params.token).is_none() {
+                paths.push(action.file_path);
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 fn expected_authorization_for_action(action: &ConfigAction, token: &str) -> Option<String> {
     if token.is_empty() {
         return None;
@@ -7987,6 +8026,83 @@ mod tests {
             panic!("expected JsonMerge");
         };
         assert_eq!(value["headers"]["Authorization"], "Bearer real-token");
+    }
+
+    /// GH#307: `am doctor`'s bearer sub-check and `am setup` must agree on
+    /// which configs are supposed to carry an `Authorization` header.
+    /// User-level configs are written world-readable and are therefore
+    /// deliberately token-free; the `0600` project-local files carry the token.
+    #[test]
+    fn config_paths_without_expected_bearer_token_lists_the_header_free_user_configs() {
+        let home = PathBuf::from("/home/tester");
+        let params = SetupParams {
+            token: "live-secret-token".into(),
+            project_dir: PathBuf::from("/tmp/project"),
+            home_dir_override: Some(home.clone()),
+            agents: Some(vec![AgentPlatform::Cursor]),
+            skip_hooks: true,
+            ..Default::default()
+        };
+
+        let header_free = config_paths_without_expected_bearer_token(&params);
+
+        assert!(
+            header_free.contains(&home.join(".cursor").join("mcp.json")),
+            "the Cursor user config is written without a bearer header: {header_free:?}"
+        );
+        assert!(
+            !header_free.contains(&PathBuf::from("/tmp/project").join("cursor.mcp.json")),
+            "the project-local Cursor config DOES carry the token: {header_free:?}"
+        );
+    }
+
+    /// The answer is derived from the real action list, so it tracks every
+    /// platform rather than a hand-maintained allowlist — and it is exactly
+    /// the complement of "the action has an expected Authorization header".
+    #[test]
+    fn config_paths_without_expected_bearer_token_is_the_complement_of_expected_auth() {
+        let params = SetupParams {
+            token: "live-secret-token".into(),
+            project_dir: PathBuf::from("/tmp/project"),
+            home_dir_override: Some(PathBuf::from("/home/tester")),
+            skip_hooks: true,
+            ..Default::default()
+        };
+        let header_free = config_paths_without_expected_bearer_token(&params);
+
+        for platform in AgentPlatform::ALL {
+            for action in platform.config_actions(&params) {
+                if matches!(action.content, ConfigContent::HooksMerge { .. }) {
+                    continue;
+                }
+                let expects_auth =
+                    expected_authorization_for_action(&action, &params.token).is_some();
+                assert_eq!(
+                    !expects_auth,
+                    header_free.contains(&action.file_path),
+                    "{} ({:?}) disagrees with its expected-auth verdict",
+                    action.file_path.display(),
+                    platform
+                );
+            }
+        }
+    }
+
+    /// With no token there is nothing to write anywhere, so every config is
+    /// header-free — the doctor sub-check that consumes this only runs when a
+    /// canonical token exists.
+    #[test]
+    fn config_paths_without_expected_bearer_token_covers_everything_when_unauthenticated() {
+        let params = SetupParams {
+            token: String::new(),
+            project_dir: PathBuf::from("/tmp/project"),
+            home_dir_override: Some(PathBuf::from("/home/tester")),
+            agents: Some(vec![AgentPlatform::Cursor]),
+            skip_hooks: true,
+            ..Default::default()
+        };
+        let header_free = config_paths_without_expected_bearer_token(&params);
+        assert!(header_free.contains(&PathBuf::from("/tmp/project").join("cursor.mcp.json")));
     }
 
     #[test]
