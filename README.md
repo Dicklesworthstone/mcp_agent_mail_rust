@@ -632,7 +632,7 @@ token values.
 | `file_reservations` | `list`, `active`, `soon`, `reserve`, `renew`, `release`, `conflicts` |
 | `acks` | `pending`, `remind`, `overdue` |
 | `projects` | `mark-identity`, `discovery-init`, `adopt` |
-| `mail` | `status`, `send`, `reply`, `inbox`, `read`, `ack`, `search`, `summarize-thread`, `replay-queued` |
+| `mail` | `status`, `send`, `reply`, `inbox`, `read`, `ack`, `search`, `summarize-thread`, `replay-queued`, `discard-queued` |
 | `products` | `ensure`, `link`, `status`, `search`, `inbox`, `summarize-thread` |
 | `doctor` (28 verbs) | `check`, `health`, `triage`, `locks`, `drain`, `fix`, `undo`, `ls`, `explain`, `fixers`, `capabilities`, `robot-docs`, `artifacts`, `reclaim`, `selftest`, `mcp-selftest`, `write-selftest`, `support-bundle`, `repair`, `reconstruct`, `backups`, `restore`, `archive-scan`, `archive-verify`, `archive-normalize`, `fix-orphan-refs`, `pack-archive`, `vacuum` (`vacuum` is on `main` and unreleased as of 2026-09-01) |
 | `agents` | `register`, `create`, `list`, `show`, `detect`, `reap`, `resolve-pane` |

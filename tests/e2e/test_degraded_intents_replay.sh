@@ -275,8 +275,8 @@ export DATABASE_URL="${HEALTHY_DB}"
 e2e_case_banner "H1/H3 release + ack queue paths — MCP-server-only trigger"
 e2e_skip "the H1 release-intent + H3 ack-intent QUEUE paths trip only through the MCP server (the CLI release/ack verbs use a direct sync-SQLite path); on-disk schema + auto-replay + abandon-on-missing are covered by DB-backed integration tests: tools messaging::tests::replay_queued_ack_intent_acks_once_on_success / replay_abandons_ack_intent_for_missing_message, tools reservations::tests::replay_queued_release_intent_releases_once, cli robot::tests::build_queued_intents_surfaces_ack_and_send"
 
-e2e_case_banner "Unified replay-intents --dry-run + cancellation — not implemented"
-e2e_skip "no unified 'am replay-intents --dry-run' / intent-cancellation surface yet: ack & release auto-replay on the next successful call, sends replay via 'am mail replay-queued'; would-replay/no-op preview + cancel are a future N-track surface"
+e2e_case_banner "Unified replay-intents --dry-run + cancellation — partially implemented"
+e2e_skip "no unified 'am replay-intents --dry-run' surface yet: ack & release auto-replay on the next successful call and still have no cancel verb; queued SENDS now have an explicit audited cancel — 'am mail discard-queued --artifact <p> --reason <why>' writes a terminal .discarded.json receipt and retires the intent (GH#306, unit-covered by cli mail_server_cli_bridge_tests::discard_* and robot::tests::scan_pending_sends_skips_discarded_artifacts_and_offers_a_discard_command); would-replay/no-op preview remains a future N-track surface"
 
 # ---------------------------------------------------------------------------
 log_summary "${E2E_SUITE}" "$((_E2E_PASS + _E2E_FAIL + _E2E_SKIP))" "${_E2E_PASS}" "${_E2E_FAIL}" \
