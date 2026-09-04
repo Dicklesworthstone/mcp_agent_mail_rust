@@ -5315,6 +5315,15 @@ fn sqlite_identity_cache_namespace(path: &Path) -> String {
     }
 }
 
+/// Freeze a configured path into an absolute alias that no later `chdir` can
+/// re-point.
+///
+/// Only `.` components are dropped. A `..` is deliberately preserved: after a
+/// symlink component it does not mean the lexical parent, so collapsing it here
+/// would resolve it against the wrong directory and hand
+/// [`normalize_sqlite_identity_path_buf`] a path that no longer names the file
+/// the kernel would open. `..` is resolved exactly once, by that function,
+/// after the deepest existing prefix has been canonicalized.
 fn absolute_lexical_authority_path(path: &Path, field: &'static str) -> DbResult<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -5329,7 +5338,10 @@ fn absolute_lexical_authority_path(path: &Path, field: &'static str) -> DbResult
             })?
             .join(path)
     };
-    Ok(normalize_lexical_path(&absolute))
+    Ok(absolute
+        .components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .collect())
 }
 
 fn sqlite_open_path_for_identity(absolute_alias: &Path, identity: &Path) -> DbResult<String> {
@@ -17885,13 +17897,13 @@ mod tests {
             "Franken fixture must retain at least one committed WAL frame"
         );
         assert!(
-            !sqlite_sidecar_path(&franken_db_path, "-shm").exists(),
-            "FrankenSQLite's healthy native WAL family does not require canonical SHM"
+            sqlite_sidecar_path(&franken_db_path, "-shm").is_file(),
+            "FrankenSQLite's healthy native WAL family carries a canonical-shaped SHM sidecar"
         );
         assert!(
             std::fs::metadata(sqlite_sidecar_path(&franken_db_path, "-wal-cert"))
                 .is_ok_and(|metadata| metadata.len() > 0),
-            "SHM-less Franken WAL fixture must carry materialized WAL certificate authority"
+            "live Franken WAL fixture must carry materialized WAL certificate authority"
         );
         assert!(sqlite_sidecar_path(&franken_db_path, "-fsqlite-ns-gate").is_file());
         assert!(sqlite_sidecar_path(&franken_db_path, "-fsqlite-ns-use").is_file());
@@ -17911,10 +17923,29 @@ mod tests {
             8
         );
         drop(franken);
+        // The `-shm` is a volatile WAL index, not database content: every
+        // reader that consults the WAL updates it in place. The canonical
+        // control above only escapes that because its fixture makes the SHM
+        // read-only, which a live FrankenSQLite mapping cannot tolerate. Byte
+        // identity is therefore asserted over the rest of the family, which is
+        // where a checkpoint or rewrite would show up.
+        let shm_name = sqlite_sidecar_path(&franken_db_path, "-shm")
+            .file_name()
+            .expect("SHM sidecar has a file name")
+            .to_os_string();
+        let without_shm =
+            |mut family: std::collections::BTreeMap<std::ffi::OsString, (bool, Vec<u8>)>| {
+                family.remove(&shm_name);
+                family
+            };
         assert_eq!(
-            exact_diagnostic_parent_snapshot(franken_directory.path()),
-            franken_before,
+            without_shm(exact_diagnostic_parent_snapshot(franken_directory.path())),
+            without_shm(franken_before),
             "Franken read-only observer must not checkpoint or rewrite a valid live WAL family"
+        );
+        assert!(
+            sqlite_sidecar_path(&franken_db_path, "-shm").is_file(),
+            "Franken read-only observer must not detach the live WAL index"
         );
         crate::close_db_conn(franken_writer, "clean up live-WAL test writer");
     }
@@ -20662,9 +20693,18 @@ mod tests {
         let alias_wal = sqlite_sidecar_path(&lossy_alias, "-wal");
         std::fs::write(&alias_wal, b"alias-wal-witness").unwrap();
 
-        let health_error = sqlite_primary_read_path_is_healthy(&invalid_path)
-            .expect_err("live health must reject a non-UTF-8 engine path");
-        assert!(health_error.to_string().contains("not valid UTF-8"));
+        // Live health no longer needs a UTF-8 engine path at all: it stages a
+        // byte-exact private copy of the family under an ASCII name and probes
+        // that, so the non-UTF-8 primary is judged on its own bytes. The
+        // decisive property is unchanged — the healthy U+FFFD alias sitting
+        // beside it must never be what gets opened. These bytes are not a
+        // database, so the verdict is a plain `false`; had the probe fallen
+        // through to the lossy alias it would have reported `true`.
+        assert!(
+            !sqlite_primary_read_path_is_healthy(&invalid_path)
+                .expect("staged live health must judge the exact non-UTF-8 path"),
+            "live health must not open a different U+FFFD alias"
+        );
         let inventory_error = inspect_mailbox_db_inventory(&invalid_path)
             .expect_err("inventory must reject a non-UTF-8 engine path");
         assert!(inventory_error.to_string().contains("not valid UTF-8"));
@@ -27681,13 +27721,17 @@ mod tests {
         let storage_root = dir.path().join("storage");
         std::fs::create_dir_all(&storage_root).unwrap();
 
-        // Create a healthy DB.
-        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
-        conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL)")
-            .unwrap();
-        conn.execute_raw("INSERT INTO marker(value) VALUES('original')")
-            .unwrap();
-        drop(conn);
+        // Seed one settled, standalone healthy database. The fixture used to
+        // write through `DbConn` (FrankenSQLite) and simply drop the handle,
+        // which leaves the seeded rows in `storage.sqlite3-wal`: the engine
+        // opens its own databases in WAL mode and does not checkpoint on
+        // close. `sqlite_marker_value` reads through `immutable=1`, which
+        // ignores a WAL by construction, so that readback reported a missing
+        // table and misattributed an engine sidecar convention to archive
+        // recovery. `write_marker_db` asserts the fixture closes as one
+        // standalone main file, which is the "already healthy" premise this
+        // test is about.
+        write_marker_db(&primary, "original");
 
         ensure_sqlite_file_healthy_with_archive(&primary, &storage_root).unwrap();
 
@@ -27811,10 +27855,19 @@ mod tests {
             "clean up proactive-backup lock fixture",
         );
         writer
+            .execute_raw("PRAGMA journal_mode = DELETE; PRAGMA autocommit_retain = OFF;")
+            .expect("configure proactive-backup lock fixture journal mode");
+        // A published `.bak` is validated as a mailbox recovery candidate, and
+        // that check requires the mailbox schema. `maintenance_test_pool` runs
+        // with `run_migrations: false`, so the fixture has to seed the schema
+        // itself; a bare probe table alone makes the staged snapshot fail the
+        // full health check and the backup abort.
+        writer
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("seed proactive-backup lock fixture mailbox schema");
+        writer
             .execute_raw(
-                "PRAGMA journal_mode = DELETE; \
-                 PRAGMA autocommit_retain = OFF; \
-                 CREATE TABLE backup_lock_probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL); \
+                "CREATE TABLE backup_lock_probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL); \
                  INSERT INTO backup_lock_probe(value) VALUES ('settled');",
             )
             .expect("seed proactive-backup lock fixture");
@@ -29802,11 +29855,37 @@ mod tests {
                 .is_ok_and(|metadata| metadata.len() > SQLITE_WAL_HEADER_BYTES),
             "fixture must retain a healthy framed WAL"
         );
+        // FrankenSQLite materializes a canonical-shaped `-shm` (32 KiB) beside
+        // a WAL-mode database; it does not run the WAL-less native path this
+        // fixture once assumed. The placeholder shape under test is therefore
+        // reached by truncating that sidecar, not by creating one. Truncation
+        // happens only after the writer is closed: shrinking a live mapping
+        // would fault the mapping holder.
         assert!(
-            !shm_path.exists(),
-            "FrankenSQLite's native WAL path should not require canonical SHM"
+            shm_path.is_file(),
+            "FrankenSQLite's native WAL path materializes a canonical SHM sidecar"
         );
-        std::fs::write(&shm_path, []).expect("materialize empty compatibility SHM placeholder");
+        assert_eq!(
+            writer
+                .query_sync("SELECT value FROM live_value", &[])
+                .expect("query live value before cleanup classification")[0]
+                .get_named::<i64>("value")
+                .expect("decode live value"),
+            8
+        );
+        crate::close_db_conn(writer, "clean up empty-SHM regression writer");
+
+        // Closing the last FrankenSQLite handle does not checkpoint, so the
+        // committed frames stay in the WAL. An empty `-shm` beside that framed
+        // WAL is exactly the shape a crashed or freshly restarted writer
+        // leaves behind, and cleanup must classify it as healthy rather than
+        // detach it.
+        assert!(
+            std::fs::metadata(&wal_path)
+                .is_ok_and(|metadata| metadata.len() > SQLITE_WAL_HEADER_BYTES),
+            "closing a FrankenSQLite writer must not checkpoint the framed WAL away"
+        );
+        std::fs::write(&shm_path, []).expect("truncate to an empty compatibility SHM placeholder");
         let family_before = exact_diagnostic_parent_snapshot(dir.path());
 
         assert_eq!(
@@ -29818,15 +29897,6 @@ mod tests {
             family_before,
             "cleanup must not detach an empty SHM placeholder from a healthy Franken WAL family"
         );
-        assert_eq!(
-            writer
-                .query_sync("SELECT value FROM live_value", &[])
-                .expect("query live value after cleanup classification")[0]
-                .get_named::<i64>("value")
-                .expect("decode live value"),
-            8
-        );
-        crate::close_db_conn(writer, "clean up empty-SHM regression writer");
     }
 
     #[test]
