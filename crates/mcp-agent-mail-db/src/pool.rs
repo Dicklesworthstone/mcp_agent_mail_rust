@@ -31755,8 +31755,9 @@ mod tests {
         let wal_path = sqlite_sidecar_path(&db_path, "-wal");
         std::fs::write(&wal_path, vec![0u8; 4096]).expect("write a WAL that could carry frames");
 
-        let error = open_guarded_read_only_canonical_sqlite_file(&db_path, "test")
-            .expect_err("a non-empty WAL without SHM stays ambiguous and must be refused");
+        let Err(error) = open_guarded_read_only_canonical_sqlite_file(&db_path, "test") else {
+            panic!("a non-empty WAL without SHM stays ambiguous and must be refused");
+        };
 
         assert!(
             error.to_string().contains("required SHM companion"),
