@@ -45643,12 +45643,15 @@ http_headers = { Authorization = "Bearer secret" }
         std::fs::create_dir_all(&link_dir).expect("mkdir link");
 
         assert!(
-            doctor_path_set_contains(&[real_config.clone()], &real_config),
+            doctor_path_set_contains(std::slice::from_ref(&real_config), &real_config),
             "an exact path always matches"
         );
         #[cfg(unix)]
         assert!(
-            doctor_path_set_contains(&[real_config], &link_dir.join("mcp.json")),
+            doctor_path_set_contains(
+                std::slice::from_ref(&real_config),
+                &link_dir.join("mcp.json")
+            ),
             "the same file reached through a symlinked directory must match"
         );
     }
