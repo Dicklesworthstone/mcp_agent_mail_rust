@@ -1,0 +1,106 @@
+name: Issue 138 one-shot fix
+
+on:
+  push:
+    branches:
+      - agent/issue-138-doctor-reader-fix
+
+permissions:
+  contents: write
+
+concurrency:
+  group: issue-138-one-shot
+  cancel-in-progress: false
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_TERM_COLOR: always
+      E2E_CARGO_FORCE_LOCAL: "1"
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Check out patch source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: patch-source
+
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          path: mcp_agent_mail_rust
+
+      - name: Check out pinned frankensearch sibling
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/frankensearch
+          ref: 3bbfd8c664062f8304e7a790c51794671f9214dc
+          path: frankensearch-rel-0332
+
+      - name: Check out beads_rust sibling
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/beads_rust
+          ref: main
+          path: beads_rust
+
+      - name: Install native build and test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang cmake jq libsqlite3-dev pkg-config
+
+      - name: Apply narrow source and regression patch
+        working-directory: mcp_agent_mail_rust
+        run: python3 ../patch-source/scripts/issue_138_patch.py
+
+      - name: Format
+        working-directory: mcp_agent_mail_rust
+        run: cargo fmt --all -- --check
+
+      - name: Test doctor read-only classification
+        working-directory: mcp_agent_mail_rust
+        run: |
+          set -o pipefail
+          cargo test -p mcp-agent-mail-cli doctor_check_is_read_only -- --nocapture 2>&1 | tee /tmp/issue-138-unit.log
+
+      - name: Run live-server regression
+        working-directory: mcp_agent_mail_rust
+        run: |
+          set -o pipefail
+          bash tests/e2e/test_doctor_check_live_server.sh 2>&1 | tee /tmp/issue-138-e2e.log
+
+      - name: Show exact patch
+        working-directory: mcp_agent_mail_rust
+        run: |
+          git status --short
+          git diff --check
+          git diff --stat
+          git diff -- crates/mcp-agent-mail-cli/src/lib.rs tests/e2e/test_doctor_check_live_server.sh
+
+      - name: Commit directly to main
+        working-directory: mcp_agent_mail_rust
+        run: |
+          git config user.name "Jeff Emanuel"
+          git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
+          git add crates/mcp-agent-mail-cli/src/lib.rs tests/e2e/test_doctor_check_live_server.sh
+          git commit -m "fix(doctor): keep standalone checks read-only beside live server" \
+            -m "Classify doctor check as detector-only before any database open so it cannot enter init-time recovery or archive reconciliation while a supervised server owns the mailbox. Add a Linux live-process regression that holds the doctor's mailbox descriptor open and verifies sole-owner classification, repeated HTTP health, JSON-RPC mailbox reads, clean completion, and no recovery-contention diagnostics (GH#138)."
+          git fetch origin main
+          git rebase origin/main
+          git push origin HEAD:main
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-138-diagnostics-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            /tmp/issue-138-unit.log
+            /tmp/issue-138-e2e.log
+            mcp_agent_mail_rust/tests/artifacts/doctor_check_live_server/**
