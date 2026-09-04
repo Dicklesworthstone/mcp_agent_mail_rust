@@ -1,0 +1,80 @@
+name: Coordinated release risk
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/coordinated-release-risk.yml'
+      - 'scripts/check_coordinated_release_risk.py'
+      - 'scripts/tests/test_check_coordinated_release_risk.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/dist.yml'
+
+permissions:
+  contents: read
+  checks: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: coordinated-release-risk
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    name: Assess coordinated release graph
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout monitor source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Run hermetic monitor regressions
+        run: python3 scripts/tests/test_check_coordinated_release_risk.py
+
+      - name: Inspect exact main heads and synchronize alert
+        id: assess
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_MONITOR_GITHUB_TOKEN || github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set +e
+          python3 scripts/check_coordinated_release_risk.py \
+            --json-out coordinated-release-risk.json \
+            --markdown-out coordinated-release-risk.md \
+            --sync-issue \
+            --issue-repository "$GITHUB_REPOSITORY" \
+            --assignee Dicklesworthstone \
+            --run-url "$RUN_URL"
+          status=$?
+          set -e
+          printf 'exit_code=%s\n' "$status" >> "$GITHUB_OUTPUT"
+          cat coordinated-release-risk.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload machine-readable evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coordinated-release-risk-${{ github.run_id }}
+          path: |
+            coordinated-release-risk.json
+            coordinated-release-risk.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Fail closed on blockers or monitor errors
+        if: steps.assess.outputs.exit_code != '0' && steps.assess.outputs.exit_code != '1'
+        env:
+          EXIT_CODE: ${{ steps.assess.outputs.exit_code }}
+        run: |
+          echo "Coordinated release monitor exited with status ${EXIT_CODE}." >&2
+          exit 1
