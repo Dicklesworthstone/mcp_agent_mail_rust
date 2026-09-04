@@ -8,6 +8,10 @@
 //! filenames derived from them never collide — the duplicate-canonical-file
 //! failure mode that motivated the bead.
 
+use asupersync::Cx;
+use mcp_agent_mail_db::pool::DbPoolConfig;
+use mcp_agent_mail_db::queries;
+use mcp_agent_mail_db::create_pool;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
@@ -119,7 +123,7 @@ fn run_worker(db_path: &str) {
         .expect("build worker runtime");
     runtime.block_on(async {
         let cx = Cx::current().expect("runtime installs worker context");
-        let cfg = crate::pool::DbPoolConfig {
+        let cfg = DbPoolConfig {
             database_url: format!("sqlite:///{db_path}"),
             storage_root: Some(storage_root.clone()),
             min_connections: 1,
@@ -127,14 +131,14 @@ fn run_worker(db_path: &str) {
             warmup_connections: 0,
             ..Default::default()
         };
-        let pool = crate::create_pool(&cfg).expect("worker pool");
+        let pool = create_pool(&cfg).expect("worker pool");
 
-        let project = crate::queries::ensure_project(&cx, &pool, "/tmp/br-sa58k-worker")
+        let project = queries::ensure_project(&cx, &pool, "/tmp/br-sa58k-worker")
             .await
             .into_result()
             .expect("ensure project");
         let project_id = project.id.expect("project id");
-        let sender = crate::queries::register_agent(
+        let sender = queries::register_agent(
             &cx,
             &pool,
             project_id,
@@ -156,7 +160,7 @@ fn run_worker(db_path: &str) {
             std::fs::write(&gate, "ready").expect("raise start gate");
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        while !go_gate.exists() {
+        while !std::path::Path::new(&go_gate).exists() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "worker {name} never observed the go gate"
@@ -164,7 +168,7 @@ fn run_worker(db_path: &str) {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
-        let message = crate::queries::create_message(
+        let message = queries::create_message(
             &cx,
             &pool,
             project_id,
