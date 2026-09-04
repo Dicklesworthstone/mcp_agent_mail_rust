@@ -1,25 +1,14 @@
-name: Coordinated release risk
+# Automatic schedule and push triggers are intentionally disabled.
+# Manual runs are read-only and do not synchronize GitHub issues.
+name: Coordinated release risk (manual only)
 
 on:
-  schedule:
-    - cron: '23 * * * *'
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - '.github/workflows/coordinated-release-risk.yml'
-      - 'scripts/check_coordinated_release_risk.py'
-      - 'scripts/tests/test_check_coordinated_release_risk.py'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/dist.yml'
 
 permissions:
   contents: read
   checks: read
   actions: read
-  issues: write
 
 concurrency:
   group: coordinated-release-risk
@@ -40,7 +29,7 @@ jobs:
       - name: Run hermetic monitor regressions
         run: python3 scripts/tests/test_check_coordinated_release_risk.py
 
-      - name: Inspect exact main heads and synchronize alert
+      - name: Inspect exact main heads
         id: assess
         env:
           GH_TOKEN: ${{ secrets.RELEASE_MONITOR_GITHUB_TOKEN || github.token }}
@@ -51,9 +40,6 @@ jobs:
           python3 scripts/check_coordinated_release_risk.py \
             --json-out coordinated-release-risk.json \
             --markdown-out coordinated-release-risk.md \
-            --sync-issue \
-            --issue-repository "$GITHUB_REPOSITORY" \
-            --assignee Dicklesworthstone \
             --run-url "$RUN_URL"
           status=$?
           set -e
