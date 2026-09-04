@@ -2108,6 +2108,31 @@ pub enum MailCommand {
         #[arg(long, default_value_t = true)]
         json: bool,
     },
+    /// Discard a queued UNSENT message artifact without sending it.
+    ///
+    /// Use when replaying the queued send would publish stale coordination
+    /// state (the milestone it describes was already recorded by newer
+    /// messages, the recipient retired, the thread moved on). Writes a durable
+    /// `.discarded.json` terminal receipt recording who, when, and why; the
+    /// original artifact is preserved, never deleted.
+    #[command(name = "discard-queued")]
+    DiscardQueued {
+        /// Path printed by a failed `am mail send` queued-send error.
+        #[arg(long, value_name = "PATH")]
+        artifact: PathBuf,
+        /// Required human-readable justification, recorded in the receipt.
+        #[arg(long, value_name = "TEXT")]
+        reason: String,
+        /// Who is discarding (defaults to AGENT_MAIL_AGENT, else the OS user).
+        #[arg(long, value_name = "NAME")]
+        actor: Option<String>,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = true)]
+        json: bool,
+    },
     /// Reply to an existing message.
     Reply {
         /// Project key.
@@ -2223,6 +2248,13 @@ pub enum MailCommand {
 
 const PENDING_SEND_SCHEMA_VERSION: &str = "am.pending_send.v1";
 const PENDING_SEND_RECEIPT_SCHEMA_VERSION: &str = "am.pending_send_receipt.v1";
+/// Schema of the terminal receipt written by `am mail discard-queued` (GH#306).
+const PENDING_SEND_DISCARD_RECEIPT_SCHEMA_VERSION: &str = "am.pending_send_discard_receipt.v1";
+/// Terminal status recorded in a discard receipt.
+const PENDING_SEND_DISCARDED_STATUS: &str = "discarded";
+/// Upper bound on the operator-supplied discard reason, so an accidental
+/// file-slurp cannot write an unbounded artifact into the mailbox.
+const PENDING_SEND_DISCARD_REASON_MAX_CHARS: usize = 2000;
 const PENDING_SEND_UNSENT_STATUS: &str = "UNSENT_UNTIL_REPLAY";
 /// Safety bound on how many byte-identical pending-send artifacts may queue
 /// for one content hash across separate outages (br-0ycog). Each replayed
@@ -2280,6 +2312,39 @@ struct PendingSendReceipt {
     artifact_path: String,
     sent_ts: String,
     response: serde_json::Value,
+}
+
+/// Terminal receipt proving a queued send was deliberately NOT delivered
+/// (GH#306).
+///
+/// A queued send can go stale during a long outage: the milestone it describes
+/// gets recorded by newer messages, the recipient retires, the thread moves on.
+/// Replaying it then publishes stale coordination state, but leaving it queued
+/// keeps `am robot status` degraded forever. `am mail discard-queued` is the
+/// third option: it consumes the intent without sending, and the receipt it
+/// writes is the audit trail — WHO discarded it, WHEN, WHY, how old the intent
+/// was, and the original failure that queued it. The artifact itself is never
+/// deleted or rewritten (RULE 1), so the full envelope stays recoverable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PendingSendDiscardReceipt {
+    schema_version: String,
+    /// Always [`PENDING_SEND_DISCARDED_STATUS`]; present so a reader can tell
+    /// the two terminal receipt kinds apart from content alone.
+    status: String,
+    content_hash: String,
+    artifact_path: String,
+    discarded_ts: String,
+    /// Who performed the discard (`--actor`, else `AGENT_MAIL_AGENT`, else the
+    /// OS user).
+    actor: String,
+    /// Required human-readable justification.
+    reason: String,
+    /// Age of the queued artifact when it was discarded, in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queued_age_seconds: Option<i64>,
+    /// The failure that originally queued the send, carried forward so the
+    /// receipt is self-contained.
+    original_failure: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -3637,6 +3702,12 @@ fn mail_command_is_read_only(action: &MailCommand) -> bool {
             | MailCommand::Read { .. }
             | MailCommand::Search { .. }
             | MailCommand::SummarizeThread { .. }
+            // GH#306: `discard-queued` issues NO mailbox query at all — it
+            // reads one queued-send artifact and writes its terminal receipt
+            // under `<storage_root>/pending_sends/`. It must stay usable while
+            // a live server owns the mailbox, since that is exactly the state
+            // in which queued sends accumulate and go stale.
+            | MailCommand::DiscardQueued { .. }
     )
 }
 
@@ -32564,6 +32635,43 @@ enum DoctorMcpConfigBearerStatus {
     Mismatch,
 }
 
+/// MCP config paths that `am setup` deliberately writes without an
+/// `Authorization` header, for the endpoint this doctor run is checking.
+///
+/// GH#307: the single source of truth is `am setup`'s own action list
+/// (`setup::config_paths_without_expected_bearer_token`), so this can never
+/// drift from what setup writes. `canonical_token` is passed in rather than
+/// re-resolved so a header is judged "intentionally absent" only when setup
+/// would have had a real token to write.
+fn doctor_config_paths_setup_leaves_header_free(
+    env_config: &Config,
+    canonical_token: &str,
+) -> Vec<PathBuf> {
+    let params = mcp_agent_mail_core::setup::SetupParams {
+        host: env_config.http_host.clone(),
+        port: env_config.http_port,
+        path: env_config.http_path.clone(),
+        project_dir: std::env::current_dir().unwrap_or_default(),
+        token: canonical_token.to_string(),
+        ..Default::default()
+    };
+    mcp_agent_mail_core::setup::config_paths_without_expected_bearer_token(&params)
+}
+
+/// Whether `path` names the same file as one of `paths`, comparing resolved
+/// spellings when both sides resolve (symlinked config dirs are common).
+fn doctor_path_set_contains(paths: &[PathBuf], path: &Path) -> bool {
+    if paths.iter().any(|candidate| candidate == path) {
+        return true;
+    }
+    let Ok(resolved) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    paths.iter().any(|candidate| {
+        std::fs::canonicalize(candidate).is_ok_and(|candidate| candidate == resolved)
+    })
+}
+
 fn doctor_mcp_config_bearer_status(
     config_path: &Path,
     content: &str,
@@ -34574,6 +34682,14 @@ fn handle_doctor_check_with_target(
 
             // Sub-check: verify bearer tokens in MCP configs match the canonical token
             if let Some(canonical_token) = env_config.http_bearer_token.as_deref() {
+                // GH#307: use the SAME notion of a correct config that
+                // `am setup` writes. Several user-level configs are written
+                // world-readable and are therefore deliberately token-free;
+                // warning that they are "missing a bearer token" and telling
+                // the operator to run `am setup` contradicted `am setup
+                // status`, which correctly reported those files as current.
+                let header_free_by_design =
+                    doctor_config_paths_setup_leaves_header_free(&env_config, canonical_token);
                 let mut token_problem_parts: Vec<String> = Vec::new();
                 for loc in &existing {
                     if let Err(error) =
@@ -34596,6 +34712,9 @@ fn handle_doctor_check_with_target(
                         canonical_token,
                     ) {
                         Some(DoctorMcpConfigBearerStatus::Missing) => {
+                            if doctor_path_set_contains(&header_free_by_design, &loc.config_path) {
+                                continue;
+                            }
                             token_problem_parts.push(format!(
                                 "{} ({}) → missing bearer token",
                                 loc.tool.slug(),
@@ -36809,11 +36928,208 @@ fn pending_send_receipt_path(artifact_path: &Path) -> PathBuf {
     artifact_path.with_file_name(format!("{stem}.sent.json"))
 }
 
+/// Sibling path of the terminal receipt written by `am mail discard-queued`
+/// (GH#306).
+fn pending_send_discard_receipt_path(artifact_path: &Path) -> PathBuf {
+    let stem = artifact_path
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or("pending-send");
+    artifact_path.with_file_name(format!("{stem}.discarded.json"))
+}
+
+/// Whether a queued-send artifact has reached a terminal state — replayed
+/// (`.sent.json`) or deliberately discarded (`.discarded.json`).
+///
+/// Both receipts consume the intent, so both must retire it from
+/// `am robot status`'s `queued_intents` and from the dedupe slot search.
+fn pending_send_is_consumed(artifact_path: &Path) -> bool {
+    pending_send_receipt_path(artifact_path).exists()
+        || pending_send_discard_receipt_path(artifact_path).exists()
+}
+
+/// Validate and normalize the operator-supplied discard reason.
+///
+/// A discard is a deliberate, auditable decision not to deliver a message that
+/// a user asked to send; a blank reason would make the receipt worthless as an
+/// audit trail, so it is refused rather than defaulted.
+fn normalize_pending_send_discard_reason(reason: &str) -> CliResult<String> {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "--reason is required and must not be blank: the discard receipt is the only record of \
+             why this message was never delivered"
+                .to_string(),
+        ));
+    }
+    if trimmed.chars().count() > PENDING_SEND_DISCARD_REASON_MAX_CHARS {
+        return Err(CliError::InvalidArgument(format!(
+            "--reason is longer than {PENDING_SEND_DISCARD_REASON_MAX_CHARS} characters"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Resolve who is performing a discard: explicit `--actor`, else the ambient
+/// agent identity, else the OS user, else `unknown`.
+fn resolve_pending_send_discard_actor(actor: Option<&str>) -> String {
+    let candidate = actor
+        .map(str::to_string)
+        .or_else(|| std::env::var("AGENT_MAIL_AGENT").ok())
+        .or_else(|| std::env::var("USER").ok())
+        .or_else(|| std::env::var("USERNAME").ok())
+        .unwrap_or_default();
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Age in seconds of a queued artifact at `now`, from its recorded
+/// `created_ts`. `None` when the timestamp cannot be parsed.
+fn pending_send_queued_age_seconds(
+    artifact: &PendingSendArtifact,
+    now: DateTime<Utc>,
+) -> Option<i64> {
+    let created = DateTime::parse_from_rfc3339(&artifact.created_ts).ok()?;
+    Some(
+        now.signed_duration_since(created.with_timezone(&Utc))
+            .num_seconds(),
+    )
+}
+
+fn load_pending_send_discard_receipt(path: &Path) -> CliResult<PendingSendDiscardReceipt> {
+    let content = std::fs::read_to_string(path).map_err(|error| {
+        CliError::Other(format!(
+            "read queued-send discard receipt {}: {error}",
+            path.display()
+        ))
+    })?;
+    serde_json::from_str(&content).map_err(|error| {
+        CliError::Format(format!(
+            "parse queued-send discard receipt {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn validate_pending_send_discard_receipt(
+    path: &Path,
+    artifact: &PendingSendArtifact,
+    receipt: &PendingSendDiscardReceipt,
+) -> CliResult<()> {
+    if receipt.schema_version != PENDING_SEND_DISCARD_RECEIPT_SCHEMA_VERSION {
+        return Err(CliError::InvalidArgument(format!(
+            "unsupported queued-send discard receipt schema_version '{}' in {}",
+            receipt.schema_version,
+            path.display()
+        )));
+    }
+    if receipt.status != PENDING_SEND_DISCARDED_STATUS {
+        return Err(CliError::InvalidArgument(format!(
+            "queued-send discard receipt {} is not marked {PENDING_SEND_DISCARDED_STATUS}",
+            path.display()
+        )));
+    }
+    if receipt.content_hash != artifact.content_hash {
+        return Err(CliError::InvalidArgument(format!(
+            "queued-send discard receipt {} content_hash mismatch: expected {}, found {}",
+            path.display(),
+            artifact.content_hash,
+            receipt.content_hash
+        )));
+    }
+    Ok(())
+}
+
+/// Write the terminal discard receipt for `artifact_path`, append-only and
+/// idempotent.
+///
+/// `create_new` makes the write a one-shot claim: a concurrent discard loses
+/// the race, re-reads the winner's receipt, validates it, and reports the same
+/// terminal state instead of clobbering it. A `.sent.json` receipt on the same
+/// artifact is a hard conflict — the message really was delivered, and a
+/// discard receipt beside it would be a lie.
+fn write_pending_send_discard_receipt(
+    artifact_path: &Path,
+    artifact: &PendingSendArtifact,
+    actor: &str,
+    reason: &str,
+) -> CliResult<(PathBuf, PendingSendDiscardReceipt, bool)> {
+    use std::io::Write as _;
+
+    let sent_receipt_path = pending_send_receipt_path(artifact_path);
+    if sent_receipt_path.exists() {
+        return Err(CliError::InvalidArgument(format!(
+            "queued-send artifact {} was already replayed (receipt {}); refusing to write a \
+             conflicting discard receipt",
+            artifact_path.display(),
+            sent_receipt_path.display()
+        )));
+    }
+
+    let receipt_path = pending_send_discard_receipt_path(artifact_path);
+    if receipt_path.exists() {
+        let receipt = load_pending_send_discard_receipt(&receipt_path)?;
+        validate_pending_send_discard_receipt(&receipt_path, artifact, &receipt)?;
+        return Ok((receipt_path, receipt, true));
+    }
+
+    let receipt = PendingSendDiscardReceipt {
+        schema_version: PENDING_SEND_DISCARD_RECEIPT_SCHEMA_VERSION.to_string(),
+        status: PENDING_SEND_DISCARDED_STATUS.to_string(),
+        content_hash: artifact.content_hash.clone(),
+        artifact_path: artifact_path.display().to_string(),
+        discarded_ts: Utc::now().to_rfc3339(),
+        actor: actor.to_string(),
+        reason: reason.to_string(),
+        queued_age_seconds: pending_send_queued_age_seconds(artifact, Utc::now()),
+        original_failure: artifact.failure.message.clone(),
+    };
+    let mut bytes = serde_json::to_vec_pretty(&receipt).map_err(|error| {
+        CliError::Format(format!("serialize queued-send discard receipt: {error}"))
+    })?;
+    bytes.push(b'\n');
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&receipt_path)
+    {
+        Ok(mut file) => {
+            file.write_all(&bytes).map_err(|error| {
+                CliError::Other(format!(
+                    "write queued-send discard receipt {}: {error}",
+                    receipt_path.display()
+                ))
+            })?;
+            file.sync_all().map_err(|error| {
+                CliError::Other(format!(
+                    "sync queued-send discard receipt {}: {error}",
+                    receipt_path.display()
+                ))
+            })?;
+            Ok((receipt_path, receipt, false))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let receipt = load_pending_send_discard_receipt(&receipt_path)?;
+            validate_pending_send_discard_receipt(&receipt_path, artifact, &receipt)?;
+            Ok((receipt_path, receipt, true))
+        }
+        Err(error) => Err(CliError::Other(format!(
+            "create queued-send discard receipt {}: {error}",
+            receipt_path.display()
+        ))),
+    }
+}
+
 /// Resolve which pending-send artifact path to (re)use for a content hash
 /// whose canonical path is `base_path` (`{hash}.json`).
 ///
-/// br-0ycog: an artifact whose sibling `.sent.json` receipt exists has already
-/// been replayed (consumed). A later byte-identical send is a *new* message —
+/// br-0ycog: an artifact whose sibling terminal receipt exists (`.sent.json`
+/// from a replay, or `.discarded.json` from an audited discard — GH#306) has
+/// been consumed. A later byte-identical send is a *new* message —
 /// deduping it into the spent slot would make `am mail replay-queued` report
 /// `already_replayed` and silently drop it. So when the canonical slot is
 /// consumed, walk `{hash}.2.json`, `{hash}.3.json`, … and return the first slot
@@ -36823,7 +37139,7 @@ fn pending_send_receipt_path(artifact_path: &Path) -> PathBuf {
 /// un-replayed, preserving the documented reproducible-path contract for the
 /// common (single-outage) case.
 fn resolve_unconsumed_pending_send_path(base_path: &Path) -> CliResult<PathBuf> {
-    if !pending_send_receipt_path(base_path).exists() {
+    if !pending_send_is_consumed(base_path) {
         return Ok(base_path.to_path_buf());
     }
     let stem = base_path
@@ -36833,7 +37149,7 @@ fn resolve_unconsumed_pending_send_path(base_path: &Path) -> CliResult<PathBuf> 
         .to_string();
     for n in 2..=PENDING_SEND_MAX_DUPLICATE_SLOTS {
         let candidate = base_path.with_file_name(format!("{stem}.{n}.json"));
-        if !pending_send_receipt_path(&candidate).exists() {
+        if !pending_send_is_consumed(&candidate) {
             return Ok(candidate);
         }
     }
@@ -37280,6 +37596,23 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             let fmt = output::CliOutputFormat::resolve(format, json);
             let queued = load_pending_send_artifact(&artifact)?;
             validate_pending_send_artifact(&artifact, &queued)?;
+            // GH#306: a discarded intent is terminal. Replaying it anyway
+            // would publish exactly the stale state the discard was recorded
+            // to avoid, and would leave two contradictory terminal receipts.
+            let discard_receipt_path = pending_send_discard_receipt_path(&artifact);
+            if discard_receipt_path.exists() {
+                let discard = load_pending_send_discard_receipt(&discard_receipt_path)?;
+                validate_pending_send_discard_receipt(&discard_receipt_path, &queued, &discard)?;
+                return Err(CliError::InvalidArgument(format!(
+                    "queued-send artifact {} was discarded by {} at {} (reason: {}); refusing to \
+                     replay it. Receipt: {}",
+                    artifact.display(),
+                    discard.actor,
+                    discard.discarded_ts,
+                    discard.reason,
+                    discard_receipt_path.display()
+                )));
+            }
             let receipt_path = pending_send_receipt_path(&artifact);
             if receipt_path.exists() {
                 let receipt = load_pending_send_receipt(&receipt_path)?;
@@ -37340,6 +37673,57 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 output::success(&format!(
                     "Queued message replayed (id={message_id}) to {rendered_to}"
                 ));
+            });
+            Ok(())
+        }
+
+        MailCommand::DiscardQueued {
+            artifact,
+            reason,
+            actor,
+            format,
+            json,
+        } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
+            let reason = normalize_pending_send_discard_reason(&reason)?;
+            let actor = resolve_pending_send_discard_actor(actor.as_deref());
+            // Validate exactly as `replay-queued` does — same schema check,
+            // same content-hash proof — so a discard can never be recorded
+            // against an artifact we could not have replayed.
+            let queued = load_pending_send_artifact(&artifact)?;
+            validate_pending_send_artifact(&artifact, &queued)?;
+            let (receipt_path, receipt, already_discarded) =
+                write_pending_send_discard_receipt(&artifact, &queued, &actor, &reason)?;
+            let data = serde_json::json!({
+                "queued_status": if already_discarded { "already_discarded" } else { "discarded" },
+                "artifact": artifact.display().to_string(),
+                "receipt": receipt_path.display().to_string(),
+                "content_hash": receipt.content_hash,
+                "actor": receipt.actor,
+                "reason": receipt.reason,
+                "discarded_ts": receipt.discarded_ts,
+                "queued_age_seconds": receipt.queued_age_seconds,
+                "subject": queued.envelope.subject,
+                "sender": queued.envelope.sender,
+                "to": queued.envelope.to,
+                "sent": false,
+            });
+            output::emit_output(&data, fmt, || {
+                if already_discarded {
+                    output::success(&format!(
+                        "Queued message already discarded by {} ({}); receipt at {}",
+                        receipt.actor,
+                        receipt.reason,
+                        receipt_path.display()
+                    ));
+                } else {
+                    output::success(&format!(
+                        "Queued message \"{}\" discarded without sending ({}); receipt at {}",
+                        queued.envelope.subject,
+                        receipt.reason,
+                        receipt_path.display()
+                    ));
+                }
             });
             Ok(())
         }
@@ -40257,8 +40641,10 @@ fn server_inbox_payload_to_cli_json(
 #[cfg(test)]
 mod mail_server_cli_bridge_tests {
     use super::{
-        CliError, PENDING_SEND_SCHEMA_VERSION, PENDING_SEND_UNSENT_STATUS, PendingMailSendEnvelope,
-        ServerToolCall, acquire_doctor_mailbox_activity_lock_for_sqlite_path,
+        CliError, PENDING_SEND_DISCARD_REASON_MAX_CHARS,
+        PENDING_SEND_DISCARD_RECEIPT_SCHEMA_VERSION, PENDING_SEND_DISCARDED_STATUS,
+        PENDING_SEND_SCHEMA_VERSION, PENDING_SEND_UNSENT_STATUS, PendingMailSendEnvelope,
+        PendingSendArtifact, ServerToolCall, acquire_doctor_mailbox_activity_lock_for_sqlite_path,
         acquire_doctor_mailbox_activity_lock_for_storage_root,
         build_server_create_agent_identity_arguments, build_server_fetch_inbox_product_arguments,
         build_server_list_agents_arguments, build_server_macro_start_session_arguments,
@@ -40270,16 +40656,21 @@ mod mail_server_cli_bridge_tests {
         is_resource_busy_cli_error, load_pending_send_artifact, load_pending_send_receipt,
         load_sender_identity_token, mail_server_rejection_allows_local_fallback,
         mailbox_activity_lock_cli_error, normalize_cli_product_inbox_agent_name,
-        parse_blocking_http_url, parse_cli_fetch_inbox_product_limit, parse_cli_search_limit,
-        pending_send_content_hash, pending_send_failure_from_error, pending_send_receipt_path,
+        normalize_pending_send_discard_reason, parse_blocking_http_url,
+        parse_cli_fetch_inbox_product_limit, parse_cli_search_limit, pending_send_content_hash,
+        pending_send_discard_receipt_path, pending_send_failure_from_error,
+        pending_send_is_consumed, pending_send_queued_age_seconds, pending_send_receipt_path,
         persist_sender_identity_token, persist_sender_identity_token_from_agent_payload,
         post_jsonrpc_request_blocking_http, product_inbox_row_to_json,
         reject_local_fallback_with_ownership_probe, reject_local_registration_when_gate,
-        resolve_mailbox_activity_sqlite_path, resolve_sender_token,
-        server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
+        resolve_mailbox_activity_sqlite_path, resolve_pending_send_discard_actor,
+        resolve_sender_token, server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
         sort_product_inbox_items_desc, sqlite_doctor_sanity_with_health_probe,
-        validate_pending_send_artifact, validate_pending_send_receipt, write_pending_send_receipt,
+        validate_pending_send_artifact, validate_pending_send_discard_receipt,
+        validate_pending_send_receipt, write_pending_send_discard_receipt,
+        write_pending_send_receipt,
     };
+    use chrono::{DateTime, Utc};
     use mcp_agent_mail_core::config::Config;
     use std::path::PathBuf;
 
@@ -40419,6 +40810,185 @@ mod mail_server_cli_bridge_tests {
                 .expect("idempotent create");
         assert_eq!(second_path, path);
         assert_eq!(second_artifact.content_hash, loaded.content_hash);
+    }
+
+    // ---- GH#306: audited discard path for stale queued sends ----
+
+    fn queue_one_pending_send(config: &Config) -> (PathBuf, PendingSendArtifact) {
+        let envelope = pending_send_test_envelope();
+        let failure =
+            pending_send_failure_from_error(&CliError::Other("database is locked".to_string()))
+                .expect("lock failure should be queueable");
+        create_pending_send_artifact(config, &envelope, failure, false)
+            .expect("create queued-send artifact")
+    }
+
+    #[test]
+    fn discard_receipt_is_terminal_auditable_and_idempotent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = config_with_storage_root(temp.path());
+        let (path, artifact) = queue_one_pending_send(&config);
+        assert!(!pending_send_is_consumed(&path));
+
+        let (receipt_path, receipt, already) = write_pending_send_discard_receipt(
+            &path,
+            &artifact,
+            "PinkStone",
+            "superseded by message 8098",
+        )
+        .expect("write discard receipt");
+
+        assert!(!already);
+        assert_eq!(receipt_path, pending_send_discard_receipt_path(&path));
+        assert_eq!(receipt.status, PENDING_SEND_DISCARDED_STATUS);
+        assert_eq!(
+            receipt.schema_version,
+            PENDING_SEND_DISCARD_RECEIPT_SCHEMA_VERSION
+        );
+        assert_eq!(receipt.content_hash, artifact.content_hash);
+        assert_eq!(receipt.actor, "PinkStone");
+        assert_eq!(receipt.reason, "superseded by message 8098");
+        assert_eq!(receipt.original_failure, artifact.failure.message);
+        assert!(!receipt.discarded_ts.is_empty());
+
+        // The artifact itself is preserved verbatim (RULE 1) and is now
+        // consumed, so it stops driving the degraded alert.
+        assert!(path.exists());
+        assert_eq!(
+            load_pending_send_artifact(&path).expect("reload artifact"),
+            artifact
+        );
+        assert!(pending_send_is_consumed(&path));
+
+        // Idempotent: a second discard reports the SAME receipt and never
+        // rewrites it, even with different words.
+        let on_disk = std::fs::read_to_string(&receipt_path).expect("read receipt");
+        let (second_path, second_receipt, already_again) =
+            write_pending_send_discard_receipt(&path, &artifact, "OtherAgent", "another reason")
+                .expect("idempotent discard");
+        assert!(already_again);
+        assert_eq!(second_path, receipt_path);
+        assert_eq!(second_receipt, receipt);
+        assert_eq!(
+            std::fs::read_to_string(&receipt_path).expect("re-read receipt"),
+            on_disk,
+            "discard receipts are append-only"
+        );
+    }
+
+    #[test]
+    fn discard_refuses_to_contradict_a_replay_receipt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = config_with_storage_root(temp.path());
+        let (path, artifact) = queue_one_pending_send(&config);
+        write_pending_send_receipt(&path, &artifact, &serde_json::json!({"id": 42}))
+            .expect("write sent receipt");
+
+        let error = write_pending_send_discard_receipt(&path, &artifact, "PinkStone", "stale")
+            .expect_err("a delivered message must not also be recorded as discarded");
+
+        assert!(
+            error.to_string().contains("already replayed"),
+            "unexpected error: {error}"
+        );
+        assert!(!pending_send_discard_receipt_path(&path).exists());
+    }
+
+    #[test]
+    fn discard_receipt_validation_rejects_foreign_and_malformed_receipts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = config_with_storage_root(temp.path());
+        let (path, artifact) = queue_one_pending_send(&config);
+        let (receipt_path, receipt, _) =
+            write_pending_send_discard_receipt(&path, &artifact, "PinkStone", "stale")
+                .expect("write discard receipt");
+
+        validate_pending_send_discard_receipt(&receipt_path, &artifact, &receipt)
+            .expect("self-consistent receipt validates");
+
+        let mut wrong_hash = receipt.clone();
+        wrong_hash.content_hash = "0".repeat(64);
+        assert!(
+            validate_pending_send_discard_receipt(&receipt_path, &artifact, &wrong_hash).is_err()
+        );
+
+        let mut wrong_schema = receipt.clone();
+        wrong_schema.schema_version = "am.pending_send_discard_receipt.v0".to_string();
+        assert!(
+            validate_pending_send_discard_receipt(&receipt_path, &artifact, &wrong_schema).is_err()
+        );
+
+        let mut wrong_status = receipt;
+        wrong_status.status = "sent".to_string();
+        assert!(
+            validate_pending_send_discard_receipt(&receipt_path, &artifact, &wrong_status).is_err()
+        );
+    }
+
+    #[test]
+    fn discard_reason_must_be_a_real_justification() {
+        assert!(normalize_pending_send_discard_reason("").is_err());
+        assert!(normalize_pending_send_discard_reason("   \t \n ").is_err());
+        assert!(
+            normalize_pending_send_discard_reason(
+                &"x".repeat(PENDING_SEND_DISCARD_REASON_MAX_CHARS + 1)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            normalize_pending_send_discard_reason("  superseded by message 8098  ")
+                .expect("valid reason"),
+            "superseded by message 8098"
+        );
+    }
+
+    #[test]
+    fn discard_actor_falls_back_to_a_named_identity() {
+        assert_eq!(
+            resolve_pending_send_discard_actor(Some("  PinkStone  ")),
+            "PinkStone"
+        );
+        // With no explicit actor the value comes from the ambient environment;
+        // it must never be blank, so the receipt always names someone.
+        assert!(!resolve_pending_send_discard_actor(None).is_empty());
+        assert!(!resolve_pending_send_discard_actor(Some("   ")).is_empty());
+    }
+
+    #[test]
+    fn discard_queued_age_is_reported_from_the_artifact_timestamp() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = config_with_storage_root(temp.path());
+        let (_, mut artifact) = queue_one_pending_send(&config);
+        artifact.created_ts = "2026-09-01T00:00:00Z".to_string();
+        let now = DateTime::parse_from_rfc3339("2026-09-01T17:00:00Z")
+            .expect("parse now")
+            .with_timezone(&Utc);
+        assert_eq!(
+            pending_send_queued_age_seconds(&artifact, now),
+            Some(17 * 3600)
+        );
+
+        artifact.created_ts = "not a timestamp".to_string();
+        assert_eq!(pending_send_queued_age_seconds(&artifact, now), None);
+    }
+
+    #[test]
+    fn a_discarded_slot_is_not_reused_for_a_later_byte_identical_send() {
+        // br-0ycog's spent-slot rule must cover BOTH terminal receipts: a new
+        // outage's byte-identical message needs its own artifact, or the
+        // discard receipt would silently swallow it.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = config_with_storage_root(temp.path());
+        let (path, artifact) = queue_one_pending_send(&config);
+        write_pending_send_discard_receipt(&path, &artifact, "PinkStone", "stale")
+            .expect("discard");
+
+        let (second_path, _) = queue_one_pending_send(&config);
+        assert_ne!(
+            second_path, path,
+            "a consumed slot must not be reused for a new send"
+        );
+        assert!(!pending_send_is_consumed(&second_path));
     }
 
     #[test]
@@ -45021,6 +45591,66 @@ http_headers = { Authorization = "Bearer secret" }
             "secret",
         );
         assert_eq!(status, Some(DoctorMcpConfigBearerStatus::Match));
+    }
+
+    /// GH#307: the doctor's bearer sub-check exempts exactly the configs
+    /// `am setup` writes without an Authorization header, so `am setup status`
+    /// and `am doctor check` stop contradicting each other on the same file.
+    #[test]
+    fn doctor_bearer_check_exempts_the_configs_setup_writes_header_free() {
+        let home = PathBuf::from("/home/tester");
+        let params = mcp_agent_mail_core::setup::SetupParams {
+            token: "live-secret-token".to_string(),
+            project_dir: PathBuf::from("/tmp/project"),
+            home_dir_override: Some(home.clone()),
+            agents: Some(vec![mcp_agent_mail_core::setup::AgentPlatform::Cursor]),
+            skip_hooks: true,
+            ..Default::default()
+        };
+        let header_free =
+            mcp_agent_mail_core::setup::config_paths_without_expected_bearer_token(&params);
+
+        // The user-level Cursor config is deliberately token-free: doctor must
+        // not report it as "missing bearer token".
+        assert!(doctor_path_set_contains(
+            &header_free,
+            &home.join(".cursor").join("mcp.json")
+        ));
+        // The project-local one carries the token: a missing header there is
+        // still real drift.
+        assert!(!doctor_path_set_contains(
+            &header_free,
+            &PathBuf::from("/tmp/project").join("cursor.mcp.json")
+        ));
+        // An unrelated config setup does not manage keeps the old behavior.
+        assert!(!doctor_path_set_contains(
+            &header_free,
+            &PathBuf::from("/etc/somewhere/else/mcp.json")
+        ));
+    }
+
+    #[test]
+    fn doctor_path_set_contains_matches_through_a_symlinked_config_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real_dir = temp.path().join("real");
+        std::fs::create_dir_all(&real_dir).expect("mkdir real");
+        let real_config = real_dir.join("mcp.json");
+        std::fs::write(&real_config, b"{}").expect("write config");
+        let link_dir = temp.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_dir, &link_dir).expect("symlink dir");
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&link_dir).expect("mkdir link");
+
+        assert!(
+            doctor_path_set_contains(&[real_config.clone()], &real_config),
+            "an exact path always matches"
+        );
+        #[cfg(unix)]
+        assert!(
+            doctor_path_set_contains(&[real_config], &link_dir.join("mcp.json")),
+            "the same file reached through a symlinked directory must match"
+        );
     }
 
     #[test]

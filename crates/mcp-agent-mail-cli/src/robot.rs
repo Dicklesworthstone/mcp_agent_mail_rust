@@ -1081,6 +1081,11 @@ pub struct QueuedIntentSummary {
     pub summary: String,
     /// How to replay: a copy-paste command, or the automatic mechanism.
     pub replay: String,
+    /// How to DISCARD the intent instead of replaying it, when replay would
+    /// publish stale state (GH#306). `None` for intents that replay
+    /// automatically and therefore have no explicit discard path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discard: Option<String>,
     /// Absolute path of the durable artifact backing this intent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -4473,6 +4478,43 @@ fn remaining_seconds_from_micros(now_us: i64, future_us: i64) -> i64 {
 /// recovery as potentially stuck and surfaces a stall warning to operators.
 const RECOVERY_STALL_THRESHOLD_SECS: u64 = 300; // 5 minutes
 
+/// Durability floor implied by mailbox ownership, for `am robot status`.
+///
+/// GH#305: `ActiveOtherOwner` with `supervised_restart_required == false` is
+/// the NORMAL supervised state — exactly one live Agent Mail server
+/// (`am serve-http` under systemd/launchd) owning its own mailbox. That is the
+/// same shape `am doctor locks` classifies as owner class `live` and that
+/// `am doctor check` reports healthy. `am robot status` is a read-only reader,
+/// so a supervised owner does not degrade it; mapping it to
+/// `DegradedReadOnly` made every healthy service look like a recovery incident
+/// to automation and recommended `am doctor repair` on a healthy mailbox.
+///
+/// Dispositions that genuinely need a supervised stop still degrade: an owner
+/// flagged `supervised_restart_required` (a legacy shadow server holding the
+/// database without activity locks), and the stale/deleted-executable/
+/// split-brain classes, which stay fatal.
+fn mailbox_ownership_durability_floor(
+    disposition: mcp_agent_mail_db::pool::MailboxOwnershipDisposition,
+    supervised_restart_required: bool,
+) -> mcp_agent_mail_db::mailbox_verdict::DurabilityState {
+    use mcp_agent_mail_db::mailbox_verdict::DurabilityState;
+    use mcp_agent_mail_db::pool::MailboxOwnershipDisposition;
+
+    match disposition {
+        MailboxOwnershipDisposition::Unowned => DurabilityState::Healthy,
+        MailboxOwnershipDisposition::ActiveOtherOwner => {
+            if supervised_restart_required {
+                DurabilityState::DegradedReadOnly
+            } else {
+                DurabilityState::Healthy
+            }
+        }
+        MailboxOwnershipDisposition::StaleLiveProcess
+        | MailboxOwnershipDisposition::DeletedExecutable
+        | MailboxOwnershipDisposition::SplitBrain => DurabilityState::Corrupt,
+    }
+}
+
 fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
     use mcp_agent_mail_db::mailbox_verdict::{
         DurabilityState, VerdictOptions, compute_mailbox_verdict,
@@ -4502,13 +4544,10 @@ fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
     // floor exactly as the verdict's own ownership probe would have
     // (ActiveOtherOwner => Suspect/degraded, stale/deleted/split-brain =>
     // fatal/corrupt).
-    let ownership_floor = match ownership.disposition {
-        MailboxOwnershipDisposition::Unowned => DurabilityState::Healthy,
-        MailboxOwnershipDisposition::ActiveOtherOwner => DurabilityState::DegradedReadOnly,
-        MailboxOwnershipDisposition::StaleLiveProcess
-        | MailboxOwnershipDisposition::DeletedExecutable
-        | MailboxOwnershipDisposition::SplitBrain => DurabilityState::Corrupt,
-    };
+    let ownership_floor = mailbox_ownership_durability_floor(
+        ownership.disposition,
+        ownership.supervised_restart_required,
+    );
     let durability =
         DurabilityState::from_mailbox_state(verdict.state).max_severity(ownership_floor);
 
@@ -4786,6 +4825,7 @@ fn build_queued_intents_for_config(
                     intent.message_id, intent.agent_name, intent.failure.stage
                 ),
                 replay: "automatic on next successful acknowledge_message".to_string(),
+                discard: None,
                 path: Some(path.clone()),
             });
         }
@@ -4814,6 +4854,7 @@ fn build_queued_intents_for_config(
                 agent: Some(intent.agent_name.clone()),
                 summary: format!("release of {target} by {} queued", intent.agent_name),
                 replay: "automatic on next successful release_file_reservations".to_string(),
+                discard: None,
                 path: Some(path.clone()),
             });
         }
@@ -4826,7 +4867,8 @@ fn build_queued_intents_for_config(
 }
 
 /// Scan `<storage_root>/pending_sends/` for UNSENT message artifacts that have
-/// not yet been replayed (no sibling `.sent.json` receipt).
+/// not yet reached a terminal state — neither replayed (`.sent.json`) nor
+/// deliberately discarded (`.discarded.json`, GH#306).
 fn scan_pending_send_intents(config: &mcp_agent_mail_core::Config) -> Vec<QueuedIntentSummary> {
     let dir = config.storage_root.join("pending_sends");
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -4838,12 +4880,17 @@ fn scan_pending_send_intents(config: &mcp_agent_mail_core::Config) -> Vec<Queued
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        // Only artifacts; skip ".sent.json" receipts and anything else.
-        if !name.ends_with(".json") || name.ends_with(".sent.json") {
+        // Only artifacts; skip terminal receipts and anything else.
+        if !name.ends_with(".json")
+            || name.ends_with(".sent.json")
+            || name.ends_with(".discarded.json")
+        {
             continue;
         }
-        // An artifact with a sibling receipt has already been sent.
-        if crate::pending_send_receipt_path(&path).exists() {
+        // An artifact with a sibling terminal receipt has been consumed —
+        // sent, or discarded without sending (GH#306). Either way it is no
+        // longer actionable and must stop driving the degraded-mode alert.
+        if crate::pending_send_is_consumed(&path) {
             continue;
         }
         let Ok(artifact) = crate::load_pending_send_artifact(&path) else {
@@ -4863,6 +4910,10 @@ fn scan_pending_send_intents(config: &mcp_agent_mail_core::Config) -> Vec<Queued
                 artifact.envelope.to.join(", ")
             ),
             replay: artifact.replay_command.clone(),
+            discard: Some(format!(
+                "am mail discard-queued --artifact {} --reason '<why this is stale>'",
+                path.display()
+            )),
             path: Some(path.display().to_string()),
         });
     }
@@ -16625,6 +16676,109 @@ mod tests {
             send.replay,
             "am mail replay-queued --artifact /tmp/deadbeef.json"
         );
+    }
+
+    /// GH#305: a healthy supervised `am serve-http` owning its own mailbox is
+    /// the normal state, not a recovery incident.
+    #[test]
+    fn supervised_active_owner_does_not_lower_the_durability_floor() {
+        use mcp_agent_mail_db::mailbox_verdict::DurabilityState;
+        use mcp_agent_mail_db::pool::MailboxOwnershipDisposition;
+
+        assert_eq!(
+            mailbox_ownership_durability_floor(MailboxOwnershipDisposition::Unowned, false),
+            DurabilityState::Healthy
+        );
+        assert_eq!(
+            mailbox_ownership_durability_floor(
+                MailboxOwnershipDisposition::ActiveOtherOwner,
+                false
+            ),
+            DurabilityState::Healthy,
+            "a supervised live server owning its own mailbox is healthy"
+        );
+        assert_eq!(
+            mailbox_ownership_durability_floor(MailboxOwnershipDisposition::ActiveOtherOwner, true),
+            DurabilityState::DegradedReadOnly,
+            "an owner that needs a supervised stop still degrades"
+        );
+        for disposition in [
+            MailboxOwnershipDisposition::StaleLiveProcess,
+            MailboxOwnershipDisposition::DeletedExecutable,
+            MailboxOwnershipDisposition::SplitBrain,
+        ] {
+            assert_eq!(
+                mailbox_ownership_durability_floor(disposition, true),
+                DurabilityState::Corrupt,
+                "{disposition:?} must stay fatal"
+            );
+        }
+    }
+
+    /// The supervised-owner floor must not silently mask a genuinely degraded
+    /// verdict: the recovery status folds it in with `max_severity`.
+    #[test]
+    fn supervised_owner_floor_still_yields_to_a_worse_verdict() {
+        use mcp_agent_mail_db::mailbox_verdict::DurabilityState;
+        use mcp_agent_mail_db::pool::MailboxOwnershipDisposition;
+
+        let floor = mailbox_ownership_durability_floor(
+            MailboxOwnershipDisposition::ActiveOtherOwner,
+            false,
+        );
+        assert_eq!(
+            DurabilityState::Corrupt.max_severity(floor),
+            DurabilityState::Corrupt
+        );
+        assert_eq!(
+            DurabilityState::DegradedReadOnly.max_severity(floor),
+            DurabilityState::DegradedReadOnly
+        );
+    }
+
+    /// GH#306: a discarded queued send is terminal — it stops driving the
+    /// degraded-mode alert exactly like a replayed one, and the summary tells
+    /// the agent how to discard.
+    #[test]
+    fn scan_pending_sends_skips_discarded_artifacts_and_offers_a_discard_command() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = queued_intents_test_config(tmp.path());
+        let pending_dir = tmp.path().join("pending_sends");
+        std::fs::create_dir_all(&pending_dir).expect("mkdir");
+        std::fs::write(
+            pending_dir.join("feedface.json"),
+            serde_json::to_vec(&pending_send_artifact_json("feedface", "x")).expect("serialize"),
+        )
+        .expect("write");
+
+        let intents = scan_pending_send_intents(&config);
+        assert_eq!(intents.len(), 1);
+        let discard = intents[0].discard.as_deref().expect("discard command");
+        assert!(
+            discard.starts_with("am mail discard-queued --artifact "),
+            "discard command: {discard}"
+        );
+        assert!(discard.contains("--reason"), "discard command: {discard}");
+
+        std::fs::write(pending_dir.join("feedface.discarded.json"), b"{}")
+            .expect("write discard receipt");
+        assert!(
+            scan_pending_send_intents(&config).is_empty(),
+            "a discarded artifact must not appear as queued"
+        );
+    }
+
+    /// A terminal receipt file is never itself mistaken for a queued artifact.
+    #[test]
+    fn scan_pending_sends_ignores_terminal_receipt_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = queued_intents_test_config(tmp.path());
+        let pending_dir = tmp.path().join("pending_sends");
+        std::fs::create_dir_all(&pending_dir).expect("mkdir");
+        std::fs::write(pending_dir.join("abc123.sent.json"), b"{}").expect("write sent receipt");
+        std::fs::write(pending_dir.join("def456.discarded.json"), b"{}")
+            .expect("write discard receipt");
+        assert!(scan_pending_send_intents(&config).is_empty());
     }
 
     #[test]
