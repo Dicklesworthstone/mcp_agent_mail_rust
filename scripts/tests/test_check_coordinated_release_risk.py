@@ -103,6 +103,9 @@ class AssessmentTests(unittest.TestCase):
             repo = spec["repo"]
             root = {"workspace": {"package": {"version": versions[key]}, "dependencies": deps.get(key, {})}}
             if key == "asupersync": root = {"package": {"version": versions[key]}}
+            if key == "frankensqlite":
+                root = {"workspace": {"dependencies": {"asupersync": "=0.4.10"}}}
+                self.contents[(repo, "crates/fsqlite/Cargo.toml")] = '[package]\nname="fsqlite"\nversion="0.3.16"\n'
             if key == "frankensearch":
                 root = {"workspace": {"dependencies": {"asupersync": ">=0.4.4, <0.5", "ftui-core": "0.5.0"}}}
                 self.contents[(repo, "frankensearch/Cargo.toml")] = '[package]\nname="frankensearch"\nversion="0.4.2"\n'
@@ -129,6 +132,7 @@ class AssessmentTests(unittest.TestCase):
         self.assertIn("dependency.incompatible.mcp_agent_mail_rust.frankentui", codes)
         self.assertIn("integration.frankensearch_snapshot_drift", codes)
         self.assertNotIn("dependency.incompatible.mcp_agent_mail_rust.frankensqlite", codes)
+        self.assertFalse(any(item["code"] == "verification.collection_failed" and item["repository"].endswith("frankensqlite") for item in report["findings"]))
 
     def test_failed_tests_block_but_pages_failure_does_not(self):
         checks = {

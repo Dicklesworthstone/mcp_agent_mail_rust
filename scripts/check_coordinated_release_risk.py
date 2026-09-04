@@ -44,7 +44,7 @@ REPOS = {
         "impact": "FastMCP, FrankenSQLite, and FrankenSearch share Asupersync runtime/context types; a split line can prevent resolution or make public types non-interchangeable.",
     },
     "frankensqlite": {
-        "repo": f"{OWNER}/frankensqlite", "version_file": "Cargo.toml", "version_path": ("workspace", "package", "version"),
+        "repo": f"{OWNER}/frankensqlite", "version_file": "crates/fsqlite/Cargo.toml", "version_path": ("package", "version"),
         "impact": "MCP Agent Mail cannot validate storage, migrations, and SQLModel behavior against the proposed database release.",
     },
     "frankensearch": {
