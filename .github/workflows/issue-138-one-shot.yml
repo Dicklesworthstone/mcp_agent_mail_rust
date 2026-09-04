@@ -58,21 +58,24 @@ jobs:
         working-directory: mcp_agent_mail_rust
         run: python3 ../patch-source/scripts/issue_138_patch.py
 
-      - name: Format
+      - name: Record formatter result
+        continue-on-error: true
         working-directory: mcp_agent_mail_rust
-        run: cargo fmt --all
+        run: |
+          set -o pipefail
+          cargo fmt --all 2>&1 | tee issue-138-fmt.log
 
       - name: Test doctor read-only classification
         working-directory: mcp_agent_mail_rust
         run: |
           set -o pipefail
-          cargo test -p mcp-agent-mail-cli doctor_check_is_read_only -- --nocapture 2>&1 | tee /tmp/issue-138-unit.log
+          cargo test -p mcp-agent-mail-cli doctor_check_is_read_only -- --nocapture 2>&1 | tee issue-138-unit.log
 
       - name: Run live-server regression
         working-directory: mcp_agent_mail_rust
         run: |
           set -o pipefail
-          bash tests/e2e/test_doctor_check_live_server.sh 2>&1 | tee /tmp/issue-138-e2e.log
+          bash tests/e2e/test_doctor_check_live_server.sh 2>&1 | tee issue-138-e2e.log
 
       - name: Show exact patch
         working-directory: mcp_agent_mail_rust
@@ -87,6 +90,7 @@ jobs:
         run: |
           git config user.name "Jeff Emanuel"
           git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
+          rm -f issue-138-fmt.log issue-138-unit.log issue-138-e2e.log
           git add crates/mcp-agent-mail-cli/src/lib.rs tests/e2e/test_doctor_check_live_server.sh
           git commit -m "fix(doctor): keep standalone checks read-only beside live server" \
             -m "Classify doctor check as detector-only before any database open so it cannot enter init-time recovery or archive reconciliation while a supervised server owns the mailbox. Add a Linux live-process regression that holds the doctor's mailbox descriptor open and verifies sole-owner classification, repeated HTTP health, JSON-RPC mailbox reads, clean completion, and no recovery-contention diagnostics (GH#138)."
@@ -101,6 +105,7 @@ jobs:
           name: issue-138-diagnostics-${{ github.run_id }}
           if-no-files-found: ignore
           path: |
-            /tmp/issue-138-unit.log
-            /tmp/issue-138-e2e.log
+            mcp_agent_mail_rust/issue-138-fmt.log
+            mcp_agent_mail_rust/issue-138-unit.log
+            mcp_agent_mail_rust/issue-138-e2e.log
             mcp_agent_mail_rust/tests/artifacts/doctor_check_live_server/**
