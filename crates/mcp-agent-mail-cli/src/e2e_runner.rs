@@ -4093,7 +4093,9 @@ sys.exit(7 if mode == 'unclean' else 0)
             ),
             (format!("{reply}\n{{\"workflow_session\":null}}"), "true"),
             (
-                format!("{reply}\n{{\"workflow_session\":{{\"passed\":true,\"completed_ids\":\"12\"}}}}"),
+                format!(
+                    "{reply}\n{{\"workflow_session\":{{\"passed\":true,\"completed_ids\":\"12\"}}}}"
+                ),
                 "true",
             ),
             (String::new(), "true"),
