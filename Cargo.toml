@@ -35,11 +35,12 @@ fastmcp-protocol = "0.7.1"
 
 # br-ba1ui: exact pins keep the shared Asupersync type universe coherent.
 # 2026-08-24: =0.4.9, lockstep with fastmcp 0.7.1 (which pins =0.4.9),
-# sqlmodel 0.4.0 (^0.4.9), and the fsqlite 0.3.14 registry baseline.
+# sqlmodel 0.4.0 (^0.4.9), and the fsqlite 0.3.16 registry baseline (bumped
+# from 0.3.14 per operator order; family moves in ^0.3.16 lockstep).
 # 0.4.9 is additive on the v0.4.3 public compatibility floor (RuntimeHandle
 # request-Cx / blocking-pool APIs, SQLite cancel correctness, owned-OTLP).
 asupersync = { version = "=0.4.9", features = ["tls-webpki-roots"] }
-fsqlite = "=0.3.14"
+fsqlite = "=0.3.16"
 
 sqlmodel = "=0.4.0"
 sqlmodel-core = "=0.4.0"
