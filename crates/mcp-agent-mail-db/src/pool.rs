@@ -31741,6 +31741,56 @@ mod tests {
         );
     }
 
+    /// The reporter's exact shape: the sidecar's own header says WAL mode, so a
+    /// plain read-only open would demand an SHM. The 0-byte WAL still carries
+    /// no frames, so the probe must read the standalone main file — without
+    /// creating the WAL/SHM pair a non-immutable open would force.
+    #[test]
+    fn inspect_atc_sidecar_health_accepts_zero_byte_wal_on_a_wal_mode_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let primary_str = primary.to_string_lossy().into_owned();
+        let sidecar = atc_sidecar_sqlite_path(&primary_str);
+        {
+            let conn =
+                crate::CanonicalDbConn::open_file(&sidecar).expect("open WAL-mode sidecar fixture");
+            conn.execute_raw("PRAGMA journal_mode = WAL;")
+                .expect("enable WAL mode on the sidecar");
+            conn.execute_raw("CREATE TABLE atc_experiences (id INTEGER PRIMARY KEY, state TEXT);")
+                .expect("create atc_experiences");
+        }
+
+        let sidecar_path = PathBuf::from(&sidecar);
+        let wal_path = sqlite_sidecar_path(&sidecar_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&sidecar_path, "-shm");
+        // A clean close leaves no sidecars; the next start recreates an empty
+        // WAL with no SHM companion (GH#304).
+        let _ = std::fs::remove_file(&shm_path);
+        std::fs::write(&wal_path, []).expect("recreate the 0-byte WAL a clean start leaves");
+        assert!(!shm_path.exists(), "fixture must have no SHM companion");
+
+        let health = inspect_atc_sidecar_health(&primary_str);
+
+        assert!(health.present);
+        assert_eq!(
+            health.quick_check_ok,
+            Some(true),
+            "a WAL-mode sidecar with a 0-byte WAL must still inspect cleanly: {}",
+            health.detail
+        );
+        assert_eq!(health.experience_rows, Some(0));
+        assert_eq!(
+            std::fs::metadata(&wal_path)
+                .expect("WAL still present")
+                .len(),
+            0
+        );
+        assert!(
+            !shm_path.exists(),
+            "the read-only probe must not materialize an SHM beside the source"
+        );
+    }
+
     /// The refusal itself is still load-bearing for a WAL that could carry
     /// frames: only the provably frameless 0-byte shape is excused.
     #[test]
