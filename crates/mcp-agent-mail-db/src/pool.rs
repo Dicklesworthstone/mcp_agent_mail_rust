@@ -5789,6 +5789,14 @@ async fn run_sqlite_init_once(
         match schema::migrate_to_latest_base(cx, &*mig_conn).await {
             Outcome::Ok(_) => {}
             Outcome::Err(err) => {
+                // Display omits QueryError.sql. Retain the failing built-in
+                // migration statement before the public error is classified;
+                // this path contains schema SQL, not mailbox query parameters.
+                tracing::error!(
+                    stage = "migrate_to_latest_base",
+                    error = ?err,
+                    "SQLite base migration failed"
+                );
                 return Outcome::Err(SqlError::Custom(format!(
                     "sqlite init stage=migrate_to_latest_base failed: {err}"
                 )));
