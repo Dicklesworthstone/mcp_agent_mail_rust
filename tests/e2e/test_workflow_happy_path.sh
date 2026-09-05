@@ -674,6 +674,7 @@ e2e_case_banner "Phase 8: offline CLI reservation lifecycle + guard"
 if python3 - "$WF_DB" "$WF_STORAGE" "$PROJECT_PATH" "$(command -v am)" \
     "$E2E_ARTIFACT_DIR" <<'PY'
 import datetime
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -741,7 +742,7 @@ def payload(stdout):
     return json.JSONDecoder().raw_decode(stdout[stdout.index("{"):])[0]
 
 def row(reservation_id):
-    with sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True) as conn:
+    with closing(sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True)) as conn:
         conn.row_factory = sqlite3.Row
         return dict(conn.execute(
             "SELECT id, path_pattern, exclusive, expires_ts, released_ts "
@@ -764,6 +765,83 @@ def micros(iso):
     delta = dt - datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
     return ((delta.days * 86400 + delta.seconds) * 1000000 + delta.microseconds)
 
+session_project = str((results / "session_project").resolve())
+Path(session_project).mkdir()
+session_pattern = "src/session-start.rs"
+stdout, _ = run("session_start", ["macros", "start-session", "--project", session_project,
+                                 "--program", "codex", "--model", "workflow-fixture",
+                                 "--agent-name", "RedFox", "--reserve", session_pattern,
+                                 "--reserve-reason", "br-21gj.4.6", "--json"])
+session = payload(stdout)
+assert session["agent"]["name"] == "RedFox", session
+assert session["file_reservations"]["conflicts"] == [], session
+assert len(session["file_reservations"]["granted"]) == 1, session
+session_id = session["file_reservations"]["granted"][0]["id"]
+session_row = row(session_id)
+session_artifact = artifact(session_id)
+assert session_row["path_pattern"] == session_artifact["path_pattern"] == session_pattern
+assert session_row["exclusive"] == 1 and session_artifact["exclusive"] is True
+assert session_row["released_ts"] is None and session_artifact.get("released_ts") is None
+assert micros(session_artifact["expires_ts"]) == session_row["expires_ts"]
+profile = Path(storage) / "projects" / session["project"]["slug"] / "agents" / "RedFox" / "profile.json"
+assert json.loads(profile.read_text())["name"] == "RedFox", profile
+_, conflict = run("session_guard_held", ["guard", "check", "--repo", session_project],
+                  expected=1, stdin=session_pattern + "\n", agent="BluePeak")
+assert "CONFLICT" in conflict and "RedFox" in conflict, conflict
+run("session_release", ["file_reservations", "release", session_project, "RedFox",
+                        "--ids", str(session_id)])
+assert row(session_id)["released_ts"] > 0
+assert micros(artifact(session_id)["released_ts"]) == row(session_id)["released_ts"]
+stdout, _ = run("session_guard_released", ["guard", "check", "--repo", session_project],
+                stdin=session_pattern + "\n", agent="BluePeak")
+assert "No file reservation conflicts" in stdout, stdout
+
+run("session_target", ["macros", "start-session", "--project", session_project,
+                       "--program", "codex", "--model", "workflow-fixture",
+                       "--agent-name", "BluePeak", "--json"], agent="BluePeak")
+welcome_body = "Retain this synthetic CLI macro welcome in SQLite and the Git archive."
+macro_thread = "kp1in-offline-macro-thread"
+stdout, _ = run("contact_welcome", ["macros", "contact-handshake", "--project", session_project,
+                                  "--from", "RedFox", "--to", "BluePeak", "--auto-accept",
+                                  "--welcome-subject", "Offline macro welcome",
+                                  "--welcome-body", welcome_body, "--thread-id", macro_thread,
+                                  "--json"])
+handshake = payload(stdout)
+assert handshake["response"]["status"] == "approved", handshake
+welcome_id = handshake["welcome_message"]["deliveries"][0]["payload"]["id"]
+with closing(sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True)) as conn:
+    assert conn.execute("SELECT body_md, thread_id FROM messages WHERE id = ?",
+                        (welcome_id,)).fetchone() == (welcome_body, macro_thread)
+welcome_archives = []
+for path in Path(storage).glob("projects/*/messages/**/*.md"):
+    content = path.read_text()
+    if content.startswith("---json\n") and "\n---\n" in content:
+        metadata, archived_body = content[8:].split("\n---\n", 1)
+        if json.loads(metadata).get("id") == welcome_id:
+            welcome_archives.append(path)
+            assert archived_body.strip() == welcome_body
+assert len(welcome_archives) == 1, welcome_archives
+stdout, _ = run("prepare_thread", ["macros", "prepare-thread", "--project", session_project,
+                                  "--thread-id", macro_thread, "--program", "codex",
+                                  "--model", "workflow-fixture", "--agent-name", "GreenLake",
+                                  "--json"], agent="GreenLake")
+prepared = payload(stdout)
+assert prepared["agent"]["name"] == "GreenLake", prepared
+assert prepared["thread"]["total_messages"] == 1, prepared
+assert prepared["thread"]["summary"]["participants"] == ["RedFox"], prepared
+assert [example["id"] for example in prepared["thread"]["examples"]] == [welcome_id], prepared
+prepared_profile = profile.parent.parent / "GreenLake" / "profile.json"
+assert json.loads(prepared_profile.read_text())["name"] == "GreenLake", prepared_profile
+stdout, _ = run("prepare_existing", ["macros", "prepare-thread", "--project", session_project,
+                                    "--thread-id", macro_thread, "--program", "codex",
+                                    "--model", "workflow-fixture", "--agent-name", "BluePeak",
+                                    "--no-register", "--no-examples", "--inbox-bodies", "--json"],
+                agent="BluePeak")
+existing = payload(stdout)
+assert existing["thread"]["examples"] == [], existing
+assert any(message["id"] == welcome_id and message["body_md"] == welcome_body
+           for message in existing["inbox"]), existing
+
 pattern = "src/offline-cycle.rs"
 stdout, _ = run("reserve", ["file_reservations", "reserve", project, "RedFox", pattern,
                             "--exclusive", "--ttl", "3600", "--reason", "br-21gj.4.4"])
@@ -785,7 +863,7 @@ stdout, _ = run("conflict", ["file_reservations", "reserve", project, "BluePeak"
 denied = payload(stdout)
 assert denied["granted"] == [] and len(denied["conflicts"]) == 1, denied
 assert denied["conflicts"][0]["holders"][0]["agent"] == "RedFox", denied
-with sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True) as conn:
+with closing(sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True)) as conn:
     assert conn.execute(
         "SELECT COUNT(*) FROM file_reservations WHERE path_pattern = ? AND released_ts IS NULL",
         (pattern,)).fetchone()[0] == 1, "a conflict must not create another active lease"
@@ -828,7 +906,7 @@ stdout, _ = run("macro_conflict", ["macros", "file-reservation-cycle", "-p", pro
 conflict = payload(stdout)["file_reservations"]
 assert conflict["granted"] == [] and len(conflict["conflicts"]) == 1, conflict
 assert conflict["conflicts"][0]["holders"][0]["agent"] == "RedFox", conflict
-with sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True) as conn:
+with closing(sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True)) as conn:
     assert conn.execute("SELECT COUNT(*) FROM file_reservations WHERE path_pattern = ? "
                         "AND released_ts IS NULL", (macro_pattern,)).fetchone()[0] == 1
 run("macro_cleanup_release", ["file_reservations", "release", project, "RedFox",
@@ -865,6 +943,7 @@ e2e_case_banner "Phase 9: HTTP messaging + clean signal shutdown + reopen"
 
 if python3 - "$WF_DB" "$WF_STORAGE" "$PROJECT_PATH" "$(command -v am)" \
     "$E2E_ARTIFACT_DIR" <<'PY'
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -982,11 +1061,11 @@ try:
     assert ack["acknowledged"] is True and ack["acknowledged_at"], ack
     stop(signal.SIGTERM)
 
-    with sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True) as conn:
+    with closing(sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True)) as conn:
         assert conn.execute("SELECT body_md FROM messages WHERE id = ?", (message_id,)).fetchone() == (body,)
         rows = conn.execute("SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
                             (message_id,)).fetchall()
-        assert len(rows) == 1 and rows[0][1] is not None, rows
+        assert len(rows) == 1 and all(value is not None and value > 0 for value in rows[0]), rows
         assert conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     archived = []

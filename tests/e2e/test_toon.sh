@@ -432,23 +432,27 @@ try:
     for request_id, name in ((3, "RedFox"), (4, "BluePeak")):
         tool(request_id, "register_agent", {"project_key": project, "name": name,
              "program": "e2e-test", "model": "fixture", "format": "json"})
+    # Choose this fixture's contact policy explicitly so the mailbox contains
+    # exactly the body whose encoding is under test, without an auto-intro.
+    tool(5, "set_contact_policy", {"project_key": project, "agent_name": "BluePeak",
+                                 "policy": "open", "format": "json"})
     body = 'Unicode λ 日本語\n"quoted", commas, \\ paths; null-looking: null; bracket: [x]'
-    sent = tool(5, "send_message", {"project_key": project, "sender_name": "RedFox",
+    sent = tool(6, "send_message", {"project_key": project, "sender_name": "RedFox",
                 "to": ["BluePeak"], "subject": "TOON roundtrip", "body_md": body, "format": "json"})
     message_id = sent["deliveries"][0]["payload"]["id"]
     arguments = {"project_key": project, "agent_name": "BluePeak", "include_bodies": True}
-    baseline = tool(6, "fetch_inbox", dict(arguments, format="json"))
+    baseline = tool(7, "fetch_inbox", dict(arguments, format="json"))
     assert len(baseline) == 1 and baseline[0]["id"] == message_id and baseline[0]["body_md"] == body
-    default = tool(7, "fetch_inbox", arguments)
+    default = tool(8, "fetch_inbox", arguments)
     assert default["meta"]["source"] == "default", default
     assert decode("tool_default", default) == baseline
-    explicit = tool(8, "fetch_inbox", dict(arguments, format="toon"))
+    explicit = tool(9, "fetch_inbox", dict(arguments, format="toon"))
     assert explicit["meta"]["source"] == "param", explicit
     assert decode("tool_explicit", explicit) == baseline
 
     uri = "resource://inbox/BluePeak?project=" + urllib.parse.quote(project, safe="") + "&include_bodies=true"
-    plain = rpc("resources/read", {"uri": uri + "&format=json"}, 9)
-    encoded = rpc("resources/read", {"uri": uri}, 10)
+    plain = rpc("resources/read", {"uri": uri + "&format=json"}, 10)
+    encoded = rpc("resources/read", {"uri": uri}, 11)
     assert len(plain["contents"]) == len(encoded["contents"]) == 1
     expected = json.loads(plain["contents"][0]["text"])
     envelope = json.loads(encoded["contents"][0]["text"])
