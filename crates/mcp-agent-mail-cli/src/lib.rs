@@ -39770,6 +39770,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .map_err(mcp_error_to_cli_error)?;
@@ -41244,6 +41245,37 @@ mod mail_server_cli_bridge_tests {
         assert_eq!(trusted_tmux_pane_header_value(None), None);
         let too_long = format!("%{}", "9".repeat(80));
         assert_eq!(trusted_tmux_pane_header_value(Some(&too_long)), None);
+    }
+
+    #[test]
+    fn caller_tmux_socket_header_uses_only_valid_tmux_socket_field() {
+        use crate::caller_tmux_socket_header;
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("TMUX", "/tmp/tmux-1001/gpqeprobe,12345,0")],
+            || {
+                assert_eq!(
+                    caller_tmux_socket_header()
+                        .expect("valid tmux socket context")
+                        .as_deref(),
+                    Some("/tmp/tmux-1001/gpqeprobe")
+                );
+            },
+        );
+        for hostile in ["relative/socket,12345,0", "/tmp/good\r\nX-Bad: yes,12345,0"] {
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("TMUX", hostile)],
+                || {
+                    assert!(
+                        caller_tmux_socket_header().is_err(),
+                        "hostile TMUX socket context was silently downgraded: {hostile:?}"
+                    );
+                },
+            );
+        }
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(&[("TMUX", "")], || {
+            assert!(caller_tmux_socket_header().is_err())
+        });
     }
 
     #[test]
@@ -85048,7 +85080,24 @@ fn trusted_tmux_pane_header_value(raw: Option<&str>) -> Option<String> {
 /// daemon injects this into identity-tool args so pane-identity reuse works for
 /// CLI-routed identity calls.
 fn caller_tmux_pane_header() -> Option<String> {
-    trusted_tmux_pane_header_value(std::env::var("TMUX_PANE").ok().as_deref())
+    trusted_tmux_pane_header_value(
+        mcp_agent_mail_core::config::process_env_value("TMUX_PANE").as_deref(),
+    )
+}
+
+/// The caller's tmux server socket as a trusted `X-Tmux-Socket` header.
+///
+/// `$TMUX` is `<socket_path>,<server_pid>,<session_index>`. The CLI extracts
+/// only the first field and applies the shared absolute/bounded/newline-free
+/// validator before the value can cross the HTTP boundary.
+fn caller_tmux_socket_header() -> CliResult<Option<String>> {
+    let Some(tmux) = mcp_agent_mail_core::config::process_env_value("TMUX") else {
+        return Ok(None);
+    };
+    let socket_path = tmux.split(',').next().unwrap_or_default();
+    mcp_agent_mail_core::validate_tmux_socket_path(Some(socket_path)).map_err(|message| {
+        CliError::InvalidArgument(format!("invalid TMUX socket context: {message}"))
+    })
 }
 
 fn post_jsonrpc_request_blocking_http(
@@ -85084,13 +85133,17 @@ fn post_jsonrpc_request_blocking_http(
     let x_tmux_pane = caller_tmux_pane_header()
         .map(|pane| format!("X-Tmux-Pane: {pane}\r\n"))
         .unwrap_or_default();
+    let x_tmux_socket = caller_tmux_socket_header()?
+        .map(|socket_path| format!("X-Tmux-Socket: {socket_path}\r\n"))
+        .unwrap_or_default();
     let head = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: mcp-agent-mail-cli\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}{}\r\n",
+        "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: mcp-agent-mail-cli\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}{}{}\r\n",
         target.request_target,
         target.host_header,
         body.len(),
         authorization,
-        x_tmux_pane
+        x_tmux_pane,
+        x_tmux_socket
     );
     // GH#220: writes must retry transient EAGAIN/EINTR just like reads.
     let deadline = std::time::Instant::now() + timeout;
@@ -85383,6 +85436,9 @@ async fn post_jsonrpc_request(
     // Carry the caller's tmux pane to the daemon (GH#177 Defect 3).
     if let Some(pane) = caller_tmux_pane_header() {
         headers.push(("X-Tmux-Pane".to_string(), pane));
+    }
+    if let Some(socket_path) = caller_tmux_socket_header()? {
+        headers.push(("X-Tmux-Socket".to_string(), socket_path));
     }
 
     // Production request-scoped Cx, not the test-only `Cx::for_testing()`

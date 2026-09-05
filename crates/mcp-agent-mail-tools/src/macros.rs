@@ -135,6 +135,7 @@ pub async fn macro_start_session(
     inbox_limit: Option<i32>,
     reaper_exempt: Option<bool>,
     pane_id: Option<String>,
+    tmux_socket_path: Option<String>,
     registration_proof: Option<String>,
 ) -> McpResult<String> {
     let agent_name =
@@ -169,10 +170,13 @@ pub async fn macro_start_session(
     // live in a DIFFERENT pane is never reused (the lookup returns None and a
     // fresh name is minted below), while a dead binding is adopted and its
     // record rewritten with this caller's pane facts.
+    let tmux_socket_path =
+        crate::identity::validated_tmux_socket_path(tmux_socket_path.as_deref())?;
     let resolved_name = agent_name.or_else(|| {
-        mcp_agent_mail_core::pane_identity::resolve_identity_with_optional_pane(
+        mcp_agent_mail_core::pane_identity::resolve_identity_with_optional_pane_on_socket(
             &project.human_key,
             pane_id.as_deref(),
+            tmux_socket_path.as_deref(),
         )
         .and_then(|name| normalize_resolved_pane_agent_name(&name))
     });
@@ -187,6 +191,7 @@ pub async fn macro_start_session(
         None,
         reaper_exempt,
         pane_id,
+        tmux_socket_path,
         registration_proof,
     )
     .await?;
@@ -353,6 +358,7 @@ pub async fn macro_prepare_thread(
             model,
             agent_name,
             task_description,
+            None,
             None,
             None,
             None,

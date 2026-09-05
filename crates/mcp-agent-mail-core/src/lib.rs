@@ -199,8 +199,11 @@ pub use pane_identity::{
     cleanup_stale_identities, get_composite_tmux_pane_id, identity_source_category,
     is_agent_pane_command, list_identities, list_identities_with_paths, read_identity_record,
     resolve_identity, resolve_identity_current_pane, resolve_identity_with_binding,
-    resolve_identity_with_optional_pane, resolve_identity_with_path, write_identity,
-    write_identity_current_pane, write_identity_with_optional_pane,
+    resolve_identity_with_binding_on_socket, resolve_identity_with_optional_pane,
+    resolve_identity_with_optional_pane_on_socket, resolve_identity_with_path,
+    validate_tmux_socket_path, write_identity, write_identity_current_pane,
+    write_identity_on_socket, write_identity_with_optional_pane,
+    write_identity_with_optional_pane_on_socket,
 };
 pub use search_types::{
     DateRange, DocChange, DocId, DocKind, Document, ExplainComposerConfig, ExplainReasonCode,
