@@ -1833,7 +1833,7 @@ pub enum FileReservationsCommand {
         /// Path patterns to reserve (one or more).
         #[arg(required = true)]
         paths: Vec<String>,
-        /// TTL in seconds (default: 3600).
+        /// TTL in seconds, clamped to 60..=31536000 (default: 3600).
         #[arg(long, default_value_t = 3600)]
         ttl: i64,
         /// Request exclusive lock.
@@ -1850,7 +1850,7 @@ pub enum FileReservationsCommand {
     Renew {
         project: String,
         agent: String,
-        /// Extension time in seconds (default: 1800).
+        /// Extension in seconds, clamped to 60..=31536000 (default: 1800).
         #[arg(long, default_value_t = 1800)]
         extend_seconds: i64,
         /// Restrict renewal to specific paths.
@@ -67823,7 +67823,18 @@ startup_timeout_sec = 42
                 ("AM_ATC_WRITE_MODE", "off"),
                 ("LLM_ENABLED", "false"),
             ],
-            || handle_file_reservations(action),
+            || {
+                let result = handle_file_reservations(action);
+                let intent_path =
+                    storage_root.join("degraded_intents/release_file_reservations.jsonl");
+                if let Ok(intents) = std::fs::read_to_string(&intent_path) {
+                    eprintln!(
+                        "release intent diagnostics at {}: {intents}",
+                        intent_path.display()
+                    );
+                }
+                result
+            },
         )
     }
 
@@ -67832,22 +67843,43 @@ startup_timeout_sec = 42
             .parent()
             .unwrap()
             .join("archive/projects/test-proj/file_reservations");
-        let artifacts: Vec<serde_json::Value> = std::fs::read_dir(&archive)
+        let artifacts: Vec<(PathBuf, serde_json::Value)> = std::fs::read_dir(&archive)
             .expect("reservation archive exists")
             .map(|entry| entry.unwrap().path())
             .filter(|path| {
                 path.extension()
                     .is_some_and(|extension| extension == "json")
             })
-            .map(|path| serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap())
-            .filter(|row: &serde_json::Value| row["id"] == id)
+            .map(|path| {
+                let row = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                (path, row)
+            })
+            .filter(|(_, row)| row["id"] == id)
+            .collect();
+        let stable: Vec<_> = artifacts
+            .iter()
+            .filter(|(path, _)| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("id-")
+            })
             .collect();
         assert_eq!(
-            artifacts.len(),
+            stable.len(),
             1,
-            "one current artifact for reservation {id}"
+            "one stable artifact for reservation {id}: {artifacts:?}"
         );
-        artifacts.into_iter().next().unwrap()
+        let canonical = &stable[0].1;
+        for (path, alias) in &artifacts {
+            assert_eq!(
+                alias,
+                canonical,
+                "reservation alias disagrees: {}",
+                path.display()
+            );
+        }
+        canonical.clone()
     }
 
     #[test]

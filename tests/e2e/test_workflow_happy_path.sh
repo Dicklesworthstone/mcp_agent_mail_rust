@@ -752,9 +752,12 @@ def artifact(reservation_id):
     for path in Path(storage).glob("projects/*/file_reservations/*.json"):
         value = json.loads(path.read_text())
         if value.get("id") == reservation_id:
-            matches.append(value)
-    assert len(matches) == 1, (reservation_id, matches)
-    return matches[0]
+            matches.append((path, value))
+    stable = [value for path, value in matches if path.name.startswith("id-")]
+    assert len(stable) == 1, (reservation_id, matches)
+    for path, value in matches:
+        assert value == stable[0], ("reservation aliases disagree", path, value, stable[0])
+    return stable[0]
 
 def micros(iso):
     dt = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
