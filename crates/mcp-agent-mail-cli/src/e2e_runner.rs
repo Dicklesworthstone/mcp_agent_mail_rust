@@ -739,22 +739,145 @@ impl Runner {
             }
         }
 
-        // Capture output
+        self.execute_script(cmd)
+    }
+
+    fn execute_script(&self, mut cmd: Command) -> std::io::Result<SuiteExecution> {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
             cmd.process_group(0);
         }
-
-        self.execute_script(cmd)
+        let mut child = cmd.spawn()?;
+        let result = self.capture_suite_child(&mut child);
+        if result.is_err() {
+            // A capture/setup error must not abandon the process we launched.
+            #[cfg(unix)]
+            crate::terminate_child_process_group(child.id(), signal_hook::consts::SIGKILL);
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        result
     }
 
-    fn execute_script(&self, mut cmd: Command) -> std::io::Result<SuiteExecution> {
-        let mut child = cmd.spawn()?;
+    #[cfg(unix)]
+    fn capture_suite_child(
+        &self,
+        child: &mut std::process::Child,
+    ) -> std::io::Result<SuiteExecution> {
+        let mut stdout_pipe = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("missing stdout"))?;
+        let mut stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("missing stderr"))?;
+        Self::nonblocking_pipe(&stdout_pipe)?;
+        Self::nonblocking_pipe(&stderr_pipe)?;
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let (mut stdout_done, mut stderr_done) = (false, false);
+        let started = Instant::now();
+        let mut exited_at = None;
+        let mut shutdown_at = None;
+        let mut timed_out = false;
+        let mut capture_incomplete = false;
+        loop {
+            if !stdout_done {
+                stdout_done =
+                    Self::drain_pipe(&mut stdout_pipe, &mut stdout, self.config.max_output_bytes)?;
+            }
+            if !stderr_done {
+                stderr_done =
+                    Self::drain_pipe(&mut stderr_pipe, &mut stderr, self.config.max_output_bytes)?;
+            }
+            let exited = child.try_wait()?.is_some();
+            capture_incomplete |= stdout.len() > self.config.max_output_bytes
+                || stderr.len() > self.config.max_output_bytes;
+            if exited && stdout_done && stderr_done {
+                break;
+            }
+            if exited {
+                exited_at.get_or_insert_with(Instant::now);
+            }
+            timed_out |= self
+                .config
+                .timeout
+                .is_some_and(|limit| started.elapsed() >= limit);
+            capture_incomplete |=
+                exited_at.is_some_and(|at: Instant| at.elapsed() >= Duration::from_secs(1));
+            if (timed_out || capture_incomplete) && shutdown_at.is_none() {
+                crate::terminate_child_process_group(child.id(), signal_hook::consts::SIGTERM);
+                shutdown_at = Some(Instant::now());
+            }
+            if shutdown_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(35)) {
+                crate::terminate_child_process_group(child.id(), signal_hook::consts::SIGKILL);
+                let _ = child.kill();
+                child.wait()?;
+                // A setsid descendant can retain the pipes outside our group.
+                // Close our nonblocking readers after the bounded drain; never
+                // detach a blocked reader thread or claim complete output.
+                stdout_done |=
+                    Self::drain_pipe(&mut stdout_pipe, &mut stdout, self.config.max_output_bytes)?;
+                stderr_done |=
+                    Self::drain_pipe(&mut stderr_pipe, &mut stderr, self.config.max_output_bytes)?;
+                capture_incomplete |= !stdout_done || !stderr_done;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        capture_incomplete |= stdout.len() > self.config.max_output_bytes
+            || stderr.len() > self.config.max_output_bytes;
+        Ok(SuiteExecution {
+            output: std::process::Output {
+                status: child.wait()?,
+                stdout,
+                stderr,
+            },
+            timed_out,
+            capture_incomplete,
+        })
+    }
 
+    #[cfg(unix)]
+    fn nonblocking_pipe(pipe: &impl std::os::fd::AsFd) -> std::io::Result<()> {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        let flags = OFlag::from_bits_retain(fcntl(pipe, FcntlArg::F_GETFL)?);
+        fcntl(pipe, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn drain_pipe(
+        reader: &mut impl std::io::Read,
+        output: &mut Vec<u8>,
+        limit: usize,
+    ) -> std::io::Result<bool> {
+        let mut buffer = [0_u8; 8192];
+        // Fairness budget: an endless writer must not starve the other stream,
+        // child-status checks or timeout enforcement.
+        for _ in 0..64 {
+            match reader.read(&mut buffer) {
+                Ok(0) => return Ok(true),
+                Ok(count) => {
+                    let retain = count.min(limit.saturating_add(1).saturating_sub(output.len()));
+                    output.extend_from_slice(&buffer[..retain]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    }
+
+    #[cfg(not(unix))]
+    fn capture_suite_child(
+        &self,
+        child: &mut std::process::Child,
+    ) -> std::io::Result<SuiteExecution> {
         let stdout_pipe = child
             .stdout
             .take()
@@ -831,6 +954,7 @@ impl Runner {
         })
     }
 
+    #[cfg(any(not(unix), test))]
     fn capture_bounded(
         mut reader: impl std::io::Read,
         limit: usize,
@@ -872,9 +996,6 @@ impl Runner {
     }
 
     fn run_native_http_suite(&self, suite: &Suite) -> SuiteResult {
-        let started_at = Utc::now();
-        let start_instant = Instant::now();
-
         let mut cmd = Command::new("cargo");
         Self::scrub_operator_env(&mut cmd);
         cmd.args([
@@ -898,56 +1019,10 @@ impl Runner {
         if let Some(artifact_root) = &self.config.artifact_dir {
             cmd.env("AM_HTTP_ARTIFACT_DIR", artifact_root);
         }
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        let output = cmd.output();
-        let elapsed = start_instant.elapsed();
-        let ended_at = Utc::now();
-
-        match output {
-            Ok(output) => {
-                let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
-                let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let counts = self.native_cargo_counts(&output);
-                let (assertions_passed, assertions_failed, assertions_skipped) =
-                    counts.unwrap_or_default();
-                let passed =
-                    output.status.success() && assertions_passed > 0 && assertions_failed == 0;
-                SuiteResult {
-                    name: suite.name.clone(),
-                    passed,
-                    exit_code: output.status.code().unwrap_or(-1),
-                    duration_ms: elapsed.as_millis() as u64,
-                    stdout,
-                    stderr,
-                    assertions_passed,
-                    assertions_failed,
-                    assertions_skipped,
-                    started_at: started_at.to_rfc3339(),
-                    ended_at: ended_at.to_rfc3339(),
-                }
-            }
-            Err(error) => SuiteResult {
-                name: suite.name.clone(),
-                passed: false,
-                exit_code: -1,
-                duration_ms: elapsed.as_millis() as u64,
-                stdout: String::new(),
-                stderr: format!("Failed to execute native http suite: {error}"),
-                assertions_passed: 0,
-                assertions_failed: 1,
-                assertions_skipped: 0,
-                started_at: started_at.to_rfc3339(),
-                ended_at: ended_at.to_rfc3339(),
-            },
-        }
+        self.execute_native_cargo_suite(suite, cmd)
     }
 
     fn run_native_share_archive_suite(&self, suite: &Suite) -> SuiteResult {
-        let started_at = Utc::now();
-        let start_instant = Instant::now();
-
         let mut cmd = Command::new("cargo");
         Self::scrub_operator_env(&mut cmd);
         cmd.args([
@@ -971,56 +1046,10 @@ impl Runner {
         if let Some(artifact_root) = &self.config.artifact_dir {
             cmd.env("AM_SHARE_ARCHIVE_ARTIFACT_DIR", artifact_root);
         }
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        let output = cmd.output();
-        let elapsed = start_instant.elapsed();
-        let ended_at = Utc::now();
-
-        match output {
-            Ok(output) => {
-                let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
-                let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let counts = self.native_cargo_counts(&output);
-                let (assertions_passed, assertions_failed, assertions_skipped) =
-                    counts.unwrap_or_default();
-                let passed =
-                    output.status.success() && assertions_passed > 0 && assertions_failed == 0;
-                SuiteResult {
-                    name: suite.name.clone(),
-                    passed,
-                    exit_code: output.status.code().unwrap_or(-1),
-                    duration_ms: elapsed.as_millis() as u64,
-                    stdout,
-                    stderr,
-                    assertions_passed,
-                    assertions_failed,
-                    assertions_skipped,
-                    started_at: started_at.to_rfc3339(),
-                    ended_at: ended_at.to_rfc3339(),
-                }
-            }
-            Err(error) => SuiteResult {
-                name: suite.name.clone(),
-                passed: false,
-                exit_code: -1,
-                duration_ms: elapsed.as_millis() as u64,
-                stdout: String::new(),
-                stderr: format!("Failed to execute native share/archive suite: {error}"),
-                assertions_passed: 0,
-                assertions_failed: 1,
-                assertions_skipped: 0,
-                started_at: started_at.to_rfc3339(),
-                ended_at: ended_at.to_rfc3339(),
-            },
-        }
+        self.execute_native_cargo_suite(suite, cmd)
     }
 
     fn run_native_mode_matrix_suite(&self, suite: &Suite) -> SuiteResult {
-        let started_at = Utc::now();
-        let start_instant = Instant::now();
-
         let mut cmd = Command::new("cargo");
         Self::scrub_operator_env(&mut cmd);
         cmd.args([
@@ -1042,56 +1071,10 @@ impl Runner {
         if let Some(artifact_root) = &self.config.artifact_dir {
             cmd.env("AM_MODE_MATRIX_ARTIFACT_DIR", artifact_root);
         }
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        let output = cmd.output();
-        let elapsed = start_instant.elapsed();
-        let ended_at = Utc::now();
-
-        match output {
-            Ok(output) => {
-                let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
-                let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let counts = self.native_cargo_counts(&output);
-                let (assertions_passed, assertions_failed, assertions_skipped) =
-                    counts.unwrap_or_default();
-                let passed =
-                    output.status.success() && assertions_passed > 0 && assertions_failed == 0;
-                SuiteResult {
-                    name: suite.name.clone(),
-                    passed,
-                    exit_code: output.status.code().unwrap_or(-1),
-                    duration_ms: elapsed.as_millis() as u64,
-                    stdout,
-                    stderr,
-                    assertions_passed,
-                    assertions_failed,
-                    assertions_skipped,
-                    started_at: started_at.to_rfc3339(),
-                    ended_at: ended_at.to_rfc3339(),
-                }
-            }
-            Err(error) => SuiteResult {
-                name: suite.name.clone(),
-                passed: false,
-                exit_code: -1,
-                duration_ms: elapsed.as_millis() as u64,
-                stdout: String::new(),
-                stderr: format!("Failed to execute native mode-matrix suite: {error}"),
-                assertions_passed: 0,
-                assertions_failed: 1,
-                assertions_skipped: 0,
-                started_at: started_at.to_rfc3339(),
-                ended_at: ended_at.to_rfc3339(),
-            },
-        }
+        self.execute_native_cargo_suite(suite, cmd)
     }
 
     fn run_native_security_privacy_suite(&self, suite: &Suite) -> SuiteResult {
-        let started_at = Utc::now();
-        let start_instant = Instant::now();
-
         let mut cmd = Command::new("cargo");
         Self::scrub_operator_env(&mut cmd);
         cmd.args([
@@ -1113,56 +1096,10 @@ impl Runner {
         if let Some(artifact_root) = &self.config.artifact_dir {
             cmd.env("AM_SECURITY_PRIVACY_ARTIFACT_DIR", artifact_root);
         }
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        let output = cmd.output();
-        let elapsed = start_instant.elapsed();
-        let ended_at = Utc::now();
-
-        match output {
-            Ok(output) => {
-                let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
-                let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let counts = self.native_cargo_counts(&output);
-                let (assertions_passed, assertions_failed, assertions_skipped) =
-                    counts.unwrap_or_default();
-                let passed =
-                    output.status.success() && assertions_passed > 0 && assertions_failed == 0;
-                SuiteResult {
-                    name: suite.name.clone(),
-                    passed,
-                    exit_code: output.status.code().unwrap_or(-1),
-                    duration_ms: elapsed.as_millis() as u64,
-                    stdout,
-                    stderr,
-                    assertions_passed,
-                    assertions_failed,
-                    assertions_skipped,
-                    started_at: started_at.to_rfc3339(),
-                    ended_at: ended_at.to_rfc3339(),
-                }
-            }
-            Err(error) => SuiteResult {
-                name: suite.name.clone(),
-                passed: false,
-                exit_code: -1,
-                duration_ms: elapsed.as_millis() as u64,
-                stdout: String::new(),
-                stderr: format!("Failed to execute native security/privacy suite: {error}"),
-                assertions_passed: 0,
-                assertions_failed: 1,
-                assertions_skipped: 0,
-                started_at: started_at.to_rfc3339(),
-                ended_at: ended_at.to_rfc3339(),
-            },
-        }
+        self.execute_native_cargo_suite(suite, cmd)
     }
 
     fn run_native_tui_a11y_suite(&self, suite: &Suite) -> SuiteResult {
-        let started_at = Utc::now();
-        let start_instant = Instant::now();
-
         let mut cmd = Command::new("cargo");
         Self::scrub_operator_env(&mut cmd);
         cmd.args([
@@ -1186,56 +1123,10 @@ impl Runner {
         }
         // CI-quality gate: skipping keyboard/adapter cases is not acceptable.
         cmd.env("AM_E2E_TUI_A11Y_REQUIRE_NO_SKIP", "1");
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        let output = cmd.output();
-        let elapsed = start_instant.elapsed();
-        let ended_at = Utc::now();
-
-        match output {
-            Ok(output) => {
-                let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
-                let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let counts = self.native_cargo_counts(&output);
-                let (assertions_passed, assertions_failed, assertions_skipped) =
-                    counts.unwrap_or_default();
-                let passed =
-                    output.status.success() && assertions_passed > 0 && assertions_failed == 0;
-                SuiteResult {
-                    name: suite.name.clone(),
-                    passed,
-                    exit_code: output.status.code().unwrap_or(-1),
-                    duration_ms: elapsed.as_millis() as u64,
-                    stdout,
-                    stderr,
-                    assertions_passed,
-                    assertions_failed,
-                    assertions_skipped,
-                    started_at: started_at.to_rfc3339(),
-                    ended_at: ended_at.to_rfc3339(),
-                }
-            }
-            Err(error) => SuiteResult {
-                name: suite.name.clone(),
-                passed: false,
-                exit_code: -1,
-                duration_ms: elapsed.as_millis() as u64,
-                stdout: String::new(),
-                stderr: format!("Failed to execute native tui_a11y suite: {error}"),
-                assertions_passed: 0,
-                assertions_failed: 1,
-                assertions_skipped: 0,
-                started_at: started_at.to_rfc3339(),
-                ended_at: ended_at.to_rfc3339(),
-            },
-        }
+        self.execute_native_cargo_suite(suite, cmd)
     }
 
     fn run_native_tui_transport_suite(&self, suite: &Suite) -> SuiteResult {
-        let started_at = Utc::now();
-        let start_instant = Instant::now();
-
         let mut cmd = Command::new("cargo");
         Self::scrub_operator_env(&mut cmd);
         cmd.args([
@@ -1259,26 +1150,47 @@ impl Runner {
         if let Some(artifact_root) = &self.config.artifact_dir {
             cmd.env("AM_TUI_ARTIFACT_DIR", artifact_root);
         }
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        self.execute_native_cargo_suite(suite, cmd)
+    }
 
-        let output = cmd.output();
+    fn execute_native_cargo_suite(&self, suite: &Suite, cmd: Command) -> SuiteResult {
+        let started_at = Utc::now();
+        let start_instant = Instant::now();
+        let execution = self.execute_script(cmd);
         let elapsed = start_instant.elapsed();
         let ended_at = Utc::now();
 
-        match output {
-            Ok(output) => {
+        match execution {
+            Ok(execution) => {
+                let output = &execution.output;
                 let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
-                let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let counts = self.native_cargo_counts(&output);
+                let mut stderr =
+                    Self::truncate_output(&output.stderr, self.config.max_output_bytes);
+                let counts = self.native_cargo_counts(output);
                 let (assertions_passed, assertions_failed, assertions_skipped) =
                     counts.unwrap_or_default();
-                let passed =
-                    output.status.success() && assertions_passed > 0 && assertions_failed == 0;
+                let passed = !execution.timed_out
+                    && !execution.capture_incomplete
+                    && output.status.success()
+                    && assertions_passed > 0
+                    && assertions_failed == 0;
+                let exit_code = if execution.timed_out {
+                    stderr.push_str(
+                        "\nNative suite timed out; child output is not terminal evidence",
+                    );
+                    124
+                } else if execution.capture_incomplete {
+                    stderr.push_str(
+                        "\nNative suite exceeded its capture limit or retained child output pipes",
+                    );
+                    125
+                } else {
+                    output.status.code().unwrap_or(-1)
+                };
                 SuiteResult {
                     name: suite.name.clone(),
                     passed,
-                    exit_code: output.status.code().unwrap_or(-1),
+                    exit_code,
                     duration_ms: elapsed.as_millis() as u64,
                     stdout,
                     stderr,
@@ -1295,7 +1207,7 @@ impl Runner {
                 exit_code: -1,
                 duration_ms: elapsed.as_millis() as u64,
                 stdout: String::new(),
-                stderr: format!("Failed to execute native tui transport suite: {error}"),
+                stderr: format!("Failed to execute native {} suite: {error}", suite.name),
                 assertions_passed: 0,
                 assertions_failed: 1,
                 assertions_skipped: 0,
@@ -3162,6 +3074,157 @@ test "$(tail -n 1 build_modes)" = 0
         assert_eq!(report.results[0].exit_code, 124);
         assert!(!report.success());
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_adapters_bound_hangs_and_both_output_streams() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = TempDir::new().unwrap().keep();
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        fs::write(bin.join("cargo"), r#"#!/bin/sh
+printf '%s\n' "$$" > "$CARGO_FIXTURE_PID"
+case "$CARGO_FIXTURE_MODE" in
+  timeout)
+    trap 'echo "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"; exit 0' TERM
+    /bin/sleep 30 &
+    wait
+    ;;
+  stdout) while :; do printf '012345678901234567890123456789012345678901234567890123456789012345\n'; done ;;
+  stderr) while :; do printf '012345678901234567890123456789012345678901234567890123456789012345\n' >&2; done ;;
+esac
+"#).unwrap();
+        fs::set_permissions(bin.join("cargo"), fs::Permissions::from_mode(0o700)).unwrap();
+        for suite in [
+            "http",
+            "share",
+            "mode_matrix",
+            "security_privacy",
+            "tui_a11y",
+            "tui_interaction",
+        ] {
+            write_suite_script(&root, suite, "#!/bin/sh\nexit 99\n");
+        }
+        for mode in ["timeout", "stdout", "stderr"] {
+            let pid_path = root.join(format!("{mode}.pid"));
+            let runner = Runner::new(
+                &root,
+                RunConfig {
+                    project_root: root.clone(),
+                    max_output_bytes: 1024,
+                    timeout: Some(Duration::from_millis(500)),
+                    env: HashMap::from([
+                        ("PATH".to_string(), bin.to_string_lossy().into_owned()),
+                        ("CARGO_FIXTURE_MODE".to_string(), mode.to_string()),
+                        (
+                            "CARGO_FIXTURE_PID".to_string(),
+                            pid_path.to_string_lossy().into_owned(),
+                        ),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for suite in [
+                "http",
+                "share",
+                "mode_matrix",
+                "security_privacy",
+                "tui_a11y",
+                "tui_interaction",
+            ] {
+                let started = Instant::now();
+                let result = runner.run_suite(runner.registry.get(suite).unwrap());
+                let pid: i32 = fs::read_to_string(&pid_path)
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                assert!(!result.passed, "{suite}/{mode}: {}", result.stdout);
+                assert_eq!(
+                    result.exit_code,
+                    if mode == "timeout" { 124 } else { 125 },
+                    "{suite}/{mode}: {}",
+                    result.stderr
+                );
+                assert!(started.elapsed() < Duration::from_secs(5), "{suite}/{mode}");
+                assert!(result.stdout.len() < 1200 && result.stderr.len() < 1400);
+                assert_eq!(
+                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+                    Err(nix::errno::Errno::ESRCH),
+                    "unreaped cargo peer: {suite}/{mode}"
+                );
+                if mode == "timeout" {
+                    // A valid-looking summary emitted by the TERM handler
+                    // does not turn a timed-out operation into success.
+                    assert_eq!(result.assertions_passed, 7, "{suite}");
+                    assert!(result.stderr.contains("timed out"));
+                } else {
+                    assert!(result.stderr.contains("capture limit"));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_closes_capture_when_descendant_escapes_process_group() {
+        let root = TempDir::new().unwrap().keep();
+        write_suite_script(
+            &root,
+            "escaped",
+            r#"#!/bin/bash
+python3 - "$E2E_PROJECT_ROOT/escaped.pid" <<'PY' &
+import os, pathlib, sys, time
+os.setsid()
+pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))
+time.sleep(90)
+PY
+while [ ! -s "$E2E_PROJECT_ROOT/escaped.pid" ]; do sleep 0.01; done
+echo 'Pass: 1  Fail: 0  Skip: 0'
+exit 0
+"#,
+        );
+        let runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                timeout: Some(Duration::from_secs(70)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let started = Instant::now();
+        let report = runner.run(&["escaped".to_string()]);
+        let elapsed = started.elapsed();
+        // This intentionally escaped fixture is owned by this test. The
+        // runner cannot reap an unrelated session; stop its exact recorded
+        // PID before assertions, even when the regression returns a failure.
+        let pid: i32 = fs::read_to_string(root.join("escaped.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let signal_result = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+        assert!(
+            signal_result.is_ok(),
+            "fixture should still hold its output pipes: {signal_result:?}"
+        );
+        assert!(!report.success());
+        assert_eq!(report.results[0].exit_code, 125);
+        assert_eq!(report.results[0].assertions_passed, 1);
+        assert!(
+            report.results[0]
+                .stderr
+                .contains("retained its output pipes")
+        );
+        assert!(
+            elapsed < Duration::from_secs(45),
+            "capture took {elapsed:?}"
+        );
     }
 
     #[test]
