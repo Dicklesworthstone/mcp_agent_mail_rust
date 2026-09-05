@@ -72,7 +72,7 @@ e2e_run_cargo() {
         return $?
     fi
 
-    if [ "${E2E_CARGO_REQUIRE_RCH}" = "1" ]; then
+    if [ "${E2E_CARGO_REQUIRE_RCH}" = "1" ] || [ "${RCH_REQUIRE_REMOTE:-0}" = "1" ]; then
         e2e_log "ERROR: rch is required but not available in PATH."
         return 127
     fi
@@ -93,6 +93,11 @@ e2e_sqlite3_compat_bin() {
     if [ -x "${bin}" ]; then
         printf '%s\n' "${bin}"
         return 0
+    fi
+
+    if [ "${E2E_CARGO_REQUIRE_RCH}" = "1" ] || [ "${RCH_REQUIRE_REMOTE:-0}" = "1" ]; then
+        e2e_log "ERROR: sqlite3 and the prepared test_db binary are unavailable; remote-required mode forbids a local helper build."
+        return 127
     fi
 
     # test_db is executed by this local shell as a sqlite3 compatibility shim.
@@ -2732,6 +2737,11 @@ e2e_ensure_binary() {
     if [ ! -x "$bin_path" ] || [ "${E2E_FORCE_BUILD:-0}" = "1" ]; then
         e2e_log "Building ${bin_name}..."
         _e2e_build_binary "${bin_name}"
+    fi
+
+    if [ ! -x "$bin_path" ] && { [ "${E2E_CARGO_REQUIRE_RCH}" = "1" ] || [ "${RCH_REQUIRE_REMOTE:-0}" = "1" ]; }; then
+        e2e_log "ERROR: remote build did not provide ${bin_name} at ${bin_path}; remote-required mode forbids a fallback binary or local retry."
+        return 1
     fi
 
     # Some environments (including remote runners) may ignore/override CARGO_TARGET_DIR.

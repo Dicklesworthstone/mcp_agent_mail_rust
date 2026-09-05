@@ -40,6 +40,7 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 send_jsonrpc_session() {
     local db_path="$1"
     shift
+    AM_E2E_ARTIFACT_DIR="$E2E_ARTIFACT_DIR" \
     python3 - "$db_path" "$WF_STORAGE" "$WORK" "$(command -v am)" \
         "${WORKFLOW_SESSION_TIMEOUT_S:-45}" "$@" <<'PY'
 import hashlib
@@ -58,7 +59,9 @@ requests = [json.loads(raw) for raw in raw_requests]
 ids = [request.get("id") for request in requests]
 if not requests or len(set(ids)) != len(ids) or None in ids:
     raise SystemExit("workflow requires a nonempty set of unique request IDs")
-session = Path(tempfile.mkdtemp(prefix="session-", dir=work))
+session_base = Path(os.environ.get("AM_E2E_ARTIFACT_DIR", work)) / "workflow_sessions"
+session_base.mkdir(parents=True, exist_ok=True)
+session = Path(tempfile.mkdtemp(prefix="session-", dir=session_base))
 env = os.environ.copy()
 env.pop("AM_INTERFACE_MODE", None)
 env.update(DATABASE_URL="sqlite:///" + db, STORAGE_ROOT=storage, RUST_LOG="error",
@@ -79,7 +82,8 @@ def interrupted(signum, frame):
 
 signal.signal(signal.SIGTERM, interrupted)
 with (session / "stderr.txt").open("wb") as stderr, \
-     (session / "history.jsonl").open("w") as history:
+     (session / "history.jsonl").open("w") as history, \
+     (session / "transcript.jsonl").open("x") as transcript:
     proc = subprocess.Popen([binary, "serve-stdio"], cwd=session, env=env,
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=stderr, start_new_session=True)
@@ -90,6 +94,8 @@ with (session / "stderr.txt").open("wb") as stderr, \
     def event(kind, payload):
         # Raw synthetic fixture responses stay in the private session files;
         # the operation history records stable IDs and content digests only.
+        transcript.write(json.dumps({"event": kind, "payload": payload}) + "\n")
+        transcript.flush()
         history.write(json.dumps({"event": kind, "id": payload.get("id"),
             "method": payload.get("method"), "elapsed_s": time.monotonic() - started,
             "sha256": hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()}) + "\n")

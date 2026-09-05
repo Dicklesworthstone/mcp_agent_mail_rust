@@ -409,6 +409,7 @@ pub struct Runner {
 struct SuiteExecution {
     output: std::process::Output,
     timed_out: bool,
+    capture_incomplete: bool,
 }
 
 impl Runner {
@@ -611,10 +612,18 @@ impl Runner {
 
                     let exit_code = if execution.timed_out {
                         124
+                    } else if execution.capture_incomplete {
+                        125
                     } else {
                         execution.output.status.code().unwrap_or(-1)
                     };
-                    let passed = !execution.timed_out && execution.output.status.success();
+                    let passed = !execution.timed_out
+                        && !execution.capture_incomplete
+                        && execution.output.status.success();
+
+                    if execution.capture_incomplete {
+                        stderr.push_str("\nSuite output exceeded its capture limit or a child retained its output pipes after the suite exited");
+                    }
 
                     if execution.timed_out {
                         if !stderr.is_empty() {
@@ -715,9 +724,7 @@ impl Runner {
         for (key, value) in &self.config.env {
             cmd.env(key, value);
         }
-        if self.config.release_scorecard
-            && let Some(root) = &self.config.artifact_dir
-        {
+        if let Some(root) = &self.config.artifact_dir {
             // The producer owns a fresh directory for each attempt; retries
             // cannot inherit a successful artifact from a failed attempt.
             let suite_root = root.join(&suite.name);
@@ -727,66 +734,124 @@ impl Runner {
                 .tempdir_in(&suite_root)?
                 .keep();
             cmd.env("AM_E2E_ARTIFACT_DIR", &attempt);
-            cmd.env("AM_E2E_RELEASE_RECEIPT", attempt.join("receipt.json"));
+            if self.config.release_scorecard {
+                cmd.env("AM_E2E_RELEASE_RECEIPT", attempt.join("receipt.json"));
+            }
         }
 
         // Capture output
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            cmd.process_group(0);
+        }
+
+        self.execute_script(cmd)
+    }
+
+    fn execute_script(&self, mut cmd: Command) -> std::io::Result<SuiteExecution> {
         let mut child = cmd.spawn()?;
 
-        let mut stdout_pipe = child
+        let stdout_pipe = child
             .stdout
             .take()
             .ok_or_else(|| std::io::Error::other("Failed to capture stdout"))?;
-        let mut stderr_pipe = child
+        let stderr_pipe = child
             .stderr
             .take()
             .ok_or_else(|| std::io::Error::other("Failed to capture stderr"))?;
 
-        // Spawn threads to read stdout/stderr so the child doesn't block on full pipe buffers
-        let stdout_handle = std::thread::spawn(move || {
-            let mut out = Vec::new();
-            let _ = std::io::copy(&mut stdout_pipe, &mut out);
-            out
-        });
-
-        let stderr_handle = std::thread::spawn(move || {
-            let mut out = Vec::new();
-            let _ = std::io::copy(&mut stderr_pipe, &mut out);
-            out
-        });
-
+        // Drain both streams concurrently, retaining at most limit + 1 bytes.
+        // The extra byte distinguishes exact-limit output from lost evidence.
+        let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let limit = self.config.max_output_bytes;
+        let stdout_overflow = std::sync::Arc::clone(&overflow);
+        let stderr_overflow = std::sync::Arc::clone(&overflow);
+        let stdout_handle =
+            std::thread::spawn(move || Self::capture_bounded(stdout_pipe, limit, &stdout_overflow));
+        let stderr_handle =
+            std::thread::spawn(move || Self::capture_bounded(stderr_pipe, limit, &stderr_overflow));
+        let started = Instant::now();
         let mut timed_out = false;
-
-        if let Some(timeout) = self.config.timeout {
-            let timeout_start = Instant::now();
-            loop {
-                if child.try_wait()?.is_some() {
-                    break;
-                }
-
-                if timeout_start.elapsed() >= timeout {
-                    timed_out = true;
-                    let _ = child.kill();
-                    break;
-                }
-
-                std::thread::sleep(Duration::from_millis(10));
+        let mut capture_incomplete = false;
+        let mut exited_at = None;
+        let mut shutdown_at = None;
+        let mut killed = false;
+        loop {
+            let exited = child.try_wait()?.is_some();
+            if exited && stdout_handle.is_finished() && stderr_handle.is_finished() {
+                break;
             }
+            if exited {
+                exited_at.get_or_insert_with(Instant::now);
+            }
+            timed_out |= self
+                .config
+                .timeout
+                .is_some_and(|limit| started.elapsed() >= limit);
+            capture_incomplete |= overflow.load(std::sync::atomic::Ordering::Relaxed)
+                || exited_at.is_some_and(|at: Instant| at.elapsed() >= Duration::from_secs(1));
+            if (timed_out || capture_incomplete) && shutdown_at.is_none() {
+                #[cfg(unix)]
+                crate::terminate_child_process_group(child.id(), signal_hook::consts::SIGTERM);
+                #[cfg(not(unix))]
+                let _ = child.kill();
+                shutdown_at = Some(Instant::now());
+            }
+            if !killed && shutdown_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(35)) {
+                #[cfg(unix)]
+                crate::terminate_child_process_group(child.id(), signal_hook::consts::SIGKILL);
+                let _ = child.kill();
+                killed = true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
 
         let status = child.wait()?;
-        let stdout = stdout_handle.join().unwrap_or_default();
-        let stderr = stderr_handle.join().unwrap_or_default();
+        let stdout = stdout_handle
+            .join()
+            .map_err(|_| std::io::Error::other("suite stdout reader panicked"))??;
+        let stderr = stderr_handle
+            .join()
+            .map_err(|_| std::io::Error::other("suite stderr reader panicked"))??;
+        capture_incomplete |= overflow.load(std::sync::atomic::Ordering::Relaxed);
         let output = std::process::Output {
             status,
             stdout,
             stderr,
         };
 
-        Ok(SuiteExecution { output, timed_out })
+        Ok(SuiteExecution {
+            output,
+            timed_out,
+            capture_incomplete,
+        })
+    }
+
+    fn capture_bounded(
+        mut reader: impl std::io::Read,
+        limit: usize,
+        overflow: &std::sync::atomic::AtomicBool,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let count = match reader.read(&mut buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if count == 0 {
+                return Ok(out);
+            }
+            let retain = count.min(limit.saturating_add(1).saturating_sub(out.len()));
+            out.extend_from_slice(&buffer[..retain]);
+            if out.len() > limit {
+                overflow.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     fn is_native_suite(name: &str) -> bool {
@@ -844,7 +909,11 @@ impl Runner {
             Ok(output) => {
                 let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
                 let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let passed = output.status.success();
+                let counts = self.native_cargo_counts(&output);
+                let (assertions_passed, assertions_failed, assertions_skipped) =
+                    counts.unwrap_or_default();
+                let passed =
+                    output.status.success() && assertions_passed > 0 && assertions_failed == 0;
                 SuiteResult {
                     name: suite.name.clone(),
                     passed,
@@ -852,9 +921,9 @@ impl Runner {
                     duration_ms: elapsed.as_millis() as u64,
                     stdout,
                     stderr,
-                    assertions_passed: if passed { 1 } else { 0 },
-                    assertions_failed: if passed { 0 } else { 1 },
-                    assertions_skipped: 0,
+                    assertions_passed,
+                    assertions_failed,
+                    assertions_skipped,
                     started_at: started_at.to_rfc3339(),
                     ended_at: ended_at.to_rfc3339(),
                 }
@@ -913,7 +982,11 @@ impl Runner {
             Ok(output) => {
                 let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
                 let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let passed = output.status.success();
+                let counts = self.native_cargo_counts(&output);
+                let (assertions_passed, assertions_failed, assertions_skipped) =
+                    counts.unwrap_or_default();
+                let passed =
+                    output.status.success() && assertions_passed > 0 && assertions_failed == 0;
                 SuiteResult {
                     name: suite.name.clone(),
                     passed,
@@ -921,9 +994,9 @@ impl Runner {
                     duration_ms: elapsed.as_millis() as u64,
                     stdout,
                     stderr,
-                    assertions_passed: if passed { 1 } else { 0 },
-                    assertions_failed: if passed { 0 } else { 1 },
-                    assertions_skipped: 0,
+                    assertions_passed,
+                    assertions_failed,
+                    assertions_skipped,
                     started_at: started_at.to_rfc3339(),
                     ended_at: ended_at.to_rfc3339(),
                 }
@@ -980,7 +1053,11 @@ impl Runner {
             Ok(output) => {
                 let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
                 let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let passed = output.status.success();
+                let counts = self.native_cargo_counts(&output);
+                let (assertions_passed, assertions_failed, assertions_skipped) =
+                    counts.unwrap_or_default();
+                let passed =
+                    output.status.success() && assertions_passed > 0 && assertions_failed == 0;
                 SuiteResult {
                     name: suite.name.clone(),
                     passed,
@@ -988,9 +1065,9 @@ impl Runner {
                     duration_ms: elapsed.as_millis() as u64,
                     stdout,
                     stderr,
-                    assertions_passed: if passed { 1 } else { 0 },
-                    assertions_failed: if passed { 0 } else { 1 },
-                    assertions_skipped: 0,
+                    assertions_passed,
+                    assertions_failed,
+                    assertions_skipped,
                     started_at: started_at.to_rfc3339(),
                     ended_at: ended_at.to_rfc3339(),
                 }
@@ -1047,7 +1124,11 @@ impl Runner {
             Ok(output) => {
                 let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
                 let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let passed = output.status.success();
+                let counts = self.native_cargo_counts(&output);
+                let (assertions_passed, assertions_failed, assertions_skipped) =
+                    counts.unwrap_or_default();
+                let passed =
+                    output.status.success() && assertions_passed > 0 && assertions_failed == 0;
                 SuiteResult {
                     name: suite.name.clone(),
                     passed,
@@ -1055,9 +1136,9 @@ impl Runner {
                     duration_ms: elapsed.as_millis() as u64,
                     stdout,
                     stderr,
-                    assertions_passed: if passed { 1 } else { 0 },
-                    assertions_failed: if passed { 0 } else { 1 },
-                    assertions_skipped: 0,
+                    assertions_passed,
+                    assertions_failed,
+                    assertions_skipped,
                     started_at: started_at.to_rfc3339(),
                     ended_at: ended_at.to_rfc3339(),
                 }
@@ -1116,7 +1197,11 @@ impl Runner {
             Ok(output) => {
                 let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
                 let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let passed = output.status.success();
+                let counts = self.native_cargo_counts(&output);
+                let (assertions_passed, assertions_failed, assertions_skipped) =
+                    counts.unwrap_or_default();
+                let passed =
+                    output.status.success() && assertions_passed > 0 && assertions_failed == 0;
                 SuiteResult {
                     name: suite.name.clone(),
                     passed,
@@ -1124,9 +1209,9 @@ impl Runner {
                     duration_ms: elapsed.as_millis() as u64,
                     stdout,
                     stderr,
-                    assertions_passed: if passed { 1 } else { 0 },
-                    assertions_failed: if passed { 0 } else { 1 },
-                    assertions_skipped: 0,
+                    assertions_passed,
+                    assertions_failed,
+                    assertions_skipped,
                     started_at: started_at.to_rfc3339(),
                     ended_at: ended_at.to_rfc3339(),
                 }
@@ -1185,7 +1270,11 @@ impl Runner {
             Ok(output) => {
                 let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
                 let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let passed = output.status.success();
+                let counts = self.native_cargo_counts(&output);
+                let (assertions_passed, assertions_failed, assertions_skipped) =
+                    counts.unwrap_or_default();
+                let passed =
+                    output.status.success() && assertions_passed > 0 && assertions_failed == 0;
                 SuiteResult {
                     name: suite.name.clone(),
                     passed,
@@ -1193,9 +1282,9 @@ impl Runner {
                     duration_ms: elapsed.as_millis() as u64,
                     stdout,
                     stderr,
-                    assertions_passed: if passed { 1 } else { 0 },
-                    assertions_failed: if passed { 0 } else { 1 },
-                    assertions_skipped: 0,
+                    assertions_passed,
+                    assertions_failed,
+                    assertions_skipped,
                     started_at: started_at.to_rfc3339(),
                     ended_at: ended_at.to_rfc3339(),
                 }
@@ -1841,7 +1930,7 @@ impl Runner {
         args: &[&str],
         env_map: &HashMap<String, String>,
     ) -> std::io::Result<std::process::Output> {
-        let mut cmd = Command::new(binary);
+        let mut cmd = Command::new(binary); // ubs:ignore -- Internal dual-mode callers use only the resolved am/mcp-agent-mail artifacts; requests are separate argv.
         cmd.args(args);
         cmd.current_dir(&self.config.project_root);
         Self::scrub_operator_env(&mut cmd);
@@ -1939,6 +2028,83 @@ impl Runner {
         let file = fs::File::create(artifact_root.join("run_summary.json"))?;
         serde_json::to_writer_pretty(file, &summary)?;
         Ok(())
+    }
+
+    fn native_cargo_counts(&self, output: &std::process::Output) -> Option<(u32, u32, u32)> {
+        if output.stdout.len() > self.config.max_output_bytes
+            || output.stderr.len() > self.config.max_output_bytes
+        {
+            return None;
+        }
+        Self::cargo_test_counts(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    /// Native Cargo lanes need terminal libtest counts, not a fabricated
+    /// single assertion for any process that exits zero. Ignored tests remain
+    /// visible to the release coverage gate.
+    fn cargo_test_counts(stdout: &str) -> Option<(u32, u32, u32)> {
+        let mut totals = (0_u32, 0_u32, 0_u32);
+        let mut summaries = 0;
+        for line in stdout.lines() {
+            let Some(rest) = line.strip_prefix("test result: ") else {
+                continue;
+            };
+            let successful = rest.starts_with("ok. ");
+            let rest = rest
+                .strip_prefix("ok. ")
+                .or_else(|| rest.strip_prefix("FAILED. "))?;
+            let mut fields = rest.split(';');
+            let passed = fields
+                .next()?
+                .trim()
+                .strip_suffix(" passed")?
+                .parse::<u32>()
+                .ok()?;
+            let failed = fields
+                .next()?
+                .trim()
+                .strip_suffix(" failed")?
+                .parse::<u32>()
+                .ok()?;
+            let ignored = fields
+                .next()?
+                .trim()
+                .strip_suffix(" ignored")?
+                .parse::<u32>()
+                .ok()?;
+            fields
+                .next()?
+                .trim()
+                .strip_suffix(" measured")?
+                .parse::<u32>()
+                .ok()?;
+            fields
+                .next()?
+                .trim()
+                .strip_suffix(" filtered out")?
+                .parse::<u32>()
+                .ok()?;
+            let duration = fields
+                .next()?
+                .trim()
+                .strip_prefix("finished in ")?
+                .strip_suffix('s')?
+                .parse::<f64>()
+                .ok()?;
+            if !duration.is_finite() || duration < 0.0 || fields.next().is_some() {
+                return None;
+            }
+            if successful != (failed == 0) {
+                return None;
+            }
+            totals.0 = totals.0.checked_add(passed)?;
+            totals.1 = totals.1.checked_add(failed)?;
+            totals.2 = totals.2.checked_add(ignored)?;
+            summaries += 1;
+        }
+        // Every native adapter selects exactly one integration-test binary.
+        // Extra summaries are ambiguous nested output, not extra coverage.
+        (summaries == 1).then_some(totals)
     }
 
     /// Truncates output to max bytes.
@@ -2834,6 +3000,171 @@ exit 0
     }
 
     #[test]
+    fn runner_honors_artifact_directory_for_ordinary_runs_and_retries() {
+        let root = TempDir::new().unwrap().keep();
+        write_suite_script(
+            &root,
+            "artifact",
+            r#"#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$AM_E2E_ARTIFACT_DIR" >> attempts.txt
+printf 'owned\n' > "$AM_E2E_ARTIFACT_DIR/witness.txt"
+if [ "$(wc -l < attempts.txt)" -eq 1 ]; then exit 1; fi
+echo 'Pass: 1  Fail: 0  Skip: 0'
+"#,
+        );
+        let artifacts = root.join("requested-artifacts");
+        let runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                artifact_dir: Some(artifacts.clone()),
+                retries: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let report = runner.run(&["artifact".to_string()]);
+        assert!(report.success());
+        let attempts = fs::read_to_string(root.join("attempts.txt")).unwrap();
+        let paths: Vec<_> = attempts.lines().map(PathBuf::from).collect();
+        assert_eq!(paths.len(), 2);
+        assert_ne!(paths[0], paths[1]);
+        for path in paths {
+            assert!(path.starts_with(artifacts.join("artifact")));
+            assert_eq!(
+                fs::read_to_string(path.join("witness.txt")).unwrap(),
+                "owned\n"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn e2e_remote_required_helpers_reject_missing_artifacts_without_local_build() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = TempDir::new().unwrap().keep();
+        let source = include_str!("../../../scripts/e2e_lib.sh");
+        let ensure = source
+            .split_once("e2e_ensure_binary() {\n")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        let compat = source
+            .split_once("e2e_sqlite3_compat_bin() {\n")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        let stale = root.join("target/debug");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("am"), "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(stale.join("am"), fs::Permissions::from_mode(0o700)).unwrap();
+        for required in ["E2E_CARGO_REQUIRE_RCH", "RCH_REQUIRE_REMOTE"] {
+            let script = format!(
+                r#"set -eu
+e2e_log() {{ echo "$*" >&2; }}
+_e2e_build_binary() {{ printf '%s\n' "$E2E_CARGO_FORCE_LOCAL" >> build_modes; }}
+cargo() {{ printf unexpected-local-build >> forbidden; return 99; }}
+type() {{ return 1; }}
+e2e_ensure_binary() {{
+{ensure}
+}}
+e2e_sqlite3_compat_bin() {{
+{compat}
+}}
+if e2e_ensure_binary am; then exit 10; fi
+if e2e_sqlite3_compat_bin; then exit 11; fi
+test ! -e forbidden
+test "$(tail -n 1 build_modes)" = 0
+"#,
+            );
+            let script_path = root.join(format!("{required}.sh"));
+            fs::write(&script_path, script).unwrap();
+            let output = Command::new("bash")
+                .arg(script_path)
+                .current_dir(&root)
+                .env("E2E_PROJECT_ROOT", &root)
+                .env("CARGO_TARGET_DIR", root.join("expected-target"))
+                .env("E2E_CARGO_REQUIRE_RCH", "0")
+                .env("RCH_REQUIRE_REMOTE", "0")
+                .env("E2E_CARGO_FORCE_LOCAL", "0")
+                .env("E2E_FORCE_BUILD", "0")
+                .env(required, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stderr).contains("remote-required"));
+        }
+    }
+
+    #[test]
+    fn runner_rejects_success_before_output_overflow_and_bounds_capture() {
+        let root = TempDir::new().unwrap().keep();
+        write_suite_script(
+            &root,
+            "overflow",
+            "#!/bin/sh\necho 'Pass: 1  Fail: 0  Skip: 0'\nhead -c 1048576 /dev/zero\n",
+        );
+        let runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                max_output_bytes: 128,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let report = runner.run(&["overflow".to_string()]);
+        let result = &report.results[0];
+        assert!(!report.success());
+        assert_eq!(result.exit_code, 125);
+        assert_eq!(result.assertions_passed, 1);
+        assert!(result.stdout.len() < 256);
+        assert!(result.stderr.contains("capture limit"));
+
+        let overflow = std::sync::atomic::AtomicBool::new(false);
+        let exact = Runner::capture_bounded(&b"12345"[..], 5, &overflow).unwrap();
+        assert_eq!(exact, b"12345");
+        assert!(!overflow.load(std::sync::atomic::Ordering::Relaxed));
+        let excess = Runner::capture_bounded(&b"123456789"[..], 5, &overflow).unwrap();
+        assert_eq!(excess, b"123456");
+        assert!(overflow.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_timeout_terminates_descendant_holding_output_pipe() {
+        let root = TempDir::new().unwrap().keep();
+        write_suite_script(
+            &root,
+            "descendant",
+            "#!/bin/bash\nsleep 30 &\ntrap 'wait; exit 0' TERM\nwait\n",
+        );
+        let runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                timeout: Some(Duration::from_millis(100)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let started = Instant::now();
+        let report = runner.run(&["descendant".to_string()]);
+        assert_eq!(report.results[0].exit_code, 124);
+        assert!(!report.success());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
     fn test_runner_retries_failed_suite_until_success() {
         let temp = TempDir::new().expect("tempdir");
         write_suite_script(
@@ -2865,6 +3196,90 @@ exit 1
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.assertions_passed, 2);
         assert!(result.stderr.contains("Attempts used: 2"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_adapters_require_real_terminal_counts_instead_of_exit_zero() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = TempDir::new().unwrap().keep();
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        // Controlled process output challenges the adapter contract. Actual
+        // mailbox/transport conformance is validated by the real Cargo lanes.
+        fs::write(
+            bin.join("cargo"),
+            "#!/bin/sh\nprintf '%s\\n' \"$CARGO_FIXTURE_OUTPUT\"\nexit \"$CARGO_FIXTURE_EXIT\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(bin.join("cargo"), fs::Permissions::from_mode(0o700)).unwrap();
+        let suites = [
+            "http",
+            "share",
+            "mode_matrix",
+            "security_privacy",
+            "tui_a11y",
+            "tui_interaction",
+        ];
+        for suite in suites {
+            write_suite_script(&root, suite, "#!/bin/sh\nexit 99\n");
+        }
+        let good = "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s";
+        for (stdout, exit, passed, counts) in [
+            (good.to_string(), "0", true, (7, 0, 0)),
+            (good.to_string(), "7", false, (7, 0, 0)),
+            ("build succeeded".to_string(), "0", false, (0, 0, 0)),
+            (
+                "test result: ok. 7 passed; 0 failed; 0 ignored".to_string(),
+                "0",
+                false,
+                (0, 0, 0),
+            ),
+            (good.replace("7 passed", "0 passed"), "0", false, (0, 0, 0)),
+            (format!("{good}\n{good}"), "0", false, (0, 0, 0)),
+            (
+                format!("{good}\n{}", "x".repeat(256)),
+                "0",
+                false,
+                (0, 0, 0),
+            ),
+            (good.replace("0 ignored", "2 ignored"), "0", true, (7, 0, 2)),
+            (
+                good.replace("ok.", "FAILED.")
+                    .replace("0 failed", "1 failed"),
+                "1",
+                false,
+                (7, 1, 0),
+            ),
+        ] {
+            let runner = Runner::new(
+                &root,
+                RunConfig {
+                    project_root: root.clone(),
+                    max_output_bytes: 128,
+                    env: HashMap::from([
+                        ("PATH".to_string(), bin.to_string_lossy().into_owned()),
+                        ("CARGO_FIXTURE_OUTPUT".to_string(), stdout),
+                        ("CARGO_FIXTURE_EXIT".to_string(), exit.to_string()),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for suite in suites {
+                let result = runner.run_suite(runner.registry.get(suite).unwrap());
+                assert_eq!(result.passed, passed, "{suite}: {}", result.stderr);
+                assert_eq!(
+                    (
+                        result.assertions_passed,
+                        result.assertions_failed,
+                        result.assertions_skipped
+                    ),
+                    counts,
+                    "{suite}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3932,9 +4347,10 @@ exit 1
             fs::write(&rows, contents).unwrap();
             let scorecard = run_dir.join("scorecard.json");
             let receipt = run_dir.join("receipt.json");
+            let producer_path = run_dir.join("producer.py");
+            fs::write(&producer_path, producer).unwrap();
             let output = Command::new("python3")
-                .arg("-c")
-                .arg(producer)
+                .arg(producer_path)
                 .arg(&rows)
                 .arg(&manifest)
                 .arg(&scorecard)
@@ -3982,8 +4398,10 @@ exit 1
             let command = format!(
                 "e2e_run_cargo() {{ printf 'test result: ok. {count} passed; 0 failed;\\n'; return {exit}; }}\nrun_cargo_fixture() {{\n{body}\n}}\nrun_cargo_fixture case-{exit}-{count}.log 1"
             );
+            let script_path = root.join(format!("case-{exit}-{count}.sh"));
+            fs::write(&script_path, command).unwrap();
             let output = Command::new("bash")
-                .args(["-c", &command])
+                .arg(script_path)
                 .env("E2E_ARTIFACT_DIR", &root)
                 .output()
                 .unwrap();
@@ -4037,8 +4455,10 @@ sys.exit(7 if mode == 'unclean' else 0)
             let work = root.join(mode);
             fs::create_dir(&work).unwrap();
             let timeout = if mode == "hang" { "0.2" } else { "10" };
+            let driver_path = work.join("driver.py");
+            fs::write(&driver_path, driver).unwrap();
             let output = Command::new("python3")
-                .args(["-c", driver])
+                .arg(driver_path)
                 .arg(work.join("mailbox.sqlite3"))
                 .arg(work.join("archive"))
                 .arg(&work)
@@ -4071,6 +4491,7 @@ sys.exit(7 if mode == 'unclean' else 0)
 
     #[test]
     fn workflow_response_validator_requires_reply_and_terminal_session() {
+        let root = TempDir::new().unwrap().keep();
         let source = include_str!("../../../tests/e2e/test_workflow_happy_path.sh");
         let body = source
             .split_once("is_error_result() {\n")
@@ -4080,6 +4501,8 @@ sys.exit(7 if mode == 'unclean' else 0)
             .unwrap()
             .0;
         let command = format!("is_error_result() {{\n{body}\n}}\nis_error_result \"$1\" 2");
+        let script_path = root.join("validator.sh");
+        fs::write(&script_path, command).unwrap();
         let reply = r#"{"jsonrpc":"2.0","id":2,"result":{}}"#;
         let terminal = r#"{"workflow_session":{"passed":true,"completed_ids":[1,2]}}"#;
         for (payload, expected) in [
@@ -4101,7 +4524,8 @@ sys.exit(7 if mode == 'unclean' else 0)
             (String::new(), "true"),
         ] {
             let output = Command::new("bash")
-                .args(["-c", &command, "workflow-validator", &payload])
+                .arg(&script_path)
+                .arg(&payload)
                 .output()
                 .unwrap();
             assert!(
