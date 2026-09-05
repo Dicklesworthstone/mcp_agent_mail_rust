@@ -1789,7 +1789,7 @@ fn ensure_stdio_startup_probes_pass(report: &startup_checks::StartupReport) -> s
     Err(std::io::Error::other(report.format_errors()))
 }
 
-pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     config.validate_user_env_authority()?;
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
@@ -1854,7 +1854,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     }
 
     tracing::info!("MCP Agent Mail server (stdio) starting transport loop");
-    build_server(config).run_stdio();
+    build_server(config).run_stdio_with_cx(cx).await;
 
     // run_stdio() returns `!` so the lines below are unreachable today.
     // They are kept as documentation of the intended graceful-shutdown

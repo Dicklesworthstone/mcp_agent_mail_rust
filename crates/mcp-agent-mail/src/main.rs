@@ -747,7 +747,7 @@ fn main() {
                 std::process::exit(1);
             }
             tracing::info!("Starting MCP Agent Mail server (stdio mode)");
-            if let Err(err) = mcp_agent_mail_server::run_stdio(&config) {
+            if let Err(err) = mcp_agent_mail_cli::run_stdio_server(&config) {
                 tracing::error!("stdio server failed: {err}");
                 std::process::exit(1);
             }

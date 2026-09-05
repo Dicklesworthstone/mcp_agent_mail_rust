@@ -9155,10 +9155,40 @@ fn build_setup_run_command_for_http_server(config: &Config) -> SetupCommand {
     }
 }
 
+fn build_stdio_runtime() -> std::io::Result<asupersync::runtime::Runtime> {
+    let reactor = asupersync::runtime::reactor::create_reactor()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_reactor(reactor)
+        // The receive pump occupies one blocking worker for the session.
+        // Without a pool, spawn_blocking runs it on the sole scheduler worker,
+        // preventing request-owned children (including archive seeding) from
+        // ever being polled. Keep a bounded, on-demand pool for both consumers.
+        .blocking_threads(0, 16)
+        .build()
+        .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+/// Run the stdio server with the application's reactor and blocking pool.
+///
+/// Both executable entrypoints use this consumer-owned runtime. The server
+/// receives its context explicitly and does not create a transport runtime.
+///
+/// # Errors
+/// Returns runtime initialization or server startup failures.
+pub fn run_stdio_server(config: &Config) -> std::io::Result<()> {
+    let runtime = build_stdio_runtime()?;
+    runtime.block_on(async {
+        let cx = asupersync::Cx::current()
+            .ok_or_else(|| std::io::Error::other("stdio runtime did not install a context"))?;
+        mcp_agent_mail_server::run_stdio(&cx, config).await
+    })
+}
+
 fn handle_serve_stdio() -> CliResult<()> {
     let config = Config::from_env();
     prepare_runtime_server_startup(&config)?;
-    let result = mcp_agent_mail_server::run_stdio(&config);
+    let result = run_stdio_server(&config);
     let cleanup_result = cleanup_database_sidecars_after_startup_use(&config.database_url);
     result?;
     cleanup_result?;
@@ -44924,6 +44954,45 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
             message.contains("LaunchAgents directory") && message.contains("must not be a symlink"),
             "unexpected error: {message}"
         );
+    }
+
+    #[test]
+    fn stdio_runtime_progresses_request_children_while_receive_pump_blocks() {
+        let runtime = build_stdio_runtime().expect("stdio runtime");
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let mut pump = runtime.block_on(async {
+            asupersync::Cx::current()
+                .expect("runtime context")
+                .spawn_blocking(move |_| {
+                    started_tx.send(()).expect("report pump start");
+                    release_rx.recv_timeout(std::time::Duration::from_secs(4))
+                })
+                .expect("admit receive pump")
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("receive pump started");
+        let started = std::time::Instant::now();
+        let result = runtime.block_on(async {
+            let cx = asupersync::Cx::current().expect("runtime context");
+            let mut child = cx.spawn(|_| async { 23 }).expect("admit request child");
+            let request_result = child.join(&cx).await.expect("request child completed");
+            let mut scan = cx.spawn_blocking(|_| 19).expect("admit archive scan");
+            request_result + scan.join(&cx).await.expect("archive scan completed")
+        });
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        let pump_result = runtime.block_on(async {
+            let cx = asupersync::Cx::current().expect("runtime context");
+            pump.join(&cx).await.expect("receive pump joined")
+        });
+        assert_eq!(result, 42);
+        assert!(
+            pump_result.is_ok(),
+            "pump timed out before requests completed"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
     }
 
     #[test]

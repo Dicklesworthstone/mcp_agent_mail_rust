@@ -39,9 +39,10 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 
 send_jsonrpc_session() {
     local db_path="$1"
-    shift
+    local storage_root="$2"
+    shift 2
     AM_E2E_ARTIFACT_DIR="$E2E_ARTIFACT_DIR" \
-    python3 - "$db_path" "$WF_STORAGE" "$WORK" "$(command -v am)" \
+    python3 - "$db_path" "$storage_root" "$WORK" "$(command -v am)" \
         "${WORKFLOW_SESSION_TIMEOUT_S:-45}" "$@" <<'PY'
 import hashlib
 import json
@@ -252,7 +253,7 @@ except Exception:
 # ===========================================================================
 e2e_case_banner "Phase 1: ensure_project + register two agents"
 
-PHASE1_RESP="$(send_jsonrpc_session "$WF_DB" \
+PHASE1_RESP="$(send_jsonrpc_session "$WF_DB" "$WF_STORAGE" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${PROJECT_PATH}\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"RedFox\"}}}" \
@@ -302,7 +303,7 @@ fi
 # ===========================================================================
 e2e_case_banner "Phase 2: file_reservation_paths (exclusive)"
 
-PHASE2_RESP="$(send_jsonrpc_session "$WF_DB" \
+PHASE2_RESP="$(send_jsonrpc_session "$WF_DB" "$WF_STORAGE" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"RedFox\",\"paths\":[\"src/lib.rs\",\"src/main.rs\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"br-3h13.7.8 testing\"}}}" \
 )"
@@ -339,7 +340,7 @@ e2e_assert_contains "src/main.rs reserved" "$RES_CHECK" "src/main.rs"
 # ===========================================================================
 e2e_case_banner "Phase 3: send → fetch_inbox → acknowledge → reply"
 
-PHASE3_RESP="$(send_jsonrpc_session "$WF_DB" \
+PHASE3_RESP="$(send_jsonrpc_session "$WF_DB" "$WF_STORAGE" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"RedFox\",\"to\":[\"BluePeak\"],\"subject\":\"Implementation update\",\"body_md\":\"## Progress\\n\\nAll tests passing. Ready for review.\",\"thread_id\":\"FEAT-42\",\"ack_required\":true}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"BluePeak\",\"include_bodies\":true,\"limit\":10}}}" \
@@ -405,7 +406,7 @@ e2e_assert_contains "body preserved" "$INBOX_CHECK" "has_body=True"
 e2e_assert_contains "thread_id preserved" "$INBOX_CHECK" "has_thread=True"
 
 # Acknowledge the message
-PHASE3B_RESP="$(send_jsonrpc_session "$WF_DB" \
+PHASE3B_RESP="$(send_jsonrpc_session "$WF_DB" "$WF_STORAGE" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":32,\"method\":\"tools/call\",\"params\":{\"name\":\"acknowledge_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"BluePeak\",\"message_id\":${MSG_ID}}}}" \
 )"
@@ -428,7 +429,7 @@ else
 fi
 
 # Reply to the message
-PHASE3C_RESP="$(send_jsonrpc_session "$WF_DB" \
+PHASE3C_RESP="$(send_jsonrpc_session "$WF_DB" "$WF_STORAGE" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":33,\"method\":\"tools/call\",\"params\":{\"name\":\"reply_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"message_id\":${MSG_ID},\"sender_name\":\"BluePeak\",\"body_md\":\"Looks great! Merging now.\"}}}" \
 )"
@@ -462,7 +463,7 @@ fi
 e2e_case_banner "Phase 4: resource://inbox + resource://thread"
 
 # Read resource://inbox/BluePeak
-PHASE4_RESP="$(send_jsonrpc_session "$WF_DB" \
+PHASE4_RESP="$(send_jsonrpc_session "$WF_DB" "$WF_STORAGE" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://inbox/BluePeak?project=${EP_SLUG}&limit=10\"}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://thread/FEAT-42?project=${EP_SLUG}&include_bodies=true\"}}" \
@@ -549,7 +550,7 @@ fi
 # ===========================================================================
 e2e_case_banner "Phase 5: release_file_reservations"
 
-PHASE5_RESP="$(send_jsonrpc_session "$WF_DB" \
+PHASE5_RESP="$(send_jsonrpc_session "$WF_DB" "$WF_STORAGE" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\",\"params\":{\"name\":\"release_file_reservations\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"RedFox\",\"paths\":[\"src/lib.rs\",\"src/main.rs\"]}}}" \
 )"
@@ -570,8 +571,10 @@ fi
 e2e_case_banner "Phase 6: macro_start_session + macro_file_reservation_cycle"
 
 MACRO_DB="${WORK}/macro_workflow.sqlite3"
+MACRO_STORAGE="${WORK}/macro_storage"
+mkdir -p "$MACRO_STORAGE"
 
-PHASE6_RESP="$(send_jsonrpc_session "$MACRO_DB" \
+PHASE6_RESP="$(send_jsonrpc_session "$MACRO_DB" "$MACRO_STORAGE" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"macro_start_session\",\"arguments\":{\"human_key\":\"/tmp/e2e_macro_workflow_$$\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"task_description\":\"happy path macro test\",\"inbox_limit\":5}}}" \
 )"
@@ -610,7 +613,7 @@ if [ -z "$MACRO_AGENT" ]; then
 fi
 
 # macro_file_reservation_cycle
-PHASE6B_RESP="$(send_jsonrpc_session "$MACRO_DB" \
+PHASE6B_RESP="$(send_jsonrpc_session "$MACRO_DB" "$MACRO_STORAGE" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":61,\"method\":\"tools/call\",\"params\":{\"name\":\"macro_file_reservation_cycle\",\"arguments\":{\"project_key\":\"/tmp/e2e_macro_workflow_$$\",\"agent_name\":\"${MACRO_AGENT}\",\"paths\":[\"src/lib.rs\"],\"reason\":\"macro workflow test\",\"ttl_seconds\":3600,\"auto_release\":false}}}" \
 )"
@@ -644,16 +647,16 @@ e2e_assert_contains "macro reserved 1 path" "$MCYCLE_CHECK" "granted=1"
 e2e_case_banner "Phase 7: CLI verification of DB state"
 
 # Verify agents are in the DB
-CLI_AGENTS="$(DATABASE_URL="sqlite:////${WF_DB}" STORAGE_ROOT="${WF_STORAGE}" \
-    am agent list --project "${PROJECT_PATH}" --json 2>/dev/null || echo "CLI_ERROR")"
+CLI_AGENTS="$(DATABASE_URL="sqlite:///${WF_DB}" STORAGE_ROOT="${WF_STORAGE}" \
+    am agents list --project "${PROJECT_PATH}" --json 2>/dev/null || echo "CLI_ERROR")"
 e2e_save_artifact "phase7_cli_agents.txt" "$CLI_AGENTS"
 
 if [ "$CLI_AGENTS" != "CLI_ERROR" ] && [ -n "$CLI_AGENTS" ]; then
-    e2e_pass "am agent list returned output"
+    e2e_pass "am agents list returned output"
     e2e_assert_contains "CLI shows RedFox" "$CLI_AGENTS" "RedFox"
     e2e_assert_contains "CLI shows BluePeak" "$CLI_AGENTS" "BluePeak"
 else
-    e2e_fail "required am agent list verification errored"
+    e2e_fail "required am agents list verification errored"
 fi
 
 # ===========================================================================
