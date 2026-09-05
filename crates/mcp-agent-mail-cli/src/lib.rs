@@ -19151,10 +19151,7 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
         if try_proxy_file_reservations_mutation(&action)? {
             return Ok(());
         }
-        let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-        let _mailbox_mutation_locks = acquire_cli_mailbox_mutation_locks(&cfg.database_url, None)?;
-        let conn = open_db_sync_while_holding_mailbox_lock()?;
-        return handle_file_reservations_with_conn(&conn, action);
+        return handle_file_reservations_mutation_locally(&action);
     }
 
     let config = Config::from_env();
@@ -19169,6 +19166,86 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
         emit_cli_reservation_read_attestation(&read_attestation);
     }
     result
+}
+
+/// Use the same reservation transaction and archive path as MCP when no daemon
+/// owns the mailbox. Keep the exclusive CLI ownership guard through the entire
+/// operation; opening a second direct-SQL mutation path loses archive updates.
+fn handle_file_reservations_mutation_locally(action: &FileReservationsCommand) -> CliResult<()> {
+    let config = Config::from_env();
+    let _mailbox_mutation_locks =
+        acquire_cli_mailbox_mutation_locks(&config.database_url, Some(&config.storage_root))?;
+    let payload = context::run_async(async {
+        let cx = asupersync::Cx::current()
+            .ok_or_else(|| CliError::Other("reservation runtime did not install a context".into()))?;
+        let ctx = McpContext::new(cx, 1);
+        let (tool, result) = match action {
+            FileReservationsCommand::Reserve {
+                project,
+                agent,
+                paths,
+                ttl,
+                exclusive,
+                shared,
+                reason,
+            } => (
+                "file_reservation_paths",
+                mcp_agent_mail_tools::reservations::file_reservation_paths(
+                    &ctx,
+                    project.clone(),
+                    agent.clone(),
+                    paths.clone(),
+                    Some(*ttl),
+                    Some(!*shared && *exclusive),
+                    Some(reason.clone()),
+                    None,
+                )
+                .await,
+            ),
+            FileReservationsCommand::Renew {
+                project,
+                agent,
+                extend_seconds,
+                paths,
+                ids,
+            } => (
+                "renew_file_reservations",
+                mcp_agent_mail_tools::reservations::renew_file_reservations(
+                    &ctx,
+                    project.clone(),
+                    agent.clone(),
+                    Some(*extend_seconds),
+                    (!paths.is_empty()).then(|| paths.clone()),
+                    (!ids.is_empty()).then(|| ids.clone()),
+                )
+                .await,
+            ),
+            FileReservationsCommand::Release {
+                project,
+                agent,
+                paths,
+                ids,
+            } => (
+                "release_file_reservations",
+                mcp_agent_mail_tools::reservations::release_file_reservations(
+                    &ctx,
+                    project.clone(),
+                    agent.clone(),
+                    (!paths.is_empty()).then(|| paths.clone()),
+                    (!ids.is_empty()).then(|| ids.clone()),
+                )
+                .await,
+            ),
+            _ => {
+                return Err(CliError::InvalidArgument(
+                    "reservation reads require the read-only command path".into(),
+                ));
+            }
+        };
+        parse_tool_json_payload(tool, &result.map_err(mcp_error_to_cli_error)?)
+    })?;
+    emit_proxied_file_reservations_output(action, &payload);
+    Ok(())
 }
 
 /// Make the provenance of a direct CLI reservation read explicit. A readable
@@ -19198,7 +19275,7 @@ fn emit_cli_reservation_read_attestation(attestation: &robot::ReservationReadAtt
 ///
 /// Returns `Ok(true)` when the daemon handled the call (output already
 /// emitted), `Ok(false)` when no daemon owns the mailbox and the caller should
-/// fall back to the local SQLite path. Returns `Err` when the daemon rejected
+/// fall back to the local tool path. Returns `Err` when the daemon rejected
 /// the call in a way that disallows local fallback, or when a daemon owns the
 /// mailbox but its HTTP endpoint is unreachable (refusing a local mutation the
 /// owner would block anyway).
@@ -19322,9 +19399,7 @@ fn file_reservations_proxy_request(
     }
 }
 
-/// Emit CLI output for a reservation verb handled by the daemon, matching the
-/// shape the local path emits so scripts see consistent results regardless of
-/// whether a daemon owns the mailbox.
+/// Render the reservation tool result identically for daemon and offline calls.
 fn emit_proxied_file_reservations_output(
     action: &FileReservationsCommand,
     payload: &serde_json::Value,
@@ -19373,6 +19448,16 @@ fn emit_proxied_file_reservations_output(
             table.render();
         }
         FileReservationsCommand::Release { project, agent, .. } => {
+            if payload.get("queued").and_then(serde_json::Value::as_bool) == Some(true)
+                || payload.get("status").and_then(serde_json::Value::as_str) == Some("queued")
+            {
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(payload).unwrap_or_default()
+                );
+                output::warn("Reservation release is queued; the lease is not yet released.");
+                return;
+            }
             let released = payload
                 .get("released")
                 .and_then(serde_json::Value::as_i64)
@@ -19423,23 +19508,6 @@ fn reservation_patterns_overlap(left: &str, right: &str) -> bool {
     let left = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(left);
     let right = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(right);
     left.overlaps(right.as_ref())
-}
-
-fn cli_reservation_path_filter_matches(row_path_pattern: &str, filter_paths: &[String]) -> bool {
-    filter_paths.is_empty()
-        || filter_paths
-            .iter()
-            .any(|pat| reservation_patterns_overlap(row_path_pattern, pat))
-}
-
-fn cli_reservation_target_matches(
-    row_id: i64,
-    row_path_pattern: &str,
-    filter_paths: &[String],
-    filter_ids: &[i64],
-) -> bool {
-    (filter_ids.is_empty() || filter_ids.contains(&row_id))
-        && cli_reservation_path_filter_matches(row_path_pattern, filter_paths)
 }
 
 fn resolve_project_for_cli_best_effort(
@@ -19671,275 +19739,11 @@ fn handle_file_reservations_with_conn(
             table.render();
             Ok(())
         }
-        FileReservationsCommand::Reserve {
-            project,
-            agent,
-            paths,
-            ttl,
-            exclusive,
-            shared,
-            reason,
-        } => {
-            let project = crate::context::resolve_project(conn, &project)?;
-            let exclusive_val = if shared { false } else { exclusive };
-            let ttl = ttl.max(60); // Min 60s
-
-            let project_id = project.id;
-            let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
-
-            // Check conflicts: find active exclusive reservations that overlap.
-            // GH#180: candidate predicate (no `NOT IN` anti-join) + Rust ledger
-            // subtraction, so the reserve conflict check stays fast under load.
-            let active_reservation_predicate = active_reservation_candidate_predicate_sql("fr");
-            let active_rows = conn
-                .query_sync(
-                    &format!(
-                        "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                                fr.expires_ts, COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name \
-                         FROM file_reservations fr \
-                         LEFT JOIN agents a ON a.id = fr.agent_id \
-                         WHERE fr.project_id = ? AND ({active_reservation_predicate}) \
-                           AND fr.expires_ts > ? AND fr.agent_id != ?"
-                    ),
-                    &[
-                        sqlmodel_core::Value::BigInt(project_id),
-                        sqlmodel_core::Value::BigInt(now_us),
-                        sqlmodel_core::Value::BigInt(agent_id),
-                    ],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let released_ids = cli_released_reservation_ids(conn)?;
-            let active_rows = active_rows
-                .into_iter()
-                .filter(|r| {
-                    let id: i64 = r.get_named("id").unwrap_or(0);
-                    !released_ids.contains(&id)
-                })
-                .collect::<Vec<_>>();
-            let mut conflicts: Vec<serde_json::Value> = Vec::new();
-            let mut conflicted_paths: BTreeSet<String> = BTreeSet::new();
-            for path in &paths {
-                for r in &active_rows {
-                    let holder_is_exclusive: bool = r.get_named("exclusive").unwrap_or(true);
-                    if !exclusive_val && !holder_is_exclusive {
-                        continue;
-                    }
-                    let holder: String = r.get_named("agent_name").unwrap_or_default();
-                    let pattern: String = r.get_named("path_pattern").unwrap_or_default();
-                    if !reservation_patterns_overlap(path, &pattern) {
-                        continue;
-                    }
-                    conflicted_paths.insert(path.clone());
-                    let rid: i64 = r.get_named("id").unwrap_or(0);
-                    conflicts.push(serde_json::json!({
-                        "path": path,
-                        "holder": holder,
-                        "holder_pattern": pattern,
-                        "reservation_id": rid,
-                    }));
-                }
-            }
-
-            // Create reservations.
-            let expires_us = now_us.saturating_add(saturating_seconds_to_micros(ttl));
-            let mut granted: Vec<serde_json::Value> = Vec::new();
-            for path in &paths {
-                if conflicted_paths.contains(path) {
-                    continue;
-                }
-                conn.query_sync(
-                    "INSERT INTO file_reservations \
-                     (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    &[
-                        sqlmodel_core::Value::BigInt(project_id),
-                        sqlmodel_core::Value::BigInt(agent_id),
-                        sqlmodel_core::Value::Text(path.clone()),
-                        sqlmodel_core::Value::BigInt(if exclusive_val { 1 } else { 0 }),
-                        sqlmodel_core::Value::Text(reason.clone()),
-                        sqlmodel_core::Value::BigInt(now_us),
-                        sqlmodel_core::Value::BigInt(expires_us),
-                    ],
-                )
-                .map_err(|e| CliError::Other(format!("insert failed: {e}")))?;
-
-                // Get the inserted ID (MAX(id) since FrankenConnection
-                // does not support last_insert_rowid).
-                let id_rows = conn
-                    .query_sync("SELECT MAX(id) AS id FROM file_reservations", &[])
-                    .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-                let rid: i64 = id_rows
-                    .first()
-                    .and_then(|r| r.get_named("id").ok())
-                    .unwrap_or(0);
-
-                granted.push(serde_json::json!({
-                    "id": rid,
-                    "path": path,
-                    "exclusive": exclusive_val,
-                    "expires_ts": mcp_agent_mail_db::timestamps::micros_to_iso(expires_us),
-                }));
-            }
-
-            // Output.
-            let result = serde_json::json!({
-                "granted": granted,
-                "conflicts": conflicts,
-            });
-            ftui_runtime::ftui_println!(
-                "{}",
-                serde_json::to_string_pretty(&result).unwrap_or_default()
-            );
-            if !conflicts.is_empty() {
-                output::warn(&format!(
-                    "{} conflict(s) detected — conflicting reservations were not created.",
-                    conflicts.len()
-                ));
-            }
-            Ok(())
-        }
-        FileReservationsCommand::Renew {
-            project,
-            agent,
-            extend_seconds,
-            paths,
-            ids,
-        } => {
-            let project = crate::context::resolve_project(conn, &project)?;
-            let extend = extend_seconds.max(60);
-            let extend_us = saturating_seconds_to_micros(extend);
-
-            let project_id = project.id;
-            let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
-
-            // Build WHERE clause for renewal.
-            let active_reservation_predicate =
-                active_reservation_predicate_sql("file_reservations");
-            let base_where = format!(
-                "project_id = ? AND agent_id = ? AND ({active_reservation_predicate}) AND expires_ts > ?"
-            );
-            let candidate_rows = conn
-                .query_sync(
-                    &format!("SELECT id, path_pattern FROM file_reservations WHERE {base_where}"),
-                    &[
-                        sqlmodel_core::Value::BigInt(project_id),
-                        sqlmodel_core::Value::BigInt(agent_id),
-                        sqlmodel_core::Value::BigInt(now_us),
-                    ],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let target_ids: Vec<i64> = candidate_rows
-                .iter()
-                .filter_map(|row| {
-                    let id: i64 = row.get_named("id").ok()?;
-                    let path_pattern: String = row.get_named("path_pattern").ok()?;
-                    cli_reservation_target_matches(id, &path_pattern, &paths, &ids).then_some(id)
-                })
-                .collect();
-            if target_ids.is_empty() {
-                output::empty_result(false, "No matching reservations to renew.");
-                return Ok(());
-            }
-            let placeholders: String = target_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!(
-                "UPDATE file_reservations SET expires_ts = expires_ts + ? \
-                 WHERE {base_where} AND id IN ({placeholders}) \
-                 RETURNING id, path_pattern, expires_ts"
-            );
-            let mut params: Vec<sqlmodel_core::Value> = vec![
-                sqlmodel_core::Value::BigInt(extend_us),
-                sqlmodel_core::Value::BigInt(project_id),
-                sqlmodel_core::Value::BigInt(agent_id),
-                sqlmodel_core::Value::BigInt(now_us),
-            ];
-            for id in &target_ids {
-                params.push(sqlmodel_core::Value::BigInt(*id));
-            }
-
-            let rows = conn
-                .query_sync(&sql, &params)
-                .map_err(|e| CliError::Other(format!("update failed: {e}")))?;
-
-            let mut table = output::CliTable::new(vec!["ID", "PATTERN", "NEW EXPIRES"]);
-            for r in &rows {
-                let id: i64 = r.get_named("id").unwrap_or(0);
-                let pattern: String = r.get_named("path_pattern").unwrap_or_default();
-                let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
-                let expires_str = mcp_agent_mail_db::timestamps::micros_to_iso(expires);
-                table.add_row(vec![
-                    id.to_string(),
-                    pattern,
-                    expires_str.get(..20).unwrap_or(&expires_str).to_string(),
-                ]);
-            }
-            output::success(&format!("Renewed {} reservation(s).", rows.len()));
-            table.render();
-            Ok(())
-        }
-        FileReservationsCommand::Release {
-            project,
-            agent,
-            paths,
-            ids,
-        } => {
-            let project = crate::context::resolve_project(conn, &project)?;
-            let project_id = project.id;
-            let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
-
-            let active_reservation_predicate =
-                active_reservation_predicate_sql("file_reservations");
-            let base_where =
-                format!("project_id = ? AND agent_id = ? AND ({active_reservation_predicate})");
-            let candidate_rows = conn
-                .query_sync(
-                    &format!("SELECT id, path_pattern FROM file_reservations WHERE {base_where}"),
-                    &[
-                        sqlmodel_core::Value::BigInt(project_id),
-                        sqlmodel_core::Value::BigInt(agent_id),
-                    ],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let target_ids: Vec<i64> = candidate_rows
-                .iter()
-                .filter_map(|row| {
-                    let id: i64 = row.get_named("id").ok()?;
-                    let path_pattern: String = row.get_named("path_pattern").ok()?;
-                    cli_reservation_target_matches(id, &path_pattern, &paths, &ids).then_some(id)
-                })
-                .collect();
-            if target_ids.is_empty() {
-                output::success(&format!(
-                    "Released 0 reservation(s) for {} in {}.",
-                    agent, project.slug
-                ));
-                return Ok(());
-            }
-            let placeholders: String = target_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!(
-                "UPDATE file_reservations SET released_ts = ? \
-                 WHERE {base_where} AND id IN ({placeholders}) \
-                 RETURNING id"
-            );
-            let mut params: Vec<sqlmodel_core::Value> = vec![
-                sqlmodel_core::Value::BigInt(now_us),
-                sqlmodel_core::Value::BigInt(project_id),
-                sqlmodel_core::Value::BigInt(agent_id),
-            ];
-            for id in &target_ids {
-                params.push(sqlmodel_core::Value::BigInt(*id));
-            }
-
-            let rows = conn
-                .query_sync(&sql, &params)
-                .map_err(|e| CliError::Other(format!("update failed: {e}")))?;
-
-            let released_count = rows.len();
-            output::success(&format!(
-                "Released {} reservation(s) for {} in {}.",
-                released_count, agent, project.slug
-            ));
-            Ok(())
-        }
+        FileReservationsCommand::Reserve { .. }
+        | FileReservationsCommand::Renew { .. }
+        | FileReservationsCommand::Release { .. } => Err(CliError::InvalidArgument(
+            "reservation mutations require the archive-aware command path".into(),
+        )),
         FileReservationsCommand::Conflicts { project, paths } => {
             let Some(project) = resolve_project_for_cli_best_effort(conn, &project)? else {
                 output::success("No conflicts detected.");
@@ -43968,6 +43772,36 @@ mod tests {
     }
 
     #[test]
+    fn file_reservations_queued_release_preserves_receipt_without_claiming_release() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let action = FileReservationsCommand::Release {
+            project: "test-proj".to_string(),
+            agent: "BlueLake".to_string(),
+            paths: Vec::new(),
+            ids: vec![1],
+        };
+        let payload = serde_json::json!({
+            "released": 0,
+            "status": "queued",
+            "queued": true,
+            "intent": {
+                "id": "release-intent-1",
+                "path": "/fixture/release-intents.jsonl",
+                "replay": "automatic_on_next_successful_release_file_reservations_call"
+            }
+        });
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        emit_proxied_file_reservations_output(&action, &payload);
+        let output = capture.drain_to_string();
+        assert!(output.contains("release-intent-1"), "{output}");
+        assert!(output.contains("/fixture/release-intents.jsonl"), "{output}");
+        assert!(output.contains("not yet released"), "{output}");
+        assert!(!output.contains("Released 0 reservation"), "{output}");
+    }
+
+    #[test]
     fn legacy_am_serve_preflight_is_scoped_to_am_binary() {
         let legacy_args = vec![OsString::from("am"), OsString::from("serve")];
         assert!(is_legacy_am_serve_invocation("am", &legacy_args));
@@ -67968,6 +67802,43 @@ startup_timeout_sec = 42
         );
     }
 
+    fn run_file_reservations_mutation_in_fixture(
+        db_path: &Path,
+        action: FileReservationsCommand,
+    ) -> CliResult<()> {
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = db_path.parent().unwrap().join("archive");
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", storage_root.to_str().unwrap()),
+                ("HTTP_HOST", "127.0.0.1"),
+                ("HTTP_PORT", "0"),
+                ("AGENT_MAIL_URL", "http://127.0.0.1:0/mcp/"),
+                ("AM_ATC_ENABLED", "false"),
+                ("AM_ATC_WRITE_MODE", "off"),
+                ("LLM_ENABLED", "false"),
+            ],
+            || handle_file_reservations(action),
+        )
+    }
+
+    fn fixture_reservation_artifact(db_path: &Path, id: i64) -> serde_json::Value {
+        let archive = db_path
+            .parent()
+            .unwrap()
+            .join("archive/projects/test-proj/file_reservations");
+        let artifacts: Vec<serde_json::Value> = std::fs::read_dir(&archive)
+            .expect("reservation archive exists")
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+            .map(|path| serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap())
+            .filter(|row: &serde_json::Value| row["id"] == id)
+            .collect();
+        assert_eq!(artifacts.len(), 1, "one current artifact for reservation {id}");
+        artifacts.into_iter().next().unwrap()
+    }
+
     #[test]
     fn integration_file_reservations_reserve_creates_entries() {
         let _guard = stdio_capture_lock()
@@ -67978,8 +67849,8 @@ startup_timeout_sec = 42
         let conn = seed_acks_and_reservations_db(&db_path);
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_file_reservations_with_conn(
-            &conn,
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
             FileReservationsCommand::Reserve {
                 project: "test-proj".to_string(),
                 agent: "RedFox".to_string(),
@@ -67997,10 +67868,10 @@ startup_timeout_sec = 42
             "expected granted output, got: {output}"
         );
 
-        // Verify reservations exist in DB.
+        // Check the actual DB and guard-visible artifacts, not just the response.
         let rows = conn
             .query_sync(
-                "SELECT path_pattern FROM file_reservations WHERE agent_id = 2 AND released_ts IS NULL",
+                "SELECT id, path_pattern FROM file_reservations WHERE agent_id = 2 AND released_ts IS NULL",
                 &[],
             )
             .unwrap();
@@ -68008,10 +67879,20 @@ startup_timeout_sec = 42
             rows.len() >= 2,
             "expected at least 2 reservations for RedFox"
         );
+        for row in rows {
+            let id: i64 = row.get_named("id").unwrap();
+            let pattern: String = row.get_named("path_pattern").unwrap();
+            let artifact = fixture_reservation_artifact(&db_path, id);
+            assert_eq!(artifact["path_pattern"], pattern);
+            assert_eq!(artifact["agent"], "RedFox");
+            assert_eq!(artifact["exclusive"], true);
+            assert_eq!(artifact["reason"], "br-123");
+            assert!(artifact["released_ts"].is_null());
+        }
     }
 
     #[test]
-    fn integration_file_reservations_reserve_accepts_orphaned_project_placeholder() {
+    fn integration_file_reservations_reserve_rejects_orphaned_project_placeholder() {
         let _guard = stdio_capture_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -68025,8 +67906,8 @@ startup_timeout_sec = 42
         .expect("delete project row");
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_file_reservations_with_conn(
-            &conn,
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
             FileReservationsCommand::Reserve {
                 project: "[unknown-project-1]".to_string(),
                 agent: "RedFox".to_string(),
@@ -68038,10 +67919,10 @@ startup_timeout_sec = 42
             },
         );
         let output = capture.drain_to_string();
-        assert!(result.is_ok(), "reserve failed: {result:?}");
+        assert!(result.is_err(), "a missing project cannot authorize a reservation");
         assert!(
-            output.contains("\"granted\"") && output.contains("orphaned/**"),
-            "expected granted output for orphaned project, got: {output}"
+            !output.contains("\"granted\""),
+            "missing project must not report a grant, got: {output}"
         );
 
         let rows = conn
@@ -68051,12 +67932,12 @@ startup_timeout_sec = 42
             )
             .unwrap();
         assert!(
-            rows.iter().any(|row| {
+            !rows.iter().any(|row| {
                 row.get_named::<String>("path_pattern")
                     .ok()
                     .is_some_and(|pattern| pattern == "orphaned/**")
             }),
-            "expected orphaned reservation to be inserted"
+            "missing project must not receive a new reservation"
         );
     }
 
@@ -68071,8 +67952,8 @@ startup_timeout_sec = 42
 
         // BlueLake already has src/api/*.rs exclusive — RedFox requesting overlapping path.
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_file_reservations_with_conn(
-            &conn,
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
             FileReservationsCommand::Reserve {
                 project: "test-proj".to_string(),
                 agent: "RedFox".to_string(),
@@ -68116,8 +67997,8 @@ startup_timeout_sec = 42
         let conn = seed_acks_and_reservations_db(&db_path);
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_file_reservations_with_conn(
-            &conn,
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
             FileReservationsCommand::Reserve {
                 project: "test-proj".to_string(),
                 agent: "RedFox".to_string(),
@@ -68171,8 +68052,8 @@ startup_timeout_sec = 42
         .expect("delete conflicting holder row");
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_file_reservations_with_conn(
-            &conn,
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
             FileReservationsCommand::Reserve {
                 project: "test-proj".to_string(),
                 agent: "RedFox".to_string(),
@@ -68189,7 +68070,7 @@ startup_timeout_sec = 42
             "reserve with orphaned conflict holder failed: {result:?}"
         );
         assert!(
-            output.contains("\"conflicts\"") && output.contains("[unknown-agent-1]"),
+            output.contains("\"conflicts\"") && output.contains("agent_1"),
             "expected orphaned conflict holder placeholder, got: {output}"
         );
     }
@@ -68201,11 +68082,11 @@ startup_timeout_sec = 42
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
-        let conn = seed_acks_and_reservations_db(&db_path);
+        drop(seed_acks_and_reservations_db(&db_path));
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_file_reservations_with_conn(
-            &conn,
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
             FileReservationsCommand::Reserve {
                 project: "test-proj".to_string(),
                 agent: "RedFox".to_string(),
@@ -68243,8 +68124,8 @@ startup_timeout_sec = 42
         let orig_expires: i64 = before.first().unwrap().get_named("expires_ts").unwrap();
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_file_reservations_with_conn(
-            &conn,
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
             FileReservationsCommand::Renew {
                 project: "test-proj".to_string(),
                 agent: "BlueLake".to_string(),
@@ -68269,6 +68150,12 @@ startup_timeout_sec = 42
             new_expires > orig_expires,
             "expires must increase: {orig_expires} -> {new_expires}"
         );
+        let artifact = fixture_reservation_artifact(&db_path, 1);
+        assert_eq!(
+            artifact["expires_ts"],
+            mcp_agent_mail_db::timestamps::micros_to_iso(new_expires)
+        );
+        assert!(artifact["released_ts"].is_null());
     }
 
     #[test]
@@ -68291,8 +68178,8 @@ startup_timeout_sec = 42
         let orig_expires: i64 = before.first().unwrap().get_named("expires_ts").unwrap();
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_file_reservations_with_conn(
-            &conn,
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
             FileReservationsCommand::Renew {
                 project: "test-proj".to_string(),
                 agent: "BlueLake".to_string(),
@@ -68328,8 +68215,8 @@ startup_timeout_sec = 42
         let conn = seed_acks_and_reservations_db(&db_path);
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_file_reservations_with_conn(
-            &conn,
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
             FileReservationsCommand::Release {
                 project: "test-proj".to_string(),
                 agent: "BlueLake".to_string(),
@@ -68353,6 +68240,11 @@ startup_timeout_sec = 42
             .unwrap();
         let released: Option<i64> = rows.first().unwrap().get_named("released_ts").ok();
         assert!(released.is_some(), "released_ts must be set");
+        let artifact = fixture_reservation_artifact(&db_path, 1);
+        assert_eq!(
+            artifact["released_ts"],
+            mcp_agent_mail_db::timestamps::micros_to_iso(released.unwrap())
+        );
     }
 
     #[test]
@@ -68370,8 +68262,8 @@ startup_timeout_sec = 42
         .unwrap();
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_file_reservations_with_conn(
-            &conn,
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
             FileReservationsCommand::Release {
                 project: "test-proj".to_string(),
                 agent: "BlueLake".to_string(),
@@ -68412,8 +68304,8 @@ startup_timeout_sec = 42
         let conn = seed_acks_and_reservations_db(&db_path);
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_file_reservations_with_conn(
-            &conn,
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
             FileReservationsCommand::Release {
                 project: "test-proj".to_string(),
                 agent: "BlueLake".to_string(),
@@ -68616,10 +68508,10 @@ startup_timeout_sec = 42
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
-        let conn = seed_acks_and_reservations_db(&db_path);
+        drop(seed_acks_and_reservations_db(&db_path));
 
-        let result = handle_file_reservations_with_conn(
-            &conn,
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
             FileReservationsCommand::Reserve {
                 project: "nonexistent".to_string(),
                 agent: "BlueLake".to_string(),
@@ -68640,10 +68532,10 @@ startup_timeout_sec = 42
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
-        let conn = seed_acks_and_reservations_db(&db_path);
+        drop(seed_acks_and_reservations_db(&db_path));
 
-        let result = handle_file_reservations_with_conn(
-            &conn,
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
             FileReservationsCommand::Reserve {
                 project: "test-proj".to_string(),
                 agent: "NonexistentAgent".to_string(),
