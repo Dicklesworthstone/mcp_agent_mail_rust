@@ -1034,7 +1034,7 @@ def start(label):
                 raise TimeoutError(f"{label}: HTTP bind deadline")
             time.sleep(0.1)
 
-def rpc(label, method, params, request_id):
+def rpc(label, method, params, request_id, expected_tool_error=None):
     request = {"jsonrpc": "2.0", "method": method, "params": params}
     if request_id is not None:
         request["id"] = request_id
@@ -1049,7 +1049,18 @@ def rpc(label, method, params, request_id):
     if request_id is None:
         return None
     decoded = json.loads(raw)
-    assert decoded.get("id") == request_id and "error" not in decoded, decoded
+    assert decoded.get("id") == request_id, decoded
+    if expected_tool_error is not None:
+        if "error" in decoded:
+            error = decoded["error"]["data"]["error"]
+        else:
+            result = decoded["result"]
+            assert result.get("isError") is True and len(result["content"]) == 1, decoded
+            error = json.loads(result["content"][0]["text"])["error"]
+        assert error["type"] == expected_tool_error, decoded
+        summary["completed"].append(label)
+        return error
+    assert "error" not in decoded, decoded
     result = decoded["result"]
     assert not result.get("isError"), result
     summary["completed"].append(label)
@@ -1091,6 +1102,22 @@ def recipient_cursors():
         assert position["events"] == [] and position["has_more"] is False, position
         assert position["next_cursor"] == position["tail_cursor"], position
         before[actor] = position["next_cursor"]
+    # Exact typed refusals must not be confused with successful empty pages.
+    invalid_requests = [
+        ("ahead", "BluePeak", {"after": before["BluePeak"] + 1}, "CURSOR_AHEAD"),
+        ("empty_ahead", "SilverWolf", {"after": 1}, "CURSOR_AHEAD"),
+        ("position_after", "BluePeak", {"after": 0, "position_now": True}, "INVALID_ARGUMENT"),
+        ("zero_limit", "BluePeak", {"limit": 0}, "INVALID_LIMIT"),
+        ("large_limit", "BluePeak", {"limit": 1001}, "INVALID_LIMIT"),
+    ]
+    for index, (label, actor, extra, code) in enumerate(invalid_requests):
+        error = rpc("cursor_invalid_" + label, "tools/call", {
+            "name": "fetch_inbox_events", "arguments": dict(extra, project_key=project,
+                agent_name=actor, format="json")}, 500 + index, expected_tool_error=code)
+        if code == "CURSOR_AHEAD":
+            assert error["data"]["tail_cursor"] == before[actor], error
+            assert error["data"]["after"] == extra["after"], error
+    summary["cursor_refusals"] = len(invalid_requests)
     body = "Synthetic delivery for explicit to, cc and bcc recipient checks."
     sent = tool("cursor_send", "send_message", {"project_key": project,
         "sender_name": "RedFox", "to": ["BluePeak"], "cc": ["GreenLake"], "bcc": ["GoldHawk"],
@@ -1118,6 +1145,13 @@ def recipient_cursors():
             assert events == [], ("nonrecipient received delivery", actor, page)
         positions[actor] = page["next_cursor"]
     # Cursor reads must not mark the real recipient rows read or acknowledged.
+    for index, actor in enumerate(roles):
+        peek = tool("cursor_peek_" + actor, "fetch_inbox", {
+            "project_key": project, "agent_name": actor, "include_bodies": True,
+            "topic": "KP1IN-CURSORS", "mark_read": False}, 510 + index)
+        assert len(peek) == 1 and peek[0]["id"] == message_id, peek
+        assert peek[0]["body_md"] == body and peek[0]["kind"] == roles[actor], peek
+        assert peek[0].get("read_ts") is None and peek[0].get("ack_ts") is None, peek
     with closing(sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True)) as conn:
         rows = conn.execute("SELECT kind, read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
                             (message_id,)).fetchall()

@@ -1697,6 +1697,15 @@ mod tests {
 
     #[test]
     fn fetch_inbox_does_not_write_read_receipts_into_archive_snapshot() {
+        assert_archive_inbox_preserves_databases(None);
+    }
+
+    #[test]
+    fn fetch_inbox_from_archive_preserves_unopenable_live_database() {
+        assert_archive_inbox_preserves_databases(Some(b"damaged live SQLite fixture"));
+    }
+
+    fn assert_archive_inbox_preserves_databases(live_bytes: Option<&[u8]>) {
         let _guard = TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1704,6 +1713,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let storage_root = directory.path().join("archive");
         let sqlite_path = directory.path().join("missing-live.sqlite3");
+        if let Some(bytes) = live_bytes {
+            fs::write(&sqlite_path, bytes).expect("seed damaged live database");
+        }
+        let live_family_before = snapshot_family(&sqlite_path);
         write_archive_fixture(&storage_root);
         fs::write(
             storage_root.join(
@@ -1767,9 +1780,10 @@ mod tests {
                             family_before,
                             "snapshot database family changed for mark_read={mark_read:?}"
                         );
-                        assert!(
-                            !sqlite_path.exists(),
-                            "a degraded read must not create the missing live database"
+                        assert_eq!(
+                            snapshot_family(&sqlite_path),
+                            live_family_before,
+                            "a degraded read must not create or repair the live database"
                         );
                     }
                 });

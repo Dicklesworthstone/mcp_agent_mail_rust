@@ -3801,7 +3801,20 @@ pub async fn fetch_inbox(
     // Keep healthy reads on the live query-only lane without waiting for
     // archive reconstruction or the coalescer. If that pool cannot open,
     // reuse the verified archive fallback so retained mail stays readable.
-    let read_pool = match get_coalescer_bypass_read_db_pool() {
+    let live_pool: McpResult<_> = async {
+        let pool = get_coalescer_bypass_read_db_pool()?;
+        // Pool construction is lazy: only acquire proves its file can open.
+        // Return this query-only connection to the pool for scope resolution.
+        let conn = db_outcome_to_mcp_result(
+            pool.acquire(ctx.cx())
+                .await
+                .map_err(|error| mcp_agent_mail_db::DbError::Sqlite(error.to_string())),
+        )?;
+        drop(conn);
+        Ok(pool)
+    }
+    .await;
+    let read_pool = match live_pool {
         Ok(pool) => crate::tool_util::ToolReadPool::live(pool),
         Err(error) => {
             tracing::warn!(error = %error, "live inbox unavailable; trying archive snapshot");
