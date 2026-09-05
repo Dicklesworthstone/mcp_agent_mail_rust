@@ -39550,6 +39550,63 @@ fn render_macro_start_session_payload(
 
 // ── Macro command handler ────────────────────────────────────────────
 
+fn render_macro_reservation_cycle_payload(
+    payload: &serde_json::Value,
+    format: output::CliOutputFormat,
+    agent_name: &str,
+) {
+    output::emit_output(payload, format, || {
+        let granted = json_path_array_len(payload, &["file_reservations", "granted"]);
+        output::kv(
+            "Granted",
+            &format!("{granted} reservation(s) for {agent_name}"),
+        );
+        if let Some(reservations) = payload
+            .pointer("/file_reservations/granted")
+            .and_then(serde_json::Value::as_array)
+        {
+            for reservation in reservations {
+                output::kv(
+                    "Path",
+                    &format!(
+                        "{} (exclusive={}, expires={})",
+                        reservation["path_pattern"].as_str().unwrap_or("?"),
+                        reservation["exclusive"],
+                        reservation["expires_ts"].as_str().unwrap_or("?")
+                    ),
+                );
+            }
+        }
+        if let Some(conflicts) = payload
+            .pointer("/file_reservations/conflicts")
+            .and_then(serde_json::Value::as_array)
+        {
+            for conflict in conflicts {
+                output::warn(&format!("Reservation conflict: {conflict}"));
+            }
+        }
+        if payload
+            .pointer("/released/queued")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            || payload
+                .pointer("/released/status")
+                .and_then(serde_json::Value::as_str)
+                == Some("queued")
+        {
+            output::warn("Reservation release is queued; the lease is not yet released.");
+            if let Some(intent) = payload.pointer("/released/intent") {
+                output::kv("Release intent", &intent.to_string());
+            }
+        } else if let Some(released) = payload
+            .pointer("/released/released")
+            .and_then(serde_json::Value::as_i64)
+        {
+            output::kv("Released", &released.to_string());
+        }
+    });
+}
+
 fn handle_macros(action: MacroCommand) -> CliResult<()> {
     context::run_async(async move { handle_macros_async(action).await })
 }
@@ -39938,21 +39995,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                 ServerToolCall::Success(result) => {
                     let payload =
                         coerce_tool_result_json_or_error("macro_file_reservation_cycle", result)?;
-                    output::emit_output(&payload, fmt, || {
-                        let granted = payload
-                            .pointer("/file_reservations/granted")
-                            .and_then(serde_json::Value::as_array)
-                            .map_or(0, Vec::len);
-                        output::success(&format!(
-                            "{granted} reservation(s) granted for {agent_name}"
-                        ));
-                        if let Some(released) = payload
-                            .pointer("/released/released")
-                            .and_then(serde_json::Value::as_i64)
-                        {
-                            output::kv("Released", &released.to_string());
-                        }
-                    });
+                    render_macro_reservation_cycle_payload(&payload, fmt, &agent_name);
                     return Ok(());
                 }
                 ServerToolCall::Unavailable(message) => {
@@ -39977,86 +40020,27 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                 }
             }
 
-            let ctx = context::AsyncCliContext::open()?;
-            let cx = asupersync::Cx::for_request();
-
-            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
-            let pid = proj.id.unwrap_or(0);
-            let agent = resolve_agent_async(&cx, &ctx.pool, pid, &agent_name).await?;
-            let aid = agent.id.unwrap_or(0);
-
-            let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-
-            let reservations = outcome_to_result(
-                mcp_agent_mail_db::queries::create_file_reservations(
-                    &cx,
-                    &ctx.pool,
-                    pid,
-                    aid,
-                    &path_refs,
-                    ttl,
-                    is_exclusive,
-                    &reason_str,
-                )
-                .await,
+            let _mailbox_mutation_locks = acquire_cli_mailbox_mutation_locks(
+                &database_url,
+                Some(&server_config.storage_root),
             )?;
-
-            let released = if auto_release {
-                let released_rows = outcome_to_result(
-                    mcp_agent_mail_db::queries::release_reservations(
-                        &cx,
-                        &ctx.pool,
-                        pid,
-                        aid,
-                        Some(&path_refs),
-                        None,
-                    )
-                    .await,
-                )?;
-                Some(released_rows)
-            } else {
-                None
-            };
-            let released_count = released.as_ref().map(Vec::len);
-
-            let resp = serde_json::json!({
-                "file_reservations": {
-                    "granted": reservations.iter().map(|r| serde_json::json!({
-                        "id": r.id.unwrap_or(0),
-                        "path_pattern": r.path_pattern,
-                        "exclusive": r.exclusive != 0,
-                        "reason": r.reason,
-                        "expires_ts": mcp_agent_mail_db::micros_to_iso(r.expires_ts),
-                    })).collect::<Vec<_>>(),
-                    "conflicts": [],
-                },
-                "released": released_count.map(|n| serde_json::json!({
-                    "released": n,
-                    "released_at": mcp_agent_mail_db::micros_to_iso(mcp_agent_mail_db::timestamps::now_micros()),
-                })),
-            });
-
-            output::emit_output(&resp, fmt, || {
-                output::success(&format!(
-                    "{} reservation(s) granted for {}",
-                    reservations.len(),
-                    agent_name
-                ));
-                for r in &reservations {
-                    output::kv(
-                        "  Path",
-                        &format!(
-                            "{} (exclusive={}, expires={})",
-                            r.path_pattern,
-                            r.exclusive != 0,
-                            mcp_agent_mail_db::micros_to_iso(r.expires_ts)
-                        ),
-                    );
-                }
-                if let Some(n) = released_count {
-                    output::kv("Released", &n.to_string());
-                }
-            });
+            let cx = asupersync::Cx::current()
+                .ok_or_else(|| CliError::Other("macro runtime did not install a context".into()))?;
+            let ctx = McpContext::new(cx, 1);
+            let result = mcp_agent_mail_tools::macros::macro_file_reservation_cycle(
+                &ctx,
+                project_key,
+                agent_name.clone(),
+                paths,
+                Some(ttl),
+                Some(is_exclusive),
+                Some(reason_str),
+                Some(auto_release),
+            )
+            .await
+            .map_err(mcp_error_to_cli_error)?;
+            let payload = parse_tool_json_payload("macro_file_reservation_cycle", &result)?;
+            render_macro_reservation_cycle_payload(&payload, fmt, &agent_name);
             Ok(())
         }
 
@@ -43803,6 +43787,46 @@ mod tests {
         );
         assert!(output.contains("not yet released"), "{output}");
         assert!(!output.contains("Released 0 reservation"), "{output}");
+    }
+
+    #[test]
+    fn macro_reservation_cycle_output_preserves_queued_release_and_conflict() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let payload = serde_json::json!({
+            "file_reservations": {
+                "granted": [],
+                "conflicts": [{"path": "src/api.rs", "holders": [{"agent": "RedFox"}]}]
+            },
+            "released": {
+                "released": 0,
+                "status": "queued",
+                "queued": true,
+                "intent": {"id": "macro-release-intent", "path": "/fixture/intents.jsonl"}
+            }
+        });
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        render_macro_reservation_cycle_payload(
+            &payload,
+            output::CliOutputFormat::Table,
+            "BlueLake",
+        );
+        let output = capture.drain_to_string();
+        assert!(output.contains("not yet released"), "{output}");
+        assert!(output.contains("macro-release-intent"), "{output}");
+        assert!(
+            output.contains("RedFox") && output.contains("src/api.rs"),
+            "{output}"
+        );
+        assert!(!output.contains("Released"), "{output}");
+
+        render_macro_reservation_cycle_payload(&payload, output::CliOutputFormat::Json, "BlueLake");
+        let output = capture.drain_to_string();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+            payload
+        );
     }
 
     #[test]
@@ -67851,7 +67875,8 @@ startup_timeout_sec = 42
                     .is_some_and(|extension| extension == "json")
             })
             .map(|path| {
-                let row = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                let row: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
                 (path, row)
             })
             .filter(|(_, row)| row["id"] == id)

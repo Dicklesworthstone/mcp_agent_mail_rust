@@ -9,7 +9,7 @@
 #   3. resource://inbox → resource://thread
 #   4. release_file_reservations → verify archive + DB
 #   5. Macro equivalents: macro_start_session → macro_file_reservation_cycle
-#   6. Offline CLI reserve → guard conflict → renew → release → guard clear
+#   6. Offline CLI and macro reservations → archive-backed guard enforcement
 #
 # Target: 30+ assertions
 
@@ -807,12 +807,227 @@ stdout, _ = run("release_again", ["file_reservations", "release", project, "RedF
 assert "Released 0 reservation(s)" in stdout, stdout
 assert row(reservation_id) == released
 assert micros(artifact(reservation_id)["released_ts"]) == released["released_ts"]
-print("Offline CLI reserve/conflict/renew/release and archive-backed guard passed.")
+
+macro_pattern = "src/offline-macro-cycle.rs"
+stdout, _ = run("macro_reserve", ["macros", "file-reservation-cycle", "-p", project,
+                                "-a", "RedFox", "--path", macro_pattern,
+                                "--reason", "br-21gj.4.6", "--json"])
+macro = payload(stdout)
+assert macro["released"] is None and macro["file_reservations"]["conflicts"] == [], macro
+assert len(macro["file_reservations"]["granted"]) == 1, macro
+macro_id = macro["file_reservations"]["granted"][0]["id"]
+assert row(macro_id)["released_ts"] is None and row(macro_id)["exclusive"] == 1
+assert artifact(macro_id)["agent"] == "RedFox"
+assert artifact(macro_id)["path_pattern"] == macro_pattern
+assert artifact(macro_id)["released_ts"] is None
+stdout, stderr = run("macro_guard_held", ["guard", "check", "--repo", project],
+                     expected=1, stdin=macro_pattern + "\n", agent="BluePeak")
+assert "RedFox" in stdout + stderr, (stdout, stderr)
+stdout, _ = run("macro_conflict", ["macros", "file-reservation-cycle", "-p", project,
+                                 "-a", "BluePeak", "--path", macro_pattern, "--json"])
+conflict = payload(stdout)["file_reservations"]
+assert conflict["granted"] == [] and len(conflict["conflicts"]) == 1, conflict
+assert conflict["conflicts"][0]["holders"][0]["agent"] == "RedFox", conflict
+with sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True) as conn:
+    assert conn.execute("SELECT COUNT(*) FROM file_reservations WHERE path_pattern = ? "
+                        "AND released_ts IS NULL", (macro_pattern,)).fetchone()[0] == 1
+run("macro_cleanup_release", ["file_reservations", "release", project, "RedFox",
+                              "--ids", str(macro_id)])
+assert row(macro_id)["released_ts"] > 0
+assert micros(artifact(macro_id)["released_ts"]) == row(macro_id)["released_ts"]
+
+auto_pattern = "src/offline-macro-auto.rs"
+stdout, _ = run("macro_auto_release", ["macros", "file-reservation-cycle", "-p", project,
+                                     "-a", "RedFox", "--path", auto_pattern,
+                                     "--auto-release", "--json"])
+auto = payload(stdout)
+assert len(auto["file_reservations"]["granted"]) == 1, auto
+assert auto["released"]["released"] == 1 and not auto["released"].get("queued", False), auto
+auto_id = auto["file_reservations"]["granted"][0]["id"]
+auto_row = row(auto_id)
+assert auto_row["released_ts"] > 0
+assert micros(artifact(auto_id)["released_ts"]) == auto_row["released_ts"]
+stdout, _ = run("macro_guard_released", ["guard", "check", "--repo", project],
+                stdin=auto_pattern + "\n", agent="BluePeak")
+assert "No file reservation conflicts" in stdout, stdout
+print("Offline CLI and macro reservation lifecycle and archive-backed guard passed.")
 PY
 then
-    e2e_pass "offline CLI lifecycle preserves DB/archive parity and guard enforcement"
+    e2e_pass "offline CLI and macro lifecycle preserve DB/archive parity and guard enforcement"
 else
-    e2e_fail "offline CLI reservation lifecycle or guard verification failed"
+    e2e_fail "offline CLI or macro reservation lifecycle or guard verification failed"
+fi
+
+# ===========================================================================
+# Phase 9: HTTP handoff, signal drain, and persisted mailbox reopen
+# ===========================================================================
+e2e_case_banner "Phase 9: HTTP messaging + clean signal shutdown + reopen"
+
+if python3 - "$WF_DB" "$WF_STORAGE" "$PROJECT_PATH" "$(command -v am)" \
+    "$E2E_ARTIFACT_DIR" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.request
+
+db, storage, project, binary, artifacts = sys.argv[1:]
+run = Path(artifacts) / "http_handoff"
+run.mkdir(mode=0o700, exist_ok=False)
+summary = {"passed": False, "client_pid": os.getpid(), "servers": [], "completed": []}
+server = None
+started = time.monotonic()
+
+def interrupted(signum, frame):
+    raise InterruptedError(f"HTTP handoff interrupted by signal {signum}")
+
+signal.signal(signal.SIGTERM, interrupted)
+
+def start(label):
+    global server, endpoint, headers
+    with socket.socket() as available:
+        available.bind(("127.0.0.1", 0))
+        port = available.getsockname()[1]
+    env = os.environ.copy()
+    env.pop("AM_INTERFACE_MODE", None)
+    env.update(DATABASE_URL="sqlite:///" + db, STORAGE_ROOT=storage,
+               HTTP_HOST="127.0.0.1", HTTP_PORT=str(port),
+               HTTP_BEARER_TOKEN="owned-http-handoff-fixture", HTTP_JWT_ENABLED="false",
+               HTTP_RATE_LIMIT_ENABLED="false", INVOCATION_ID="kp1in-handoff-fixture",
+               AM_ATC_ENABLED="false", AM_ATC_WRITE_MODE="off", ATC_LEARNING_DISABLED="1",
+               LLM_ENABLED="false", NOTIFICATIONS_ENABLED="false", TUI_ENABLED="false",
+               MCP_AGENT_MAIL_OUTPUT_FORMAT="json", TOON_DEFAULT_FORMAT="", RUST_LOG="warn")
+    with (run / (label + ".stdout")).open("xb") as stdout, (run / (label + ".stderr")).open("xb") as stderr:
+        server = subprocess.Popen([binary, "serve-http", "--host", "127.0.0.1",
+                                   "--port", str(port), "--no-tui"], cwd=run, env=env,
+                                  stdout=stdout, stderr=stderr, start_new_session=True)
+    summary["servers"].append({"label": label, "pid": server.pid, "port": port})
+    endpoint = f"http://127.0.0.1:{port}/mcp/"
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+               "Authorization": "Bearer owned-http-handoff-fixture"}
+    deadline = time.monotonic() + 30
+    while True:
+        assert server.poll() is None, (label, "server exited before listening", server.returncode)
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                break
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"{label}: HTTP bind deadline")
+            time.sleep(0.1)
+
+def rpc(label, method, params, request_id):
+    request = {"jsonrpc": "2.0", "method": method, "params": params}
+    if request_id is not None:
+        request["id"] = request_id
+    (run / (label + ".request.json")).write_text(json.dumps(request))
+    with urllib.request.urlopen(urllib.request.Request(endpoint, data=json.dumps(request).encode(),
+                                 headers=headers), timeout=35) as response:
+        raw = response.read(8 * 1024 * 1024 + 1)
+        assert len(raw) <= 8 * 1024 * 1024, "HTTP response budget exceeded"
+        if response.headers.get("Mcp-Session-Id"):
+            headers["Mcp-Session-Id"] = response.headers["Mcp-Session-Id"]
+    (run / (label + ".response.json")).write_bytes(raw)
+    if request_id is None:
+        return None
+    decoded = json.loads(raw)
+    assert decoded.get("id") == request_id and "error" not in decoded, decoded
+    result = decoded["result"]
+    assert not result.get("isError"), result
+    summary["completed"].append(label)
+    return result
+
+def initialize(label):
+    rpc(label + "_initialize", "initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+        "clientInfo": {"name": "http-handoff-e2e", "version": "1"}}, 1)
+    rpc(label + "_initialized", "notifications/initialized", {}, None)
+
+def tool(label, name, arguments, request_id):
+    result = rpc(label, "tools/call", {"name": name, "arguments": dict(arguments, format="json")}, request_id)
+    assert len(result["content"]) == 1, result
+    return json.loads(result["content"][0]["text"])
+
+def stop(signum):
+    global server
+    assert server.poll() is None, "server exited before its requested stop"
+    summary["servers"][-1]["requested_signal"] = signum
+    os.killpg(server.pid, signum)
+    code = server.wait(timeout=75)
+    summary["servers"][-1]["exit"] = code
+    assert code == 0, ("headless stop must drain and return success", signum, code)
+    server = None
+
+try:
+    with open(binary, "rb") as executable:
+        summary["binary_sha256"] = hashlib.file_digest(executable, "sha256").hexdigest()
+    start("first")
+    initialize("first")
+    body = "Persist this synthetic HTTP handoff message through signal drain and restart."
+    sent = tool("send", "send_message", {"project_key": project, "sender_name": "RedFox",
+        "to": ["BluePeak"], "subject": "HTTP handoff persistence", "body_md": body,
+        "ack_required": True}, 2)
+    message_id = sent["deliveries"][0]["payload"]["id"]
+    summary["message_id"] = message_id
+    arguments = {"project_key": project, "agent_name": "BluePeak", "include_bodies": True}
+    inbox = tool("inbox", "fetch_inbox", arguments, 3)
+    assert any(row["id"] == message_id and row["body_md"] == body for row in inbox), inbox
+    ack = tool("ack", "acknowledge_message", {"project_key": project, "agent_name": "BluePeak",
+               "message_id": message_id}, 4)
+    assert ack["acknowledged"] is True and ack["acknowledged_at"], ack
+    stop(signal.SIGTERM)
+
+    with sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True) as conn:
+        assert conn.execute("SELECT body_md FROM messages WHERE id = ?", (message_id,)).fetchone() == (body,)
+        rows = conn.execute("SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
+                            (message_id,)).fetchall()
+        assert len(rows) == 1 and rows[0][1] is not None, rows
+        assert conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    archived = []
+    for path in Path(storage).glob("projects/*/messages/**/*.md"):
+        content = path.read_text()
+        if content.startswith("---json\n") and "\n---\n" in content:
+            metadata, archived_body = content[8:].split("\n---\n", 1)
+            if json.loads(metadata).get("id") == message_id:
+                archived.append(path)
+                assert archived_body.strip() == body
+    assert len(archived) == 1, archived
+    summary["archive_message"] = str(archived[0])
+
+    start("reopen")
+    initialize("reopen")
+    inbox = tool("reopen_inbox", "fetch_inbox", arguments, 2)
+    assert any(row["id"] == message_id and row["body_md"] == body for row in inbox), inbox
+    stop(signal.SIGINT)
+    summary["passed"] = True
+except BaseException as error:
+    summary["error"] = repr(error)
+finally:
+    if server is not None:
+        if server.poll() is None:
+            os.killpg(server.pid, signal.SIGTERM)
+            try:
+                server.wait(timeout=75)
+            except subprocess.TimeoutExpired:
+                os.killpg(server.pid, signal.SIGKILL)
+                server.wait(timeout=5)
+                summary["forced_cleanup"] = True
+        summary["servers"][-1]["exit"] = server.returncode
+    summary["elapsed_s"] = time.monotonic() - started
+    (run / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+print(json.dumps(summary))
+raise SystemExit(0 if summary["passed"] else 1)
+PY
+then
+    e2e_pass "HTTP send/read/ack survives clean SIGTERM drain and SIGINT reopen shutdown"
+else
+    e2e_fail "HTTP handoff, clean signal shutdown or persisted reopen failed"
 fi
 
 # ===========================================================================

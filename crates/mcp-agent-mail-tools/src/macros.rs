@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::identity::{AgentResponse, ProjectResponse, WhoisResponse};
 use crate::llm;
 use crate::messaging::InboxMessage;
-use crate::reservations::{ReleaseResult, ReservationResponse};
+use crate::reservations::ReservationResponse;
 use crate::search::{ExampleMessage, ThreadSummary};
 use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_project};
 use mcp_agent_mail_db::micros_to_iso;
@@ -60,7 +60,9 @@ pub struct PreparedThread {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReservationCycleResponse {
     pub file_reservations: ReservationResponse,
-    pub released: Option<ReleaseResult>,
+    /// Preserve the release tool's complete result, including a queued intent
+    /// and its replay receipt when the lease could not yet be released.
+    pub released: Option<Value>,
 }
 
 /// Contact handshake response
@@ -576,7 +578,7 @@ pub async fn macro_file_reservation_cycle(
                 return Err(e);
             }
         };
-        Some(parse_json::<ReleaseResult>(release_json, "released")?)
+        Some(parse_json::<Value>(release_json, "released")?)
     } else {
         None
     };
@@ -994,14 +996,36 @@ mod tests {
                 granted: Vec::new(),
                 conflicts: Vec::new(),
             },
-            released: Some(ReleaseResult {
-                released: 3,
-                released_at: "2026-02-06T12:00:00Z".into(),
-            }),
+            released: Some(serde_json::json!({
+                "released": 3,
+                "released_at": "2026-02-06T12:00:00Z",
+            })),
         };
         let val: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
         assert_eq!(val["released"]["released"], 3);
+    }
+
+    #[test]
+    fn reservation_cycle_response_preserves_queued_release_receipt() {
+        let payload = serde_json::json!({
+            "file_reservations": {"granted": [], "conflicts": []},
+            "released": {
+                "released": 0,
+                "released_at": "2026-09-05T02:00:00Z",
+                "status": "queued",
+                "queued": true,
+                "message": "lease release queued because DB unavailable",
+                "intent": {
+                    "id": "release-receipt",
+                    "path": "/private-fixture/degraded_intents/release_file_reservations.jsonl",
+                    "content_sha256": "receipt-digest",
+                    "replay": "automatic_on_next_successful_release_file_reservations_call"
+                }
+            }
+        });
+        let parsed: ReservationCycleResponse = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), payload);
     }
 
     // -----------------------------------------------------------------------
@@ -1430,22 +1454,20 @@ mod tests {
 
     #[test]
     fn reservation_cycle_auto_release_present() {
-        use crate::reservations::ReleaseResult;
-
         let resp = ReservationCycleResponse {
             file_reservations: ReservationResponse {
                 granted: Vec::new(),
                 conflicts: Vec::new(),
             },
-            released: Some(ReleaseResult {
-                released: 5,
-                released_at: "2026-02-12T12:00:00Z".into(),
-            }),
+            released: Some(serde_json::json!({
+                "released": 5,
+                "released_at": "2026-02-12T12:00:00Z",
+            })),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: ReservationCycleResponse = serde_json::from_str(&json).unwrap();
         assert!(parsed.released.is_some());
-        assert_eq!(parsed.released.unwrap().released, 5);
+        assert_eq!(parsed.released.unwrap()["released"], 5);
     }
 
     // -----------------------------------------------------------------------
