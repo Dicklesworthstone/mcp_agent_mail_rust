@@ -33,12 +33,11 @@
 #        rather than an opaque error. Exercised with a page-level corruption
 #        injection; honest SKIP when the environment cannot stage it.
 #
-# Surface notes (why the MCP stdio server, not `am file_reservations`):
-#   The CLI `file_reservations {reserve,release,...}` verbs are a direct-SQL
-#   operator surface — they write no archive artifacts and never route through
-#   the tools crate, so F1/F3-archive/F5 logic is only reachable through the
-#   MCP tool surface. This suite drives short `am serve-stdio` JSON-RPC
-#   sessions for those, exactly like test_tools_reservations.sh.
+# Surface notes:
+#   Offline CLI reserve/renew/release and MCP now share the reservation tools,
+#   including archive writes. This suite exercises MCP reconciliation and
+#   incident cases. test_workflow_happy_path.sh additionally checks the offline
+#   CLI lifecycle against real DB rows, archive artifacts and guard decisions.
 #
 # Ref: br-bvq1x.14.8 (N8). Depends on F1-F5 (br-bvq1x.6.*, all closed).
 

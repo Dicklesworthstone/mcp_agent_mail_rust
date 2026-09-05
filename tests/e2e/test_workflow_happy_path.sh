@@ -9,6 +9,7 @@
 #   3. resource://inbox → resource://thread
 #   4. release_file_reservations → verify archive + DB
 #   5. Macro equivalents: macro_start_session → macro_file_reservation_cycle
+#   6. Offline CLI reserve → guard conflict → renew → release → guard clear
 #
 # Target: 30+ assertions
 
@@ -663,6 +664,152 @@ if [ "$CLI_AGENTS_STATUS" -eq 0 ] && [ -n "$CLI_AGENTS" ]; then
     e2e_assert_contains "CLI shows BluePeak" "$CLI_AGENTS" "BluePeak"
 else
     e2e_fail "required am agents list verification errored"
+fi
+
+# ===========================================================================
+# Phase 8: Offline CLI reservations must be visible to the archive-backed guard
+# ===========================================================================
+e2e_case_banner "Phase 8: offline CLI reservation lifecycle + guard"
+
+if python3 - "$WF_DB" "$WF_STORAGE" "$PROJECT_PATH" "$(command -v am)" \
+    "$E2E_ARTIFACT_DIR" <<'PY'
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+
+db, storage, project, binary, artifacts = sys.argv[1:]
+results = Path(artifacts) / "offline_cli"
+results.mkdir()
+Path(project).mkdir(exist_ok=True)
+env = os.environ.copy()
+env.update(DATABASE_URL="sqlite:///" + db, STORAGE_ROOT=storage,
+           HTTP_HOST="127.0.0.1", HTTP_PORT="0", AGENT_MAIL_URL="http://127.0.0.1:0/mcp/",
+           AM_INTERFACE_MODE="cli", AM_ATC_ENABLED="false", AM_ATC_WRITE_MODE="off",
+           LLM_ENABLED="false", NOTIFICATIONS_ENABLED="false", TUI_ENABLED="false",
+           NO_COLOR="1", RUST_LOG="error")
+
+def interrupted(signum, frame):
+    raise InterruptedError(f"offline CLI workflow interrupted by signal {signum}")
+
+signal.signal(signal.SIGTERM, interrupted)
+
+def run(name, args, expected=0, stdin="", agent="RedFox"):
+    child_env = dict(env, AGENT_NAME=agent)
+    started = time.monotonic()
+    with open(binary, "rb") as executable:
+        digest = hashlib.file_digest(executable, "sha256").hexdigest()
+    proc = subprocess.Popen([binary, *args], cwd=results, env=child_env,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True)
+    failure = None
+    try:
+        stdout, stderr = proc.communicate(stdin, timeout=45)
+    except BaseException as error:
+        failure = error
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = proc.communicate(timeout=5)
+    (results / (name + ".stdout")).write_text(stdout)
+    (results / (name + ".stderr")).write_text(stderr)
+    (results / (name + ".json")).write_text(json.dumps({
+        "argv": args, "pid": proc.pid, "binary_sha256": digest,
+        "exit_code": proc.returncode, "timed_out": isinstance(failure, subprocess.TimeoutExpired),
+        "failure": None if failure is None else str(failure),
+        "elapsed_s": time.monotonic() - started}, indent=2))
+    if failure is not None:
+        raise failure
+    assert proc.returncode == expected, (name, proc.returncode, stderr)
+    return stdout, stderr
+
+def payload(stdout):
+    return json.JSONDecoder().raw_decode(stdout[stdout.index("{"):])[0]
+
+def row(reservation_id):
+    with sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        return dict(conn.execute(
+            "SELECT id, path_pattern, exclusive, expires_ts, released_ts "
+            "FROM file_reservations WHERE id = ?", (reservation_id,)).fetchone())
+
+def artifact(reservation_id):
+    matches = []
+    for path in Path(storage).glob("projects/*/file_reservations/*.json"):
+        value = json.loads(path.read_text())
+        if value.get("id") == reservation_id:
+            matches.append(value)
+    assert len(matches) == 1, (reservation_id, matches)
+    return matches[0]
+
+def micros(iso):
+    dt = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    delta = dt - datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+    return ((delta.days * 86400 + delta.seconds) * 1000000 + delta.microseconds)
+
+pattern = "src/offline-cycle.rs"
+stdout, _ = run("reserve", ["file_reservations", "reserve", project, "RedFox", pattern,
+                            "--exclusive", "--ttl", "3600", "--reason", "br-21gj.4.4"])
+grant = payload(stdout)
+assert len(grant["granted"]) == 1 and not grant["conflicts"], grant
+reservation_id = grant["granted"][0]["id"]
+before = row(reservation_id)
+active = artifact(reservation_id)
+assert before["path_pattern"] == active["path_pattern"] == pattern
+assert before["exclusive"] == 1 and active["exclusive"] is True
+assert active["agent"] == "RedFox" and active["reason"] == "br-21gj.4.4"
+assert before["released_ts"] is None and active.get("released_ts") is None
+assert micros(active["expires_ts"]) == before["expires_ts"]
+_, conflict = run("guard_active", ["guard", "check", "--repo", project],
+                  expected=1, stdin=pattern + "\n", agent="BluePeak")
+assert "CONFLICT" in conflict and "RedFox" in conflict, conflict
+stdout, _ = run("conflict", ["file_reservations", "reserve", project, "BluePeak", pattern,
+                             "--exclusive", "--ttl", "3600"])
+denied = payload(stdout)
+assert denied["granted"] == [] and len(denied["conflicts"]) == 1, denied
+assert denied["conflicts"][0]["holders"][0]["agent"] == "RedFox", denied
+with sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True) as conn:
+    assert conn.execute(
+        "SELECT COUNT(*) FROM file_reservations WHERE path_pattern = ? AND released_ts IS NULL",
+        (pattern,)).fetchone()[0] == 1, "a conflict must not create another active lease"
+run("renew", ["file_reservations", "renew", project, "RedFox",
+              "--ids", str(reservation_id), "--extend-seconds", "1800"])
+renewed = row(reservation_id)
+assert renewed["expires_ts"] >= before["expires_ts"] + 1800 * 1000000
+assert micros(artifact(reservation_id)["expires_ts"]) == renewed["expires_ts"]
+run("release", ["file_reservations", "release", project, "RedFox",
+                "--ids", str(reservation_id)])
+released = row(reservation_id)
+assert released["released_ts"] > 0
+assert micros(artifact(reservation_id)["released_ts"]) == released["released_ts"]
+stdout, _ = run("guard_released", ["guard", "check", "--repo", project],
+                stdin=pattern + "\n", agent="BluePeak")
+assert "No file reservation conflicts" in stdout, stdout
+stdout, _ = run("release_again", ["file_reservations", "release", project, "RedFox",
+                                 "--ids", str(reservation_id)])
+assert "Released 0 reservation(s)" in stdout, stdout
+assert row(reservation_id) == released
+assert micros(artifact(reservation_id)["released_ts"]) == released["released_ts"]
+print("Offline CLI reserve/conflict/renew/release and archive-backed guard passed.")
+PY
+then
+    e2e_pass "offline CLI lifecycle preserves DB/archive parity and guard enforcement"
+else
+    e2e_fail "offline CLI reservation lifecycle or guard verification failed"
 fi
 
 # ===========================================================================
