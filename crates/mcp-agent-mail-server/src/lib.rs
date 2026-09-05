@@ -1789,6 +1789,38 @@ fn ensure_stdio_startup_probes_pass(report: &startup_checks::StartupReport) -> s
     Err(std::io::Error::other(report.format_errors()))
 }
 
+async fn initialize_stdio_database(
+    cx: &Cx,
+    config: &mcp_agent_mail_core::Config,
+) -> std::io::Result<mcp_agent_mail_db::DbPool> {
+    let mut pool_config = DbPoolConfig::from_env();
+    pool_config.database_url.clone_from(&config.database_url);
+    pool_config.storage_root = Some(config.storage_root.clone());
+    pool_config.run_migrations = true;
+    let pool = mcp_agent_mail_db::get_or_create_pool(&pool_config)
+        .map_err(|error| std::io::Error::other(format!("stdio database startup: {error}")))?;
+    match pool.acquire(cx).await {
+        asupersync::Outcome::Ok(connection) => drop(connection),
+        asupersync::Outcome::Err(error) => {
+            return Err(std::io::Error::other(format!(
+                "stdio database startup: {error}"
+            )));
+        }
+        asupersync::Outcome::Cancelled(reason) => {
+            return Err(std::io::Error::other(format!(
+                "stdio database startup cancelled: {reason:?}"
+            )));
+        }
+        asupersync::Outcome::Panicked(payload) => {
+            return Err(std::io::Error::other(format!(
+                "stdio database startup panicked: {}",
+                payload.message()
+            )));
+        }
+    }
+    Ok(pool)
+}
+
 pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     config.validate_user_env_authority()?;
     // Initialize console theme from parsed config (includes persisted envfile values).
@@ -1808,6 +1840,12 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
     // Now that probes have confirmed no other process holds the locks,
     // acquire our runtime shared lock for the duration of the process.
     let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
+
+    // Finish the first pooled initialization before integrity/backup workers
+    // open this database directly. Those opens bypass the pool's init gate and
+    // otherwise race its schema migrations. Retain the pool for the session so
+    // tool calls can reuse its initialized connections through the weak cache.
+    let _runtime_database_pool = initialize_stdio_database(cx, config).await?;
 
     // Enable global query tracker if instrumentation is on.
     if config.instrumentation_enabled {
@@ -2501,7 +2539,10 @@ fn run_http_headless_supervisor(
     // run_http_with_control retain their caller-supplied shutdown authority.
     #[cfg(any(unix, windows))]
     let (signal_control, control_rx) = if control_rx.is_none() {
-        let signals = [asupersync::signal::sigterm()?, asupersync::signal::sigint()?];
+        let signals = [
+            asupersync::signal::sigterm()?,
+            asupersync::signal::sigint()?,
+        ];
         let (tx, rx) = mpsc::channel(1);
         (Some((tx, signals)), Some(rx))
     } else {
@@ -18990,6 +19031,78 @@ mod tests {
             "got: {message}"
         );
         assert!(message.contains("run repair"), "got: {message}");
+    }
+
+    #[test]
+    fn stdio_database_bootstrap_installs_schema_before_background_workers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("stdio-bootstrap.sqlite3");
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", path.display()),
+            storage_root: dir.path().join("archive"),
+            ..Default::default()
+        };
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("consumer context");
+            let pool = initialize_stdio_database(&cx, &config)
+                .await
+                .expect("bootstrap before workers");
+            let connection = pool.acquire(&cx).await.into_result().expect("checkout");
+            let rows = connection
+                .query_sync(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' \
+                     AND name IN ('projects', 'agents', 'messages', 'message_recipients') \
+                     ORDER BY name",
+                    &[],
+                )
+                .expect("read installed schema");
+            let names: Vec<String> = rows
+                .iter()
+                .map(|row| row.get_named("name").expect("table name"))
+                .collect();
+            assert_eq!(
+                names,
+                ["agents", "message_recipients", "messages", "projects"]
+            );
+            connection
+                .execute_sync(
+                    "INSERT INTO projects (slug, human_key, created_at) \
+                     VALUES ('stdio-ready', '/tmp/stdio-ready', 1)",
+                    &[],
+                )
+                .expect("initialized pool accepts its first real write");
+        });
+    }
+
+    #[test]
+    fn stdio_database_bootstrap_refuses_newer_schema_without_changing_primary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("stdio-future.sqlite3");
+        let connection = mcp_agent_mail_db::CanonicalDbConn::open_file(path.display().to_string())
+            .expect("create future-schema fixture");
+        connection
+            .execute_raw(&format!(
+                "CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES ('preserve'); \
+                 PRAGMA user_version = {};",
+                mcp_agent_mail_db::schema::SCHEMA_VERSION + 1
+            ))
+            .expect("seed future schema");
+        drop(connection);
+        let before = std::fs::read(&path).expect("primary before startup");
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", path.display()),
+            storage_root: dir.path().join("archive"),
+            ..Default::default()
+        };
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("consumer context");
+            let result = initialize_stdio_database(&cx, &config).await;
+            let error = result.err().expect("future schema must stop startup");
+            assert!(error.to_string().contains("newer"), "{error}");
+        });
+        assert_eq!(std::fs::read(&path).expect("primary after refusal"), before);
     }
 
     fn config_for_boot_check_storage(
