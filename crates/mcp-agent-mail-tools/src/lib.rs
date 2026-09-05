@@ -1281,22 +1281,27 @@ pub mod tool_util {
 
     pub struct ToolReadPool {
         pool: mcp_agent_mail_db::DbPool,
-        _snapshot: Option<Arc<crate::archive_read::SharedSnapshot>>,
+        snapshot: Option<Arc<crate::archive_read::SharedSnapshot>>,
     }
 
     impl ToolReadPool {
-        const fn live(pool: mcp_agent_mail_db::DbPool) -> Self {
+        pub(crate) const fn live(pool: mcp_agent_mail_db::DbPool) -> Self {
             Self {
                 pool,
-                _snapshot: None,
+                snapshot: None,
             }
         }
 
         fn snapshot(snapshot: Arc<crate::archive_read::SharedSnapshot>) -> Self {
             Self {
                 pool: snapshot.pool(),
-                _snapshot: Some(snapshot),
+                snapshot: Some(snapshot),
             }
+        }
+
+        /// Snapshot-local IDs cannot authorize writes to either database.
+        pub(crate) fn live_sqlite_path(&self) -> Option<&str> {
+            self.snapshot.is_none().then(|| self.pool.sqlite_path())
         }
     }
 

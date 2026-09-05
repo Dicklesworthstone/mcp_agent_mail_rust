@@ -1696,6 +1696,89 @@ mod tests {
     }
 
     #[test]
+    fn fetch_inbox_does_not_write_read_receipts_into_archive_snapshot() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_for_test();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage_root = directory.path().join("archive");
+        let sqlite_path = directory.path().join("missing-live.sqlite3");
+        write_archive_fixture(&storage_root);
+        fs::write(
+            storage_root.join(
+                "projects/single-flight-project/messages/2026/07/2026-07-19T00-00-00Z__hello__1.md",
+            ),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Alice\"],\"subject\":\"hello\",\"importance\":\"normal\",\"ack_required\":true,\"created_ts\":\"2026-07-19T00:00:00Z\"}\n---\n\narchive inbox body\n",
+        )
+        .expect("write recipient-bearing message");
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root.to_str().expect("storage path")),
+            ],
+            || {
+                mcp_agent_mail_core::Config::reset_cached();
+                let cx = Cx::for_testing();
+                let snapshot = acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx)
+                    .expect("acquire snapshot")
+                    .expect("missing live database requires an archive snapshot");
+                let family_before = snapshot_family(snapshot.path());
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                runtime.block_on(async {
+                    let ctx = fastmcp::prelude::McpContext::new(cx.clone(), 1);
+                    for mark_read in [Some(false), None, Some(true)] {
+                        let response = crate::fetch_inbox(
+                            &ctx,
+                            "/single-flight-project".to_string(),
+                            "Alice".to_string(),
+                            None,
+                            None,
+                            Some(10),
+                            Some(true),
+                            Some(true),
+                            None,
+                            None,
+                            mark_read,
+                        )
+                        .await
+                        .expect("archive inbox remains readable");
+                        let messages: serde_json::Value =
+                            serde_json::from_str(&response).expect("inbox JSON");
+                        assert_eq!(messages.as_array().expect("inbox array").len(), 1);
+                        assert_eq!(messages[0]["id"], 1);
+                        assert_eq!(messages[0]["from"], "Alice");
+                        assert!(
+                            messages[0]["body_md"]
+                                .as_str()
+                                .expect("body")
+                                .contains("archive inbox body")
+                        );
+                        assert!(
+                            messages[0]["read_ts"].is_null(),
+                            "snapshot reads must not invent durable read receipts: {response}"
+                        );
+                        assert!(messages[0]["ack_ts"].is_null());
+                        assert_eq!(
+                            snapshot_family(snapshot.path()),
+                            family_before,
+                            "snapshot database family changed for mark_read={mark_read:?}"
+                        );
+                        assert!(
+                            !sqlite_path.exists(),
+                            "a degraded read must not create the missing live database"
+                        );
+                    }
+                });
+            },
+        );
+        reset_for_test();
+    }
+
+    #[test]
     fn cancelled_waiter_does_not_cancel_single_flight_owner() {
         let _guard = TEST_LOCK
             .lock()

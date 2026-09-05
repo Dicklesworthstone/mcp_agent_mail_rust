@@ -3798,11 +3798,16 @@ pub async fn fetch_inbox(
     phase.set_include_bodies(include_body);
     phase.mark("argument_validation");
 
-    // Fetching must return from the live query-only lane without waiting for
-    // archive reconstruction or the write-behind coalescer.  The optional
-    // read-receipt update below targets the live SQLite path directly after
-    // this bounded read has completed.
-    let read_pool = get_coalescer_bypass_read_db_pool()?;
+    // Keep healthy reads on the live query-only lane without waiting for
+    // archive reconstruction or the coalescer. If that pool cannot open,
+    // reuse the verified archive fallback so retained mail stays readable.
+    let read_pool = match get_coalescer_bypass_read_db_pool() {
+        Ok(pool) => crate::tool_util::ToolReadPool::live(pool),
+        Err(error) => {
+            tracing::warn!(error = %error, "live inbox unavailable; trying archive snapshot");
+            crate::tool_util::get_read_db_pool(ctx.cx()).await?
+        }
+    };
     let project = resolve_existing_project(ctx, &read_pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
@@ -3929,16 +3934,15 @@ pub async fn fetch_inbox(
     // mark_message_read calls — ~80% latency reduction for typical 20-message
     // inbox fetches.
     //
-    // The write-back MUST target the live DB, not the archive snapshot,
-    // because snapshot pools are read-only reconstructions. If the live DB
-    // is degraded the write will fail gracefully (already best-effort).
+    // Only a live read can authorize write-back. Archive snapshots remain
+    // immutable, and their reconstructed IDs may identify different rows in
+    // the live DB. A snapshot read therefore cannot produce a read receipt.
     //
     // `mark_read=false` skips this entirely: a non-consuming peek (GH#207)
     // must leave read state untouched.
     if mark_read.unwrap_or(true) && !messages.is_empty() {
         let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
-        let write_path = Some(read_pool.sqlite_path().to_string());
-        if let Some(ref live_sqlite_path) = write_path {
+        if let Some(live_sqlite_path) = read_pool.live_sqlite_path() {
             match mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
                 live_sqlite_path,
                 agent_id,
@@ -3966,7 +3970,7 @@ pub async fn fetch_inbox(
             tracing::warn!(
                 agent_id = agent_id,
                 count = ids.len(),
-                "skipping auto-mark-read because the live DB pool is unavailable (degraded mode)"
+                "skipping auto-mark-read for an archive snapshot inbox"
             );
         }
     }
@@ -4910,6 +4914,104 @@ mod tests {
             Outcome::Ok(agent) => agent,
             other => panic!("register_agent({name}, None) failed: {other:?}"),
         }
+    }
+
+    #[test]
+    fn fetch_inbox_live_read_receipts_preserve_peek_and_ack_state() {
+        let temp = tempfile::tempdir().expect("inbox receipt tempdir");
+        let database_path = temp.path().join("storage.sqlite3");
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&database_path);
+        let storage_root = temp.path().join("archive");
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root.to_str().expect("storage path")),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+                rt.block_on(async {
+                    let cx = Cx::for_testing();
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let pool = DbPool::new(&DbPoolConfig {
+                        database_url: database_url.clone(),
+                        ..DbPoolConfig::default()
+                    })
+                    .expect("live database pool");
+                    let project = ensure_project_row(&cx, &pool, "/live-inbox-receipts").await;
+                    let recipient =
+                        register_agent_row(&cx, &pool, project.id.unwrap(), "BlueLake").await;
+                    let message = match queries::create_message_with_recipients(
+                        &cx,
+                        &pool,
+                        project.id.unwrap(),
+                        recipient.id.unwrap(),
+                        "live inbox receipt",
+                        "persistent body",
+                        None,
+                        "normal",
+                        true,
+                        "[]",
+                        &[(recipient.id.unwrap(), "to")],
+                    )
+                    .await
+                    {
+                        Outcome::Ok(message) => message,
+                        outcome => panic!("seed live message: {outcome:?}"),
+                    };
+                    let mut first_read_ts = None;
+                    for mark_read in [Some(false), None, Some(false), Some(true)] {
+                        let response = fetch_inbox(
+                            &ctx,
+                            project.human_key.clone(),
+                            recipient.name.clone(),
+                            None,
+                            None,
+                            None,
+                            Some(true),
+                            None,
+                            None,
+                            None,
+                            mark_read,
+                        )
+                        .await
+                        .expect("fetch live inbox");
+                        let messages: serde_json::Value =
+                            serde_json::from_str(&response).expect("inbox JSON");
+                        assert_eq!(messages.as_array().expect("inbox array").len(), 1);
+                        assert_eq!(messages[0]["id"].as_i64(), message.id);
+                        assert_eq!(messages[0]["body_md"], "persistent body");
+                        let conn = mcp_agent_mail_db::DbConn::open_file(
+                            database_path.to_str().expect("database path"),
+                        )
+                        .expect("independent live database connection");
+                        let rows = conn
+                            .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+                            .expect("read durable receipt");
+                        assert_eq!(rows.len(), 1);
+                        let read_ts = rows[0].get_named::<Option<i64>>("read_ts").unwrap();
+                        let ack_ts = rows[0].get_named::<Option<i64>>("ack_ts").unwrap();
+                        if mark_read.unwrap_or(true) {
+                            assert!(
+                                read_ts.is_some(),
+                                "live fetch must persist its read receipt"
+                            );
+                            first_read_ts = first_read_ts.or(read_ts);
+                        }
+                        assert_eq!(
+                            read_ts, first_read_ts,
+                            "peek and repeated reads preserve the first receipt"
+                        );
+                        assert_eq!(
+                            messages[0]["read_ts"],
+                            serde_json::to_value(read_ts.map(micros_to_iso)).unwrap()
+                        );
+                        assert!(ack_ts.is_none(), "reading must not acknowledge a message");
+                        assert!(messages[0]["ack_ts"].is_null());
+                    }
+                });
+            },
+        );
     }
 
     #[test]
