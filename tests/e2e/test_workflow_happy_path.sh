@@ -1074,6 +1074,72 @@ def stop(signum):
     assert code == 0, ("headless stop must drain and return success", signum, code)
     server = None
 
+def recipient_cursors():
+    actors = ["RedFox", "BluePeak", "GreenLake", "GoldHawk", "SilverWolf"]
+    roles = {"BluePeak": "to", "GreenLake": "cc", "GoldHawk": "bcc"}
+    for index, actor in enumerate(actors[3:]):
+        tool("cursor_register_" + actor, "register_agent", {
+            "project_key": project, "program": "codex", "model": "workflow-fixture",
+            "name": actor}, 200 + index)
+        tool("cursor_policy_" + actor, "set_contact_policy", {
+            "project_key": project, "agent_name": actor, "policy": "open"}, 210 + index)
+    before = {}
+    for index, actor in enumerate(actors):
+        position = tool("cursor_before_" + actor, "fetch_inbox_events", {
+            "project_key": project, "agent_name": actor, "position_now": True}, 220 + index)
+        assert position["events"] == [] and position["has_more"] is False, position
+        assert position["next_cursor"] == position["tail_cursor"], position
+        before[actor] = position["next_cursor"]
+    body = "Synthetic delivery for explicit to, cc and bcc recipient checks."
+    sent = tool("cursor_send", "send_message", {"project_key": project,
+        "sender_name": "RedFox", "to": ["BluePeak"], "cc": ["GreenLake"], "bcc": ["GoldHawk"],
+        "subject": "Cursor recipient isolation", "body_md": body, "ack_required": True,
+        "thread_id": "kp1in-recipient-cursors", "topic": "Kp1in-Cursors",
+        "idempotency_key": "kp1in-recipient-cursors"}, 230)
+    message_id = sent["deliveries"][0]["payload"]["id"]
+    positions = {}
+    for index, actor in enumerate(actors):
+        page = tool("cursor_events_" + actor, "fetch_inbox_events", {
+            "project_key": project, "agent_name": actor, "after": before[actor], "limit": 1}, 240 + index)
+        events = page["events"]
+        assert page["has_more"] is False, page
+        if actor in roles:
+            assert len(events) == 1, (actor, page)
+            event = events[0]
+            assert event["message_id"] == message_id and event["kind"] == roles[actor], event
+            assert event["cursor"] > before[actor] and event["cursor"] == page["next_cursor"], page
+            assert event["from"] == "RedFox" and event["ack_required"] is True, event
+            assert "body_md" not in event and "bcc" not in event, event
+        else:
+            assert events == [], ("nonrecipient received delivery", actor, page)
+        positions[actor] = page["next_cursor"]
+    # Cursor reads must not mark the real recipient rows read or acknowledged.
+    with closing(sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True)) as conn:
+        rows = conn.execute("SELECT kind, read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
+                            (message_id,)).fetchall()
+        assert sorted(rows) == [(kind, None, None) for kind in sorted(roles.values())], rows
+    for index, actor in enumerate(actors):
+        inbox = tool("cursor_inbox_" + actor, "fetch_inbox", {
+            "project_key": project, "agent_name": actor, "include_bodies": True,
+            "topic": "KP1IN-CURSORS", "limit": 100}, 250 + index)
+        assert len(inbox) == (1 if actor in roles else 0), (actor, inbox)
+        if actor in roles:
+            message = inbox[0]
+            assert message["id"] == message_id and message["body_md"] == body, message
+            assert message["kind"] == roles[actor], message
+            assert message["to"] == ["BluePeak"] and message["cc"] == ["GreenLake"], message
+            assert message.get("bcc", []) == [], ("BCC identity exposed to a recipient", actor, message)
+            ack = tool("cursor_ack_" + actor, "acknowledge_message", {
+                "project_key": project, "agent_name": actor, "message_id": message_id}, 260 + index)
+            assert ack["acknowledged"] is True and ack["acknowledged_at"], ack
+    # fetch_topic is intentionally project-scoped; it has no recipient filter.
+    topic = tool("cursor_topic", "fetch_topic", {"project_key": project,
+        "topic_name": "kp1in-cursors", "include_bodies": True}, 270)
+    assert len(topic) == 1 and topic[0]["id"] == message_id and topic[0]["body_md"] == body, topic
+    summary["recipient_cursors"] = {"message_id": message_id, "before": before,
+        "after": positions, "roles": roles, "body_sha256": hashlib.sha256(body.encode()).hexdigest()}
+    return message_id, positions, roles, body
+
 def concurrent_ring():
     # Each client is a separate OS process with its own MCP session. The two
     # parent barriers ensure all identities exist before sends and all sends
@@ -1270,6 +1336,7 @@ try:
                "message_id": message_id}, 4)
     assert ack["acknowledged"] is True and ack["acknowledged_at"], ack
     ring = concurrent_ring()
+    cursor_message_id, cursor_positions, cursor_roles, cursor_body = recipient_cursors()
     stop(signal.SIGTERM)
 
     with closing(sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True)) as conn:
@@ -1291,10 +1358,16 @@ try:
         assert sorted((row[0], row[1]) for row in recipients) == sorted(
             (value["sent_id"], value["recipient"]) for value in ring.values()), recipients
         assert all(row[2] and row[3] for row in recipients), recipients
+        cursor_rows = conn.execute(
+            "SELECT a.name, r.kind, r.read_ts, r.ack_ts FROM message_recipients r "
+            "JOIN agents a ON a.id = r.agent_id WHERE r.message_id = ?", (cursor_message_id,)).fetchall()
+        assert sorted((row[0], row[1]) for row in cursor_rows) == sorted(cursor_roles.items()), cursor_rows
+        assert all(row[2] and row[3] for row in cursor_rows), cursor_rows
         assert conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     archived = []
     ring_archived = []
+    cursor_archived = []
     for path in Path(storage).glob("projects/*/messages/**/*.md"):
         content = path.read_text()
         if content.startswith("---json\n") and "\n---\n" in content:
@@ -1304,8 +1377,12 @@ try:
                 assert archived_body.strip() == body
             if json.loads(metadata).get("thread_id") == "kp1in-concurrent-ring":
                 ring_archived.append((json.loads(metadata)["id"], archived_body.strip()))
+            if json.loads(metadata).get("id") == cursor_message_id:
+                assert archived_body.strip() == cursor_body
+                cursor_archived.append(path)
     assert len(archived) == 1, archived
     assert sorted(ring_archived) == sorted((row[0], row[2]) for row in expected_ring), ring_archived
+    assert len(cursor_archived) == 1, cursor_archived
     summary["archive_message"] = str(archived[0])
 
     start("reopen")
@@ -1319,6 +1396,19 @@ try:
         matches = [row for row in inbox if row.get("thread_id") == "kp1in-concurrent-ring"]
         assert len(matches) == 1 and matches[0]["id"] == value["sent_id"], matches
         assert matches[0]["body_md"] == "Durable concurrent message from " + actor, matches
+    for index, (actor, cursor) in enumerate(cursor_positions.items()):
+        page = tool("reopen_cursor_" + actor, "fetch_inbox_events", {
+            "project_key": project, "agent_name": actor, "after": cursor, "limit": 1}, 30 + index)
+        assert page["events"] == [] and page["has_more"] is False, (actor, page)
+        assert page["next_cursor"] == cursor, (actor, page)
+        # Rewinding one processed event replays the same durable delivery,
+        # even though fetch_inbox and acknowledgement have changed read state.
+        if actor in cursor_roles:
+            replay = tool("reopen_cursor_replay_" + actor, "fetch_inbox_events", {
+                "project_key": project, "agent_name": actor,
+                "after": summary["recipient_cursors"]["before"][actor], "limit": 1}, 40 + index)
+            assert len(replay["events"]) == 1 and replay["events"][0]["message_id"] == cursor_message_id, replay
+            assert replay["next_cursor"] == cursor, replay
     stop(signal.SIGINT)
     summary["passed"] = True
 except BaseException as error:
