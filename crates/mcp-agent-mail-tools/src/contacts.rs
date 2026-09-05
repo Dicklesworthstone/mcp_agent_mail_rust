@@ -187,6 +187,13 @@ pub(crate) async fn resolve_or_register_sender(
             .await;
             let row = db_outcome_to_mcp_result(out)?;
             enqueue_agent_semantic_index(&row);
+            // Implicit requesters need the same durable identity profile as
+            // explicit registrations and implicitly registered recipients.
+            crate::identity::try_write_agent_profile(
+                &mcp_agent_mail_core::Config::get(),
+                project_slug,
+                &crate::identity::agent_archive_profile_json(&row, None),
+            );
             Ok(row)
         }
     }

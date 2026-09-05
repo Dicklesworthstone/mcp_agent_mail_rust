@@ -799,6 +799,30 @@ assert "No file reservation conflicts" in stdout, stdout
 run("session_target", ["macros", "start-session", "--project", session_project,
                        "--program", "codex", "--model", "workflow-fixture",
                        "--agent-name", "BluePeak", "--json"], agent="BluePeak")
+stdout, _ = run("contact_implicit_requester", ["macros", "contact-handshake",
+                "--project", session_project, "--from", "GreenLake", "--to", "BluePeak",
+                "--register-missing", "--reg-program", "codex", "--reg-model", "workflow-fixture",
+                "--reg-task", "implicit requester archive parity", "--auto-accept", "--json"],
+                agent="GreenLake")
+implicit_contact = payload(stdout)
+assert implicit_contact["response"]["approved"] is True, implicit_contact
+assert implicit_contact["response"]["updated"] == 1, implicit_contact
+implicit_profile_path = profile.parent.parent / "GreenLake" / "profile.json"
+implicit_profile = json.loads(implicit_profile_path.read_text())
+with closing(sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True)) as conn:
+    implicit_row = conn.execute(
+        "SELECT a.name, a.program, a.model, a.task_description FROM agents a "
+        "JOIN projects p ON p.id = a.project_id WHERE p.human_key = ? AND a.name = 'GreenLake'",
+        (session_project,)).fetchone()
+    assert implicit_row == ("GreenLake", "codex", "workflow-fixture",
+                            "implicit requester archive parity"), implicit_row
+    assert conn.execute(
+        "SELECT l.status FROM agent_links l JOIN agents a ON a.id = l.a_agent_id "
+        "JOIN agents b ON b.id = l.b_agent_id JOIN projects p ON p.id = l.a_project_id "
+        "WHERE p.human_key = ? AND a.name = 'GreenLake' AND b.name = 'BluePeak'",
+        (session_project,)).fetchall() == [("approved",)]
+assert tuple(implicit_profile[field] for field in ("name", "program", "model", "task_description")) == implicit_row
+assert "registration_token" not in implicit_profile, implicit_profile_path
 welcome_body = "Retain this synthetic CLI macro welcome in SQLite and the Git archive."
 macro_thread = "kp1in-offline-macro-thread"
 stdout, _ = run("contact_welcome", ["macros", "contact-handshake", "--project", session_project,
