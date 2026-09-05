@@ -403,6 +403,8 @@ pub struct Runner {
     registry: SuiteRegistry,
     /// Run configuration.
     config: RunConfig,
+    /// Shared deadline for a native suite made up of multiple child commands.
+    deadline: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -431,7 +433,11 @@ impl Runner {
     /// Creates a new runner.
     pub fn new(project_root: impl AsRef<Path>, config: RunConfig) -> std::io::Result<Self> {
         let registry = SuiteRegistry::new(project_root)?;
-        Ok(Self { registry, config })
+        Ok(Self {
+            registry,
+            config,
+            deadline: None,
+        })
     }
 
     /// Returns the suite registry.
@@ -501,6 +507,7 @@ impl Runner {
         let execution_runner = Self {
             registry: self.registry.clone(),
             config: execution_config,
+            deadline: None,
         };
 
         for name in suite_names {
@@ -610,16 +617,25 @@ impl Runner {
                         self.config.max_output_bytes,
                     );
 
+                    let (assertions_passed, assertions_failed, _) = Self::parse_assertions(&stdout);
+                    let assertions_valid = assertions_passed > 0 && assertions_failed == 0;
                     let exit_code = if execution.timed_out {
                         124
                     } else if execution.capture_incomplete {
                         125
+                    } else if execution.output.status.success() && !assertions_valid {
+                        1
                     } else {
                         execution.output.status.code().unwrap_or(-1)
                     };
                     let passed = !execution.timed_out
                         && !execution.capture_incomplete
-                        && execution.output.status.success();
+                        && execution.output.status.success()
+                        && assertions_valid;
+
+                    if execution.output.status.success() && !assertions_valid {
+                        stderr.push_str("\nSuite did not report a nonzero passing assertion count with zero failed assertions");
+                    }
 
                     if execution.capture_incomplete {
                         stderr.push_str("\nSuite output exceeded its capture limit or a child retained its output pipes after the suite exited");
@@ -743,6 +759,15 @@ impl Runner {
     }
 
     fn execute_script(&self, mut cmd: Command) -> std::io::Result<SuiteExecution> {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Suite deadline elapsed before child admission",
+            ));
+        }
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         #[cfg(unix)]
@@ -796,16 +821,13 @@ impl Runner {
             let exited = child.try_wait()?.is_some();
             capture_incomplete |= stdout.len() > self.config.max_output_bytes
                 || stderr.len() > self.config.max_output_bytes;
+            timed_out |= self.command_timed_out(started);
             if exited && stdout_done && stderr_done {
                 break;
             }
             if exited {
                 exited_at.get_or_insert_with(Instant::now);
             }
-            timed_out |= self
-                .config
-                .timeout
-                .is_some_and(|limit| started.elapsed() >= limit);
             capture_incomplete |=
                 exited_at.is_some_and(|at: Instant| at.elapsed() >= Duration::from_secs(1));
             if (timed_out || capture_incomplete) && shutdown_at.is_none() {
@@ -905,16 +927,13 @@ impl Runner {
         let mut killed = false;
         loop {
             let exited = child.try_wait()?.is_some();
+            timed_out |= self.command_timed_out(started);
             if exited && stdout_handle.is_finished() && stderr_handle.is_finished() {
                 break;
             }
             if exited {
                 exited_at.get_or_insert_with(Instant::now);
             }
-            timed_out |= self
-                .config
-                .timeout
-                .is_some_and(|limit| started.elapsed() >= limit);
             capture_incomplete |= overflow.load(std::sync::atomic::Ordering::Relaxed)
                 || exited_at.is_some_and(|at: Instant| at.elapsed() >= Duration::from_secs(1));
             if (timed_out || capture_incomplete) && shutdown_at.is_none() {
@@ -1218,6 +1237,18 @@ impl Runner {
     }
 
     fn run_native_dual_mode_suite(&self, suite: &Suite) -> SuiteResult {
+        let bounded = Self {
+            registry: self.registry.clone(),
+            config: self.config.clone(),
+            deadline: self
+                .config
+                .timeout
+                .and_then(|limit| Instant::now().checked_add(limit)),
+        };
+        bounded.run_native_dual_mode_checks(suite)
+    }
+
+    fn run_native_dual_mode_checks(&self, suite: &Suite) -> SuiteResult {
         let started_at = Utc::now();
         let start_instant = Instant::now();
 
@@ -1798,17 +1829,19 @@ impl Runner {
         let mcp_bin = target_dir.join("debug/mcp-agent-mail");
 
         let build_package = |package: &str| -> Result<(), String> {
-            let status = Command::new("cargo")
-                .args(["build", "-p", package])
-                .current_dir(&self.config.project_root)
-                .status()
+            let mut cmd = Command::new("cargo");
+            cmd.args(["build", "-p", package]);
+            cmd.current_dir(&self.config.project_root);
+            let output = self
+                .execute_complete_command(cmd)
                 .map_err(|error| format!("Failed to run cargo build for {package}: {error}"))?;
-            if status.success() {
+            if output.status.success() {
                 Ok(())
             } else {
                 Err(format!(
-                    "cargo build -p {package} failed with exit code {:?}",
-                    status.code()
+                    "cargo build -p {package} failed with exit code {:?}: {}",
+                    output.status.code(),
+                    Self::output_excerpt(&output.stderr, 500)
                 ))
             }
         };
@@ -1849,7 +1882,41 @@ impl Runner {
         for (key, value) in env_map {
             cmd.env(key, value);
         }
-        cmd.output()
+        self.execute_complete_command(cmd)
+    }
+
+    fn command_timed_out(&self, started: Instant) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+            || self
+                .config
+                .timeout
+                .is_some_and(|limit| started.elapsed() >= limit)
+    }
+
+    /// Preserve ordinary nonzero exits: a mode-rejection check expects them.
+    /// Timeout or incomplete capture must instead fail the check itself, even
+    /// when a termination handler exits with the expected rejection code.
+    fn execute_complete_command(&self, cmd: Command) -> std::io::Result<std::process::Output> {
+        let execution = self.execute_script(cmd)?;
+        let failure = if execution.timed_out {
+            Some((std::io::ErrorKind::TimedOut, "Command timed out"))
+        } else if execution.capture_incomplete {
+            Some((std::io::ErrorKind::Other, "Command capture is incomplete"))
+        } else {
+            None
+        };
+        if let Some((kind, reason)) = failure {
+            return Err(std::io::Error::new(
+                kind,
+                format!(
+                    "{reason}; stdout: {}; stderr: {}",
+                    Self::output_excerpt(&execution.output.stdout, 500),
+                    Self::output_excerpt(&execution.output.stderr, 500)
+                ),
+            ));
+        }
+        Ok(execution.output)
     }
 
     fn output_excerpt(bytes: &[u8], max_chars: usize) -> String {
@@ -2745,6 +2812,37 @@ mod tests {
     }
 
     #[test]
+    fn shell_exit_zero_does_not_override_missing_or_failed_assertions() {
+        let root = TempDir::new().unwrap().keep();
+        for (name, summary) in [
+            ("missing", "setup complete"),
+            ("empty", "Pass: 0 Fail: 0 Skip: 0"),
+            ("skipped", "Pass: 0 Fail: 0 Skip: 3"),
+            ("failed", "Pass: 3 Fail: 1 Skip: 0"),
+            ("positive", "Pass: 3 Fail: 0 Skip: 0"),
+        ] {
+            write_suite_script(
+                &root,
+                name,
+                &format!("#!/bin/sh\necho '{summary}'\nexit 0\n"),
+            );
+        }
+        let runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for name in ["missing", "empty", "skipped", "failed", "positive"] {
+            let report = runner.run(&[name.to_owned()]);
+            assert_eq!(report.success(), name == "positive", "{name}");
+            assert_eq!(report.results[0].exit_code, i32::from(name != "positive"));
+        }
+    }
+
+    #[test]
     fn runner_unknown_suite_is_an_explicit_failure_even_with_a_passing_suite() {
         let root = TempDir::new().expect("tempdir").keep();
         write_suite_script(
@@ -3165,6 +3263,109 @@ esac
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dual_mode_commands_preserve_exits_and_reject_incomplete_children() {
+        let root = TempDir::new().unwrap().keep();
+        let runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                max_output_bytes: 1024,
+                timeout: Some(Duration::from_millis(500)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let pid_path = root.join("child.pid");
+        let env = HashMap::from([(
+            "DUAL_MODE_FIXTURE_PID".to_owned(),
+            pid_path.to_string_lossy().into_owned(),
+        )]);
+        for (script, expected) in [
+            ("echo allowed; exit 0", Ok(0)),
+            ("echo rejected >&2; exit 2", Ok(2)),
+            (
+                "trap 'echo rejected >&2; exit 2' TERM; /bin/sleep 30 & wait",
+                Err(std::io::ErrorKind::TimedOut),
+            ),
+            (
+                "while :; do echo 012345678901234567890123456789; done",
+                Err(std::io::ErrorKind::Other),
+            ),
+            (
+                "while :; do echo 012345678901234567890123456789 >&2; done",
+                Err(std::io::ErrorKind::Other),
+            ),
+        ] {
+            let script = format!("printf '%s\\n' \"$$\" > \"$DUAL_MODE_FIXTURE_PID\"; {script}");
+            let started = Instant::now();
+            let output = runner.run_dual_mode_command(Path::new("/bin/sh"), &["-c", &script], &env);
+            match expected {
+                Ok(code) => assert_eq!(output.unwrap().status.code(), Some(code)),
+                Err(kind) => assert_eq!(output.unwrap_err().kind(), kind),
+            }
+            let pid: i32 = fs::read_to_string(&pid_path)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+                Err(nix::errno::Errno::ESRCH),
+                "dual-mode child was not reaped"
+            );
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dual_mode_children_share_one_deadline_and_stop_admission() {
+        let root = TempDir::new().unwrap().keep();
+        let mut runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                timeout: Some(Duration::from_secs(30)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        runner.deadline = Some(Instant::now() + Duration::from_secs(1));
+        let env = HashMap::new();
+        let first = runner
+            .run_dual_mode_command(Path::new("/bin/sh"), &["-c", "echo ready"], &env)
+            .unwrap();
+        assert!(first.status.success());
+        // Spend the suite's remaining budget in a different child. A fresh
+        // per-command 30-second timeout would leave this one running.
+        let started = Instant::now();
+        let second = runner
+            .run_dual_mode_command(
+                Path::new("/bin/sh"),
+                &["-c", "trap 'exit 2' TERM; /bin/sleep 30 & wait"],
+                &env,
+            )
+            .unwrap_err();
+        assert_eq!(second.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let marker = root.join("must-not-launch");
+        let env = HashMap::from([(
+            "ADMISSION_MARKER".to_owned(),
+            marker.to_string_lossy().into_owned(),
+        )]);
+        let refused = runner
+            .run_dual_mode_command(
+                Path::new("/bin/sh"),
+                &["-c", "echo launched > \"$ADMISSION_MARKER\""],
+                &env,
+            )
+            .unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::TimedOut);
+        assert!(!marker.exists());
     }
 
     #[cfg(unix)]

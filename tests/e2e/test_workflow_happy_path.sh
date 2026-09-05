@@ -1012,6 +1012,7 @@ def start(label):
                HTTP_BEARER_TOKEN="owned-http-handoff-fixture", HTTP_JWT_ENABLED="false",
                HTTP_RATE_LIMIT_ENABLED="false", INVOCATION_ID="kp1in-handoff-fixture",
                AM_ATC_ENABLED="false", AM_ATC_WRITE_MODE="off", ATC_LEARNING_DISABLED="1",
+               WORKTREES_ENABLED="true",
                LLM_ENABLED="false", NOTIFICATIONS_ENABLED="false", TUI_ENABLED="false",
                MCP_AGENT_MAIL_OUTPUT_FORMAT="json", TOON_DEFAULT_FORMAT="", RUST_LOG="warn")
     with (run / (label + ".stdout")).open("xb") as stdout, (run / (label + ".stderr")).open("xb") as stderr:
@@ -1096,7 +1097,10 @@ def recipient_cursors():
         "subject": "Cursor recipient isolation", "body_md": body, "ack_required": True,
         "thread_id": "kp1in-recipient-cursors", "topic": "Kp1in-Cursors",
         "idempotency_key": "kp1in-recipient-cursors"}, 230)
-    message_id = sent["deliveries"][0]["payload"]["id"]
+    payload = sent["deliveries"][0]["payload"]
+    assert payload["to"] == ["BluePeak"] and payload["cc"] == ["GreenLake"], payload
+    assert payload["bcc"] == ["GoldHawk"], payload
+    message_id = payload["id"]
     positions = {}
     for index, actor in enumerate(actors):
         page = tool("cursor_events_" + actor, "fetch_inbox_events", {
@@ -1127,7 +1131,6 @@ def recipient_cursors():
             message = inbox[0]
             assert message["id"] == message_id and message["body_md"] == body, message
             assert message["kind"] == roles[actor], message
-            assert message["to"] == ["BluePeak"] and message["cc"] == ["GreenLake"], message
             assert message.get("bcc", []) == [], ("BCC identity exposed to a recipient", actor, message)
             ack = tool("cursor_ack_" + actor, "acknowledge_message", {
                 "project_key": project, "agent_name": actor, "message_id": message_id}, 260 + index)
@@ -1139,6 +1142,65 @@ def recipient_cursors():
     summary["recipient_cursors"] = {"message_id": message_id, "before": before,
         "after": positions, "roles": roles, "body_sha256": hashlib.sha256(body.encode()).hexdigest()}
     return message_id, positions, roles, body
+
+def product_and_slots():
+    product_row = tool("product_create", "ensure_product", {"name": "kp1in-workflow-product"}, 300)
+    product_key = product_row["product_uid"]
+    assert tool("product_repeat", "ensure_product", {"product_key": product_key}, 301) == product_row
+    projects = [project, str(run / "linked-project"), str(run / "unlinked-project")]
+    project_ids, message_ids = [], []
+    for index, project_key in enumerate(projects):
+        base = 310 + index * 10
+        info = tool(f"product_project_{index}", "ensure_project", {"human_key": project_key}, base)
+        project_ids.append(info["id"])
+        if index:
+            for offset, actor in enumerate(["RedFox", "BluePeak"]):
+                tool(f"product_register_{index}_{actor}", "register_agent", {
+                    "project_key": project_key, "program": "codex", "model": "workflow-fixture",
+                    "name": actor}, base + 1 + offset)
+            tool(f"product_policy_{index}", "set_contact_policy", {
+                "project_key": project_key, "agent_name": "BluePeak", "policy": "open"}, base + 3)
+        if index < 2:
+            args = {"product_key": product_key, "project_key": project_key}
+            linked = tool(f"product_link_{index}", "products_link", args, base + 4)
+            assert linked["linked"] is True and linked["project"]["id"] == info["id"], linked
+            assert tool(f"product_link_repeat_{index}", "products_link", args, base + 5) == linked
+        sent = tool(f"product_send_{index}", "send_message", {
+            "project_key": project_key, "sender_name": "RedFox", "to": ["BluePeak"],
+            "subject": "Product scope fixture", "body_md": f"Synthetic product scope {index}",
+            "thread_id": "kp1in-product-scope", "idempotency_key": "kp1in-product-scope"}, base + 6)
+        message_ids.append(sent["deliveries"][0]["payload"]["id"])
+    inbox = tool("product_inbox", "fetch_inbox_product", {"product_key": product_key,
+        "agent_name": "BluePeak", "include_bodies": True, "limit": 100}, 350)
+    selected = [row for row in inbox if row.get("thread_id") == "kp1in-product-scope"]
+    assert sorted((row["project_id"], row["id"], row["body_md"]) for row in selected) == sorted(
+        (project_ids[index], message_ids[index], f"Synthetic product scope {index}") for index in range(2)), selected
+    assert message_ids[2] not in [row["id"] for row in inbox], inbox
+    with closing(sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True)) as conn:
+        links = conn.execute("SELECT project_id FROM product_project_links WHERE product_id = ?",
+                             (product_row["id"],)).fetchall()
+        assert sorted(row[0] for row in links) == sorted(project_ids[:2]), links
+        for message_id in message_ids:
+            assert conn.execute("SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
+                                (message_id,)).fetchall() == [(None, None)]
+    slot = {"project_key": project, "slot": "kp1in-advisory-slot"}
+    first = tool("slot_first", "acquire_build_slot", dict(slot, agent_name="RedFox",
+        ttl_seconds=120, exclusive=True), 360)
+    assert first["conflicts"] == [] and first["granted"]["agent"] == "RedFox", first
+    second = tool("slot_conflict", "acquire_build_slot", dict(slot, agent_name="BluePeak",
+        ttl_seconds=120, exclusive=False), 361)
+    # A conflict is advisory: the second lease is still granted and persisted.
+    assert second["granted"]["agent"] == "BluePeak" and second["granted"]["exclusive"] is False, second
+    assert [row["agent"] for row in second["conflicts"]] == ["RedFox"], second
+    renewed = tool("slot_renew", "renew_build_slot", dict(slot, agent_name="RedFox", extend_seconds=300), 362)
+    assert renewed["renewed"] is True and renewed["expires_ts"] > first["granted"]["expires_ts"], renewed
+    leases = [json.loads(path.read_text()) for path in Path(storage).glob(
+        "projects/*/build_slots/kp1in-advisory-slot/*.json")]
+    assert sorted(row["agent"] for row in leases) == ["BluePeak", "RedFox"], leases
+    assert all(not row.get("released_ts") for row in leases), leases
+    assert next(row for row in leases if row["agent"] == "RedFox")["expires_ts"] == renewed["expires_ts"]
+    summary["product_scope"] = {"product": product_row, "projects": project_ids, "messages": message_ids}
+    summary["advisory_slots"] = {"slot": slot, "renewed_expires_ts": renewed["expires_ts"]}
 
 def concurrent_ring():
     # Each client is a separate OS process with its own MCP session. The two
@@ -1336,6 +1398,7 @@ try:
                "message_id": message_id}, 4)
     assert ack["acknowledged"] is True and ack["acknowledged_at"], ack
     ring = concurrent_ring()
+    product_and_slots()
     cursor_message_id, cursor_positions, cursor_roles, cursor_body = recipient_cursors()
     stop(signal.SIGTERM)
 
@@ -1409,6 +1472,28 @@ try:
                 "after": summary["recipient_cursors"]["before"][actor], "limit": 1}, 40 + index)
             assert len(replay["events"]) == 1 and replay["events"][0]["message_id"] == cursor_message_id, replay
             assert replay["next_cursor"] == cursor, replay
+    product = summary["product_scope"]
+    assert tool("reopen_product", "ensure_product", {"product_key": product["product"]["product_uid"]}, 400) == product["product"]
+    inbox = tool("reopen_product_inbox", "fetch_inbox_product", {
+        "product_key": product["product"]["product_uid"], "agent_name": "BluePeak",
+        "include_bodies": True, "limit": 100}, 401)
+    assert sorted(row["id"] for row in inbox if row.get("thread_id") == "kp1in-product-scope") == sorted(product["messages"][:2]), inbox
+    slot = summary["advisory_slots"]["slot"]
+    renewed = tool("reopen_slot_renew", "renew_build_slot", dict(slot, agent_name="RedFox", extend_seconds=60), 402)
+    assert renewed["renewed"] is True and renewed["expires_ts"] > summary["advisory_slots"]["renewed_expires_ts"], renewed
+    released = tool("reopen_slot_release", "release_build_slot", dict(slot, agent_name="RedFox"), 403)
+    assert released["released"] is True and released["released_at"], released
+    no_renew = tool("reopen_slot_released_renew", "renew_build_slot", dict(slot, agent_name="RedFox"), 404)
+    assert no_renew["renewed"] is False, no_renew
+    shared = tool("reopen_slot_shared", "acquire_build_slot", dict(slot, agent_name="GreenLake",
+        ttl_seconds=120, exclusive=False), 405)
+    assert shared["conflicts"] == [] and shared["granted"]["agent"] == "GreenLake", shared
+    for index, actor in enumerate(["BluePeak", "GreenLake"]):
+        assert tool("reopen_slot_release_" + actor, "release_build_slot", dict(slot, agent_name=actor), 406 + index)["released"] is True
+    leases = [json.loads(path.read_text()) for path in Path(storage).glob(
+        "projects/*/build_slots/kp1in-advisory-slot/*.json")]
+    assert sorted(row["agent"] for row in leases) == ["BluePeak", "GreenLake", "RedFox"], leases
+    assert all(row.get("released_ts") for row in leases), leases
     stop(signal.SIGINT)
     summary["passed"] = True
 except BaseException as error:
