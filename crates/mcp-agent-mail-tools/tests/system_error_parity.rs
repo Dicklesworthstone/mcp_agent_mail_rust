@@ -194,6 +194,7 @@ fn register_agent_under_sqlite_lock_maps_to_resource_busy() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("locked sqlite write should fail");

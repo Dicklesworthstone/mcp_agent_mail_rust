@@ -95,6 +95,7 @@ fn token_echoed_by_default() {
                 None,
                 None,
                 None,
+                None,
                 None, // return_registration_token omitted => default true
             )
             .await
@@ -131,6 +132,7 @@ fn token_omitted_on_opt_out_but_persisted() {
                 "gpt-5".to_string(),
                 None,
                 Some("transcript-safety opt-out".to_string()),
+                None,
                 None,
                 None,
                 None,
@@ -234,6 +236,7 @@ fn send_message_null_auto_contact_contract() {
                 "claude-code".to_string(),
                 "opus-4.5".to_string(),
                 Some(name.to_string()),
+                None,
                 None,
                 None,
                 None,

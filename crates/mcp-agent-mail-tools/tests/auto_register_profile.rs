@@ -105,6 +105,7 @@ fn auto_registered_recipient_gets_an_archived_profile() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("register sender");

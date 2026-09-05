@@ -83,6 +83,7 @@ async fn setup_project_and_agent(ctx: &McpContext, project_key: &str, agent: &st
         None,
         None,
         None,
+        None,
     )
     .await
     .expect("register_agent");
@@ -327,6 +328,7 @@ fn test_empty_program_message() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("empty program should fail");
@@ -369,6 +371,7 @@ fn test_empty_model_message() {
             "codex-cli".to_string(),
             "  ".to_string(), // whitespace-only
             Some("BlueLake".to_string()),
+            None,
             None,
             None,
             None,

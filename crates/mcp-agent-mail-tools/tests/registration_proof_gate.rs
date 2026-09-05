@@ -202,6 +202,7 @@ fn disabled_gate_registers_without_proof() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("register_agent should succeed with gate disabled");
@@ -218,6 +219,7 @@ fn disabled_gate_registers_without_proof() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("create_agent_identity should succeed with gate disabled");
@@ -230,6 +232,7 @@ fn disabled_gate_registers_without_proof() {
             "opus-4.1".to_string(),
             Some("RedStone".to_string()),
             Some("proof gate disabled".to_string()),
+            None,
             None,
             None,
             None,
@@ -271,6 +274,7 @@ fn enabled_gate_blocks_every_entry_point_without_proof() {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect_err("register_agent must fail closed without proof");
@@ -288,6 +292,7 @@ fn enabled_gate_blocks_every_entry_point_without_proof() {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect_err("create_agent_identity must fail closed without proof");
@@ -301,6 +306,7 @@ fn enabled_gate_blocks_every_entry_point_without_proof() {
                 "opus-4.1".to_string(),
                 Some("RedStone".to_string()),
                 Some("no proof".to_string()),
+                None,
                 None,
                 None,
                 None,
@@ -377,6 +383,7 @@ fn enabled_gate_allows_valid_proof_through_tool_and_macro() {
                 None,
                 None,
                 None,
+                None,
                 Some(proof),
             )
             .await
@@ -401,6 +408,7 @@ fn enabled_gate_allows_valid_proof_through_tool_and_macro() {
                 "opus-4.1".to_string(),
                 Some("GreenCastle".to_string()),
                 Some("valid proof".to_string()),
+                None,
                 None,
                 None,
                 None,
@@ -456,6 +464,7 @@ fn enabled_gate_rejects_replayed_nonce_durably() {
                 None,
                 None,
                 None,
+                None,
                 Some(proof1),
             )
             .await
@@ -486,6 +495,7 @@ fn enabled_gate_rejects_replayed_nonce_durably() {
                 "opus-4.1".to_string(),
                 Some("GreenCastle".to_string()),
                 Some("replay".to_string()),
+                None,
                 None,
                 None,
                 None,
@@ -538,6 +548,7 @@ async fn register_with_proof(
         "opus-4.1".to_string(),
         Some(name.to_string()),
         Some("valid proof".to_string()),
+        None,
         None,
         None,
         None,
@@ -691,6 +702,7 @@ fn disabled_gate_auto_registers_via_send_message_and_request_contact() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("register sender");
@@ -735,6 +747,7 @@ fn disabled_gate_auto_registers_via_send_message_and_request_contact() {
             "opus-4.1".to_string(),
             Some("RedStone".to_string()),
             Some("gate off".to_string()),
+            None,
             None,
             None,
             None,

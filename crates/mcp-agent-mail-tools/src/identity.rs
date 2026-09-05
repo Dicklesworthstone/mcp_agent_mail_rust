@@ -1644,6 +1644,7 @@ fn authenticate_lifecycle_agent(
     agent: &mcp_agent_mail_db::AgentRow,
     registration_token: Option<&str>,
     pane_id: Option<&str>,
+    tmux_socket_path: Option<&str>,
     action: &str,
 ) -> McpResult<()> {
     let provided_token = registration_token.filter(|token| !token.is_empty());
@@ -1655,8 +1656,12 @@ fn authenticate_lifecycle_agent(
     // An explicitly supplied but invalid token must not silently fall back to
     // ambient pane identity. That keeps stale or stolen credentials loud.
     let pane_matches = provided_token.is_none()
-        && mcp_agent_mail_core::resolve_identity_with_optional_pane(&project.human_key, pane_id)
-            .is_some_and(|resolved| resolved.eq_ignore_ascii_case(&agent.name));
+        && mcp_agent_mail_core::resolve_identity_with_optional_pane_on_socket(
+            &project.human_key,
+            pane_id,
+            validated_tmux_socket_path(tmux_socket_path)?.as_deref(),
+        )
+        .is_some_and(|resolved| resolved.eq_ignore_ascii_case(&agent.name));
     if token_matches || pane_matches {
         return Ok(());
     }
@@ -1674,6 +1679,17 @@ fn authenticate_lifecycle_agent(
             "token_param": "registration_token",
         }),
     ))
+}
+
+pub(crate) fn validated_tmux_socket_path(raw: Option<&str>) -> McpResult<Option<String>> {
+    mcp_agent_mail_core::validate_tmux_socket_path(raw).map_err(|message| {
+        legacy_tool_error(
+            "INVALID_TMUX_SOCKET_PATH",
+            message,
+            true,
+            json!({ "field": "tmux_socket_path" }),
+        )
+    })
 }
 
 async fn reject_deregistered_lifecycle_transition(
@@ -2124,6 +2140,8 @@ Check that all parameters have valid values."
 /// - `reaper_exempt`: Optional bool to exempt agent from the inactivity reaper (default: false)
 /// - `pane_id`: Optional tmux pane identifier. HTTP clients should pass the
 ///   caller pane explicitly; stdio callers may omit it.
+/// - `tmux_socket_path`: Optional absolute tmux socket path. The HTTP server
+///   derives this from the validated `X-Tmux-Socket` transport header.
 ///
 /// # Returns
 /// Agent profile with all fields
@@ -2148,6 +2166,7 @@ pub async fn register_agent(
     attachments_policy: Option<String>,
     reaper_exempt: Option<bool>,
     pane_id: Option<String>,
+    tmux_socket_path: Option<String>,
     registration_proof: Option<String>,
 ) -> McpResult<String> {
     use mcp_agent_mail_core::models::{detect_agent_name_mistake, generate_agent_name};
@@ -2175,6 +2194,7 @@ pub async fn register_agent(
         ));
     }
 
+    let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
     let pool = get_db_pool()?;
 
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -2396,9 +2416,10 @@ Check that all parameters have valid values."
     try_write_agent_profile(config, &project.slug, &agent_json);
 
     // Write per-pane identity file (best-effort, only when $TMUX_PANE is set)
-    if let Some(result) = mcp_agent_mail_core::write_identity_with_optional_pane(
+    if let Some(result) = mcp_agent_mail_core::write_identity_with_optional_pane_on_socket(
         &project.human_key,
         pane_id.as_deref(),
+        tmux_socket_path.as_deref(),
         &row.name,
     ) {
         match result {
@@ -2451,6 +2472,8 @@ Check that all parameters have valid values."
 /// - `attachments_policy`: Optional attachment handling policy
 /// - `pane_id`: Optional tmux pane identifier. HTTP clients should pass the
 ///   caller pane explicitly; stdio callers may omit it.
+/// - `tmux_socket_path`: Optional absolute tmux socket path. The HTTP server
+///   derives this from the validated `X-Tmux-Socket` transport header.
 /// - `return_registration_token`: When `true` (default), the response includes
 ///   the freshly-minted `registration_token`. When `false`, the token is
 ///   omitted from the tool result (transcript safety, GH#255 / Python issue
@@ -2478,6 +2501,7 @@ pub async fn create_agent_identity(
     task_description: Option<String>,
     attachments_policy: Option<String>,
     pane_id: Option<String>,
+    tmux_socket_path: Option<String>,
     registration_proof: Option<String>,
     return_registration_token: Option<bool>,
 ) -> McpResult<String> {
@@ -2506,6 +2530,7 @@ pub async fn create_agent_identity(
         ));
     }
 
+    let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
     let pool = get_db_pool()?;
 
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -2686,9 +2711,10 @@ Choose a different name (or omit the name to auto-generate one)."
     try_write_agent_profile(config, &project.slug, &agent_json);
 
     // Write per-pane identity file (best-effort, only when $TMUX_PANE is set)
-    if let Some(result) = mcp_agent_mail_core::write_identity_with_optional_pane(
+    if let Some(result) = mcp_agent_mail_core::write_identity_with_optional_pane_on_socket(
         &project.human_key,
         pane_id.as_deref(),
+        tmux_socket_path.as_deref(),
         &row.name,
     ) {
         match result {
@@ -2754,6 +2780,7 @@ pub async fn retire_agent(
     agent_name: String,
     registration_token: Option<String>,
     pane_id: Option<String>,
+    tmux_socket_path: Option<String>,
 ) -> McpResult<String> {
     let pool = get_db_pool()?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
@@ -2771,6 +2798,7 @@ pub async fn retire_agent(
         &agent,
         registration_token.as_deref(),
         pane_id.as_deref(),
+        tmux_socket_path.as_deref(),
         "retire_agent",
     )?;
     reject_deregistered_lifecycle_transition(ctx, &pool, &agent, "retired").await?;
@@ -2813,6 +2841,7 @@ pub async fn unretire_agent(
     agent_name: String,
     registration_token: Option<String>,
     pane_id: Option<String>,
+    tmux_socket_path: Option<String>,
 ) -> McpResult<String> {
     let pool = get_db_pool()?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
@@ -2830,6 +2859,7 @@ pub async fn unretire_agent(
         &agent,
         registration_token.as_deref(),
         pane_id.as_deref(),
+        tmux_socket_path.as_deref(),
         "unretire_agent",
     )?;
     reject_deregistered_lifecycle_transition(ctx, &pool, &agent, "unretired").await?;
@@ -2861,6 +2891,7 @@ pub async fn deregister_agent(
     agent_name: String,
     registration_token: Option<String>,
     pane_id: Option<String>,
+    tmux_socket_path: Option<String>,
 ) -> McpResult<String> {
     let pool = get_db_pool()?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
@@ -2878,6 +2909,7 @@ pub async fn deregister_agent(
         &agent,
         registration_token.as_deref(),
         pane_id.as_deref(),
+        tmux_socket_path.as_deref(),
         "deregister_agent",
     )?;
 
@@ -3049,13 +3081,18 @@ pub async fn whois(
 fn resolve_identity_from_project_keys(
     project_keys: &[String],
     pane_id: &str,
+    tmux_socket_path: Option<&str>,
 ) -> Option<(
     String,
     std::path::PathBuf,
     mcp_agent_mail_core::PaneBindingStatus,
 )> {
     project_keys.iter().find_map(|project_key| {
-        mcp_agent_mail_core::resolve_identity_with_binding(project_key, pane_id)
+        mcp_agent_mail_core::resolve_identity_with_binding_on_socket(
+            project_key,
+            pane_id,
+            tmux_socket_path,
+        )
     })
 }
 
@@ -3077,7 +3114,9 @@ pub async fn resolve_pane_identity(
     ctx: &McpContext,
     project_key: String,
     pane_id: Option<String>,
+    tmux_socket_path: Option<String>,
 ) -> McpResult<String> {
+    let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
     let effective_pane = match pane_id {
         Some(p) if !p.trim().is_empty() => p.trim().to_string(),
         _ => mcp_agent_mail_core::get_composite_tmux_pane_id().unwrap_or_default(),
@@ -3107,7 +3146,12 @@ pub async fn resolve_pane_identity(
         &effective_pane,
     );
 
-    resolve_identity_from_project_keys(&project_keys, &effective_pane).map_or_else(
+    resolve_identity_from_project_keys(
+        &project_keys,
+        &effective_pane,
+        tmux_socket_path.as_deref(),
+    )
+    .map_or_else(
         || {
             Err(legacy_tool_error(
                 "IDENTITY_NOT_FOUND",
@@ -4897,7 +4941,7 @@ body
                 );
 
                 let resolved =
-                    resolve_identity_from_project_keys(&[raw_project_key, human_key], pane)
+                    resolve_identity_from_project_keys(&[raw_project_key, human_key], pane, None)
                         .expect("resolve identity across project keys");
                 assert_eq!(resolved.0, "BlueLake");
                 assert_eq!(resolved.1, written_path);

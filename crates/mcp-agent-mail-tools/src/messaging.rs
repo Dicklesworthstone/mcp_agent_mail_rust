@@ -4961,6 +4961,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                     .expect("register sender");
@@ -4972,6 +4973,7 @@ mod tests {
                         Some("GreenStone".to_string()),
                         Some("recipient".to_string()),
                         Some("auto".to_string()),
+                        None,
                         None,
                         None,
                         None,
@@ -5100,6 +5102,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                     .expect("register sender");
@@ -5111,6 +5114,7 @@ mod tests {
                         Some("GreenStone".to_string()),
                         Some("stable recipient".to_string()),
                         Some("auto".to_string()),
+                        None,
                         None,
                         None,
                         None,
@@ -5128,6 +5132,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                     .expect("register replaceable recipient");
@@ -5142,6 +5147,7 @@ mod tests {
                         Some("AzureCanyon".to_string()),
                         Some("recipient activity refresh".to_string()),
                         Some("auto".to_string()),
+                        None,
                         None,
                         None,
                         None,
@@ -5173,6 +5179,7 @@ mod tests {
                         Some("AzureCanyon".to_string()),
                         Some("replacement recipient".to_string()),
                         Some("auto".to_string()),
+                        None,
                         None,
                         None,
                         None,
