@@ -19176,8 +19176,9 @@ fn handle_file_reservations_mutation_locally(action: &FileReservationsCommand) -
     let _mailbox_mutation_locks =
         acquire_cli_mailbox_mutation_locks(&config.database_url, Some(&config.storage_root))?;
     let payload = context::run_async(async {
-        let cx = asupersync::Cx::current()
-            .ok_or_else(|| CliError::Other("reservation runtime did not install a context".into()))?;
+        let cx = asupersync::Cx::current().ok_or_else(|| {
+            CliError::Other("reservation runtime did not install a context".into())
+        })?;
         let ctx = McpContext::new(cx, 1);
         let (tool, result) = match action {
             FileReservationsCommand::Reserve {
@@ -43796,7 +43797,10 @@ mod tests {
         emit_proxied_file_reservations_output(&action, &payload);
         let output = capture.drain_to_string();
         assert!(output.contains("release-intent-1"), "{output}");
-        assert!(output.contains("/fixture/release-intents.jsonl"), "{output}");
+        assert!(
+            output.contains("/fixture/release-intents.jsonl"),
+            "{output}"
+        );
         assert!(output.contains("not yet released"), "{output}");
         assert!(!output.contains("Released 0 reservation"), "{output}");
     }
@@ -67831,11 +67835,18 @@ startup_timeout_sec = 42
         let artifacts: Vec<serde_json::Value> = std::fs::read_dir(&archive)
             .expect("reservation archive exists")
             .map(|entry| entry.unwrap().path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
             .map(|path| serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap())
             .filter(|row: &serde_json::Value| row["id"] == id)
             .collect();
-        assert_eq!(artifacts.len(), 1, "one current artifact for reservation {id}");
+        assert_eq!(
+            artifacts.len(),
+            1,
+            "one current artifact for reservation {id}"
+        );
         artifacts.into_iter().next().unwrap()
     }
 
@@ -67892,6 +67903,74 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn integration_file_reservations_shared_minimum_ttl_and_renewal() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        for agent in ["BlueLake", "RedFox"] {
+            run_file_reservations_mutation_in_fixture(
+                &db_path,
+                FileReservationsCommand::Reserve {
+                    project: "test-proj".to_string(),
+                    agent: agent.to_string(),
+                    paths: vec!["shared/notes.md".to_string()],
+                    ttl: 1,
+                    exclusive: false,
+                    shared: true,
+                    reason: "shared minimum TTL".to_string(),
+                },
+            )
+            .expect("shared grants may overlap");
+        }
+        let rows = conn
+            .query_sync(
+                "SELECT id, agent_id, created_ts, expires_ts FROM file_reservations \
+                 WHERE path_pattern = 'shared/notes.md' ORDER BY agent_id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2, "both shared grants must exist");
+        for row in &rows {
+            let id: i64 = row.get_named("id").unwrap();
+            let created: i64 = row.get_named("created_ts").unwrap();
+            let expires: i64 = row.get_named("expires_ts").unwrap();
+            assert_eq!(expires - created, 60_000_000, "minimum TTL is 60 seconds");
+            assert_eq!(
+                fixture_reservation_artifact(&db_path, id)["exclusive"],
+                false
+            );
+        }
+        let id: i64 = rows[0].get_named("id").unwrap();
+        let old_expires: i64 = rows[0].get_named("expires_ts").unwrap();
+        run_file_reservations_mutation_in_fixture(
+            &db_path,
+            FileReservationsCommand::Renew {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                extend_seconds: 1,
+                paths: vec![],
+                ids: vec![id],
+            },
+        )
+        .expect("minimum renewal succeeds");
+        let renewed = conn
+            .query_sync(
+                "SELECT expires_ts FROM file_reservations WHERE id = ?",
+                &[sqlmodel_core::Value::BigInt(id)],
+            )
+            .unwrap();
+        let new_expires: i64 = renewed[0].get_named("expires_ts").unwrap();
+        assert_eq!(new_expires - old_expires, 60_000_000);
+        assert_eq!(
+            fixture_reservation_artifact(&db_path, id)["expires_ts"],
+            mcp_agent_mail_db::timestamps::micros_to_iso(new_expires)
+        );
+    }
+
+    #[test]
     fn integration_file_reservations_reserve_rejects_orphaned_project_placeholder() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -67919,7 +67998,10 @@ startup_timeout_sec = 42
             },
         );
         let output = capture.drain_to_string();
-        assert!(result.is_err(), "a missing project cannot authorize a reservation");
+        assert!(
+            result.is_err(),
+            "a missing project cannot authorize a reservation"
+        );
         assert!(
             !output.contains("\"granted\""),
             "missing project must not report a grant, got: {output}"
