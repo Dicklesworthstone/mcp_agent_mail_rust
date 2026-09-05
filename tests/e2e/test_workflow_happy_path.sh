@@ -647,11 +647,17 @@ e2e_assert_contains "macro reserved 1 path" "$MCYCLE_CHECK" "granted=1"
 e2e_case_banner "Phase 7: CLI verification of DB state"
 
 # Verify agents are in the DB
+# Port zero has no listener: the CLI must read this fixture's mailbox, even
+# when the worker has its own daemon on the usual port.
+CLI_AGENTS_STATUS=0
 CLI_AGENTS="$(DATABASE_URL="sqlite:///${WF_DB}" STORAGE_ROOT="${WF_STORAGE}" \
-    am agents list --project "${PROJECT_PATH}" --json 2>/dev/null || echo "CLI_ERROR")"
+    HTTP_HOST=127.0.0.1 HTTP_PORT=0 AGENT_MAIL_URL=http://127.0.0.1:0/mcp/ \
+    am agents list --project "${PROJECT_PATH}" --json \
+    2>"${E2E_ARTIFACT_DIR}/phase7_cli_agents.stderr")" || CLI_AGENTS_STATUS=$?
 e2e_save_artifact "phase7_cli_agents.txt" "$CLI_AGENTS"
+e2e_save_artifact "phase7_cli_agents.exit" "$CLI_AGENTS_STATUS"
 
-if [ "$CLI_AGENTS" != "CLI_ERROR" ] && [ -n "$CLI_AGENTS" ]; then
+if [ "$CLI_AGENTS_STATUS" -eq 0 ] && [ -n "$CLI_AGENTS" ]; then
     e2e_pass "am agents list returned output"
     e2e_assert_contains "CLI shows RedFox" "$CLI_AGENTS" "RedFox"
     e2e_assert_contains "CLI shows BluePeak" "$CLI_AGENTS" "BluePeak"
