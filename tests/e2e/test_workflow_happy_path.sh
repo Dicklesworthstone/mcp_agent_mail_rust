@@ -982,6 +982,7 @@ from pathlib import Path
 import signal
 import socket
 import sqlite3
+import selectors
 import subprocess
 import sys
 import time
@@ -1073,6 +1074,184 @@ def stop(signum):
     assert code == 0, ("headless stop must drain and return success", signum, code)
     server = None
 
+def concurrent_ring():
+    # Each client is a separate OS process with its own MCP session. The two
+    # parent barriers ensure all identities exist before sends and all sends
+    # have acknowledged commits before recipients inspect their inboxes.
+    client_source = r'''
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import urllib.request
+
+endpoint, project, actor, recipient, incoming_from, directory = sys.argv[1:]
+headers = {"Content-Type": "application/json",
+           "Accept": "application/json, text/event-stream",
+           "Authorization": "Bearer owned-http-handoff-fixture"}
+counter = 0
+history = (Path(directory) / "history.jsonl").open("x", buffering=1)
+
+def rpc(method, params, notification=False):
+    global counter
+    counter += 1
+    request = {"jsonrpc": "2.0", "method": method, "params": params}
+    if not notification:
+        request["id"] = counter
+    raw_request = json.dumps(request, sort_keys=True).encode()
+    history.write(json.dumps({"event": "invoke", "id": counter, "method": method,
+        "client_pid": os.getpid(), "monotonic_ns": time.monotonic_ns(),
+        "sha256": hashlib.sha256(raw_request).hexdigest()}) + "\n")
+    with urllib.request.urlopen(urllib.request.Request(endpoint, data=raw_request,
+                                 headers=headers), timeout=25) as response:
+        raw = response.read(8 * 1024 * 1024 + 1)
+        assert len(raw) <= 8 * 1024 * 1024, "client response budget exceeded"
+        if response.headers.get("Mcp-Session-Id"):
+            headers["Mcp-Session-Id"] = response.headers["Mcp-Session-Id"]
+    history.write(json.dumps({"event": "complete", "id": counter,
+        "client_pid": os.getpid(), "monotonic_ns": time.monotonic_ns(),
+        "sha256": hashlib.sha256(raw).hexdigest()}) + "\n")
+    if notification:
+        return None
+    decoded = json.loads(raw)
+    assert decoded.get("id") == counter and "error" not in decoded, decoded
+    result = decoded["result"]
+    assert not result.get("isError"), result
+    return result
+
+def tool(name, arguments):
+    result = rpc("tools/call", {"name": name, "arguments": dict(arguments, format="json")})
+    assert len(result["content"]) == 1, result
+    return json.loads(result["content"][0]["text"])
+
+def barrier(stage, **values):
+    print(json.dumps(dict(stage=stage, actor=actor, pid=os.getpid(), **values)), flush=True)
+    if stage != "done":
+        assert sys.stdin.readline().strip() == "go", "parent barrier ended"
+
+try:
+    rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+        "clientInfo": {"name": "concurrent-ring-" + actor, "version": "1"}})
+    rpc("notifications/initialized", {}, notification=True)
+    identity = tool("register_agent", {"project_key": project, "program": "codex",
+        "model": "workflow-fixture", "name": actor})
+    tool("set_contact_policy", {"project_key": project, "agent_name": actor, "policy": "open"})
+    barrier("ready")
+    arguments = {"project_key": project, "sender_name": actor, "to": [recipient],
+        "subject": "Concurrent ring " + actor, "body_md": "Durable concurrent message from " + actor,
+        "thread_id": "kp1in-concurrent-ring", "ack_required": True,
+        "sender_token": identity["registration_token"], "idempotency_key": "kp1in-ring-" + actor}
+    sent = tool("send_message", arguments)
+    sent_id = sent["deliveries"][0]["payload"]["id"]
+    assert sent["verified_sender"] is True, sent
+    replay = tool("send_message", arguments)
+    assert replay["deliveries"][0]["payload"]["id"] == sent_id, replay
+    assert replay["idempotent_replay"] is True, replay
+    barrier("sent", message_id=sent_id)
+    inbox = tool("fetch_inbox", {"project_key": project, "agent_name": actor,
+                                "include_bodies": True, "limit": 100})
+    received = [row for row in inbox if row.get("thread_id") == "kp1in-concurrent-ring"]
+    assert len(received) == 1, received
+    message = received[0]
+    assert message["from"] == incoming_from, message
+    assert message["body_md"] == "Durable concurrent message from " + incoming_from, message
+    ack_args = {"project_key": project, "agent_name": actor, "message_id": message["id"]}
+    first_ack = tool("acknowledge_message", ack_args)
+    second_ack = tool("acknowledge_message", ack_args)
+    assert first_ack["acknowledged"] is True and first_ack["acknowledged_at"], first_ack
+    assert second_ack["acknowledged"] is True and second_ack["acknowledged_at"], second_ack
+    barrier("done", sent_id=sent_id, received_id=message["id"], recipient=recipient,
+            incoming_from=incoming_from, acknowledged_at=second_ack["acknowledged_at"])
+finally:
+    history.close()
+'''
+    client_file = run / "concurrent_client.py"
+    with client_file.open("x") as script:
+        script.write(client_source)
+    names = ["RedFox", "BluePeak", "GreenLake"]
+    clients = []
+    buffers = {}
+    selector = selectors.DefaultSelector()
+    deadline = time.monotonic() + 120
+    records = []
+    summary["concurrent_clients"] = records
+
+    def stage(expected):
+        pending = set(range(len(clients)))
+        values = {}
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"concurrent client barrier {expected}: {sorted(pending)}")
+            for key, _ in selector.select(min(remaining, 0.5)):
+                index = key.data
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    raise RuntimeError(f"client {names[index]} EOF before barrier {expected}")
+                buffers[index] += chunk
+                assert len(buffers[index]) <= 65536, "client status budget exceeded"
+                while b"\n" in buffers[index]:
+                    line, buffers[index] = buffers[index].split(b"\n", 1)
+                    value = json.loads(line)
+                    assert index in pending and value["stage"] == expected, value
+                    assert value["pid"] == clients[index].pid and value["actor"] == names[index], value
+                    values[names[index]] = value
+                    pending.remove(index)
+                if index not in pending:
+                    selector.unregister(key.fileobj)
+        return values
+
+    def advance():
+        for index, child in enumerate(clients):
+            child.stdin.write(b"go\n")
+            child.stdin.flush()
+            selector.register(child.stdout, selectors.EVENT_READ, index)
+
+    try:
+        for index, name in enumerate(names):
+            directory = run / ("client-" + name)
+            directory.mkdir(mode=0o700)
+            with (directory / "stderr.txt").open("xb") as stderr:
+                child = subprocess.Popen([sys.executable, str(client_file), endpoint, project, name,
+                    names[(index + 1) % len(names)], names[(index - 1) % len(names)], str(directory)],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
+                    start_new_session=True)
+            clients.append(child)
+            records.append({"actor": name, "pid": child.pid, "history": str(directory / "history.jsonl")})
+            buffers[index] = b""
+            selector.register(child.stdout, selectors.EVENT_READ, index)
+        assert len({child.pid for child in clients}) == 3
+        stage("ready")
+        summary["concurrent_ready_barrier_ns"] = time.monotonic_ns()
+        advance()
+        sent = stage("sent")
+        assert len({value["message_id"] for value in sent.values()}) == 3, sent
+        advance()
+        results = stage("done")
+        for record, child in zip(records, clients):
+            record["exit"] = child.wait(timeout=max(0.1, deadline - time.monotonic()))
+            assert record["exit"] == 0, record
+            record["result"] = results[record["actor"]]
+        for value in results.values():
+            assert value["received_id"] == results[value["incoming_from"]]["sent_id"], results
+        return results
+    finally:
+        selector.close()
+        for record, child in zip(records, clients):
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGTERM)
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(child.pid, signal.SIGKILL)
+                    child.wait(timeout=5)
+                    record["forced_cleanup"] = True
+            record["exit"] = child.returncode
+            child.stdin.close()
+            child.stdout.close()
+
 try:
     with open(binary, "rb") as executable:
         summary["binary_sha256"] = hashlib.file_digest(executable, "sha256").hexdigest()
@@ -1090,6 +1269,7 @@ try:
     ack = tool("ack", "acknowledge_message", {"project_key": project, "agent_name": "BluePeak",
                "message_id": message_id}, 4)
     assert ack["acknowledged"] is True and ack["acknowledged_at"], ack
+    ring = concurrent_ring()
     stop(signal.SIGTERM)
 
     with closing(sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True)) as conn:
@@ -1097,9 +1277,24 @@ try:
         rows = conn.execute("SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
                             (message_id,)).fetchall()
         assert len(rows) == 1 and all(value is not None and value > 0 for value in rows[0]), rows
+        ring_rows = conn.execute(
+            "SELECT m.id, a.name, m.body_md FROM messages m JOIN agents a ON a.id = m.sender_id "
+            "WHERE m.thread_id = 'kp1in-concurrent-ring'").fetchall()
+        expected_ring = sorted((value["sent_id"], actor, "Durable concurrent message from " + actor)
+                               for actor, value in ring.items())
+        assert sorted(ring_rows) == expected_ring, ring_rows
+        recipients = conn.execute(
+            "SELECT r.message_id, a.name, r.read_ts, r.ack_ts FROM message_recipients r "
+            "JOIN messages m ON m.id = r.message_id JOIN agents a ON a.id = r.agent_id "
+            "WHERE m.thread_id = 'kp1in-concurrent-ring'").fetchall()
+        assert len(recipients) == 3, recipients
+        assert sorted((row[0], row[1]) for row in recipients) == sorted(
+            (value["sent_id"], value["recipient"]) for value in ring.values()), recipients
+        assert all(row[2] and row[3] for row in recipients), recipients
         assert conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     archived = []
+    ring_archived = []
     for path in Path(storage).glob("projects/*/messages/**/*.md"):
         content = path.read_text()
         if content.startswith("---json\n") and "\n---\n" in content:
@@ -1107,13 +1302,23 @@ try:
             if json.loads(metadata).get("id") == message_id:
                 archived.append(path)
                 assert archived_body.strip() == body
+            if json.loads(metadata).get("thread_id") == "kp1in-concurrent-ring":
+                ring_archived.append((json.loads(metadata)["id"], archived_body.strip()))
     assert len(archived) == 1, archived
+    assert sorted(ring_archived) == sorted((row[0], row[2]) for row in expected_ring), ring_archived
     summary["archive_message"] = str(archived[0])
 
     start("reopen")
     initialize("reopen")
     inbox = tool("reopen_inbox", "fetch_inbox", arguments, 2)
     assert any(row["id"] == message_id and row["body_md"] == body for row in inbox), inbox
+    for index, (actor, value) in enumerate(ring.items()):
+        inbox = tool("reopen_ring_" + actor, "fetch_inbox",
+                     {"project_key": project, "agent_name": value["recipient"],
+                      "include_bodies": True, "limit": 100}, 10 + index)
+        matches = [row for row in inbox if row.get("thread_id") == "kp1in-concurrent-ring"]
+        assert len(matches) == 1 and matches[0]["id"] == value["sent_id"], matches
+        assert matches[0]["body_md"] == "Durable concurrent message from " + actor, matches
     stop(signal.SIGINT)
     summary["passed"] = True
 except BaseException as error:
