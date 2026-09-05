@@ -807,9 +807,16 @@ stdout, _ = run("contact_welcome", ["macros", "contact-handshake", "--project", 
                                   "--welcome-body", welcome_body, "--thread-id", macro_thread,
                                   "--json"])
 handshake = payload(stdout)
-assert handshake["response"]["status"] == "approved", handshake
+assert handshake["response"]["approved"] is True, handshake
+assert handshake["response"]["updated"] == 1, handshake
 welcome_id = handshake["welcome_message"]["deliveries"][0]["payload"]["id"]
 with closing(sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True)) as conn:
+    assert conn.execute(
+        "SELECT l.status FROM agent_links l "
+        "JOIN agents a ON a.id = l.a_agent_id JOIN agents b ON b.id = l.b_agent_id "
+        "JOIN projects p ON p.id = l.a_project_id "
+        "WHERE p.human_key = ? AND a.name = 'RedFox' AND b.name = 'BluePeak'",
+        (session_project,)).fetchall() == [("approved",)]
     assert conn.execute("SELECT body_md, thread_id FROM messages WHERE id = ?",
                         (welcome_id,)).fetchone() == (welcome_body, macro_thread)
 welcome_archives = []
@@ -897,7 +904,7 @@ macro_id = macro["file_reservations"]["granted"][0]["id"]
 assert row(macro_id)["released_ts"] is None and row(macro_id)["exclusive"] == 1
 assert artifact(macro_id)["agent"] == "RedFox"
 assert artifact(macro_id)["path_pattern"] == macro_pattern
-assert artifact(macro_id)["released_ts"] is None
+assert artifact(macro_id).get("released_ts") is None
 stdout, stderr = run("macro_guard_held", ["guard", "check", "--repo", project],
                      expected=1, stdin=macro_pattern + "\n", agent="BluePeak")
 assert "RedFox" in stdout + stderr, (stdout, stderr)
