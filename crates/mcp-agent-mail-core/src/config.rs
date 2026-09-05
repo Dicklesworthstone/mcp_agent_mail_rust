@@ -2652,7 +2652,7 @@ impl Config {
         );
 
         // TOON output format
-        // Encoder binary: TOON_TRU_BIN > TOON_BIN > None (will use default "tru")
+        // Encoder binary: TOON_TRU_BIN > TOON_BIN > None (will use default "toon")
         config.toon_bin = env_value("TOON_TRU_BIN")
             .map(|v| v.trim().to_string())
             .filter(|s| !s.is_empty())

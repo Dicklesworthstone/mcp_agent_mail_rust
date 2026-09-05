@@ -9,9 +9,11 @@
 # 5. Encoder validation: --help / --version responses
 # 6. Broken encoder path: graceful fallback
 #
-# All tests are offline — no real tru binary or server required.
+# Existing cases are offline substitutes. Select the real HTTP/codec lane with
+# AM_E2E_REAL_TOON=1, AM_E2E_REAL_TOON_BIN and AM_E2E_REAL_TOON_SHA256.
 
 E2E_SUITE="toon"
+: "${AM_E2E_KEEP_TMP:=1}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../../scripts/e2e_lib.sh
 source "${SCRIPT_DIR}/../../scripts/e2e_lib.sh"
@@ -296,6 +298,193 @@ TOON_ERR=$(json_get_nested "$FALLBACK_ENVELOPE" "meta.toon_error")
 e2e_assert_contains "fallback has toon_error" "$TOON_ERR" "exited with"
 
 e2e_save_artifact "case7_fallback_envelope.json" "$FALLBACK_ENVELOPE"
+
+# ---------------------------------------------------------------------------
+# Case 8: Explicitly selected real HTTP transport and Rust codec roundtrip
+# ---------------------------------------------------------------------------
+if [ "${AM_E2E_REAL_TOON:-0}" = "1" ]; then
+    e2e_case_banner "Real HTTP tool/resource TOON roundtrip"
+    e2e_ensure_binary "am" >/dev/null
+    if python3 - "${CARGO_TARGET_DIR}/debug/am" "${AM_E2E_REAL_TOON_BIN:-}" \
+        "${AM_E2E_REAL_TOON_SHA256:-}" "${E2E_ARTIFACT_DIR}/real_toon" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+binary, encoder, expected_hash, destination = sys.argv[1:]
+run = Path(destination).resolve()
+run.mkdir(mode=0o700, exist_ok=False)
+summary = {"passed": False, "completed_ids": [], "client_pid": os.getpid(),
+           "scope": "real HTTP tool/resource encoding and semantic roundtrip"}
+server = None
+started = time.monotonic()
+
+def interrupted(signum, frame):
+    raise InterruptedError(f"real TOON lane interrupted by signal {signum}")
+
+signal.signal(signal.SIGTERM, interrupted)
+
+def digest(path):
+    with open(path, "rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+try:
+    assert encoder and len(expected_hash) == 64, "selected real lane requires encoder path and SHA256"
+    encoder = Path(encoder).resolve(strict=True)
+    assert encoder.name in ("toon", "toon.exe"), "use the published executable name to test default lookup"
+    assert digest(encoder) == expected_hash, "encoder differs from the selected artifact"
+    summary.update(binary_sha256=digest(binary), encoder_sha256=expected_hash,
+                   binary=str(binary), encoder=str(encoder))
+    for flag in ("--help", "--version"):
+        probe = subprocess.run([str(encoder), flag], capture_output=True, text=True, timeout=10)
+        (run / (flag[2:] + ".stdout")).write_text(probe.stdout)
+        (run / (flag[2:] + ".stderr")).write_text(probe.stderr)
+        assert probe.returncode == 0, (flag, probe.returncode, probe.stderr)
+        if flag == "--help":
+            assert "reference implementation in rust" in probe.stdout.lower(), probe.stdout
+        else:
+            summary["encoder_version"] = probe.stdout.strip()
+    with socket.socket() as available:
+        available.bind(("127.0.0.1", 0))
+        port = available.getsockname()[1]
+    env = os.environ.copy()
+    env.pop("AM_INTERFACE_MODE", None)
+    env.update(DATABASE_URL="sqlite:///" + str(run / "mailbox.sqlite3"),
+               STORAGE_ROOT=str(run / "storage"), HTTP_HOST="127.0.0.1", HTTP_PORT=str(port),
+               HTTP_BEARER_TOKEN="owned-real-toon-fixture", AM_ATC_ENABLED="false",
+               AM_ATC_WRITE_MODE="off", ATC_LEARNING_DISABLED="1", LLM_ENABLED="false",
+               NOTIFICATIONS_ENABLED="false", TUI_ENABLED="false", RUST_LOG="warn",
+               INVOCATION_ID="kp1in-real-toon-fixture",
+               TOON_TRU_BIN="", TOON_BIN="", TOON_DEFAULT_FORMAT="",
+               MCP_AGENT_MAIL_OUTPUT_FORMAT="toon", TOON_STATS="true",
+               PATH=str(encoder.parent) + os.pathsep + env.get("PATH", ""))
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+               "Authorization": "Bearer owned-real-toon-fixture"}
+    with (run / "server.stdout").open("xb") as stdout, (run / "server.stderr").open("xb") as stderr:
+        server = subprocess.Popen([binary, "serve-http", "--host", "127.0.0.1",
+                                   "--port", str(port), "--no-tui"], cwd=run, env=env,
+                                  stdout=stdout, stderr=stderr, start_new_session=True)
+    summary["server_pid"] = server.pid
+    deadline = time.monotonic() + 30
+    while True:
+        assert server.poll() is None, "server exited before listening"
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                break
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("server readiness deadline")
+            time.sleep(0.1)
+
+    def rpc(method, params, request_id):
+        request = {"jsonrpc": "2.0", "method": method, "params": params}
+        if request_id is not None:
+            request["id"] = request_id
+        with (run / "transcript.jsonl").open("a") as trace:
+            trace.write(json.dumps({"invoke": request}) + "\n")
+        with urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{port}/mcp/", data=json.dumps(request).encode(),
+                headers=headers), timeout=35) as response:
+            raw = response.read(8 * 1024 * 1024 + 1)
+            assert len(raw) <= 8 * 1024 * 1024, "response budget"
+            if response.headers.get("Mcp-Session-Id"):
+                headers["Mcp-Session-Id"] = response.headers["Mcp-Session-Id"]
+        decoded = json.loads(raw) if raw else None
+        with (run / "transcript.jsonl").open("a") as trace:
+            trace.write(json.dumps({"complete": decoded}) + "\n")
+        if request_id is None:
+            return None
+        assert decoded and decoded.get("id") == request_id and "error" not in decoded, decoded
+        result = decoded["result"]
+        assert not result.get("isError"), result
+        summary["completed_ids"].append(request_id)
+        return result
+
+    def tool(request_id, name, arguments):
+        result = rpc("tools/call", {"name": name, "arguments": arguments}, request_id)
+        assert len(result["content"]) == 1, result
+        return json.loads(result["content"][0]["text"])
+
+    def decode(name, envelope):
+        assert envelope["format"] == "toon", envelope
+        assert "toon_error" not in envelope["meta"], envelope
+        result = subprocess.run([str(encoder), "--decode"], input=envelope["data"],
+                                capture_output=True, text=True, timeout=15)
+        (run / (name + ".toon")).write_text(envelope["data"])
+        (run / (name + ".decoded.json")).write_text(result.stdout)
+        (run / (name + ".decode.stderr")).write_text(result.stderr)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "real-toon-e2e", "version": "1"}}, 1)
+    rpc("notifications/initialized", {}, None)
+    project = str(run / "project")
+    tool(2, "ensure_project", {"human_key": project, "format": "json"})
+    for request_id, name in ((3, "RedFox"), (4, "BluePeak")):
+        tool(request_id, "register_agent", {"project_key": project, "name": name,
+             "program": "e2e-test", "model": "fixture", "format": "json"})
+    body = 'Unicode λ 日本語\n"quoted", commas, \\ paths; null-looking: null; bracket: [x]'
+    sent = tool(5, "send_message", {"project_key": project, "sender_name": "RedFox",
+                "to": ["BluePeak"], "subject": "TOON roundtrip", "body_md": body, "format": "json"})
+    message_id = sent["deliveries"][0]["payload"]["id"]
+    arguments = {"project_key": project, "agent_name": "BluePeak", "include_bodies": True}
+    baseline = tool(6, "fetch_inbox", dict(arguments, format="json"))
+    assert len(baseline) == 1 and baseline[0]["id"] == message_id and baseline[0]["body_md"] == body
+    default = tool(7, "fetch_inbox", arguments)
+    assert default["meta"]["source"] == "default", default
+    assert decode("tool_default", default) == baseline
+    explicit = tool(8, "fetch_inbox", dict(arguments, format="toon"))
+    assert explicit["meta"]["source"] == "param", explicit
+    assert decode("tool_explicit", explicit) == baseline
+
+    uri = "resource://inbox/BluePeak?project=" + urllib.parse.quote(project, safe="") + "&include_bodies=true"
+    plain = rpc("resources/read", {"uri": uri + "&format=json"}, 9)
+    encoded = rpc("resources/read", {"uri": uri}, 10)
+    assert len(plain["contents"]) == len(encoded["contents"]) == 1
+    expected = json.loads(plain["contents"][0]["text"])
+    envelope = json.loads(encoded["contents"][0]["text"])
+    assert envelope["meta"]["source"] == "default", envelope
+    assert decode("resource_default", envelope) == expected
+    assert digest(encoder) == expected_hash, "encoder changed during the run"
+    assert server.poll() is None, "server exited during the real lane"
+    summary["passed"] = True
+except BaseException as error:
+    summary["error"] = repr(error)
+finally:
+    if server is not None:
+        if server.poll() is None:
+            os.killpg(server.pid, signal.SIGTERM)
+            try:
+                server.wait(timeout=20)
+                summary["shutdown"] = "owned stop and join; not graceful-shutdown certification"
+            except subprocess.TimeoutExpired:
+                os.killpg(server.pid, signal.SIGKILL)
+                server.wait(timeout=5)
+                summary["shutdown"] = "forced"
+                summary["passed"] = False
+        summary["server_exit"] = server.returncode
+        if server.returncode not in (0, -signal.SIGTERM):
+            summary["passed"] = False
+    summary["elapsed_s"] = time.monotonic() - started
+    (run / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+print(json.dumps(summary))
+raise SystemExit(0 if summary["passed"] else 1)
+PY
+    then
+        e2e_pass "real HTTP tool/resource TOON roundtrip preserves Unicode and structured data"
+    else
+        e2e_fail "selected real TOON lane failed or lacked its required dependency"
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Summary

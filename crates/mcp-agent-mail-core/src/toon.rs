@@ -6,7 +6,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
-use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
@@ -162,7 +161,7 @@ fn implicit_json() -> FormatDecision {
 // ---------------------------------------------------------------------------
 
 /// Default encoder binary name.
-const DEFAULT_ENCODER: &str = "tru";
+const DEFAULT_ENCODER: &str = "toon";
 const ENCODER_VALIDATION_CACHE_CAPACITY: usize = 16;
 const ENCODER_RESULT_CACHE_CAPACITY: usize = 64;
 const ENCODER_RESULT_CACHE_MAX_PAYLOAD_BYTES: usize = 16 * 1024;
@@ -364,7 +363,7 @@ fn clear_result_cache_for_tests() {
 /// Resolve the encoder binary path from config.
 ///
 /// Returns the configured `TOON_BIN` as shell-style arguments, or the default
-/// `"tru"` if not configured.
+/// `"toon"` if not configured, matching the `tru` package's executable name.
 #[must_use]
 pub fn resolve_encoder(config: &Config) -> Vec<String> {
     let raw = config.toon_bin.as_deref().unwrap_or(DEFAULT_ENCODER).trim();
@@ -381,27 +380,17 @@ pub fn resolve_encoder(config: &Config) -> Vec<String> {
 
 /// Check if a binary looks like the `toon_rust` encoder.
 ///
-/// Rejects binaries named exactly "toon" or "toon.exe" (Node.js CLI protection).
-/// Runs `exe --help` and `exe --version` to validate.
+/// Runs successful `--help` / `--version` probes to distinguish the Rust
+/// encoder from incompatible CLIs. The Rust package now also names its binary
+/// `toon`, so the executable basename cannot distinguish the implementations.
 pub fn looks_like_toon_rust_encoder(exe: &str) -> Result<bool, std::io::Error> {
-    // Extract basename
-    let basename = Path::new(exe)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(exe)
-        .to_lowercase();
-
-    // Reject Node.js toon CLI
-    if basename == "toon" || basename == "toon.exe" {
-        return Ok(false);
-    }
-
     // Try --help: look for "reference implementation in rust"
     if let Ok(output) = Command::new(exe).arg("--help").output() {
         let text = String::from_utf8_lossy(&output.stdout);
-        if text
-            .to_lowercase()
-            .contains("reference implementation in rust")
+        if output.status.success()
+            && text
+                .to_lowercase()
+                .contains("reference implementation in rust")
         {
             return Ok(true);
         }
@@ -410,7 +399,7 @@ pub fn looks_like_toon_rust_encoder(exe: &str) -> Result<bool, std::io::Error> {
     // Try --version: look for "tru " or "toon_rust " prefix
     if let Ok(output) = Command::new(exe).arg("--version").output() {
         let text = String::from_utf8_lossy(&output.stdout).to_lowercase();
-        if text.starts_with("tru ") || text.starts_with("toon_rust ") {
+        if output.status.success() && (text.starts_with("tru ") || text.starts_with("toon_rust ")) {
             return Ok(true);
         }
     }
@@ -425,7 +414,7 @@ pub fn validate_encoder(encoder_parts: &[String]) -> Result<String, String> {
     match looks_like_toon_rust_encoder(exe) {
         Ok(true) => Ok(exe.clone()),
         Ok(false) => Err(format!(
-            "TOON_BIN resolved to '{exe}', which does not look like toon_rust (expected tru). \
+            "TOON_BIN resolved to '{exe}', which does not look like toon_rust (expected the Rust TOON encoder). \
              Refusing to run a non-toon_rust encoder."
         )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1025,7 +1014,7 @@ mod tests {
     fn resolve_encoder_default() {
         let config = test_config();
         let parts = resolve_encoder(&config);
-        assert_eq!(parts, vec!["tru".to_string()]);
+        assert_eq!(parts, vec!["toon".to_string()]);
     }
 
     #[test]
@@ -1657,7 +1646,7 @@ esac
             ..test_config()
         };
         let parts = resolve_encoder(&config);
-        assert_eq!(parts, vec!["tru".to_string()]);
+        assert_eq!(parts, vec!["toon".to_string()]);
     }
 
     #[test]
@@ -1731,31 +1720,42 @@ esac
         assert!(debug.contains("42"));
     }
 
-    // -- looks_like_toon_rust_encoder basename rejection --
+    // -- Encoder identity probes (process-boundary controls, not codec proof) --
 
-    #[test]
-    fn basename_toon_rejected() {
-        // "toon" basename should be rejected regardless of path
-        let result = looks_like_toon_rust_encoder("toon");
-        if matches!(result, Ok(true)) {
-            panic!("should reject 'toon' basename");
-        }
+    #[cfg(unix)]
+    fn probe_fixture(name: &str, script: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        (dir, path)
     }
 
+    #[cfg(unix)]
     #[test]
-    fn basename_toon_exe_rejected() {
-        let result = looks_like_toon_rust_encoder("toon.exe");
-        if matches!(result, Ok(true)) {
-            panic!("should reject 'toon.exe' basename");
-        }
+    fn rust_encoder_named_toon_is_accepted() {
+        let (_dir, path) = probe_fixture(
+            "toon",
+            "#!/bin/sh\nprintf '%s\\n' 'TOON reference implementation in Rust (JSON <-> TOON)'\n",
+        );
+        assert!(looks_like_toon_rust_encoder(path.to_str().unwrap()).unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn basename_toon_in_path_rejected() {
-        let result = looks_like_toon_rust_encoder("/usr/local/bin/toon");
-        if matches!(result, Ok(true)) {
-            panic!("should reject '/usr/local/bin/toon'");
-        }
+    fn non_rust_toon_version_does_not_authorize_encoder() {
+        let (_dir, path) = probe_fixture("toon.exe", "#!/bin/sh\nprintf '%s\\n' 'toon 0.2.4'\n");
+        assert!(!looks_like_toon_rust_encoder(path.to_str().unwrap()).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_rust_identity_probe_does_not_authorize_encoder() {
+        let (_dir, path) = probe_fixture(
+            "toon",
+            "#!/bin/sh\nprintf '%s\\n' 'tru 0.2.4' 'reference implementation in Rust'\nexit 1\n",
+        );
+        assert!(!looks_like_toon_rust_encoder(path.to_str().unwrap()).unwrap());
     }
 
     // -- EncoderError variants --

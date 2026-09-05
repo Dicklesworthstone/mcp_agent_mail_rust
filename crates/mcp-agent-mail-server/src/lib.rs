@@ -2497,6 +2497,16 @@ fn run_http_headless_supervisor(
     config: mcp_agent_mail_core::Config,
     control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
 ) -> std::io::Result<()> {
+    // The standalone headless process owns its signal policy. Embedders using
+    // run_http_with_control retain their caller-supplied shutdown authority.
+    #[cfg(any(unix, windows))]
+    let (signal_control, control_rx) = if control_rx.is_none() {
+        let signals = [asupersync::signal::sigterm()?, asupersync::signal::sigint()?];
+        let (tx, rx) = mpsc::channel(1);
+        (Some((tx, signals)), Some(rx))
+    } else {
+        (None, control_rx)
+    };
     tracing::info!(
         host = %config.http_host,
         port = config.http_port,
@@ -2505,10 +2515,15 @@ fn run_http_headless_supervisor(
     );
     let runtime = build_http_runtime()?;
     let result_rx = spawn_http_supervisor_task(runtime.handle(), config, None, control_rx, None)?;
-    // Unbounded by design: with no TUI there is no shutdown flag — this park
-    // is what keeps the headless process serving until the supervisor exits on
-    // its own (error), the process is signalled, or an embedder's control
-    // channel (`run_http_with_control`) delivers `Shutdown` / disconnects.
+    // Serving has no deadline. Once signalled, request the normal supervisor
+    // drain and use the same bounded join budget as the TUI shutdown path.
+    #[cfg(any(unix, windows))]
+    let result = if let Some((tx, mut signals)) = signal_control {
+        recv_http_supervisor_result_signalled(&result_rx, &tx, &mut signals)
+    } else {
+        recv_http_supervisor_result(result_rx)
+    };
+    #[cfg(not(any(unix, windows)))]
     let result = recv_http_supervisor_result(result_rx);
     drop(runtime);
     result
@@ -4564,6 +4579,45 @@ fn recv_http_supervisor_result(
             "HTTP supervisor task exited without reporting",
         ))
     })
+}
+
+#[cfg(any(unix, windows))]
+fn recv_http_supervisor_result_signalled(
+    result_rx: &std::sync::mpsc::Receiver<std::io::Result<()>>,
+    control_tx: &mpsc::Sender<tui_bridge::ServerControlMsg>,
+    signals: &mut [asupersync::signal::Signal],
+) -> std::io::Result<()> {
+    loop {
+        for signal in &mut *signals {
+            let kind = signal.kind();
+            // Signal::recv is cancel-safe and retains deliveries across polls.
+            // Poll once here, then park on the result receiver for at most
+            // 200ms; no detached signal-forwarder task outlives the server.
+            let received = {
+                let mut next = std::pin::pin!(signal.recv());
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                next.as_mut().poll(&mut cx).is_ready()
+            };
+            if received {
+                tracing::info!(signal = %kind, "headless HTTP shutdown requested");
+                sd_notify("STOPPING=1");
+                send_server_shutdown_control(control_tx);
+                return recv_http_supervisor_result_within(
+                    result_rx,
+                    HTTP_SUPERVISOR_SHUTDOWN_RECV_BUDGET,
+                );
+            }
+        }
+        match result_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(std::io::Error::other(
+                    "HTTP supervisor task exited without reporting",
+                ));
+            }
+        }
+    }
 }
 
 /// Total budget for waiting on the HTTP supervisor's exit report once
@@ -12999,9 +13053,7 @@ to skip auth for local requests.</p>
                         None,
                     );
                 }
-                if let Some(ref fmt) = format_value {
-                    apply_toon_to_content(&mut value, "content", fmt, &self.config);
-                }
+                apply_toon_to_content(&mut value, "content", format_value.as_deref(), &self.config);
                 Ok(value)
             }
             "resources/list" => {
@@ -13038,9 +13090,12 @@ to skip auth for local requests.</p>
                 )?;
                 dispatch_checkpoint(cx, cancel)?;
                 let mut value = serde_json::to_value(out).map_err(McpError::from)?;
-                if let Some(ref fmt) = format_value {
-                    apply_toon_to_content(&mut value, "contents", fmt, &self.config);
-                }
+                apply_toon_to_content(
+                    &mut value,
+                    "contents",
+                    format_value.as_deref(),
+                    &self.config,
+                );
                 Ok(value)
             }
             "resources/subscribe" | "resources/unsubscribe" | "ping" => Ok(serde_json::json!({})),
@@ -15731,16 +15786,16 @@ fn log_tool_query_stats(
 /// `content_key` is "content" for tool results (`CallToolResult.content`)
 /// or "contents" for resource results (`ReadResourceResult.contents`).
 ///
-/// Walks each content block, finds ones with `type:"text"`, parses the
-/// text as JSON, applies TOON encoding, and replaces the text with the
-/// envelope JSON string.
+/// Tool text blocks carry `type:"text"`; resource text contents carry a
+/// `text` field without that discriminator. Parse their JSON payloads and
+/// apply the explicit format or the configured default.
 fn apply_toon_to_content(
     value: &mut serde_json::Value,
     content_key: &str,
-    format_value: &str,
+    format_value: Option<&str>,
     config: &mcp_agent_mail_core::Config,
 ) {
-    let Ok(decision) = mcp_agent_mail_core::toon::resolve_output_format(Some(format_value), config)
+    let Ok(decision) = mcp_agent_mail_core::toon::resolve_output_format(format_value, config)
     else {
         return;
     };
@@ -15754,10 +15809,12 @@ fn apply_toon_to_content(
     };
 
     for block in blocks {
-        let is_text = block
-            .get("type")
-            .and_then(|t| t.as_str())
-            .is_some_and(|t| t == "text");
+        let is_text = (content_key == "contents"
+            && block.get("text").is_some_and(serde_json::Value::is_string))
+            || block
+                .get("type")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t == "text");
         if !is_text {
             continue;
         }
@@ -15771,7 +15828,7 @@ fn apply_toon_to_content(
         };
         // Apply TOON format wrapping
         if let Ok(Some(envelope)) =
-            mcp_agent_mail_core::toon::apply_toon_format(&payload, Some(format_value), config)
+            mcp_agent_mail_core::toon::apply_toon_format(&payload, format_value, config)
             && let Ok(envelope_json) = serde_json::to_string(&envelope)
         {
             block["text"] = serde_json::Value::String(envelope_json);
@@ -26865,7 +26922,7 @@ first body
         let mut value = serde_json::json!({
             "content": [{"type": "text", "text": "{\"id\":1}"}]
         });
-        apply_toon_to_content(&mut value, "content", "json", &config);
+        apply_toon_to_content(&mut value, "content", Some("json"), &config);
         // Should be unchanged
         assert_eq!(value["content"][0]["text"].as_str().unwrap(), "{\"id\":1}");
     }
@@ -26876,7 +26933,7 @@ first body
         let mut value = serde_json::json!({
             "content": [{"type": "text", "text": "{\"id\":1}"}]
         });
-        apply_toon_to_content(&mut value, "content", "xml", &config);
+        apply_toon_to_content(&mut value, "content", Some("xml"), &config);
         // Should be unchanged (invalid format)
         assert_eq!(value["content"][0]["text"].as_str().unwrap(), "{\"id\":1}");
     }
@@ -26887,7 +26944,7 @@ first body
         let mut value = serde_json::json!({
             "content": [{"type": "text", "text": "{\"id\":1,\"subject\":\"Test\"}"}]
         });
-        apply_toon_to_content(&mut value, "content", "toon", &config);
+        apply_toon_to_content(&mut value, "content", Some("toon"), &config);
         let text = value["content"][0]["text"].as_str().unwrap();
         let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
         // Format is either "toon" (encoder present) or "json" (fallback)
@@ -26917,7 +26974,7 @@ first body
         let mut value = serde_json::json!({
             "content": [{"type": "text", "text": "{\"id\":1,\"subject\":\"Test\"}"}]
         });
-        apply_toon_to_content(&mut value, "content", "toon", &config);
+        apply_toon_to_content(&mut value, "content", Some("toon"), &config);
         let text = value["content"][0]["text"].as_str().unwrap();
         let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(envelope["format"], "json"); // fallback
@@ -26932,7 +26989,7 @@ first body
         let mut value = serde_json::json!({
             "content": [{"type": "text", "text": "not json content"}]
         });
-        apply_toon_to_content(&mut value, "content", "toon", &config);
+        apply_toon_to_content(&mut value, "content", Some("toon"), &config);
         // Non-JSON text should be left as-is
         assert_eq!(
             value["content"][0]["text"].as_str().unwrap(),
@@ -26943,17 +27000,41 @@ first body
     #[test]
     fn toon_wrapping_respects_content_key() {
         let config = mcp_agent_mail_core::Config::default();
-        // Resources use "contents" not "content"
+        // Real MCP resources have no tool content type discriminator.
         let mut value = serde_json::json!({
-            "contents": [{"type": "text", "text": "{\"agent\":\"Blue\"}"}]
+            "contents": [{"uri": "resource://agents/backend", "mimeType": "application/json",
+                          "text": "{\"agent\":\"Blue\"}"}]
         });
-        apply_toon_to_content(&mut value, "contents", "toon", &config);
+        apply_toon_to_content(&mut value, "contents", Some("toon"), &config);
         let text = value["contents"][0]["text"].as_str().unwrap();
         let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
         // Format is either "toon" (encoder present) or "json" (fallback)
         let fmt = envelope["format"].as_str().unwrap();
         assert!(fmt == "toon" || fmt == "json");
         assert_eq!(envelope["meta"]["requested"], "toon");
+    }
+
+    #[test]
+    fn toon_wrapping_uses_configured_default_and_explicit_json_overrides_it() {
+        let config = mcp_agent_mail_core::Config {
+            output_format_default: Some("toon".to_string()),
+            toon_bin: Some("/nonexistent/encoder".to_string()),
+            ..Default::default()
+        };
+        let original = serde_json::json!({
+            "content": [{"type": "text", "text": "{\"id\":1}"}]
+        });
+        let mut explicit = original.clone();
+        apply_toon_to_content(&mut explicit, "content", Some("json"), &config);
+        assert_eq!(explicit, original);
+
+        let mut implicit = original;
+        apply_toon_to_content(&mut implicit, "content", None, &config);
+        let envelope: serde_json::Value =
+            serde_json::from_str(implicit["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["meta"]["source"], "default");
+        assert_eq!(envelope["data"]["id"], 1);
+        assert!(envelope["meta"]["toon_error"].is_string());
     }
 
     #[test]

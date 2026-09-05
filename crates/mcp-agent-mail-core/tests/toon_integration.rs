@@ -98,21 +98,30 @@ fn nonexistent_encoder_fails_validation() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn toon_basename_rejected() {
-    // A binary named exactly "toon" should be rejected (Node.js protection)
-    let result = looks_like_toon_rust_encoder("toon");
-    if matches!(result, Ok(true)) {
-        panic!("should reject 'toon' basename");
-    }
+fn rust_encoder_probe_can_use_published_toon_basename() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("toon");
+    std::fs::copy(stub_encoder_path(), &path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(looks_like_toon_rust_encoder(path.to_str().unwrap()).unwrap());
 }
 
+#[cfg(unix)]
 #[test]
-fn toon_exe_basename_rejected() {
-    let result = looks_like_toon_rust_encoder("toon.exe");
-    if matches!(result, Ok(true)) {
-        panic!("should reject 'toon.exe' basename");
-    }
+fn non_rust_toon_exe_remains_rejected() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("toon.exe");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\nprintf '%s\\n' 'TOON encoder for Node.js' 'toon 0.2.4'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!looks_like_toon_rust_encoder(path.to_str().unwrap()).unwrap());
 }
 
 // ---------------------------------------------------------------------------
