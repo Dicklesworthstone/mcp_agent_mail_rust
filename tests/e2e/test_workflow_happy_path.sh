@@ -64,7 +64,8 @@ session_base.mkdir(parents=True, exist_ok=True)
 session = Path(tempfile.mkdtemp(prefix="session-", dir=session_base))
 env = os.environ.copy()
 env.pop("AM_INTERFACE_MODE", None)
-env.update(DATABASE_URL="sqlite:///" + db, STORAGE_ROOT=storage, RUST_LOG="error",
+env.update(DATABASE_URL="sqlite:///" + db, STORAGE_ROOT=storage,
+           RUST_LOG=os.environ.get("WORKFLOW_RUST_LOG", "error"),
            AM_ATC_ENABLED="false", AM_ATC_WRITE_MODE="off", ATC_LEARNING_DISABLED="1",
            LLM_ENABLED="false", NOTIFICATIONS_ENABLED="false", TUI_ENABLED="false")
 started = time.monotonic()
