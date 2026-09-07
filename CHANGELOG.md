@@ -12,16 +12,16 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## [v0.3.33](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.33) — 2026-09-07
 
-FrankenSQLite is pinned to **0.3.17**, up from **0.3.11** in v0.3.32.
+FrankenSQLite is pinned to **0.3.18**, up from **0.3.11** in v0.3.32.
 SQLModel 0.4.0, Asupersync 0.4.9, and FastMCP 0.7.1 remain pinned to the
 compatible runtime stack. The portable binaries include lexical search.
 
 ### Known issues
 
-- FrankenSQLite 0.3.17 still reproduces the tracked bound-UPDATE persistence,
+- FrankenSQLite 0.3.18 still reproduces the tracked bound-UPDATE persistence,
   ADD COLUMN catalog-normalization, and foreign SQLite WAL-reader close/write-loss
-  probes. The dependency update does not establish that these engine defects
-  are fixed. Current validation results and limitations accompany the release.
+  probes. Those engine defects remain open. Validation results and limitations
+  accompany the release.
 
 - **The published container image is still frozen at `v0.3.13`.** The v0.3.31
   notes said the ghcr image was unstuck; the registry disagrees. `docker.yml`
@@ -146,13 +146,13 @@ compatible runtime stack. The portable binaries include lexical search.
   of unconditionally importing Unix APIs. Missing identity declines reuse.
   A native Windows regression checks that replacement invalidates the stamp
   even when the replacement has the same size and modification time.
-- **Offline contact-handshake welcome messages reach the Git archive before
-  the CLI exits.** The local macro now drains the existing archive queue and
-  commit coalescer while retaining its mailbox mutation locks. Previously the
-  command could return success with a persisted SQLite row but exit before
-  writing its archive artifact. The unchanged real workflow passes all42
-  assertions, including offline macros, reservations, guard enforcement, HTTP
-  messaging, concurrent clients, and persisted reopen.
+- **Offline CLI commands drain queued archive writes before process exit.**
+  Ordinary sends previously returned success with a persisted SQLite row but
+  could exit before writing its archive artifact. CLI shutdown now drains the
+  existing write queue and commit coalescer. Contact-handshake welcomes also
+  drain while retaining the macro's mailbox mutation locks. The real workflow
+  checks ordinary sends and welcomes against SQLite and archive files after
+  their CLI processes exit.
 - **Read and acknowledgement replies require actual stored integer receipts.**
   Suppressed writes return an error and roll back inbox statistics instead of
   inventing a timestamp or leaving an idempotent success record. Real-engine
