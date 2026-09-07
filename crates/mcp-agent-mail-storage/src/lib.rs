@@ -6304,7 +6304,9 @@ pub fn enqueue_async_commit(
 /// Call this in tests, during graceful shutdown, or before reading git history
 /// that depends on recent writes.
 pub fn flush_async_commits() {
-    get_commit_coalescer().flush_sync();
+    if let Some(coalescer) = COMMIT_COALESCER.get() {
+        coalescer.flush_sync();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -12572,6 +12574,36 @@ mod tests {
         };
         assert!(!extra.any_dead());
         assert_eq!(extra.dead_workers(), 0);
+    }
+
+    #[test]
+    fn flush_async_commits_does_not_start_idle_workers() {
+        const CHILD: &str = "AM_TEST_IDLE_COALESCER_FLUSH_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(COMMIT_COALESCER.get().is_none());
+            flush_async_commits();
+            assert!(COMMIT_COALESCER.get().is_none());
+            assert_eq!(COMMIT_COALESCER_WORKERS_EXPECTED.load(Ordering::Relaxed), 0);
+            return;
+        }
+
+        // Other tests may initialize these process-wide statics. Exercise the
+        // public flush in a fresh process, as a read-only CLI invocation does.
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "tests::flush_async_commits_does_not_start_idle_workers",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run cold coalescer flush regression");
+        assert!(
+            output.status.success(),
+            "cold coalescer flush failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

@@ -873,6 +873,31 @@ assert existing["thread"]["examples"] == [], existing
 assert any(message["id"] == welcome_id and message["body_md"] == welcome_body
            for message in existing["inbox"]), existing
 
+# Ordinary one-shot mail commands must drain their own archive queue too.
+offline_body = "Archive this ordinary offline CLI send before process exit."
+stdout, _ = run("ordinary_send", ["mail", "send", "--project", session_project,
+                                 "--from", "RedFox", "--to", "BluePeak",
+                                 "--subject", "Offline send archive witness",
+                                 "--body", offline_body, "--json"])
+offline_id = payload(stdout)["id"]
+with closing(sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True)) as conn:
+    assert conn.execute("SELECT body_md FROM messages WHERE id = ?",
+                        (offline_id,)).fetchone() == (offline_body,)
+offline_archives = []
+for path in Path(storage).glob("projects/*/messages/**/*.md"):
+    content = path.read_text()
+    if content.startswith("---json\n") and "\n---\n" in content:
+        metadata, archived_body = content[8:].split("\n---\n", 1)
+        if json.loads(metadata).get("id") == offline_id:
+            offline_archives.append(path)
+            assert archived_body.strip() == offline_body
+assert len(offline_archives) == 1, offline_archives
+stdout, _ = run("ordinary_send_reopen", ["mail", "inbox", "--project", session_project,
+                                        "--agent", "BluePeak", "--include-bodies", "--json"],
+                agent="BluePeak")
+assert any(message["id"] == offline_id and message["body_md"] == offline_body
+           for message in json.loads(stdout))
+
 pattern = "src/offline-cycle.rs"
 stdout, _ = run("reserve", ["file_reservations", "reserve", project, "RedFox", pattern,
                             "--exclusive", "--ttl", "3600", "--reason", "br-21gj.4.4"])

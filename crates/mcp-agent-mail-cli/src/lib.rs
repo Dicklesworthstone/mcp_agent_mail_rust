@@ -3549,7 +3549,13 @@ pub fn run_with_invocation_name(invocation_name: &'static str) -> i32 {
         Ok(cli) => cli,
         Err(code) => return code,
     };
-    match execute(cli) {
+    let result = execute(cli);
+    // One-shot commands can enqueue archive writes just before returning.
+    // Drain this process's queue and commits before the binary calls exit;
+    // neither shutdown operation initializes storage for read-only commands.
+    mcp_agent_mail_storage::wbq_shutdown();
+    mcp_agent_mail_storage::flush_async_commits();
+    match result {
         Ok(()) => 0,
         Err(err) => {
             emit_error(&err);
