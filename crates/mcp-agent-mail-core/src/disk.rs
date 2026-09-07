@@ -854,6 +854,11 @@ pub fn sqlite_file_path_from_database_url(database_url: &str) -> Option<PathBuf>
         // captured Windows URLs without surprise.
         path.remove(0);
     }
+    if path.starts_with(r"/\\") {
+        // The slash before a backslash UNC root belongs to `sqlite:///`.
+        // Keep both network-root backslashes, including a verbatim namespace.
+        path.remove(0);
+    }
 
     if path.is_empty() {
         return None;
@@ -865,23 +870,28 @@ pub fn sqlite_file_path_from_database_url(database_url: &str) -> Option<PathBuf>
 /// Construct a `sqlite:///` URL from a filesystem path, applying the
 /// normalizations that `sqlite_file_path_from_database_url` expects.
 ///
-/// On Windows this strips a leading `\\?\` (or `\\?\UNC\`) verbatim prefix
-/// returned by `fs::canonicalize` and converts path separators to `/`. Without
-/// the prefix-strip, the literal `?` inside `\\?\` is interpreted as the URL
-/// query separator and the embedded path is truncated to garbage (issue #93).
+/// Windows drive paths use forward slashes without their leading `\\?\`.
+/// Network paths retain their UNC root and use backslashes to distinguish it
+/// from the Unix absolute-path slash forms. Extended UNC paths also retain
+/// their namespace: removing it can change long paths or trailing-dot names.
+/// The parser preserves the literal `?` inside that namespace (issue #93).
 ///
 /// Use this everywhere a `SQLite` database URL is constructed from a `Path`
 /// instead of `format!("sqlite:///{}", path.display())`.
 #[must_use]
 pub fn sqlite_url_from_path(path: &Path) -> String {
     let raw = path.to_string_lossy();
-    // Strip Windows UNC verbatim prefix (`\\?\` or `\\?\UNC\`).  Stripping
-    // these is always safe because the byte sequence is not a legal component
-    // of any normal Unix path; doing it unconditionally lets cross-platform
-    // tests on Linux exercise this branch without `cfg!(windows)` gating.
-    let stripped = raw
-        .strip_prefix(r"\\?\UNC\")
-        .or_else(|| raw.strip_prefix(r"\\?\"));
+    if raw.starts_with(r"\\?\UNC\")
+        || (raw.starts_with(r"\\") && !raw.starts_with(r"\\?\") && !raw.starts_with(r"\\.\"))
+    {
+        return format!("sqlite:///{raw}");
+    }
+    if cfg!(windows) && raw.starts_with("//") {
+        return format!("sqlite:///{}", raw.replace('/', r"\"));
+    }
+    // Preserve the existing drive-path normalization, including captured
+    // Windows paths parsed by tooling running on Unix.
+    let stripped = raw.strip_prefix(r"\\?\");
     let cleaned: std::borrow::Cow<'_, str> = match stripped {
         Some(s) => std::borrow::Cow::Owned(s.replace('\\', "/")),
         None if cfg!(windows) => std::borrow::Cow::Owned(raw.replace('\\', "/")),
@@ -1260,7 +1270,9 @@ mod tests {
             ),
         ] {
             let classified = classify_sqlite_recovery_candidate_name(primary, OsStr::new(name))
-                .unwrap_or_else(|| panic!("expected published candidate: {name}"));
+                .unwrap_or_else(|| {
+                    panic!("expected published candidate: {name}"); // ubs:ignore -- cfg(test) assertion
+                });
             assert_eq!(classified.kind(), expected_kind, "candidate {name}");
         }
 
@@ -1893,6 +1905,81 @@ mod tests {
         assert_eq!(url, "sqlite:////var/data/db.sqlite3");
         let parsed = sqlite_file_path_from_database_url(&url).expect("round-trip");
         assert_eq!(parsed, PathBuf::from("/var/data/db.sqlite3"));
+    }
+
+    #[test]
+    fn sqlite_url_round_trip_preserves_windows_unc_network_root() {
+        for path in [
+            r"\\server\share\mail\db.sqlite3",
+            r"\\?\UNC\server\share\mail\db.sqlite3",
+            r"\\server\share with spaces\mail\db.sqlite3",
+            r"\\?\UNC\server\share\trailing.\db.sqlite3",
+            r"\\?\UNC\server\share\trailing \db.sqlite3",
+        ] {
+            let url = sqlite_url_from_path(Path::new(path));
+            assert_eq!(
+                sqlite_file_path_from_database_url(&url),
+                Some(PathBuf::from(path)),
+                "network root and namespace must survive: {url:?}"
+            );
+        }
+        let long_path = format!(
+            r"\\?\UNC\server\share\{}\db.sqlite3",
+            "directory\\".repeat(35)
+        );
+        assert_eq!(
+            sqlite_file_path_from_database_url(&sqlite_url_from_path(Path::new(&long_path))),
+            Some(PathBuf::from(long_path))
+        );
+    }
+
+    #[test]
+    fn sqlite_url_parses_windows_unc_without_consuming_the_network_root() {
+        for scheme in ["sqlite", "sqlite+aiosqlite"] {
+            for path in [
+                r"\\server\share\db.sqlite3",
+                r"\\?\UNC\server\share\db.sqlite3",
+            ] {
+                for separator in ["//", "///"] {
+                    for suffix in ["", "?mode=ro", "#fragment", "?mode=ro#fragment"] {
+                        let url = format!("{scheme}:{separator}{path}{suffix}");
+                        assert_eq!(
+                            sqlite_file_path_from_database_url(&url),
+                            Some(PathBuf::from(path)),
+                            "UNC URL should retain its network root: {url:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(sqlite_file_path_from_database_url(r"https:///\\server\share\db").is_none());
+        assert!(sqlite_file_path_from_database_url("sqlite:///?mode=ro").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sqlite_url_from_forward_slash_unc_path_keeps_network_root() {
+        let url = sqlite_url_from_path(Path::new("//server/share/mail/db.sqlite3"));
+        assert_eq!(
+            sqlite_file_path_from_database_url(&url),
+            Some(PathBuf::from(r"\\server\share\mail\db.sqlite3"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_url_unc_handling_preserves_unix_path_contract() {
+        for path in ["/tmp/db.sqlite3", r"/tmp/back\slash/db.sqlite3"] {
+            assert_eq!(
+                sqlite_file_path_from_database_url(&sqlite_url_from_path(Path::new(path))),
+                Some(PathBuf::from(path))
+            );
+        }
+        // Repeated forward slashes retain the documented Unix absolute-path rule.
+        assert_eq!(
+            sqlite_file_path_from_database_url("sqlite://///tmp/db.sqlite3"),
+            Some(PathBuf::from("/tmp/db.sqlite3"))
+        );
     }
 
     #[test]

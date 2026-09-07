@@ -3549,7 +3549,13 @@ pub fn run_with_invocation_name(invocation_name: &'static str) -> i32 {
         Ok(cli) => cli,
         Err(code) => return code,
     };
-    match execute(cli) {
+    let result = execute(cli);
+    // One-shot commands can enqueue archive writes just before returning.
+    // Drain this process's queue and commits before the binary calls exit;
+    // neither shutdown operation initializes storage for read-only commands.
+    mcp_agent_mail_storage::wbq_shutdown();
+    mcp_agent_mail_storage::flush_async_commits();
+    match result {
         Ok(()) => 0,
         Err(err) => {
             emit_error(&err);
@@ -16086,7 +16092,7 @@ fn open_db_async_canonical_read_with_database_url(
             context,
         )?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
+    pool_cfg.database_url = sqlite_url_from_path(source.actual_path());
     pool_cfg.storage_root = Some(storage_root);
     let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
         .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
@@ -16111,7 +16117,7 @@ fn open_db_sync_async_canonical_read_with_database_url(
         )?;
     let conn = source.open_read_only(context)?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
+    pool_cfg.database_url = sqlite_url_from_path(source.actual_path());
     pool_cfg.storage_root = Some(storage_root);
     let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
         .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
@@ -16142,7 +16148,7 @@ fn open_db_sync_async_canonical_read_best_effort_with_database_url(
         )?;
     let conn = source.open_read_only(context)?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
+    pool_cfg.database_url = sqlite_url_from_path(source.actual_path());
     pool_cfg.storage_root = Some(storage_root);
     pool_cfg.run_migrations = false;
     pool_cfg.warmup_connections = 0;
@@ -16197,7 +16203,7 @@ fn open_atc_simulate_read_pool_with_database_url(
     }
     let conn = source.open_read_only("ATC simulate snapshot")?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
+    pool_cfg.database_url = sqlite_url_from_path(source.actual_path());
     pool_cfg.storage_root = Some(storage_root);
     pool_cfg.run_migrations = false;
     pool_cfg.warmup_connections = 0;

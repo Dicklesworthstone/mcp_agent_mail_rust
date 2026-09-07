@@ -23,10 +23,10 @@ compatible runtime stack. The portable binaries include lexical search.
 
 ### Known issues
 
-- FrankenSQLite 0.3.17 still reproduces the tracked bound-UPDATE persistence,
+- FrankenSQLite 0.3.18 still reproduces the tracked bound-UPDATE persistence,
   ADD COLUMN catalog-normalization, and foreign SQLite WAL-reader close/write-loss
-  probes. The dependency update does not establish that these engine defects
-  are fixed. Current validation results and limitations accompany the release.
+  probes. Those engine defects remain open. Validation results and limitations
+  accompany the release.
 
 - **The published container image is still frozen at `v0.3.13`.** The v0.3.31
   notes said the ghcr image was unstuck; the registry disagrees. `docker.yml`
@@ -170,18 +170,23 @@ compatible runtime stack. The portable binaries include lexical search.
   nevertheless used to resolve it, so the caller's server was asked about the
   daemon's pane id and a colliding `%N` there could verify the wrong pane.
   The socket now applies only to an explicit `pane_id`.
+- **Windows snapshot readers use the existing SQLite path encoder.** Canonical
+  temporary paths contain a `\\?\` prefix; directly interpolating them into a
+  SQLite URL left an extra leading slash in the parsed filesystem path. Inbox,
+  search, product, and ATC snapshot pools now use `sqlite_url_from_path` to open
+  the intended private database.
 - **Health-verdict caching compiles on Windows and retains real file identity.**
   The metadata stamp now uses Windows volume and file-index information instead
   of unconditionally importing Unix APIs. Missing identity declines reuse.
   A native Windows regression checks that replacement invalidates the stamp
   even when the replacement has the same size and modification time.
-- **Offline contact-handshake welcome messages reach the Git archive before
-  the CLI exits.** The local macro now drains the existing archive queue and
-  commit coalescer while retaining its mailbox mutation locks. Previously the
-  command could return success with a persisted SQLite row but exit before
-  writing its archive artifact. The unchanged real workflow passes all42
-  assertions, including offline macros, reservations, guard enforcement, HTTP
-  messaging, concurrent clients, and persisted reopen.
+- **Offline CLI commands drain queued archive writes before process exit.**
+  Ordinary sends previously returned success with a persisted SQLite row but
+  could exit before writing its archive artifact. CLI shutdown now drains the
+  existing write queue and commit coalescer. Contact-handshake welcomes also
+  drain while retaining the macro's mailbox mutation locks. The real workflow
+  checks ordinary sends and welcomes against SQLite and archive files after
+  their CLI processes exit.
 - **Read and acknowledgement replies require actual stored integer receipts.**
   Suppressed writes return an error and roll back inbox statistics instead of
   inventing a timestamp or leaving an idempotent success record. Real-engine
