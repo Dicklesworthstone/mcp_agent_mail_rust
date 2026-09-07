@@ -9829,16 +9829,36 @@ fn health_verdict_reuse_window() -> Duration {
     Duration::from_secs(secs.min(HEALTH_VERDICT_REUSE_WINDOW_MAX_SECS))
 }
 
-/// Device, inode, length, and mtime of a regular file; `None` for anything
-/// else (missing, symlink, directory), which also means "never reuse".
+/// Device/volume, inode/file index, length, and mtime of a regular file.
+/// `None` for missing, nonregular, or unidentifiable files means "never reuse".
 fn health_probe_file_stamp(path: &Path) -> Option<(u64, u64, u64, i128)> {
-    use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::symlink_metadata(path).ok()?;
     if !metadata.file_type().is_file() {
         return None;
     }
-    let mtime = i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec());
-    Some((metadata.dev(), metadata.ino(), metadata.len(), mtime))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mtime =
+            i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec());
+        Some((metadata.dev(), metadata.ino(), metadata.len(), mtime))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Windows timestamps use 100 ns ticks from its native epoch. Cache
+        // entries are process-local, so only exact equality is significant.
+        Some((
+            u64::from(metadata.volume_serial_number()?),
+            metadata.file_index()?,
+            metadata.len(),
+            i128::from(metadata.last_write_time()) * 100,
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
 }
 
 fn health_verdict_fingerprint(path: &Path) -> Option<HealthVerdictFingerprint> {
@@ -24012,6 +24032,41 @@ mod tests {
             .expect("insert");
         crate::close_db_conn(conn, "seed healthy probe db");
         path
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn health_probe_file_stamp_tracks_identity_and_rejects_nonfiles() {
+        let dir = tempfile::tempdir().expect("stamp fixture");
+        let path = dir.path().join("main.db");
+        assert!(health_probe_file_stamp(&path).is_none());
+        assert!(health_probe_file_stamp(dir.path()).is_none());
+
+        let replacement = dir.path().join("replacement.db");
+        let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for (file_path, contents) in [(&path, b"old!"), (&replacement, b"new!")] {
+            std::fs::write(file_path, contents).expect("write fixture");
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(file_path)
+                .expect("open fixture metadata");
+            file.set_times(std::fs::FileTimes::new().set_modified(modified))
+                .expect("set identical modification times");
+        }
+        let before = health_probe_file_stamp(&path).expect("regular file identity");
+        assert_eq!(health_probe_file_stamp(&path), Some(before));
+        std::fs::rename(&path, dir.path().join("preserved.db")).expect("preserve original");
+        std::fs::rename(&replacement, &path).expect("install replacement");
+        let after = health_probe_file_stamp(&path).expect("replacement identity");
+        assert_eq!((before.2, before.3), (after.2, after.3));
+        assert_ne!((before.0, before.1), (after.0, after.1));
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.db");
+            std::os::unix::fs::symlink(&path, &link).expect("create symlink");
+            assert!(health_probe_file_stamp(&link).is_none());
+        }
     }
 
     /// br-eru3j: back-to-back probes of an unchanged family stage and check

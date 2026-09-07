@@ -141,6 +141,11 @@ compatible runtime stack. The portable binaries include lexical search.
 
 ### Fixed
 
+- **Health-verdict caching compiles on Windows and retains real file identity.**
+  The metadata stamp now uses Windows volume and file-index information instead
+  of unconditionally importing Unix APIs. Missing identity declines reuse.
+  A native Windows regression checks that replacement invalidates the stamp
+  even when the replacement has the same size and modification time.
 - **Offline contact-handshake welcome messages reach the Git archive before
   the CLI exits.** The local macro now drains the existing archive queue and
   commit coalescer while retaining its mailbox mutation locks. Previously the

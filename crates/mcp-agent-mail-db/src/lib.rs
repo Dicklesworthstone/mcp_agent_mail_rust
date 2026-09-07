@@ -15,6 +15,9 @@
 // Raised for the trait solver: proving Send/CoerceUnsized for the boxed async blocks in
 // queries.rs overflows the default limit on newer rustc. Not a defect in the code.
 #![recursion_limit = "512"]
+// Health-verdict reuse needs the real Windows volume/file identity, never a
+// length/timestamp substitute. This workspace already requires nightly Rust.
+#![cfg_attr(windows, feature(windows_by_handle))]
 #![forbid(unsafe_code)]
 #![allow(
     clippy::result_large_err,
