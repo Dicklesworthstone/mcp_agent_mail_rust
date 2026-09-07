@@ -12,7 +12,12 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## [v0.3.33](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.33) — 2026-09-07
 
-FrankenSQLite is pinned to **0.3.17**, up from **0.3.11** in v0.3.32.
+FrankenSQLite is pinned to **0.3.18**, up from **0.3.11** in v0.3.32. That
+engine line carries the page-allocator EOF-growth double-grant fix (0.3.16,
+the "page N double-referenced" corruption class recurring on v0.3.32 in
+GH#278), the GH#402 post-commit checkpoint rescan fix (0.3.14), and 0.3.18's
+rowid-seek planning for parameterized `rowid IN (?, …)` lists, GID-aware
+namespace-sidecar modes, and fail-closed byte-neutral read-only WAL readers.
 SQLModel 0.4.0, Asupersync 0.4.9, and FastMCP 0.7.1 remain pinned to the
 compatible runtime stack. The portable binaries include lexical search.
 
@@ -32,6 +37,23 @@ compatible runtime stack. The portable binaries include lexical search.
 
 ### Security
 
+- **Every tmux probe on the identity path is bounded (GH#310 follow-up).**
+  `X-Tmux-Socket` lets a caller steer the pane-facts queries at a socket of
+  its choosing, and those queries ran `tmux` through an unbounded
+  `Command::output()`. A socket held by a listener that accepts the
+  connection and never answers (`nc -lU /tmp/x`) therefore blocked the
+  identity tool call — and its dispatch slot — for as long as the listener
+  lived. Registration, `macro_start_session` reuse, lifecycle
+  authentication, `resolve_pane_identity`, bare/composite key normalization,
+  the GH#252 live-holder check and the record liveness probe now spawn
+  `tmux` with a 2 s deadline (`AM_TMUX_PROBE_TIMEOUT_MS`, clamped
+  50–60000): at the deadline the child is killed and reaped, a
+  `TMUX_PROBE_TIMEOUT` warning is logged, and the query reports pane facts
+  unavailable — the same degraded outcome as a missing `tmux` binary. A
+  liveness probe that times out is *unverifiable*, never *dead*, so a stalled
+  server can neither enable adoption nor a cleanup purge. The ambient probes
+  (the caller's own `$TMUX_PANE` composite lookup, stale-identity cleanup)
+  get the same bound.
 - **`am self-update` now verifies the signed release manifest (GH#292).** The
   updater used to compare the archive against an unsigned `SHA256SUMS`
   fetched from the same place as the archive, which is weaker than the
@@ -141,6 +163,13 @@ compatible runtime stack. The portable binaries include lexical search.
 
 ### Fixed
 
+- **`resolve_pane_identity` without a `pane_id` ignores the caller's tmux
+  socket (GH#310 follow-up).** The `$TMUX_PANE` fallback names this
+  process's own pane, on its own server; a caller-supplied
+  `tmux_socket_path` (or the daemon-injected `X-Tmux-Socket`) was
+  nevertheless used to resolve it, so the caller's server was asked about the
+  daemon's pane id and a colliding `%N` there could verify the wrong pane.
+  The socket now applies only to an explicit `pane_id`.
 - **Health-verdict caching compiles on Windows and retains real file identity.**
   The metadata stamp now uses Windows volume and file-index information instead
   of unconditionally importing Unix APIs. Missing identity declines reuse.

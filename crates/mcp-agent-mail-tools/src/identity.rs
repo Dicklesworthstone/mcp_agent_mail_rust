@@ -3122,6 +3122,38 @@ pub async fn whois(
         .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
 }
 
+/// The pane a `resolve_pane_identity` call is about, and the tmux server it
+/// must be resolved on.
+///
+/// An explicit `pane_id` is looked up on the caller's server
+/// (`tmux_socket_path`, GH#310). Without one the pane comes from THIS
+/// process's `$TMUX_PANE`, which lives on this process's ambient server, so a
+/// caller socket is ignored: consulting it would ask the caller's server
+/// about a pane id that was never on it, and a colliding `%N` there would
+/// verify the wrong pane. An empty pane means the caller must supply one.
+fn pane_request_target<'a>(
+    pane_id: Option<&str>,
+    tmux_socket_path: Option<&'a str>,
+) -> (String, mcp_agent_mail_core::TmuxServer<'a>) {
+    pane_id
+        .map(str::trim)
+        .filter(|pane| !pane.is_empty())
+        .map_or_else(
+            || {
+                (
+                    mcp_agent_mail_core::get_composite_tmux_pane_id().unwrap_or_default(),
+                    mcp_agent_mail_core::TmuxServer::AMBIENT,
+                )
+            },
+            |pane| {
+                (
+                    pane.to_string(),
+                    mcp_agent_mail_core::TmuxServer::from_validated(tmux_socket_path),
+                )
+            },
+        )
+}
+
 fn resolve_identity_from_project_keys(
     project_keys: &[String],
     pane_id: &str,
@@ -3152,7 +3184,7 @@ fn resolve_identity_from_project_keys(
 /// # Conformance
 /// Rust-native.
 #[tool(
-    description = "Resolve the agent name for a tmux pane from the canonical per-pane identity file.\n\nChecks the following locations in priority order:\n1. Canonical: ~/.config/agent-mail/identity/<project_hash>/<pane_id>\n2. Legacy Claude Code: ~/.claude/agent-mail/identity.<pane_id>\n3. Legacy NTM: /tmp/agent-mail-name.<project_hash>.<pane_id>\n\nEach candidate passes the GH#252 liveness predicate before it is returned: a binding verifiably live in a DIFFERENT pane is never handed out (the lookup reports not-found so the caller mints a fresh identity), a dead binding is adopted and rewritten with the caller pane's facts, and legacy bare-name files resolve under a conservative compatibility rule. The response's `binding` field reports which case applied: \"verified-live\", \"adopted-dead\", or \"legacy-unverified\".\n\nParameters\n----------\nproject_key : str\n    Absolute path to the project directory (used to scope the lookup).\npane_id : Optional[str]\n    Tmux pane identifier (e.g., \"%0\", \"%3\"). If omitted, reads $TMUX_PANE.\ntmux_socket_path : Optional[str]\n    Absolute socket path of the tmux server `pane_id` belongs to (first field of the caller's $TMUX). Pane ids are only unique per server; the HTTP daemon fills this from the X-Tmux-Socket header.\n\nReturns\n-------\ndict\n    { agent_name, pane_id, identity_path, binding }"
+    description = "Resolve the agent name for a tmux pane from the canonical per-pane identity file.\n\nChecks the following locations in priority order:\n1. Canonical: ~/.config/agent-mail/identity/<project_hash>/<pane_id>\n2. Legacy Claude Code: ~/.claude/agent-mail/identity.<pane_id>\n3. Legacy NTM: /tmp/agent-mail-name.<project_hash>.<pane_id>\n\nEach candidate passes the GH#252 liveness predicate before it is returned: a binding verifiably live in a DIFFERENT pane is never handed out (the lookup reports not-found so the caller mints a fresh identity), a dead binding is adopted and rewritten with the caller pane's facts, and legacy bare-name files resolve under a conservative compatibility rule. The response's `binding` field reports which case applied: \"verified-live\", \"adopted-dead\", or \"legacy-unverified\".\n\nParameters\n----------\nproject_key : str\n    Absolute path to the project directory (used to scope the lookup).\npane_id : Optional[str]\n    Tmux pane identifier (e.g., \"%0\", \"%3\"). If omitted, reads $TMUX_PANE.\ntmux_socket_path : Optional[str]\n    Absolute socket path of the tmux server `pane_id` belongs to (first field of the caller's $TMUX). Pane ids are only unique per server; the HTTP daemon fills this from the X-Tmux-Socket header. Ignored when pane_id is omitted (the $TMUX_PANE fallback is this process's own pane, on its own server).\n\nReturns\n-------\ndict\n    { agent_name, pane_id, identity_path, binding }"
 )]
 pub async fn resolve_pane_identity(
     ctx: &McpContext,
@@ -3163,14 +3195,13 @@ pub async fn resolve_pane_identity(
     // without it a pane id from another server would be looked up on this
     // process's ambient tmux (GH#310). Over HTTP the daemon fills this from the
     // `X-Tmux-Socket` header and ignores any body value; stdio callers may pass
-    // it explicitly. Ignored when `pane_id` is absent.
+    // it explicitly. Ignored when `pane_id` is absent: the `$TMUX_PANE`
+    // fallback is this process's own pane, on its own server.
     tmux_socket_path: Option<String>,
 ) -> McpResult<String> {
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
-    let effective_pane = match pane_id {
-        Some(p) if !p.trim().is_empty() => p.trim().to_string(),
-        _ => mcp_agent_mail_core::get_composite_tmux_pane_id().unwrap_or_default(),
-    };
+    let (effective_pane, tmux_server) =
+        pane_request_target(pane_id.as_deref(), tmux_socket_path.as_deref());
 
     if effective_pane.is_empty() {
         return Err(legacy_tool_error(
@@ -3196,12 +3227,7 @@ pub async fn resolve_pane_identity(
         &effective_pane,
     );
 
-    resolve_identity_from_project_keys(
-        &project_keys,
-        &effective_pane,
-        mcp_agent_mail_core::TmuxServer::from_validated(tmux_socket_path.as_deref()),
-    )
-    .map_or_else(
+    resolve_identity_from_project_keys(&project_keys, &effective_pane, tmux_server).map_or_else(
         || {
             Err(legacy_tool_error(
                 "IDENTITY_NOT_FOUND",
@@ -4958,6 +4984,35 @@ body
         // Edge case: multiple @ signs — last one is the host separator
         let result = redact_database_url("postgres://user:p@ss@host/db");
         assert_eq!(result, "postgres://****@host/db");
+    }
+
+    /// GH#310 follow-up: a caller socket only describes the server an
+    /// EXPLICIT pane id belongs to. When the pane falls back to this
+    /// process's own `$TMUX_PANE`, the socket must be ignored rather than
+    /// used to query the caller's server about the daemon's own pane.
+    #[test]
+    fn pane_request_target_ignores_the_caller_socket_without_an_explicit_pane() {
+        use mcp_agent_mail_core::TmuxServer;
+
+        // No caller pane env: the fallback fails closed without running tmux.
+        with_process_env_overrides_for_test(&[("TMUX_PANE", "")], || {
+            let caller_socket = Some("/tmp/tmux-1000/caller");
+            let (pane, server) = pane_request_target(None, caller_socket);
+            assert!(pane.is_empty(), "no pane and no $TMUX_PANE fails closed");
+            assert_eq!(server, TmuxServer::AMBIENT);
+
+            let (pane, server) = pane_request_target(Some("   "), caller_socket);
+            assert!(pane.is_empty(), "blank pane_id is the same as absent");
+            assert_eq!(server, TmuxServer::AMBIENT);
+
+            let (pane, server) = pane_request_target(Some(" %7 "), caller_socket);
+            assert_eq!(pane, "%7");
+            assert_eq!(server, TmuxServer::at_socket("/tmp/tmux-1000/caller"));
+
+            let (pane, server) = pane_request_target(Some("%7"), None);
+            assert_eq!(pane, "%7");
+            assert_eq!(server, TmuxServer::AMBIENT);
+        });
     }
 
     #[test]
