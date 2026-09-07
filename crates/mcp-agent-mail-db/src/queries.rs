@@ -11363,7 +11363,7 @@ pub async fn mark_message_read(
         //
         // We intentionally do not trust `rows_affected` from the UPDATE above:
         // under some backend/runtime combinations, updates that clearly match
-        // a row can report 0. Existence is determined by this read-back query.
+        // a row can report 0. Require the actual stored receipt instead.
         let read_sql =
             "SELECT read_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?";
         let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
@@ -11376,14 +11376,16 @@ pub async fn mark_message_read(
                         format!("{agent_id}:{message_id}"),
                     ));
                 }
-                rows.first()
+                let Some(ts) = rows.first()
                     .and_then(|r| r.get(0))
-                    .and_then(|v| match v {
-                        Value::BigInt(n) => Some(*n),
-                        Value::Int(n) => Some(i64::from(*n)),
-                        _ => None,
-                    })
-                    .unwrap_or(now)
+                    .and_then(value_as_i64)
+                else {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::Internal(format!(
+                        "mark_message_read did not store an integer read_ts for {agent_id}:{message_id}"
+                    )));
+                };
+                ts
             }
             Outcome::Err(e) => {
                 rollback_tx(cx, &tracked).await;
@@ -12088,7 +12090,7 @@ async fn acknowledge_message_impl(
         //
         // We intentionally do not trust `rows_affected` from the UPDATE above:
         // under some backend/runtime combinations, updates that clearly match
-        // a row can report 0. Existence is determined by this read-back query.
+        // a row can report 0. Require both actual stored receipts instead.
         let read_sql =
             "SELECT read_ts, ack_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?";
         let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
@@ -12105,20 +12107,16 @@ async fn acknowledge_message_impl(
                     let row = rows.first();
                     let read_ts = row
                         .and_then(|r| r.get(0))
-                        .and_then(|v| match v {
-                            Value::BigInt(n) => Some(*n),
-                            Value::Int(n) => Some(i64::from(*n)),
-                            _ => None,
-                        })
-                        .unwrap_or(now);
+                        .and_then(value_as_i64);
                     let ack_ts = row
                         .and_then(|r| r.get(1))
-                        .and_then(|v| match v {
-                            Value::BigInt(n) => Some(*n),
-                            Value::Int(n) => Some(i64::from(*n)),
-                            _ => None,
-                        })
-                        .unwrap_or(now);
+                        .and_then(value_as_i64);
+                    let (Some(read_ts), Some(ack_ts)) = (read_ts, ack_ts) else {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(DbError::Internal(format!(
+                            "acknowledge_message did not store integer read_ts and ack_ts for {agent_id}:{message_id}"
+                        )));
+                    };
                     (read_ts, ack_ts)
                 }
                 Outcome::Err(e) => {
@@ -32723,6 +32721,74 @@ mod tests {
             assert_eq!(other_read_ts, None);
             assert_eq!(other_ack_ts, None);
         });
+    }
+
+    #[test]
+    fn receipt_operations_reject_suppressed_updates_without_fabricating_timestamps() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        for (label, acknowledge, already_read) in [
+            ("read", false, false),
+            ("ack", true, false),
+            ("partial_ack", true, true),
+        ] {
+            let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+            let (_cx, pool, _dir) = setup_test_pool(&format!("suppressed_{label}.db"));
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let project = ensure_project(&cx, &pool, "/tmp/am-suppressed-receipt")
+                    .await.into_result().expect("project");
+                let project_id = project.id.expect("project id");
+                let agent = register_agent(
+                    &cx, &pool, project_id, "BlueLake", "codex-cli", "gpt-5",
+                    None, None, None,
+                ).await.into_result().expect("agent");
+                let agent_id = agent.id.expect("agent id");
+                let message = create_message_with_recipients(
+                    &cx, &pool, project_id, agent_id, "Receipt truth", "Body",
+                    None, "normal", true, "[]", &[(agent_id, "to")],
+                ).await.into_result().expect("message");
+                let message_id = message.id.expect("message id");
+                let original_read = if already_read {
+                    Some(mark_message_read(&cx, &pool, agent_id, message_id)
+                        .await.into_result().expect("initial read receipt"))
+                } else {
+                    None
+                };
+                {
+                    let conn = acquire_conn(&cx, &pool).await.into_result().expect("seed connection");
+                    // A real engine trigger suppresses the write while allowing
+                    // UPDATE to return successfully. Verify its effect below.
+                    conn.execute_raw(
+                        "CREATE TRIGGER suppress_receipt_update BEFORE UPDATE ON message_recipients \
+                         BEGIN SELECT RAISE(IGNORE); END;",
+                    ).expect("install update suppressor");
+                    conn.execute_raw("UPDATE inbox_stats SET total_count = 99")
+                        .expect("seed rollback witness");
+                }
+                let outcome = if acknowledge {
+                    acknowledge_message(&cx, &pool, agent_id, message_id).await.map(|_| ())
+                } else {
+                    mark_message_read(&cx, &pool, agent_id, message_id).await.map(|_| ())
+                };
+                let conn = acquire_conn(&cx, &pool).await.into_result().expect("verification connection");
+                let rows = conn.query_sync(
+                    "SELECT read_ts, ack_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?",
+                    &[Value::BigInt(agent_id), Value::BigInt(message_id)],
+                ).expect("read actual stored receipts");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), original_read,
+                    "{label}: the real trigger must suppress the update");
+                assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+                assert!(matches!(outcome, Outcome::Err(DbError::Internal(ref message))
+                    if message.contains("did not store")), "{label}: {outcome:?}");
+                let rows = conn.query_sync("SELECT total_count FROM inbox_stats", &[])
+                    .expect("read rollback witness");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get_named::<i64>("total_count").unwrap(), 99,
+                    "{label}: receipt failure must roll back the stats rebuild");
+            });
+        }
     }
 
     #[test]

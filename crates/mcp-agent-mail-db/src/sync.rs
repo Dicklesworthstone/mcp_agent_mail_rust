@@ -769,24 +769,20 @@ fn compute_agent_inbox_stats_sync(
     conn: &DbConn,
     agent_id: i64,
 ) -> Result<Option<SyncAgentInboxStatsRebuild>, DbError> {
+    // Match the async rebuild's PK JOIN instead of repeating message
+    // subqueries. The inner join still excludes orphan recipient rows.
     let sql = "\
         SELECT \
             COUNT(*) AS total_count, \
-            SUM(CASE WHEN read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
-            SUM(CASE \
-                WHEN ack_ts IS NULL \
-                 AND message_id IN (SELECT id FROM messages WHERE ack_required = 1) \
+            SUM(CASE WHEN mr.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+            SUM(CASE WHEN mr.ack_ts IS NULL AND m.ack_required = 1 \
                 THEN 1 ELSE 0 END) AS ack_pending_count, \
-            (SELECT MAX(created_ts) \
-               FROM messages \
-              WHERE id IN (SELECT message_id \
-                             FROM message_recipients \
-                            WHERE agent_id = ?)) AS last_message_ts \
-        FROM message_recipients \
-        WHERE agent_id = ? \
-          AND message_id IN (SELECT id FROM messages)";
+            MAX(m.created_ts) AS last_message_ts \
+        FROM message_recipients mr \
+        JOIN messages m ON m.id = mr.message_id \
+        WHERE mr.agent_id = ?";
     let rows = conn
-        .query_sync(sql, &[Value::BigInt(agent_id), Value::BigInt(agent_id)])
+        .query_sync(sql, &[Value::BigInt(agent_id)])
         .map_err(|e| DbError::Sqlite(e.to_string()))?;
     let row = rows.first().ok_or_else(|| {
         DbError::Internal(format!(
@@ -2201,6 +2197,81 @@ mod tests {
             .and_then(|r| r.get_named::<String>("importance").ok())
             .unwrap();
         assert_eq!(importance, "urgent");
+    }
+
+    #[test]
+    fn compute_agent_inbox_stats_sync_filters_orphans_and_other_agents() {
+        let conn = DbConn::open_memory().expect("open real aggregate fixture");
+        // A partial schema permits deliberate orphan recipients. They must
+        // neither inflate counts nor contribute a last-message timestamp.
+        conn.execute_raw(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, ack_required INTEGER, created_ts INTEGER); \
+             CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, read_ts INTEGER, ack_ts INTEGER); \
+             INSERT INTO messages VALUES (1, 1, 11), (2, 1, 22), (3, 0, 33), (4, 1, 99); \
+             INSERT INTO message_recipients VALUES \
+                 (1, 10, NULL, NULL), (2, 10, 30, 40), (3, 10, NULL, NULL), \
+                 (4, 20, NULL, NULL), (999, 10, NULL, NULL), (999, 30, NULL, NULL);",
+        )
+        .expect("seed mixed real message and recipient rows");
+
+        let read_stats = |agent_id| {
+            compute_agent_inbox_stats_sync(&conn, agent_id)
+                .expect("aggregate inbox stats")
+                .map(|stats| {
+                    (
+                        stats.total_count,
+                        stats.unread_count,
+                        stats.ack_pending_count,
+                        stats.last_message_ts,
+                    )
+                })
+        };
+        assert_eq!(read_stats(10), Some((3, 2, 1, Some(33))));
+        assert_eq!(read_stats(20), Some((1, 1, 1, Some(99))));
+        assert_eq!(read_stats(30), None, "only orphan recipients remain empty");
+        assert_eq!(read_stats(40), None, "an absent agent remains empty");
+    }
+
+    #[test]
+    fn compute_agent_inbox_stats_sync_reports_query_errors() {
+        let conn = DbConn::open_memory().expect("open schema-less real database");
+        let error = compute_agent_inbox_stats_sync(&conn, 10)
+            .expect_err("missing tables must not appear to be an empty inbox");
+        assert!(matches!(error, DbError::Sqlite(_)), "{error:?}");
+    }
+
+    #[test]
+    fn mark_messages_read_batch_sync_rolls_back_when_stats_query_fails() {
+        let conn = DbConn::open_memory().expect("open real rollback fixture");
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, read_ts INTEGER, ack_ts INTEGER); \
+             CREATE TABLE inbox_stats (agent_id INTEGER PRIMARY KEY, total_count INTEGER, unread_count INTEGER, ack_pending_count INTEGER, last_message_ts INTEGER); \
+             INSERT INTO message_recipients VALUES (1, 10, NULL, NULL); \
+             INSERT INTO inbox_stats VALUES (10, 1, 1, 0, 100);",
+        )
+        .expect("seed receipt and cached stats without the messages table");
+
+        let error = mark_messages_read_batch_sync_conn(&conn, 10, &[1])
+            .expect_err("the actual missing-table query must fail the transaction");
+        assert!(matches!(error, DbError::Sqlite(_)), "{error:?}");
+        let rows = conn
+            .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+            .expect("read rolled-back receipt");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].get_named::<i64>("read_ts").is_err());
+        assert!(rows[0].get_named::<i64>("ack_ts").is_err());
+        let rows = conn
+            .query_sync(
+                "SELECT total_count, unread_count, ack_pending_count, last_message_ts \
+                 FROM inbox_stats WHERE agent_id = 10",
+                &[],
+            )
+            .expect("read restored inbox stats");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("total_count").unwrap(), 1);
+        assert_eq!(rows[0].get_named::<i64>("unread_count").unwrap(), 1);
+        assert_eq!(rows[0].get_named::<i64>("ack_pending_count").unwrap(), 0);
+        assert_eq!(rows[0].get_named::<i64>("last_message_ts").unwrap(), 100);
     }
 
     #[test]
