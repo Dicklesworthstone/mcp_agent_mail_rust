@@ -32742,7 +32742,42 @@ mod tests {
             ("partial_ack", true, true),
         ] {
             let rt = RuntimeBuilder::current_thread().build().expect("runtime");
-            let (_cx, pool, _dir) = setup_test_pool(&format!("suppressed_{label}.db"));
+            let dir = tempfile::tempdir().expect("receipt fixture");
+            let db_path = dir.path().join(format!("suppressed_{label}.db"));
+            let seed = crate::DbConn::open_file(db_path.display().to_string())
+                .expect("open receipt fixture");
+            seed.execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+                .expect("initialize receipt pragmas");
+            seed.execute_raw(&crate::schema::init_schema_sql_base())
+                .expect("initialize receipt schema");
+            rt.block_on(async {
+                let cx = Cx::current().expect("migration context");
+                crate::schema::migrate_to_latest_base(&cx, &seed)
+                    .await
+                    .into_result()
+                    .expect("migrate receipt schema");
+            });
+            // Install DDL before pooled transactions begin. The partial-ack
+            // fixture permits its initial read and suppresses only the ack.
+            let trigger = if already_read {
+                "CREATE TRIGGER suppress_receipt_update BEFORE UPDATE ON message_recipients \
+                 WHEN NEW.ack_ts IS NOT NULL BEGIN SELECT RAISE(IGNORE); END;"
+            } else {
+                "CREATE TRIGGER suppress_receipt_update BEFORE UPDATE ON message_recipients \
+                 BEGIN SELECT RAISE(IGNORE); END;"
+            };
+            seed.execute_raw(trigger)
+                .expect("install update suppressor");
+            drop(seed);
+            let pool = crate::create_pool(&crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("receipt pool");
             rt.block_on(async {
                 let cx = Cx::current().expect("runtime context");
                 let project = ensure_project(&cx, &pool, "/tmp/am-suppressed-receipt")
@@ -32797,13 +32832,6 @@ mod tests {
                         .await
                         .into_result()
                         .expect("seed connection");
-                    // A real engine trigger suppresses the write while allowing
-                    // UPDATE to return successfully. Verify its effect below.
-                    conn.execute_raw(
-                        "CREATE TRIGGER suppress_receipt_update BEFORE UPDATE ON message_recipients \
-                         BEGIN SELECT RAISE(IGNORE); END;",
-                    )
-                    .expect("install update suppressor");
                     conn.execute_raw("UPDATE inbox_stats SET total_count = 99")
                         .expect("seed rollback witness");
                 }

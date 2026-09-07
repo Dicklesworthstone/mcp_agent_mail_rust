@@ -40071,6 +40071,13 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             .map_err(mcp_error_to_cli_error)?;
             let payload = parse_tool_json_payload("macro_contact_handshake", &result)?;
             let welcome_sent = payload.get("welcome_message").is_some_and(|v| !v.is_null());
+            if welcome_sent {
+                // This offline command exits immediately after rendering. Drain
+                // its queued welcome archive before the process ends, while the
+                // mailbox mutation locks still protect this operation.
+                mcp_agent_mail_storage::wbq_shutdown();
+                mcp_agent_mail_storage::flush_async_commits();
+            }
             output::emit_output(&payload, fmt, || {
                 output::success(&format!("Contact handshake: {from} → {to}"));
                 if auto_accept {

@@ -19733,6 +19733,7 @@ mod tests {
                 1,
                 "the election advanced the durable row to the committed id"
             );
+            drop(pooled);
 
             let second = crate::queries::create_message(
                 &cx, &pool, project_id, sender_id, "two", "body", None, "normal", false, "{}",
