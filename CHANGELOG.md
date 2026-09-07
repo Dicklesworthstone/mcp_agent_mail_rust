@@ -130,6 +130,19 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ### Fixed
 
+- **Reconcile-on-read converges after healing a prior-generation reservation
+  artifact (GH#311 follow-up).** The reservation read path resolved a row's
+  archive artifact with the generation-blind `find_reservation_artifact`,
+  whose tie-break among stamped names is the lexicographically smallest. Once
+  a foreign-only row had been healed by re-emitting it under the live
+  generation, both `id-<id>-g<foreign>.json` and `id-<id>-g<live>.json`
+  coexisted and — whenever the superseded token sorted first — every later
+  `file_reservation_paths` call resolved the foreign artifact again, rewrote
+  the identical live artifact and enqueued another archive commit. The active
+  and released healers now read through the generation-aware
+  `read_project_archive_reservation_for_generation` (live-generation or legacy
+  artifact first, blind fallback only when that is the row's sole coverage),
+  so the second read resolves the healed artifact and the heal stops.
 - **The reservation parity fixer reconciles the artifact the detector flagged,
   never prior-generation history (GH#311).** `am doctor fix --only
   fm-db-state-files-reservation-db-archive-parity` resolved the archive

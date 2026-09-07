@@ -967,11 +967,48 @@ impl From<ArchiveReservationState> for ArchiveReservationView {
 /// healing it on next access stays cheap even on a long-lived mailbox. A missing
 /// or malformed artifact returns `None` (it must never block a reservation call);
 /// the caller treats `None` as "needs healing".
+///
+/// Generation-blind: equivalent to
+/// [`read_project_archive_reservation_for_generation`] with an unknown live
+/// generation. Callers that know the live `db_identity` token should use that
+/// variant so a healed current-generation artifact is the one read back.
 #[must_use]
 pub fn read_project_archive_reservation(
     storage_root: &Path,
     project_slug: &str,
     reservation_id: i64,
+) -> Option<ArchiveReservationView> {
+    read_project_archive_reservation_for_generation(
+        storage_root,
+        project_slug,
+        reservation_id,
+        None,
+    )
+}
+
+/// [`read_project_archive_reservation`] attributed to the live database
+/// generation (GH#311 follow-up).
+///
+/// Resolves the artifact the parity checker would compare — the
+/// `live_generation`-stamped file, else the legacy `id-<id>.json` — via
+/// `find_reservation_artifact_for_generation`. When that yields nothing (the
+/// row's only coverage is a prior-generation artifact, or the generation is
+/// unknown and several stamped candidates exist) it falls back to the
+/// generation-blind `find_reservation_artifact`, so a foreign-only artifact
+/// still surfaces with its foreign token and the reconcile-on-read healers can
+/// re-emit it under the live generation.
+///
+/// Without the generation-aware step, reconcile-on-read never converged after
+/// such a heal: the blind finder prefers the lexicographically smallest stamped
+/// name, so whenever the superseded token sorted before the live one every
+/// subsequent read resolved the foreign artifact again, rewrote the identical
+/// current-generation artifact and enqueued another archive commit.
+#[must_use]
+pub fn read_project_archive_reservation_for_generation(
+    storage_root: &Path,
+    project_slug: &str,
+    reservation_id: i64,
+    live_generation: Option<&str>,
 ) -> Option<ArchiveReservationView> {
     if reservation_id <= 0 {
         return None;
@@ -983,10 +1020,17 @@ pub fn read_project_archive_reservation(
         .join("projects")
         .join(project_slug)
         .join("file_reservations");
-    let path = mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+    let path = mcp_agent_mail_core::reservation_artifact::find_reservation_artifact_for_generation(
         &reservation_dir,
         reservation_id,
-    )?;
+        live_generation,
+    )
+    .or_else(|| {
+        mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+            &reservation_dir,
+            reservation_id,
+        )
+    })?;
     if path_is_symlink(&path) {
         return None;
     }
@@ -1627,5 +1671,85 @@ mod tests {
         assert!(line.contains("path_pattern=1"), "{line}");
         assert!(line.contains("exclusive=1"), "{line}");
         assert!(line.contains("total=2"), "{line}");
+    }
+
+    // ── GH#311 follow-up: generation-aware reconcile-on-read reader ─────────
+
+    #[test]
+    fn read_for_generation_prefers_the_live_artifact_over_foreign_debris() {
+        // After reconcile-on-read heals a foreign-only row, `id-1-g<foreign>.json`
+        // and `id-1-g<live>.json` coexist. The generation-blind reader picks the
+        // lexicographically smallest stamped name — the FOREIGN one whenever it
+        // sorts first — which made every later read re-heal the same row.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let slug = "proj-conv";
+        let foreign = "aaaa1111"; // sorts before the live token
+        let live = "bbbb2222";
+        write_reservation_artifact(root, slug, 1, Some(foreign), "GreenCastle", "src/**", true);
+        write_reservation_artifact(root, slug, 1, Some(live), "GreenCastle", "src/**", true);
+
+        let blind = read_project_archive_reservation(root, slug, 1).expect("blind read");
+        assert_eq!(
+            blind.generation.as_deref(),
+            Some(foreign),
+            "documents the blind tie-break this reader exists to avoid"
+        );
+
+        let aware = read_project_archive_reservation_for_generation(root, slug, 1, Some(live))
+            .expect("aware read");
+        assert_eq!(aware.generation.as_deref(), Some(live));
+        assert!(!is_foreign_generation(
+            Some(live),
+            aware.generation.as_deref()
+        ));
+    }
+
+    #[test]
+    fn read_for_generation_matches_the_checker_and_falls_back_for_foreign_only_coverage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let slug = "proj-fallback";
+        let foreign = "aaaa1111";
+        let live = "bbbb2222";
+
+        // Foreign-only coverage must still surface (with its foreign token) so the
+        // healers can re-emit it under the live generation.
+        write_reservation_artifact(root, slug, 1, Some(foreign), "GreenCastle", "src/**", true);
+        let only_foreign =
+            read_project_archive_reservation_for_generation(root, slug, 1, Some(live))
+                .expect("foreign-only coverage resolves");
+        assert_eq!(only_foreign.generation.as_deref(), Some(foreign));
+        assert!(is_foreign_generation(
+            Some(live),
+            only_foreign.generation.as_deref()
+        ));
+
+        // Legacy + foreign: the checker compares the legacy file; so does the reader.
+        write_reservation_artifact(root, slug, 1, None, "GreenCastle", "src/**", true);
+        let legacy = read_project_archive_reservation_for_generation(root, slug, 1, Some(live))
+            .expect("legacy resolves");
+        assert_eq!(legacy.generation, None);
+
+        // Unknown live generation with several stamped candidates: fall back to the
+        // blind pick rather than returning nothing (the pre-existing behavior).
+        write_reservation_artifact(root, slug, 2, Some(foreign), "GreenCastle", "docs/**", true);
+        write_reservation_artifact(root, slug, 2, Some(live), "GreenCastle", "docs/**", true);
+        let unknown = read_project_archive_reservation_for_generation(root, slug, 2, None)
+            .expect("ambiguous set still resolves when the generation is unknown");
+        assert_eq!(unknown.generation.as_deref(), Some(foreign));
+        assert_eq!(
+            read_project_archive_reservation(root, slug, 2).map(|view| view.generation),
+            Some(unknown.generation),
+            "the blind wrapper is exactly the unknown-generation variant"
+        );
+
+        // Guard rails unchanged: non-positive ids and missing artifacts are None.
+        assert!(
+            read_project_archive_reservation_for_generation(root, slug, 0, Some(live)).is_none()
+        );
+        assert!(
+            read_project_archive_reservation_for_generation(root, slug, 404, Some(live)).is_none()
+        );
     }
 }

@@ -291,7 +291,7 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 | `am doctor locks` (`--json`) | No (read-only owner intelligence — D1) | 0 |
 | `am doctor fix --yes` | Yes (via `mutate()`) | 0 / 2 / 3 / 4 |
 | `am doctor fix --dry-run` | No | 0 |
-| `am doctor fix --only <fm-id>` | Yes (via `mutate()`) | 0 / 3 / 4 / 64 |
+| `am doctor fix --only <fm-id>` | Yes (via `mutate()`) | 0 / 1 / 2 / 3 / 4 / 64 (exit equals the envelope's `exit_code`: 1 = findings remain, nothing mutated; 2 = partial fix) |
 | `am doctor fix --only <fm-id> --list` | No | 0 |
 | `am doctor fix --list` | No | 0 |
 | `am doctor undo <run-id>` | Yes (restore-only) | 0 / 3 |

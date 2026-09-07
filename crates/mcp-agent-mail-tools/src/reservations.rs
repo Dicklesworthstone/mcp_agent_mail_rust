@@ -459,10 +459,12 @@ fn ts_is_positive(ts: Option<i64>) -> bool {
 /// divergence (the #112 stuck-`released_ts` class).
 ///
 /// A resolved artifact stamped with a *foreign* (superseded) generation is also
-/// divergence, even when every field matches: `find_reservation_artifact` (used
-/// to resolve `view`) is generation-blind, so without this check a row whose only
-/// coverage is a prior-generation artifact looks "healthy" here and never gets
-/// re-emitted under the current generation — while `reservation_parity`'s checker
+/// divergence, even when every field matches: the reader
+/// (`read_project_archive_reservation_for_generation`) prefers the live
+/// generation's artifact but falls back to a prior-generation one when that is
+/// the row's only coverage, so without this check such a row looks "healthy"
+/// here and never gets re-emitted under the current generation — while
+/// `reservation_parity`'s checker
 /// correctly excludes that same artifact as foreign and reports it as missing.
 /// The two subsystems must agree on what counts as current coverage
 /// (hfdt-am-parity-checker-stale-artifact-read-mwmv4 follow-up).
@@ -568,11 +570,13 @@ fn reconcile_active_reservation_archive(
     let mut present = BTreeMap::new();
     for row in active_rows {
         if let Some(id) = row.id
-            && let Some(view) = crate::reservation_parity::read_project_archive_reservation(
-                &config.storage_root,
-                &project.slug,
-                id,
-            )
+            && let Some(view) =
+                crate::reservation_parity::read_project_archive_reservation_for_generation(
+                    &config.storage_root,
+                    &project.slug,
+                    id,
+                    db_generation,
+                )
         {
             present.insert(id, view);
         }
@@ -617,11 +621,13 @@ fn reconcile_active_reservation_archive(
 ///
 /// Also heals when the resolved artifact is only available under a *foreign*
 /// (superseded) generation, even though its content — including `released_ts`
-/// — already matches the DB: `read_project_archive_reservation` resolves via
-/// `find_reservation_artifact`, which is generation-blind, so a released row
-/// whose only coverage predates the live database's generation (typically
-/// after `doctor reconstruct` mints a new one) looked fully healthy here and
-/// was never re-emitted under the current generation. Meanwhile
+/// — already matches the DB: `read_project_archive_reservation_for_generation`
+/// falls back to a prior-generation artifact when it is the row's only
+/// coverage, so a released row whose coverage predates the live database's
+/// generation (typically after `doctor reconstruct` mints a new one) would
+/// otherwise look fully healthy here and never be re-emitted under the current
+/// generation (once re-emitted, the reader resolves the live artifact and the
+/// heal converges). Meanwhile
 /// `reservation_parity`'s checker correctly excludes that same foreign-
 /// generation artifact from comparison and reports the row as drift — and
 /// nothing ever reconciled the disagreement, since this was the one code path
@@ -691,11 +697,13 @@ fn reconcile_released_reservation_archive(
     let mut present = BTreeMap::new();
     for row in released_rows {
         if let Some(id) = row.id
-            && let Some(view) = crate::reservation_parity::read_project_archive_reservation(
-                &config.storage_root,
-                &project.slug,
-                id,
-            )
+            && let Some(view) =
+                crate::reservation_parity::read_project_archive_reservation_for_generation(
+                    &config.storage_root,
+                    &project.slug,
+                    id,
+                    db_generation,
+                )
         {
             present.insert(id, view);
         }
@@ -4638,6 +4646,144 @@ mod tests {
             ts_is_positive(view.released_ts),
             "healed release artifact must scan back as released"
         );
+    }
+
+    /// Storage names a healed artifact `id-<id>-g<generation>.json` (br-n8qh6);
+    /// mirror that so the read-back below sees exactly what a real heal leaves.
+    fn write_stamped_artifact(reservation_dir: &Path, id: i64, generation: &str, artifact: &Value) {
+        let name = mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+            Some(generation),
+            id,
+        );
+        std::fs::write(
+            reservation_dir.join(name),
+            serde_json::to_vec_pretty(artifact).expect("serialize artifact"),
+        )
+        .expect("write stamped artifact");
+    }
+
+    #[test]
+    fn released_heal_converges_once_the_live_generation_artifact_exists() {
+        // GH#311 follow-up. A released row whose only coverage is a
+        // prior-generation artifact is healed by re-emitting it under the live
+        // generation — after which BOTH stamped files coexist. The read-back must
+        // then resolve the live artifact and stop healing, even when the
+        // superseded token sorts before the live one (the generation-blind
+        // finder's tie-break), otherwise every reservation read rewrites the
+        // same artifact and enqueues another archive commit forever.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage-root");
+        let slug = "proj-released-converge";
+        let reservation_dir = storage_root
+            .join("projects")
+            .join(slug)
+            .join("file_reservations");
+        std::fs::create_dir_all(&reservation_dir).expect("create reservation dir");
+        let foreign = "aaaa1111"; // sorts BEFORE the live token
+        let live = "bbbb2222";
+
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, Some(5_000))];
+        let agent_names = names(&[(7, "GreenCastle")]);
+        let prior =
+            released_reservation_artifact_json("/abs/proj", "GreenCastle", &rows[0], Some(foreign));
+        write_stamped_artifact(&reservation_dir, 1, foreign, &prior);
+
+        let read_live = || {
+            crate::reservation_parity::read_project_archive_reservation_for_generation(
+                &storage_root,
+                slug,
+                1,
+                Some(live),
+            )
+            .expect("artifact resolves")
+        };
+
+        // Pass 1: foreign-only coverage → heal under the live generation.
+        let mut present = BTreeMap::new();
+        present.insert(1, read_live());
+        let heal = released_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &agent_names,
+            &present,
+            Some(live),
+        );
+        assert_eq!(heal.len(), 1, "foreign-only coverage must be re-emitted");
+        write_stamped_artifact(&reservation_dir, 1, live, &heal[0]);
+
+        // Pass 2: the live artifact is resolved → converged, no further heal.
+        present.clear();
+        present.insert(1, read_live());
+        assert_eq!(present[&1].generation.as_deref(), Some(live));
+        let heal = released_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &agent_names,
+            &present,
+            Some(live),
+        );
+        assert!(heal.is_empty(), "must converge after one heal: {heal:?}");
+
+        // The generation-blind reader still resolves the foreign artifact here —
+        // the regression this test pins.
+        let blind =
+            crate::reservation_parity::read_project_archive_reservation(&storage_root, slug, 1)
+                .expect("blind read");
+        assert_eq!(blind.generation.as_deref(), Some(foreign));
+    }
+
+    #[test]
+    fn active_heal_converges_once_the_live_generation_artifact_exists() {
+        // Same convergence property for the active-row healer.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage-root");
+        let slug = "proj-active-converge";
+        let reservation_dir = storage_root
+            .join("projects")
+            .join(slug)
+            .join("file_reservations");
+        std::fs::create_dir_all(&reservation_dir).expect("create reservation dir");
+        let foreign = "aaaa1111";
+        let live = "bbbb2222";
+
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let agent_names = names(&[(7, "GreenCastle")]);
+        let prior =
+            active_reservation_artifact_json("/abs/proj", "GreenCastle", &rows[0], Some(foreign));
+        write_stamped_artifact(&reservation_dir, 1, foreign, &prior);
+
+        let read_live = || {
+            crate::reservation_parity::read_project_archive_reservation_for_generation(
+                &storage_root,
+                slug,
+                1,
+                Some(live),
+            )
+            .expect("artifact resolves")
+        };
+
+        let mut present = BTreeMap::new();
+        present.insert(1, read_live());
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &agent_names,
+            &present,
+            Some(live),
+        );
+        assert_eq!(heal.len(), 1, "foreign-only coverage must be re-emitted");
+        write_stamped_artifact(&reservation_dir, 1, live, &heal[0]);
+
+        present.clear();
+        present.insert(1, read_live());
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &agent_names,
+            &present,
+            Some(live),
+        );
+        assert!(heal.is_empty(), "must converge after one heal: {heal:?}");
     }
 
     #[test]
