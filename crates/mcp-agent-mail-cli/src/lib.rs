@@ -16092,7 +16092,7 @@ fn open_db_async_canonical_read_with_database_url(
             context,
         )?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
+    pool_cfg.database_url = sqlite_url_from_path(source.actual_path());
     pool_cfg.storage_root = Some(storage_root);
     let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
         .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
@@ -16117,7 +16117,7 @@ fn open_db_sync_async_canonical_read_with_database_url(
         )?;
     let conn = source.open_read_only(context)?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
+    pool_cfg.database_url = sqlite_url_from_path(source.actual_path());
     pool_cfg.storage_root = Some(storage_root);
     let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
         .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
@@ -16148,7 +16148,7 @@ fn open_db_sync_async_canonical_read_best_effort_with_database_url(
         )?;
     let conn = source.open_read_only(context)?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
+    pool_cfg.database_url = sqlite_url_from_path(source.actual_path());
     pool_cfg.storage_root = Some(storage_root);
     pool_cfg.run_migrations = false;
     pool_cfg.warmup_connections = 0;
@@ -16203,7 +16203,7 @@ fn open_atc_simulate_read_pool_with_database_url(
     }
     let conn = source.open_read_only("ATC simulate snapshot")?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
+    pool_cfg.database_url = sqlite_url_from_path(source.actual_path());
     pool_cfg.storage_root = Some(storage_root);
     pool_cfg.run_migrations = false;
     pool_cfg.warmup_connections = 0;

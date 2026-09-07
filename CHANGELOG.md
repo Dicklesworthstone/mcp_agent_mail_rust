@@ -141,6 +141,11 @@ compatible runtime stack. The portable binaries include lexical search.
 
 ### Fixed
 
+- **Windows snapshot readers use the existing SQLite path encoder.** Canonical
+  temporary paths contain a `\\?\` prefix; directly interpolating them into a
+  SQLite URL left an extra leading slash in the parsed filesystem path. Inbox,
+  search, product, and ATC snapshot pools now use `sqlite_url_from_path` to open
+  the intended private database.
 - **Health-verdict caching compiles on Windows and retains real file identity.**
   The metadata stamp now uses Windows volume and file-index information instead
   of unconditionally importing Unix APIs. Missing identity declines reuse.
