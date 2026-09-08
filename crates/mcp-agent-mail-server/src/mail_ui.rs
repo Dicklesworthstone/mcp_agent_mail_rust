@@ -75,6 +75,13 @@ pub fn dispatch_with_cx(
     body: &str,
     cx: &Cx,
 ) -> Result<Option<String>, (u16, String)> {
+    // Archive routes read Git directly and must remain available when the
+    // SQLite index cannot be opened. Their method/input checks run here too.
+    let sub = path.strip_prefix("/mail").unwrap_or(path);
+    if sub.starts_with("/archive/") {
+        return render_archive_route(sub, query, method);
+    }
+
     // GH#184: when this dispatch runs inside a live server process, the
     // server's pool for this database is already open — reuse it for BOTH
     // reads and writes instead of bootstrapping a fresh observability pool
@@ -108,9 +115,6 @@ pub fn dispatch_with_cx(
         .as_ref()
         .map_or(live_pool, crate::ObservabilityDbPool::pool);
 
-    // Strip leading "/mail" prefix.
-    let sub = path.strip_prefix("/mail").unwrap_or(path);
-
     match sub {
         // Python parity: GET /mail and /mail/unified-inbox → unified inbox.
         "" | "/" | "/unified-inbox" => {
@@ -128,9 +132,6 @@ pub fn dispatch_with_cx(
         "/projects" => render_projects_list(cx, read_pool),
         _ if sub.starts_with("/api/") => {
             handle_api_route(sub, query, method, body, cx, read_pool, &live_pool)
-        }
-        _ if sub.starts_with("/archive/") => {
-            render_archive_route(sub, query, method, cx, read_pool)
         }
         _ => dispatch_project_route(sub, method, body, cx, read_pool, &live_pool, query),
     }
@@ -180,6 +181,119 @@ mod request_budget_tests {
         assert!(
             !budget.is_past_deadline(now),
             "mail UI request deadlines must be relative to the current asupersync clock"
+        );
+    }
+
+    #[test]
+    fn mail_ui_db_bridge_expired_context_does_not_poll_database_write() {
+        let pool = initialized_test_pool("mail-ui-expired-admission");
+        let cx = Cx::for_request_with_budget(
+            asupersync::Budget::INFINITE.with_deadline(asupersync::Time::ZERO),
+        );
+        let polled = std::cell::Cell::new(false);
+        let result = block_on_outcome(&cx, async {
+            polled.set(true);
+            queries::ensure_project(&cx, &pool, "/mail-ui-expired-admission").await
+        });
+        assert_eq!(result.unwrap_err(), (503, "Request cancelled".to_string()));
+        assert!(
+            !polled.get(),
+            "expired requests must not start database work"
+        );
+
+        let read_cx = Cx::for_testing();
+        let projects = block_on_outcome(&read_cx, queries::list_projects(&read_cx, &pool))
+            .expect("read back actual database");
+        assert!(
+            projects.is_empty(),
+            "expired request must not create a project"
+        );
+    }
+
+    #[test]
+    fn mail_ui_db_bridge_preserves_completed_write_and_ambient_context() {
+        let pool = initialized_test_pool("mail-ui-ready-cancel");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native runtime");
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let _guard = Cx::set_current(Some(cx.clone()));
+        let project = block_on_outcome(&cx, async {
+            let ambient = Cx::current().expect("caller context remains installed");
+            assert_eq!(ambient.task_id(), cx.task_id());
+            assert_eq!(ambient.region_id(), cx.region_id());
+            let result = queries::ensure_project(&cx, &pool, "/mail-ui-ready-cancel").await;
+            cx.cancel_with(asupersync::types::CancelKind::User, Some("completed write"));
+            result
+        })
+        .expect("completed write outcome must survive a concurrent cancellation");
+        assert!(cx.is_cancel_requested());
+
+        let read_cx = Cx::for_testing();
+        let projects = block_on_outcome(&read_cx, queries::list_projects(&read_cx, &pool))
+            .expect("read back committed database row");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, project.id);
+        assert_eq!(projects[0].human_key, "/mail-ui-ready-cancel");
+        assert_eq!(
+            Cx::current().expect("ambient context retained").task_id(),
+            cx.task_id()
+        );
+    }
+
+    #[test]
+    fn mail_ui_db_bridge_expired_context_refuses_cached_project() {
+        let pool = initialized_test_pool("mail-ui-expired-cache");
+        let seed_cx = Cx::for_testing();
+        let project = block_on_outcome(
+            &seed_cx,
+            queries::ensure_project(&seed_cx, &pool, "/mail-ui-expired-cache"),
+        )
+        .expect("seed real project and read cache");
+        let cx = Cx::for_request_with_budget(
+            asupersync::Budget::INFINITE.with_deadline(asupersync::Time::ZERO),
+        );
+        let result = block_on_outcome(&cx, queries::get_project_by_slug(&cx, &pool, &project.slug));
+        assert_eq!(result.unwrap_err(), (503, "Request cancelled".to_string()));
+    }
+
+    // R3: the following three tests replace the database future with a pending
+    // future to force polling-boundary failures. They prove this bridge's error
+    // contract only. The real database/cache tests above compensate for the
+    // persistence path; br-22gm3 retains broader pool cancellation work.
+    #[test]
+    fn mail_ui_db_bridge_cancelled_pending_returns_503() {
+        let cx = Cx::for_testing();
+        let result: Result<(), _> = block_on_outcome(
+            &cx,
+            std::future::poll_fn(|_| {
+                cx.cancel_with(asupersync::types::CancelKind::User, Some("pending request"));
+                Poll::Pending
+            }),
+        );
+        assert_eq!(result, Err((503, "Request cancelled".to_string())));
+    }
+
+    #[test]
+    fn mail_ui_db_bridge_deadline_pending_returns_503() {
+        let cx = Cx::for_request_with_budget(
+            asupersync::Budget::INFINITE.with_deadline(wall_now() + Duration::from_millis(10)),
+        );
+        let result: Result<(), _> = block_on_outcome(&cx, std::future::pending());
+        assert_eq!(result, Err((503, "Request cancelled".to_string())));
+        assert!(
+            cx.is_cancel_requested(),
+            "deadline must be acknowledged through Cx"
+        );
+    }
+
+    #[test]
+    fn mail_ui_db_bridge_poll_exhaustion_returns_503() {
+        let cx = Cx::for_request_with_budget(asupersync::Budget::INFINITE);
+        let result: Result<(), _> = block_on_outcome(&cx, std::future::pending());
+        assert_eq!(
+            result,
+            Err((503, "Database operation did not complete".to_string()))
         );
     }
 }
@@ -270,6 +384,78 @@ first body
             ],
             f,
         )
+    }
+
+    #[test]
+    fn archive_dispatch_reads_committed_content_without_database() {
+        let dir = tempdir().expect("private archive directory");
+        let storage_root = dir.path().join("archive");
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("DATABASE_URL", "unsupported://archive-routing-test"),
+            ],
+            || {
+                let config = Config::from_env();
+                let archive = storage::ensure_archive(&config, "demo").expect("initialize Git");
+                std::fs::write(
+                    archive.root.join("project.json"),
+                    r#"{"slug":"demo","human_key":"/demo"}"#,
+                )
+                .expect("write archive project");
+                let content = "Committed archive content survives an unavailable index.";
+                std::fs::write(archive.root.join("notes.txt"), content)
+                    .expect("write archive file");
+                storage::commit_paths_with_retry(
+                    &archive.repo_root,
+                    &config,
+                    "seed committed archive",
+                    &["projects/demo/project.json", "projects/demo/notes.txt"],
+                )
+                .expect("commit real archive files");
+                std::fs::write(archive.root.join("notes.txt"), "uncommitted working copy")
+                    .expect("change working copy after commit");
+
+                let (status, _) = dispatch("/mail/projects", "", "GET", "")
+                    .expect_err("database-backed route must still reject the unavailable index");
+                assert_eq!(status, 500);
+
+                let payload = dispatch(
+                    "/mail/archive/browser/demo/file",
+                    "path=notes.txt",
+                    "GET",
+                    "",
+                )
+                .expect("archive file must not require a database")
+                .expect("archive file route must be handled");
+                assert_eq!(serde_json::from_str::<String>(&payload).unwrap(), content);
+
+                for (path, query) in [
+                    ("/mail/archive/guide", ""),
+                    ("/mail/archive/activity", ""),
+                    ("/mail/archive/timeline", "project=demo"),
+                    ("/mail/archive/browser", "project=demo"),
+                    ("/mail/archive/network", "project=demo"),
+                    ("/mail/archive/time-travel", ""),
+                ] {
+                    let html = dispatch(path, query, "GET", "")
+                        .unwrap_or_else(|error| panic!("{path} failed without SQLite: {error:?}"))
+                        .expect("archive route must be handled");
+                    assert!(!html.is_empty(), "{path} must render an archive page");
+                }
+                assert_eq!(
+                    dispatch("/mail/archive/unknown", "", "GET", "").unwrap(),
+                    None
+                );
+                assert_eq!(
+                    dispatch("/mail/archive/guide", "", "POST", "")
+                        .expect_err("archive writes remain forbidden")
+                        .0,
+                    405
+                );
+            },
+        );
     }
 
     #[test]
@@ -392,7 +578,7 @@ first body
 
         with_mail_ui_env(&storage_root, &db_path, || {
             let (slug, human_key) =
-                resolve_project_slug(&cx, &pool, None).expect("archive default should resolve");
+                resolve_project_slug(None).expect("archive default should resolve");
             assert_eq!(slug, "ahead-project");
             assert_eq!(human_key, "/ahead-project");
         });
@@ -582,19 +768,12 @@ first body
     fn archive_time_travel_snapshot_uses_archive_without_registered_project() {
         let dir = tempdir().expect("tempdir");
         let (storage_root, db_path) = write_archive_ahead_fixture(dir.path());
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
-        let pool = make_test_pool("mail-ui-archive-snapshot");
 
         with_mail_ui_env(&storage_root, &db_path, || {
-            let payload = render_archive_time_travel_snapshot(
-                &cx,
-                &pool,
-                "ahead-project",
-                "Alice",
-                "2026-03-22T12:00",
-            )
-            .expect("archive snapshot should succeed")
-            .expect("archive snapshot should return json");
+            let payload =
+                render_archive_time_travel_snapshot("ahead-project", "Alice", "2026-03-22T12:00")
+                    .expect("archive snapshot should succeed")
+                    .expect("archive snapshot should return json");
             assert!(payload.contains("\"requested_time\":\"2026-03-22T12:00\""));
         });
     }
@@ -1302,7 +1481,22 @@ fn get_pool() -> Result<DbPool, (u16, String)> {
     get_or_create_pool(&cfg).map_err(|e| (500, format!("Database error: {e}")))
 }
 
-/// Drive a future to completion using a spin loop.
+enum DbPollError {
+    Cancelled,
+    PollLimit,
+}
+
+impl DbPollError {
+    fn into_http_error(self) -> (u16, String) {
+        let message = match self {
+            Self::Cancelled => "Request cancelled",
+            Self::PollLimit => "Database operation did not complete",
+        };
+        (503, message.to_string())
+    }
+}
+
+/// Drive a database future with the caller's cancellation context.
 ///
 /// **Why not `fastmcp_core::block_on`?**
 ///
@@ -1318,23 +1512,26 @@ fn get_pool() -> Result<DbPool, (u16, String)> {
 ///    `test_on_checkout` triggers an async `ping()` validation query during
 ///    `pool.acquire()`.
 ///
-/// Since all underlying SQLite operations in frankensqlite are synchronous
-/// (wrapped in `async move { ... }` blocks that resolve on the first poll),
-/// a simple spin loop is sufficient and avoids the nested-runtime problem
-/// entirely.  The `Cx` that callers pass to query functions is preserved
-/// because we never overwrite the thread-local context.
+/// FrankenSQLite operations are synchronous and normally resolve on the first
+/// poll. Check the caller's budget before starting work and between pending
+/// polls without replacing its thread-local context. A completed outcome is
+/// preserved even if cancellation arrives during that poll. The poll limit is
+/// a final failure bound for futures that never complete, including callers
+/// with an infinite budget. Operations that block inside a poll must enforce
+/// their own cancellation and timeout checks.
 ///
 /// See: <https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/72>
-fn spin_block_on<F: Future>(future: F) -> F::Output {
+fn spin_block_on<F: Future>(cx: &Cx, future: F) -> Result<F::Output, DbPollError> {
     const MAX_POLLS: u64 = 500_000;
 
     let waker = Waker::noop();
-    let mut cx = Context::from_waker(waker);
+    let mut task_cx = Context::from_waker(waker);
     let mut future = Box::pin(future);
 
     for _ in 0..MAX_POLLS {
-        match future.as_mut().poll(&mut cx) {
-            Poll::Ready(output) => return output,
+        cx.checkpoint().map_err(|_| DbPollError::Cancelled)?;
+        match future.as_mut().poll(&mut task_cx) {
+            Poll::Ready(output) => return Ok(output),
             Poll::Pending => {
                 // Yield to allow other threads to make progress (e.g. pool
                 // lock holders).
@@ -1342,17 +1539,15 @@ fn spin_block_on<F: Future>(future: F) -> F::Output {
             }
         }
     }
-    panic!(
-        "spin_block_on: future did not resolve after {MAX_POLLS} polls — \
-         likely a genuine hang (not a waker issue)"
-    );
+    tracing::error!(MAX_POLLS, "Mail UI database future exceeded its poll limit");
+    Err(DbPollError::PollLimit)
 }
 
 fn block_on_outcome<T>(
-    _cx: &Cx,
+    cx: &Cx,
     fut: impl Future<Output = asupersync::Outcome<T, mcp_agent_mail_db::DbError>>,
 ) -> Result<T, (u16, String)> {
-    match spin_block_on(fut) {
+    match spin_block_on(cx, fut).map_err(DbPollError::into_http_error)? {
         asupersync::Outcome::Ok(v) => Ok(v),
         asupersync::Outcome::Err(e) => {
             let status = if matches!(e, mcp_agent_mail_db::DbError::NotFound { .. }) {
@@ -2196,9 +2391,7 @@ mod auth_route_hardening_regression_suite {
 
     #[test]
     fn regression_archive_routes_reject_post_method() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
-        let pool = make_test_pool();
-        let result = render_archive_route("/archive/guide", "", "POST", &cx, &pool);
+        let result = render_archive_route("/archive/guide", "", "POST");
         let (status, _) = result.expect_err("POST to archive should be 405");
         assert_eq!(status, 405);
     }
@@ -2346,8 +2539,7 @@ mod auth_route_hardening_regression_suite {
                 )
                 .expect("archive metadata should persist");
 
-                let (slug, _) =
-                    resolve_project_slug(&cx, &pool, None).expect("archive default should resolve");
+                let (slug, _) = resolve_project_slug(None).expect("archive default should resolve");
                 assert_eq!(slug, real_project.slug);
             },
         );
@@ -2415,7 +2607,7 @@ mod auth_route_hardening_regression_suite {
                 )
                 .expect("archive metadata should persist");
 
-                let html = render_archive_time_travel(&cx, &pool)
+                let html = render_archive_time_travel()
                     .expect("archive time travel should succeed")
                     .expect("archive time travel should render html");
                 assert!(html.contains(&real_project.slug));
@@ -4380,7 +4572,7 @@ fn render_attachments(
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let pid = p.id.unwrap_or(0);
-    let conn = match spin_block_on(pool.acquire(cx)) {
+    let conn = match spin_block_on(cx, pool.acquire(cx)).map_err(DbPollError::into_http_error)? {
         asupersync::Outcome::Ok(conn) => conn,
         asupersync::Outcome::Err(err) => {
             return Err((
@@ -4779,43 +4971,41 @@ fn render_archive_route(
     sub: &str,
     query: &str,
     method: &str,
-    cx: &Cx,
-    pool: &DbPool,
 ) -> Result<Option<String>, (u16, String)> {
     if method != "GET" {
         return Err((405, "Method Not Allowed".to_string()));
     }
     match sub {
-        "/archive/guide" => render_archive_guide(cx, pool),
+        "/archive/guide" => render_archive_guide(),
         "/archive/activity" => {
             let limit = extract_query_int(query, "limit", 50).min(500);
             render_archive_activity(limit)
         }
         "/archive/timeline" => {
             let project = extract_query_str(query, "project");
-            render_archive_timeline(cx, pool, project.as_deref())
+            render_archive_timeline(project.as_deref())
         }
         "/archive/browser" => {
             let project = extract_query_str(query, "project");
             let path = extract_query_str(query, "path").unwrap_or_default();
-            render_archive_browser(cx, pool, project.as_deref(), &path)
+            render_archive_browser(project.as_deref(), &path)
         }
         "/archive/network" => {
             let project = extract_query_str(query, "project");
-            render_archive_network(cx, pool, project.as_deref())
+            render_archive_network(project.as_deref())
         }
-        "/archive/time-travel" => render_archive_time_travel(cx, pool),
+        "/archive/time-travel" => render_archive_time_travel(),
         "/archive/time-travel/snapshot" => {
             let project = extract_query_str(query, "project").unwrap_or_default();
             let agent = extract_query_str(query, "agent").unwrap_or_default();
             let timestamp = extract_query_str(query, "timestamp").unwrap_or_default();
-            render_archive_time_travel_snapshot(cx, pool, &project, &agent, &timestamp)
+            render_archive_time_travel_snapshot(&project, &agent, &timestamp)
         }
         _ if archive_browser_file_project_slug(sub).is_some() => {
             // /archive/browser/{project}/file?path=...
             let project_slug = archive_browser_file_project_slug(sub).unwrap_or_default();
             let path = extract_query_str(query, "path").unwrap_or_default();
-            render_archive_browser_file(cx, pool, project_slug, &path)
+            render_archive_browser_file(project_slug, &path)
         }
         _ if sub.starts_with("/archive/commit/") => {
             let sha = sub.strip_prefix("/archive/commit/").unwrap_or("");
@@ -4843,8 +5033,7 @@ struct ArchiveGuideProject {
     human_key: String,
 }
 
-fn render_archive_guide(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)> {
-    let _ = (cx, pool);
+fn render_archive_guide() -> Result<Option<String>, (u16, String)> {
     let config = Config::from_env();
     let storage_root = config.storage_root.display().to_string();
 
@@ -4995,15 +5184,11 @@ struct ArchiveTimelineCtx {
     project_name: String,
 }
 
-fn render_archive_timeline(
-    cx: &Cx,
-    pool: &DbPool,
-    project: Option<&str>,
-) -> Result<Option<String>, (u16, String)> {
+fn render_archive_timeline(project: Option<&str>) -> Result<Option<String>, (u16, String)> {
     let root = get_archive_root()?;
 
     // Default to first project if not specified
-    let (slug, project_name) = resolve_project_slug(cx, pool, project)?;
+    let (slug, project_name) = resolve_project_slug(project)?;
 
     let commits = storage::get_timeline_commits(&root, &slug, 100)
         .map_err(|e| (500, format!("Archive error: {e}")))?;
@@ -5020,12 +5205,8 @@ fn render_archive_timeline(
 
 /// Resolve a project slug + `human_key`, defaulting to the first project.
 ///
-/// F2: Validates slug format before DB lookup to reject malformed input early.
-fn resolve_project_slug(
-    _cx: &Cx,
-    _pool: &DbPool,
-    project: Option<&str>,
-) -> Result<(String, String), (u16, String)> {
+/// F2: Validates slug format before archive lookup to reject malformed input early.
+fn resolve_project_slug(project: Option<&str>) -> Result<(String, String), (u16, String)> {
     if let Some(slug) = project {
         let project = resolve_archive_project(slug)?;
         Ok((project.slug, project.human_key))
@@ -5048,8 +5229,6 @@ struct ArchiveBrowserCtx {
 }
 
 fn render_archive_browser(
-    _cx: &Cx,
-    _pool: &DbPool,
     project: Option<&str>,
     path: &str,
 ) -> Result<Option<String>, (u16, String)> {
@@ -5077,8 +5256,6 @@ fn render_archive_browser(
 
 /// JSON API: get file content from archive.
 fn render_archive_browser_file(
-    _cx: &Cx,
-    _pool: &DbPool,
     project_slug: &str,
     path: &str,
 ) -> Result<Option<String>, (u16, String)> {
@@ -5126,13 +5303,9 @@ struct ArchiveNetworkCtx {
     project_name: String,
 }
 
-fn render_archive_network(
-    cx: &Cx,
-    pool: &DbPool,
-    project: Option<&str>,
-) -> Result<Option<String>, (u16, String)> {
+fn render_archive_network(project: Option<&str>) -> Result<Option<String>, (u16, String)> {
     let root = get_archive_root()?;
-    let (slug, project_name) = resolve_project_slug(cx, pool, project)?;
+    let (slug, project_name) = resolve_project_slug(project)?;
 
     let graph = storage::get_communication_graph(&root, &slug, 200)
         .map_err(|e| (500, format!("Archive error: {e}")))?;
@@ -5154,8 +5327,7 @@ struct ArchiveTimeTravelCtx {
     projects: Vec<String>,
 }
 
-fn render_archive_time_travel(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)> {
-    let _ = (cx, pool);
+fn render_archive_time_travel() -> Result<Option<String>, (u16, String)> {
     let projects = list_archive_projects()?;
     let slugs: Vec<String> = projects
         .iter()
@@ -5169,8 +5341,6 @@ fn render_archive_time_travel(cx: &Cx, pool: &DbPool) -> Result<Option<String>, 
 
 /// JSON API: get historical inbox snapshot at a point in time.
 fn render_archive_time_travel_snapshot(
-    _cx: &Cx,
-    _pool: &DbPool,
     project_slug: &str,
     agent_name: &str,
     timestamp: &str,
@@ -5602,9 +5772,20 @@ fn handle_sibling_update(
         return json_err(400, "Invalid action");
     };
 
-    match spin_block_on(queries::update_project_sibling_status(
-        cx, pool, project_id, other_id, status,
-    )) {
+    let outcome = match spin_block_on(
+        cx,
+        queries::update_project_sibling_status(cx, pool, project_id, other_id, status),
+    ) {
+        Ok(outcome) => outcome,
+        Err(DbPollError::Cancelled) => {
+            return json_err(503, "Sibling suggestion update was cancelled");
+        }
+        Err(error) => {
+            let (status, message) = error.into_http_error();
+            return json_err(status, &message);
+        }
+    };
+    match outcome {
         asupersync::Outcome::Ok(suggestion) => {
             tracing::info!(
                 project_id,
@@ -6068,8 +6249,6 @@ mod fresh_eyes_regression_tests {
 
     #[test]
     fn archive_time_travel_snapshot_requires_existing_archive() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
-        let pool = make_test_pool("mail-ui-time-travel");
         let missing_slug = format!(
             "missingfreshsight{}",
             SystemTime::now()
@@ -6078,14 +6257,9 @@ mod fresh_eyes_regression_tests {
                 .as_nanos()
         );
 
-        let (status, detail) = render_archive_time_travel_snapshot(
-            &cx,
-            &pool,
-            &missing_slug,
-            "BlueLake",
-            "2026-02-11T05:43",
-        )
-        .expect_err("missing project should fail before archive lookup");
+        let (status, detail) =
+            render_archive_time_travel_snapshot(&missing_slug, "BlueLake", "2026-02-11T05:43")
+                .expect_err("missing project should fail before archive lookup");
 
         assert_eq!(status, 404);
         assert!(detail.contains("Archive"), "unexpected detail: {detail}");
