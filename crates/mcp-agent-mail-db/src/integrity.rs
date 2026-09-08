@@ -380,7 +380,8 @@ pub fn integrity_details_are_suspect(details: &[String]) -> bool {
 ///
 /// Returns `Some(index_names)` only when at least one row is index-class
 /// damage (`wrong # of entries in index <name>` or `row <N> missing from
-/// index <name>`) and every other row is either the `*** in database ... ***`
+/// index <name>`, or FrankenSQLite's exact index key-order complaint) and
+/// every other row is either the `*** in database ... ***`
 /// section header or a benign finding (freelist/sidecar slack, per
 /// [`integrity_details_are_suspect`]'s classes). Any other row — page-level
 /// damage, fragmentation accounting, b-tree errors — disqualifies the fast
@@ -393,25 +394,6 @@ pub fn integrity_details_are_suspect(details: &[String]) -> bool {
 /// every distinct owner table, which rebuilds all of that table's indexes.
 #[must_use]
 pub fn index_only_corruption_index_names(details: &[String]) -> Option<Vec<String>> {
-    fn index_name_from_detail(detail: &str) -> Option<&str> {
-        let trimmed = detail.trim();
-        if let Some(name) = trimmed.strip_prefix("wrong # of entries in index ") {
-            return Some(name.trim());
-        }
-        if trimmed.starts_with("row ")
-            && let Some(pos) = trimmed.find(" missing from index ")
-        {
-            let name = trimmed[pos + " missing from index ".len()..].trim();
-            // The prefix between "row " and the marker must be a bare rowid;
-            // anything else is a message we did not anticipate.
-            let rowid = &trimmed["row ".len()..pos];
-            if !rowid.is_empty() && rowid.chars().all(|c| c.is_ascii_digit()) {
-                return Some(name);
-            }
-        }
-        None
-    }
-
     fn detail_is_unused_page_row(detail: &str) -> bool {
         let lower = detail.trim().to_ascii_lowercase();
         lower.contains("never used") || lower.contains("unused")
@@ -431,7 +413,7 @@ pub fn index_only_corruption_index_names(details: &[String]) -> Option<Vec<Strin
     let mut names: Vec<String> = Vec::new();
     let mut unused_page_rows = 0_usize;
     for detail in details {
-        if let Some(name) = index_name_from_detail(detail) {
+        if let Some(name) = index_damage_index_name(detail) {
             if name.is_empty() {
                 return None;
             }
@@ -453,6 +435,35 @@ pub fn index_only_corruption_index_names(details: &[String]) -> Option<Vec<Strin
         }
     }
     if names.is_empty() { None } else { Some(names) }
+}
+
+/// Share the exact index-damage grammar between repair and typed diagnostics.
+fn index_damage_index_name(detail: &str) -> Option<&str> {
+    let trimmed = detail.trim();
+    if let Some(name) = trimmed.strip_prefix("wrong # of entries in index ") {
+        return Some(name.trim());
+    }
+    if trimmed.starts_with("row ")
+        && let Some(pos) = trimmed.find(" missing from index ")
+    {
+        let name = trimmed[pos + " missing from index ".len()..].trim();
+        let rowid = &trimmed["row ".len()..pos];
+        if !rowid.is_empty() && rowid.chars().all(|c| c.is_ascii_digit()) {
+            return Some(name);
+        }
+    }
+
+    // FrankenSQLite 0.3.18 returns this complete diagnostic as an
+    // integrity_check row. Match the whole message: a broad substring match
+    // could mistake a structural error mentioning an index for repairable
+    // index-only damage. Backtick-ambiguous names remain unclassified.
+    let franken = trimmed
+        .strip_prefix("database disk image is malformed: ")
+        .unwrap_or(trimmed);
+    let name = franken
+        .strip_prefix("index `")?
+        .strip_suffix("` entries are out of order for their declared key directions")?;
+    (!name.is_empty() && !name.contains('`') && !name.chars().any(char::is_control)).then_some(name)
 }
 
 /// GH#293: index names when every integrity-check row is a collated-index
@@ -826,7 +837,7 @@ pub struct IntegrityClassification {
     /// Rows that are neither benign nor index-only damage.
     pub structural_errors: usize,
     /// Index-level damage rows (`wrong # of entries in index …`,
-    /// `row N missing from index …`).
+    /// `row N missing from index …`, or the runtime's exact key-order error).
     pub index_errors: usize,
     /// First structural error verbatim, for triage without the full stream.
     pub first_structural_error: Option<String>,
@@ -841,23 +852,6 @@ pub struct IntegrityClassification {
 /// callers decide.
 #[must_use]
 pub fn classify_check_details(details: &[String]) -> IntegrityClassification {
-    fn detail_is_index_damage(detail: &str) -> bool {
-        let trimmed = detail.trim();
-        if trimmed.starts_with("wrong # of entries in index ") {
-            return trimmed.len() > "wrong # of entries in index ".len();
-        }
-        if trimmed.starts_with("row ")
-            && let Some(pos) = trimmed.find(" missing from index ")
-        {
-            let rowid = &trimmed["row ".len()..pos];
-            let name = trimmed[pos + " missing from index ".len()..].trim();
-            return !rowid.is_empty()
-                && rowid.chars().all(|c| c.is_ascii_digit())
-                && !name.is_empty();
-        }
-        false
-    }
-
     let mut leaked_pages = 0_usize;
     let mut structural_errors = 0_usize;
     let mut index_errors = 0_usize;
@@ -875,7 +869,7 @@ pub fn classify_check_details(details: &[String]) -> IntegrityClassification {
             leaked_pages += 1;
             continue;
         }
-        if detail_is_index_damage(trimmed) {
+        if index_damage_index_name(trimmed).is_some_and(|name| !name.is_empty()) {
             index_errors += 1;
             continue;
         }
@@ -1840,6 +1834,48 @@ mod tests {
             "wrong # of entries in index idx_r_pa".to_string(),
         ];
         assert!(index_only_corruption_index_names(&details).is_none());
+    }
+
+    #[test]
+    fn index_only_classifier_accepts_runtime_key_order_damage() {
+        for prefix in ["", "database disk image is malformed: "] {
+            let details = vec![format!(
+                "{prefix}index `idx_agents_project_name` entries are out of order for their declared key directions"
+            )];
+            assert_eq!(
+                index_only_corruption_index_names(&details),
+                Some(vec!["idx_agents_project_name".to_string()])
+            );
+            let classification = classify_check_details(&details);
+            assert_eq!(classification.index_errors, 1);
+            assert_eq!(classification.structural_errors, 0);
+
+            let mut mixed = details;
+            mixed.push("Page 3: b-tree page is malformed".to_string());
+            assert!(index_only_corruption_index_names(&mixed).is_none());
+            assert_eq!(classify_check_details(&mixed).structural_errors, 1);
+        }
+    }
+
+    #[test]
+    fn index_only_classifier_rejects_ambiguous_runtime_order_messages() {
+        for detail in [
+            "index `` entries are out of order for their declared key directions",
+            "index `idx`extra` entries are out of order for their declared key directions",
+            "index `idx\nname` entries are out of order for their declared key directions",
+            "index `idx` entries are out of order on a malformed page",
+            "index `idx` entries are out of order for their declared key directions; page 3 is corrupt",
+            "page corruption: index `idx` entries are out of order for their declared key directions",
+        ] {
+            let details = vec![detail.to_string()];
+            assert!(
+                index_only_corruption_index_names(&details).is_none(),
+                "must not authorize REINDEX for {detail:?}"
+            );
+            let classification = classify_check_details(&details);
+            assert_eq!(classification.index_errors, 0, "{detail:?}");
+            assert_eq!(classification.structural_errors, 1, "{detail:?}");
+        }
     }
 
     #[test]
