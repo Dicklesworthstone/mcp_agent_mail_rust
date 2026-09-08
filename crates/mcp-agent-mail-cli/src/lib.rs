@@ -60886,6 +60886,139 @@ startup_timeout_sec = 42
         );
     }
 
+    /// GH#312: the live database still opens and its coordination tables read
+    /// cleanly, but full `integrity_check` *raises* "database disk image is
+    /// malformed" on a torn page instead of reporting rows. `am doctor
+    /// reconstruct --yes` used to rebuild a clean candidate and then refuse to
+    /// promote it because the promotion receipt could not classify the corrupt
+    /// source ("semantic snapshot succeeded but full integrity_check failed"),
+    /// leaving a `reconstruct-failed-*` artifact on every retry until the
+    /// operator moved the source aside by hand.
+    #[test]
+    fn doctor_reconstruct_promotes_over_a_source_whose_integrity_check_raises() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = tmp.path().join("storage");
+        let db_path = tmp.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage.to_string_lossy().to_string();
+        let db_url_text = db_url.clone();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("DATABASE_URL", db_url_text.as_str()),
+            ],
+            || {
+                handle_migrate_with_database_url(&db_url).expect("migrate");
+                {
+                    let conn = open_db_sync_with_database_url(&db_url).expect("open");
+                    conn.execute_raw(
+                        "INSERT INTO projects (slug, human_key, created_at)
+                         VALUES ('legacy-project', '/tmp/legacy-project', 0)",
+                    )
+                    .expect("insert legacy project");
+                }
+                tear_last_page_behind_readable_tables(&db_path);
+
+                // Precondition: the reporter's shape. Coordination tables
+                // read cleanly while the full check raises.
+                {
+                    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+                        db_path.display().to_string(),
+                    )
+                    .expect("reopen torn live db");
+                    let rows = conn
+                        .query_sync("SELECT slug FROM projects", &[])
+                        .expect("projects must stay readable on the torn live db");
+                    assert_eq!(rows.len(), 1);
+                    let raise = conn
+                        .query_sync("PRAGMA integrity_check", &[])
+                        .expect_err("integrity_check must raise on the torn page");
+                    assert!(
+                        raise
+                            .to_string()
+                            .contains("database disk image is malformed"),
+                        "unexpected raise: {raise}"
+                    );
+                }
+
+                let archive_project = storage.join("projects").join("archive-only-project");
+                let archive_agent = archive_project.join("agents").join("ArchiveFox");
+                let archive_messages = archive_project.join("messages").join("2026").join("03");
+                std::fs::create_dir_all(&archive_agent).expect("create archive agent dir");
+                std::fs::create_dir_all(&archive_messages).expect("create archive message dir");
+                std::fs::write(
+                    archive_project.join("project.json"),
+                    r#"{"slug":"archive-only-project","human_key":"/tmp/archive-only-project"}"#,
+                )
+                .expect("write project.json");
+                std::fs::write(
+                    archive_agent.join("profile.json"),
+                    r#"{"name":"ArchiveFox","program":"codex","model":"gpt-5","task_description":"archive seed","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z","attachments_policy":"auto","contact_policy":"auto"}"#,
+                )
+                .expect("write profile");
+                std::fs::write(
+                    archive_messages.join("20260322T000001Z__9001.md"),
+                    "---json\n{\"id\":9001,\"from\":\"ArchiveFox\",\"to\":[\"LegacyAgent\"],\"subject\":\"Archive only message\",\"thread_id\":\"archive-thread\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T00:00:01Z\",\"attachments\":[]}\n---\nRecovered from archive only.\n",
+                )
+                .expect("write archive message");
+
+                let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+                let result = handle_doctor_reconstruct_with(
+                    Some(&db_path),
+                    Some(&storage),
+                    false,
+                    true,
+                    true,
+                );
+                let output = capture.drain_to_string();
+                assert!(
+                    result.is_ok(),
+                    "GH#312: reconstruct must promote over a source whose integrity_check raises: {result:?}\n{output}"
+                );
+                assert!(
+                    mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(
+                        &db_path
+                    )
+                    .expect("probe promoted db"),
+                    "the promoted database must pass full integrity"
+                );
+
+                let verify =
+                    mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+                        .expect("reopen promoted db");
+                let slugs = verify
+                    .query_sync("SELECT slug FROM projects ORDER BY slug", &[])
+                    .expect("query projects")
+                    .iter()
+                    .map(|row| row.get_named::<String>("slug").expect("slug"))
+                    .collect::<Vec<_>>();
+                assert!(
+                    slugs.iter().any(|slug| slug == "archive-only-project"),
+                    "archive state must be promoted: {slugs:?}"
+                );
+
+                let artifacts = std::fs::read_dir(tmp.path())
+                    .expect("read tmp dir")
+                    .filter_map(|entry| entry.ok())
+                    .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+                    .collect::<Vec<_>>();
+                assert!(
+                    artifacts.iter().any(|name| name.contains(".corrupt-")),
+                    "the torn source must be quarantined beside the live path, not deleted: {artifacts:?}"
+                );
+                assert!(
+                    !artifacts
+                        .iter()
+                        .any(|name| name.contains(".reconstruct-failed-")),
+                    "no refused candidate may be left behind: {artifacts:?}"
+                );
+            },
+        );
+    }
+
     #[test]
     fn doctor_reconstruct_salvages_quarantined_artifact_when_primary_is_missing() {
         let _guard = stdio_capture_lock()
@@ -92205,6 +92338,50 @@ fn seed_malformed_btree_db(db_path: &Path) {
         *byte = 0xA5;
     }
     std::fs::write(db_path, &bytes).expect("write corrupted malformed fixture db file");
+}
+
+/// GH#312: append a multi-page filler b-tree to an existing mailbox database
+/// and zero-fill the file's last page. Every pre-existing table stays
+/// readable, while canonical SQLite *raises* `database disk image is
+/// malformed` from inside `PRAGMA integrity_check` instead of reporting error
+/// rows — the source shape that used to make promotion unclassifiable.
+#[cfg(test)]
+fn tear_last_page_behind_readable_tables(db_path: &Path) {
+    let db_path_text = db_path.display().to_string();
+    {
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_text)
+            .expect("open canonical db for torn-page fixture");
+        for statement in [
+            "CREATE TABLE gh312_filler (id INTEGER PRIMARY KEY, payload BLOB NOT NULL)",
+            "CREATE INDEX idx_gh312_filler_payload ON gh312_filler(payload)",
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 300) \
+             INSERT INTO gh312_filler (payload) SELECT zeroblob(900) FROM seq",
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+        ] {
+            conn.execute_raw(statement)
+                .unwrap_or_else(|error| panic!("torn-page fixture `{statement}`: {error}"));
+        }
+    }
+
+    let mut bytes = std::fs::read(db_path).expect("read torn-page fixture db file");
+    let page_size = {
+        let raw = u16::from_be_bytes([bytes[16], bytes[17]]);
+        if raw == 1 {
+            65_536usize
+        } else {
+            usize::from(raw)
+        }
+    };
+    assert!(
+        bytes.len() >= page_size * 8 && bytes.len().is_multiple_of(page_size),
+        "torn-page fixture must span whole pages (len={}, page_size={page_size})",
+        bytes.len()
+    );
+    let last_page = bytes.len() - page_size;
+    for byte in bytes.iter_mut().skip(last_page) {
+        *byte = 0;
+    }
+    std::fs::write(db_path, &bytes).expect("write torn-page fixture db file");
 }
 
 #[cfg(test)]

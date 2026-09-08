@@ -627,9 +627,24 @@ where
         return Ok(Vec::new());
     }
     Err(format!(
-        "every {kind} probe form failed — {}",
+        "every {kind}{PROBE_FORMS_EXHAUSTED_MARKER} — {}",
         errors.join("; ")
     ))
+}
+
+/// Message fragment [`probe_check_rows`] emits when every SQL form of one
+/// check failed, i.e. the connection opened but the check statement itself
+/// could not run.
+const PROBE_FORMS_EXHAUSTED_MARKER: &str = " probe form failed";
+
+/// Whether `message` is (or wraps) a [`probe_check_rows`] failure in which
+/// every probe form of a check failed on an open connection.
+///
+/// Callers use this to tell "SQLite opened the file but could not execute
+/// `integrity_check` on it" apart from open/staging failures.
+#[must_use]
+pub fn is_probe_forms_exhausted_message(message: &str) -> bool {
+    message.contains(PROBE_FORMS_EXHAUSTED_MARKER)
 }
 
 /// Compact, bounded rendering of integrity-check detail rows.

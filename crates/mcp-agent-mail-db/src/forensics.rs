@@ -2873,14 +2873,21 @@ fn archive_canonical_project_identities(storage_root: &Path) -> BTreeMap<String,
 /// `Ok(Some(reason))` means the file is present but not a trustworthy SQLite
 /// generation; callers empty the source sets so a healthy archive candidate
 /// can still be promoted (br-r6awv).
-/// `Err` is reserved for probes that failed without proving corruption
-/// (lock/busy, I/O) — those must not look like a successful heal.
+/// `Err` is reserved for probes that failed without saying anything about the
+/// file (disk full, I/O error, descriptor exhaustion, a copy that would not
+/// open) — those must not look like a successful heal.
 ///
 /// `path` is always a PRIVATE staged copy ([`CanonicalSnapshotSource`]), so
 /// the probe opens it writable: a settled copy whose main-file header still
 /// demands WAL recovery is unreadable to a read-only canonical open ("unable
 /// to open database file" on every probe form), which used to make an
 /// unclassifiable source veto a healthy archive candidate.
+///
+/// When the copy opens but `integrity_check` itself then fails on it, that is
+/// a verdict about the copy, not an environmental failure: the promotion gate
+/// cannot demand that a corrupt source pass a check it can no longer run
+/// (GH#312 — every retry produced another refused candidate and the mailbox
+/// stayed down until the operator moved the source aside by hand).
 fn source_full_integrity_refusal(path: &Path) -> Result<Option<String>, SqlError> {
     match crate::pool::sqlite_private_copy_passes_full_integrity_check(path) {
         Ok(true) => Ok(None),
@@ -2890,7 +2897,7 @@ fn source_full_integrity_refusal(path: &Path) -> Result<Option<String>, SqlError
         ))),
         Err(health_error) => {
             let message = health_error.to_string();
-            if crate::pool::is_corruption_error_message(&message) {
+            if crate::pool::private_copy_integrity_probe_failure_is_verdict(&message) {
                 Ok(Some(message))
             } else {
                 Err(health_error)
@@ -5598,6 +5605,64 @@ mod tests {
             "receipt must attest that the garbage source was not used as authority"
         );
         assert_eq!(document.body.source.projects.count, 0);
+    }
+
+    /// GH#312: the source opens, its coordination tables read cleanly (the
+    /// semantic snapshot succeeds), but full `integrity_check` *raises*
+    /// "database disk image is malformed" on a torn page instead of reporting
+    /// rows. Promotion used to treat that raise as an unclassifiable probe
+    /// failure and refuse forever — a check the corrupt source can no longer
+    /// run cannot gate a healthy archive candidate.
+    #[test]
+    fn recovery_receipt_promotes_when_source_integrity_check_raises_on_torn_page() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let candidate = dir.path().join("candidate.sqlite3");
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("mail-root");
+        seed_recovery_receipt_db(&source, true);
+        crate::pool::append_filler_btree_and_tear_last_page(&source);
+        seed_recovery_receipt_db(&candidate, true);
+
+        // Preconditions pin the reporter's shape: the semantic snapshot still
+        // succeeds on the torn source, and the full probe raises rather than
+        // reporting rows.
+        collect_recovery_continuity_sets(&source)
+            .expect("semantic snapshot must still succeed on the torn source");
+        let staged =
+            super::CanonicalSnapshotSource::for_family(&source).expect("stage torn source");
+        let probe_error =
+            crate::pool::sqlite_private_copy_passes_full_integrity_check(staged.snapshot_path())
+                .expect_err("integrity_check must raise on the torn page");
+        assert!(
+            probe_error
+                .to_string()
+                .contains("database disk image is malformed"),
+            "unexpected probe failure shape: {probe_error}"
+        );
+        drop(staged);
+
+        let prepared = prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
+            .expect(
+                "GH#312: a source whose integrity_check raises must be attested as unverified, \
+                 not veto the healthy candidate",
+            );
+        let document: super::RecoveryReceiptDocument = serde_json::from_slice(
+            &std::fs::read(&prepared.pending_path).expect("read pending receipt"),
+        )
+        .expect("decode pending receipt");
+        assert!(
+            document.body.source_snapshot_failure_sha256.is_some(),
+            "receipt must attest that the torn source was not used as promotion authority"
+        );
+        assert_eq!(
+            document.body.source.projects.count, 0,
+            "a source that cannot pass full integrity must not contribute continuity sets"
+        );
+        assert_eq!(
+            document.body.delta.messages.lost_count, 0,
+            "no loss may be charged against an unverified source"
+        );
     }
 
     /// The identity/volatile split (GH#208): lifecycle state that archive

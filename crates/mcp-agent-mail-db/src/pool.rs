@@ -7337,6 +7337,41 @@ pub fn is_corruption_error_message(message: &str) -> bool {
         || lower.contains("no healthy backup was found")
 }
 
+/// Whether a failed full-integrity probe of a PRIVATE staged family copy is a
+/// verdict about that copy rather than an environmental failure of the probe.
+///
+/// A corruption-classified message is always a verdict. Beyond that, when the
+/// copy opened but every `integrity_check` form then failed on it
+/// ([`integrity::is_probe_forms_exhausted_message`]), the copy is not a
+/// trustworthy SQLite generation unless the failure text is a resource or
+/// lock class (disk full, I/O error, descriptor/pool exhaustion, a temp-file
+/// `unable to open database file`) — those are retryable host conditions that
+/// say nothing about the file and must keep recovery fail-closed. Nobody else
+/// can hold a lock on a copy this process just staged, so any remaining error
+/// SQLite raises from inside `integrity_check` is evidence about the file
+/// (GH#312: promotion was refused forever because such a failure was treated
+/// as unclassifiable).
+///
+/// Open failures of the copy are never a verdict here: they carry no evidence
+/// beyond what [`is_corruption_error_message`] already recognises.
+#[must_use]
+pub(crate) fn private_copy_integrity_probe_failure_is_verdict(message: &str) -> bool {
+    if is_corruption_error_message(message) {
+        return true;
+    }
+    if !integrity::is_probe_forms_exhausted_message(message) {
+        return false;
+    }
+    !matches!(
+        crate::error::classify_db_error_message(message).class,
+        crate::error::DbErrorClass::HostPressure
+            | crate::error::DbErrorClass::FdExhaustion
+            | crate::error::DbErrorClass::PoolExhaustion
+            | crate::error::DbErrorClass::BusyRetryable
+            | crate::error::DbErrorClass::LiveOwnerNoActivityLock
+    )
+}
+
 #[allow(clippy::result_large_err)]
 fn sqlite_check_rows_with<F>(
     mut query: F,
@@ -14726,6 +14761,85 @@ fn recent_reconstruct_store(
 
 /// Clear the coalescing cache. Intended for tests only — production lookup
 /// also gates every hit on matching archive inventory and a healthy live file.
+/// Build a mailbox-shaped database whose coordination tables stay fully
+/// readable while the last page (part of an unrelated filler b-tree) is
+/// zeroed. On this shape canonical SQLite *raises* `database disk image is
+/// malformed` from inside `PRAGMA integrity_check` instead of reporting error
+/// rows — the GH#312 source shape ("semantic snapshot succeeded but full
+/// integrity_check failed").
+#[cfg(test)]
+pub(crate) fn seed_readable_db_with_torn_filler_page(path: &Path) {
+    {
+        let conn = crate::CanonicalDbConn::open_file(path.display().to_string())
+            .expect("open canonical db");
+        for statement in [
+            "PRAGMA page_size = 4096",
+            "PRAGMA journal_mode = DELETE",
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+            "INSERT INTO projects (id, slug, human_key) VALUES (17, 'alpha', '/srv/alpha')",
+            "INSERT INTO agents (id, project_id, name) VALUES (41, 17, 'BlueFox')",
+        ] {
+            conn.execute_raw(statement)
+                .unwrap_or_else(|error| panic!("seed torn-page fixture `{statement}`: {error}"));
+        }
+    }
+    append_filler_btree_and_tear_last_page(path);
+}
+
+/// Append a multi-page filler table plus index to an existing standalone
+/// SQLite file, then zero-fill its final page. Every pre-existing table stays
+/// readable; `PRAGMA integrity_check` raises instead of reporting rows.
+#[cfg(test)]
+pub(crate) fn append_filler_btree_and_tear_last_page(path: &Path) {
+    use std::io::{Seek, SeekFrom, Write};
+    {
+        let conn = crate::CanonicalDbConn::open_file(path.display().to_string())
+            .expect("open fixture for filler");
+        for statement in [
+            "PRAGMA journal_mode = DELETE",
+            "CREATE TABLE gh312_filler (id INTEGER PRIMARY KEY, payload BLOB NOT NULL)",
+            "CREATE INDEX idx_gh312_filler_payload ON gh312_filler(payload)",
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 300) \
+             INSERT INTO gh312_filler (payload) SELECT zeroblob(900) FROM seq",
+        ] {
+            conn.execute_raw(statement)
+                .unwrap_or_else(|error| panic!("seed filler fixture `{statement}`: {error}"));
+        }
+    }
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+        assert!(
+            !path_is_occupied(&sqlite_sidecar_path(path, suffix)),
+            "fixture must be a standalone main file before tearing a page ({suffix} present)"
+        );
+    }
+    let bytes = std::fs::read(path).expect("read fixture");
+    // Header bytes 16..18 hold the page size big-endian; the value 1 means
+    // 65536.
+    let page_size = match u64::from(u16::from_be_bytes([bytes[16], bytes[17]])) {
+        1 => 65_536,
+        size => size,
+    };
+    let len = u64::try_from(bytes.len()).expect("fixture length fits u64");
+    assert!(
+        len >= page_size * 8 && len.is_multiple_of(page_size),
+        "fixture must span several whole pages, got {len} bytes at page size {page_size}"
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open fixture for tearing");
+    file.seek(SeekFrom::Start(len - page_size))
+        .expect("seek to last page");
+    file.write_all(&vec![
+        0_u8;
+        usize::try_from(page_size)
+            .expect("page size fits usize")
+    ])
+    .expect("zero last page");
+    file.sync_all().expect("sync torn fixture");
+}
+
 #[cfg(test)]
 pub(crate) fn reset_recent_reconstruct_cache_for_test() {
     recent_reconstruct_cache()
@@ -15958,6 +16072,85 @@ mod tests {
             !sqlite_file_passes_full_integrity_check(&path).expect("integrity probe"),
             "mass never-used page loss must fail the full canonical integrity check"
         );
+    }
+
+    /// GH#312: when `integrity_check` raises on a private staged copy, the
+    /// probe error must be a corruption verdict even though the joined
+    /// multi-form message leads with the table-valued form's
+    /// `no such table: 1000000` noise.
+    #[test]
+    fn private_copy_integrity_probe_raise_on_torn_page_is_a_corruption_verdict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("torn-page.sqlite3");
+        seed_readable_db_with_torn_filler_page(&path);
+        {
+            let conn = crate::CanonicalDbConn::open_file(path.display().to_string())
+                .expect("reopen torn fixture");
+            let rows = conn
+                .query_sync("SELECT name FROM agents", &[])
+                .expect("coordination tables must stay readable on the torn fixture");
+            assert_eq!(rows.len(), 1);
+        }
+
+        let error = sqlite_private_copy_passes_full_integrity_check(&path)
+            .expect_err("integrity_check must raise on the torn page rather than report rows");
+        let message = error.to_string();
+        assert!(
+            integrity::is_probe_forms_exhausted_message(&message),
+            "expected every probe form to fail: {message}"
+        );
+        assert!(
+            message.contains("database disk image is malformed"),
+            "expected the raise to carry the malformed verdict: {message}"
+        );
+        assert!(
+            is_corruption_error_message(&message),
+            "GH#312: the joined probe error must classify as corruption: {message}"
+        );
+        assert!(private_copy_integrity_probe_failure_is_verdict(&message));
+    }
+
+    #[test]
+    fn private_copy_integrity_probe_failure_verdict_keeps_environmental_failures_closed() {
+        let exhausted = |detail: &str| {
+            format!(
+                "integrity_check failed: every integrity_check probe form failed — \
+                 `SELECT integrity_check FROM pragma_integrity_check(1000000)`: Query error: {detail}; \
+                 `PRAGMA integrity_check`: Query error: {detail}"
+            )
+        };
+        // Resource and lock classes say nothing about the file.
+        for detail in [
+            "database or disk is full",
+            "disk I/O error",
+            "unable to open database file",
+            "Too many open files (os error 24)",
+        ] {
+            assert!(
+                !private_copy_integrity_probe_failure_is_verdict(&exhausted(detail)),
+                "{detail:?} must stay fail-closed"
+            );
+        }
+        // A raise SQLite produced from inside the check on a copy nobody else
+        // can touch is evidence about the copy.
+        for detail in [
+            "database disk image is malformed",
+            "no such table: 1000000; `PRAGMA integrity_check`: Query error: database disk image is malformed",
+            "SQL logic error",
+            "vtable constructor failed: fts_messages",
+        ] {
+            assert!(
+                private_copy_integrity_probe_failure_is_verdict(&exhausted(detail)),
+                "{detail:?} must be a verdict about the copy"
+            );
+        }
+        // An open failure of the copy carries no verdict beyond corruption text.
+        assert!(!private_copy_integrity_probe_failure_is_verdict(
+            "private-copy canonical integrity open failed for /x/health-probe.sqlite3: unable to open database file"
+        ));
+        assert!(private_copy_integrity_probe_failure_is_verdict(
+            "private-copy canonical integrity open failed for /x/health-probe.sqlite3: file is not a database"
+        ));
     }
 
     #[test]

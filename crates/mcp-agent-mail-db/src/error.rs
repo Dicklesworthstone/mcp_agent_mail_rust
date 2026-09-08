@@ -1053,14 +1053,22 @@ fn classify_db_error_message_class(msg: &str) -> DbErrorClass {
     if contains_fts_index_corruption(msg) {
         return DbErrorClass::FtsIndexCorruption;
     }
+    // An explicit main-file corruption signature outranks the generic
+    // schema-drift strings. A multi-form integrity probe joins every form's
+    // error into one message, and on current SQLite the table-valued
+    // `pragma_integrity_check(N)` form always fails first with
+    // "no such table: N" (the argument is quoted and looked up as a table
+    // name); letting that noise classify a message that also carries
+    // "database disk image is malformed" as schema drift made recovery treat
+    // a proven-corrupt source as unclassifiable and refuse promotion (GH#312).
+    if contains_main_db_corruption(msg) {
+        return DbErrorClass::MainDbBtreeCorruption;
+    }
     if contains_schema_drift(msg) {
         return DbErrorClass::SchemaDriftOrMissingTables;
     }
     if contains_engine_probe_limitation(msg) {
         return DbErrorClass::EngineProbeLimitation;
-    }
-    if contains_main_db_corruption(msg) {
-        return DbErrorClass::MainDbBtreeCorruption;
     }
     if contains_foreign_key_inconsistency(msg) {
         return DbErrorClass::ForeignKeyInconsistency;
@@ -1293,6 +1301,37 @@ mod tests {
             "unexpected classification for {message:?}: {classification:?}"
         );
         classification
+    }
+
+    /// GH#312: a multi-form integrity probe joins every form's error into one
+    /// message. On current SQLite the table-valued `pragma_integrity_check(N)`
+    /// form fails first with "no such table: N" (the argument is quoted and
+    /// resolved as a table name), so the joined message carries a generic
+    /// schema-drift string *and* the real "database disk image is malformed"
+    /// verdict from the forms that ran. The corruption evidence must win; the
+    /// old order classified this as schema drift, `is_corruption_error`
+    /// returned false, and recovery treated a proven-corrupt source as
+    /// unclassifiable.
+    #[test]
+    fn explicit_main_db_corruption_outranks_schema_drift_noise_in_joined_probe_errors() {
+        let joined = "integrity_check failed: every integrity_check probe form failed — \
+             `SELECT integrity_check FROM pragma_integrity_check(1000000)`: Query error: no such table: 1000000; \
+             `PRAGMA integrity_check(1000000)`: Query error: database disk image is malformed; \
+             `SELECT integrity_check FROM pragma_integrity_check()`: Query error: no such table: pragma_integrity_check; \
+             `PRAGMA integrity_check`: Query error: database disk image is malformed";
+        assert_class(joined, DbErrorClass::MainDbBtreeCorruption);
+        assert!(is_corruption_error(joined));
+
+        // The generic strings alone still classify as drift, and the typed
+        // classifier stays conservative about raw schema-corruption strings.
+        assert_class(
+            "no such table: 1000000",
+            DbErrorClass::SchemaDriftOrMissingTables,
+        );
+        assert_class(
+            "malformed database schema (idx_agent_links_pair_unique) - invalid rootpage (11)",
+            DbErrorClass::SchemaDriftOrMissingTables,
+        );
     }
 
     #[test]
