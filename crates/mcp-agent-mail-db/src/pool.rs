@@ -21858,6 +21858,11 @@ mod tests {
     fn startup_integrity_check_recovers_corrupt_primary_under_admission() {
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("startup_corrupt.db");
+        let storage_root = dir.path().join("archive");
+        // Archive-aware startup must restore durable mail, never turn an
+        // unrecoverable mailbox into an empty healthy database. Reuse the
+        // real archive fixture, with its seed DB outside the primary family.
+        seed_reconstructed_primary_from_archive(&dir.path().join("seed.db"), &storage_root);
         std::fs::write(&primary, b"not-a-sqlite-file").expect("write corrupt file");
         let breaker_lock = crate::recovery_breaker::breaker_lock_path(&primary);
         assert!(
@@ -21867,6 +21872,7 @@ mod tests {
 
         let config = DbPoolConfig {
             database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: Some(storage_root),
             run_migrations: false,
             ..Default::default()
         };
@@ -21892,6 +21898,30 @@ mod tests {
             .expect("successful admitted recovery persists cleared authority");
         assert_eq!(breaker.consecutive_failures, 0);
         assert!(!breaker.tripped);
+        let recovered =
+            DbConn::open_file(primary.to_string_lossy().as_ref()).expect("open recovered mailbox");
+        let rows = recovered
+            .query_sync("SELECT id, subject, body_md FROM messages", &[])
+            .expect("read restored archive message");
+        assert_eq!(rows.len(), 1, "recovery must preserve the archived message");
+        assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 1);
+        assert_eq!(rows[0].get_named::<String>("subject").unwrap(), "First");
+        assert_eq!(
+            rows[0].get_named::<String>("body_md").unwrap().trim(),
+            "first body"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("read recovery artifacts")
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("startup_corrupt.db.corrupt-"))
+                .any(|entry| std::fs::read(entry.path())
+                    .is_ok_and(|bytes| bytes == b"not-a-sqlite-file")),
+            "the corrupt primary must survive verbatim in quarantine"
+        );
     }
 
     #[test]
