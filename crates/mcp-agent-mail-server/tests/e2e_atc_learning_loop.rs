@@ -496,7 +496,11 @@ fn e2e_message_learning_loop_covers_ack_and_ack_overdue_branches() {
             ("HTTP_RATE_LIMIT_ENABLED", "false"),
             ("HTTP_RBAC_ENABLED", "false"),
             ("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "true"),
+            // This scenario requires both observation writes and activity
+            // tracking, even when the operator's saved preferences disable ATC.
+            ("AM_ATC_ENABLED", "true"),
             ("AM_ATC_WRITE_MODE", "live"),
+            ("ATC_LEARNING_DISABLED", "0"),
             ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
             ("DATABASE_POOL_SIZE", "1"),
             ("DATABASE_MAX_OVERFLOW", "0"),
@@ -514,6 +518,10 @@ fn e2e_message_learning_loop_covers_ack_and_ack_overdue_branches() {
             let server = RunningServer::spawn(server_config);
 
             wait_for_readiness(port, &server.result_rx);
+            assert!(
+                atc::atc_enabled(),
+                "the live learning-loop fixture must enable ATC activity tracking"
+            );
             let db_pool = get_or_create_pool(&DbPoolConfig::from_env()).expect("shared test pool");
 
             let ensure_project = tool_payload(

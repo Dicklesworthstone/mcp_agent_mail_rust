@@ -3448,6 +3448,31 @@ mod tests {
 
     #[test]
     fn build_detect_report_marks_legacy_storage_only_env_signal() {
+        const CHILD_ENV: &str = "AM_TEST_LEGACY_STORAGE_ENV_SIGNAL";
+        const WITNESS: &str = "legacy-storage-only-env-marker-observed";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // The scenario exercises project .env authority. An inherited
+            // STORAGE_ROOT legitimately wins over it, so remove that input
+            // only in a child instead of racing other tests' process env.
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .arg("legacy::tests::build_detect_report_marks_legacy_storage_only_env_signal")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .env_remove("STORAGE_ROOT")
+            .output()
+            .expect("run isolated legacy marker fixture");
+            assert!(
+                output.status.success(),
+                "legacy marker child failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(WITNESS));
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         fs::write(
             tmp.path().join(".env"),
@@ -3457,13 +3482,16 @@ mod tests {
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("MOCK_AM_BINARY", "")],
             || {
-                let report = build_detect_report(tmp.path(), None, None).unwrap();
+                let report =
+                    build_detect_report(tmp.path(), Some(&tmp.path().join("absent.db")), None)
+                        .unwrap();
                 assert!(
                     report
                         .markers
                         .iter()
                         .any(|marker| marker.id == "legacy_env_defaults")
                 );
+                println!("{WITNESS}");
             },
         );
     }

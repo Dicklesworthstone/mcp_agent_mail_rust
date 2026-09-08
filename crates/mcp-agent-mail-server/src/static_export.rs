@@ -1165,14 +1165,25 @@ first body
 
     #[test]
     fn emit_route_reports_missing_dispatch() {
-        let dir = PathBuf::from("/tmp/static_export_test_missing");
-        let _ = fs::remove_dir_all(&dir);
-        let mut files = BTreeMap::new();
-        let err = emit_route("/nonexistent/route", "", "test.html", &dir, &mut files)
-            .expect_err("missing dispatch route should fail export");
-        assert!(err.contains("not handled by mail UI dispatcher"));
-        assert!(files.is_empty());
-        let _ = fs::remove_dir_all(&dir);
+        let dir = tempfile::tempdir().expect("private export fixture").keep();
+        let storage_root = dir.join("archive");
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+        // Dispatch opens a read pool before resolving project routes. This
+        // fixture owns that dependency and must not inspect an operator DB.
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", "sqlite:///:memory:"),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || {
+                let mut files = BTreeMap::new();
+                let err = emit_route("/nonexistent/route", "", "test.html", &dir, &mut files)
+                    .expect_err("missing dispatch route should fail export");
+                assert!(err.contains("not handled by mail UI dispatcher"), "{err}");
+                assert!(files.is_empty());
+                assert!(!dir.join("test.html").exists());
+            },
+        );
     }
 
     #[test]
