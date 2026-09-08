@@ -1,5 +1,406 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+**Current assessment: September 8, 2026 — requested complete reality check.**
+This assessment supersedes the September 4 and September 2 assessments retained
+below. The audit began at `ba2ad9ce`; peer changes subsequently advanced the code
+through `4717f869`. Released v0.3.34 is still `0125f050`. These are different
+subjects of verification.
+
+## September 8 judgment
+
+**The core product is real and useful; reliable operation under contention and
+strict release acceptance are unfinished.** This is no longer a missing-server
+or empty-command problem. Actual released binaries can register agents, reserve
+paths, send/read/ack/reply, serve resources, and enforce the archive-backed guard.
+However, a fresh execution of the canonical workflow failed its concurrent HTTP
+phase, the last complete workspace run had 12 failures, and manual publication
+did not satisfy the documented zero-failure gate. Those facts outweigh the large
+number of closed issues when deciding whether the project is finished.
+
+The highest return comes from delivering already-tested isolated repairs,
+resolving the remaining database/recovery failures, and making the existing
+release and workflow machinery decisive. Another architecture, dashboard,
+replacement engine, or broad feature campaign would dilute that work.
+
+### Evidence and its limits
+
+- Read all 1,339 lines of `AGENTS.md` and all initial 1,993 lines of `README.md`.
+  Read the subsequent 15-line README addition for the newly landed guard bounds.
+  Reviewed the existing full September 4 vision/plan audit, current documentation
+  index, durability contract, verification realism/closure policy and release
+  gates. Compared plan/spec documentation since the earlier assessment: only
+  this bridge changed before the concurrent README addition. Historical document
+  reads and measurements are reused explicitly; they are not new executions.
+- Initial tracker inventory: **2,457 issues: 2,289 closed, 90 open, 77 in progress,
+  one blocked**. Thus 168 unfinished issues, not 90. `bv` reported 155 actionable
+  and 13 not actionable; actionable does not mean unowned. Its top suggestion
+  was an old mirror-sync task, demonstrating why graph ranking needs source and
+  release evidence before taking action.
+- Live GitHub API confirmed v0.3.34 public, published September 8 at 02:58:05 UTC,
+  with 25 uploaded assets. Prior retained receipts establish six target families,
+  signed public downloads, Bash install/update, Homebrew formula publication and
+  dual-architecture GHCR publication. Linux ARM execution used QEMU; Intel Mac
+  used Rosetta. A fresh full PowerShell installer and `brew install` were not
+  executed. Every active crate remains `publish = false`; crates.io is an explicit
+  product decision (`br-95spu`), not a venue silently completed by this release.
+- Full nextest receipt at source `43459c5a`, run
+  `f70dd3fe-fc26-4d85-a6aa-a1dcc3aaf19c`: **17,384 executed, 17,372 passed,
+  12 failed, 37 skipped, two passing tests reported leaky**, exit 100. Raw log
+  SHA-256 `265e326d0a11f1c8ab66f31ffa0d41f62f840c85bd023aa888323ec0ea890d48`.
+  Final release-source check, Clippy with warnings denied, formatting and 123
+  focused tests passed. Neither result validates the later peer commits or
+  changes the red full-suite verdict.
+- **Fresh published-binary workflow, 19:19:23–19:20:09 UTC:** 41 assertions passed,
+  one failed, zero skipped. Phases 1–8 passed. Phase 9 completed HTTP initialize,
+  send, inbox and ack, then RedFox's concurrent `register_agent` returned
+  `RESOURCE_BUSY` / `busy_retryable`; the client exited before the ready barrier.
+  The other two clients were terminated by the owned harness and the server
+  exited 0. The reopen portion was not reached. This is a real failed workflow,
+  not evidence of lost mail or a proven new engine regression. The server calls
+  the error recoverable; the fixture currently requires first-attempt success.
+  That acceptance mismatch must be resolved explicitly, with bounded retry and
+  durable identity checks if retry is the intended contract.
+- That fresh run used release `am` SHA-256
+  `5931c453048d78154046865986a2c274e6189cc53714e418967b77b38f0785c7` and server
+  SHA-256 `687d5569130a7366cfe2abad2b6510ceec2acf8d618b49e9dab34c282aa94f20`.
+  Both workflow script and common harness hashes match the frozen source manifest.
+  The earlier 42/42 run remains valid for its own invocation; it cannot erase
+  this failure. No retry-until-green loop was run.
+- Local `timeout 15s am doctor health` returned 124 after reporting
+  `local_config_unattested` and migration work on its private probe copy. This is
+  no health verdict about the shared mailbox. The separate authoritative
+  reservation snapshot was conflict-free and lease 9572 was granted for this
+  document. No shared-mailbox repair or process takeover was attempted.
+- Keyword and Rust AST scans found no `todo!()` or `unimplemented!()` calls in
+  `crates`. Real handlers and known failures are stronger evidence than this
+  absence. Explicit model/encoder substitutes remain proof limitations, not
+  missing implementations inferred from a keyword.
+
+Evidence roots: local/CSS `/data/projects/am-release-0334-artifacts-20260908`;
+fresh execution on CSS under `reality-check-0908-7_egxbm3/` with the terminal
+`final-release-workflow-receipt.json`, full stdout and each client's stderr and
+history. Published release: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.34.
+
+### Vision checklist: present capability, remaining gap, owner
+
+`WORKING` below is bounded to the named executed path. `PARTIAL` includes known
+integration defects. `UNPROVEN` means the required current proof is absent, not
+that implementation is absent. No whole-product completion percentage is used.
+
+| # | Promise from README / governing contracts | Current assessment | Remaining work and existing coverage |
+|---|---|---|---|
+| 1 | Discoverable tools and real MCP dispatch | WORKING for exercised handlers; 45-tool source/retained discovery | Full per-tool closure: `br-l1q6z`, conformance. Registry counts alone prove no behavior. |
+| 2 | Inbox/thread and other resources | WORKING for fresh inbox/thread; wider 25-resource contract PARTIAL | `resources.rs`, conformance and `br-4meup`; no empty-resource rewrite. |
+| 3 | Send, reply, read/ack and explicit routing | WORKING sequentially in fresh release run; concurrency PARTIAL | `messaging.rs`, `queries.rs`; `br-kp1in.1/.2`, `br-sa58k`, `br-oeam8`, `br-e0blb`. |
+| 4 | Broadcast intentionally forbidden | Implemented refusal and tests at both normalization/tool boundaries | Preserve rejection at `messaging.rs:1136,1891`; no broadcast feature task. |
+| 5 | DB commit plus durable Git recovery ledger | PARTIAL: real persistence/archive pipeline and offline parity pass | `br-0flbu`, `br-htobc`, `br-kp1in.1/.2/.9/.10`, `br-8j6cb`; eventual archive is not synchronous commit. |
+| 6 | Concurrent agents without wedges or corruption | PARTIAL: fresh three-client identity contention failed workflow | `br-kp1in.1/.2`, `br-22gm3`, `br-qz7rz`, `br-fkam4`, `br-9bwnb`; retain retry/cancellation histories. |
+| 7 | Recover corrupt state without false health or source loss | PARTIAL; multiple full-suite failures; new source recovery fix `ad87cdb8` | `br-qdgio`, `br-r6psd`, `br-sd3md`, `br-kp1in.12`, `br-l1q6z`; validate new promotion behavior, not just a refusal. |
+| 8 | FrankenSQLite runtime and structured async | Real fsqlite 0.3.18/asupersync 0.4.9; lifecycle guarantee PARTIAL | Canonical SQLite remains verification/recovery only. `br-tl2sg`, `br-22gm3`, engine probes; no policy/default reversal. |
+| 9 | Scoped identities, contacts and durable topics | PARTIAL; identity sequential pass, concurrent Busy; new source contact repair `708ae6ba` | `contacts.rs`, `macros.rs`; `br-g6c0z`, `br-sgaee`, `br-qayvs`, current conformance gate. |
+| 10 | Reservations, TTL/release and commit/push guard | WORKING for fresh offline lifecycle/guard; broader bounds PARTIAL | New source guard `4717f869` is not in release; `br-ssog9`, `br-l1q6z`; preserve advisory semantics. |
+| 11 | Product bus and advisory build slots | Real handlers, current complete behavior UNPROVEN | Existing mixed workflow and conformance; `br-kp1in.1/.2`; membership/privacy and expiry remain acceptance. |
+| 12 | Useful 16-screen TUI | Real implementation; current visual/interaction proof PARTIAL | `br-boq46`, `br-y8k4z`, `br-mljnz`, full TUI traversal; snapshots are not live input proof. |
+| 13 | Web mailbox/archive review | PARTIAL; two archive HTTP failures and static-export failure | `mail_ui.rs:71` opens DB before archive dispatch; validated isolated routing repair remains unlanded under `br-l1q6z`. |
+| 14 | Robot snapshots and noninteractive CLI | WORKING for sampled agents/list; broader truth PARTIAL | `robot.rs`; `br-4myjj`, `br-eru3j`, `br-49eak`; recheck stale titles before reimplementing fixes. |
+| 15 | Reversible, scoped, owner-safe doctor | PARTIAL; real seven-op mutation/undo machinery, failed integrity cases | `doctor/mutate.rs`, `br-x2jf5`, `br-6u4hx`, recovery tasks; local unattested timeout is not live health. |
+| 16 | Agent setup, config authority and secret safety | PARTIAL; substantial real integration and unfinished authority tasks | `br-siq0z`, `br-ww5js`, `br-q8k82`, `br-3cqr4`, `br-x5a8y`, `br-fphbm`. |
+| 17 | Search V3 lexical and optional hybrid | Real integration; route/quality coverage PARTIAL | `search_service.rs`; `br-7x5fm`, `br-ku0kl`, `br-eh8bj`, `br-kp1in.7/.8`; portable release is lexical. |
+| 18 | Useful optional summaries and compact output | PARTIAL; offline substitutes cannot establish model/encoder quality | `br-kp1in.7/.8`; actual selected model/encoder, scope canaries and semantic round trip required. |
+| 19 | ATC learning with quiet, safe defaults | PARTIAL; fresh default-disabled workflow; learning test still red | `br-hwney`, `br-au76r`, `br-kp1in.1/.2`; isolated enabled fixture fix is not file-backed restart proof. |
+| 20 | Share/export encryption and hosted verification | Real crypto/bundle code; complete current hosted path UNPROVEN | `share/src`, `br-ji2f0`, security/share real-path gates; no synthetic-only closure. |
+| 21 | Signed installation/update and all supported venues | WORKING within retained platform/install/update scopes; release acceptance PARTIAL | GitHub/Homebrew/GHCR delivered; `br-bx73n`, `br-nq2kb`, `br-kp1in.3/.4`; native installer gaps disclosed. |
+| 22 | Lossless legacy import and deliberate old-repo cutover | PARTIAL; source import/reopen fixes and unresolved authority tasks | `br-dbt24`, `br-lkhxw`, `br-mrfhc`, `br-p4s42`, `br-ajiq8`; no inferred cutover/deletion. |
+| 23 | Current complete correctness and installed parity | PARTIAL: retained 12-red full run; later source has no new full verdict here | `br-l1q6z`, `br-bx73n`; ignored installed parity must run explicitly with exact paths. |
+| 24 | Measured latency/resource budgets | UNPROVEN at current candidate/load; dated baselines only | `br-kp1in.5/.6`, `br-eru3j`, `br-y8k4z`; report workload, route, errors and resource growth with latency. |
+| 25 | Honest docs and explicit public replay/browser boundary | PARTIAL; replay deliberately sanitized, live browser mirror deferred | `br-4meup`, `br-f9avw/.10`, `br-mq9q1`; stale gate/topology prose must not redefine current scope. |
+
+**Would completing the existing backlog close the gaps?** It covers every
+identified goal at the capability-family level. No new untracked feature family
+was found in this refresh. But completing stale task descriptions literally
+would not finish the project: some still call for Actions, claim absent containers,
+or ask for already-landed scorecard code, while strict manual publication and
+concurrent retry acceptance need explicit current criteria. Revise those existing
+issues rather than create a second backlog. Implementation plus current real-path
+acceptance closes bounded promises; it cannot prove universal zero deadlocks,
+corruption or future performance.
+
+## September 8 bridge and execution order
+
+1. **Deliver the small existing repairs (S–M, highest immediate return).** Under
+   `br-l1q6z`, review the isolated archive-routing, polling, environment and ATC
+   fixtures against current main, reserve their paths, resolve drift, and land
+   only reviewed changes. Archive dispatch must work from actual committed Git
+   content with unusable DB configuration, retaining auth/method/path checks.
+   Polling must return bounded errors without weakening cancellation semantics.
+   `br-ue7e5` similarly retains the tested CORS `Vary` repair. Prior candidate
+   passes are evidence to reuse, not proof of current delivery. Do not project a
+   reduced full-suite failure count from focused tests.
+2. **Finish database/recovery correctness (M–L, critical path).** Classify each of
+   the 12 retained failures, distinguish fixture authority from physical integrity,
+   and validate new recovery commit `ad87cdb8`. Preserve corruption negatives,
+   same-process writer exclusion, hot-WAL truth, stable generation and no-clobber
+   promotion. `br-kp1in.12` stays blocked until its snapshot semantics work with
+   the actual runtime engine. Engine-level minimal reproductions remain separate
+   from application workaround proof; do not silently swap the runtime engine.
+3. **Make multi-process workflows meet their actual retry contract (M).** Extend
+   `br-kp1in.1/.2` from the retained failed three-client registration. Choose and
+   document whether first-attempt registration must succeed or bounded Busy retry
+   is supported. If retry is allowed, retain every error and attempt, reuse the
+   requested identity, prove one durable identity/profile, cap elapsed time and
+   attempts, and complete the send/reopen/archive assertions. A fixed-delay
+   rerun-until-green or suppressing `isError` does not count.
+4. **Finish child/resource lifetime bounds (S–M).** `br-tl2sg` owns the detached
+   stdout reader in `run_tmux_bounded`: caller timeout does not stop `read_to_end`
+   when a descendant holds the pipe. Include real descendant and sustained-output
+   fixtures, bounded memory, cleanup/join evidence and repeated-probe thread/FD
+   counts. Keep large finite output and unavailable-pane behavior; no unsafe code.
+5. **Connect current release gates to manual publication (M).** Keep Actions
+   disabled. `br-nq2kb` must gate the DSR/manual path, using `br-kp1in.3/.4`'s
+   existing candidate-bound code and `br-bx73n`'s installed parity/reliability
+   receipts. Deliberately red lint/test, absent required suite, wrong binary and
+   incomplete producer must prevent the local publish transition. A signed asset
+   proves provenance, not correctness. No retroactive green release claim and no
+   deletion/replacement of published assets.
+6. **Earn sustained reliability and performance claims (L).** Complete the
+   existing mixed histories `.1/.2/.9/.10` before the proposed 24-hour/two-host
+   workload; the smoke must first complete. Use `.5/.6` to measure actual routes,
+   offered/completed rates, p95/p99, queue occupancy, errors, memory/FD/disk and
+   archive lag. A/A and paired windows matter for comparative claims; absolute
+   budget misses remain visible even if comparisons have no verdict. Do not turn
+   a historical gauntlet into a universal safety guarantee.
+7. **Finish selected optional and user surfaces (M–L, independent lanes).**
+   `.7/.8` require real selected dependency evidence. TUI input, scoped web/share,
+   setup secrets and legacy import keep their existing owners and strong tests.
+   Optional hybrid/LLM is not a hidden dependency of a lexical-only release.
+8. **Reconcile the documentation last (S).** `br-4meup` must distinguish working,
+   shipped, tested and deferred. Replace stale topology and absolutist claims
+   with dated boundaries while preserving the actual goals. The root historical
+   TODO's checked boxes are not present-day correctness certificates.
+
+No implementation task waits on a new audit epic. Existing implementation/test
+pairs remain `.1/.2`, `.3/.4`, `.5/.6`, `.7/.8`, `.9/.10`. Causal product repairs
+can proceed while tests are authored; only certification waits on their result.
+
+## September 8 skill execution and granular TODO
+
+The frozen Phase 3a and Phase 5 instructions retained verbatim in the September 4
+record below are applied again to the current gaps. Existing self-contained
+Beads are the generated work graph: regeneration updates their current evidence,
+implementation/test requirements and dependencies instead of duplicating them.
+
+- [x] Read complete AGENTS and README; inspect later README/source drift.
+- [x] Read skill and references; compare current contracts with prior full audit.
+- [x] Inventory every tracker status, existing ownership, and initial `bv` triage.
+- [x] Inspect source wiring, AST placeholder scan, release identity and receipts.
+- [x] Execute actual released software in a fresh private remote workflow.
+- [x] Investigate the failed phase and preserve its original terminal artifacts.
+- [x] Produce 25-goal coverage matrix and concrete prioritized bridge.
+- [x] Phase 3a: revise existing Beads with current evidence and acceptance.
+- [x] Ambition round 1: improve repair delivery and contract-level integration.
+- [x] Ambition round 2: improve fault/retry histories and resource bounds.
+- [x] Ambition round 3: improve causal release gates and measurable claims.
+- [x] Regenerate Beads from those improvements without duplicate tasks.
+- [x] Refinement 1: stale scope, ownership and coverage.
+- [x] Refinement 2: preserved behavior and realistic positive/negative tests.
+- [x] Refinement 3: exact source, executed artifacts and evidence retention.
+- [x] Refinement 4: dependencies and practical execution order.
+- [x] Refinement 5: fresh convergence check, `br` cycles and `bv` triage.
+- [x] Validate the document/tracker delta and report honest completion limits.
+
+Process creation gate: this report is requested explicitly by the project owner
+to decide the next implementation priorities. It catches the observed stale
+assessment, red release gate and failed concurrent workflow. It earns zero
+capability credit and is retired as active guidance when the next assessment
+supersedes it; historical material is retained, not deleted. The highest-value
+implementation remains the already-tested archive/runtime repairs, and this
+assessment must hand back to that work after its requested phases.
+
+### Ambition round 1 — complete the operator journey
+
+The initial list fixes individual failures, but the user needs one coherent
+mailbox through normal operation, trouble and recovery. Extend the existing
+mixed workflow to cover **the same message identities and recipient state**
+through live operation, verified archive fallback, supervised recovery and resumed
+live operation. Check that a healthy primary still supplies fresh reads and that
+archive-only browsing remains available when database opening fails. A successful
+recovery must make new messages usable, not merely return a safe refusal.
+
+This also improves delivery order: use separate, reviewable patches for archive
+dispatch, polling, environment ownership and CORS, then run their combined real
+workflow. Passing each isolated candidate is insufficient if the combined source
+changes routing or cancellation. The later peer recovery/contact/guard changes
+must be included in that integration candidate. Keep the safety negatives and
+original feature behavior; do not turn the sequence into destructive production
+recovery or add a second recovery runner.
+
+### Ambition round 2 — separate safe retry from hidden overload
+
+For the observed Busy response, an operation history must distinguish requested,
+admitted, committed, replied and retried operations. Record first-attempt success,
+eventual success, deadline failures and attempts per completed operation. A
+healthy eventual result with rapidly growing attempts or queue/resource usage
+still fails the declared operational budget. Retry only explicit retryable
+responses within one original deadline; do not restart the clock per attempt.
+Timeouts with unknown commit outcome require reconciliation before repeating a
+mutation. This extends the existing bounded history checker rather than adding
+another event schema or production telemetry service.
+
+The cancellation boundary also includes retained pipes and output memory. The
+tmux fixture needs a finite output control, an output-flood overflow case, an
+inherited-pipe case and repeated probes. Cap accepted bytes before allocating
+without limit, and prove the mechanism releases owned readers and children.
+An error response at two seconds is not proof that resources were reclaimed.
+Use independent bounds for caller latency, output bytes and cleanup grace.
+
+### Ambition round 3 — make release acceptance follow the actual executable
+
+The candidate-bound scorecard is valuable only if the manual publisher consumes
+it. Define one immutable candidate input to the existing release entrypoint:
+source and dirty-overlay identity, dependency closure, features, targets and
+artifact digests. Required suites and installed parity must resolve to that same
+candidate. Validate again immediately before the publish transition so a changed
+artifact or substituted successful report cannot inherit an earlier approval.
+Exercise the local transition with a valid positive and one altered term at a
+time; no external test release is necessary.
+
+Keep two conclusions explicit: distribution successfully published, and strict
+acceptance satisfied. v0.3.34 meets the first within its documented scope; its
+retained 12-failure workspace result prevents the second. An optional, unselected
+hybrid/model lane cannot block a lexical-only candidate, but failed required
+correctness cannot be relabeled optional after observing its result. The existing
+release gate and its tests should enforce this; no second ledger or dashboard.
+
+Bead regeneration adds these improvements to the existing implementation/test
+pairs and publication owners. There are zero new issues: the contribution is
+current, executable acceptance and a shorter route to delivery, not a larger queue.
+
+### Five fresh refinement passes
+
+1. **Scope and ownership:** checked all 25 rows against the complete issue
+   inventory and current source. Updated obsolete manual-release/container task
+   titles and attached the delivered GHCR evidence without claiming an unrun
+   public pull. Kept every status/assignee intact. Candidate scorecard code is
+   already present; its consumer/evidence is the remaining work. Gate development
+   must not wait for every product repair; publication does. Shared runner file
+   edits require one reservation owner at a time.
+2. **Behavior and tests:** extended the existing history and performance
+   companion tasks with legal Busy/retry/stable-identity and illegal duplicate
+   histories, nonretryable auth/argument errors, deadline exhaustion, preserved
+   read/ack state and completion-versus-amplification controls. Real process/DB
+   observations remain decisive; synthetic counterexamples test the checker,
+   not the product. No existing assertions, fixtures or functionality removed.
+3. **Evidence identity:** verified the retained full-nextest log against its
+   recorded SHA-256 and the fresh workflow/common-harness hashes against the
+   release manifest. Separated released `0125f050`, full-test `43459c5a` and
+   peer source `4717f869` (metadata HEAD `bd21aeb6`). The required installed
+   parity/reliability packet remains missing from the retained release evidence;
+   signatures and smoke do not substitute. Both successful and failed workflow
+   invocations remain visible, without a new-engine regression claim.
+4. **Dependencies and completion:** checked the real `.1/.3 -> .9 -> .10 -> .2`
+   prerequisite chain and the independent budget/optional-quality pairs. Kept
+   those edges; added no parent/child cycles or blanket product-bug dependency
+   that would prevent authoring the publication gate. Found a genuine acceptance
+   hole in `br-l1q6z`: its checklist required a recorded run but not restoration
+   to zero unresolved required failures. Added that criterion explicitly so a
+   well-documented red run cannot close the restoration task. Existing skips and
+   leaky results must remain disclosed. `br ready` exposes the unowned budget
+   lane, manual acceptance and tmux task; the tested repair lanes retain owners.
+5. **Convergence:** rereviewed all 25 vision rows, the revised acceptance,
+   implementation/test pairings, preserved defaults and source/evidence
+   boundaries. No further scope or dependency changes were needed. Fresh `br`
+   inventory has the same 2,457 IDs, zero additions/removals, and zero status or
+   assignee changes. All literal Bead IDs in this assessment resolve. Final
+   `bv --robot-triage` completed; `br dep cycles --json` reports zero active
+   cycles. `git diff --check` passes. Scoped UBS exits 3 because Markdown is
+   unsupported: it ran no scanner and is not reported as a pass.
+
+### Honesty and work audit
+
+Window: this September 8 reality-check request, with the prior release packet
+reviewed specifically for claims being relied on. The product's purpose is
+persistent, auditable coordination between coding agents. Output classification:
+one updated assessment and the existing Bead revisions are **PROCESS**; no USER
+or ENABLER implementation is claimed. The fresh actual-binary run provides
+evidence, not a new feature. This is bounded work requested by the operator;
+its next consumer is the implementation owner choosing the repair sequence.
+
+Creation worksheet: running code does not branch on this report. The explicit
+operator request supplies its consumer and decision gate; observed defects are
+the stale assessment, failed concurrent workflow and unmet release acceptance.
+It retires as active guidance at the next assessment. The integrity-control
+exception is unnecessary: the explicit request already qualifies it. Its minimal
+form is this existing document and existing tracker, not another report system.
+An hour on the existing archive/polling repairs would yield more runtime benefit;
+the assessment therefore stops here and hands off to them.
+
+Real-work worksheet: no feature shipped in this audit to demonstrate; the earlier
+release and new peer fixes are not credited to it. Without the process work, the
+same binaries would exist, but the user would lack this requested correction and
+prioritized plan. No speculative runtime enabler was created. Long-standing
+durability/corruption work (`br-htobc` among the oldest actionable rows) remains
+valuable; this window addressed the explicitly requested steering instead.
+No new swarm was dispatched, no closure count is used as progress, and no task
+was split to close an unmet parent. Disposition: legitimate requested assessment,
+zero capability credit; another planning round would be drift.
+
+Honesty inventory, numbered against the skill worksheet:
+
+1. No test weakened/deleted/ignored (checked: this turn's diff contains only this
+   document and Beads; the restoration criterion was strengthened).
+2. No test double introduced (checked: no test/source edits).
+3. No golden regenerated (checked: no test/fixture edits by this audit; peer
+   contact fixture changes are separately identified, not certified here).
+4. No validator/CI relaxation (checked: no runtime gate edits; any `[skip ci]`
+   commit annotation follows the user's explicit no-Actions instruction).
+5. No fabricated gate satisfaction (checked: red full suite and failed workflow
+   are retained and prevent a strict-ready claim).
+6. No zero-run green (checked: 41/1 fresh assertions; AST zero matches is only a
+   scan result; UBS exit 3 is explicitly no scan).
+7. No unrun-command claim (checked: full suite is retained evidence at its named
+   source, not a fresh run of the later main; missing parity is disclosed).
+8. No fixture upgraded to live proof (checked: actual release binaries and real
+   transport/storage for the fresh run; model/encoder substitutes stay limited).
+9. **Correction required for prior release wording:** publication completion must
+   not mean every release gate passed. The retained 12-failure suite and absent
+   mandatory parity/scorecard packet leave strict acceptance unfinished. This
+   correction is explicit here and on `br-nq2kb`/`br-bx73n`; failed required
+   tests cannot be made optional after the result is known.
+10. No cited command hides stderr (checked: failed client stderr and suite output
+    retained; unsupported UBS and initial inventory-parser errors disclosed).
+11. No unmet item closed (checked: all initial statuses and assignees preserved).
+12. No requirement rewritten to match success (checked: zero-failure gate retained;
+    concurrent Busy retry remains an explicit acceptance decision with negatives).
+13–17. No new delegated agents or accepted subagent assertions in this window;
+    peer commits are source observations, not independently verified tests or
+    agreement-based proof. No refusal farming or delegated closures are credited.
+18. Denominators are the complete retained run and the complete fresh workflow;
+    no passing subset substitutes for either.
+19. The moments requiring explanation are the initial inventory parser expecting
+    an array instead of the returned object, one optional-field parser correction,
+    the failed workflow and the release-completion distinction. Parser errors
+    were corrected before deriving inventory claims; product failures stay red.
+20. Strongest evidence: re-executable release workflow with exact binary/harness
+    hashes, 41 passing assertions, original failed client stderr and joined process
+    outcomes. Source/Bead validation is a separate, reproducible document check.
+
+No additional CASS-wide older-session honesty sweep is claimed; this window uses
+the retained release receipts and current source directly. The prior-release
+wording correction is recorded in place, disclosed to the operator, and guarded
+by explicit zero-failure acceptance on `br-l1q6z` and the manual publisher task
+(`RH-9` follow-up laundering / `RH-10` plan edits cannot stand in for delivery).
+Review is solo and bounded, not independent verification of new peer code.
+
+**Handoff:** all requested skill phases are complete. The project remains
+unfinished for the reasons above; implementation Beads remain open. Resume the
+existing repair-delivery lane, then complete actual concurrent/recovery workflow
+acceptance and the manual release gate. Do not create another planning campaign.
+
+## Historical September 4 assessment (superseded)
+
+<details>
+<summary>September 4 assessment and earlier retained proposal; use September 8 guidance above</summary>
+
 **Current assessment:** 2026-09-04, GentleBeaver, requested full `reality-check-for-project` workflow.
 **Source reviewed:** `a6ebaf5057ad40f5de16b3c44b35e8472bf5c699` on `main`; earlier observations began at `ff47e953`. The checkout changed during the audit, so observations identify their actual revision or binary.
 **Installed executable:** `am 0.3.32`, SHA-256 `8eea1560ece6d30912af107d2de5f4f66e9a8b4ece2d447ea239c0f6b23975d3`. This is not evidence that the installed executable contains current `main`.
@@ -620,5 +1021,7 @@ Recommended order of epics: 12 (one day, unblocks honest tracking) → 13 → 3 
 ## 8. Provenance
 
 Phase 1 sources: full reads of AGENTS.md, README.md, VISION.md, every root and `docs/planning` plan, `docs/VERIFICATION_COVERAGE_LEDGER.md`, `RELIABILITY_COVERAGE_MATRIX.md`, `DOCTOR_FM_DISPOSITION.md`, `FRANKENSQLITE_PRAGMA_GAPS.md`, `CONFORMANCE_AUDIT_2026-04-18.md`, `RELEASE_TRAIN_PLAN.md`, the April reality check; five parallel code audits; the 2026-09-01 nextest logs; live probes on ts1. Phase 2 sources: the 2026-09-01/02 landing lanes (baselines in a detached worktree at `ba1b8a42`, nextest summaries on `f85b22c2`), `br list` on 2026-09-02 (108 open, 66 in-progress, 2248 closed, 208 tombstoned), and the strace trace of the symlinked-root recovery.
+
+</details>
 
 </details>
