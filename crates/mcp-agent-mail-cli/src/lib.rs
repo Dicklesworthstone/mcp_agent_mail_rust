@@ -26775,12 +26775,44 @@ fn doctor_open_private_immutable_canonical_snapshot(
 /// recover the WAL frames into a fresh `-shm` inside the tempdir
 /// (`immutable=1` would hide those frames — see the revert of the
 /// sidecar-free `immutable=1` fallback). Canonical SQLite never opens the
-/// live main inode, so no live FrankenSQLite `fcntl` lock can be disturbed,
-/// and the cross-engine refusal for Franken-admitted families stays intact.
+/// live main inode. On Linux, the raw copy itself must also exclude live
+/// namespace users: closing its source descriptor would otherwise release
+/// another connection's process-wide `fcntl` locks. A busy namespace falls
+/// back to the guarded logical export, whose verdict remains inconclusive.
 fn doctor_open_staged_family_copy_canonical(
     db_path: &Path,
     operation: &str,
 ) -> CliResult<DoctorCanonicalDiagnosticOpen> {
+    #[cfg(target_os = "linux")]
+    let _namespace_guards = if sqlite_family_is_franken_admitted(db_path) {
+        // Match the engine's gate-then-use lock order. Holding both exclusive
+        // flock leases proves existing connections have quiesced and prevents
+        // new admissions until every raw source descriptor has closed. A PID
+        // or /proc/fd inventory alone would race a newly admitted writer.
+        // Open existing sidecars only: diagnostics must not create or rewrite
+        // namespace records, including on a partial/malformed family.
+        let mut guards = Vec::with_capacity(2);
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            let path = sqlite_sidecar_path(db_path, suffix);
+            let guard =
+                mcp_agent_mail_core::disk::open_regular_file_no_follow(&path).map_err(|error| {
+                    CliError::Other(format!(
+                        "{operation} cannot reserve physical-copy namespace {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            fs2::FileExt::try_lock_exclusive(&guard).map_err(|error| {
+                CliError::Other(format!(
+                    "{operation} cannot reserve physical-copy namespace {} (live connections must retain their locks): {error}",
+                    path.display()
+                ))
+            })?;
+            guards.push(guard);
+        }
+        guards
+    } else {
+        Vec::new()
+    };
     let staged = mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(db_path)
         .map_err(|error| {
             CliError::Other(format!(
@@ -74110,22 +74142,27 @@ startup_timeout_sec = 42
         assert_child_observes_busy(&db_path);
 
         let cross_check = doctor_canonical_double_probe(&db_path);
-        assert!(
-            matches!(cross_check, DoctorCanonicalCrossCheck::Healthy),
-            "the healthy physical copy must pass the canonical battery: {cross_check:?}"
-        );
+        match cross_check {
+            DoctorCanonicalCrossCheck::Inconclusive(detail) => assert!(
+                detail.contains("private logical rebuild"),
+                "a busy namespace must use the non-authoritative logical fallback: {detail}"
+            ),
+            other => panic!(
+                "a live writer must exclude physical staging without losing its locks: {other:?}"
+            ),
+        }
         assert_child_observes_busy(&db_path);
 
         let database_url = format!("sqlite:///{}", db_path.display());
         let read_only = open_db_for_doctor_check_read_only_with_context(&database_url)
-            .expect("open live doctor diagnostics through a retained private physical copy");
+            .expect("open live doctor diagnostics through the retained logical fallback");
         assert!(
-            read_only._staged_family.is_some(),
-            "live read-only doctor diagnostics must retain their private physical copy"
+            read_only._snapshot_source.is_some(),
+            "busy-namespace diagnostics must retain their private logical snapshot"
         );
         assert_eq!(
             read_only.source_kind,
-            DoctorCanonicalDiagnosticSourceKind::StagedFamilyCopy
+            DoctorCanonicalDiagnosticSourceKind::LiveLogicalSnapshot
         );
         let rows = read_only
             .conn
