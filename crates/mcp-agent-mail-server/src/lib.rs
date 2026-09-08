@@ -11419,6 +11419,9 @@ impl HttpState {
 
         let mut resp = self.handle_inner(req).await;
         apply_security_headers(&mut resp);
+        if self.config.http_cors_enabled {
+            apply_cors_cache_vary(&mut resp);
+        }
         // The port-ownership probe validates the real MCP POST route even when
         // bearer auth rejects it. Carry a non-secret signature on every
         // response so a signed 401 remains identifiable.
@@ -17317,6 +17320,22 @@ fn to_http1_response(
     out
 }
 
+/// CORS headers depend on Origin, including when it is missing or denied.
+/// Mark responses at the outer handler so errors and non-CORS responses vary too.
+fn apply_cors_cache_vary(resp: &mut Http1Response) {
+    let already_varies = resp.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("vary")
+            && value.split(',').any(|field| {
+                let field = field.trim();
+                field == "*" || field.eq_ignore_ascii_case("origin")
+            })
+    });
+    if !already_varies {
+        resp.headers
+            .push(("vary".to_string(), "Origin".to_string()));
+    }
+}
+
 fn apply_cors_headers(
     resp: &mut Http1Response,
     origin: Option<String>,
@@ -22653,6 +22672,93 @@ first body
     }
 
     #[test]
+    fn cors_cache_vary_preserves_existing_fields_and_is_idempotent() {
+        for (fields, already_varies) in [
+            (vec![], false),
+            (vec![("Vary", "Accept-Encoding")], false),
+            (
+                vec![("vary", "X-Origin"), ("VARY", "Accept-Language")],
+                false,
+            ),
+            (vec![("Vary", "Accept-Encoding, oRiGiN")], true),
+            (
+                vec![("vary", "Accept-Encoding"), ("VARY", " Origin ")],
+                true,
+            ),
+            (vec![("Vary", "*")], true),
+        ] {
+            let mut response = Http1Response::new(200, "OK", Vec::new());
+            response.headers = fields
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect();
+            let mut expected = response.headers.clone();
+            if !already_varies {
+                expected.push(("vary".to_string(), "Origin".to_string()));
+            }
+            apply_cors_cache_vary(&mut response);
+            assert_eq!(response.headers, expected, "original fields: {fields:?}");
+            apply_cors_cache_vary(&mut response);
+            assert_eq!(response.headers, expected, "second application: {fields:?}");
+        }
+    }
+
+    #[test]
+    fn cors_cache_vary_covers_allowed_denied_and_missing_origins_on_every_route() {
+        for enabled in [true, false] {
+            let state = build_state(mcp_agent_mail_core::Config {
+                http_cors_enabled: enabled,
+                http_cors_origins: vec![
+                    "https://a.example.test".to_string(),
+                    "https://b.example.test".to_string(),
+                ],
+                http_cors_allow_credentials: true,
+                http_bearer_token: None,
+                database_url: "sqlite:///:memory:".to_string(),
+                ..Default::default()
+            });
+            for origin in [
+                Some("https://a.example.test"),
+                Some("https://b.example.test"),
+                Some("https://denied.example.test"),
+                None,
+            ] {
+                for (method, path, expected_status) in [
+                    (Http1Method::Get, "/health/liveness", 200),
+                    (Http1Method::Get, "/not-a-real-route", 404),
+                    (Http1Method::Options, "/api/", 204),
+                    (Http1Method::Get, "/web-dashboard", 501),
+                ] {
+                    let headers = origin.map(|origin| ("Origin", origin));
+                    let request = make_request(method, path, headers.as_slice());
+                    let response = block_on(state.handle(request));
+                    assert_eq!(response.status, expected_status, "route {path}");
+                    assert_eq!(
+                        response_header(&response, "vary"),
+                        enabled.then_some("Origin"),
+                        "enabled={enabled}, route={path}, origin={origin:?}"
+                    );
+                    let allowed = enabled
+                        && matches!(
+                            origin,
+                            Some("https://a.example.test" | "https://b.example.test")
+                        );
+                    assert_eq!(
+                        response_header(&response, "access-control-allow-origin"),
+                        origin.filter(|_| allowed),
+                        "origin authorization for {path}"
+                    );
+                    assert_eq!(
+                        response_header(&response, "access-control-allow-credentials"),
+                        allowed.then_some("true"),
+                        "credential authorization for {path}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cors_preflight_includes_configured_headers() {
         let config = mcp_agent_mail_core::Config {
             http_cors_enabled: true,
@@ -22687,6 +22793,7 @@ first body
             Some("*")
         );
         assert!(response_header(&resp, "access-control-allow-credentials").is_none());
+        assert_eq!(response_header(&resp, "vary"), Some("Origin"));
     }
 
     #[test]
@@ -22795,6 +22902,7 @@ first body
         let resp = block_on(state.handle(req));
         assert_eq!(resp.status, 200);
         assert!(response_header(&resp, "access-control-allow-origin").is_none());
+        assert!(response_header(&resp, "vary").is_none());
     }
 
     #[test]
