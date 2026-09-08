@@ -610,9 +610,128 @@ def get_staged_files():
     except Exception as exc:
         fail_closed("mcp-agent-mail: guard failed to inspect staged files: " + str(exc))
 
+# ---------------------------------------------------------------------------
+# Bounded push-path enumeration.
+#
+# Listing the paths a push touches must not cost time or memory proportional to
+# an unbounded commit range. Three bounds, in the order they bite:
+#
+#   1. Batching. ONE `git diff-tree --stdin` for the whole range, not one git
+#      process per commit. Process startup dominates on a large repository:
+#      measured on a 630-commit range in a monorepo checkout on WSL1, spawning
+#      git per commit cost 11.4s per commit (almost all of it kernel time, so
+#      it is the process and its pack mmaps, not the diff), which extrapolates
+#      to about two hours; the same range through one `--stdin` process took
+#      31s. The path sets were identical.
+#   2. A commit cap, AGENT_MAIL_GUARD_MAX_PUSH_COMMITS (default 1000). Past the
+#      cap the guard reads the net range diff instead, which is one process
+#      whatever the range size.
+#   3. A wall-clock budget, AGENT_MAIL_GUARD_PUSH_TIMEOUT_SECS (default 60),
+#      across the whole enumeration.
+#
+# Set either variable to 0 to remove that bound.
+#
+# Exhausting bound 2 or 3, and any git allocation failure, allows the push with
+# a warning instead of blocking it. That is deliberate, and it is weaker than
+# the fail_closed path: it lets through a push nothing checked. The alternative
+# is worse. A developer who cannot push at all reaches for
+# `git push --no-verify`, which turns off this guard AND every other pre-push
+# hook, on that push and every later one they copy the flag into.
+# ---------------------------------------------------------------------------
+
+GUARD_ENV_MAX_PUSH_COMMITS = "AGENT_MAIL_GUARD_MAX_PUSH_COMMITS"
+GUARD_ENV_PUSH_TIMEOUT = "AGENT_MAIL_GUARD_PUSH_TIMEOUT_SECS"
+DEFAULT_MAX_PUSH_COMMITS = 1000
+DEFAULT_PUSH_TIMEOUT_SECS = 60.0
+
+
+def fail_open(message):
+    """Allow the push with a warning, having checked nothing.
+
+    The counterpart to fail_closed. Used only where blocking would leave the
+    operator with no way forward except `git push --no-verify`.
+    """
+    print("WARNING: " + message, file=sys.stderr)
+    sys.exit(0)
+
+
+def _bound_from_env(name, default):
+    """Read a positive numeric bound. 0 or negative means no bound (None)."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        print(
+            "mcp-agent-mail: %s=%r is not a number; using %s" % (name, raw, default),
+            file=sys.stderr,
+        )
+        return default
+    return value if value > 0 else None
+
+
+def _budget_left(deadline):
+    """Seconds left before `deadline`, or None when there is no deadline."""
+    if deadline is None:
+        return None
+    left = deadline - _time.monotonic()
+    return left if left > 0 else 0.0
+
+
+def _looks_like_allocation_failure(text):
+    """Whether git's stderr says it could not get memory.
+
+    git reports these as `fatal:`, so they arrive as an ordinary nonzero exit
+    and are indistinguishable from a bad-object error without reading the text.
+    Seen in the field as:
+      fatal: mmap failed, check sys.vm.max_map_count and/or RLIMIT_DATA:
+             Cannot allocate memory
+    """
+    low = (text or "").lower()
+    return (
+        "cannot allocate memory" in low
+        or "mmap failed" in low
+        or "out of memory" in low
+    )
+
+
+def _collect_name_status_z(data, files):
+    """Add every path in `git ... --name-status -z` output to `files`."""
+    parts = data.split(b'\0')
+    i = 0
+    while i < len(parts):
+        status = parts[i].decode('utf-8', 'ignore').strip()
+        if not status:
+            i += 1
+            continue
+        i += 1
+        if status.startswith(('R', 'C')):
+            if i + 1 < len(parts):
+                oldp = parts[i].decode('utf-8', 'ignore')
+                newp = parts[i + 1].decode('utf-8', 'ignore')
+                if oldp:
+                    files.add(oldp)
+                if newp:
+                    files.add(newp)
+                i += 2
+        else:
+            if i < len(parts):
+                p = parts[i].decode('utf-8', 'ignore')
+                if p:
+                    files.add(p)
+                i += 1
+
+
 def get_push_files():
     """Get list of files modified in the push (for pre-push)."""
     files = set()
+    timeout_secs = _bound_from_env(GUARD_ENV_PUSH_TIMEOUT, DEFAULT_PUSH_TIMEOUT_SECS)
+    deadline = None if timeout_secs is None else _time.monotonic() + timeout_secs
+    max_commits = _bound_from_env(GUARD_ENV_MAX_PUSH_COMMITS, DEFAULT_MAX_PUSH_COMMITS)
+    if max_commits is not None:
+        max_commits = int(max_commits)
+
     try:
         # Read stdin for ref updates (local_ref local_sha remote_ref remote_sha)
         # sys.stdin.read() works because chain-runner pipes input as text/bytes depending on OS,
@@ -634,70 +753,130 @@ def get_push_files():
             if set(local_sha) == {'0'}:
                 continue
 
-            if set(remote_sha) == {'0'}:
+            new_branch = set(remote_sha) == {'0'}
+            if new_branch:
+                # No remote tip to diff against, so there is no range either.
+                diff_range = None
                 rev_list_args = ["git", "rev-list", "--topo-order", local_sha, "--not", "--remotes"]
             else:
-                rev_list_args = ["git", "rev-list", "--topo-order", f"{remote_sha}..{local_sha}"]
+                diff_range = f"{remote_sha}..{local_sha}"
+                rev_list_args = ["git", "rev-list", "--topo-order", diff_range]
 
             # Get commits in range
             res = _run_git_with_retry(
                 rev_list_args,
-                capture_output=True, text=True
+                capture_output=True, text=True, timeout=_budget_left(deadline),
             )
             if res.returncode != 0:
                 detail = (res.stderr or "").strip()
                 if not detail:
                     detail = f"git rev-list exited with status {res.returncode}"
+                if _looks_like_allocation_failure(detail):
+                    fail_open(
+                        "mcp-agent-mail: git ran out of memory listing the pushed commits, so "
+                        "this push was NOT checked against file reservations: " + detail
+                    )
                 fail_closed(
                     "mcp-agent-mail: guard failed to enumerate pushed commits: " + detail
                 )
 
             commits = [c.strip() for c in res.stdout.splitlines() if c.strip()]
+            if not commits:
+                continue
 
-            for sha in commits:
-                diff_res = _run_git_with_retry(
-                    # `--cc` (not `-m`): on a merge commit `-m` explodes the diff
-                    # into one section PER PARENT, flagging every file merely
-                    # carried in from origin as a "pushed change" (false positive,
-                    # issue #238). `--cc` reports only the files the merge itself
-                    # changed relative to ALL parents, preserving the fail-closed
-                    # check for real conflict-resolution edits while dropping
-                    # carried files. On a regular (single-parent) commit `--cc`
-                    # and `-m` produce identical --name-status output (no FN).
-                    ["git", "diff-tree", "--root", "-r", "--no-commit-id", "--name-status",
-                     "-M", "--no-ext-diff", "--diff-filter=ACMRDTU", "-z", "--cc", sha],
-                    capture_output=True
+            over_cap = max_commits is not None and len(commits) > max_commits
+
+            if over_cap and diff_range is not None:
+                # Bound 2 on a range push: one tree-to-tree diff, one process,
+                # whatever the range size. It covers every path whose content
+                # differs between the two tips. What it misses is a path changed
+                # and then changed back inside the range, whose net effect is
+                # nothing -- the case the per-commit pass exists to catch.
+                print(
+                    "mcp-agent-mail: push covers %d commits, over %s=%d. Checking the net "
+                    "diff of %s instead of each commit; a path changed and then reverted "
+                    "inside the range is not checked."
+                    % (len(commits), GUARD_ENV_MAX_PUSH_COMMITS, max_commits, diff_range),
+                    file=sys.stderr,
                 )
-                if diff_res.returncode != 0:
-                    detail = diff_res.stderr.decode("utf-8", "ignore").strip()
+                net_res = _run_git_with_retry(
+                    ["git", "diff", "--name-status", "-M", "--no-ext-diff",
+                     "--diff-filter=ACMRDTU", "-z", diff_range],
+                    capture_output=True, timeout=_budget_left(deadline),
+                )
+                if net_res.returncode != 0:
+                    detail = net_res.stderr.decode("utf-8", "ignore").strip()
                     if not detail:
-                        detail = f"git diff-tree exited with status {diff_res.returncode}"
+                        detail = f"git diff exited with status {net_res.returncode}"
+                    if _looks_like_allocation_failure(detail):
+                        fail_open(
+                            "mcp-agent-mail: git ran out of memory diffing the pushed range, so "
+                            "this push was NOT checked against file reservations: " + detail
+                        )
                     fail_closed(
                         "mcp-agent-mail: guard failed to inspect pushed commit paths: " + detail
                     )
-                data = diff_res.stdout
-                parts = data.split(b'\0')
-                i = 0
-                while i < len(parts):
-                    status = parts[i].decode('utf-8', 'ignore').strip()
-                    if not status:
-                        i += 1
-                        continue
-                    i += 1
-                    if status.startswith(('R', 'C')):
-                        if i + 1 < len(parts):
-                            oldp = parts[i].decode('utf-8', 'ignore')
-                            newp = parts[i+1].decode('utf-8', 'ignore')
-                            if oldp: files.add(oldp)
-                            if newp: files.add(newp)
-                            i += 2
-                    else:
-                        if i < len(parts):
-                            p = parts[i].decode('utf-8', 'ignore')
-                            if p: files.add(p)
-                            i += 1
+                _collect_name_status_z(net_res.stdout, files)
+                continue
+
+            if over_cap:
+                # Bound 2 on a new-branch push. There is no remote tip, so the
+                # net-diff route above does not exist; inspect the newest
+                # `max_commits` and say what went unchecked. rev-list is
+                # newest-first.
+                print(
+                    "mcp-agent-mail: new branch push covers %d commits, over %s=%d. Checking "
+                    "only the newest %d; older pushed commits are not checked against file "
+                    "reservations."
+                    % (len(commits), GUARD_ENV_MAX_PUSH_COMMITS, max_commits, max_commits),
+                    file=sys.stderr,
+                )
+                commits = commits[:max_commits]
+
+            # Bound 1: one diff-tree for every commit at once. --stdin takes the
+            # commit list on stdin and, with --no-commit-id -z, concatenates the
+            # per-commit name-status records into one NUL-delimited stream.
+            #
+            # `--cc` (not `-m`): on a merge commit `-m` explodes the diff into
+            # one section PER PARENT, flagging every file merely carried in from
+            # origin as a "pushed change" (false positive, issue #238). `--cc`
+            # reports only the files the merge itself changed relative to ALL
+            # parents, preserving the fail-closed check for real
+            # conflict-resolution edits while dropping carried files. On a
+            # regular (single-parent) commit `--cc` and `-m` produce identical
+            # --name-status output (no FN).
+            diff_res = _run_git_with_retry(
+                ["git", "diff-tree", "--root", "-r", "--no-commit-id", "--name-status",
+                 "-M", "--no-ext-diff", "--diff-filter=ACMRDTU", "-z", "--cc", "--stdin"],
+                input="".join(sha + "\n" for sha in commits).encode("utf-8"),
+                capture_output=True, timeout=_budget_left(deadline),
+            )
+            if diff_res.returncode != 0:
+                detail = diff_res.stderr.decode("utf-8", "ignore").strip()
+                if not detail:
+                    detail = f"git diff-tree exited with status {diff_res.returncode}"
+                if _looks_like_allocation_failure(detail):
+                    fail_open(
+                        "mcp-agent-mail: git ran out of memory reading the pushed commit paths, "
+                        "so this push was NOT checked against file reservations: " + detail
+                    )
+                fail_closed(
+                    "mcp-agent-mail: guard failed to inspect pushed commit paths: " + detail
+                )
+            _collect_name_status_z(diff_res.stdout, files)
     except SystemExit:
         raise
+    except subprocess.TimeoutExpired:
+        fail_open(
+            "mcp-agent-mail: guard used up its %ss budget listing the pushed paths, so this "
+            "push was NOT checked against file reservations. Raise %s to give it longer."
+            % (timeout_secs, GUARD_ENV_PUSH_TIMEOUT)
+        )
+    except MemoryError as exc:
+        fail_open(
+            "mcp-agent-mail: guard ran out of memory listing the pushed paths, so this push "
+            "was NOT checked against file reservations: " + str(exc)
+        )
     except Exception as exc:
         fail_closed("mcp-agent-mail: guard failed to inspect push files: " + str(exc))
     return sorted(list(files))
@@ -2294,12 +2473,282 @@ pub fn get_staged_paths(repo_root: &Path) -> GuardResult<Vec<String>> {
     parse_name_status_z(&output.stdout)
 }
 
-/// Get paths changed in a push range (for pre-push hook).
+// ---------------------------------------------------------------------------
+// Bounded push-path enumeration
+// ---------------------------------------------------------------------------
+
+/// Environment variable naming the most commits the guard will inspect per ref.
+pub const ENV_MAX_PUSH_COMMITS: &str = "AGENT_MAIL_GUARD_MAX_PUSH_COMMITS";
+/// Environment variable naming the guard's wall-clock budget, in seconds.
+pub const ENV_PUSH_TIMEOUT_SECS: &str = "AGENT_MAIL_GUARD_PUSH_TIMEOUT_SECS";
+/// Default commit cap. Past it the guard reads the net range diff instead.
+pub const DEFAULT_MAX_PUSH_COMMITS: usize = 1000;
+/// Default wall-clock budget for the whole enumeration.
+pub const DEFAULT_PUSH_TIMEOUT_SECS: f64 = 60.0;
+
+/// What `get_push_paths` managed to inspect.
 ///
-/// Parses stdin ref tuples `<local_ref> <local_sha> <remote_ref> <remote_sha>` and
-/// uses `git diff --name-status -M -z <remote>..<local>` to find changed files.
-pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<String>> {
+/// The guard has to be able to say "I checked nothing" as something other than
+/// "I found no conflicting paths", because the two demand opposite handling:
+/// the first is a warning the operator must see, the second is silence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushPaths {
+    /// Every pushed commit, or the whole net range, was inspected.
+    Checked(Vec<String>),
+    /// The guard hit one of its bounds and inspected nothing. `reason` is
+    /// written for the operator, not for a log parser.
+    Unchecked { reason: String },
+}
+
+/// Read a positive numeric bound from the environment.
+///
+/// `None` means the bound is off, which an explicit `0` (or any non-positive
+/// value) selects. An unparseable value keeps the default rather than turning
+/// the bound off, so a typo cannot silently unbound the guard.
+fn bound_from_env<T: std::str::FromStr + PartialOrd + Copy>(
+    name: &str,
+    default: T,
+    zero: T,
+) -> Option<T> {
+    parse_bound(name, std::env::var(name).ok().as_deref(), default, zero)
+}
+
+/// The parsing half of [`bound_from_env`], with the environment passed in.
+///
+/// Separate so a test can cover the four cases without setting a
+/// process-global variable, which under a parallel test runner would leak into
+/// unrelated tests (and is `unsafe` from edition 2024 on).
+fn parse_bound<T: std::str::FromStr + PartialOrd + Copy>(
+    name: &str,
+    raw: Option<&str>,
+    default: T,
+    zero: T,
+) -> Option<T> {
+    let Some(raw) = raw else {
+        return Some(default);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Some(default);
+    }
+    match raw.parse::<T>() {
+        Ok(v) if v > zero => Some(v),
+        Ok(_) => None,
+        Err(_) => {
+            eprintln!("mcp-agent-mail: {name}={raw:?} is not a number; using the default");
+            Some(default)
+        }
+    }
+}
+
+/// Whether git's stderr says it could not get memory.
+///
+/// git reports these as `fatal:`, so they arrive as an ordinary nonzero exit and
+/// are indistinguishable from a bad-object error without reading the text. Seen
+/// in the field as:
+///   `fatal: mmap failed, check sys.vm.max_map_count and/or RLIMIT_DATA:
+///    Cannot allocate memory`
+fn looks_like_allocation_failure(stderr: &str) -> bool {
+    let low = stderr.to_ascii_lowercase();
+    low.contains("cannot allocate memory")
+        || low.contains("mmap failed")
+        || low.contains("out of memory")
+}
+
+fn is_segfault_exit(status: std::process::ExitStatus) -> bool {
+    let by_signal = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            matches!(status.signal(), Some(11 | 7))
+        }
+        #[cfg(not(unix))]
+        false
+    };
+    by_signal || matches!(status.code(), Some(139 | 135))
+}
+
+/// Run a git command under a deadline, optionally feeding it stdin.
+///
+/// `Ok(None)` means the deadline passed and the child was killed. Keeps the
+/// SIGSEGV retry policy of `guard_run_git_with_retry`; the deadline spans all
+/// attempts, so a retry cannot extend the budget.
+///
+/// stdin, stdout and stderr are each drained on their own thread. Writing the
+/// commit list inline would deadlock as soon as it outgrew the pipe buffer,
+/// which for a large push it always does.
+fn guard_run_git_bounded(
+    mut cmd: Command,
+    stdin_blob: Option<&[u8]>,
+    deadline: Option<std::time::Instant>,
+) -> std::io::Result<Option<std::process::Output>> {
+    const BACKOFFS_MS: [u64; 3] = [100, 400, 1600];
+    const POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+    cmd.stdin(if stdin_blob.is_some() {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::null()
+    })
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+
+    let mut last: Option<std::process::Output> = None;
+    for (attempt, maybe_base) in BACKOFFS_MS
+        .into_iter()
+        .map(Some)
+        .chain(std::iter::once(None))
+        .enumerate()
+    {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return Ok(None);
+        }
+
+        let mut child = cmd.spawn()?;
+
+        let writer = stdin_blob.map(|blob| {
+            let mut sink = child.stdin.take().expect("stdin piped");
+            let owned = blob.to_vec();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let _ = sink.write_all(&owned);
+                let _ = sink.flush();
+                drop(sink);
+            })
+        });
+        let mut out_pipe = child.stdout.take().expect("stdout piped");
+        let mut err_pipe = child.stderr.take().expect("stderr piped");
+        let out_reader = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = out_pipe.read_to_end(&mut buf);
+            buf
+        });
+        let err_reader = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = err_pipe.read_to_end(&mut buf);
+            buf
+        });
+
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break Some(status);
+            }
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(POLL);
+        };
+
+        let stdout = out_reader.join().unwrap_or_default();
+        let stderr = err_reader.join().unwrap_or_default();
+        if let Some(w) = writer {
+            let _ = w.join();
+        }
+
+        let Some(status) = status else {
+            return Ok(None);
+        };
+        let output = std::process::Output {
+            status,
+            stdout,
+            stderr,
+        };
+
+        if !is_segfault_exit(output.status) {
+            return Ok(Some(output));
+        }
+        let Some(base) = maybe_base else {
+            tracing::warn!(
+                target: "mcp_agent_mail::guard::segfault_retry",
+                attempt = attempt,
+                "guard_git_segfault_retry_exhausted"
+            );
+            last = Some(output);
+            break;
+        };
+        tracing::warn!(
+            target: "mcp_agent_mail::guard::segfault_retry",
+            attempt = attempt,
+            "guard_git_segfault_retry"
+        );
+        // Jitter formula MUST match mcp_agent_mail_core::git_cmd::jitter_ms,
+        // as in guard_run_git_with_retry.
+        let span = base / 2;
+        let low = base - span / 2;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::from(d.subsec_nanos()));
+        let jitter = low + nanos % span.max(1);
+        std::thread::sleep(std::time::Duration::from_millis(jitter));
+    }
+    Ok(last)
+}
+
+/// Get paths changed in a push range (for pre-push hook), under a bound.
+///
+/// Parses stdin ref tuples `<local_ref> <local_sha> <remote_ref> <remote_sha>`.
+///
+/// Listing the paths a push touches must not cost time or memory proportional
+/// to an unbounded commit range. Three bounds, in the order they bite:
+///
+///  1. Batching. ONE `git diff-tree --stdin` for the whole range, not one git
+///     process per commit. Process startup dominates on a large repository:
+///     measured on a 630-commit range in a monorepo checkout on WSL1, spawning
+///     git per commit cost 11.4s per commit (almost all of it kernel time, so
+///     it is the process and its pack mmaps, not the diff), which extrapolates
+///     to about two hours; the same range through one `--stdin` process took
+///     31s. The path sets were identical.
+///  2. A commit cap, [`ENV_MAX_PUSH_COMMITS`] (default
+///     [`DEFAULT_MAX_PUSH_COMMITS`]). Past the cap the guard reads the net
+///     range diff, which is one process whatever the range size.
+///  3. A wall-clock budget, [`ENV_PUSH_TIMEOUT_SECS`] (default
+///     [`DEFAULT_PUSH_TIMEOUT_SECS`]), across the whole enumeration.
+///
+/// Set either variable to 0 to remove that bound.
+///
+/// Exhausting bound 3, and any git allocation failure, returns
+/// [`PushPaths::Unchecked`] rather than an error: the push is allowed, warned,
+/// and checked against nothing. That is weaker than the fail-closed `Err`
+/// paths, and it is deliberate. A developer who cannot push at all reaches for
+/// `git push --no-verify`, which turns off this guard AND every other pre-push
+/// hook, on that push and every later one they copy the flag into.
+pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<PushPaths> {
+    let budget = bound_from_env(ENV_PUSH_TIMEOUT_SECS, DEFAULT_PUSH_TIMEOUT_SECS, 0.0)
+        .map(|s| std::time::Duration::from_secs_f64(s.min(86_400.0)));
+    let max_commits = bound_from_env(ENV_MAX_PUSH_COMMITS, DEFAULT_MAX_PUSH_COMMITS, 0);
+    get_push_paths_bounded(repo_root, stdin_lines, max_commits, budget)
+}
+
+/// [`get_push_paths`] with the bounds passed in rather than read from the
+/// environment.
+///
+/// `None` for either bound removes it. Exists so a test can exercise the
+/// degradation paths without setting a process-global environment variable,
+/// which under a parallel test runner would leak into unrelated tests.
+#[allow(clippy::too_many_lines)]
+pub fn get_push_paths_bounded(
+    repo_root: &Path,
+    stdin_lines: &str,
+    max_commits: Option<usize>,
+    budget: Option<std::time::Duration>,
+) -> GuardResult<PushPaths> {
     let mut all_paths = Vec::new();
+    let deadline = budget.map(|d| std::time::Instant::now() + d);
+
+    let budget_spent = || -> PushPaths {
+        PushPaths::Unchecked {
+            reason: format!(
+                "mcp-agent-mail: guard used up its {:.0}s budget listing the pushed paths, so \
+                 this push was NOT checked against file reservations. Raise \
+                 {ENV_PUSH_TIMEOUT_SECS} to give it longer.",
+                budget.unwrap_or_default().as_secs_f64()
+            ),
+        }
+    };
 
     for line in stdin_lines.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -2314,103 +2763,184 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
             continue;
         }
 
+        let new_branch = remote_sha.chars().all(|c| c == '0');
+        // A new branch has no remote tip, so it has no range either.
+        let diff_range = if new_branch {
+            None
+        } else {
+            Some(format!("{remote_sha}..{local_sha}"))
+        };
+
         let mut rev_list_cmd = Command::new("git");
         rev_list_cmd
             .current_dir(repo_root)
             .args(["rev-list", "--topo-order"]);
-        let diff_range = if remote_sha.chars().all(|c| c == '0') {
-            rev_list_cmd.args([local_sha, "--not", "--remotes"]);
-            None
-        } else {
-            let r = format!("{remote_sha}..{local_sha}");
-            rev_list_cmd.arg(&r);
-            Some(r)
+        match diff_range.as_deref() {
+            Some(range) => {
+                rev_list_cmd.arg(range);
+            }
+            None => {
+                rev_list_cmd.args([local_sha, "--not", "--remotes"]);
+            }
+        }
+
+        let Some(rev_list) = guard_run_git_bounded(rev_list_cmd, None, deadline)? else {
+            return Ok(budget_spent());
         };
 
-        // Prefer per-commit path enumeration (legacy guard.py parity): this catches paths
-        // that were touched in any pushed commit, even if the net diff ends up empty.
-        let rev_list = guard_run_git_with_retry(rev_list_cmd)?;
+        if !rev_list.status.success() {
+            let stderr = String::from_utf8_lossy(&rev_list.stderr);
+            if looks_like_allocation_failure(&stderr) {
+                return Ok(PushPaths::Unchecked {
+                    reason: format!(
+                        "mcp-agent-mail: git ran out of memory listing the pushed commits, so \
+                         this push was NOT checked against file reservations: {}",
+                        stderr.trim()
+                    ),
+                });
+            }
+            // Fail CLOSED on a real git error, on a new branch as much as on a
+            // range: silently allowing the push would enforce nothing.
+            return Err(GuardError::Io(std::io::Error::other(format!(
+                "git rev-list failed (exit {}): {}",
+                rev_list.status.code().unwrap_or(-1),
+                stderr.trim(),
+            ))));
+        }
 
-        if rev_list.status.success() {
-            for sha in String::from_utf8_lossy(&rev_list.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                let mut diff_tree_cmd = Command::new("git");
-                // `--cc` (not `-m`): on a merge commit `-m` explodes the diff
-                // into one section PER PARENT, flagging every file merely carried
-                // in from origin as a "pushed change" (false positive, issue
-                // #238). `--cc` reports only the files the merge itself changed
-                // relative to ALL parents — preserving the fail-closed check for
-                // genuine conflict-resolution edits to reserved paths while
-                // dropping carried files. On a regular (single-parent) commit
-                // `--cc` and `-m` produce identical --name-status output, so
-                // there is no false negative on normal commits.
-                diff_tree_cmd.current_dir(repo_root).args([
-                    "diff-tree",
-                    "--root",
-                    "-r",
-                    "--no-commit-id",
+        let mut commits: Vec<String> = String::from_utf8_lossy(&rev_list.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if commits.is_empty() {
+            continue;
+        }
+
+        let over_cap = max_commits.is_some_and(|cap| commits.len() > cap);
+
+        if over_cap {
+            let cap = max_commits.unwrap_or(DEFAULT_MAX_PUSH_COMMITS);
+            if let Some(range) = diff_range.as_deref() {
+                // Bound 2 on a range push: one tree-to-tree diff, one process,
+                // whatever the range size. It covers every path whose content
+                // differs between the two tips. What it misses is a path changed
+                // and then changed back inside the range, whose net effect is
+                // nothing, which is the case the per-commit pass exists to catch.
+                eprintln!(
+                    "mcp-agent-mail: push covers {} commits, over {ENV_MAX_PUSH_COMMITS}={cap}. \
+                     Checking the net diff of {range} instead of each commit; a path changed and \
+                     then reverted inside the range is not checked.",
+                    commits.len()
+                );
+                let mut diff_cmd = Command::new("git");
+                diff_cmd.current_dir(repo_root).args([
+                    "diff",
                     "--name-status",
                     "-M",
                     "--no-ext-diff",
                     "--diff-filter=ACMRDTU",
                     "-z",
-                    "--cc",
-                    sha,
+                    range,
                 ]);
-                let output = guard_run_git_with_retry(diff_tree_cmd)?;
-
+                let Some(output) = guard_run_git_bounded(diff_cmd, None, deadline)? else {
+                    return Ok(budget_spent());
+                };
                 if output.status.success() {
-                    let paths = parse_name_status_z(&output.stdout)?;
-                    all_paths.extend(paths);
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(GuardError::Io(std::io::Error::other(format!(
-                        "git diff-tree failed for {sha} (exit {}): {}",
-                        output.status.code().unwrap_or(-1),
-                        stderr.trim(),
-                    ))));
+                    all_paths.extend(parse_name_status_z(&output.stdout)?);
+                    continue;
                 }
-            }
-        } else if let Some(range) = diff_range {
-            // Fallback: net diff across the range (less precise, but better than nothing).
-            let mut diff_cmd = Command::new("git");
-            diff_cmd
-                .current_dir(repo_root)
-                .args(["diff", "--name-status", "-M", "-z", &range]);
-            let output = guard_run_git_with_retry(diff_cmd)?;
-
-            if output.status.success() {
-                let paths = parse_name_status_z(&output.stdout)?;
-                all_paths.extend(paths);
-            } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
+                if looks_like_allocation_failure(&stderr) {
+                    return Ok(PushPaths::Unchecked {
+                        reason: format!(
+                            "mcp-agent-mail: git ran out of memory diffing the pushed range, so \
+                             this push was NOT checked against file reservations: {}",
+                            stderr.trim()
+                        ),
+                    });
+                }
                 return Err(GuardError::Io(std::io::Error::other(format!(
                     "git diff fallback failed for {range} (exit {}): {}",
                     output.status.code().unwrap_or(-1),
                     stderr.trim(),
                 ))));
             }
-        } else {
-            // New-branch push (remote all-zeros) where `git rev-list … --not
-            // --remotes` itself failed: fail CLOSED rather than silently allowing
-            // the push with zero reservation enforcement. Mirrors the enforced
-            // Python pre-push plugin, which exits non-zero on rev-list failure.
-            let stderr = String::from_utf8_lossy(&rev_list.stderr);
-            return Err(GuardError::Io(std::io::Error::other(format!(
-                "git rev-list failed for new-branch push (exit {}): {}",
-                rev_list.status.code().unwrap_or(-1),
-                stderr.trim(),
-            ))));
+            // Bound 2 on a new-branch push. There is no remote tip, so the
+            // net-diff route above does not exist; inspect the newest `cap`
+            // commits and say what went unchecked. rev-list is newest-first.
+            eprintln!(
+                "mcp-agent-mail: new branch push covers {} commits, over \
+                 {ENV_MAX_PUSH_COMMITS}={cap}. Checking only the newest {cap}; older pushed \
+                 commits are not checked against file reservations.",
+                commits.len()
+            );
+            commits.truncate(cap);
         }
+
+        // Bound 1: one diff-tree for every commit at once. --stdin takes the
+        // commit list on stdin and, with --no-commit-id -z, concatenates the
+        // per-commit name-status records into one NUL-delimited stream.
+        //
+        // `--cc` (not `-m`): on a merge commit `-m` explodes the diff
+        // into one section PER PARENT, flagging every file merely carried in
+        // from origin as a "pushed change" (false positive, issue #238). `--cc`
+        // reports only the files the merge itself changed relative to ALL
+        // parents, preserving the fail-closed check for genuine
+        // conflict-resolution edits to reserved paths while dropping carried
+        // files. On a regular (single-parent) commit `--cc` and `-m` produce
+        // identical --name-status output, so there is no false negative on
+        // normal commits.
+        let mut blob = String::with_capacity(commits.len() * 41);
+        for sha in &commits {
+            blob.push_str(sha);
+            blob.push('\n');
+        }
+        let mut diff_tree_cmd = Command::new("git");
+        diff_tree_cmd.current_dir(repo_root).args([
+            "diff-tree",
+            "--root",
+            "-r",
+            "--no-commit-id",
+            "--name-status",
+            "-M",
+            "--no-ext-diff",
+            "--diff-filter=ACMRDTU",
+            "-z",
+            "--cc",
+            "--stdin",
+        ]);
+        let Some(output) = guard_run_git_bounded(diff_tree_cmd, Some(blob.as_bytes()), deadline)?
+        else {
+            return Ok(budget_spent());
+        };
+
+        if output.status.success() {
+            all_paths.extend(parse_name_status_z(&output.stdout)?);
+            continue;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if looks_like_allocation_failure(&stderr) {
+            return Ok(PushPaths::Unchecked {
+                reason: format!(
+                    "mcp-agent-mail: git ran out of memory reading the pushed commit paths, so \
+                     this push was NOT checked against file reservations: {}",
+                    stderr.trim()
+                ),
+            });
+        }
+        return Err(GuardError::Io(std::io::Error::other(format!(
+            "git diff-tree failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim(),
+        ))));
     }
 
     // Deduplicate
     all_paths.sort();
     all_paths.dedup();
-    Ok(all_paths)
+    Ok(PushPaths::Checked(all_paths))
 }
 
 /// Parse NUL-delimited `git diff --name-status -z` output.
@@ -3579,6 +4109,290 @@ mod tests {
     // Git integration: pushed paths (pre-push)
     // -----------------------------------------------------------------------
 
+    /// Unwrap a Checked outcome, failing loudly on Unchecked.
+    ///
+    /// Every existing test asserts on inspected paths, so an Unchecked result
+    /// is a test failure and must not read as "no paths found".
+    fn push_paths_checked(repo: &std::path::Path, stdin_lines: &str) -> Vec<String> {
+        match get_push_paths(repo, stdin_lines).expect("push paths") {
+            PushPaths::Checked(paths) => paths,
+            PushPaths::Unchecked { reason } => {
+                panic!("expected Checked, got Unchecked: {reason}")
+            }
+        }
+    }
+
+    /// The old shape: one `git diff-tree` process per commit. Kept in the tests
+    /// only, as the reference the batched implementation must agree with.
+    fn push_paths_per_commit_loop(repo: &std::path::Path, range: &str) -> Vec<String> {
+        let listed = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["rev-list", "--topo-order", range])
+            .output()
+            .expect("rev-list");
+        assert!(listed.status.success(), "rev-list failed");
+        let mut paths = Vec::new();
+        for sha in String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let out = std::process::Command::new("git")
+                .current_dir(repo)
+                .args([
+                    "diff-tree",
+                    "--root",
+                    "-r",
+                    "--no-commit-id",
+                    "--name-status",
+                    "-M",
+                    "--no-ext-diff",
+                    "--diff-filter=ACMRDTU",
+                    "-z",
+                    "--cc",
+                    sha,
+                ])
+                .output()
+                .expect("diff-tree");
+            assert!(out.status.success(), "diff-tree failed for {sha}");
+            paths.extend(parse_name_status_z(&out.stdout).expect("parse"));
+        }
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// A repo with a rename, a touched-then-reverted path, and a merge, so the
+    /// cases where batching could diverge from the per-commit loop are all
+    /// present. Returns (repo dir, base sha, tip sha).
+    fn repo_with_a_mixed_history() -> (tempfile::TempDir, std::path::PathBuf, String, String) {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        run_git(&repo, &["init", "-q", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "test@test.com"]);
+        run_git(&repo, &["config", "user.name", "test"]);
+
+        std::fs::write(repo.join("base.txt"), "base\n").expect("write");
+        run_git(&repo, &["add", "base.txt"]);
+        run_git(&repo, &["commit", "-qm", "base"]);
+        let base = run_git_stdout(&repo, &["rev-parse", "HEAD"]);
+
+        // touched then reverted: the net diff loses it, the per-commit pass keeps it
+        std::fs::write(repo.join("flip.txt"), "one\n").expect("write");
+        run_git(&repo, &["add", "flip.txt"]);
+        run_git(&repo, &["commit", "-qm", "add flip"]);
+        run_git(&repo, &["rm", "-q", "flip.txt"]);
+        run_git(&repo, &["commit", "-qm", "remove flip"]);
+
+        // a rename, so both names must show up
+        std::fs::write(repo.join("old.py"), "print('x')\n").expect("write");
+        run_git(&repo, &["add", "old.py"]);
+        run_git(&repo, &["commit", "-qm", "add old.py"]);
+        run_git(&repo, &["mv", "old.py", "new.py"]);
+        run_git(&repo, &["commit", "-qm", "rename"]);
+
+        // a side branch merged back, so the range holds a merge commit
+        run_git(&repo, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(repo.join("side.txt"), "side\n").expect("write");
+        run_git(&repo, &["add", "side.txt"]);
+        run_git(&repo, &["commit", "-qm", "side work"]);
+        run_git(&repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("main.txt"), "main\n").expect("write");
+        run_git(&repo, &["add", "main.txt"]);
+        run_git(&repo, &["commit", "-qm", "main work"]);
+        run_git(
+            &repo,
+            &["merge", "-q", "--no-ff", "-m", "merge side", "side"],
+        );
+        let tip = run_git_stdout(&repo, &["rev-parse", "HEAD"]);
+        (td, repo, base, tip)
+    }
+
+    #[test]
+    fn push_paths_batched_agrees_with_the_per_commit_loop() {
+        let (_td, repo, base, tip) = repo_with_a_mixed_history();
+        let stdin_lines = format!("refs/heads/main {tip} refs/heads/main {base}\n");
+        let batched = push_paths_checked(&repo, &stdin_lines);
+        let mut looped = push_paths_per_commit_loop(&repo, &format!("{base}..{tip}"));
+        looped.sort();
+        looped.dedup();
+        assert_eq!(
+            batched, looped,
+            "one diff-tree --stdin must report exactly what a process per commit reports"
+        );
+        // and the cases that could have diverged are actually present
+        for expected in ["flip.txt", "old.py", "new.py", "side.txt", "main.txt"] {
+            assert!(
+                batched.contains(&expected.to_string()),
+                "expected {expected} in {batched:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn push_paths_over_the_commit_cap_reads_the_net_range_diff() {
+        let (_td, repo, base, tip) = repo_with_a_mixed_history();
+        let stdin_lines = format!("refs/heads/main {tip} refs/heads/main {base}\n");
+        let outcome = get_push_paths_bounded(&repo, &stdin_lines, Some(1), None).expect("bounded");
+        let PushPaths::Checked(paths) = outcome else {
+            panic!("over the cap should still check the net range, not give up");
+        };
+        assert!(
+            paths.contains(&"new.py".to_string()),
+            "the net range diff must still report a path the push changed: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"flip.txt".to_string()),
+            "a path changed and then reverted inside the range is what the net diff gives up; \
+             the warning says so. Got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn push_paths_under_the_commit_cap_still_inspects_every_commit() {
+        let (_td, repo, base, tip) = repo_with_a_mixed_history();
+        let stdin_lines = format!("refs/heads/main {tip} refs/heads/main {base}\n");
+        let outcome =
+            get_push_paths_bounded(&repo, &stdin_lines, Some(10_000), None).expect("bounded");
+        let PushPaths::Checked(paths) = outcome else {
+            panic!("under the cap must inspect every commit");
+        };
+        assert!(
+            paths.contains(&"flip.txt".to_string()),
+            "under the cap the touched-then-reverted path must survive: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn push_paths_reports_unchecked_when_the_budget_is_gone() {
+        let (_td, repo, base, tip) = repo_with_a_mixed_history();
+        let stdin_lines = format!("refs/heads/main {tip} refs/heads/main {base}\n");
+        let outcome =
+            get_push_paths_bounded(&repo, &stdin_lines, None, Some(std::time::Duration::ZERO))
+                .expect("a spent budget allows the push, it does not error");
+        match outcome {
+            PushPaths::Unchecked { reason } => {
+                assert!(
+                    reason.contains(ENV_PUSH_TIMEOUT_SECS),
+                    "the warning must name the variable that raises the budget: {reason}"
+                );
+                assert!(
+                    reason.contains("NOT checked"),
+                    "the warning must say nothing was checked: {reason}"
+                );
+            }
+            PushPaths::Checked(paths) => {
+                panic!("a zero budget must not read as a clean check of {paths:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn push_paths_new_branch_over_the_cap_keeps_the_newest_commits() {
+        let (_td, repo, _base, tip) = repo_with_a_mixed_history();
+        // remote all-zeros: a new branch, so there is no range to diff against
+        let stdin_lines = format!("refs/heads/main {tip} refs/heads/main {}\n", "0".repeat(40));
+        let outcome = get_push_paths_bounded(&repo, &stdin_lines, Some(2), None).expect("bounded");
+        let PushPaths::Checked(paths) = outcome else {
+            panic!(
+                "a new-branch push over the cap inspects the newest commits, it does not give up"
+            );
+        };
+        assert!(
+            paths.contains(&"main.txt".to_string()) || paths.contains(&"side.txt".to_string()),
+            "the newest commits must still be inspected: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"base.txt".to_string()),
+            "the oldest commits are the ones the cap drops, and the warning says so: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn allocation_failures_are_told_apart_from_other_git_errors() {
+        // the message seen in the field, verbatim
+        assert!(looks_like_allocation_failure(
+            "fatal: mmap failed, check sys.vm.max_map_count and/or RLIMIT_DATA: \
+             Cannot allocate memory"
+        ));
+        assert!(looks_like_allocation_failure(
+            "fatal: Out of memory, malloc failed"
+        ));
+        assert!(!looks_like_allocation_failure("fatal: bad object deadbeef"));
+        assert!(!looks_like_allocation_failure(""));
+    }
+
+    #[test]
+    fn a_bound_is_only_removed_by_an_explicit_zero() {
+        let name = ENV_MAX_PUSH_COMMITS;
+        assert_eq!(
+            parse_bound(name, None, 7_usize, 0),
+            Some(7),
+            "unset keeps the default"
+        );
+        assert_eq!(
+            parse_bound(name, Some("  "), 7_usize, 0),
+            Some(7),
+            "blank keeps the default"
+        );
+        assert_eq!(
+            parse_bound(name, Some("250"), 7_usize, 0),
+            Some(250),
+            "a number wins"
+        );
+        assert_eq!(
+            parse_bound(name, Some(" 250 "), 7_usize, 0),
+            Some(250),
+            "padding is trimmed"
+        );
+        assert_eq!(
+            parse_bound(name, Some("0"), 7_usize, 0),
+            None,
+            "zero removes the bound"
+        );
+        // A typo must not read as "no bound": that would silently unbound the
+        // guard, which is the bug this whole change exists to prevent.
+        assert_eq!(parse_bound(name, Some("lots"), 7_usize, 0), Some(7));
+        assert_eq!(
+            parse_bound(name, Some("-5"), 7_i64, 0),
+            None,
+            "negative removes the bound"
+        );
+    }
+
+    #[test]
+    fn rendered_pre_push_template_is_bounded() {
+        let script = render_guard_plugin_script("/my/project", "pre-push");
+        // Match the argv fragment, not the word: `--stdin` also appears in the
+        // template's own comments, so `contains("--stdin")` passed even with
+        // batching removed. A gate that cannot go red is worse than no gate.
+        assert!(
+            script.contains(r#""-z", "--cc", "--stdin"]"#),
+            "the template's diff-tree call must take its commit list on stdin"
+        );
+        assert!(
+            script.contains(r#"GUARD_ENV_MAX_PUSH_COMMITS = "AGENT_MAIL_GUARD_MAX_PUSH_COMMITS""#),
+            "the template must expose the commit cap"
+        );
+        assert!(
+            script.contains(r#"GUARD_ENV_PUSH_TIMEOUT = "AGENT_MAIL_GUARD_PUSH_TIMEOUT_SECS""#),
+            "the template must expose the wall-clock budget"
+        );
+        assert!(
+            script.contains("timeout=_budget_left(deadline)"),
+            "every git call in the template must run under the budget"
+        );
+        assert!(
+            script.contains("def fail_open("),
+            "the template must be able to allow a push it could not check"
+        );
+        assert!(
+            !script.contains("for sha in commits:"),
+            "a process per pushed commit is the bug; it must not come back"
+        );
+    }
+
     #[test]
     fn push_paths_includes_touched_files_even_if_net_diff_is_empty() {
         let td = tempfile::TempDir::new().expect("tempdir");
@@ -3607,7 +4421,7 @@ mod tests {
         let local_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
 
         let stdin_lines = format!("refs/heads/main {local_sha} refs/heads/main {remote_sha}\n");
-        let paths = get_push_paths(&repo_dir, &stdin_lines).expect("push paths");
+        let paths = push_paths_checked(&repo_dir, &stdin_lines);
         assert!(
             paths.contains(&"a.txt".to_string()),
             "expected a.txt in push paths, got: {paths:?}"
@@ -3633,7 +4447,7 @@ mod tests {
         let local_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
 
         let stdin_lines = format!("refs/heads/main {local_sha} refs/heads/main {remote_sha}\n");
-        let paths = get_push_paths(&repo_dir, &stdin_lines).expect("push paths");
+        let paths = push_paths_checked(&repo_dir, &stdin_lines);
         assert!(
             paths.contains(&"old_name.py".to_string()),
             "expected old_name.py in push paths, got: {paths:?}"
@@ -3693,7 +4507,7 @@ mod tests {
         let local_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
 
         let stdin_lines = format!("refs/heads/main {local_sha} refs/heads/main {remote_sha}\n");
-        let paths = get_push_paths(&repo_dir, &stdin_lines).expect("push paths");
+        let paths = push_paths_checked(&repo_dir, &stdin_lines);
         // carried.txt is already on origin (in remote_sha) and the merge commit
         // itself does not touch it, so --cc must omit it. With the old `-m`, the
         // merge's per-parent diff vs main's parent would have flagged it.
@@ -3756,7 +4570,7 @@ mod tests {
         let local_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
 
         let stdin_lines = format!("refs/heads/main {local_sha} refs/heads/main {remote_sha}\n");
-        let paths = get_push_paths(&repo_dir, &stdin_lines).expect("push paths");
+        let paths = push_paths_checked(&repo_dir, &stdin_lines);
         assert!(
             paths.contains(&"shared.txt".to_string()),
             "a file genuinely modified by the merge resolution must be flagged \
@@ -3775,7 +4589,7 @@ mod tests {
 
         // Delete push: local sha is all zeros. Should not attempt git and should return empty.
         let stdin_lines = "refs/heads/main 0000000000000000000000000000000000000000 refs/heads/main 1234567890abcdef1234567890abcdef12345678\n";
-        let paths = get_push_paths(&repo_dir, stdin_lines).expect("push paths");
+        let paths = push_paths_checked(&repo_dir, stdin_lines);
         assert_eq!(paths, [] as [std::string::String; 0]);
     }
 
@@ -3796,7 +4610,7 @@ mod tests {
         let stdin_lines = format!(
             "refs/heads/main {local_sha} refs/heads/main 0000000000000000000000000000000000000000\n"
         );
-        let paths = get_push_paths(&repo_dir, &stdin_lines).expect("push paths");
+        let paths = push_paths_checked(&repo_dir, &stdin_lines);
         assert!(
             paths.contains(&"tracked.rs".to_string()),
             "expected tracked.rs in initial-push paths, got {paths:?}"
@@ -3824,7 +4638,7 @@ mod tests {
         let local_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
 
         let stdin_lines = format!("HEAD {local_sha} refs/heads/main {remote_sha}\n");
-        let paths = get_push_paths(&repo_dir, &stdin_lines).expect("push paths");
+        let paths = push_paths_checked(&repo_dir, &stdin_lines);
         assert!(
             paths.contains(&"detached.txt".to_string()),
             "expected detached.txt in push paths, got {paths:?}"
@@ -3852,7 +4666,7 @@ mod tests {
         let local_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
 
         let stdin_lines = format!("HEAD {local_sha} refs/heads/main {remote_sha}\n");
-        let paths = get_push_paths(&repo_dir, &stdin_lines).expect("push paths");
+        let paths = push_paths_checked(&repo_dir, &stdin_lines);
         assert!(
             paths.contains(&"detached.txt".to_string()),
             "expected detached.txt in push paths, got {paths:?}"
