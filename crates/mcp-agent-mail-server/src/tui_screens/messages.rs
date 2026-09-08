@@ -276,6 +276,7 @@ const SYSTEM_MESSAGE_SUBJECT_PREFIXES: &[&str] = &[
     "Contact request from ",
     "Contact request approved by ",
     "Contact request denied by ",
+    "Contact approved: ",
 ];
 
 /// Returns `true` for subjects produced by the system's coordination paths
@@ -6225,6 +6226,9 @@ mod tests {
             "[build-slot] Acquired worktree slot"
         ));
         assert!(is_system_message_subject("Contact request from RubyKnoll"));
+        assert!(is_system_message_subject(
+            "Contact approved: RubyKnoll -> GreenCastle"
+        ));
         assert!(is_system_message_subject("  [system] Heartbeat OK"));
     }
 

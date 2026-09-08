@@ -126,7 +126,13 @@ fn classify_dimension(err_msg: &str) -> Dimension {
         | C::ForeignKeyInconsistency
         | C::EngineProbeLimitation => Dimension::Corruption,
         C::HostPressure => Dimension::Permissions,
-        C::FdExhaustion | C::ConnectionOrConfigError => Dimension::Transport,
+        // `RequestSemanticError` is only ever produced from a typed
+        // `DbError`, never from raw message classification; it is listed for
+        // exhaustiveness and would mean the self-test itself issued a bad
+        // request, which is not a storage dimension at all.
+        C::FdExhaustion | C::ConnectionOrConfigError | C::RequestSemanticError => {
+            Dimension::Transport
+        }
     }
 }
 

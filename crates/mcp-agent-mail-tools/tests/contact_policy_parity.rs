@@ -5,7 +5,8 @@ use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{
-    ensure_project, fetch_inbox, register_agent, request_contact, send_message, set_contact_policy,
+    ensure_project, fetch_inbox, macro_contact_handshake, register_agent, request_contact,
+    respond_contact, send_message, set_contact_policy,
 };
 use serde_json::Value;
 use std::fs;
@@ -211,6 +212,201 @@ fn test_request_contact_uses_canonical_agent_names_in_intro() {
             intro.get("body_md").and_then(Value::as_str),
             Some("BlueLake requests permission to contact GreenCastle.")
         );
+    });
+}
+
+async fn fetch_inbox_with_bodies(ctx: &McpContext, project_key: &str, agent: &str) -> Vec<Value> {
+    let inbox_json = fetch_inbox(
+        ctx,
+        project_key.to_string(),
+        agent.to_string(),
+        None,
+        None,
+        Some(20),
+        Some(true),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("fetch inbox");
+    serde_json::from_str(&inbox_json).expect("parse inbox")
+}
+
+fn assert_only_approval_notice(
+    inbox: &[Value],
+    project_key: &str,
+    requester: &str,
+    target: &str,
+) -> Value {
+    let subjects: Vec<&str> = inbox
+        .iter()
+        .filter_map(|message| message.get("subject").and_then(Value::as_str))
+        .collect();
+    assert!(
+        !subjects
+            .iter()
+            .any(|subject| subject.starts_with("Contact request from")),
+        "GH#313: an auto-approved handshake must not leave a pending-looking intro: {subjects:?}"
+    );
+    let expected_subject = format!("Contact approved: {requester} -> {target}");
+    let notice = inbox
+        .iter()
+        .find(|message| {
+            message
+                .get("subject")
+                .and_then(Value::as_str)
+                .is_some_and(|subject| subject == expected_subject)
+        })
+        .unwrap_or_else(|| panic!("approval notice missing from inbox: {subjects:?}"))
+        .clone();
+    assert_eq!(
+        notice.get("ack_required"),
+        Some(&Value::Bool(false)),
+        "the approval notice must not be actionable"
+    );
+    let body = notice
+        .get("body_md")
+        .and_then(Value::as_str)
+        .expect("notice body");
+    assert!(body.contains("no action is required"), "{body}");
+    assert!(
+        body.contains(&format!(
+            "respond_contact(project_key='{project_key}', to_agent='{target}', \
+             from_agent='{requester}', from_project='{project_key}', accept=false)"
+        )),
+        "the notice must spell out the exact approved tuple: {body}"
+    );
+    notice
+}
+
+/// GH#313: `send_message(auto_contact_if_blocked=true)` against the default
+/// `auto` policy approves the link inline. The recipient must get the intended
+/// message plus a non-actionable approval notice naming the tuple — not an
+/// ack-required "Contact request from X" that looks pending after approval.
+#[test]
+fn test_auto_contact_send_leaves_no_pending_intro_and_names_the_approved_tuple() {
+    run_serial_async(|cx| async move {
+        let scenario = "auto_contact_send_no_pending_intro";
+        let project_key = format!("/tmp/{scenario}-{}", unique_suffix());
+        let ctx = McpContext::new(cx.clone(), 1);
+        let _project_slug =
+            setup_project_and_agents(&ctx, &project_key, &["GreenCastle", "RedStone"]).await;
+
+        send_basic_message(&ctx, &project_key, vec!["RedStone".to_string()], Some(true))
+            .await
+            .expect("auto-contact send must succeed against the default auto policy");
+
+        let inbox = fetch_inbox_with_bodies(&ctx, &project_key, "RedStone").await;
+        assert!(
+            inbox.iter().any(|message| {
+                message
+                    .get("subject")
+                    .and_then(Value::as_str)
+                    .is_some_and(|subject| subject == "Parity test subject")
+            }),
+            "the intended message must be delivered"
+        );
+        assert_only_approval_notice(&inbox, &project_key, "GreenCastle", "RedStone");
+
+        // Answering with the requester's home project instead of the approved
+        // tuple is a lookup miss on a healthy mailbox: NOT_FOUND, and the
+        // envelope must not claim reads are unsafe or block edits.
+        let home_key = format!("/tmp/{scenario}-home-{}", unique_suffix());
+        setup_project_and_agents(&ctx, &home_key, &["GreenCastle"]).await;
+        let err = respond_contact(
+            &ctx,
+            project_key.clone(),
+            "RedStone".to_string(),
+            "GreenCastle".to_string(),
+            Some(home_key),
+            true,
+            None,
+        )
+        .await
+        .expect_err("the home-project tuple was never linked");
+        let payload = error_object(&err);
+        assert_eq!(
+            payload.get("type").and_then(Value::as_str),
+            Some("NOT_FOUND")
+        );
+        let envelope = payload
+            .get("data")
+            .and_then(|data| data.get("failure_envelope"))
+            .expect("NOT_FOUND carries the failure envelope");
+        assert_eq!(
+            envelope.get("class").and_then(Value::as_str),
+            Some("request_semantic_error")
+        );
+        assert_eq!(
+            envelope.pointer("/policy/blocks_edits"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            envelope.pointer("/policy/safe_to_continue_read_only"),
+            Some(&Value::Bool(true))
+        );
+
+        // The tuple the notice names still resolves.
+        let response_json = respond_contact(
+            &ctx,
+            project_key.clone(),
+            "RedStone".to_string(),
+            "GreenCastle".to_string(),
+            Some(project_key.clone()),
+            true,
+            None,
+        )
+        .await
+        .expect("the approved tuple must resolve");
+        let response: Value = serde_json::from_str(&response_json).expect("parse response");
+        assert_eq!(response.get("approved"), Some(&Value::Bool(true)));
+    });
+}
+
+/// GH#313: the explicit macro with `auto_accept=true` behaves the same way,
+/// while a plain request still sends the actionable pending intro.
+#[test]
+fn test_handshake_auto_accept_sends_approval_notice_not_pending_intro() {
+    run_serial_async(|cx| async move {
+        let scenario = "handshake_auto_accept_notice";
+        let project_key = format!("/tmp/{scenario}-{}", unique_suffix());
+        let ctx = McpContext::new(cx.clone(), 1);
+        let _project_slug =
+            setup_project_and_agents(&ctx, &project_key, &["BlueLake", "GreenCastle"]).await;
+
+        let response_json = macro_contact_handshake(
+            &ctx,
+            project_key.clone(),
+            Some("BlueLake".to_string()),
+            Some("GreenCastle".to_string()),
+            None,
+            None,
+            None,
+            Some("auto-accept parity".to_string()),
+            Some(true),
+            Some(3600),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("auto-accept handshake");
+        let response: Value = serde_json::from_str(&response_json).expect("parse handshake");
+        assert_eq!(
+            response.pointer("/response/approved"),
+            Some(&Value::Bool(true))
+        );
+
+        let inbox = fetch_inbox_with_bodies(&ctx, &project_key, "GreenCastle").await;
+        assert_eq!(inbox.len(), 1, "exactly one notice: {inbox:?}");
+        assert_only_approval_notice(&inbox, &project_key, "BlueLake", "GreenCastle");
     });
 }
 

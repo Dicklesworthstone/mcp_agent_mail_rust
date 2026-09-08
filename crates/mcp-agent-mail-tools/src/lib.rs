@@ -349,10 +349,13 @@ pub mod tool_util {
         // A5 (br-bvq1x.1.5): record the typed class at the single chokepoint
         // where a DB error is surfaced to a caller, so corruption-class trend
         // counters (and the K3 circuit breaker) see every classified failure
-        // exactly once.
-        mcp_agent_mail_core::global_metrics()
-            .corruption
-            .record_class(classification.class.as_str());
+        // exactly once. A semantic miss (GH#313) is not a storage failure and
+        // must not feed the failure trend.
+        if classification.class != mcp_agent_mail_db::DbErrorClass::RequestSemanticError {
+            mcp_agent_mail_core::global_metrics()
+                .corruption
+                .record_class(classification.class.as_str());
+        }
         match e {
             // D3 (br-bvq1x.4.3): a bounded retry loop already spent its
             // budget. Render an honest, class-distinct envelope that reports
@@ -2226,6 +2229,17 @@ body
             assert_eq!(data["error"]["type"], "NOT_FOUND");
             assert_eq!(data["error"]["recoverable"], true);
             assert_eq!(data["error"]["data"]["entity"], "Agent");
+            // GH#313: a lookup miss must not wear the storage-failure policy
+            // (reads unsafe, edits blocked, "run am doctor health").
+            let envelope = &data["error"]["data"]["failure_envelope"];
+            assert_eq!(envelope["class"], "request_semantic_error");
+            assert_eq!(envelope["policy"]["blocks_edits"], false);
+            assert_eq!(envelope["policy"]["safe_to_continue_read_only"], true);
+            assert_eq!(envelope["policy"]["repairable"], false);
+            assert_eq!(
+                data["error"]["data"]["db_error_classification"]["class"],
+                "request_semantic_error"
+            );
         }
 
         #[test]

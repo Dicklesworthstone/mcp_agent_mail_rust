@@ -126,6 +126,10 @@ pub enum DbErrorClass {
     FtsIndexCorruption,
     /// Connection, path, permission, or configuration error.
     ConnectionOrConfigError,
+    /// The request itself was unsatisfiable — a lookup missed, a row already
+    /// existed, an argument was invalid. Storage is healthy; nothing here
+    /// says reads are unsafe or edits must stop (GH#313).
+    RequestSemanticError,
     /// Retryable busy/lock/MVCC contention.
     BusyRetryable,
     /// Process file-descriptor exhaustion.
@@ -150,6 +154,7 @@ impl DbErrorClass {
             Self::ForeignKeyInconsistency => "foreign_key_inconsistency",
             Self::FtsIndexCorruption => "fts_index_corruption",
             Self::ConnectionOrConfigError => "connection_or_config_error",
+            Self::RequestSemanticError => "request_semantic_error",
             Self::BusyRetryable => "busy_retryable",
             Self::FdExhaustion => "fd_exhaustion",
             Self::PoolExhaustion => "pool_exhaustion",
@@ -267,6 +272,19 @@ impl DbErrorClassification {
                 safe_to_continue_read_only: false,
                 blocks_edits: true,
                 recommended_command: "am doctor health",
+            },
+            // A miss or an invalid argument is a fact about the request, not
+            // about storage: reads stay safe, edits stay allowed, and no
+            // doctor command is implied. Retrying the same request will miss
+            // again, so `safe_to_retry` stays false.
+            DbErrorClass::RequestSemanticError => Self {
+                class,
+                severity: DbErrorSeverity::P3,
+                repairable: false,
+                safe_to_retry: false,
+                safe_to_continue_read_only: true,
+                blocks_edits: false,
+                recommended_command: "correct the request arguments; no database remediation is needed",
             },
             DbErrorClass::BusyRetryable => Self {
                 class,
@@ -635,10 +653,14 @@ impl DbError {
             Self::Sqlite(message) | Self::Schema(message) => classify_db_error_message(message),
             Self::Internal(message) => classify_db_error_message(message),
             Self::RetryBudgetExhausted { inner, .. } => inner.classification(),
-            Self::NotFound { .. }
-            | Self::Duplicate { .. }
-            | Self::InvalidArgument { .. }
-            | Self::Serialization(_) => {
+            // GH#313: a semantic miss carried the connection/config policy
+            // (reads unsafe, edits blocked, "run am doctor health"), so a
+            // wrong-tuple `respond_contact` on a healthy mailbox read like a
+            // storage incident.
+            Self::NotFound { .. } | Self::Duplicate { .. } | Self::InvalidArgument { .. } => {
+                DbErrorClassification::for_class(DbErrorClass::RequestSemanticError)
+            }
+            Self::Serialization(_) => {
                 DbErrorClassification::for_class(DbErrorClass::ConnectionOrConfigError)
             }
         }
@@ -1331,6 +1353,40 @@ mod tests {
         assert_class(
             "malformed database schema (idx_agent_links_pair_unique) - invalid rootpage (11)",
             DbErrorClass::SchemaDriftOrMissingTables,
+        );
+    }
+
+    /// GH#313: a lookup miss, a duplicate, or an invalid argument is a fact
+    /// about the request, not about storage. It must not inherit the
+    /// connection/config policy that marks reads unsafe and blocks edits.
+    #[test]
+    fn semantic_request_errors_do_not_carry_storage_failure_policy() {
+        for error in [
+            DbError::not_found("AgentLink", "1:41->1:42"),
+            DbError::duplicate("Agent", "BlueLake"),
+            DbError::invalid("ttl_seconds", "must be positive"),
+        ] {
+            let classification = error.classification();
+            assert_eq!(
+                classification.class,
+                DbErrorClass::RequestSemanticError,
+                "{error}"
+            );
+            assert!(classification.safe_to_continue_read_only, "{error}");
+            assert!(!classification.blocks_edits, "{error}");
+            assert!(!classification.repairable, "{error}");
+            assert!(!classification.safe_to_retry, "{error}");
+            let envelope = error.failure_envelope();
+            assert_eq!(envelope.class, "request_semantic_error");
+            assert!(!envelope.policy.blocks_edits);
+            assert!(envelope.policy.safe_to_continue_read_only);
+        }
+        // A row that cannot be decoded is still a storage-side fault.
+        assert_eq!(
+            DbError::Serialization("bad json".into())
+                .classification()
+                .class,
+            DbErrorClass::ConnectionOrConfigError
         );
     }
 

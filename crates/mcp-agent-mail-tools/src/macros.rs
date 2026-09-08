@@ -701,8 +701,17 @@ pub async fn macro_contact_handshake(
     // NOTE: Removed manual same-project fast path that bypassed side effects.
     // We now always delegate to request_contact/respond_contact to ensure
     // consistent behavior, normalization, and archive writes.
-
-    let request_json = crate::contacts::request_contact(
+    //
+    // GH#313: when this macro approves the request itself, the target must
+    // not receive the ack-required "Contact request from X" intro — it would
+    // look actionable after the link is already approved. The pending intro
+    // is deferred and replaced by a non-actionable approval notice below.
+    let intro = if should_auto_accept {
+        crate::contacts::ContactIntro::Deferred
+    } else {
+        crate::contacts::ContactIntro::PendingRequest
+    };
+    let request_json = crate::contacts::request_contact_with_intro(
         ctx,
         source_project_key.clone(),
         from_agent.clone(),
@@ -716,6 +725,7 @@ pub async fn macro_contact_handshake(
         program.clone(),
         model.clone(),
         task_description.clone(),
+        intro,
     )
     .await?;
     let request_val: Value = parse_json(request_json, "request")?;
@@ -735,7 +745,16 @@ pub async fn macro_contact_handshake(
             Some(ttl),
         )
         .await?;
-        Some(parse_json(respond_json, "response")?)
+        let response_val: Value = parse_json(respond_json, "response")?;
+        crate::contacts::send_contact_approved_notice(
+            ctx,
+            &source_project_key,
+            &from_agent,
+            &target_project_key,
+            &target_agent_name,
+        )
+        .await?;
+        Some(response_val)
     } else {
         None
     };

@@ -263,7 +263,6 @@ fn parse_contact_target(
 #[tool(
     description = "Request contact approval to message another agent.\n\nCreates (or refreshes) a pending AgentLink and sends a small ack_required intro message.\n\nDiscovery\n---------\nTo discover available agent names, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\nfrom_agent : str\n    Your agent name (must be registered in the project).\nto_agent : str\n    Target agent name (use resource://agents/{project_key} to discover names).\nto_project : Optional[str]\n    Target project if different from your project (cross-project coordination).\nreason : str\n    Optional explanation for the contact request.\nttl_seconds : int\n    Time to live for the contact approval request (default: 7 days)."
 )]
-#[allow(clippy::too_many_lines)]
 pub async fn request_contact(
     ctx: &McpContext,
     project_key: String,
@@ -276,6 +275,52 @@ pub async fn request_contact(
     program: Option<String>,
     model: Option<String>,
     task_description: Option<String>,
+) -> McpResult<String> {
+    request_contact_with_intro(
+        ctx,
+        project_key,
+        from_agent,
+        to_agent,
+        to_project,
+        reason,
+        ttl_seconds,
+        register_if_missing,
+        program,
+        model,
+        task_description,
+        ContactIntro::PendingRequest,
+    )
+    .await
+}
+
+/// How the target learns about a contact request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContactIntro {
+    /// The target must decide: send the ack-required "Contact request from X"
+    /// intro it can act on.
+    PendingRequest,
+    /// The caller approves the link itself right after this call
+    /// (`macro_contact_handshake(auto_accept=true)`) and sends its own
+    /// non-actionable notice once the approval is in place, so no
+    /// pending-looking intro is created here (GH#313).
+    Deferred,
+}
+
+/// [`request_contact`] with an explicit intro policy.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) async fn request_contact_with_intro(
+    ctx: &McpContext,
+    project_key: String,
+    from_agent: String,
+    to_agent: String,
+    to_project: Option<String>,
+    reason: Option<String>,
+    ttl_seconds: Option<i64>,
+    register_if_missing: Option<bool>,
+    program: Option<String>,
+    model: Option<String>,
+    task_description: Option<String>,
+    intro: ContactIntro,
 ) -> McpResult<String> {
     let register_if_missing = register_if_missing.unwrap_or(true);
 
@@ -376,92 +421,26 @@ pub async fn request_contact(
 
     // Only send intro mail if the target's policy allows it and the link
     // is not blocked (a re-request against a blocked link should be silent).
-    let should_send_intro = to_row.contact_policy != "block_all" && link_row.status != "blocked";
+    let should_send_intro = intro == ContactIntro::PendingRequest
+        && to_row.contact_policy != "block_all"
+        && link_row.status != "blocked";
 
     if should_send_intro {
         let subject = format!("Contact request from {from_agent_name}");
         let body_md =
             format!("{from_agent_name} requests permission to contact {target_agent_name}.");
-
-        let to_id = to_row.id.unwrap_or(0);
-        let recipients: &[(i64, &str)] = &[(to_id, "to")];
-        let message_out = mcp_agent_mail_db::queries::create_message_with_recipients(
-            ctx.cx(),
+        send_contact_notice(
+            ctx,
             &pool,
-            target_project_id,
-            from_row.id.unwrap_or(0),
+            &from_row,
+            &to_row,
+            &target_project_row,
             &subject,
             &body_md,
-            None,
-            "normal",
             true,
-            "[]",
-            recipients,
+            "request_contact intro-message insert failed",
         )
-        .await;
-        if let Outcome::Err(ref err) = message_out {
-            tracing::error!(
-                from_agent = %from_agent_name,
-                from_project_id = project_id,
-                to_agent = %target_agent_name,
-                to_project_id = target_project_id,
-                sender_id = from_row.id.unwrap_or(0),
-                recipient_id = to_id,
-                error = %err,
-                "request_contact intro-message insert failed"
-            );
-        }
-        let message = db_outcome_to_mcp_result(message_out)?;
-        enqueue_message_semantic_index(
-            target_project_id,
-            message.id.unwrap_or(0),
-            &message.subject,
-            &message.body_md,
-        );
-        crate::messaging::enqueue_message_lexical_index(
-            &mcp_agent_mail_db::search_v3::IndexableMessage {
-                id: message.id.unwrap_or(0),
-                project_id: target_project_id,
-                project_slug: target_project_row.slug.clone(),
-                sender_name: from_agent_name.clone(),
-                subject: message.subject.clone(),
-                body_md: message.body_md.clone(),
-                thread_id: message.thread_id.clone(),
-                importance: message.importance.clone(),
-                created_ts: message.created_ts,
-            },
-        );
-
-        // Write message to archive
-        let config = mcp_agent_mail_core::Config::get();
-        let message_id = message.id.unwrap_or(0);
-        let all_recipient_names = vec![target_agent_name.clone()];
-
-        let msg_json = serde_json::json!({
-            "id": message_id,
-            "from": &from_agent_name,
-            "to": &all_recipient_names,
-            "cc": [],
-            "bcc": [],
-            "subject": &message.subject,
-            "created": micros_to_iso(message.created_ts),
-            "thread_id": &message.thread_id,
-            "project": &target_project_row.human_key,
-            "project_slug": &target_project_row.slug,
-            "importance": &message.importance,
-            "ack_required": message.ack_required != 0,
-            "attachments": [],
-        });
-
-        try_write_message_archive(
-            &config,
-            &target_project_row.slug,
-            &msg_json,
-            &message.body_md,
-            &from_agent_name,
-            &all_recipient_names,
-            &[],
-        );
+        .await?;
     }
 
     let response = ContactLinkState {
@@ -475,6 +454,171 @@ pub async fn request_contact(
 
     serde_json::to_string(&response)
         .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
+}
+
+/// Persist, index, and archive a system notice from `from_row` to `to_row`
+/// inside the target's project.
+#[allow(clippy::too_many_arguments)]
+async fn send_contact_notice(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    from_row: &mcp_agent_mail_db::AgentRow,
+    to_row: &mcp_agent_mail_db::AgentRow,
+    target_project: &mcp_agent_mail_db::ProjectRow,
+    subject: &str,
+    body_md: &str,
+    ack_required: bool,
+    failure_label: &'static str,
+) -> McpResult<()> {
+    let target_project_id = target_project.id.unwrap_or(0);
+    let sender_id = from_row.id.unwrap_or(0);
+    let to_id = to_row.id.unwrap_or(0);
+    let recipients: &[(i64, &str)] = &[(to_id, "to")];
+    let message_out = mcp_agent_mail_db::queries::create_message_with_recipients(
+        ctx.cx(),
+        pool,
+        target_project_id,
+        sender_id,
+        subject,
+        body_md,
+        None,
+        "normal",
+        ack_required,
+        "[]",
+        recipients,
+    )
+    .await;
+    if let Outcome::Err(ref err) = message_out {
+        tracing::error!(
+            from_agent = %from_row.name,
+            from_project_id = from_row.project_id,
+            to_agent = %to_row.name,
+            to_project_id = target_project_id,
+            sender_id,
+            recipient_id = to_id,
+            error = %err,
+            "{failure_label}"
+        );
+    }
+    let message = db_outcome_to_mcp_result(message_out)?;
+    enqueue_message_semantic_index(
+        target_project_id,
+        message.id.unwrap_or(0),
+        &message.subject,
+        &message.body_md,
+    );
+    crate::messaging::enqueue_message_lexical_index(
+        &mcp_agent_mail_db::search_v3::IndexableMessage {
+            id: message.id.unwrap_or(0),
+            project_id: target_project_id,
+            project_slug: target_project.slug.clone(),
+            sender_name: from_row.name.clone(),
+            subject: message.subject.clone(),
+            body_md: message.body_md.clone(),
+            thread_id: message.thread_id.clone(),
+            importance: message.importance.clone(),
+            created_ts: message.created_ts,
+        },
+    );
+
+    // Write message to archive
+    let config = mcp_agent_mail_core::Config::get();
+    let message_id = message.id.unwrap_or(0);
+    let all_recipient_names = vec![to_row.name.clone()];
+
+    let msg_json = serde_json::json!({
+        "id": message_id,
+        "from": &from_row.name,
+        "to": &all_recipient_names,
+        "cc": [],
+        "bcc": [],
+        "subject": &message.subject,
+        "created": micros_to_iso(message.created_ts),
+        "thread_id": &message.thread_id,
+        "project": &target_project.human_key,
+        "project_slug": &target_project.slug,
+        "importance": &message.importance,
+        "ack_required": message.ack_required != 0,
+        "attachments": [],
+    });
+
+    try_write_message_archive(
+        &config,
+        &target_project.slug,
+        &msg_json,
+        &message.body_md,
+        &from_row.name,
+        &all_recipient_names,
+        &[],
+    );
+    Ok(())
+}
+
+/// Tell the target that a request was approved on the requester's behalf
+/// (`macro_contact_handshake(auto_accept=true)`), naming the exact approved
+/// link tuple.
+///
+/// GH#313: the ack-required "Contact request from X" intro looked pending
+/// after the link was already approved, and answering it with the requester's
+/// home project instead of the approved tuple returned `NOT_FOUND`. The notice
+/// is informational (`ack_required=false`) and spells out the tuple so a
+/// client can revoke the link without inferring projects from reply routing.
+pub(crate) async fn send_contact_approved_notice(
+    ctx: &McpContext,
+    source_project_key: &str,
+    from_agent: &str,
+    target_project_key: &str,
+    target_agent: &str,
+) -> McpResult<()> {
+    let pool = get_db_pool()?;
+    let source_project = resolve_project(ctx, &pool, source_project_key).await?;
+    let target_project = resolve_project(ctx, &pool, target_project_key).await?;
+    let from_row = resolve_agent(
+        ctx,
+        &pool,
+        source_project.id.unwrap_or(0),
+        from_agent,
+        &source_project.slug,
+        &source_project.human_key,
+    )
+    .await?;
+    let to_row = resolve_agent(
+        ctx,
+        &pool,
+        target_project.id.unwrap_or(0),
+        target_agent,
+        &target_project.slug,
+        &target_project.human_key,
+    )
+    .await?;
+    // Mirror the pending intro: a target that accepts no mail gets none.
+    if to_row.contact_policy == "block_all" {
+        return Ok(());
+    }
+    let from = &from_row.name;
+    let to = &to_row.name;
+    let from_project = &source_project.human_key;
+    let to_project = &target_project.human_key;
+    let subject = format!("Contact approved: {from} -> {to}");
+    let body_md = format!(
+        "{from} requested permission to contact {to}; the request was approved on {from}'s \
+         behalf (auto_accept), so no action is required.\n\n\
+         Approved link: {from} (project {from_project}) -> {to} (project {to_project}).\n\n\
+         To revoke it, call respond_contact(project_key='{to_project}', to_agent='{to}', \
+         from_agent='{from}', from_project='{from_project}', accept=false)."
+    );
+    send_contact_notice(
+        ctx,
+        &pool,
+        &from_row,
+        &to_row,
+        &target_project,
+        &subject,
+        &body_md,
+        false,
+        "contact approved notice insert failed",
+    )
+    .await
 }
 
 /// Approve or deny a contact request.
