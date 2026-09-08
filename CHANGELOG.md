@@ -8,10 +8,11 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ---
 
-## [Unreleased]
+## [v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.34) — 2026-09-08
 
-Landed on `main` after the v0.3.33 tag (`ae59cb4a`) was cut; not in the
-v0.3.33 binaries.
+This patch includes the tmux identity and Windows UNC fixes that landed after
+v0.3.33. FrankenSQLite remains pinned to 0.3.18 with SQLModel 0.4.0,
+Asupersync 0.4.9, and FastMCP 0.7.1.
 
 ### Security
 
@@ -35,6 +36,12 @@ v0.3.33 binaries.
 
 ### Fixed
 
+- **Windows UNC roots survive SQLite URL round trips.** Ordinary and extended
+  network roots retain their leading separators, allowing read-only inbox
+  snapshots when temporary storage is on a UNC path. The regression covers
+  local SMB shares; it does not certify every network server or long-path
+  variant.
+
 - **`resolve_pane_identity` without a `pane_id` ignores the caller's tmux
   socket (GH#310 follow-up).** The `$TMUX_PANE` fallback names this
   process's own pane, on its own server; a caller-supplied
@@ -42,6 +49,20 @@ v0.3.33 binaries.
   nevertheless used to resolve it, so the caller's server was asked about the
   daemon's pane id and a colliding `%N` there could verify the wrong pane.
   The socket now applies only to an explicit `pane_id`.
+
+### Validation and known issues
+
+- The pre-version-bump workspace gate ran 17,384 tests: 17,372 passed,
+  12 failed, and 37 were skipped. Two passing fixtures were reported as leaky.
+  All 12 failures also appear in v0.3.33's recorded gate; this is not an
+  all-green workspace claim. Final compiler and executable validation is
+  recorded with the release artifacts.
+- The previously tracked FrankenSQLite bound-UPDATE persistence,
+  ADD COLUMN catalog-normalization, and foreign SQLite WAL-reader boundary
+  defects remain open. This release does not change the engine version.
+- Release binaries and container images are built with the DSR/fleet process;
+  GitHub Actions are disabled. The container recipe consumes the exact GNU
+  release binaries and checks both architectures before publication.
 
 ## [v0.3.33](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.33) — 2026-09-07
 
