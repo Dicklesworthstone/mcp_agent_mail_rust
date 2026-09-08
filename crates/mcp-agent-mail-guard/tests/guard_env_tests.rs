@@ -592,3 +592,122 @@ fn is_bypass_active_false_for_zero() {
     unsafe { std::env::set_var("AGENT_MAIL_BYPASS", "0") };
     assert!(!mcp_agent_mail_guard::is_bypass_active());
 }
+
+// -----------------------------------------------------------------------
+// Push scan bounds from the environment
+// -----------------------------------------------------------------------
+
+const PUSH_SCAN_ENV: [&str; 3] = [
+    mcp_agent_mail_guard::PUSH_MAX_COMMITS_ENV,
+    mcp_agent_mail_guard::PUSH_MAX_PATHS_ENV,
+    mcp_agent_mail_guard::PUSH_TIMEOUT_ENV,
+];
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("git must run");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Three commits on top of a base; returns the pre-push stdin line.
+fn three_commit_push(td: &Path) -> (std::path::PathBuf, String) {
+    let repo = td.join("repo");
+    std::fs::create_dir_all(&repo).expect("mkdir");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "test@test.com"]);
+    git(&repo, &["config", "user.name", "test"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("base.txt"), "base\n").expect("write");
+    git(&repo, &["add", "base.txt"]);
+    git(&repo, &["commit", "-qm", "base"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    for i in 1..=3 {
+        std::fs::write(repo.join(format!("f{i}.txt")), format!("{i}\n")).expect("write");
+        git(&repo, &["add", &format!("f{i}.txt")]);
+        git(&repo, &["commit", "-qm", &format!("commit {i}")]);
+    }
+    let tip = git(&repo, &["rev-parse", "HEAD"]);
+    (
+        repo,
+        format!("refs/heads/main {tip} refs/heads/main {base}\n"),
+    )
+}
+
+#[test]
+fn push_scan_limits_from_env_reads_every_bound() {
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = EnvGuard::save(&PUSH_SCAN_ENV);
+
+    for name in PUSH_SCAN_ENV {
+        unsafe { std::env::remove_var(name) };
+    }
+    assert_eq!(
+        mcp_agent_mail_guard::PushScanLimits::from_env(),
+        mcp_agent_mail_guard::PushScanLimits::default(),
+        "unset variables give the defaults"
+    );
+
+    unsafe {
+        std::env::set_var(mcp_agent_mail_guard::PUSH_MAX_COMMITS_ENV, "12");
+        std::env::set_var(mcp_agent_mail_guard::PUSH_MAX_PATHS_ENV, "0");
+        std::env::set_var(mcp_agent_mail_guard::PUSH_TIMEOUT_ENV, "junk");
+    }
+    let limits = mcp_agent_mail_guard::PushScanLimits::from_env();
+    assert_eq!(limits.max_commits, Some(12));
+    assert_eq!(limits.max_paths, None, "0 removes the bound");
+    assert_eq!(
+        limits.timeout,
+        Some(mcp_agent_mail_guard::PushScanLimits::DEFAULT_TIMEOUT),
+        "an unparseable value keeps the default"
+    );
+}
+
+#[test]
+fn get_push_paths_reports_a_truncated_scan_as_an_error() {
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = EnvGuard::save(&PUSH_SCAN_ENV);
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let (repo, stdin_line) = three_commit_push(td.path());
+
+    for name in PUSH_SCAN_ENV {
+        unsafe { std::env::remove_var(name) };
+    }
+    let paths = mcp_agent_mail_guard::get_push_paths(&repo, &stdin_line).expect("complete scan");
+    assert_eq!(paths, vec!["f1.txt", "f2.txt", "f3.txt"]);
+
+    unsafe { std::env::set_var(mcp_agent_mail_guard::PUSH_MAX_COMMITS_ENV, "2") };
+    let err = mcp_agent_mail_guard::get_push_paths(&repo, &stdin_line)
+        .expect_err("a truncated scan must not come back as a shorter path list");
+    match &err {
+        GuardError::PushScanTruncated { detail } => {
+            assert!(
+                detail.contains("more than 2 commits")
+                    && detail.contains(mcp_agent_mail_guard::PUSH_MAX_COMMITS_ENV),
+                "{detail}"
+            );
+        }
+        other => panic!("expected PushScanTruncated, got {other:?}"),
+    }
+
+    // The partial result is still reachable for a caller that wants it.
+    let scan = mcp_agent_mail_guard::scan_push_paths(
+        &repo,
+        &stdin_line,
+        &mcp_agent_mail_guard::PushScanLimits::from_env(),
+    )
+    .expect("scan");
+    assert_eq!(scan.paths, vec!["f2.txt", "f3.txt"]);
+    assert!(!scan.is_complete());
+}

@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
 use globset::GlobSetBuilder;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Repository metadata that is shared by every agent and must not be guarded.
 ///
@@ -30,6 +32,11 @@ pub enum GuardError {
          shared directory with AGENT_MAIL_GUARD_ALLOW_GLOBAL_HOOKSPATH=1."
     )]
     GlobalHooksPath { hooks_path: String, origin: String },
+    #[error(
+        "pre-push scan was truncated, so part of the push was not checked against file \
+         reservations: {detail}"
+    )]
+    PushScanTruncated { detail: String },
     #[error("git error: {0}")]
     Git(#[from] git2::Error),
     #[error("io error: {0}")]
@@ -495,6 +502,18 @@ def fail_closed(message):
 import random as _random
 import time as _time
 
+def _git_argv(args):
+    """Apply the AM_GIT_BINARY override to a git argv list."""
+    env_bin = os.environ.get("AM_GIT_BINARY")
+    if env_bin and args and args[0] == "git":
+        return [env_bin] + list(args[1:])
+    return list(args)
+
+def _is_segfault_rc(rc):
+    """Segfault-shaped exit: -11 / -7 on POSIX (signal), 139 / 135 via a
+    shell wrapper, 0xC0000005 on Windows."""
+    return rc in (-11, -7, 139, 135, 0xC0000005)
+
 def _run_git_with_retry(args, **kwargs):
     """subprocess.run wrapper that retries on SIGSEGV (git 2.51.0).
 
@@ -508,9 +527,7 @@ def _run_git_with_retry(args, **kwargs):
     that pass check=True would see the first segfault as an exception
     and bypass the retry entirely.
     """
-    env_bin = os.environ.get("AM_GIT_BINARY")
-    if env_bin and args and args[0] == "git":
-        args = [env_bin] + list(args[1:])
+    args = _git_argv(args)
 
     check_requested = kwargs.pop("check", False)
 
@@ -520,11 +537,7 @@ def _run_git_with_retry(args, **kwargs):
     for attempt in range(max_retries + 1):
         last_result = subprocess.run(args, check=False, **kwargs)
         rc = last_result.returncode
-        # segfault-like exits:
-        #   -11 / -7 on POSIX (signal), 139 / 135 via shell wrapping,
-        #   0xC0000005 on Windows.
-        is_segfault = rc in (-11, -7, 139, 135, 0xC0000005)
-        if not is_segfault:
+        if not _is_segfault_rc(rc):
             # Non-segfault outcome (success OR other error).
             # If caller requested check=True and we saw a nonzero
             # non-segfault exit, emulate subprocess.run's behavior
@@ -610,9 +623,221 @@ def get_staged_files():
     except Exception as exc:
         fail_closed("mcp-agent-mail: guard failed to inspect staged files: " + str(exc))
 
+# ---------------------------------------------------------------------------
+# Bounded pre-push path scan.
+#
+# The paths a push touches used to be listed with one `git diff-tree` process
+# per pushed commit, and every path was then matched against every reservation
+# with a regex rebuilt on each pairing. Both costs grow with the push, so a
+# large one (thousands of commits, tens of thousands of paths) sat in the guard
+# for minutes and, on a machine short of memory, failed the push outright.
+#
+# The scan is now ONE `git rev-list | git diff-tree --stdin` pipeline per
+# pushed ref, parsed as it streams, and it is bounded three ways:
+#
+#   AGENT_MAIL_GUARD_PUSH_MAX_COMMITS   commits listed per ref     (default 2000)
+#   AGENT_MAIL_GUARD_PUSH_MAX_PATHS     path records read per ref  (default 100000)
+#   AGENT_MAIL_GUARD_PUSH_TIMEOUT_SECS  wall clock for the scan    (default 120)
+#
+# Setting a variable to 0 removes that bound. Reaching a bound TRUNCATES the
+# scan: the paths already read are still checked, and if none of them
+# conflicts while another agent holds an active lease, the guard exits through
+# fail_closed() (GH#224 policy -- an inspection the guard could not finish is
+# never reported as "no conflict").
+# AGENT_MAIL_GUARD_MODE=warn turns that into a warning, and the message names
+# the variable to raise, so nobody has to reach for `git push --no-verify`.
+# ---------------------------------------------------------------------------
+import threading as _threading
+
+PUSH_MAX_COMMITS_ENV = "AGENT_MAIL_GUARD_PUSH_MAX_COMMITS"
+PUSH_MAX_PATHS_ENV = "AGENT_MAIL_GUARD_PUSH_MAX_PATHS"
+PUSH_TIMEOUT_ENV = "AGENT_MAIL_GUARD_PUSH_TIMEOUT_SECS"
+PUSH_MAX_COMMITS_DEFAULT = 2000
+PUSH_MAX_PATHS_DEFAULT = 100000
+PUSH_TIMEOUT_SECS_DEFAULT = 120
+
+def push_scan_bound(name, default):
+    """Read one integer bound from the environment.
+
+    Unset or blank keeps the default; 0 or a negative value removes the bound
+    (None); anything unparseable keeps the default and says so, so a typo can
+    never silently unbound the scan.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        print(
+            "mcp-agent-mail: %s=%r is not an integer; using %d" % (name, raw, default),
+            file=sys.stderr,
+        )
+        return default
+    return value if value > 0 else None
+
+def _seconds_left(deadline):
+    if deadline is None:
+        return None
+    return max(0.0, deadline - _time.monotonic())
+
+class _NameStatusStream:
+    """Incremental parser for NUL-delimited `--name-status -z` output.
+
+    Same record grammar as get_staged_files(): STATUS NUL path NUL, or
+    Rnnn NUL old NUL new NUL (likewise Cnnn) for renames and copies. Records
+    are counted as they start, so the record cap bounds memory as well as
+    time no matter how many commits feed the stream.
+    """
+
+    def __init__(self, files, max_records):
+        self.files = files
+        self.max_records = max_records
+        self.records = 0
+        self.capped = False
+        self._tail = b""
+        self._paths_left = 0
+
+    def feed(self, chunk):
+        """Parse `chunk`; returns False once the record cap has been hit."""
+        if self.capped:
+            return False
+        parts = (self._tail + chunk).split(b"\0")
+        self._tail = parts.pop()
+        for token in parts:
+            if self._paths_left == 0:
+                status = token.decode("utf-8", "ignore").strip()
+                if not status:
+                    continue
+                if self.max_records is not None and self.records >= self.max_records:
+                    self.capped = True
+                    return False
+                self.records += 1
+                self._paths_left = 2 if status.startswith(("R", "C")) else 1
+                continue
+            path = token.decode("utf-8", "ignore")
+            if path:
+                self.files.add(path)
+            self._paths_left -= 1
+        return True
+
+def _kill_quietly(proc):
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+def _scan_push_commits(rev_list_args, files, max_paths, deadline):
+    """Stream `git rev-list ... | git diff-tree --stdin` into `files`.
+
+    Returns (records, capped, timed_out). Both git processes are killed the
+    moment the record cap or the deadline is reached. A segfault-shaped exit
+    is retried the way _run_git_with_retry() retries; any other failure of
+    either process is a fail_closed() exit.
+    """
+    # `--cc` (not `-m`): on a merge commit `-m` explodes the diff into one
+    # section PER PARENT, flagging every file merely carried in from origin
+    # as a "pushed change" (false positive, issue #238). `--cc` reports only
+    # the files the merge itself changed relative to ALL parents. On a
+    # regular (single-parent) commit `--cc` and `-m` produce identical
+    # --name-status output (no FN). `--stdin` takes the commit list from
+    # rev-list and, with `--no-commit-id -z`, emits one NUL-delimited stream
+    # identical to the concatenation of the per-commit outputs.
+    diff_tree_args = _git_argv(
+        ["git", "diff-tree", "--root", "-r", "--no-commit-id", "--name-status",
+         "-M", "--no-ext-diff", "--diff-filter=ACMRDTU", "-z", "--cc", "--stdin"]
+    )
+    rev_list_args = _git_argv(rev_list_args)
+    delays = (0.1, 0.4, 1.6)
+    for attempt in range(len(delays) + 1):
+        left = _seconds_left(deadline)
+        if left is not None and left <= 0:
+            return 0, False, True
+        scratch = set()
+        parser = _NameStatusStream(scratch, max_paths)
+        rev_list = subprocess.Popen(
+            rev_list_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        try:
+            diff_tree = subprocess.Popen(
+                diff_tree_args, stdin=rev_list.stdout,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        except Exception:
+            _kill_quietly(rev_list)
+            rev_list.wait()
+            raise
+        rev_list.stdout.close()  # diff-tree owns the read end now
+        expired = _threading.Event()
+
+        def _expire():
+            expired.set()
+            _kill_quietly(diff_tree)
+            _kill_quietly(rev_list)
+
+        timer = None
+        if left is not None:
+            timer = _threading.Timer(left, _expire)
+            timer.daemon = True
+            timer.start()
+        try:
+            while True:
+                chunk = diff_tree.stdout.read(65536)
+                if not chunk:
+                    break
+                if not parser.feed(chunk):
+                    _kill_quietly(diff_tree)
+                    _kill_quietly(rev_list)
+                    break
+        finally:
+            if timer is not None:
+                timer.cancel()
+        diff_tree.stdout.close()
+        diff_tree_err = diff_tree.stderr.read().decode("utf-8", "ignore").strip()
+        rev_list_err = rev_list.stderr.read().decode("utf-8", "ignore").strip()
+        diff_tree_rc = diff_tree.wait()
+        rev_list_rc = rev_list.wait()
+
+        if parser.capped:
+            files.update(scratch)
+            return parser.records, True, False
+        if diff_tree_rc == 0 and rev_list_rc == 0:
+            files.update(scratch)
+            return parser.records, False, False
+        if expired.is_set():
+            files.update(scratch)
+            return parser.records, False, True
+        if (_is_segfault_rc(diff_tree_rc) or _is_segfault_rc(rev_list_rc)) and attempt < len(delays):
+            sleep_s = delays[attempt] * _random.uniform(0.75, 1.25)
+            sys.stderr.write(
+                "guard: git segfault (rc=%d/%d, attempt %d/%d); retrying in %.2fs\n"
+                % (rev_list_rc, diff_tree_rc, attempt + 1, len(delays) + 1, sleep_s)
+            )
+            _time.sleep(sleep_s)
+            continue
+        if rev_list_rc != 0:
+            fail_closed(
+                "mcp-agent-mail: guard failed to enumerate pushed commits: "
+                + (rev_list_err or "git rev-list exited with status %d" % rev_list_rc)
+            )
+        fail_closed(
+            "mcp-agent-mail: guard failed to inspect pushed commit paths: "
+            + (diff_tree_err or "git diff-tree exited with status %d" % diff_tree_rc)
+        )
+    return 0, False, False  # unreachable: the loop returns or exits
+
 def get_push_files():
-    """Get list of files modified in the push (for pre-push)."""
+    """Get (paths, unchecked) for the push (for pre-push).
+
+    `unchecked` describes, for the operator, every part of the push the
+    bounded scan did not inspect; empty means the scan was complete.
+    """
     files = set()
+    unchecked = []
+    max_commits = push_scan_bound(PUSH_MAX_COMMITS_ENV, PUSH_MAX_COMMITS_DEFAULT)
+    max_paths = push_scan_bound(PUSH_MAX_PATHS_ENV, PUSH_MAX_PATHS_DEFAULT)
+    timeout = push_scan_bound(PUSH_TIMEOUT_ENV, PUSH_TIMEOUT_SECS_DEFAULT)
+    deadline = None if timeout is None else _time.monotonic() + timeout
     try:
         # Read stdin for ref updates (local_ref local_sha remote_ref remote_sha)
         # sys.stdin.read() works because chain-runner pipes input as text/bytes depending on OS,
@@ -621,7 +846,7 @@ def get_push_files():
         # Safe fallback is sys.stdin.read().
         stdin_data = sys.stdin.read()
         if not stdin_data:
-            return []
+            return [], []
 
         for line in stdin_data.splitlines():
             parts = line.split()
@@ -635,72 +860,65 @@ def get_push_files():
                 continue
 
             if set(remote_sha) == {'0'}:
-                rev_list_args = ["git", "rev-list", "--topo-order", local_sha, "--not", "--remotes"]
+                rev_args = [local_sha, "--not", "--remotes"]
+                what = "new-branch push of %s" % local_sha[:12]
             else:
-                rev_list_args = ["git", "rev-list", "--topo-order", f"{remote_sha}..{local_sha}"]
+                rev_args = ["%s..%s" % (remote_sha, local_sha)]
+                what = "push %s..%s" % (remote_sha[:12], local_sha[:12])
 
-            # Get commits in range
+            # Bound 1: how many commits, without walking past the cap. `-n`
+            # stops the walk itself, so this is cheap on any history size.
+            count_args = ["git", "rev-list", "--count"]
+            if max_commits is not None:
+                count_args += ["-n", str(max_commits + 1)]  # stops the walk right past the cap
             res = _run_git_with_retry(
-                rev_list_args,
-                capture_output=True, text=True
+                count_args + rev_args,
+                capture_output=True, text=True, timeout=_seconds_left(deadline),
             )
             if res.returncode != 0:
                 detail = (res.stderr or "").strip()
                 if not detail:
-                    detail = f"git rev-list exited with status {res.returncode}"
+                    detail = "git rev-list exited with status %d" % res.returncode
                 fail_closed(
                     "mcp-agent-mail: guard failed to enumerate pushed commits: " + detail
                 )
-
-            commits = [c.strip() for c in res.stdout.splitlines() if c.strip()]
-
-            for sha in commits:
-                diff_res = _run_git_with_retry(
-                    # `--cc` (not `-m`): on a merge commit `-m` explodes the diff
-                    # into one section PER PARENT, flagging every file merely
-                    # carried in from origin as a "pushed change" (false positive,
-                    # issue #238). `--cc` reports only the files the merge itself
-                    # changed relative to ALL parents, preserving the fail-closed
-                    # check for real conflict-resolution edits while dropping
-                    # carried files. On a regular (single-parent) commit `--cc`
-                    # and `-m` produce identical --name-status output (no FN).
-                    ["git", "diff-tree", "--root", "-r", "--no-commit-id", "--name-status",
-                     "-M", "--no-ext-diff", "--diff-filter=ACMRDTU", "-z", "--cc", sha],
-                    capture_output=True
+            count = int((res.stdout or "").strip() or "0")
+            if count == 0:
+                continue
+            inspect = count
+            if max_commits is not None and count > max_commits:
+                inspect = max_commits
+                unchecked.append(
+                    "%s has more than %d commits; only the newest %d were inspected "
+                    "(raise %s)" % (what, max_commits, max_commits, PUSH_MAX_COMMITS_ENV)
                 )
-                if diff_res.returncode != 0:
-                    detail = diff_res.stderr.decode("utf-8", "ignore").strip()
-                    if not detail:
-                        detail = f"git diff-tree exited with status {diff_res.returncode}"
-                    fail_closed(
-                        "mcp-agent-mail: guard failed to inspect pushed commit paths: " + detail
-                    )
-                data = diff_res.stdout
-                parts = data.split(b'\0')
-                i = 0
-                while i < len(parts):
-                    status = parts[i].decode('utf-8', 'ignore').strip()
-                    if not status:
-                        i += 1
-                        continue
-                    i += 1
-                    if status.startswith(('R', 'C')):
-                        if i + 1 < len(parts):
-                            oldp = parts[i].decode('utf-8', 'ignore')
-                            newp = parts[i+1].decode('utf-8', 'ignore')
-                            if oldp: files.add(oldp)
-                            if newp: files.add(newp)
-                            i += 2
-                    else:
-                        if i < len(parts):
-                            p = parts[i].decode('utf-8', 'ignore')
-                            if p: files.add(p)
-                            i += 1
+
+            # Bounds 2 and 3: one streamed pipeline, capped on records read and
+            # on the shared deadline.
+            records, capped, timed_out = _scan_push_commits(
+                ["git", "rev-list", "-n", str(inspect)] + rev_args, files, max_paths, deadline
+            )
+            if capped:
+                unchecked.append(
+                    "%s: the path scan stopped after %d path records (raise %s)"
+                    % (what, records, PUSH_MAX_PATHS_ENV)
+                )
+            if timed_out:
+                unchecked.append(
+                    "%s: the scan ran out of its %ds budget after %d path records (raise %s)"
+                    % (what, timeout, records, PUSH_TIMEOUT_ENV)
+                )
+                break
     except SystemExit:
         raise
+    except subprocess.TimeoutExpired:
+        unchecked.append(
+            "the scan ran out of its %ds budget while counting pushed commits (raise %s)"
+            % (timeout, PUSH_TIMEOUT_ENV)
+        )
     except Exception as exc:
         fail_closed("mcp-agent-mail: guard failed to inspect push files: " + str(exc))
-    return sorted(list(files))
+    return sorted(files), unchecked
 
 def is_real_directory(path):
     try:
@@ -1300,31 +1518,50 @@ def glob_to_regex(pattern):
     regex = re.sub(r"\\?\{(.+?)\\?\}", lambda m: "(" + m.group(1).replace("\\", "").replace(",", "|") + ")", regex)
     return regex
 
-def glob_match(path, pattern):
-    """Simple shell-style glob matching (similar to Rust implementation)."""
-    # NOTE: path must be a concrete path, pattern is the glob.
-    normalized_f = normalize_match_input(path)
-    normalized_pattern = normalize_match_input(pattern)
-    if not normalized_f or not normalized_pattern:
-        return False
-    try:
-        return re.fullmatch(glob_to_regex(normalized_pattern), normalized_f) is not None
-    except re.error as exc:
-        # FAIL CLOSED. A reservation pattern we cannot compile into a matcher
-        # must never be silently treated as "no conflict" -- that is exactly
-        # the fail-OPEN the CPython 3.14 fnmatch change caused. Be
-        # conservative: report a potential conflict so the commit/push is
-        # blocked and the operator can investigate, and make it loud.
-        sys.stderr.write(
-            "mcp-agent-mail: guard could not evaluate reservation pattern "
-            "%r (%s); treating as a conflict (fail-closed).\n" % (pattern, exc)
-        )
-        return True
+def compile_reservations(reservations, self_agent):
+    """Build every foreign reservation's matcher ONCE.
+
+    check_conflicts() used to rebuild the regex for each (path, reservation)
+    pair, which made a large push pay the glob translation tens of thousands
+    of times per reservation. Returns a list of
+    (pattern, holder, normalized_pattern, matcher, has_glob) tuples.
+
+    `matcher` is None when the pattern cannot be compiled. That stays FAIL
+    CLOSED: a reservation pattern we cannot compile into a matcher must never
+    be silently treated as "no conflict" -- that is exactly the fail-OPEN the
+    CPython 3.14 fnmatch change caused. Be conservative: report a potential
+    conflict so the commit/push is blocked and the operator can investigate,
+    and make it loud.
+    """
+    compiled = []
+    for res in reservations:
+        pattern = res["path_pattern"]
+        holder = res.get("agent_name", "unknown")
+        if holder.lower() == self_agent:
+            continue  # Skip our own reservations
+
+        normalized_pattern = normalize_match_input(pattern)
+        if not normalized_pattern:
+            continue
+        try:
+            matcher = re.compile(glob_to_regex(normalized_pattern))
+        except re.error as exc:
+            sys.stderr.write(
+                "mcp-agent-mail: guard could not evaluate reservation pattern "
+                "%r (%s); treating as a conflict (fail-closed).\n" % (pattern, exc)
+            )
+            matcher = None
+        has_glob = any(c in pattern for c in "*?[{")
+        compiled.append((pattern, holder, normalized_pattern, matcher, has_glob))
+    return compiled
 
 def check_conflicts(paths, reservations, self_agent):
     """Check if any paths conflict with active reservations."""
     self_agent = self_agent.lower()
+    compiled = compile_reservations(reservations, self_agent)
     conflicts = []
+    if not compiled:
+        return conflicts
     for f in paths:
         if is_default_exempt_path(f):
             continue
@@ -1332,24 +1569,13 @@ def check_conflicts(paths, reservations, self_agent):
         if not normalized_f:
             continue
 
-        for res in reservations:
-            pattern = res["path_pattern"]
-            holder = res.get("agent_name", "unknown")
-            if holder.lower() == self_agent:
-                continue  # Skip our own reservations
-
-            normalized_pattern = normalize_match_input(pattern)
-            if not normalized_pattern:
-                continue
-
+        for pattern, holder, normalized_pattern, matcher, has_glob in compiled:
             # 1. Glob matching: check if concrete path matches reserved glob
-            if glob_match(normalized_f, normalized_pattern):
+            #    (an uncompilable pattern matches everything, see above).
+            if matcher is None or matcher.fullmatch(normalized_f) is not None:
                 conflicts.append((f, pattern, holder))
                 break
-            
-            # Directory prefix matching
-            has_glob = any(c in pattern for c in "*?[{")
-            
+
             # 2. Reverse check: pattern is inside touched path (e.g. dir replaced by file)
             # This handles cases where a concrete parent directory is touched.
             if normalized_pattern.startswith(normalized_f + "/"):
@@ -1362,6 +1588,16 @@ def check_conflicts(paths, reservations, self_agent):
                 conflicts.append((f, pattern, holder))
                 break
     return conflicts
+
+def has_foreign_reservations(reservations, self_agent):
+    """Whether any active reservation is held by someone other than `self_agent`.
+
+    A truncated push scan only matters if there is a reservation the skipped
+    part of the push could have collided with; an agent's own leases never
+    conflict with its push.
+    """
+    self_agent = self_agent.lower()
+    return any(res.get("agent_name", "unknown").lower() != self_agent for res in reservations)
 
 def is_truthy(val):
     if not val:
@@ -1379,12 +1615,13 @@ def main():
     if enforcement_enabled is not None and not is_truthy(enforcement_enabled):
         sys.exit(0)
 
+    unchecked = []
     if HOOK_NAME == "pre-push":
-        files_to_check = get_push_files()
+        files_to_check, unchecked = get_push_files()
     else:
         files_to_check = get_staged_files()
 
-    if not files_to_check:
+    if not files_to_check and not unchecked:
         sys.exit(0)
 
     reservations = get_active_reservations()
@@ -1403,11 +1640,21 @@ def main():
 
     conflicts = check_conflicts(files_to_check, reservations, agent_name)
     if not conflicts:
+        if unchecked and has_foreign_reservations(reservations, agent_name):
+            # Nothing inspected conflicts, but the scan did not cover the
+            # whole push and someone else holds a lease it could have hit:
+            # that is an unfinished inspection, not a clean one.
+            fail_closed(
+                "mcp-agent-mail: the pre-push scan was truncated, so part of this push "
+                "was NOT checked against active file reservations: " + "; ".join(unchecked)
+            )
         sys.exit(0)
 
     msg = "mcp-agent-mail: file reservation conflict detected!\n"
     for path, pattern, holder in conflicts:
         msg += f"  {path} conflicts with reservation '{pattern}' held by {holder}\n"
+    if unchecked:
+        msg += "  (the scan was also truncated: " + "; ".join(unchecked) + ")\n"
 
     if GUARD_MODE == "warn":
         print(f"WARNING: {msg}", file=sys.stderr)
@@ -2216,26 +2463,15 @@ fn is_expired(ts_str: &str, now: &chrono::DateTime<chrono::Utc>) -> bool {
 /// policy in `mcp_agent_mail_core::git_cmd::GitCmd::run` (3 retries,
 /// 100/400/1600ms jittered). Only retries segfault-shaped exits.
 fn guard_run_git_with_retry(mut cmd: Command) -> std::io::Result<std::process::Output> {
-    const BACKOFFS_MS: [u64; 3] = [100, 400, 1600];
     let mut last_output: Option<std::process::Output> = None;
-    for (attempt, maybe_base) in BACKOFFS_MS
+    for (attempt, maybe_base) in SEGFAULT_BACKOFFS_MS
         .into_iter()
         .map(Some)
         .chain(std::iter::once(None))
         .enumerate()
     {
         let output = cmd.output()?;
-        let signal_segfault = {
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::ExitStatusExt;
-                matches!(output.status.signal(), Some(11 | 7))
-            }
-            #[cfg(not(unix))]
-            false
-        };
-        let code_segfault = matches!(output.status.code(), Some(139 | 135));
-        if !signal_segfault && !code_segfault {
+        if !is_segfault_status(output.status) {
             return Ok(output);
         }
         let Some(base) = maybe_base else {
@@ -2252,22 +2488,45 @@ fn guard_run_git_with_retry(mut cmd: Command) -> std::io::Result<std::process::O
             attempt = attempt,
             "guard_git_segfault_retry"
         );
-        // Jitter formula MUST match mcp_agent_mail_core::git_cmd::jitter_ms
-        // so the guard's retry cadence is identical to the server's.
-        //   span = base / 2           (half the base)
-        //   low  = base - span / 2    (~ 0.75 * base)
-        //   jitter ∈ [low, low + span)
-        // For base=100 → [75, 125), base=400 → [300, 500), base=1600 → [1200, 2000).
-        let span = base / 2;
-        let low = base - span / 2;
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| u64::from(d.subsec_nanos()));
-        let offset = nanos % span.max(1);
-        let jitter = low + offset;
-        std::thread::sleep(std::time::Duration::from_millis(jitter));
+        std::thread::sleep(segfault_retry_delay(base));
     }
     Ok(last_output.expect("last_output set before break"))
+}
+
+/// Retry backoffs for segfault-shaped git exits (br-8ujfs.5.5 / E5).
+const SEGFAULT_BACKOFFS_MS: [u64; 3] = [100, 400, 1600];
+
+/// Whether `status` looks like the git 2.51.0 index-race crash: SIGSEGV or
+/// SIGBUS, or the 139 / 135 a shell wrapper turns them into.
+fn is_segfault_status(status: std::process::ExitStatus) -> bool {
+    let signal_segfault = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            matches!(status.signal(), Some(11 | 7))
+        }
+        #[cfg(not(unix))]
+        false
+    };
+    signal_segfault || matches!(status.code(), Some(139 | 135))
+}
+
+/// Jittered delay before retrying a segfaulted git invocation.
+///
+/// The formula MUST match `mcp_agent_mail_core::git_cmd::jitter_ms` so the
+/// guard's retry cadence is identical to the server's:
+///   span = base / 2           (half the base)
+///   low  = base - span / 2    (~ 0.75 * base)
+///   jitter ∈ [low, low + span)
+/// For base=100 → [75, 125), base=400 → [300, 500), base=1600 → [1200, 2000).
+fn segfault_retry_delay(base_ms: u64) -> Duration {
+    let span = base_ms / 2;
+    let low = base_ms - span / 2;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()));
+    let offset = nanos % span.max(1);
+    Duration::from_millis(low + offset)
 }
 
 /// Get staged file paths from git, including rename handling.
@@ -2294,12 +2553,158 @@ pub fn get_staged_paths(repo_root: &Path) -> GuardResult<Vec<String>> {
     parse_name_status_z(&output.stdout)
 }
 
-/// Get paths changed in a push range (for pre-push hook).
+// ---------------------------------------------------------------------------
+// Bounded pre-push path scan
+// ---------------------------------------------------------------------------
+//
+// The paths a push touches used to be listed with one `git diff-tree` process
+// per pushed commit, so a large push paid a process spawn (and, on a big
+// repository, a fresh pack mmap) per commit: thousands of commits meant
+// minutes inside the hook and, on a machine short of memory, a failed push.
+// The scan is now one `git rev-list | git diff-tree --stdin` pipeline per
+// pushed ref, parsed as it streams, and bounded in the commits it lists, the
+// path records it reads, and the wall clock it may use. The installed Python
+// hook (`render_guard_plugin_script`) implements the same bounds with the same
+// environment variables and defaults; keep the two in step.
+
+/// Environment variable: most commits inspected per pushed ref (`0` = unbounded).
+pub const PUSH_MAX_COMMITS_ENV: &str = "AGENT_MAIL_GUARD_PUSH_MAX_COMMITS";
+/// Environment variable: most `--name-status` records read per pushed ref (`0` = unbounded).
+pub const PUSH_MAX_PATHS_ENV: &str = "AGENT_MAIL_GUARD_PUSH_MAX_PATHS";
+/// Environment variable: wall-clock budget, in seconds, for the whole scan (`0` = unbounded).
+pub const PUSH_TIMEOUT_ENV: &str = "AGENT_MAIL_GUARD_PUSH_TIMEOUT_SECS";
+
+/// How much of a push the pre-push scan is allowed to inspect.
 ///
-/// Parses stdin ref tuples `<local_ref> <local_sha> <remote_ref> <remote_sha>` and
-/// uses `git diff --name-status -M -z <remote>..<local>` to find changed files.
+/// `None` in any field removes that bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PushScanLimits {
+    /// Most commits listed per pushed ref; the newest ones are kept.
+    pub max_commits: Option<usize>,
+    /// Most `--name-status` records read per pushed ref.
+    pub max_paths: Option<usize>,
+    /// Wall-clock budget shared by every ref in the push.
+    pub timeout: Option<Duration>,
+}
+
+impl PushScanLimits {
+    /// Default commit cap (matches the installed Python hook).
+    pub const DEFAULT_MAX_COMMITS: usize = 2000;
+    /// Default path-record cap (matches the installed Python hook).
+    pub const DEFAULT_MAX_PATHS: usize = 100_000;
+    /// Default wall-clock budget, in seconds (matches the installed Python hook).
+    pub const DEFAULT_TIMEOUT_SECS: usize = 120;
+    /// Default wall-clock budget (matches the installed Python hook).
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(Self::DEFAULT_TIMEOUT_SECS as u64);
+    /// No bounds at all: the scan inspects every commit of the push.
+    pub const UNBOUNDED: Self = Self {
+        max_commits: None,
+        max_paths: None,
+        timeout: None,
+    };
+
+    /// The defaults, overridden by the `AGENT_MAIL_GUARD_PUSH_*` variables.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let read = |name: &str, default: usize| {
+            parse_push_bound(std::env::var(name).ok().as_deref(), default)
+        };
+        Self {
+            max_commits: read(PUSH_MAX_COMMITS_ENV, Self::DEFAULT_MAX_COMMITS),
+            max_paths: read(PUSH_MAX_PATHS_ENV, Self::DEFAULT_MAX_PATHS),
+            timeout: read(PUSH_TIMEOUT_ENV, Self::DEFAULT_TIMEOUT_SECS)
+                .map(|secs| Duration::from_secs(u64::try_from(secs).unwrap_or(u64::MAX))),
+        }
+    }
+}
+
+impl Default for PushScanLimits {
+    fn default() -> Self {
+        Self {
+            max_commits: Some(Self::DEFAULT_MAX_COMMITS),
+            max_paths: Some(Self::DEFAULT_MAX_PATHS),
+            timeout: Some(Self::DEFAULT_TIMEOUT),
+        }
+    }
+}
+
+/// Parse one scan bound the way the installed hook does.
+///
+/// Unset or blank keeps the default; `0` or a negative value removes the
+/// bound; anything unparseable keeps the default, so a typo can never
+/// silently unbound the scan.
+fn parse_push_bound(raw: Option<&str>, default: usize) -> Option<usize> {
+    let raw = raw.map(str::trim).unwrap_or_default();
+    if raw.is_empty() {
+        return Some(default);
+    }
+    match raw.parse::<i64>() {
+        Ok(value) if value > 0 => Some(usize::try_from(value).unwrap_or(usize::MAX)),
+        Ok(_) => None,
+        Err(_) => {
+            tracing::warn!(
+                target: "mcp_agent_mail::guard::push_scan",
+                value = raw,
+                default = default,
+                "guard_push_scan_bound_unparseable"
+            );
+            Some(default)
+        }
+    }
+}
+
+/// What a bounded pre-push scan inspected.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PushScan {
+    /// Sorted, deduplicated paths touched by the inspected commits.
+    pub paths: Vec<String>,
+    /// Every part of the push the scan did NOT inspect, written for the
+    /// operator. Empty means the scan covered the whole push.
+    pub unchecked: Vec<String>,
+}
+
+impl PushScan {
+    /// Whether every pushed commit was inspected.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.unchecked.is_empty()
+    }
+}
+
+/// Get paths changed in a push range (for pre-push hook), with the default
+/// bounds from the environment.
+///
+/// Parses stdin ref tuples `<local_ref> <local_sha> <remote_ref> <remote_sha>`
+/// and unions the paths touched by every pushed commit. A scan that hits one
+/// of its bounds is an error ([`GuardError::PushScanTruncated`]) rather than a
+/// shorter path list, so a caller can never mistake "checked part of the push"
+/// for "checked the push"; use [`scan_push_paths`] to keep the partial result.
 pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<String>> {
-    let mut all_paths = Vec::new();
+    let scan = scan_push_paths(repo_root, stdin_lines, &PushScanLimits::from_env())?;
+    if scan.is_complete() {
+        Ok(scan.paths)
+    } else {
+        Err(GuardError::PushScanTruncated {
+            detail: scan.unchecked.join("; "),
+        })
+    }
+}
+
+/// Bounded enumeration of the paths a push touches.
+///
+/// Per pushed ref this runs `git rev-list --count -n <cap+1>` (so the walk
+/// stops right past the cap) and then ONE `git rev-list -n <n> | git diff-tree
+/// --stdin` pipeline, parsed as it streams and stopped at `max_paths` records
+/// or at the deadline. The union of the per-commit `--cc` outputs is exactly
+/// what the old per-commit loop produced (issue #238 semantics unchanged).
+pub fn scan_push_paths(
+    repo_root: &Path,
+    stdin_lines: &str,
+    limits: &PushScanLimits,
+) -> GuardResult<PushScan> {
+    let deadline = limits.timeout.map(|budget| Instant::now() + budget);
+    let mut paths = std::collections::BTreeSet::new();
+    let mut unchecked = Vec::new();
 
     for line in stdin_lines.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -2314,103 +2719,459 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
             continue;
         }
 
-        let mut rev_list_cmd = Command::new("git");
-        rev_list_cmd
-            .current_dir(repo_root)
-            .args(["rev-list", "--topo-order"]);
-        let diff_range = if remote_sha.chars().all(|c| c == '0') {
-            rev_list_cmd.args([local_sha, "--not", "--remotes"]);
-            None
+        let (rev_args, what) = if remote_sha.chars().all(|c| c == '0') {
+            (
+                vec![
+                    local_sha.to_string(),
+                    "--not".to_string(),
+                    "--remotes".to_string(),
+                ],
+                format!("new-branch push of {}", short_sha(local_sha)),
+            )
         } else {
-            let r = format!("{remote_sha}..{local_sha}");
-            rev_list_cmd.arg(&r);
-            Some(r)
+            (
+                vec![format!("{remote_sha}..{local_sha}")],
+                format!("push {}..{}", short_sha(remote_sha), short_sha(local_sha)),
+            )
         };
 
-        // Prefer per-commit path enumeration (legacy guard.py parity): this catches paths
-        // that were touched in any pushed commit, even if the net diff ends up empty.
-        let rev_list = guard_run_git_with_retry(rev_list_cmd)?;
-
-        if rev_list.status.success() {
-            for sha in String::from_utf8_lossy(&rev_list.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                let mut diff_tree_cmd = Command::new("git");
-                // `--cc` (not `-m`): on a merge commit `-m` explodes the diff
-                // into one section PER PARENT, flagging every file merely carried
-                // in from origin as a "pushed change" (false positive, issue
-                // #238). `--cc` reports only the files the merge itself changed
-                // relative to ALL parents — preserving the fail-closed check for
-                // genuine conflict-resolution edits to reserved paths while
-                // dropping carried files. On a regular (single-parent) commit
-                // `--cc` and `-m` produce identical --name-status output, so
-                // there is no false negative on normal commits.
-                diff_tree_cmd.current_dir(repo_root).args([
-                    "diff-tree",
-                    "--root",
-                    "-r",
-                    "--no-commit-id",
-                    "--name-status",
-                    "-M",
-                    "--no-ext-diff",
-                    "--diff-filter=ACMRDTU",
-                    "-z",
-                    "--cc",
-                    sha,
-                ]);
-                let output = guard_run_git_with_retry(diff_tree_cmd)?;
-
-                if output.status.success() {
-                    let paths = parse_name_status_z(&output.stdout)?;
-                    all_paths.extend(paths);
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(GuardError::Io(std::io::Error::other(format!(
-                        "git diff-tree failed for {sha} (exit {}): {}",
-                        output.status.code().unwrap_or(-1),
-                        stderr.trim(),
-                    ))));
-                }
-            }
-        } else if let Some(range) = diff_range {
-            // Fallback: net diff across the range (less precise, but better than nothing).
-            let mut diff_cmd = Command::new("git");
-            diff_cmd
-                .current_dir(repo_root)
-                .args(["diff", "--name-status", "-M", "-z", &range]);
-            let output = guard_run_git_with_retry(diff_cmd)?;
-
-            if output.status.success() {
-                let paths = parse_name_status_z(&output.stdout)?;
-                all_paths.extend(paths);
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(GuardError::Io(std::io::Error::other(format!(
-                    "git diff fallback failed for {range} (exit {}): {}",
-                    output.status.code().unwrap_or(-1),
-                    stderr.trim(),
-                ))));
-            }
-        } else {
-            // New-branch push (remote all-zeros) where `git rev-list … --not
-            // --remotes` itself failed: fail CLOSED rather than silently allowing
-            // the push with zero reservation enforcement. Mirrors the enforced
-            // Python pre-push plugin, which exits non-zero on rev-list failure.
-            let stderr = String::from_utf8_lossy(&rev_list.stderr);
+        // Bound 1: how many commits, without walking past the cap.
+        let mut count_cmd = Command::new("git");
+        count_cmd
+            .current_dir(repo_root)
+            .args(["rev-list", "--count"]);
+        if let Some(cap) = limits.max_commits {
+            count_cmd.arg("-n").arg(cap.saturating_add(1).to_string());
+        }
+        count_cmd.args(&rev_args);
+        let Some(count_output) = run_git_until(count_cmd, deadline)? else {
+            unchecked.push(format!(
+                "{what}: the scan ran out of its time budget while counting commits \
+                 (raise {PUSH_TIMEOUT_ENV})"
+            ));
+            break;
+        };
+        if !count_output.status.success() {
+            // Fail closed in both the range and the new-branch case: a range we
+            // cannot even count is a push we cannot claim to have checked.
+            let stderr = String::from_utf8_lossy(&count_output.stderr);
             return Err(GuardError::Io(std::io::Error::other(format!(
-                "git rev-list failed for new-branch push (exit {}): {}",
-                rev_list.status.code().unwrap_or(-1),
+                "git rev-list failed for {what} (exit {}): {}",
+                count_output.status.code().unwrap_or(-1),
                 stderr.trim(),
             ))));
         }
+        let count: usize = String::from_utf8_lossy(&count_output.stdout)
+            .trim()
+            .parse()
+            .map_err(|err| {
+                GuardError::Io(std::io::Error::other(format!(
+                    "git rev-list --count for {what} printed no count: {err}"
+                )))
+            })?;
+        if count == 0 {
+            continue;
+        }
+        let mut inspect = count;
+        if let Some(cap) = limits.max_commits
+            && count > cap
+        {
+            inspect = cap;
+            unchecked.push(format!(
+                "{what} has more than {cap} commits; only the newest {cap} were inspected \
+                 (raise {PUSH_MAX_COMMITS_ENV})"
+            ));
+        }
+
+        // Bounds 2 and 3: one streamed pipeline, capped on records read and on
+        // the shared deadline.
+        let outcome =
+            stream_push_commit_paths(repo_root, &rev_args, inspect, limits.max_paths, deadline)?;
+        paths.extend(outcome.paths);
+        match outcome.stop {
+            ScanStop::Complete => {}
+            ScanStop::Capped => unchecked.push(format!(
+                "{what}: the path scan stopped after {} path records (raise {PUSH_MAX_PATHS_ENV})",
+                outcome.records
+            )),
+            ScanStop::TimedOut => {
+                unchecked.push(format!(
+                    "{what}: the scan ran out of its time budget after {} path records \
+                     (raise {PUSH_TIMEOUT_ENV})",
+                    outcome.records
+                ));
+                break;
+            }
+        }
     }
 
-    // Deduplicate
-    all_paths.sort();
-    all_paths.dedup();
-    Ok(all_paths)
+    Ok(PushScan {
+        paths: paths.into_iter().collect(),
+        unchecked,
+    })
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
+/// Why a streamed `diff-tree` scan stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanStop {
+    /// Every listed commit was read.
+    Complete,
+    /// The record cap was reached; the remaining output was not read.
+    Capped,
+    /// The deadline passed; git was killed mid-stream.
+    TimedOut,
+}
+
+struct StreamOutcome {
+    paths: Vec<String>,
+    records: usize,
+    stop: ScanStop,
+}
+
+/// Incremental parser for NUL-delimited `--name-status -z` output.
+///
+/// Same record grammar as [`parse_name_status_z`] (`STATUS NUL path NUL`, or
+/// `Rnnn NUL old NUL new NUL` / `Cnnn ...` for renames and copies), but fed a
+/// chunk at a time so the record cap bounds memory as well as time no matter
+/// how many commits feed the stream. Records are counted as they start.
+#[derive(Debug, Default)]
+struct NameStatusStream {
+    tail: Vec<u8>,
+    paths_left: u8,
+    records: usize,
+    capped: bool,
+    paths: Vec<String>,
+}
+
+impl NameStatusStream {
+    /// Parse `chunk`; returns `false` once `max_records` has been reached.
+    fn feed(&mut self, chunk: &[u8], max_records: Option<usize>) -> bool {
+        if self.capped {
+            return false;
+        }
+        self.tail.extend_from_slice(chunk);
+        let mut consumed = 0;
+        while let Some(len) = self.tail[consumed..].iter().position(|b| *b == 0) {
+            let token_end = consumed + len;
+            let keep_going = self.push_token(consumed, token_end, max_records);
+            consumed = token_end + 1;
+            if !keep_going {
+                self.capped = true;
+                break;
+            }
+        }
+        self.tail.drain(..consumed);
+        !self.capped
+    }
+
+    fn push_token(&mut self, start: usize, end: usize, max_records: Option<usize>) -> bool {
+        let token = String::from_utf8_lossy(&self.tail[start..end]);
+        if self.paths_left == 0 {
+            let status = token.trim();
+            if status.is_empty() {
+                return true;
+            }
+            if max_records.is_some_and(|cap| self.records >= cap) {
+                return false;
+            }
+            self.records += 1;
+            self.paths_left = if status.starts_with(['R', 'C']) { 2 } else { 1 };
+            return true;
+        }
+        if !token.is_empty() {
+            self.paths.push(token.into_owned());
+        }
+        self.paths_left -= 1;
+        true
+    }
+}
+
+/// Stream `git rev-list -n <inspect> <rev_args> | git diff-tree --stdin`.
+///
+/// Both processes are killed the moment the record cap or the deadline is
+/// reached. A segfault-shaped exit (git 2.51.0) is retried with the same
+/// cadence as [`guard_run_git_with_retry`]; any other failure of either
+/// process is an error (fail closed).
+fn stream_push_commit_paths(
+    repo_root: &Path,
+    rev_args: &[String],
+    inspect: usize,
+    max_records: Option<usize>,
+    deadline: Option<Instant>,
+) -> GuardResult<StreamOutcome> {
+    for attempt in 0..=SEGFAULT_BACKOFFS_MS.len() {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Ok(StreamOutcome {
+                paths: Vec::new(),
+                records: 0,
+                stop: ScanStop::TimedOut,
+            });
+        }
+        let mut rev_list = Command::new("git")
+            .current_dir(repo_root)
+            .args(["rev-list", "-n", &inspect.to_string()])
+            .args(rev_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let rev_list_stdout = rev_list.stdout.take().expect("piped stdout");
+        // `--cc` (not `-m`): on a merge commit `-m` explodes the diff into one
+        // section PER PARENT, flagging every file merely carried in from origin
+        // as a "pushed change" (false positive, issue #238). `--cc` reports
+        // only the files the merge itself changed relative to ALL parents. On
+        // a regular (single-parent) commit `--cc` and `-m` produce identical
+        // --name-status output (no FN). `--stdin` takes the commit list from
+        // rev-list and, with `--no-commit-id -z`, emits one NUL-delimited
+        // stream identical to the concatenation of the per-commit outputs.
+        let diff_tree = Command::new("git")
+            .current_dir(repo_root)
+            .args([
+                "diff-tree",
+                "--root",
+                "-r",
+                "--no-commit-id",
+                "--name-status",
+                "-M",
+                "--no-ext-diff",
+                "--diff-filter=ACMRDTU",
+                "-z",
+                "--cc",
+                "--stdin",
+            ])
+            .stdin(Stdio::from(rev_list_stdout))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        let mut diff_tree = match diff_tree {
+            Ok(child) => child,
+            Err(err) => {
+                let _ = rev_list.kill();
+                let _ = rev_list.wait();
+                return Err(err.into());
+            }
+        };
+
+        let run = drive_pipeline(&mut rev_list, &mut diff_tree, max_records, deadline);
+        let rev_list_status = rev_list.wait()?;
+        let diff_tree_status = diff_tree.wait()?;
+
+        let PipelineRun {
+            parser,
+            rev_list_stderr,
+            diff_tree_stderr,
+            timed_out,
+        } = run;
+
+        if parser.capped {
+            return Ok(StreamOutcome {
+                paths: parser.paths,
+                records: parser.records,
+                stop: ScanStop::Capped,
+            });
+        }
+        if rev_list_status.success() && diff_tree_status.success() {
+            return Ok(StreamOutcome {
+                paths: parser.paths,
+                records: parser.records,
+                stop: ScanStop::Complete,
+            });
+        }
+        if timed_out {
+            return Ok(StreamOutcome {
+                paths: parser.paths,
+                records: parser.records,
+                stop: ScanStop::TimedOut,
+            });
+        }
+        if let Some(base) = SEGFAULT_BACKOFFS_MS.get(attempt)
+            && (is_segfault_status(rev_list_status) || is_segfault_status(diff_tree_status))
+        {
+            tracing::warn!(
+                target: "mcp_agent_mail::guard::segfault_retry",
+                attempt = attempt,
+                "guard_git_segfault_retry"
+            );
+            std::thread::sleep(segfault_retry_delay(*base));
+            continue;
+        }
+        if !rev_list_status.success() {
+            return Err(GuardError::Io(std::io::Error::other(format!(
+                "git rev-list failed (exit {}): {}",
+                rev_list_status.code().unwrap_or(-1),
+                rev_list_stderr.trim(),
+            ))));
+        }
+        return Err(GuardError::Io(std::io::Error::other(format!(
+            "git diff-tree failed (exit {}): {}",
+            diff_tree_status.code().unwrap_or(-1),
+            diff_tree_stderr.trim(),
+        ))));
+    }
+    unreachable!("the retry loop returns on its final attempt")
+}
+
+struct PipelineRun {
+    parser: NameStatusStream,
+    rev_list_stderr: String,
+    diff_tree_stderr: String,
+    timed_out: bool,
+}
+
+/// Read the pipeline's output until EOF, the record cap, or the deadline.
+///
+/// stdout is parsed on a helper thread so the deadline can be enforced from
+/// this one; both stderr pipes are drained on their own threads so neither git
+/// can block on a full pipe. Reaching the cap or the deadline kills both
+/// processes, which is what turns the helper thread's blocking read into EOF.
+fn drive_pipeline(
+    rev_list: &mut Child,
+    diff_tree: &mut Child,
+    max_records: Option<usize>,
+    deadline: Option<Instant>,
+) -> PipelineRun {
+    let mut stdout = diff_tree.stdout.take().expect("piped stdout");
+    let rev_list_stderr = rev_list.stderr.take().expect("piped stderr");
+    let diff_tree_stderr = diff_tree.stderr.take().expect("piped stderr");
+    let mut timed_out = false;
+
+    let (parser, rev_list_stderr, diff_tree_stderr) = std::thread::scope(|scope| {
+        let rev_err = scope.spawn(move || read_to_string_lossy(rev_list_stderr));
+        let diff_err = scope.spawn(move || read_to_string_lossy(diff_tree_stderr));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = scope.spawn(move || {
+            let mut parser = NameStatusStream::default();
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if !parser.feed(&buf[..n], max_records) {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = done_tx.send(());
+            parser
+        });
+
+        loop {
+            match done_rx.recv_timeout(Duration::from_millis(5)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                timed_out = true;
+                break;
+            }
+        }
+        // Reached on cap, deadline, or after EOF (where both have already
+        // exited and the kills are no-ops).
+        let _ = diff_tree.kill();
+        let _ = rev_list.kill();
+
+        let parser = reader.join().expect("diff-tree reader thread");
+        (
+            parser,
+            rev_err.join().expect("rev-list stderr thread"),
+            diff_err.join().expect("diff-tree stderr thread"),
+        )
+    });
+
+    PipelineRun {
+        parser,
+        rev_list_stderr,
+        diff_tree_stderr,
+        timed_out,
+    }
+}
+
+fn read_to_string_lossy(mut reader: impl Read) -> String {
+    let mut bytes = Vec::new();
+    let _ = reader.read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Run one git command to completion, or kill it at `deadline`.
+///
+/// Returns `None` when the deadline passed first. Only for commands with small
+/// output (the pipes are drained on helper threads, so a chatty command still
+/// cannot deadlock, but its output is buffered in full).
+fn run_git_until(
+    mut cmd: Command,
+    deadline: Option<Instant>,
+) -> std::io::Result<Option<std::process::Output>> {
+    for attempt in 0..=SEGFAULT_BACKOFFS_MS.len() {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Ok(None);
+        }
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let (status, stdout, stderr) = std::thread::scope(|scope| {
+            let out = scope.spawn(move || read_to_end_lossy_bytes(stdout));
+            let err = scope.spawn(move || read_to_end_lossy_bytes(stderr));
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Some(status),
+                    Ok(None) => {}
+                    Err(err) => {
+                        // Never leave the child (and the reader threads the
+                        // scope must join) behind on a wait error.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(err);
+                    }
+                }
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            Ok::<_, std::io::Error>((
+                status,
+                out.join().expect("stdout thread"),
+                err.join().expect("stderr thread"),
+            ))
+        })?;
+        let Some(status) = status else {
+            return Ok(None);
+        };
+        if let Some(base) = SEGFAULT_BACKOFFS_MS.get(attempt)
+            && is_segfault_status(status)
+        {
+            tracing::warn!(
+                target: "mcp_agent_mail::guard::segfault_retry",
+                attempt = attempt,
+                "guard_git_segfault_retry"
+            );
+            std::thread::sleep(segfault_retry_delay(*base));
+            continue;
+        }
+        return Ok(Some(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }));
+    }
+    unreachable!("the retry loop returns on its final attempt")
+}
+
+fn read_to_end_lossy_bytes(mut reader: impl Read) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let _ = reader.read_to_end(&mut bytes);
+    bytes
 }
 
 /// Parse NUL-delimited `git diff --name-status -z` output.
@@ -3856,6 +4617,443 @@ mod tests {
         assert!(
             paths.contains(&"detached.txt".to_string()),
             "expected detached.txt in push paths, got {paths:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounded push scan: parsing, batching, caps, deadline
+    // -----------------------------------------------------------------------
+
+    fn init_repo(td: &Path) -> PathBuf {
+        let repo_dir = td.join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        run_git(&repo_dir, &["config", "user.email", "test@test.com"]);
+        run_git(&repo_dir, &["config", "user.name", "test"]);
+        run_git(&repo_dir, &["config", "commit.gpgsign", "false"]);
+        repo_dir
+    }
+
+    /// Build `commits` linear commits on top of HEAD, each adding
+    /// `files_per_commit` fresh files, through one `git fast-import` (a
+    /// per-commit `git commit` would make the large-push tests slower than
+    /// the scan they measure). Returns the new tip.
+    fn fast_import_linear(repo_dir: &Path, commits: usize, files_per_commit: usize) -> String {
+        use std::fmt::Write as _;
+        let mut stream = String::new();
+        let mut n = 0usize;
+        for c in 0..commits {
+            stream.push_str("commit refs/heads/main\n");
+            let _ = writeln!(stream, "committer t <t@t.com> {} +0000", 1_700_000_000 + c);
+            let msg = format!("commit {c}");
+            let _ = writeln!(stream, "data {}\n{msg}", msg.len());
+            if c == 0 {
+                stream.push_str("from refs/heads/main^0\n");
+            }
+            for _ in 0..files_per_commit {
+                n += 1;
+                let body = format!("// file {n}\n");
+                let _ = writeln!(
+                    stream,
+                    "M 100644 inline src/d{:03}/f{n:06}.rs\ndata {}\n{body}",
+                    n % 97,
+                    body.len()
+                );
+            }
+            stream.push('\n');
+        }
+        let mut child = Command::new("git")
+            .current_dir(repo_dir)
+            .args(["fast-import", "--quiet"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn fast-import");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(stream.as_bytes())
+            .expect("write fast-import stream");
+        let out = child.wait_with_output().expect("fast-import");
+        assert!(
+            out.status.success(),
+            "fast-import failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        run_git_stdout(repo_dir, &["rev-parse", "HEAD"])
+    }
+
+    /// Reference implementation: the per-commit loop the batched pipeline replaced.
+    fn per_commit_reference(repo_dir: &Path, rev_args: &[&str]) -> Vec<String> {
+        let mut rev_list = Command::new("git");
+        rev_list
+            .current_dir(repo_dir)
+            .arg("rev-list")
+            .args(rev_args);
+        let listed = rev_list.output().expect("rev-list");
+        assert!(listed.status.success());
+        let mut paths = std::collections::BTreeSet::new();
+        for sha in String::from_utf8_lossy(&listed.stdout).lines() {
+            let out = Command::new("git")
+                .current_dir(repo_dir)
+                .args([
+                    "diff-tree",
+                    "--root",
+                    "-r",
+                    "--no-commit-id",
+                    "--name-status",
+                    "-M",
+                    "--no-ext-diff",
+                    "--diff-filter=ACMRDTU",
+                    "-z",
+                    "--cc",
+                    sha,
+                ])
+                .output()
+                .expect("diff-tree");
+            assert!(out.status.success());
+            paths.extend(parse_name_status_z(&out.stdout).expect("parse"));
+        }
+        paths.into_iter().collect()
+    }
+
+    #[test]
+    fn parse_push_bound_follows_the_hook_rules() {
+        assert_eq!(
+            parse_push_bound(None, 7),
+            Some(7),
+            "unset keeps the default"
+        );
+        assert_eq!(
+            parse_push_bound(Some("  "), 7),
+            Some(7),
+            "blank keeps the default"
+        );
+        assert_eq!(parse_push_bound(Some(" 42 "), 7), Some(42));
+        assert_eq!(parse_push_bound(Some("0"), 7), None, "0 removes the bound");
+        assert_eq!(
+            parse_push_bound(Some("-3"), 7),
+            None,
+            "negative removes the bound"
+        );
+        assert_eq!(
+            parse_push_bound(Some("lots"), 7),
+            Some(7),
+            "a typo must not unbound the scan"
+        );
+        assert_eq!(parse_push_bound(Some("1.5"), 7), Some(7));
+    }
+
+    #[test]
+    fn push_scan_limits_default_is_bounded_and_unbounded_is_not() {
+        let limits = PushScanLimits::default();
+        assert_eq!(
+            limits.max_commits,
+            Some(PushScanLimits::DEFAULT_MAX_COMMITS)
+        );
+        assert_eq!(limits.max_paths, Some(PushScanLimits::DEFAULT_MAX_PATHS));
+        assert_eq!(limits.timeout, Some(PushScanLimits::DEFAULT_TIMEOUT));
+        assert_eq!(
+            PushScanLimits::UNBOUNDED,
+            PushScanLimits {
+                max_commits: None,
+                max_paths: None,
+                timeout: None
+            }
+        );
+    }
+
+    #[test]
+    fn name_status_stream_matches_batch_parser_at_every_chunk_boundary() {
+        // A, M, a rename (two paths), a merge-combined status, a copy, and a
+        // trailing record with no terminator.
+        let raw =
+            b"A\0src/a.rs\0M\0src/b.rs\0R100\0old.rs\0new.rs\0MA\0m.txt\0C75\0x\0y\0D\0gone.rs";
+        let expected = parse_name_status_z(raw).expect("batch parse");
+        assert_eq!(expected.len(), 8, "sanity: {expected:?}");
+
+        for chunk in 1..=raw.len() {
+            let mut stream = NameStatusStream::default();
+            for piece in raw.chunks(chunk) {
+                assert!(stream.feed(piece, None));
+            }
+            // git always NUL-terminates, so the stream leaves an unterminated
+            // trailing token pending; the batch parser accepts it as a path.
+            assert!(!stream.capped);
+            assert_eq!(
+                stream.paths,
+                expected[..expected.len() - 1],
+                "chunk size {chunk}"
+            );
+            assert_eq!(stream.records, 6, "chunk size {chunk}");
+        }
+    }
+
+    #[test]
+    fn name_status_stream_stops_at_the_record_cap() {
+        let raw = b"A\0one\0R100\0two-old\0two-new\0M\0three\0M\0four\0";
+        let mut stream = NameStatusStream::default();
+        // Cap of 2 records: the rename counts once but yields both of its paths.
+        let keep_going = stream.feed(&raw[..], Some(2));
+        assert!(!keep_going);
+        assert!(stream.capped);
+        assert_eq!(stream.records, 2);
+        assert_eq!(stream.paths, vec!["one", "two-old", "two-new"]);
+        // Once capped, further input is ignored.
+        assert!(!stream.feed(b"M\0five\0", Some(2)));
+        assert_eq!(stream.paths.len(), 3);
+    }
+
+    #[test]
+    fn name_status_stream_ignores_empty_status_tokens() {
+        let mut stream = NameStatusStream::default();
+        assert!(stream.feed(b"\0\0A\0keep\0\0", None));
+        assert_eq!(stream.paths, vec!["keep"]);
+        assert_eq!(stream.records, 1);
+    }
+
+    /// The batched `diff-tree --stdin` pipeline must produce exactly the set
+    /// the per-commit loop produced: renames (both names), a path touched and
+    /// then reverted inside the range, a merge that carries a file (not
+    /// flagged, issue #238) and a merge-side edit (flagged), and a root commit.
+    #[test]
+    fn scan_push_paths_batched_matches_per_commit_loop() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = init_repo(td.path());
+        std::fs::write(repo_dir.join("a.txt"), "a\n").expect("write");
+        std::fs::write(repo_dir.join("b.txt"), "b\n").expect("write");
+        run_git(&repo_dir, &["add", "."]);
+        run_git(&repo_dir, &["commit", "-qm", "root"]);
+        let base = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+        run_git(&repo_dir, &["switch", "-qc", "feature"]);
+        std::fs::write(repo_dir.join("carried.txt"), "carried\n").expect("write");
+        run_git(&repo_dir, &["add", "carried.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "carried"]);
+        run_git(&repo_dir, &["mv", "a.txt", "renamed.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "rename"]);
+        run_git(&repo_dir, &["switch", "-q", "main"]);
+        std::fs::write(repo_dir.join("b.txt"), "touched\n").expect("write");
+        run_git(&repo_dir, &["commit", "-qam", "touch"]);
+        std::fs::write(repo_dir.join("b.txt"), "b\n").expect("write");
+        run_git(&repo_dir, &["commit", "-qam", "revert"]);
+        std::fs::write(repo_dir.join("m.txt"), "main\n").expect("write");
+        run_git(&repo_dir, &["add", "m.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "main side"]);
+        run_git(
+            &repo_dir,
+            &["merge", "-q", "--no-ff", "feature", "-m", "merge"],
+        );
+        std::fs::write(repo_dir.join("m.txt"), "edited in merge\n").expect("write");
+        run_git(&repo_dir, &["add", "m.txt"]);
+        run_git(&repo_dir, &["commit", "-q", "--amend", "--no-edit"]);
+        let tip = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+        let range = format!("{base}..{tip}");
+        let expected = per_commit_reference(&repo_dir, &[&range]);
+        assert!(
+            expected.contains(&"b.txt".to_string()),
+            "reverted path: {expected:?}"
+        );
+        assert!(
+            expected.contains(&"a.txt".to_string()),
+            "rename old name: {expected:?}"
+        );
+        assert!(expected.contains(&"renamed.txt".to_string()));
+        assert!(expected.contains(&"m.txt".to_string()), "merge-side edit");
+
+        let stdin_lines = format!("refs/heads/main {tip} refs/heads/main {base}\n");
+        let scan =
+            scan_push_paths(&repo_dir, &stdin_lines, &PushScanLimits::UNBOUNDED).expect("scan");
+        assert!(scan.is_complete(), "{:?}", scan.unchecked);
+        assert_eq!(scan.paths, expected);
+
+        let bounded =
+            scan_push_paths(&repo_dir, &stdin_lines, &PushScanLimits::default()).expect("scan");
+        assert_eq!(bounded, scan, "defaults must not bite a six-commit push");
+
+        // New-branch push: the whole history, root commit included.
+        let new_branch = format!(
+            "refs/heads/main {tip} refs/heads/main 0000000000000000000000000000000000000000\n"
+        );
+        let scan =
+            scan_push_paths(&repo_dir, &new_branch, &PushScanLimits::UNBOUNDED).expect("scan");
+        let expected = per_commit_reference(&repo_dir, &[&tip, "--not", "--remotes"]);
+        assert!(expected.contains(&"b.txt".to_string()));
+        assert_eq!(scan.paths, expected);
+    }
+
+    #[test]
+    fn scan_push_paths_commit_cap_keeps_newest_commits_and_reports_the_rest() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = init_repo(td.path());
+        std::fs::write(repo_dir.join("base.txt"), "base\n").expect("write");
+        run_git(&repo_dir, &["add", "base.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "base"]);
+        let base = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+        let tip = fast_import_linear(&repo_dir, 5, 1);
+        let stdin_lines = format!("refs/heads/main {tip} refs/heads/main {base}\n");
+
+        let limits = PushScanLimits {
+            max_commits: Some(2),
+            ..PushScanLimits::UNBOUNDED
+        };
+        let scan = scan_push_paths(&repo_dir, &stdin_lines, &limits).expect("scan");
+        assert_eq!(
+            scan.paths,
+            vec!["src/d004/f000004.rs", "src/d005/f000005.rs"],
+            "the newest two commits are the ones inspected"
+        );
+        assert_eq!(scan.unchecked.len(), 1, "{:?}", scan.unchecked);
+        assert!(
+            scan.unchecked[0].contains("more than 2 commits")
+                && scan.unchecked[0].contains(PUSH_MAX_COMMITS_ENV),
+            "{:?}",
+            scan.unchecked
+        );
+
+        // Exactly at the cap is not truncated.
+        let limits = PushScanLimits {
+            max_commits: Some(5),
+            ..PushScanLimits::UNBOUNDED
+        };
+        let scan = scan_push_paths(&repo_dir, &stdin_lines, &limits).expect("scan");
+        assert!(scan.is_complete(), "{:?}", scan.unchecked);
+        assert_eq!(scan.paths.len(), 5);
+    }
+
+    #[test]
+    fn scan_push_paths_path_cap_stops_reading_and_reports_truncation() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = init_repo(td.path());
+        std::fs::write(repo_dir.join("base.txt"), "base\n").expect("write");
+        run_git(&repo_dir, &["add", "base.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "base"]);
+        let base = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+        let tip = fast_import_linear(&repo_dir, 3, 40);
+        let stdin_lines = format!("refs/heads/main {tip} refs/heads/main {base}\n");
+
+        let limits = PushScanLimits {
+            max_paths: Some(25),
+            ..PushScanLimits::UNBOUNDED
+        };
+        let scan = scan_push_paths(&repo_dir, &stdin_lines, &limits).expect("scan");
+        assert_eq!(scan.paths.len(), 25);
+        assert_eq!(scan.unchecked.len(), 1, "{:?}", scan.unchecked);
+        assert!(
+            scan.unchecked[0].contains("25 path records")
+                && scan.unchecked[0].contains(PUSH_MAX_PATHS_ENV),
+            "{:?}",
+            scan.unchecked
+        );
+
+        let limits = PushScanLimits {
+            max_paths: Some(120),
+            ..PushScanLimits::UNBOUNDED
+        };
+        let scan = scan_push_paths(&repo_dir, &stdin_lines, &limits).expect("scan");
+        assert!(
+            scan.is_complete(),
+            "exactly at the cap is complete: {:?}",
+            scan.unchecked
+        );
+        assert_eq!(scan.paths.len(), 120);
+    }
+
+    #[test]
+    fn scan_push_paths_exhausted_budget_is_reported_not_swallowed() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = init_repo(td.path());
+        std::fs::write(repo_dir.join("base.txt"), "base\n").expect("write");
+        run_git(&repo_dir, &["add", "base.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "base"]);
+        let base = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+        let tip = fast_import_linear(&repo_dir, 2, 2);
+        let stdin_lines = format!("refs/heads/main {tip} refs/heads/main {base}\n");
+
+        let limits = PushScanLimits {
+            timeout: Some(Duration::ZERO),
+            ..PushScanLimits::UNBOUNDED
+        };
+        let started = Instant::now();
+        let scan = scan_push_paths(&repo_dir, &stdin_lines, &limits).expect("scan");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(scan.paths, Vec::<String>::new());
+        assert_eq!(scan.unchecked.len(), 1, "{:?}", scan.unchecked);
+        assert!(
+            scan.unchecked[0].contains("time budget")
+                && scan.unchecked[0].contains(PUSH_TIMEOUT_ENV),
+            "{:?}",
+            scan.unchecked
+        );
+    }
+
+    #[test]
+    fn scan_push_paths_fails_closed_on_a_bad_range() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = init_repo(td.path());
+        std::fs::write(repo_dir.join("base.txt"), "base\n").expect("write");
+        run_git(&repo_dir, &["add", "base.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "base"]);
+        let tip = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+        let bogus = "1111111111111111111111111111111111111111";
+        let stdin_lines = format!("refs/heads/main {tip} refs/heads/main {bogus}\n");
+        let err = scan_push_paths(&repo_dir, &stdin_lines, &PushScanLimits::default())
+            .expect_err("unknown remote sha must not scan as empty");
+        assert!(
+            err.to_string().contains("rev-list failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// With the record cap in place the work per push is fixed, so doubling
+    /// (and quadrupling) the number of pushed paths must not grow the scan
+    /// time with it. The ratio bound is loose on purpose: it catches a return
+    /// to per-commit or per-path scaling, not scheduler noise.
+    #[test]
+    fn scan_push_paths_time_stays_bounded_as_the_push_doubles() {
+        let cap = 400usize;
+        let mut timings = Vec::new();
+        for commits in [100usize, 200, 400] {
+            let td = tempfile::TempDir::new().expect("tempdir");
+            let repo_dir = init_repo(td.path());
+            std::fs::write(repo_dir.join("base.txt"), "base\n").expect("write");
+            run_git(&repo_dir, &["add", "base.txt"]);
+            run_git(&repo_dir, &["commit", "-qm", "base"]);
+            let base = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+            let tip = fast_import_linear(&repo_dir, commits, 10);
+            let stdin_lines = format!("refs/heads/main {tip} refs/heads/main {base}\n");
+
+            let limits = PushScanLimits {
+                max_paths: Some(cap),
+                ..PushScanLimits::UNBOUNDED
+            };
+            let started = Instant::now();
+            let scan = scan_push_paths(&repo_dir, &stdin_lines, &limits).expect("scan");
+            let elapsed = started.elapsed();
+            assert_eq!(
+                scan.paths.len(),
+                cap,
+                "{commits} commits: {:?}",
+                scan.unchecked
+            );
+            assert!(!scan.is_complete());
+            timings.push((commits, elapsed));
+
+            // Unbounded, the batched scan still reads every path in one pipeline.
+            let full =
+                scan_push_paths(&repo_dir, &stdin_lines, &PushScanLimits::UNBOUNDED).expect("scan");
+            assert!(full.is_complete());
+            assert_eq!(full.paths.len(), commits * 10);
+        }
+        let (_, smallest) = timings[0];
+        let (_, largest) = timings[timings.len() - 1];
+        let allowed = (smallest * 3).max(Duration::from_secs(2));
+        assert!(
+            largest <= allowed,
+            "capped scan time grew with the push: {timings:?}"
         );
     }
 
@@ -5573,5 +6771,310 @@ refs/heads/topic dddddddddddddddddddddddddddddddddddddddd\n";
                 && stderr.contains("60-later exited with status 9"),
             "chain should report every failed plugin while returning the first status: stderr={stderr}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Installed pre-push hook: bounded scan end to end
+    // -----------------------------------------------------------------------
+
+    fn write_foreign_reservation(repo_dir: &Path, pattern: &str) {
+        write_reservation(repo_dir, pattern, "OtherAgent");
+    }
+
+    fn write_reservation(repo_dir: &Path, pattern: &str, holder: &str) {
+        let reservations_dir = repo_dir.join("file_reservations");
+        std::fs::create_dir_all(&reservations_dir).expect("mkdir reservations");
+        let name = format!(
+            "{}.json",
+            pattern.replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+        );
+        std::fs::write(
+            reservations_dir.join(name),
+            serde_json::json!({
+                "path_pattern": pattern,
+                "agent_name": holder,
+                "exclusive": true,
+                "expires_ts": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                "released_ts": serde_json::Value::Null,
+            })
+            .to_string(),
+        )
+        .expect("write reservation");
+    }
+
+    fn run_pre_push_hook(
+        python: &str,
+        repo_dir: &Path,
+        stdin_line: &str,
+        envs: &[(&str, &str)],
+    ) -> std::process::Output {
+        let script_path = repo_dir.join("guard_pre_push_bounded.py");
+        std::fs::write(
+            &script_path,
+            render_guard_plugin_script(&repo_dir.to_string_lossy(), "pre-push"),
+        )
+        .expect("write guard script");
+        let mut cmd = Command::new(python);
+        cmd.current_dir(repo_dir)
+            .env("AGENT_NAME", "PinkStone")
+            .env_remove("AGENT_MAIL_GUARD_MODE")
+            .env_remove("AGENT_MAIL_GUARD_PUSH_MAX_COMMITS")
+            .env_remove("AGENT_MAIL_GUARD_PUSH_MAX_PATHS")
+            .env_remove("AGENT_MAIL_GUARD_PUSH_TIMEOUT_SECS")
+            .arg(&script_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        let mut child = cmd.spawn().expect("spawn guard script");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(stdin_line.as_bytes())
+            .expect("write stdin");
+        child.wait_with_output().expect("wait output")
+    }
+
+    /// A linear push of `commits` commits on top of a base commit; returns the
+    /// pre-push stdin line for it.
+    fn linear_push(repo_dir: &Path, commits: usize, files_per_commit: usize) -> String {
+        std::fs::write(repo_dir.join("base.txt"), "base\n").expect("write");
+        run_git(repo_dir, &["add", "base.txt"]);
+        run_git(repo_dir, &["commit", "-qm", "base"]);
+        let base = run_git_stdout(repo_dir, &["rev-parse", "HEAD"]);
+        let tip = fast_import_linear(repo_dir, commits, files_per_commit);
+        format!("refs/heads/main {tip} refs/heads/main {base}\n")
+    }
+
+    #[test]
+    fn rendered_pre_push_hook_is_batched_and_bounded() {
+        let script = render_guard_plugin_script("/abs/project", "pre-push");
+        assert!(
+            script.contains("\"-z\", \"--cc\", \"--stdin\"]"),
+            "diff-tree must take its commit list on stdin"
+        );
+        assert!(
+            !script.contains("for sha in commits:"),
+            "no per-commit git process loop"
+        );
+        assert!(script.contains("def compile_reservations(reservations, self_agent):"));
+        assert!(script.contains("def push_scan_bound(name, default):"));
+        for (name, default) in [
+            (PUSH_MAX_COMMITS_ENV, PushScanLimits::DEFAULT_MAX_COMMITS),
+            (PUSH_MAX_PATHS_ENV, PushScanLimits::DEFAULT_MAX_PATHS),
+            (PUSH_TIMEOUT_ENV, PushScanLimits::DEFAULT_TIMEOUT_SECS),
+        ] {
+            assert!(script.contains(&format!("\"{name}\"")), "{name} missing");
+            assert!(
+                script.contains(&format!("_DEFAULT = {default}\n")),
+                "default {default} for {name} must match the Rust scan"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_plugin_pre_push_truncated_scan_fails_closed_and_names_the_bound() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = init_repo(td.path());
+        let stdin_line = linear_push(&repo_dir, 6, 1);
+        let capped = [("AGENT_MAIL_GUARD_PUSH_MAX_COMMITS", "2")];
+
+        // Only the pushing agent's own lease exists: nothing the skipped
+        // commits could collide with, so truncation is not a failure.
+        write_reservation(&repo_dir, "src/**", "PinkStone");
+        let output = run_pre_push_hook(&python, &repo_dir, &stdin_line, &capped);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        assert!(stderr.trim().is_empty(), "{stderr}");
+
+        // A foreign reservation that nothing in the push touches: the only
+        // thing standing between the push and exit 0 is the truncation.
+        write_foreign_reservation(&repo_dir, "docs/**/*.md");
+        let output = run_pre_push_hook(&python, &repo_dir, &stdin_line, &capped);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "a truncated scan with nothing conflicting must fail closed: {stderr}"
+        );
+        assert!(
+            stderr.contains("scan was truncated")
+                && stderr.contains("more than 2 commits")
+                && stderr.contains("AGENT_MAIL_GUARD_PUSH_MAX_COMMITS")
+                && stderr.contains("AGENT_MAIL_GUARD_MODE=warn"),
+            "operator must be told what was skipped and how to raise the bound: {stderr}"
+        );
+
+        // Warn mode turns the same outcome into a warning, as for every other
+        // fail-closed path (GH#224).
+        let output = run_pre_push_hook(
+            &python,
+            &repo_dir,
+            &stdin_line,
+            &[
+                ("AGENT_MAIL_GUARD_PUSH_MAX_COMMITS", "2"),
+                ("AGENT_MAIL_GUARD_MODE", "warn"),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        assert!(
+            stderr.contains("WARNING") && stderr.contains("scan was truncated"),
+            "{stderr}"
+        );
+
+        // Raising the bound past the push size makes the scan complete again.
+        let output = run_pre_push_hook(
+            &python,
+            &repo_dir,
+            &stdin_line,
+            &[("AGENT_MAIL_GUARD_PUSH_MAX_COMMITS", "6")],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        assert!(stderr.trim().is_empty(), "{stderr}");
+
+        // A conflict inside the inspected (newest) commits still blocks with the
+        // usual conflict message, and the truncation is mentioned alongside it.
+        write_foreign_reservation(&repo_dir, "src/d006/f000006.rs");
+        let output = run_pre_push_hook(&python, &repo_dir, &stdin_line, &capped);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("src/d006/f000006.rs conflicts with reservation")
+                && stderr.contains("scan was also truncated"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn guard_plugin_pre_push_path_cap_bounds_the_records_read() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = init_repo(td.path());
+        let stdin_line = linear_push(&repo_dir, 1, 60);
+        write_foreign_reservation(&repo_dir, "docs/**/*.md");
+
+        let output = run_pre_push_hook(
+            &python,
+            &repo_dir,
+            &stdin_line,
+            &[("AGENT_MAIL_GUARD_PUSH_MAX_PATHS", "10")],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(
+            stderr.contains("stopped after 10 path records")
+                && stderr.contains("AGENT_MAIL_GUARD_PUSH_MAX_PATHS"),
+            "{stderr}"
+        );
+
+        // 0 removes the bound; a bad value keeps the default (and says so).
+        for (value, expect_note) in [("0", false), ("ten", true)] {
+            let output = run_pre_push_hook(
+                &python,
+                &repo_dir,
+                &stdin_line,
+                &[("AGENT_MAIL_GUARD_PUSH_MAX_PATHS", value)],
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(0), "value {value}: {stderr}");
+            assert_eq!(
+                stderr.contains("is not an integer; using 100000"),
+                expect_note,
+                "value {value}: {stderr}"
+            );
+        }
+    }
+
+    /// The wall-clock budget must actually kill a git that stalls mid-scan,
+    /// not merely be checked between commands.
+    #[cfg(unix)]
+    #[test]
+    fn guard_plugin_pre_push_budget_kills_a_stalled_git() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Some(python) = python_executable() else {
+            return;
+        };
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = init_repo(td.path());
+        let stdin_line = linear_push(&repo_dir, 3, 2);
+        write_foreign_reservation(&repo_dir, "docs/**/*.md");
+
+        // A git that sleeps far longer than the budget on diff-tree only.
+        let stub = td.path().join("slow-git");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\ncase \"$1\" in diff-tree) exec sleep 30 ;; esac\nexec git \"$@\"\n",
+        )
+        .expect("write stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let started = Instant::now();
+        let output = run_pre_push_hook(
+            &python,
+            &repo_dir,
+            &stdin_line,
+            &[
+                ("AM_GIT_BINARY", &stub.to_string_lossy()),
+                ("AGENT_MAIL_GUARD_PUSH_TIMEOUT_SECS", "1"),
+            ],
+        );
+        let elapsed = started.elapsed();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(
+            stderr.contains("ran out of its 1s budget")
+                && stderr.contains("AGENT_MAIL_GUARD_PUSH_TIMEOUT_SECS"),
+            "{stderr}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "the stalled git was not killed at the deadline: {elapsed:?}"
+        );
+    }
+
+    /// A push of 2,000 commits and 50,000 paths, checked against 20 foreign
+    /// reservations. Before the batched scan and the precompiled matchers this
+    /// took minutes (one git process per commit, one regex build per
+    /// path × reservation); the bound here is a coarse regression fence, not a
+    /// benchmark.
+    #[test]
+    fn guard_plugin_pre_push_large_push_completes_quickly() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = init_repo(td.path());
+        let stdin_line = linear_push(&repo_dir, 2000, 25);
+        for i in 0..20 {
+            write_foreign_reservation(&repo_dir, &format!("docs/area{i}/**/*.md"));
+        }
+
+        let started = Instant::now();
+        let output = run_pre_push_hook(&python, &repo_dir, &stdin_line, &[]);
+        let elapsed = started.elapsed();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        assert!(stderr.trim().is_empty(), "{stderr}");
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "large push took {elapsed:?}; the scan has regressed to per-commit or per-path work"
+        );
+
+        // And a conflict buried in the oldest commit is still found.
+        write_foreign_reservation(&repo_dir, "src/d001/f000001.rs");
+        let output = run_pre_push_hook(&python, &repo_dir, &stdin_line, &[]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("src/d001/f000001.rs conflicts"), "{stderr}");
     }
 }

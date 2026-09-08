@@ -848,6 +848,18 @@ agent remain protected. When no matching mailbox archive can be found (including
 a proven slug collision), the hook emits a warning and allows the commit rather
 than turning stale/missing mailbox state into a universal commit gate.
 
+The pre-push hook lists the paths a push touches with one streamed
+`git rev-list | git diff-tree --stdin` pipeline per pushed ref, so its cost no
+longer grows with a git process per commit. The scan is bounded by
+`AGENT_MAIL_GUARD_PUSH_MAX_COMMITS` (default 2000 commits per ref, newest
+first), `AGENT_MAIL_GUARD_PUSH_MAX_PATHS` (default 100000 path records per
+ref) and `AGENT_MAIL_GUARD_PUSH_TIMEOUT_SECS` (default 120 seconds for the
+whole push); `0` removes a bound. Reaching a bound truncates the scan: the
+paths already read are still checked, and if none of them conflicts while
+another agent holds an active lease, the hook fails closed (exit 2) naming what
+was skipped and which variable to raise, the same way every other unfinished
+inspection does. `AGENT_MAIL_GUARD_MODE=warn` turns that into a warning.
+
 | Area | Reserve glob |
 |------|-------------|
 | Core types/config | `crates/mcp-agent-mail-core/src/**` |
@@ -1071,6 +1083,9 @@ All configuration via environment variables. The server reads them at startup vi
 | `DB_JOURNAL_SIZE_LIMIT_BYTES` | `268435456` | `journal_size_limit` WAL truncation cap (256 MiB) |
 | `AM_GIT_BINARY` | (resolver) | Override the `git` binary for all in-process shell-outs (mitigates the git 2.51.0 index race) |
 | `AM_GIT_FLOCK_TIMEOUT_SECS` | `60` | Bounded wait for the per-repo `am.git-serialize.lock` before a git shell-out fails `EX_TEMPFAIL` (75) |
+| `AGENT_MAIL_GUARD_PUSH_MAX_COMMITS` | `2000` | Most commits the pre-push guard inspects per pushed ref (newest first); past it the scan is truncated and fails closed. `0` removes the bound |
+| `AGENT_MAIL_GUARD_PUSH_MAX_PATHS` | `100000` | Most `--name-status` path records the pre-push guard reads per pushed ref before truncating. `0` removes the bound |
+| `AGENT_MAIL_GUARD_PUSH_TIMEOUT_SECS` | `120` | Wall-clock budget for the whole pre-push path scan; git is killed at the deadline and the scan is truncated. `0` removes the bound |
 
 For the full list of 100+ env vars, see `crates/mcp-agent-mail-core/src/config.rs`.
 The feature-flag and tuning-knob registry is inspectable at runtime with
