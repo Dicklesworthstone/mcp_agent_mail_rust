@@ -1789,8 +1789,6 @@ async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbEr
                         Ok(rows) => {
                             retire = true;
                             let progress = wal_checkpoint_progress(&rows);
-                            #[cfg(test)]
-                            eprintln!("publication probe: deferred checkpoint {progress:?}");
                             tracing::debug!(
                                 db_path = %tracked.inner.path(),
                                 checkpoint_busy = ?progress.map(|value| value.busy),
@@ -1801,8 +1799,6 @@ async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbEr
                         }
                         Err(error) => {
                             retire = true;
-                            #[cfg(test)]
-                            eprintln!("publication probe: checkpoint error {error}");
                             tracing::debug!(
                                 db_path = %tracked.inner.path(),
                                 error = %error,
@@ -22888,10 +22884,6 @@ mod tests {
             reader
                 .execute_raw("ROLLBACK;")
                 .expect("child releases external read transaction");
-            eprintln!(
-                "publication probe: WAL after reader rollback {:?}",
-                std::fs::metadata(format!("{}-wal", reader.path())).map(|metadata| metadata.len())
-            );
             return;
         }
 
@@ -22975,10 +22967,6 @@ mod tests {
         });
 
         let prompt_result = result_rx.recv_timeout(Duration::from_secs(3));
-        eprintln!(
-            "publication probe: WAL before reader release {:?}",
-            std::fs::metadata(format!("{}-wal", db_path.display())).map(|metadata| metadata.len())
-        );
         writeln!(
             reader
                 .stdin
@@ -22989,10 +22977,6 @@ mod tests {
         .expect("release external canonical reader");
         let reader_status = reader.wait().expect("wait for external reader child");
         assert!(reader_status.success(), "external reader child failed");
-        eprintln!(
-            "publication probe: WAL after reader close {:?}",
-            std::fs::metadata(format!("{}-wal", db_path.display())).map(|metadata| metadata.len())
-        );
 
         let completed_while_reader_held = prompt_result.is_ok();
         let result = match prompt_result {
@@ -23036,16 +23020,10 @@ mod tests {
             ),
             "post-commit publication must restore the connection's request lock-wait policy"
         );
-        eprintln!(
-            "publication probe: runtime projects {:?}",
-            pooled.query_sync("SELECT id, human_key FROM projects ORDER BY id", &[])
-        );
         drop(pooled);
 
-        let frames = pool
-            .wal_checkpoint_passive()
+        pool.wal_checkpoint_passive()
             .expect("structured maintenance publishes deferred committed frames");
-        eprintln!("publication probe: maintenance checkpointed {frames} frames");
         let verify = crate::CanonicalDbConn::open_file(
             db_path
                 .to_str()
