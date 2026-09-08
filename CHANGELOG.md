@@ -6,17 +6,37 @@ Versions marked **[Release]** have published [GitHub Releases](https://github.co
 
 Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_PLAN.md), and per-release sign-off packets should start from [docs/RELEASE_READINESS_TEMPLATE.md](docs/RELEASE_READINESS_TEMPLATE.md).
 
+**Scope window:** the latest evidence review covers
+[v0.3.33 → v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.33...v0.3.34),
+including publication and the adjacent container-history correction. Earlier
+entries are retained. This review uses git diffs, tag targets, GitHub release
+metadata, checked-in Beads records, and executed release receipts; dates in the
+recent timeline are GitHub publication dates in UTC.
+
+## Release Timeline
+
+Recent releases; the earlier version history continues below.
+
+| Version | Published (UTC) | Status | Delivered capability |
+|---------|-----------------|--------|----------------------|
+| [v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.34) | 2026-09-08 | **Release** | Windows UNC snapshots, bounded tmux identity probes, six-platform binaries and matching GHCR images |
+| [v0.3.33](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.33) | 2026-09-07 | **Release** | FrankenSQLite 0.3.18 and signed self-update manifest verification |
+
 ---
 
-## [v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.34) — 2026-09-08
+## [v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.34) — 2026-09-08 [Release]
 
-This patch includes the tmux identity and Windows UNC fixes that landed after
-v0.3.33. FrankenSQLite remains pinned to 0.3.18 with SQLModel 0.4.0,
-Asupersync 0.4.9, and FastMCP 0.7.1.
+Published at 02:58:05 UTC from
+[the frozen release source](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/0125f0505fa0ba604dbbbb580fad56d283e46488).
+This patch makes identity lookups return when tmux stalls and preserves network
+roots in Windows inbox snapshots. FrankenSQLite remains pinned to 0.3.18 with
+SQLModel 0.4.0, Asupersync 0.4.9, and FastMCP 0.7.1; those dependency versions
+already shipped in v0.3.33. Portable binaries include lexical search.
 
 ### Security
 
-- **Every tmux probe on the identity path is bounded (GH#310 follow-up).**
+- **Tmux identity probes have a deadline** (follow-up to
+  [PR #310](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/pull/310)).
   `X-Tmux-Socket` lets a caller steer the pane-facts queries at a socket of
   its choosing, and those queries ran `tmux` through an unbounded
   `Command::output()`. A socket held by a listener that accepts the
@@ -32,7 +52,8 @@ Asupersync 0.4.9, and FastMCP 0.7.1.
   liveness probe that times out is *unverifiable*, never *dead*, so a stalled
   server can neither enable adoption nor a cleanup purge. The ambient probes
   (the caller's own `$TMUX_PANE` composite lookup, stale-identity cleanup)
-  get the same bound.
+  get the same bound. This bounds the caller's wait; the descendant-held stdout
+  reader limitation is recorded under known issues below.
 
 ### Fixed
 
@@ -43,26 +64,80 @@ Asupersync 0.4.9, and FastMCP 0.7.1.
   variant.
 
 - **`resolve_pane_identity` without a `pane_id` ignores the caller's tmux
-  socket (GH#310 follow-up).** The `$TMUX_PANE` fallback names this
+  socket.** The `$TMUX_PANE` fallback names this
   process's own pane, on its own server; a caller-supplied
   `tmux_socket_path` (or the daemon-injected `X-Tmux-Socket`) was
   nevertheless used to resolve it, so the caller's server was asked about the
   daemon's pane id and a colliding `%N` there could verify the wrong pane.
   The socket now applies only to an explicit `pane_id`.
 
+### Distribution and upgrades
+
+- **Both binaries ship for six targets:** GNU Linux x86_64 and ARM64, static
+  musl x86_64, macOS ARM64 and Intel, and Windows x86_64 MSVC. GNU binaries
+  require glibc 2.28 or newer; Windows uses static CRT and system DLLs only.
+  Eleven flat archives, eleven checksum sidecars, a release manifest,
+  `SHA256SUMS`, and its minisign signature make 25 uploaded assets. Every draft
+  and public asset was independently downloaded and verified against the executed binary
+  hashes. GitHub's two automatic source archives are separate from that count.
+- **GHCR now publishes the same release binaries for amd64 and arm64** under
+  `v0.3.34`, `0.3.34`, `0.3`, and `latest`. Both images pass non-root HTTP
+  messaging and restart/archive checks; anonymous registry reads match the
+  tested image digests. The container recipe uses architecture-specific
+  BuildKit package-list caches outside the image layers. All builds and
+  publication used DSR/fleet tooling; GitHub Actions remained disabled.
+- **Homebrew and ACFS agree with the release.** The
+  [Homebrew update](https://github.com/Dicklesworthstone/homebrew-tap/commit/70888dea15d78e824814d5ada9f44e29c6f4dca1)
+  pins v0.3.34 and all four archive hashes. The required ACFS checksum refresh
+  passed; Agent Mail's unchanged public installer matches its existing pin.
+- **Signed upgrades preserve mailbox state.** The actual v0.3.33-to-v0.3.34
+  update and forced signed reinstall preserve existing messages, identities,
+  receipt rows, and archive bytes. A new message survives process exit and
+  reaches the archive. Fresh public Bash installs also pass on the build host
+  and a separate host. These are validation results for the existing signed
+  updater, which first shipped in v0.3.33.
+
 ### Validation and known issues
 
+- Workspace/all-target `cargo check`, Clippy with warnings denied, and
+  `cargo fmt --check` pass. The focused identity/path selection passes 123
+  tests; doctests pass 4 with 21 ignored. The GNU binaries pass the canonical
+  nine-phase mail workflow with 42 assertions. Native Windows and macOS ARM64
+  checks pass; Intel macOS runs under Rosetta and Linux ARM64 under QEMU.
 - The pre-version-bump workspace gate ran 17,384 tests: 17,372 passed,
   12 failed, and 37 were skipped. Two passing fixtures were reported as leaky.
   All 12 failures also appear in v0.3.33's recorded gate; this is not an
-  all-green workspace claim. Final compiler and executable validation is
-  recorded with the release artifacts.
+  all-green workspace claim. Failures cover integrity/lock handling, legacy
+  configuration, an external SQLite reader, archive HTTP error responses,
+  static export, and ATC learning. Final compiler, executable, and publication
+  evidence is summarized in the
+  [release record](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/0ca77962e81d52e2f51355dd496709d1a32efa7a/.beads/issues.jsonl#L2266).
 - The previously tracked FrankenSQLite bound-UPDATE persistence,
   ADD COLUMN catalog-normalization, and foreign SQLite WAL-reader boundary
   defects remain open. This release does not change the engine version.
-- Release binaries and container images are built with the DSR/fleet process;
-  GitHub Actions are disabled. The container recipe consumes the exact GNU
-  release binaries and checks both architectures before publication.
+- Post-release source review found that a descendant retaining tmux's stdout
+  pipe can leave the detached reader alive after the caller times out.
+  [br-tl2sg](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/0ca77962e81d52e2f51355dd496709d1a32efa7a/.beads/issues.jsonl#L2564)
+  remains open; the release tests do not prove reader cleanup in that case.
+- Native UNC checks exercise localhost SMB, not every network server or
+  long-path variant. The v0.3.33 comparison executable timed out on ordinary
+  UNC after local setup/readback succeeded; its extended-UNC case was not
+  reached. Homebrew syntax/formula validation passed; a fresh `brew install`
+  and the full PowerShell installer flow were not rerun.
+
+### Completed workstreams and representative commits
+
+The Windows path workstream
+[br-bzh9p](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/0ca77962e81d52e2f51355dd496709d1a32efa7a/.beads/issues.jsonl#L2117)
+and distribution workstream
+[br-itacp](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/0ca77962e81d52e2f51355dd496709d1a32efa7a/.beads/issues.jsonl#L2266)
+are closed. The tmux changes are follow-ups to PR #310, which closed before
+this release; the new reader-lifetime issue remains separate.
+
+**Representative commits:**
+[tmux deadlines and ambient socket routing](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/57bb812077082681a3b4764233ec37102bfacd6e),
+[Windows UNC round trips](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/b8e6076d21fa7753af23df360bd9d7764324b3b8),
+and [container package-cache handling](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/9a8c69b8de5feb85f5cea60a698f8bb1c6553db7).
 
 ## [v0.3.33](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.33) — 2026-09-07
 
@@ -82,12 +157,12 @@ compatible runtime stack. The portable binaries include lexical search.
   probes. Those engine defects remain open. Validation results and limitations
   accompany the release.
 
-- **The published container image is still frozen at `v0.3.13`.** The v0.3.31
-  notes said the ghcr image was unstuck; the registry disagrees. `docker.yml`
-  has never completed a successful run and has not been triggered since the
-  v0.3.29 tag (releases are cut by the maintainer's local release tooling,
-  which does not build the image). Until an image is published by the same
-  tooling, install from the release archives or build from source.
+- **Container-history correction, 2026-09-08:** this entry previously said
+  GHCR was frozen at v0.3.13. The retained pre-v0.3.34 registry inspection
+  reported v0.3.30; it does not establish when that image was published.
+  The [v0.3.34 release](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.34)
+  subsequently published and verified matching amd64/arm64 images through
+  DSR/fleet tooling. The old frozen-image warning is no longer current.
 
 ### Security
 
