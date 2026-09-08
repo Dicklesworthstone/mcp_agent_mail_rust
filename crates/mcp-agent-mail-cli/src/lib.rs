@@ -75526,8 +75526,9 @@ startup_timeout_sec = 42
     #[test]
     fn open_db_sync_with_database_url_ignores_unrelated_implicit_archive_root() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let fake_home = dir.path().join("home");
-        let fake_data_home = dir.path().join("xdg-data");
+        let private_root = std::fs::canonicalize(dir.path()).expect("canonicalize private root");
+        let fake_home = private_root.join("home");
+        let fake_data_home = private_root.join("xdg-data");
         let fake_home_text = fake_home.to_string_lossy().into_owned();
         let fake_data_home_text = fake_data_home.to_string_lossy().into_owned();
         std::fs::create_dir_all(&fake_home).expect("create fake home");
@@ -75535,6 +75536,7 @@ startup_timeout_sec = 42
         let implicit_storage_root = fake_data_home
             .join("mcp-agent-mail")
             .join("git_mailbox_repo");
+        let implicit_storage_root_text = implicit_storage_root.to_string_lossy().into_owned();
         let unrelated_message_dir = seed_archive_mailbox_project(&implicit_storage_root);
         write_archive_mailbox_message(
             &unrelated_message_dir,
@@ -75562,10 +75564,19 @@ startup_timeout_sec = 42
             &[
                 ("DATABASE_URL", db_url.as_str()),
                 ("HOME", fake_home_text.as_str()),
+                ("USERPROFILE", fake_home_text.as_str()),
                 ("XDG_DATA_HOME", fake_data_home_text.as_str()),
+                // Pin the redirected default: ambient config.env must not select
+                // the operator's explicitly configured mailbox for this fixture.
+                ("STORAGE_ROOT", implicit_storage_root_text.as_str()),
+                ("AM_ALLOW_HOME_STORAGE_ROOT", "1"),
             ],
             || {
                 let resolved_storage_root = resolve_mailbox_activity_storage_root(None);
+                assert_eq!(resolved_storage_root, implicit_storage_root);
+                assert!(mcp_agent_mail_core::config::is_default_storage_root(
+                    &resolved_storage_root
+                ));
                 assert!(
                     !should_lock_mailbox_storage_root(&db_path, &resolved_storage_root, None),
                     "external custom DB should not lock unrelated implicit storage root {}; db={}",
