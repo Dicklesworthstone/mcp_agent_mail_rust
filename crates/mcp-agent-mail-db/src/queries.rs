@@ -22888,6 +22888,10 @@ mod tests {
             reader
                 .execute_raw("ROLLBACK;")
                 .expect("child releases external read transaction");
+            eprintln!(
+                "publication probe: WAL after reader rollback {:?}",
+                std::fs::metadata(format!("{}-wal", reader.path())).map(|metadata| metadata.len())
+            );
             return;
         }
 
@@ -22971,6 +22975,10 @@ mod tests {
         });
 
         let prompt_result = result_rx.recv_timeout(Duration::from_secs(3));
+        eprintln!(
+            "publication probe: WAL before reader release {:?}",
+            std::fs::metadata(format!("{}-wal", db_path.display())).map(|metadata| metadata.len())
+        );
         writeln!(
             reader
                 .stdin
@@ -22981,6 +22989,10 @@ mod tests {
         .expect("release external canonical reader");
         let reader_status = reader.wait().expect("wait for external reader child");
         assert!(reader_status.success(), "external reader child failed");
+        eprintln!(
+            "publication probe: WAL after reader close {:?}",
+            std::fs::metadata(format!("{}-wal", db_path.display())).map(|metadata| metadata.len())
+        );
 
         let completed_while_reader_held = prompt_result.is_ok();
         let result = match prompt_result {
@@ -23030,7 +23042,8 @@ mod tests {
         );
         drop(pooled);
 
-        let frames = pool.wal_checkpoint_passive()
+        let frames = pool
+            .wal_checkpoint_passive()
             .expect("structured maintenance publishes deferred committed frames");
         eprintln!("publication probe: maintenance checkpointed {frames} frames");
         let verify = crate::CanonicalDbConn::open_file(

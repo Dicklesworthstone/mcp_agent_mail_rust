@@ -31316,10 +31316,11 @@ fn doctor_fold_probe_authority(
 /// corroborates corruption, or is inconclusive.
 ///
 /// An offline canonical database is opened through true read-only flags. A
-/// live FrankenSQLite family is first exported to a private logical image, so
-/// canonical SQLite never opens or closes the live main inode. A clean logical
-/// rebuild cannot prove the physical live b-tree healthy and is therefore
-/// inconclusive rather than `Healthy`. The battery, in increasing cost, is:
+/// live FrankenSQLite family is first staged as a private physical copy, with
+/// logical export as a fallback, so canonical SQLite never opens or closes the
+/// live main inode. A clean logical rebuild cannot prove the physical live
+/// b-tree healthy and is therefore inconclusive rather than `Healthy`.
+/// The battery, in increasing cost, is:
 /// `quick_check`, full `integrity_check`,
 /// `foreign_key_check`, a schema-table probe (core tables present and readable),
 /// and an FTS read probe when a legacy FTS table exists.
@@ -59465,16 +59466,30 @@ startup_timeout_sec = 42
         assert_eq!(rows[0].get_named::<i64>("count").expect("count"), 50);
         mcp_agent_mail_db::close_db_conn(admitted, "settle live Franken index-corruption fixture");
 
+        let logical_is_healthy = with_private_canonical_snapshot_from_live_franken(
+            &db_path,
+            "index-corruption logical export control",
+            |snapshot| {
+                sqlite_conn_check_ok_canonical(snapshot, mcp_agent_mail_db::CheckKind::Full)
+                    .map_err(|error| CliError::Other(error.to_string()))
+            },
+        )
+        .expect("check actual rebuilt logical image");
+        assert!(
+            logical_is_healthy,
+            "VACUUM rebuild should normalize the damaged secondary index in the private image"
+        );
+
         let opened = open_db_for_doctor_check_read_only_with_context(&db_url)
-            .expect("materialize guarded live logical snapshot");
+            .expect("stage guarded live physical family");
         assert_eq!(
             opened.source_kind,
-            DoctorCanonicalDiagnosticSourceKind::LiveLogicalSnapshot
+            DoctorCanonicalDiagnosticSourceKind::StagedFamilyCopy
         );
         assert!(
-            sqlite_conn_check_ok_canonical(&opened.conn, mcp_agent_mail_db::CheckKind::Full)
-                .expect("check rebuilt logical image"),
-            "VACUUM rebuild should normalize the damaged secondary index in the private image"
+            !sqlite_conn_check_ok_canonical(&opened.conn, mcp_agent_mail_db::CheckKind::Full)
+                .expect("check physical family copy"),
+            "the staged copy must preserve the damaged secondary index"
         );
         assert!(
             !doctor_read_only_physical_integrity_check(&opened, mcp_agent_mail_db::CheckKind::Full)
@@ -74095,27 +74110,22 @@ startup_timeout_sec = 42
         assert_child_observes_busy(&db_path);
 
         let cross_check = doctor_canonical_double_probe(&db_path);
-        match cross_check {
-            DoctorCanonicalCrossCheck::Inconclusive(detail) => assert!(
-                detail.contains("private logical rebuild"),
-                "a clean private rebuild must be explicitly non-authoritative for live physical bytes: {detail}"
-            ),
-            other => panic!(
-                "a clean logical snapshot must never override the live physical verdict: {other:?}"
-            ),
-        }
+        assert!(
+            matches!(cross_check, DoctorCanonicalCrossCheck::Healthy),
+            "the healthy physical copy must pass the canonical battery: {cross_check:?}"
+        );
         assert_child_observes_busy(&db_path);
 
         let database_url = format!("sqlite:///{}", db_path.display());
         let read_only = open_db_for_doctor_check_read_only_with_context(&database_url)
-            .expect("open live doctor diagnostics through a retained private snapshot");
+            .expect("open live doctor diagnostics through a retained private physical copy");
         assert!(
-            read_only._snapshot_source.is_some(),
-            "live read-only doctor diagnostics must retain their private snapshot"
+            read_only._staged_family.is_some(),
+            "live read-only doctor diagnostics must retain their private physical copy"
         );
         assert_eq!(
             read_only.source_kind,
-            DoctorCanonicalDiagnosticSourceKind::LiveLogicalSnapshot
+            DoctorCanonicalDiagnosticSourceKind::StagedFamilyCopy
         );
         let rows = read_only
             .conn
