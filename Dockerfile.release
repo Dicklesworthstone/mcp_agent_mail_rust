@@ -55,6 +55,8 @@ FROM debian:trixie-slim AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+ARG TARGETARCH
+
 # Runtime needs:
 #   * ca-certificates — outbound HTTPS (e.g. share-link uploads)
 #   * curl            — HEALTHCHECK
@@ -65,14 +67,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 #                       work correctly when running under Docker/Kubernetes
 # `adduser` is explicit because Debian trixie's slim image no longer ships it
 # (bookworm did); without it this layer fails with exit 127 after apt succeeds.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=cache,id=am-release-apt-${TARGETARCH},target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
         adduser \
         ca-certificates \
         curl \
         git \
         libsqlite3-0 \
         tini \
-    && rm -rf /var/lib/apt/lists/* \
     && adduser --system --group --home /home/appuser --uid 10001 appuser \
     && mkdir -p /data/mailbox \
     && chown -R appuser:appuser /data /home/appuser \
@@ -90,7 +92,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # which pre-built release binary lands in this architecture's layer, which is
 # what makes a single `--platform linux/amd64,linux/arm64` invocation produce a
 # correct multi-arch index instead of two copies of the host architecture.
-ARG TARGETARCH
 COPY dist/${TARGETARCH}/mcp-agent-mail /usr/local/bin/mcp-agent-mail
 COPY dist/${TARGETARCH}/am             /usr/local/bin/am
 RUN chmod 0755 /usr/local/bin/mcp-agent-mail /usr/local/bin/am
@@ -104,8 +105,7 @@ RUN /usr/local/bin/mcp-agent-mail --help > /tmp/server.help \
     && /usr/local/bin/am --help          > /tmp/cli.help \
     && grep -qE '^Usage: mcp-agent-mail ' /tmp/server.help \
     && grep -qE '(^|[[:space:]])serve([[:space:]]|$)' /tmp/server.help \
-    && grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)' /tmp/cli.help \
-    && rm -f /tmp/server.help /tmp/cli.help
+    && grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)' /tmp/cli.help
 
 # Pin the packaged release version and source revision into the image so
 # `docker inspect`, both binaries, the GitHub release tag, and the GHCR page
