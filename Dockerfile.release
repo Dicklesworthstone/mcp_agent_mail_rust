@@ -32,9 +32,9 @@
 # -----
 #   docker buildx build -f Dockerfile.release \
 #       --platform linux/amd64,linux/arm64 \
-#       --build-arg AM_VERSION=0.3.34 \
+#       --build-arg AM_VERSION=0.3.35 \
 #       --build-arg AM_REVISION=<full-tag-commit-sha> \
-#       -t ghcr.io/dicklesworthstone/mcp_agent_mail_rust:0.3.34 \
+#       -t ghcr.io/dicklesworthstone/mcp_agent_mail_rust:0.3.35 \
 #       -t ghcr.io/dicklesworthstone/mcp_agent_mail_rust:latest \
 #       --push .
 #

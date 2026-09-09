@@ -19,12 +19,22 @@ Recent releases; the earlier version history continues below.
 
 | Version | Published (UTC) | Status | Delivered capability |
 |---------|-----------------|--------|----------------------|
+| [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.35) | 2026-09-09 | **Release** | Lifecycle tools require the registration token over HTTP (PR #310 option c); bounded tmux probe readers |
 | [v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.34) | 2026-09-08 | **Release** | Windows UNC snapshots, bounded tmux identity probes, six-platform binaries and matching GHCR images |
 | [v0.3.33](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.33) | 2026-09-07 | **Release** | FrankenSQLite 0.3.18 and signed self-update manifest verification |
 
 ---
 
-## [Unreleased]
+## [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.35) — 2026-09-09 [Release]
+
+This patch closes the authorization gap left after PR #310: the agent
+lifecycle tools require the registration token when called over HTTP. It also
+carries the bounded tmux probe reader work that landed on `main` after
+v0.3.34 (8f1fec3f: stdout is drained within the child deadline without
+detached reader threads, and incomplete facts are discarded on timeout, I/O
+failure, or output over 1 MiB). FrankenSQLite remains pinned to 0.3.18 with
+SQLModel 0.4.0, Asupersync 0.4.9, and FastMCP 0.7.1. Portable binaries include
+lexical search.
 
 ### Security
 
@@ -55,6 +65,27 @@ Recent releases; the earlier version history continues below.
   probe), HTTP + valid token is allowed, stdio + bound pane is allowed, a
   body-forged `stdio` transport is overwritten by the daemon, malformed
   socket headers behave as before.
+
+### Also in this release (landed on `main` after v0.3.34)
+
+- **Tmux probe readers are bounded** (8f1fec3f, closes the v0.3.34 known
+  issue): stdout is drained within the child deadline without detached reader
+  threads; on timeout, I/O failure, or output over 1 MiB the child is reaped
+  and the facts are discarded as unverifiable.
+- **Reservations fail closed on every unverifiable acquire** (404caf6d).
+- **Doctor/database recovery hardening** (br-l1q6z series): archive rebuilds
+  are promoted over a source whose `integrity_check` raises (GH#312), a
+  corrupt primary is recovered from the Git archive with the bytes
+  quarantined, doctor integrity stages a physical family copy under exclusive
+  FrankenSQLite namespace flocks so `VACUUM` cannot hide damage, index
+  key-order complaints are classified as index-only damage, crashed recovery
+  mutations stay on one breaker lineage, and proactive backups are reused
+  only when the verified generation is unchanged.
+- **No stale contact intro after auto-accept; `NOT_FOUND` is not a storage
+  failure** (GH#313, 708ae6ba). **Pre-push guard scan is bounded and batches
+  its git work** (PR #314, 4717f869). Archive mail UI is served without
+  SQLite and cancelled DB polls are refused (07c94443). Test fixtures are
+  isolated from process env and operator databases.
 
 ## [v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.34) — 2026-09-08 [Release]
 
