@@ -5080,6 +5080,9 @@ setup_single_toml_config() {
   local desired_auth_header=""
   local tmp_file=""
   local backup=""
+  local source_identity=""
+
+  ensure_private_file_target_path "$config_path" "TOML config" || return 2
 
   if [ -n "$bearer_token" ]; then
     desired_auth_header="Bearer ${bearer_token}"
@@ -5183,6 +5186,8 @@ def write_config_atomic(path: str, text: str, mode: int) -> None:
             continue
         temp_path = candidate
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), mode)
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
@@ -5243,8 +5248,9 @@ PY
   # The awk rewrite lands on a private, O_EXCL-created temporary in the
   # destination directory; a predictable name could be pre-created as a
   # symlink so the credential-bearing rewrite flows into someone else's
-  # inode. The final mv below is a rename, which never follows a leaf.
-  if ! tmp_file=$(mktemp "${config_path}.tmp.mcp-agent-mail.XXXXXX"); then
+  # inode. Publish with the same private backup/replace helpers as config.env.
+  source_identity=$(private_file_identity "$config_path") || return 2
+  if ! tmp_file=$(umask 077; mktemp "${config_path}.tmp.mcp-agent-mail.XXXXXX"); then
     verbose "setup_toml_config:error tool=${tool} path=${config_path} reason=tmp_create_failed"
     return 2
   fi
@@ -5419,16 +5425,24 @@ PY
     return 2
   fi
 
-  if cmp -s "$config_path" "$tmp_file"; then
+  if cmp -s "$config_path" "$tmp_file" \
+    && private_file_security_identity "$config_path" >/dev/null; then
     rm -f "$tmp_file"
     verbose "setup_toml_config:unchanged tool=${tool} path=${config_path}"
     return 1
   fi
 
-  backup="${config_path}.$(date -u +%Y%m%d_%H%M%S).bak"
-  cp -p "$config_path" "$backup"
-  chmod --reference="$config_path" "$tmp_file" 2>/dev/null || true
-  mv "$tmp_file" "$config_path"
+  if [ "$(private_file_identity "$config_path")" != "$source_identity" ]; then
+    verbose "setup_toml_config:error tool=${tool} path=${config_path} reason=source_changed"
+    return 2
+  fi
+  backup_envfile_if_present "$config_path" "TOML config" || return 2
+  backup="$PRIVATE_BACKUP_PATH"
+  if [ "$(private_file_identity "$config_path")" != "$source_identity" ]; then
+    verbose "setup_toml_config:error tool=${tool} path=${config_path} reason=source_changed_after_backup"
+    return 2
+  fi
+  write_private_file_atomic "$config_path" "TOML config" < "$tmp_file" || return 2
   verbose "setup_toml_config:updated tool=${tool} path=${config_path} backup=${backup}"
   return 0
 }
@@ -5555,6 +5569,8 @@ def write_backup(path: str, raw: bytes, mode: int) -> str:
         except FileExistsError:
             continue
         with os.fdopen(fd, "wb") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), mode)
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
@@ -5584,6 +5600,8 @@ def write_config_atomic(path: str, text: str, mode: int) -> None:
             continue
         temp_path = candidate
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), mode)
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
@@ -5778,7 +5796,9 @@ if tool == "omp":
             if name == entry_key or name not in entry_names
         ]
 new_text = dump_json(doc)
-effective_mode = 0o600 if existing_mode is None else existing_mode & 0o600
+# Secret-capable configs and backups are owner-readable/writable, never
+# group/other-accessible. Intersecting old mode 0040 with 0600 yields 0000.
+effective_mode = 0o600
 permissions_need_tightening = (
     existing_mode is not None and effective_mode != existing_mode
 )
@@ -5959,6 +5979,8 @@ def write_backup(path: str, raw: bytes, mode: int) -> str:
         except FileExistsError:
             continue
         with os.fdopen(fd, "wb") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), mode)
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
@@ -5988,6 +6010,8 @@ def write_config_atomic(path: str, text: str, mode: int) -> None:
             continue
         temp_path = candidate
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), mode)
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
@@ -6107,7 +6131,11 @@ if isinstance(legacy, dict):
         doc.pop("mcpServers", None)
 
 new_text = dump_json(doc)
-if new_text == dump_json(parse_json(text)):
+effective_mode = 0o600
+permissions_need_tightening = (
+    existing_mode is not None and existing_mode != effective_mode
+)
+if new_text == dump_json(parse_json(text)) and not permissions_need_tightening:
     print("SKIP:unchanged")
     raise SystemExit(0)
 
@@ -6121,7 +6149,6 @@ if parent_dir:
 if path_has_symlink_component(config_path):
     print("ERROR:symlink_path")
     raise SystemExit(0)
-effective_mode = 0o600 if existing_mode is None else existing_mode & 0o600
 if existing_mode is not None:
     backup = write_backup(config_path, raw, effective_mode)
 else:
@@ -6304,6 +6331,8 @@ def write_config_atomic(path: str, text: str, mode: int) -> None:
             continue
         temp_path = candidate
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), mode)
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
@@ -6466,6 +6495,8 @@ def write_backup(path: str, raw: bytes, mode: int) -> str:
         except FileExistsError:
             continue
         with os.fdopen(fd, "wb") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), mode)
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
@@ -6495,6 +6526,8 @@ def write_config_atomic(path: str, text: str, mode: int) -> None:
             continue
         temp_path = candidate
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), mode)
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
@@ -6558,20 +6591,22 @@ for key in ["mcpServers", "servers", "mcp", "mcp_servers"]:
         container_key = key
         break
 
-if container_key and "mcp-agent-mail" in doc[container_key]:
+entry_already_present = bool(container_key and "mcp-agent-mail" in doc[container_key])
+if entry_already_present and existing_mode == 0o600:
     print("SKIP:already_present")
     raise SystemExit(0)
 
-# Insert entry
-try:
-    entry = json.loads(entry_json)
-except json.JSONDecodeError:
-    print("ERROR:bad_entry")
-    raise SystemExit(0)
-if container_key is None:
-    container_key = "mcpServers"
-    doc[container_key] = {}
-doc[container_key]["mcp-agent-mail"] = entry
+# Insert only when absent; a permission-only repair preserves the existing entry.
+if not entry_already_present:
+    try:
+        entry = json.loads(entry_json)
+    except json.JSONDecodeError:
+        print("ERROR:bad_entry")
+        raise SystemExit(0)
+    if container_key is None:
+        container_key = "mcpServers"
+        doc[container_key] = {}
+    doc[container_key]["mcp-agent-mail"] = entry
 
 parent_dir = os.path.dirname(config_path)
 if parent_dir:
@@ -6583,11 +6618,11 @@ if parent_dir:
 if path_has_symlink_component(config_path):
     print("ERROR:symlink_path")
     raise SystemExit(0)
-effective_mode = 0o600 if existing_mode is None else existing_mode & 0o600
+effective_mode = 0o600
 backup = write_backup(config_path, raw, effective_mode)
 write_config_atomic(config_path, json.dumps(doc, indent=2) + "\n", effective_mode)
 
-print("OK:inserted backup=" + backup)
+print(("OK:updated backup=" if entry_already_present else "OK:inserted backup=") + backup)
 PY
 ) || true
 
@@ -6596,7 +6631,7 @@ PY
         verbose "setup_mcp_config:skip_existing tool=${tool} path=${config_path}"
         return 1
         ;;
-      OK:inserted*)
+      OK:inserted*|OK:updated*)
         verbose "setup_mcp_config:inserted tool=${tool} path=${config_path} ${result}"
         return 0
         ;;

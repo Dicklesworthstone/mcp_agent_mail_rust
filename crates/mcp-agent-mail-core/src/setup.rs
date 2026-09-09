@@ -3985,21 +3985,27 @@ fn transform_config_atomic_inner(
         .map(|snapshot| snapshot.content.as_str());
     let new_content = transform(existing)?;
 
-    // Never widen an existing config's permissions. Conversely, when setup is
-    // adding a secret to a previously broad file, tighten it to the requested
-    // mode. Backups use the same effective mode so they cannot leak the
-    // pre-update contents.
-    let effective_permissions = existing_file.as_ref().map_or(permissions, |snapshot| {
-        #[cfg(unix)]
-        {
-            snapshot.permissions & permissions
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = snapshot;
-            permissions
-        }
+    let existing_may_contain_secret = existing.is_some_and(|content| {
+        content.contains("Bearer ") || content.contains("HTTP_BEARER_TOKEN")
     });
+    let output_contains_literal_secret = new_content.contains("Bearer ");
+    let secret_write =
+        contains_literal_secret || existing_may_contain_secret || output_contains_literal_secret;
+
+    // Published configs and backups must remain readable and writable by
+    // their owner. Narrow non-owner access without intersecting away owner
+    // bits (e.g. 0040 & 0600 would publish an unusable mode-0000 file).
+    // Secret-bearing input or output always caps the requested mode at 0600.
+    let requested_permissions = if secret_write { 0o600 } else { permissions };
+    #[cfg(unix)]
+    let effective_permissions = existing_file
+        .as_ref()
+        .map_or(requested_permissions, |snapshot| {
+            snapshot.permissions & requested_permissions
+        })
+        | 0o600;
+    #[cfg(not(unix))]
+    let effective_permissions = requested_permissions;
     #[cfg(unix)]
     let permissions_need_tightening = existing_file
         .as_ref()
@@ -4010,12 +4016,6 @@ fn transform_config_atomic_inner(
         .as_ref()
         .is_some_and(|snapshot| snapshot.link_count != 1);
 
-    let existing_may_contain_secret = existing.is_some_and(|content| {
-        content.contains("Bearer ") || content.contains("HTTP_BEARER_TOKEN")
-    });
-    let output_contains_literal_secret = new_content.contains("Bearer ");
-    let secret_write =
-        contains_literal_secret || existing_may_contain_secret || output_contains_literal_secret;
     if secret_write && !secret_protected {
         return with_secret_config_git_protection(path, |authority| {
             // Re-read and re-render after acquiring the repository authority.
@@ -9424,7 +9424,266 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn write_config_atomic_never_widens_existing_permissions() {
+    fn config_permission_normalization_native() {
+        for mode in [Some(0o400), Some(0o600), Some(0o644), None] {
+            assert_private_setup_mode(mode, "{}\n", write_native_permission_fixture);
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_native_permission_fixture(path: &Path) -> bool {
+        let action = ConfigAction {
+            platform: AgentPlatform::Cursor,
+            file_path: path.to_path_buf(),
+            description: "permission regression".into(),
+            content: ConfigContent::JsonFull(json!({"token": "Bearer permission-fixture"})),
+            permissions: 0o644, // Literal secrets override an otherwise public requested mode.
+            backup: true,
+        };
+        write_config_atomic(&action, true).expect("native config publication")
+            != ActionOutcome::Unchanged
+    }
+
+    #[cfg(unix)]
+    fn assert_private_setup_mode(
+        mode: Option<u32>,
+        original: &str,
+        mut write: impl FnMut(&Path) -> bool,
+    ) {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let mode_of = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let tmp = setup_real_tempdir();
+        let is_toml = original.starts_with('#');
+        let path = tmp.path().join(if is_toml {
+            "config.toml"
+        } else {
+            "config.json"
+        });
+        if let Some(mode) = mode {
+            std::fs::write(&path, original).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            if mode == 0o040 {
+                // The privileged opt-in test prepares a foreign-owned file
+                // readable through our group. Publication itself is unprivileged.
+                let group = std::fs::metadata(&path).unwrap().gid();
+                let status = std::process::Command::new("sudo")
+                    .args(["-n", "chown", "--"])
+                    .arg(format!("65534:{group}"))
+                    .arg(&path)
+                    .status()
+                    .expect("sudo for the isolated group-readable fixture");
+                assert!(status.success(), "fixture ownership must be established");
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            }
+        }
+        let backups = || {
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.ends_with(".bak") || name.contains(".bak.mcp-agent-mail.")
+                })
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>()
+        };
+        assert!(write(&path));
+        assert_eq!(mode_of(&path), 0o600);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("permission-fixture"));
+        if is_toml {
+            toml::from_str::<toml::Value>(&content).expect("published TOML");
+        } else {
+            serde_json::from_str::<Value>(&content).expect("published JSON");
+        }
+        let first_backups = backups();
+        assert_eq!(first_backups.len(), usize::from(mode.is_some()));
+        for backup in &first_backups {
+            assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
+            assert_eq!(mode_of(backup), 0o600);
+        }
+        assert!(!write(&path), "second write must be a no-op");
+        assert_eq!(backups().len(), first_backups.len());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            write(&path),
+            "unchanged content still needs permission repair"
+        );
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        assert_eq!(backups().len(), first_backups.len() + 1);
+        assert!(!write(&path));
+        for backup in backups() {
+            assert_eq!(mode_of(&backup), 0o600);
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_installer_permission_fixture(path: &Path, writer: usize, mask: u32) -> bool {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let installer = include_str!("../../../install.sh");
+        let (function, block) = match writer {
+            0 => ("setup_single_standard_http_json_config() {", 0),
+            1 => ("setup_single_opencode_json_config() {", 0),
+            _ => ("setup_single_mcp_config() {", usize::from(path.exists())),
+        };
+        let body = installer.split_once(function).expect("installer writer").1;
+        let script = body
+            .split("<<'PY'\n")
+            .nth(block + 1)
+            .and_then(|block| block.split_once("\nPY\n"))
+            .expect("verbatim Python writer")
+            .0;
+        // Only process umask is controlled; execute the real installer body
+        // without replacing its IO, parsing, backup or publication routines.
+        let mut command = Command::new("python3");
+        command.arg("-");
+        if writer == 0 {
+            command.arg("omp");
+        }
+        command.arg(path);
+        if writer < 2 {
+            command.args(["http://127.0.0.1:8765/mcp/", "Bearer permission-fixture"]);
+        } else {
+            command.arg(r#"{"command":"am","env":{"HTTP_BEARER_TOKEN":"permission-fixture"}}"#);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("real installer Python");
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, "import os; os.umask({mask})\n{script}").unwrap();
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.starts_with("OK:") || stdout.starts_with("SKIP:"),
+            "{stdout}"
+        );
+        stdout.starts_with("OK:")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_permission_normalization_installer() {
+        for writer in 0..3 {
+            for mask in [0o022, 0o777] {
+                for mode in [Some(0o400), Some(0o600), Some(0o644), None] {
+                    assert_private_setup_mode(mode, "{}\n", |path| {
+                        write_installer_permission_fixture(path, writer, mask)
+                    });
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires sudo -n chown for a foreign-owned group-readable fixture"]
+    fn config_permission_normalization_group_readable() {
+        assert_private_setup_mode(Some(0o040), "{}\n", write_native_permission_fixture);
+        for writer in 0..3 {
+            assert_private_setup_mode(Some(0o040), "{}\n", |path| {
+                write_installer_permission_fixture(path, writer, 0o022)
+            });
+        }
+        assert_private_setup_mode(Some(0o040), "# original\n", |path| {
+            write_toml_permission_fixture(path, 0o022)
+        });
+    }
+
+    #[cfg(unix)]
+    fn write_toml_permission_fixture(path: &Path, mask: u32) -> bool {
+        use std::fmt::Write as _;
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let installer = include_str!("../../../install.sh");
+        let mut script = String::from(
+            "set -euo pipefail\nwarn() { printf '%s\\n' \"$*\" >&2; }\n\
+             info() { :; }\nverbose() { :; }\n\
+             desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }\n\
+             resolve_setup_http_bearer_token() { printf '%s' 'permission-fixture'; }\n",
+        );
+        for name in [
+            "private_file_identity",
+            "private_file_link_count",
+            "private_file_security_identity",
+            "ensure_private_file_target_path",
+            "write_private_file_atomic",
+            "backup_envfile_if_present",
+            "ensure_real_directory_tree",
+            "ensure_real_file_target_path",
+            "setup_single_toml_config",
+        ] {
+            let marker = format!("{name}() {{");
+            let body = installer
+                .split_once(&marker)
+                .expect("real shell helper")
+                .1
+                .split_once("\n}\n")
+                .expect("shell helper boundary")
+                .0;
+            writeln!(script, "{marker}{body}\n}}").unwrap();
+        }
+        write!(
+            script,
+            "umask {mask:03o}\nif setup_single_toml_config codex \"$1\" am; then\n\
+             printf 'OK:\\n'\nelse\nrc=$?\n[ \"$rc\" = 1 ] || exit \"$rc\"\n\
+             printf 'SKIP:\\n'\nfi\n"
+        )
+        .unwrap();
+        let mut child = Command::new("bash")
+            .args(["-s", "--"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("real TOML shell writer");
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(script.as_bytes()).unwrap();
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.starts_with("OK:") || stdout.starts_with("SKIP:"),
+            "{stdout}"
+        );
+        stdout.starts_with("OK:")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_permission_normalization_toml() {
+        for mask in [0o022, 0o777] {
+            for mode in [Some(0o400), Some(0o600), Some(0o644), None] {
+                assert_private_setup_mode(mode, "# original\n", |path| {
+                    write_toml_permission_fixture(path, mask)
+                });
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_atomic_never_widens_existing_nonowner_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = setup_real_tempdir();
