@@ -473,8 +473,14 @@ legacy `PI_PROFILE`) use `~/.omp/profiles/<name>/agent/mcp.json`. Profile names
 must use OMP's lowercase `[a-z0-9][a-z0-9._-]{0,63}` syntax; an invalid
 explicit profile fails closed instead of redirecting setup to the default.
 Setup also honors OMP's `PI_CONFIG_DIR` and default-profile `PI_CODING_AGENT_DIR`
-overrides. The project config is profile-independent and applies under every
-named OMP profile.
+overrides, with a stricter path-safety contract: neither may contain `..`
+components. `PI_CONFIG_DIR` is rooted beneath the user's home directory;
+a relative `PI_CODING_AGENT_DIR` is resolved against the working directory,
+and an absolute path is accepted. For example, use `agent` instead of
+`foo/../agent`. Invalid overrides cause setup to fail before writing config
+files; setup also refuses symlink traversal when accessing those files.
+The project config is profile-independent and applies under every named OMP
+profile.
 
 `am setup run --agent omp --no-user-config` leaves active-user bytes untouched,
 but setup and status still read the authorities that decide whether the
