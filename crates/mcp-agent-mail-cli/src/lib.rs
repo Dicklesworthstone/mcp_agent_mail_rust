@@ -55862,16 +55862,16 @@ http_headers = { Authorization = "Bearer secret" }
             .write(true)
             .open(&lock_path)
             .unwrap();
-        let mut child = match std::process::Command::new("flock")
+        // Replace flock with sleep in the same process so killing and waiting
+        // reaps the lock holder without leaving a descendant's output pipe open.
+        let mut child = std::process::Command::new("flock")
+            .arg("--no-fork")
             .arg("-x")
             .arg(&lock_path)
             .arg("sleep")
             .arg("5")
             .spawn()
-        {
-            Ok(child) => child,
-            Err(_) => return,
-        };
+            .expect("flock must be available for the real lock-holder test");
         let child_pid = child.id();
         let mut observed = None;
         for _ in 0..50 {
@@ -55900,16 +55900,14 @@ http_headers = { Authorization = "Bearer secret" }
         let lock_path = tmp.path().join(".mailbox.activity.lock");
         std::os::unix::fs::symlink(&target_path, &lock_path).unwrap();
 
-        let mut child = match std::process::Command::new("flock")
+        let mut child = std::process::Command::new("flock")
+            .arg("--no-fork")
             .arg("-x")
             .arg(&target_path)
             .arg("sleep")
             .arg("5")
             .spawn()
-        {
-            Ok(child) => child,
-            Err(_) => return,
-        };
+            .expect("flock must be available for the real symlink lock-holder test");
         let child_pid = child.id();
         let mut target_lock_visible = false;
         for _ in 0..50 {
