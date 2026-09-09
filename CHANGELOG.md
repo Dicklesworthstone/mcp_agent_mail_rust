@@ -6,13 +6,12 @@ Versions marked **[Release]** have published [GitHub Releases](https://github.co
 
 Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_PLAN.md), and per-release sign-off packets should start from [docs/RELEASE_READINESS_TEMPLATE.md](docs/RELEASE_READINESS_TEMPLATE.md).
 
-**Scope window:** the published-release review covers
+**Scope window:** the latest evidence review covers
 [v0.3.33 → v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.33...v0.3.34),
 including publication and the adjacent container-history correction. Earlier
 entries are retained. This review uses git diffs, tag targets, GitHub release
 metadata, checked-in Beads records, and executed release receipts; dates in the
 recent timeline are GitHub publication dates in UTC.
-
 The additional review on 2026-09-09 covers the configuration fixes after the
 v0.3.35 tag and OMP runtime detection below. Release metadata was checked again:
 v0.3.35 is tag-only; v0.3.34 remains the latest published GitHub Release.
@@ -32,7 +31,7 @@ Recent releases; the earlier version history continues below.
 ## Unreleased
 
 Changes after the [v0.3.35 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.35),
-reviewed on 2026-09-09.
+reviewed on 2026-09-09. These changes are not published release artifacts.
 
 ### Fixed
 
