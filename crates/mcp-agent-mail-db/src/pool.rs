@@ -3931,7 +3931,9 @@ impl DbPool {
     ///
     /// Cold startup uses [`Self::run_startup_integrity_check`] and proves a
     /// private copy of the exact SQLite family before the first live engine
-    /// open. Repeating that full-family copy on every periodic guard cycle
+    /// open. If a pool connection is already live, its namespace instead
+    /// requires the bound read-only health path. Repeating a full-family copy
+    /// on every periodic guard cycle
     /// would make steady-state integrity cost proportional to database size.
     /// The live cycle may therefore skip that cold-open proof when there is no
     /// relevant durable recovery history; every cleanup and recovery mutation
@@ -7794,14 +7796,13 @@ fn canonical_mailbox_is_schema_only_for_reconcile(sqlite_path: &str, phase: &str
 #[allow(clippy::result_large_err)]
 fn sqlite_primary_check_is_ok_with_canonical_fallback(
     path: &Path,
-    conn: &DbConn,
+    primary_details: Result<Vec<String>, SqlError>,
     kind: integrity::CheckKind,
 ) -> Result<bool, SqlError> {
     // Keep the primary probe's detail rows: the primary engine reports a
     // collated-index order complaint as `Ok(rows)` ("database disk image is
     // malformed: index `…` entries are out of order …"), not as an error, so
     // the false-positive classifier must see the rows, not just an `Err`.
-    let primary_details = sqlite_pragma_check_details(conn, kind);
     let primary_result: Result<bool, SqlError> = match &primary_details {
         Ok(details) => Ok(integrity::details_indicate_ok(details)
             || integrity::integrity_details_are_suspect(details)),
@@ -9312,11 +9313,65 @@ fn stage_sqlite_family_for_health_probe_once_in(
     root: Option<&Path>,
 ) -> std::io::Result<Option<SqliteHealthProbeSource>> {
     match std::fs::symlink_metadata(source) {
-        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(metadata) if metadata.file_type().is_file() =>
+        {
+            #[cfg(target_os = "linux")]
+            if metadata.nlink() != 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "physical health copying requires one authoritative main pathname",
+                ));
+            }
+        }
         Ok(_) => return Ok(None),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     }
+
+    // Closing an independently opened source descriptor can erase another
+    // connection's process-wide fcntl locks. Reserve the existing namespace
+    // before any copy opens the main inode, retaining gate-then-use flock
+    // admission until every source descriptor has closed. This belongs here
+    // so health, forensics and doctor callers share the same protection.
+    #[cfg(target_os = "linux")]
+    let _namespace_guards = match inspect_namespace_sidecar_shape(source, "physical health copy")
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+    {
+        NamespaceSidecarShape::Absent => Vec::new(),
+        NamespaceSidecarShape::Incomplete => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "physical health copy refuses an incomplete FrankenSQLite namespace sidecar pair",
+            ));
+        }
+        NamespaceSidecarShape::Complete => {
+            let mut guards = Vec::with_capacity(2);
+            for suffix in FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES {
+                let path = sqlite_sidecar_path(source, suffix);
+                if std::fs::symlink_metadata(&path)?.nlink() != 1 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "physical health copying refuses a hard-linked namespace sidecar",
+                    ));
+                }
+                // Open existing records without following symlinks. A probe
+                // must not create or rewrite admission authority.
+                let guard = mcp_agent_mail_core::disk::open_regular_file_no_follow(&path)?;
+                fs2::FileExt::try_lock_exclusive(&guard).map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::WouldBlock {
+                        std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "database is busy: physical health copying requires an idle FrankenSQLite namespace; live connections must retain their locks",
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+                guards.push(guard);
+            }
+            guards
+        }
+    };
 
     // Always inspect a private family copy, even when the source currently has
     // no sidecars. A normal writable SQLite open can create WAL/SHM merely by
@@ -9338,6 +9393,13 @@ fn stage_sqlite_family_for_health_probe_once_in(
         let source_sidecar = sqlite_sidecar_path(source, suffix);
         match std::fs::symlink_metadata(&source_sidecar) {
             Ok(metadata) if metadata.file_type().is_file() => {
+                #[cfg(target_os = "linux")]
+                if metadata.nlink() != 1 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "physical health copying refuses a hard-linked recovery sidecar",
+                    ));
+                }
                 copy_file_without_overwrite(
                     &source_sidecar,
                     &sqlite_sidecar_path(&staged_path, suffix),
@@ -9365,6 +9427,11 @@ fn stage_sqlite_family_for_health_probe_once_in(
 /// engine authority, which the private copy must not inherit. Returns
 /// `Ok(None)` when `source` is not a regular file or a sidecar slot holds a
 /// non-file.
+///
+/// On Linux an admitted family must have an idle, complete namespace pair:
+/// busy admission returns a lock error before opening the source inode.
+/// Hard-linked sources and sidecars are refused because another pathname can
+/// carry live locks which this pathname's namespace cannot protect.
 #[allow(clippy::result_large_err)]
 pub fn stage_sqlite_family_for_health_probe(
     source: &Path,
@@ -9566,10 +9633,17 @@ fn sqlite_primary_read_path_is_healthy_direct_with_cleanup(
     // returns. Close the FrankenSQLite connection synchronously on every early
     // return so a delayed drop cannot recreate the just-quarantined live path.
     let conn = crate::guard_db_conn(conn, "sqlite primary health probe");
+    let quick_details = sqlite_pragma_check_details(&conn, integrity::CheckKind::Quick);
+    let incremental_details = sqlite_pragma_check_details(&conn, integrity::CheckKind::Incremental);
+    let ack_pending_result = sqlite_ack_pending_probe_is_ok(&conn);
+    // This path owns a private staged image. Finish its native reads before
+    // asking canonical SQLite for a second opinion; otherwise our own idle
+    // connection excludes the next physical copy through namespace admission.
+    drop(conn);
 
     match sqlite_primary_check_is_ok_with_canonical_fallback(
         path,
-        &conn,
+        quick_details,
         integrity::CheckKind::Quick,
     ) {
         Ok(false) => return Ok(false),
@@ -9592,7 +9666,7 @@ fn sqlite_primary_read_path_is_healthy_direct_with_cleanup(
 
     match sqlite_primary_check_is_ok_with_canonical_fallback(
         path,
-        &conn,
+        incremental_details,
         integrity::CheckKind::Incremental,
     ) {
         Ok(false) => return Ok(false),
@@ -9609,7 +9683,7 @@ fn sqlite_primary_read_path_is_healthy_direct_with_cleanup(
         }
     }
 
-    match sqlite_ack_pending_probe_is_ok(&conn) {
+    match ack_pending_result {
         Ok(false) => return Ok(false),
         Ok(true) => {}
         Err(e) => {
@@ -9631,15 +9705,67 @@ fn sqlite_primary_read_path_is_healthy_direct_with_cleanup(
 /// Run the FrankenSQLite read-path checks against a private copy of the whole
 /// SQLite family.
 ///
-/// The live primary and every adjacent sidecar remain byte- and name-identical
-/// even if the engine replays a journal or resets WAL/SHM while opening the
-/// staged copy.
+/// When copying is admitted, the live primary and every adjacent sidecar
+/// remain byte- and name-identical even if the engine replays a journal or
+/// resets WAL/SHM while opening the staged copy.
+///
+/// When a live namespace excludes physical copying, use the existing bound
+/// read-only runtime opener. A successful primary check retains the existing
+/// canonical-busy policy; a primary rejection cannot become confirmed damage
+/// without a canonical second opinion.
+/// This live path follows normal read-only engine semantics: WAL read marks
+/// in the volatile SHM index may change, but no recovery or checkpoint of the
+/// source is permitted.
 #[allow(clippy::result_large_err)]
 pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError> {
-    let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
-        return Ok(false);
+    let staged = match stage_sqlite_family_for_health_probe(path) {
+        Ok(Some(staged)) => staged,
+        Ok(None) => return Ok(false),
+        Err(error) if is_lock_error(&error.to_string()) => {
+            return sqlite_live_read_path_is_healthy(path, error);
+        }
+        Err(error) => return Err(error),
     };
     sqlite_primary_read_path_is_healthy_direct(&staged.path)
+}
+
+/// Obtain real primary-engine health without disturbing a live namespace.
+/// No private-copy/canonical certification or reusable dual-engine cache entry
+/// is produced by this fallback. The bound opener retains all namespace,
+/// no-follow, breaker and no-recovery preconditions.
+#[allow(clippy::result_large_err)]
+fn sqlite_live_read_path_is_healthy(
+    path: &Path,
+    canonical_unavailable: SqlError,
+) -> Result<bool, SqlError> {
+    let conn = crate::guard_db_conn(
+        open_guarded_read_only_franken_existing_file(path, "live read-only health probe")?,
+        "live read-only health probe",
+    );
+    for kind in [
+        integrity::CheckKind::Quick,
+        integrity::CheckKind::Incremental,
+    ] {
+        let details = sqlite_pragma_check_details(&conn, kind)?;
+        if !integrity::details_indicate_ok(&details)
+            && !integrity::integrity_details_are_suspect(&details)
+        {
+            note_inconclusive_unhealthy_reason(
+                path,
+                format!(
+                    "live primary {kind} reported {}; a canonical physical copy is unavailable",
+                    integrity::first_detail_rows(&details, 3)
+                ),
+            );
+            return Err(SqlError::Custom(format!(
+                "{CANONICAL_SECOND_OPINION_INCONCLUSIVE}: live primary {kind} needs a canonical physical check after the namespace becomes idle"
+            )));
+        }
+    }
+    if !sqlite_ack_pending_probe_is_ok(&conn)? {
+        return Ok(false);
+    }
+    normalize_compatibility_probe_result(path, Err(canonical_unavailable))
 }
 
 #[allow(clippy::result_large_err)]
@@ -10019,12 +10145,19 @@ pub fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
     {
         return Ok(true);
     }
-    let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
-        note_inconclusive_unhealthy_reason(
-            path,
-            "the SQLite family could not be staged for a health probe",
-        );
-        return Ok(false);
+    let staged = match stage_sqlite_family_for_health_probe(path) {
+        Ok(Some(staged)) => staged,
+        Ok(None) => {
+            note_inconclusive_unhealthy_reason(
+                path,
+                "the SQLite family could not be staged for a health probe",
+            );
+            return Ok(false);
+        }
+        Err(error) if is_lock_error(&error.to_string()) => {
+            return sqlite_live_read_path_is_healthy(path, error);
+        }
+        Err(error) => return Err(error),
     };
     let healthy = sqlite_file_is_healthy_staged(&staged.path, true)?;
     if healthy {
@@ -10057,7 +10190,15 @@ pub fn sqlite_file_is_healthy_without_family_cleanup(path: &Path) -> Result<bool
     {
         return Ok(true);
     }
-    let healthy = sqlite_file_is_healthy_without_family_cleanup_uncached(path)?;
+    let staged = match stage_sqlite_family_for_health_probe(path) {
+        Ok(Some(staged)) => staged,
+        Ok(None) => return Ok(false),
+        Err(error) if is_lock_error(&error.to_string()) => {
+            return sqlite_live_read_path_is_healthy(path, error);
+        }
+        Err(error) => return Err(error),
+    };
+    let healthy = sqlite_file_is_healthy_without_family_cleanup_staged(&staged.path)?;
     if healthy {
         remember_healthy_verdict(
             path,
@@ -10069,26 +10210,23 @@ pub fn sqlite_file_is_healthy_without_family_cleanup(path: &Path) -> Result<bool
 }
 
 #[allow(clippy::result_large_err)]
-fn sqlite_file_is_healthy_without_family_cleanup_uncached(path: &Path) -> Result<bool, SqlError> {
-    let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
-        return Ok(false);
-    };
-    let staged_wal = crate::wal_classify::classify_wal_sidecar(&staged.path);
-    let staged_sidecars = inspect_mailbox_sidecar_state(&staged.path);
+fn sqlite_file_is_healthy_without_family_cleanup_staged(path: &Path) -> Result<bool, SqlError> {
+    let staged_wal = crate::wal_classify::classify_wal_sidecar(path);
+    let staged_sidecars = inspect_mailbox_sidecar_state(path);
     // A rollback journal may require recovery merely to observe the database.
     // The no-cleanup contract must not accept a staged open that succeeded by
     // replaying or resetting that journal, because the corresponding live
     // read-only observer has no authority to trigger recovery.
-    if path_is_occupied(&sqlite_sidecar_path(&staged.path, "-journal"))
+    if path_is_occupied(&sqlite_sidecar_path(path, "-journal"))
         || staged_wal.state.is_damaged()
         || (staged_sidecars.shm_exists && !staged_sidecars.wal_exists)
     {
         return Ok(false);
     }
-    if !classify_sqlite_family_cleanup(&staged.path)?.is_empty() {
+    if !classify_sqlite_family_cleanup(path)?.is_empty() {
         return Ok(false);
     }
-    sqlite_file_is_healthy_staged(&staged.path, false)
+    sqlite_file_is_healthy_staged(path, false)
 }
 
 #[allow(clippy::result_large_err)]
@@ -16000,6 +16138,9 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
 
+    #[cfg(target_os = "linux")]
+    type HealthProbe = fn(&Path) -> Result<bool, SqlError>;
+
     // GH#288: the "both rejected" WARN dedups per (path, message) — first
     // observation warns, identical repeats inside the cadence stay quiet, a
     // changed message or a different path warns fresh.
@@ -18144,6 +18285,18 @@ mod tests {
             8
         );
         drop(franken);
+        assert!(
+            sqlite_primary_read_path_is_healthy(&franken_db_path)
+                .expect("primary health reads the live WAL through the bound opener")
+        );
+        assert!(
+            sqlite_file_is_healthy(&franken_db_path)
+                .expect("layered health retains a real primary verdict under namespace contention")
+        );
+        assert!(
+            sqlite_file_is_healthy_without_family_cleanup(&franken_db_path)
+                .expect("strict health reads the live WAL without cleanup")
+        );
         // The `-shm` is a volatile WAL index, not database content: every
         // reader that consults the WAL updates it in place. The canonical
         // control above only escapes that because its fixture makes the SHM
@@ -18351,6 +18504,67 @@ mod tests {
         drop(observer);
         assert_child_observes_busy(&db_path);
 
+        // Physical health staging must not erase locks held by an unrelated
+        // connection in this process, even if it cannot obtain a safe copy.
+        let staged = stage_sqlite_family_for_health_probe(&db_path);
+        assert_child_observes_busy(&db_path);
+        let error = staged
+            .map(drop)
+            .expect_err("a live namespace excludes physical staging");
+        assert!(
+            is_lock_error(&error.to_string()),
+            "unexpected refusal: {error}"
+        );
+        let probes: [HealthProbe; 3] = [
+            sqlite_primary_read_path_is_healthy,
+            sqlite_file_is_healthy,
+            sqlite_file_is_healthy_without_family_cleanup,
+        ];
+        for probe in probes {
+            let result = probe(&db_path);
+            assert_child_observes_busy(&db_path);
+            assert!(
+                result.expect("bound read-only health must coexist with the reserved writer"),
+                "a healthy live primary must remain usable without a physical copy"
+            );
+        }
+        let pool = maintenance_test_pool(&db_path);
+        let startup = pool.run_startup_integrity_check();
+        assert_child_observes_busy(&db_path);
+        assert!(
+            startup
+                .expect("startup integrity may inspect an already-live namespace")
+                .ok,
+            "an existing writer must not make a healthy startup check fail"
+        );
+        let compatibility = sqlite_compatibility_read_path_is_healthy(&db_path);
+        assert_child_observes_busy(&db_path);
+        assert!(is_lock_error(
+            &compatibility
+                .expect_err("canonical-only health must still defer on a busy namespace")
+                .to_string()
+        ));
+        for variant in [
+            HealthVerdictVariant::WithFamilyCleanup,
+            HealthVerdictVariant::WithoutFamilyCleanup,
+        ] {
+            assert!(
+                !healthy_verdict_cache()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .contains_key(&(normalize_sqlite_identity_path_buf(&db_path), variant)),
+                "a live primary-only verdict must not populate the dual-engine cache"
+            );
+        }
+        let second_opinion =
+            sqlite_canonical_file_check_is_ok(&db_path, integrity::CheckKind::Full);
+        assert_child_observes_busy(&db_path);
+        assert!(is_lock_error(
+            &second_opinion
+                .expect_err("busy second opinion must defer")
+                .to_string()
+        ));
+
         // A pathname-only namespace check is insufficient when another name
         // reaches the same inode: the alias has no adjacent Franken namespace
         // records, yet opening and closing it through canonical SQLite would
@@ -18383,6 +18597,10 @@ mod tests {
             )
             .is_err(),
             "Franken diagnostics must require one authoritative main pathname"
+        );
+        assert!(
+            stage_sqlite_family_for_health_probe(&alias_path).is_err(),
+            "an alias without namespace records must not bypass physical-copy admission"
         );
         assert_child_observes_busy(&db_path);
 
@@ -29478,6 +29696,88 @@ mod tests {
             .collect();
         found.sort();
         found
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn health_probe_staging_refuses_unsafe_namespace_and_sidecar_links() {
+        for shape in [
+            "partial",
+            "namespace-link",
+            "recovery-link",
+            "namespace-symlink",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let source = dir.path().join("source.sqlite3");
+            seed_settled_diagnostic_database(&source);
+            let target = dir.path().join("unrelated-file");
+            std::fs::write(&target, b"unrelated bytes must remain unchanged").unwrap();
+            let gate = sqlite_sidecar_path(&source, "-fsqlite-ns-gate");
+            let use_path = sqlite_sidecar_path(&source, "-fsqlite-ns-use");
+            match shape {
+                "partial" => std::fs::write(&gate, b"partial authority").unwrap(),
+                "namespace-link" => {
+                    std::fs::hard_link(&target, &gate).unwrap();
+                    std::fs::write(&use_path, b"existing authority").unwrap();
+                }
+                "recovery-link" => {
+                    std::fs::hard_link(&target, sqlite_sidecar_path(&source, "-wal")).unwrap();
+                }
+                "namespace-symlink" => {
+                    std::os::unix::fs::symlink(&target, &gate).unwrap();
+                    std::fs::write(&use_path, b"existing authority").unwrap();
+                }
+                _ => unreachable!("fixed fixture shapes"),
+            }
+            let before = exact_diagnostic_parent_snapshot(dir.path());
+            assert!(
+                stage_sqlite_family_for_health_probe(&source).is_err(),
+                "physical staging must refuse {shape} before following unsafe authority"
+            );
+            assert_eq!(
+                exact_diagnostic_parent_snapshot(dir.path()),
+                before,
+                "refusing {shape} must preserve every source and unrelated byte"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_health_probe_cannot_accept_a_torn_physical_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("torn-live.sqlite3");
+        seed_readable_db_with_torn_filler_page(&path);
+        seed_quiescent_franken_namespace(&path);
+        let binding = acquire_guarded_read_only_namespace_binding(&path, "torn health fixture")
+            .expect("retain actual namespace admission while probing");
+        let before = exact_diagnostic_parent_snapshot(dir.path());
+        assert!(
+            is_lock_error(
+                &stage_sqlite_family_for_health_probe(&path)
+                    .map(drop)
+                    .expect_err("fixture must force the live health path")
+                    .to_string()
+            ),
+            "the retained binding must exclude physical staging"
+        );
+        let probes: [HealthProbe; 3] = [
+            sqlite_primary_read_path_is_healthy,
+            sqlite_file_is_healthy,
+            sqlite_file_is_healthy_without_family_cleanup,
+        ];
+        for probe in probes {
+            assert!(
+                !matches!(probe(&path), Ok(true)),
+                "unavailable canonical evidence must never make a torn source healthy"
+            );
+        }
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(dir.path()),
+            before,
+            "live health must not repair or rewrite the damaged source"
+        );
+        drop(binding);
     }
 
     #[test]

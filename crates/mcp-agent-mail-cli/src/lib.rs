@@ -26783,36 +26783,6 @@ fn doctor_open_staged_family_copy_canonical(
     db_path: &Path,
     operation: &str,
 ) -> CliResult<DoctorCanonicalDiagnosticOpen> {
-    #[cfg(target_os = "linux")]
-    let _namespace_guards = if sqlite_family_is_franken_admitted(db_path) {
-        // Match the engine's gate-then-use lock order. Holding both exclusive
-        // flock leases proves existing connections have quiesced and prevents
-        // new admissions until every raw source descriptor has closed. A PID
-        // or /proc/fd inventory alone would race a newly admitted writer.
-        // Open existing sidecars only: diagnostics must not create or rewrite
-        // namespace records, including on a partial/malformed family.
-        let mut guards = Vec::with_capacity(2);
-        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
-            let path = sqlite_sidecar_path(db_path, suffix);
-            let guard =
-                mcp_agent_mail_core::disk::open_regular_file_no_follow(&path).map_err(|error| {
-                    CliError::Other(format!(
-                        "{operation} cannot reserve physical-copy namespace {}: {error}",
-                        path.display()
-                    ))
-                })?;
-            fs2::FileExt::try_lock_exclusive(&guard).map_err(|error| {
-                CliError::Other(format!(
-                    "{operation} cannot reserve physical-copy namespace {} (live connections must retain their locks): {error}",
-                    path.display()
-                ))
-            })?;
-            guards.push(guard);
-        }
-        guards
-    } else {
-        Vec::new()
-    };
     let staged = mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(db_path)
         .map_err(|error| {
             CliError::Other(format!(
