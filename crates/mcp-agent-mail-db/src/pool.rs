@@ -3017,6 +3017,9 @@ pub struct DbPool {
     /// persisted backfill marker by this path, never by the temporary file
     /// actually opened (GH#297). `None` means the pool IS the mailbox.
     search_identity_path: Option<String>,
+    /// Retained identity and digest of this pool's last verified backup.
+    /// Clones serialize backup publication and share the same authority.
+    proactive_backup: Arc<Mutex<Option<ProactiveBackupWitness>>>,
 }
 
 /// One immutable filesystem authority for a `DbPool` wrapper.
@@ -3328,6 +3331,7 @@ impl DbPool {
             stats_sampler,
             message_id_allocator,
             search_identity_path: None,
+            proactive_backup: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -3390,6 +3394,7 @@ impl DbPool {
             stats_sampler,
             message_id_allocator,
             search_identity_path: None,
+            proactive_backup: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -4587,7 +4592,9 @@ impl DbPool {
     ///
     /// Returns `Ok(Some(path))` with the backup path on success, `Ok(None)`
     /// if the operation was skipped (memory DB, missing file, or the existing
-    /// backup is younger than `max_age`).
+    /// backup is younger than `max_age` and still matches the verified file
+    /// retained by this pool). Reuse hashes the backup without opening SQLite
+    /// or staging another copy; modification time alone is never authority.
     pub fn create_proactive_backup(
         &self,
         max_age: std::time::Duration,
@@ -4599,6 +4606,9 @@ impl DbPool {
         if !primary.exists() {
             return Ok(None);
         }
+        let mut verified_backup = self.proactive_backup.lock().map_err(|error| {
+            DbError::Sqlite(format!("proactive backup authority lock poisoned: {error}"))
+        })?;
 
         let bak_path = sqlite_path_with_file_name_suffix(primary, ".bak", "storage.sqlite3.bak");
         if !sqlite_recovery_candidate_is_standalone(&bak_path) {
@@ -4607,29 +4617,18 @@ impl DbPool {
                 bak_path.display()
             )));
         }
-        let backup_exists = match std::fs::symlink_metadata(&bak_path) {
+        let existing_backup = match std::fs::symlink_metadata(&bak_path) {
             Ok(metadata) if metadata.file_type().is_file() => {
-                if let Ok(modified) = metadata.modified()
+                let observed = ProactiveBackupWitness::capture(&bak_path)?;
+                if let Some(modified) = observed.modified
                     && modified.elapsed().unwrap_or(max_age) < max_age
+                    && verified_backup
+                        .as_ref()
+                        .is_some_and(|verified| verified.same_generation(&observed))
                 {
-                    // Perf: a fresh backup was fully health-checked when it was
-                    // published (`validate_proactive_backup_stage` runs full
-                    // health + checkpoint validation on the staged copy before
-                    // the atomic rename). Re-verifying the whole .bak here on
-                    // every guard cycle (every 5 minutes) is O(backup size)
-                    // for zero new information — the file is immutable between
-                    // refreshes. Verification therefore runs only when the
-                    // backup is actually (re)created, i.e. at most once per
-                    // `max_age` refresh interval.
-                    if !sqlite_recovery_candidate_is_standalone(&bak_path) {
-                        return Err(DbError::Sqlite(format!(
-                            "fresh proactive backup {} gained companion state during inspection; refusing to classify it as self-contained",
-                            bak_path.display()
-                        )));
-                    }
                     return Ok(None);
                 }
-                true
+                Some(observed)
             }
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(DbError::Sqlite(format!(
@@ -4643,7 +4642,7 @@ impl DbPool {
                     bak_path.display()
                 )));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
                 return Err(DbError::Sqlite(format!(
                     "proactive backup failed to inspect destination {}: {error}",
@@ -4651,6 +4650,8 @@ impl DbPool {
                 )));
             }
         };
+        // A failed refresh must never leave stale health authority reusable.
+        *verified_backup = None;
         if !sqlite_recovery_candidate_is_standalone(&bak_path) {
             return Err(DbError::Sqlite(format!(
                 "proactive backup destination {} gained companion state during inspection; refusing to replace one file from a multi-file generation",
@@ -4688,14 +4689,22 @@ impl DbPool {
             .map_err(|error| DbError::Sqlite(error.to_string()))?;
 
         let (staged_directory, staged_backup) = create_proactive_backup_stage(primary, &bak_path)?;
-        if let Err(error) = validate_proactive_backup_stage(primary, &staged_backup) {
-            let preserved = staged_directory.preserve();
-            tracing::warn!(
-                path = %preserved.display(),
-                "preserved failed proactive-backup staging directory for inspection"
-            );
-            return Err(error);
-        }
+        let staged_authority =
+            match ProactiveBackupWitness::capture(&staged_backup).and_then(|witness| {
+                validate_proactive_backup_stage(primary, &staged_backup)?;
+                witness.verify(&staged_backup)?;
+                Ok(witness)
+            }) {
+                Ok(witness) => witness,
+                Err(error) => {
+                    let preserved = staged_directory.preserve();
+                    tracing::warn!(
+                        path = %preserved.display(),
+                        "preserved failed proactive-backup staging directory for inspection"
+                    );
+                    return Err(error);
+                }
+            };
         if !sqlite_recovery_candidate_is_standalone(&bak_path) {
             let preserved = staged_directory.preserve();
             return Err(DbError::Sqlite(format!(
@@ -4704,8 +4713,12 @@ impl DbPool {
                 preserved.display()
             )));
         }
-        let rotated_backup = if backup_exists {
-            match rotate_existing_proactive_backup(&bak_path) {
+        let rotated_backup = if let Some(expected) = &existing_backup {
+            match rotate_existing_proactive_backup(
+                &bak_path,
+                expected,
+                rename_noreplace_preserving_source,
+            ) {
                 Ok(rotated) => Some(rotated),
                 Err(error) => {
                     let preserved = staged_directory.preserve();
@@ -4779,11 +4792,14 @@ impl DbPool {
                 bak_path.display()
             ))
         })?;
+        staged_authority.verify(&bak_path)?;
+        *verified_backup = Some(staged_authority);
+        drop(verified_backup);
 
         tracing::info!(
             primary = %primary.display(),
             backup = %bak_path.display(),
-            replaced_existing = backup_exists,
+            replaced_existing = existing_backup.is_some(),
             "created proactive database backup"
         );
 
@@ -13278,6 +13294,96 @@ pub fn sqlite_recovery_candidate_passes_full_integrity_check(
     normalize_recovery_candidate_probe_result(probe)
 }
 
+/// A retained open handle prevents file-id reuse; a digest detects in-place
+/// writes even when the writer restores the file's length and timestamps.
+struct ProactiveBackupWitness {
+    identity: same_file::Handle,
+    len: u64,
+    sha256: [u8; 32],
+    modified: Option<SystemTime>,
+}
+
+impl ProactiveBackupWitness {
+    fn capture(path: &Path) -> DbResult<Self> {
+        use sha2::Digest as _;
+        use std::io::Read as _;
+
+        let capture = || -> std::io::Result<Self> {
+            if !sqlite_recovery_candidate_is_standalone(path) {
+                return Err(std::io::Error::other("backup has companion state"));
+            }
+            let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
+            let before = file.metadata()?;
+            let identity = same_file::Handle::from_file(file.try_clone()?)?;
+            let mut reader = file.take(before.len().saturating_add(1));
+            let mut digest = sha2::Sha256::new();
+            let mut observed_len = 0_u64;
+            let mut buffer = vec![0_u8; 64 * 1024];
+            loop {
+                let count = reader.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                observed_len =
+                    observed_len.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+                digest.update(&buffer[..count]);
+            }
+            let after = reader.get_ref().metadata()?;
+            if observed_len != before.len()
+                || after.len() != before.len()
+                || after.modified().ok() != before.modified().ok()
+            {
+                return Err(std::io::Error::other(
+                    "backup changed while being witnessed",
+                ));
+            }
+            #[cfg(unix)]
+            if before.ctime() != after.ctime() || before.ctime_nsec() != after.ctime_nsec() {
+                return Err(std::io::Error::other(
+                    "backup changed while being witnessed",
+                ));
+            }
+            let current = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
+            if same_file::Handle::from_file(current)? != identity
+                || !sqlite_recovery_candidate_is_standalone(path)
+            {
+                return Err(std::io::Error::other(
+                    "backup generation changed while being witnessed",
+                ));
+            }
+            Ok(Self {
+                identity,
+                len: observed_len,
+                sha256: digest.finalize().into(),
+                modified: after.modified().ok(),
+            })
+        };
+        capture().map_err(|error| {
+            DbError::Sqlite(format!(
+                "proactive backup could not witness {}: {error}",
+                path.display()
+            ))
+        })
+    }
+
+    fn same_generation(&self, observed: &Self) -> bool {
+        self.identity == observed.identity
+            && self.len == observed.len
+            && self.sha256 == observed.sha256
+    }
+
+    fn verify(&self, path: &Path) -> DbResult<()> {
+        if self.same_generation(&Self::capture(path)?) {
+            Ok(())
+        } else {
+            Err(DbError::Sqlite(format!(
+                "proactive backup {} changed identity or bytes after inspection; refusing to trust or replace a different generation",
+                path.display()
+            )))
+        }
+    }
+}
+
 fn validate_proactive_backup_stage(primary: &Path, staged_backup: &Path) -> DbResult<()> {
     if !sqlite_recovery_candidate_is_standalone(staged_backup) {
         return Err(DbError::Sqlite(format!(
@@ -13351,7 +13457,11 @@ where
     }
 }
 
-fn rotate_existing_proactive_backup(backup_path: &Path) -> DbResult<PathBuf> {
+fn rotate_existing_proactive_backup(
+    backup_path: &Path,
+    expected: &ProactiveBackupWitness,
+    mut move_backup: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> DbResult<PathBuf> {
     if !is_real_file(backup_path) || !sqlite_recovery_candidate_is_standalone(backup_path) {
         return Err(DbError::Sqlite(format!(
             "proactive backup destination {} is no longer a standalone regular file; refusing rotation",
@@ -13364,8 +13474,20 @@ fn rotate_existing_proactive_backup(backup_path: &Path) -> DbResult<PathBuf> {
         if sqlite_candidate_artifact_conflicts(&rotated) {
             continue;
         }
-        match rename_noreplace_preserving_source(backup_path, &rotated) {
+        expected.verify(backup_path)?;
+        match move_backup(backup_path, &rotated) {
             Ok(()) => {
+                if let Err(error) = expected.verify(&rotated) {
+                    let rollback = rollback_rotated_proactive_backup_with(
+                        Some(&rotated),
+                        backup_path,
+                        sync_recovery_parent,
+                    );
+                    return Err(DbError::Sqlite(format!(
+                        "{error}; raced backup was preserved without publishing a replacement; rollback outcome: {rollback:?}; rotation path: {}",
+                        rotated.display()
+                    )));
+                }
                 sync_recovery_parent(&rotated).map_err(|error| {
                     DbError::Sqlite(format!(
                         "proactive backup preserved the previous generation at {} but could not durably sync the rotation before publishing a replacement: {error}",
@@ -28715,9 +28837,111 @@ mod tests {
 
         // Second backup should skip (backup is <1 hour old).
         let second = pool
+            .clone()
             .create_proactive_backup(std::time::Duration::from_hours(1))
             .unwrap();
         assert!(second.is_none(), "should skip since backup is fresh");
+    }
+
+    #[test]
+    fn proactive_backup_refreshes_same_bytes_replaced_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("replaced-backup.db");
+        write_marker_db(&db_path, "healthy-primary");
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        })
+        .unwrap();
+        let backup = pool
+            .create_proactive_backup(Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        let original = dir.path().join("retained-original.bak");
+        let before = ProactiveBackupWitness::capture(&backup).unwrap();
+        rename_noreplace_preserving_source(&backup, &original).unwrap();
+        std::fs::copy(&original, &backup).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&backup)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(before.modified.unwrap()))
+            .unwrap();
+        let replaced = ProactiveBackupWitness::capture(&backup).unwrap();
+        assert_eq!(before.len, replaced.len);
+        assert_eq!(before.sha256, replaced.sha256);
+        assert_eq!(before.modified, replaced.modified);
+        assert_ne!(before.identity, replaced.identity);
+        assert_eq!(
+            pool.create_proactive_backup(Duration::from_hours(1))
+                .unwrap(),
+            Some(backup.clone()),
+            "a new inode must not inherit the retained file's health authority"
+        );
+        assert_eq!(
+            sqlite_marker_value(&backup).as_deref(),
+            Some("healthy-primary")
+        );
+        before.verify(&original).unwrap();
+    }
+
+    #[test]
+    fn proactive_backup_refreshes_unknown_fresh_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("unknown-backup.db");
+        let backup = dir.path().join("unknown-backup.db.bak");
+        write_marker_db(&db_path, "healthy-primary");
+        std::fs::write(&backup, b"unverified fresh bytes").unwrap();
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            pool.create_proactive_backup(Duration::from_hours(1))
+                .unwrap(),
+            Some(backup.clone())
+        );
+        assert_eq!(
+            sqlite_marker_value(&backup).as_deref(),
+            Some("healthy-primary")
+        );
+    }
+
+    #[test]
+    fn proactive_backup_rotation_preserves_raced_replacements() {
+        for destination_arrives in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let backup = dir.path().join("race.db.bak");
+            let original = dir.path().join("inspected-generation.bak");
+            std::fs::write(&backup, b"inspected generation").unwrap();
+            let expected = ProactiveBackupWitness::capture(&backup).unwrap();
+            let mut raced_rotation = None;
+            let error = rotate_existing_proactive_backup(&backup, &expected, |from, to| {
+                // Actual filesystem replacement after the admission check,
+                // followed by the production no-clobber move primitive.
+                rename_noreplace_preserving_source(from, &original)?;
+                std::fs::write(from, b"raced replacement")?;
+                rename_noreplace_preserving_source(from, to)?;
+                raced_rotation = Some(to.to_path_buf());
+                if destination_arrives {
+                    std::fs::write(from, b"new arrival")?;
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("changed identity or bytes"));
+            expected.verify(&original).unwrap();
+            if destination_arrives {
+                assert_eq!(std::fs::read(&backup).unwrap(), b"new arrival");
+                assert_eq!(
+                    std::fs::read(raced_rotation.unwrap()).unwrap(),
+                    b"raced replacement"
+                );
+            } else {
+                assert_eq!(std::fs::read(&backup).unwrap(), b"raced replacement");
+            }
+        }
     }
 
     #[cfg(not(windows))]
