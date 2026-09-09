@@ -1535,38 +1535,26 @@ fn reservation_acquire_failure(
 ) -> McpError {
     let classification = err.classification();
     let cause = classification.class.as_str();
-    let blocks_edits = classification.blocks_edits;
     let safe_to_continue_read_only = classification.safe_to_continue_read_only;
     let recommended_command = classification.recommended_command;
     // Reuse the canonical classified envelope (class / severity / code / metrics)...
     let mut error = db_error_to_mcp_error(err);
     // ...then graft the reservation-acquire fail-closed context onto its data.
-    let guidance = if blocks_edits {
-        "Reservation acquire FAILED CLOSED: current holders are unverifiable because the \
-         reservation index could not be read. Do NOT edit the requested paths until the \
-         database is recovered."
-    } else {
-        "Reservation acquire did NOT grant: the reservation subsystem is temporarily \
-         unavailable (busy/locked). The paths were left unreserved; retry after the \
-         condition clears."
-    };
-    // Fail closed: when the index is unreadable, every requested path is a
-    // DO-NOT-EDIT until reservations can be verified again. (Precomputed because
-    // `json!` cannot take a bare `if`/`else` in value position.)
-    let do_not_edit: Vec<String> = if blocks_edits {
-        requested_paths.to_vec()
-    } else {
-        Vec::new()
-    };
+    let guidance = "Reservation request FAILED CLOSED: current holders could not be \
+         verified for this request. Do NOT edit the requested paths until the reported \
+         cause is resolved and a reservation check or acquire succeeds.";
+    // Generic request errors need no database repair, but an unknown caller
+    // still cannot verify ownership. This reservation-specific policy blocks
+    // every requested path without relabeling the underlying DB classification.
     let context = json!({
         "operation": operation,
         "cause": cause,
         "fail_closed": true,
-        "blocks_edits": blocks_edits,
+        "blocks_edits": true,
         "safe_to_continue_read_only": safe_to_continue_read_only,
         "recommended_command": recommended_command,
         "requested_paths": requested_paths,
-        "do_not_edit": do_not_edit,
+        "do_not_edit": requested_paths,
         "guidance": guidance,
     });
     // `db_error_to_mcp_error` always produces the legacy envelope
@@ -3465,6 +3453,8 @@ mod tests {
             .get("reservation_acquire")
             .expect("reservation_acquire context block");
         assert_eq!(acq.get("fail_closed").and_then(Value::as_bool), Some(true));
+        assert_eq!(acq["blocks_edits"], true);
+        assert_eq!(acq["do_not_edit"], serde_json::json!(paths));
         // The whole point of F5: an UNAVAILABLE cause is classified DISTINCTLY
         // from a corruption cause (and both are distinct from a genuine conflict,
         // which is the separate FILE_RESERVATION_CONFLICT path).
@@ -3794,6 +3784,15 @@ mod tests {
                 assert_eq!(
                     data["error"]["data"]["reservation_acquire"]["do_not_edit"],
                     serde_json::json!(["src/guard.rs"])
+                );
+                assert_eq!(data["error"]["type"], "NOT_FOUND");
+                let policy = &data["error"]["data"]["reservation_acquire"];
+                assert_eq!(policy["cause"], "request_semantic_error");
+                assert_eq!(policy["blocks_edits"], true);
+                assert_eq!(policy["safe_to_continue_read_only"], true);
+                assert_eq!(
+                    policy["recommended_command"],
+                    "correct the request arguments; no database remediation is needed"
                 );
             });
         });
