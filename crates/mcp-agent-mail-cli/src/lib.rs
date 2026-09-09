@@ -32574,6 +32574,24 @@ fn doctor_mcp_config_check_status(
     }
 }
 
+/// Reuse setup's effective OMP view: a project entry can be disabled by a
+/// separate active-profile file that contains no Agent Mail entry of its own.
+fn doctor_omp_runtime_drift(params: &mcp_agent_mail_core::setup::SetupParams) -> Vec<String> {
+    mcp_agent_mail_core::setup::check_status(params)
+        .iter()
+        .filter(|status| status.slug == "omp")
+        .flat_map(|status| {
+            status.config_files.iter().filter_map(|file| {
+                (file.exists
+                    && (file.omp_active_user_config_drift
+                        || file.omp_settings_config_drift
+                        || file.omp_mcp_alias_drift))
+                    .then(|| setup_status_file_drift_summary(&status.slug, file))
+            })
+        })
+        .collect()
+}
+
 fn normalize_mcp_config_status_url_host(host: &str) -> &str {
     if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1" {
         "127.0.0.1"
@@ -34344,6 +34362,40 @@ fn handle_doctor_check_with_target(
                 )
             };
             let desired_urls_label = desired_urls.join(" or ");
+
+            if existing
+                .iter()
+                .any(|loc| loc.tool == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp)
+            {
+                use mcp_agent_mail_core::setup::{self, AgentPlatform, SetupParams};
+
+                let runtime_drift = std::env::current_dir()
+                    .map_err(|error| error.to_string())
+                    .and_then(|project_dir| {
+                        let overlays = setup::omp_settings_overlay_paths_from_env(&project_dir)
+                            .map_err(|error| error.to_string())?;
+                        Ok(doctor_omp_runtime_drift(&SetupParams {
+                            host: env_config.http_host.clone(),
+                            port: env_config.http_port,
+                            path: env_config.http_path.clone(),
+                            token: env_config.http_bearer_token.clone().unwrap_or_default(),
+                            project_dir,
+                            omp_settings_overlay_paths: overlays,
+                            agents: Some(vec![AgentPlatform::Omp]),
+                            skip_hooks: true,
+                            ..SetupParams::default()
+                        }))
+                    })
+                    .unwrap_or_else(|error| {
+                        vec![format!(
+                            "OMP runtime configuration cannot be resolved: {error}"
+                        )]
+                    });
+                if !runtime_drift.is_empty() {
+                    omp_contract_issues += 1;
+                    detail_parts.extend(runtime_drift);
+                }
+            }
 
             for loc in &existing {
                 if let Err(error) =
@@ -45500,6 +45552,59 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(doctor_mcp_config_check_status(false, true, true), "warn");
         assert_eq!(doctor_mcp_config_check_status(false, false, true), "ok");
         assert_eq!(doctor_mcp_config_check_status(false, false, false), "warn");
+    }
+
+    #[test]
+    fn doctor_omp_runtime_drift_correlates_active_user_denylist_read_only() {
+        use mcp_agent_mail_core::setup::{AgentPlatform, SetupParams};
+
+        let temp = canonical_test_tempdir("am-doctor-omp-runtime-");
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        let project_config = project.join(".omp/mcp.json");
+        let active = home.join(".omp/profiles/work/agent/mcp.json");
+        let inactive = home.join(".omp/agent/mcp.json");
+        for path in [&project_config, &active, &inactive] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        let healthy = r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/","enabled":true}}}"#;
+        let disabled = r#"{"disabledServers":["mcp-agent-mail"]}"#;
+        std::fs::write(&project_config, healthy).unwrap();
+        std::fs::write(&inactive, disabled).unwrap();
+        let params = SetupParams {
+            project_dir: project,
+            home_dir_override: Some(home),
+            omp_user_config_path_override: Some(active.clone()),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..SetupParams::default()
+        };
+        // The former per-file logic sees neither file as broken.
+        assert!(!omp_config_needs_native_contract_repair(healthy));
+        assert!(!omp_config_needs_native_contract_repair(disabled));
+        for (user_config, expect_drift) in [
+            ("{}", false),
+            (disabled, true),
+            (r#"{"disabledServers":"mcp-agent-mail"}"#, true),
+            (r#"{"disabledServers":["other",7]}"#, true),
+            (r#"{"disabledServers":["other"]}"#, false),
+        ] {
+            std::fs::write(&active, user_config).unwrap();
+            let findings = doctor_omp_runtime_drift(&params);
+            assert_eq!(
+                !findings.is_empty(),
+                expect_drift,
+                "{user_config}: {findings:?}"
+            );
+            if expect_drift {
+                assert!(findings.iter().any(|finding| finding.contains("am setup")));
+                assert_eq!(doctor_mcp_config_check_status(true, false, true), "fail");
+            }
+            assert_eq!(std::fs::read_to_string(&active).unwrap(), user_config);
+            assert_eq!(std::fs::read_to_string(&inactive).unwrap(), disabled);
+            assert_eq!(std::fs::read_to_string(&project_config).unwrap(), healthy);
+        }
     }
 
     #[test]
