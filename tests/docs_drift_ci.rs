@@ -118,7 +118,16 @@ mod container_release_contract {
             require_exactly_once(source_dockerfile, needle)?;
         }
 
+        let release_instructions = release_dockerfile
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
         for needle in [
+            "ARG TARGETARCH",
+            "COPY dist/${TARGETARCH}/mcp-agent-mail ",
+            "COPY dist/${TARGETARCH}/am ",
             "ARG AM_VERSION",
             "ARG AM_REVISION",
             "test \"${#AM_REVISION}\" -eq 40",
@@ -127,17 +136,7 @@ mod container_release_contract {
             "org.opencontainers.image.version=\"${AM_VERSION}\"",
             "org.opencontainers.image.revision=\"${AM_REVISION}\"",
         ] {
-            require_exactly_once(release_dockerfile, needle)?;
-        }
-        require_exactly_once(
-            release_dockerfile,
-            "The dist matrix builds both GNU artifacts natively",
-        )?;
-        if release_dockerfile.contains("GLIBC_2.28")
-            || release_dockerfile.contains("cargo zigbuild")
-            || release_dockerfile.contains("dsr already cross-builds and signs")
-        {
-            return Err("release Dockerfile claims stale release artifact provenance".to_string());
+            require_exactly_once(&release_instructions, needle)?;
         }
 
         Ok(())
@@ -206,6 +205,8 @@ mod container_release_contract {
         let workflow = read(".github/workflows/docker.yml");
         let release_dockerfile = read("Dockerfile.release");
         let source_dockerfile = read("Dockerfile");
+        validate(&workflow, &release_dockerfile, &source_dockerfile)
+            .expect("unmodified release contract must pass before testing mutations");
 
         let workflow_mutations = [
             workflow.replacen(
@@ -263,6 +264,7 @@ mod container_release_contract {
             ),
         ];
         for mutation in workflow_mutations {
+            assert_ne!(mutation, workflow, "workflow mutation anchor must exist");
             assert!(
                 validate(&mutation, &release_dockerfile, &source_dockerfile).is_err(),
                 "workflow contract mutation unexpectedly passed"
@@ -278,12 +280,22 @@ mod container_release_contract {
                 1,
             ),
             release_dockerfile.replacen(
-                "The dist matrix builds both GNU artifacts natively",
-                "linux/arm64 needs GLIBC_2.28 because cargo zigbuild is used",
+                "COPY dist/${TARGETARCH}/mcp-agent-mail ",
+                "COPY dist/amd64/mcp-agent-mail ",
+                1,
+            ),
+            release_dockerfile.replacen("COPY dist/${TARGETARCH}/am ", "COPY dist/amd64/am ", 1),
+            release_dockerfile.replacen(
+                "COPY dist/${TARGETARCH}/am ",
+                "# COPY dist/${TARGETARCH}/am ",
                 1,
             ),
         ];
         for mutation in release_dockerfile_mutations {
+            assert_ne!(
+                mutation, release_dockerfile,
+                "release Dockerfile mutation anchor must exist"
+            );
             assert!(
                 validate(&workflow, &mutation, &source_dockerfile).is_err(),
                 "release Dockerfile contract mutation unexpectedly passed"
@@ -292,6 +304,10 @@ mod container_release_contract {
 
         let source_dockerfile_mutation =
             source_dockerfile.replacen("git checkout -q FETCH_HEAD;", "git checkout -q main;", 1);
+        assert_ne!(
+            source_dockerfile_mutation, source_dockerfile,
+            "source Dockerfile mutation anchor must exist"
+        );
         assert!(
             validate(&workflow, &release_dockerfile, &source_dockerfile_mutation).is_err(),
             "source Dockerfile checkout mutation unexpectedly passed"
