@@ -5,8 +5,8 @@ use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{
-    ensure_project, fetch_inbox, macro_contact_handshake, register_agent, request_contact,
-    respond_contact, send_message, set_contact_policy,
+    ensure_project, fetch_inbox, list_contacts, macro_contact_handshake, register_agent,
+    request_contact, respond_contact, send_message, set_contact_policy,
 };
 use serde_json::Value;
 use std::fs;
@@ -346,6 +346,41 @@ fn test_auto_contact_send_leaves_no_pending_intro_and_names_the_approved_tuple()
         assert_eq!(
             envelope.pointer("/policy/safe_to_continue_read_only"),
             Some(&Value::Bool(true))
+        );
+
+        // A reversed denial must explain the names and leave the actual
+        // approved direction unchanged, rather than silently reversing it.
+        let reversed = respond_contact(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            "RedStone".to_string(),
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect_err("the reversed tuple was never linked");
+        let reversed_payload = error_object(&reversed);
+        assert_eq!(reversed_payload["type"], "NOT_FOUND");
+        let message = reversed_payload["message"]
+            .as_str()
+            .expect("lookup guidance");
+        assert!(message.contains("from RedStone"));
+        assert!(message.contains("to GreenCastle"));
+        assert!(message.contains("from_agent to the requester"));
+        assert!(message.contains(&project_key));
+        assert_eq!(reversed.message, message);
+        let contacts = list_contacts(&ctx, project_key.clone(), "GreenCastle".to_string())
+            .await
+            .expect("read original directed link after reversed denial");
+        let contacts: Value = serde_json::from_str(&contacts).expect("parse contacts");
+        assert!(
+            contacts
+                .as_array()
+                .expect("contact list")
+                .iter()
+                .any(|link| { link["to"] == "RedStone" && link["status"] == "approved" })
         );
 
         // The tuple the notice names still resolves.

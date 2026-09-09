@@ -711,7 +711,29 @@ pub async fn respond_contact(
             "respond_contact query failed"
         );
     }
-    let (updated, link_row) = db_outcome_to_mcp_result(respond_out)?;
+    let (updated, link_row) = db_outcome_to_mcp_result(respond_out).map_err(|mut error| {
+        // Keep the shared NOT_FOUND failure envelope, but explain the directed
+        // tuple using caller-visible names rather than opaque database IDs.
+        // Never retry in reverse: that would authorize a different request.
+        if let Some(payload) = error
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut("error"))
+            .and_then(serde_json::Value::as_object_mut)
+            && payload.get("type").and_then(serde_json::Value::as_str) == Some("NOT_FOUND")
+        {
+            let message = format!(
+                "No contact request from {from_agent} (project {}) to {to_agent} (project {}). \
+                 Set from_agent to the requester and to_agent to the recipient responding; \
+                 project_key is the recipient's project and from_project is the requester's project. \
+                 Check list_contacts before retrying; the reverse direction was not changed.",
+                source_project_row.human_key, project.human_key,
+            );
+            payload.insert("message".to_string(), serde_json::Value::String(message.clone()));
+            error.message = message;
+        }
+        error
+    })?;
 
     let response = RespondContactResponse {
         from: from_agent,
