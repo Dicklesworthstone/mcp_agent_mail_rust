@@ -45,6 +45,7 @@ tempfile.workspace = true
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 winsafe.workspace = true
+socketpair.workspace = true
 
 [features]
 # Optional local filesystem probes for installed coding-agent CLIs.
@@ -59,6 +60,7 @@ optional = true
 [dev-dependencies]
 criterion.workspace = true
 loom.workspace = true
+nix = { workspace = true, features = ["process", "signal"] }
 proptest.workspace = true
 tempfile.workspace = true
 
