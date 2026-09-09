@@ -2,16 +2,20 @@
 
 All notable changes to [MCP Agent Mail (Rust)](https://github.com/Dicklesworthstone/mcp_agent_mail_rust) are documented in this file.
 
-Versions marked **[Release]** have published [GitHub Releases](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases) with downloadable binaries. Versions marked **[Tag only]** exist as git tags but were never published as GitHub Releases.
+Versions marked **[Release]** have published [GitHub Releases](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases) with downloadable binaries. Versions marked **[Tag only]** have git tags without a currently published GitHub Release.
 
 Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_PLAN.md), and per-release sign-off packets should start from [docs/RELEASE_READINESS_TEMPLATE.md](docs/RELEASE_READINESS_TEMPLATE.md).
 
-**Scope window:** the latest evidence review covers
+**Scope window:** the published-release review covers
 [v0.3.33 → v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.33...v0.3.34),
 including publication and the adjacent container-history correction. Earlier
 entries are retained. This review uses git diffs, tag targets, GitHub release
 metadata, checked-in Beads records, and executed release receipts; dates in the
 recent timeline are GitHub publication dates in UTC.
+
+The additional review on 2026-09-09 covers the configuration fixes after the
+v0.3.35 tag and OMP runtime detection below. Release metadata was checked again:
+v0.3.35 is tag-only; v0.3.34 remains the latest published GitHub Release.
 
 ## Release Timeline
 
@@ -19,13 +23,57 @@ Recent releases; the earlier version history continues below.
 
 | Version | Published (UTC) | Status | Delivered capability |
 |---------|-----------------|--------|----------------------|
-| [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.35) | 2026-09-09 | **Release** | Lifecycle tools require the registration token over HTTP (PR #310 option c); bounded tmux probe readers |
+| [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.35) | — | **Tag only** | Tagged source: lifecycle tokens over HTTP (PR #310 option c); bounded tmux probe readers |
 | [v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.34) | 2026-09-08 | **Release** | Windows UNC snapshots, bounded tmux identity probes, six-platform binaries and matching GHCR images |
 | [v0.3.33](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.33) | 2026-09-07 | **Release** | FrankenSQLite 0.3.18 and signed self-update manifest verification |
 
 ---
 
-## [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.35) — 2026-09-09 [Release]
+## Unreleased
+
+Changes after the [v0.3.35 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.35),
+reviewed on 2026-09-09.
+
+### Fixed
+
+- **Setup detects OMP installations selected by runtime overrides.** Automatic
+  `am setup run` and `am setup status` now use the existing OMP configuration
+  resolver alongside the upstream filesystem detector. Installations selected
+  through `PI_CODING_AGENT_DIR`, `PI_CONFIG_DIR`, `OMP_PROFILE`, or `PI_PROFILE`
+  no longer need explicit `--agent omp` selection. Invalid active profiles are
+  reported as undetected without hiding other agents; explicit detector roots
+  and connector filters retain their behavior. The real-process regression
+  matrix runs on Unix; native Windows profile isolation remains unverified.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/6b9e84541ac98dc391453f74ba3957e02f4eba9f),
+  [br-86hk0](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/ce66a70cadc20de9baab37b1c348daeaa02934f5/.beads/issues.jsonl#L1654))
+- **Configuration reset reloads user-file values and rejection state together.**
+  After replacing or repairing `config.env`, `Config::reset_cached()` starts a
+  new generation for both parsed settings and the file authority. In-flight
+  readers may finish with their old snapshot but cannot populate the new cache
+  with stale credentials. Existing `Config` clones retain their snapshots.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/ce66a70cadc20de9baab37b1c348daeaa02934f5),
+  [br-e6oxx](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/ce66a70cadc20de9baab37b1c348daeaa02934f5/.beads/issues.jsonl#L2151))
+- **Observed in-place configuration rewrites are rejected.** User env-file
+  reads require repeated bounded byte reads and stable metadata, so retaining
+  the inode and restoring mtime no longer bypasses the generation check.
+  Rejection still suppresses stale legacy-file fallback. This detects observed
+  races; it does not lock out a writer that changes and restores bytes between
+  observations.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/3e034b965c81e5e33152e8a6795af74f4ac1a905),
+  [br-sh712](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/ce66a70cadc20de9baab37b1c348daeaa02934f5/.beads/issues.jsonl#L2546))
+- **Secret-bearing setup files keep owner read/write access.** Native setup and
+  installer writers publish private `0600` files and backups, including when the
+  old file is read-only or group-readable. Permission repair also runs when
+  configuration content is unchanged. TOML installation uses the private
+  backup/replace helpers and checks source identity around the backup.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f9e4ee92a78f0c212b81c611b94019f41ac1a063),
+  [br-atwzh](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/ce66a70cadc20de9baab37b1c348daeaa02934f5/.beads/issues.jsonl#L1965))
+
+## [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.35) — 2026-09-09 [Tag only]
+
+The tag was created at 04:12:42 UTC from
+[this source commit](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/56bb26d747ebd87bbb233d5a19cf268ade522d82).
+No published GitHub Release was available when checked on 2026-09-09.
 
 This patch closes the authorization gap left after PR #310: the agent
 lifecycle tools require the registration token when called over HTTP. It also
@@ -33,8 +81,8 @@ carries the bounded tmux probe reader work that landed on `main` after
 v0.3.34 (8f1fec3f: stdout is drained within the child deadline without
 detached reader threads, and incomplete facts are discarded on timeout, I/O
 failure, or output over 1 MiB). FrankenSQLite remains pinned to 0.3.18 with
-SQLModel 0.4.0, Asupersync 0.4.9, and FastMCP 0.7.1. Portable binaries include
-lexical search.
+SQLModel 0.4.0, Asupersync 0.4.9, and FastMCP 0.7.1. The release configuration
+enables lexical search in portable binaries.
 
 ### Security
 
@@ -66,7 +114,7 @@ lexical search.
   body-forged `stdio` transport is overwritten by the daemon, malformed
   socket headers behave as before.
 
-### Also in this release (landed on `main` after v0.3.34)
+### Also in this tag (landed on `main` after v0.3.34)
 
 - **Tmux probe readers are bounded** (8f1fec3f, closes the v0.3.34 known
   issue): stdout is drained within the child deadline without detached reader
