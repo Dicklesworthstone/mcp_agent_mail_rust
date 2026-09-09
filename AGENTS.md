@@ -694,6 +694,17 @@ documented (GH#290).
   authoritative; legacy parity never overrides reliability, security, bounded
   work, or structured-concurrency invariants.
 - **Dual-mode interface** — MCP server and CLI share tools but enforce surface separation
+- **Per-transport lifecycle authorization** — `retire_agent`, `unretire_agent`
+  and `deregister_agent` authorize by `registration_token` on every transport.
+  A tmux pane bound to the agent stands in for the token **over stdio only**
+  (the caller is a same-user process). Over `am serve-http` the pane context
+  (`X-Tmux-Pane` / `X-Tmux-Socket`, or a body `pane_id`) is a client assertion,
+  so the daemon stamps the transport-owned `call_transport = "http"` argument and
+  the tools apply `LifecycleAuthPolicy::TokenRequired`; the refusal is
+  `AUTHENTICATION_REQUIRED` with `reason: token_required` and names where the
+  token came from (the `registration_token` field of the register_agent /
+  create_agent_identity / macro_start_session response). Agents must keep that
+  token if they intend to retire or deregister themselves over HTTP.
 - **Advisory file reservations** — symmetric fnmatch with archive reading and rename handling
 - **Pre-commit guard** — enforces reservation compliance at `git commit` time
 - **Query-only reads** — direct reads use an existing live SQLite pool and do not wait for archive reconstruction or write-behind coalescing

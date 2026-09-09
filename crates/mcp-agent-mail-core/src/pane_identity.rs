@@ -225,6 +225,131 @@ impl<'a> TmuxServer<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Call transport and lifecycle authorization policy (PR #310 follow-up)
+// ---------------------------------------------------------------------------
+
+/// The transport a tool call arrived on, as far as identity authorization is
+/// concerned.
+///
+/// Pane context (`pane_id`, `tmux_socket_path`) means different things on the
+/// two transports. Over stdio the MCP client is a same-user process on this
+/// host, so "the caller's pane is bound to agent X" is a fact about the
+/// caller. Over the `serve-http` daemon the pane and socket arrive in
+/// `X-Tmux-Pane` / `X-Tmux-Socket` headers (or in the JSON body) and are an
+/// *assertion by the client*; the daemon can only check that some pane with
+/// that id, on that socket, carries a binding for X — not that the client is
+/// that pane.
+///
+/// The daemon stamps the wire value ([`Self::ARG_NAME`]) into the arguments
+/// of every lifecycle tool call it forwards, overwriting whatever the body
+/// said. Absent (stdio) means [`Self::Stdio`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CallTransport {
+    /// MCP over stdio: the client is a same-user process on this host.
+    #[default]
+    Stdio,
+    /// The `serve-http` daemon: pane context is a client assertion.
+    Http,
+}
+
+impl CallTransport {
+    /// The transport-owned tool argument the HTTP daemon fills in.
+    pub const ARG_NAME: &'static str = "call_transport";
+
+    /// Wire spelling of this transport.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Http => "http",
+        }
+    }
+
+    /// Parse the wire spelling (case-insensitive, surrounding whitespace
+    /// ignored). Anything else is a caller error rather than a silent
+    /// downgrade to the more permissive stdio policy.
+    pub fn parse(raw: &str) -> Result<Self, CallTransportError> {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("stdio") {
+            Ok(Self::Stdio)
+        } else if trimmed.eq_ignore_ascii_case("http") {
+            Ok(Self::Http)
+        } else {
+            Err(CallTransportError)
+        }
+    }
+}
+
+impl std::fmt::Display for CallTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A `call_transport` value that is neither `stdio` nor `http`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallTransportError;
+
+impl std::fmt::Display for CallTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("call_transport must be \"stdio\" or \"http\"")
+    }
+}
+
+impl std::error::Error for CallTransportError {}
+
+/// How the lifecycle tools (`retire_agent`, `unretire_agent`,
+/// `deregister_agent`) authorize a caller, decided per transport.
+///
+/// A matching `registration_token` authorizes on every transport. The
+/// difference is whether a tmux pane bound to the agent may stand in for it:
+///
+/// | transport | policy |
+/// |-----------|--------|
+/// | stdio     | [`Self::TokenOrBoundPane`] — the pane is the caller's own |
+/// | HTTP      | [`Self::TokenRequired`] — the pane is a client assertion |
+///
+/// Over HTTP a client that names another agent's pane (and, since GH#310,
+/// the socket to look it up on) could otherwise retire or deregister that
+/// agent without ever holding its token. The pane context still flows to the
+/// tools on HTTP for registration and identity resolution; it simply no longer
+/// *authorizes* a lifecycle transition there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleAuthPolicy {
+    /// The registration token, or a tmux pane verifiably bound to the agent.
+    TokenOrBoundPane,
+    /// The registration token only; pane context is advisory.
+    TokenRequired,
+}
+
+impl LifecycleAuthPolicy {
+    /// The policy that applies to calls arriving on `transport`.
+    #[must_use]
+    pub const fn for_transport(transport: CallTransport) -> Self {
+        match transport {
+            CallTransport::Stdio => Self::TokenOrBoundPane,
+            CallTransport::Http => Self::TokenRequired,
+        }
+    }
+
+    /// Whether a pane bound to the agent authorizes a lifecycle transition
+    /// under this policy.
+    #[must_use]
+    pub const fn accepts_bound_pane(self) -> bool {
+        matches!(self, Self::TokenOrBoundPane)
+    }
+
+    /// Machine-readable name, surfaced in `AUTHENTICATION_REQUIRED` details.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TokenOrBoundPane => "token_or_bound_pane",
+            Self::TokenRequired => "token_required",
+        }
+    }
+}
+
 /// Why a caller-supplied tmux socket path was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TmuxSocketPathError {
@@ -2981,6 +3106,43 @@ mod tests {
             );
         });
         drop(config);
+    }
+
+    // ── PR #310 follow-up: per-transport lifecycle authorization ──────────
+
+    #[test]
+    fn call_transport_round_trips_its_wire_spelling() {
+        for transport in [CallTransport::Stdio, CallTransport::Http] {
+            assert_eq!(CallTransport::parse(transport.as_str()), Ok(transport));
+            assert_eq!(transport.to_string(), transport.as_str());
+        }
+        assert_eq!(CallTransport::parse("  HTTP\t"), Ok(CallTransport::Http));
+        assert_eq!(CallTransport::parse("Stdio"), Ok(CallTransport::Stdio));
+        assert_eq!(CallTransport::default(), CallTransport::Stdio);
+        assert_eq!(CallTransport::ARG_NAME, "call_transport");
+    }
+
+    #[test]
+    fn call_transport_rejects_anything_else() {
+        for raw in ["", "   ", "https", "http2", "sse", "std io", "http\0"] {
+            assert_eq!(
+                CallTransport::parse(raw),
+                Err(CallTransportError),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_policy_requires_token_only_over_http() {
+        let stdio = LifecycleAuthPolicy::for_transport(CallTransport::Stdio);
+        let http = LifecycleAuthPolicy::for_transport(CallTransport::Http);
+        assert_eq!(stdio, LifecycleAuthPolicy::TokenOrBoundPane);
+        assert_eq!(http, LifecycleAuthPolicy::TokenRequired);
+        assert!(stdio.accepts_bound_pane());
+        assert!(!http.accepts_bound_pane());
+        assert_eq!(stdio.as_str(), "token_or_bound_pane");
+        assert_eq!(http.as_str(), "token_required");
     }
 
     // ── GH#310: caller tmux server ─────────────────────────────────────────

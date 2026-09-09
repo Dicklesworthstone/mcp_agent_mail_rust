@@ -24,6 +24,38 @@ Recent releases; the earlier version history continues below.
 
 ---
 
+## [Unreleased]
+
+### Security
+
+- **Lifecycle tools require the registration token over HTTP** (follow-up to
+  [PR #310](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/pull/310),
+  option (c) of its review). `retire_agent`, `unretire_agent` and
+  `deregister_agent` accepted a tmux pane bound to the agent in place of the
+  `registration_token` on every transport. Over stdio that pane is the
+  caller's own; over `am serve-http` the pane id and — since GH#310 — the
+  tmux socket to look it up on arrive from the client (`X-Tmux-Pane` /
+  `X-Tmux-Socket` headers, or a body `pane_id`), so a remote caller that
+  named another agent's pane could retire or deregister that agent without
+  ever holding its token. Authorization is now decided by a per-transport
+  policy (`LifecycleAuthPolicy`): `TokenOrBoundPane` over stdio (unchanged),
+  `TokenRequired` over HTTP. The daemon stamps a transport-owned
+  `call_transport = "http"` argument on every lifecycle call it forwards,
+  overwriting any body value, and the tools treat an absent value as stdio;
+  a present-but-unknown value is an `INVALID_ARGUMENT` refusal, never a
+  downgrade. An HTTP call without a token is refused before any tmux probe
+  runs. The `AUTHENTICATION_REQUIRED` refusal now says which transport and
+  policy applied (`transport`, `policy`, `reason` = `token_required` /
+  `token_mismatch` / `no_bound_pane`) and where the token comes from (the
+  `registration_token` field of the register_agent / create_agent_identity /
+  macro_start_session response). A supplied-but-wrong token stays loud on
+  both transports; registration, `macro_start_session` reuse and
+  `resolve_pane_identity` keep using the caller's pane and socket exactly as
+  in v0.3.34. Tests: HTTP + bound pane without token is refused (and does not
+  probe), HTTP + valid token is allowed, stdio + bound pane is allowed, a
+  body-forged `stdio` transport is overwritten by the daemon, malformed
+  socket headers behave as before.
+
 ## [v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.34) — 2026-09-08 [Release]
 
 Published at 02:58:05 UTC from

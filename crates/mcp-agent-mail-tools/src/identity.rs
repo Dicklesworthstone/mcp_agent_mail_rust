@@ -1639,46 +1639,156 @@ pub struct AgentResponse {
     pub deregistered_at: Option<String>,
 }
 
+/// Why a lifecycle call was refused (`AUTHENTICATION_REQUIRED` details).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleAuthRefusal {
+    /// A non-empty `registration_token` was supplied and does not match.
+    TokenMismatch,
+    /// No token; the policy accepts a bound pane but none resolved to the agent.
+    NoBoundPane,
+    /// No token; the policy does not accept a bound pane on this transport.
+    TokenRequired,
+}
+
+impl LifecycleAuthRefusal {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TokenMismatch => "token_mismatch",
+            Self::NoBoundPane => "no_bound_pane",
+            Self::TokenRequired => "token_required",
+        }
+    }
+}
+
+/// The transport-neutral lifecycle authorization decision.
+///
+/// `pane_bound_to_agent` is only consulted when the policy accepts a bound
+/// pane *and* no token was supplied, so an HTTP call without a token never
+/// spawns a tmux probe, and an explicitly supplied but invalid token never
+/// falls back to ambient pane identity (stale or stolen credentials stay
+/// loud).
+fn lifecycle_auth_decision(
+    policy: mcp_agent_mail_core::LifecycleAuthPolicy,
+    provided_token: Option<&str>,
+    stored_token: Option<&str>,
+    pane_bound_to_agent: impl FnOnce() -> bool,
+) -> Result<(), LifecycleAuthRefusal> {
+    let provided_token = provided_token.filter(|token| !token.is_empty());
+    if let Some(provided) = provided_token {
+        return if stored_token.is_some_and(|stored| {
+            mcp_agent_mail_core::setup::constant_time_str_eq(provided, stored)
+        }) {
+            Ok(())
+        } else {
+            Err(LifecycleAuthRefusal::TokenMismatch)
+        };
+    }
+    if !policy.accepts_bound_pane() {
+        return Err(LifecycleAuthRefusal::TokenRequired);
+    }
+    if pane_bound_to_agent() {
+        Ok(())
+    } else {
+        Err(LifecycleAuthRefusal::NoBoundPane)
+    }
+}
+
+/// Authorize a lifecycle transition (`retire_agent`, `unretire_agent`,
+/// `deregister_agent`) for `agent` under the policy of `transport`.
+///
+/// See [`mcp_agent_mail_core::LifecycleAuthPolicy`]: over stdio a tmux pane
+/// bound to the agent may stand in for the registration token; over HTTP
+/// (`am serve-http`) the pane context is a client assertion and only the
+/// token authorizes.
 fn authenticate_lifecycle_agent(
     project: &mcp_agent_mail_db::ProjectRow,
     agent: &mcp_agent_mail_db::AgentRow,
     registration_token: Option<&str>,
     pane_id: Option<&str>,
     tmux_server: mcp_agent_mail_core::TmuxServer<'_>,
+    transport: mcp_agent_mail_core::CallTransport,
     action: &str,
 ) -> McpResult<()> {
-    let provided_token = registration_token.filter(|token| !token.is_empty());
-    let token_matches = provided_token.is_some_and(|provided| {
-        agent.registration_token.as_deref().is_some_and(|stored| {
-            mcp_agent_mail_core::setup::constant_time_str_eq(provided, stored)
-        })
-    });
-    // An explicitly supplied but invalid token must not silently fall back to
-    // ambient pane identity. That keeps stale or stolen credentials loud.
-    let pane_matches = provided_token.is_none()
-        && mcp_agent_mail_core::resolve_identity_with_optional_pane_on_server(
-            &project.human_key,
-            pane_id,
-            tmux_server,
-        )
-        .is_some_and(|resolved| resolved.eq_ignore_ascii_case(&agent.name));
-    if token_matches || pane_matches {
+    let policy = mcp_agent_mail_core::LifecycleAuthPolicy::for_transport(transport);
+    let Err(refusal) = lifecycle_auth_decision(
+        policy,
+        registration_token,
+        agent.registration_token.as_deref(),
+        || {
+            mcp_agent_mail_core::resolve_identity_with_optional_pane_on_server(
+                &project.human_key,
+                pane_id,
+                tmux_server,
+            )
+            .is_some_and(|resolved| resolved.eq_ignore_ascii_case(&agent.name))
+        },
+    ) else {
         return Ok(());
-    }
+    };
+
+    let name = &agent.name;
+    let message = match refusal {
+        LifecycleAuthRefusal::TokenMismatch => format!(
+            "{action} was refused: the supplied registration_token does not match agent '{name}'. \
+Present the token returned when '{name}' was registered (the `registration_token` field of the \
+register_agent / create_agent_identity / macro_start_session response)."
+        ),
+        LifecycleAuthRefusal::TokenRequired => format!(
+            "{action} over HTTP requires the registration_token for agent '{name}'; a tmux pane bound \
+to the agent does not authorize lifecycle changes on this transport. Present the token returned when \
+'{name}' was registered (the `registration_token` field of the register_agent / create_agent_identity / \
+macro_start_session response). Over stdio the same call may instead run from the pane bound to '{name}'."
+        ),
+        LifecycleAuthRefusal::NoBoundPane => format!(
+            "{action} requires the registration_token for agent '{name}', or a tmux pane session bound to \
+that agent. Present the token returned when '{name}' was registered (the `registration_token` field of \
+the register_agent / create_agent_identity / macro_start_session response), or run the call from \
+the pane '{name}' registered in."
+        ),
+    };
 
     Err(legacy_tool_error(
         "AUTHENTICATION_REQUIRED",
-        format!(
-            "{action} requires the registration_token for agent '{}', or a pane session bound to that agent.",
-            agent.name
-        ),
+        message,
         true,
         json!({
             "agent_name": agent.name,
             "project_key": project.human_key,
             "token_param": "registration_token",
+            "token_source": "register_agent / create_agent_identity / macro_start_session response field `registration_token`",
+            "transport": transport.as_str(),
+            "policy": policy.as_str(),
+            "reason": refusal.as_str(),
         }),
     ))
+}
+
+/// Validate a tool's `call_transport` argument into a
+/// [`mcp_agent_mail_core::CallTransport`]. `None`/blank means stdio (the only
+/// transport on which the argument is ever absent: the HTTP daemon always
+/// stamps it); a present-but-unknown value is a caller error, never a silent
+/// downgrade to the more permissive stdio policy.
+pub(crate) fn validated_call_transport(
+    raw: Option<&str>,
+) -> McpResult<mcp_agent_mail_core::CallTransport> {
+    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Ok(mcp_agent_mail_core::CallTransport::Stdio);
+    };
+    mcp_agent_mail_core::CallTransport::parse(raw).map_err(|error| {
+        legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!(
+                "Invalid argument value: {error}, got: '{raw}'. \
+Omit call_transport over stdio; the HTTP daemon fills it in itself. \
+Check that all parameters have valid values."
+            ),
+            true,
+            json!({
+                "field": mcp_agent_mail_core::CallTransport::ARG_NAME,
+                "allowed": ["stdio", "http"],
+            }),
+        )
+    })
 }
 
 /// Validate a tool's `tmux_socket_path` argument (GH#310) into an owned,
@@ -2795,7 +2905,7 @@ Choose a different name (or omit the name to auto-generate one)."
 
 /// Temporarily remove an agent from active routing while preserving history.
 #[tool(
-    description = "Soft-delete an agent: mark it as retired so it stops accepting new messages while preserving message history. Retired agents are hidden from active agent lists but visible in 'all agents' views.\n\nRust authorization extension: authorization requires either the agent registration_token or a pane bound to the agent."
+    description = "Soft-delete an agent: mark it as retired so it stops accepting new messages while preserving message history. Retired agents are hidden from active agent lists but visible in 'all agents' views.\n\nRust authorization extension: over stdio, authorization requires either the agent registration_token or a tmux pane bound to the agent; over HTTP (am serve-http) the registration_token is required and pane context does not authorize. The token is the `registration_token` field returned by register_agent / create_agent_identity / macro_start_session."
 )]
 pub async fn retire_agent(
     ctx: &McpContext,
@@ -2810,8 +2920,14 @@ pub async fn retire_agent(
     // `X-Tmux-Socket` header and ignores any body value; stdio callers may pass
     // it explicitly. Ignored when `pane_id` is absent.
     tmux_socket_path: Option<String>,
+    // Transport the call arrived on ("stdio" | "http"). Transport-owned: the
+    // HTTP daemon always stamps "http" over whatever the body said; stdio
+    // callers omit it. Selects the lifecycle authorization policy — over HTTP
+    // the registration_token is required and a bound pane does not authorize.
+    call_transport: Option<String>,
 ) -> McpResult<String> {
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
+    let transport = validated_call_transport(call_transport.as_deref())?;
     let pool = get_db_pool()?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let agent = db_outcome_to_mcp_result(
@@ -2829,6 +2945,7 @@ pub async fn retire_agent(
         registration_token.as_deref(),
         pane_id.as_deref(),
         mcp_agent_mail_core::TmuxServer::from_validated(tmux_socket_path.as_deref()),
+        transport,
         "retire_agent",
     )?;
     reject_deregistered_lifecycle_transition(ctx, &pool, &agent, "retired").await?;
@@ -2863,7 +2980,7 @@ pub async fn retire_agent(
 
 /// Restore a retired agent to active routing.
 #[tool(
-    description = "Restore a retired agent back to active status. The agent will resume accepting new messages.\n\nRust authorization extension: deregistered agents cannot be unretired, and authorization requires either the agent registration_token or a pane bound to the agent."
+    description = "Restore a retired agent back to active status. The agent will resume accepting new messages.\n\nRust authorization extension: deregistered agents cannot be unretired. Over stdio, authorization requires either the agent registration_token or a tmux pane bound to the agent; over HTTP (am serve-http) the registration_token is required and pane context does not authorize. The token is the `registration_token` field returned by register_agent / create_agent_identity / macro_start_session."
 )]
 pub async fn unretire_agent(
     ctx: &McpContext,
@@ -2878,8 +2995,11 @@ pub async fn unretire_agent(
     // `X-Tmux-Socket` header and ignores any body value; stdio callers may pass
     // it explicitly. Ignored when `pane_id` is absent.
     tmux_socket_path: Option<String>,
+    // Transport the call arrived on ("stdio" | "http"); see `retire_agent`.
+    call_transport: Option<String>,
 ) -> McpResult<String> {
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
+    let transport = validated_call_transport(call_transport.as_deref())?;
     let pool = get_db_pool()?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let agent = db_outcome_to_mcp_result(
@@ -2897,6 +3017,7 @@ pub async fn unretire_agent(
         registration_token.as_deref(),
         pane_id.as_deref(),
         mcp_agent_mail_core::TmuxServer::from_validated(tmux_socket_path.as_deref()),
+        transport,
         "unretire_agent",
     )?;
     reject_deregistered_lifecycle_transition(ctx, &pool, &agent, "unretired").await?;
@@ -2920,7 +3041,7 @@ pub async fn unretire_agent(
 
 /// Permanently remove an agent from active routing without deleting history.
 #[tool(
-    description = "Remove an agent from a project. Marks the agent as inactive and removes it from the active roster. Messages from/to the agent are preserved for audit but the agent can no longer send or receive new messages.\n\nRust authorization extension: deregistration also preserves reservations and Git archive history. It is permanent for that identity, and authorization requires either the agent registration_token or a pane bound to the agent."
+    description = "Remove an agent from a project. Marks the agent as inactive and removes it from the active roster. Messages from/to the agent are preserved for audit but the agent can no longer send or receive new messages.\n\nRust authorization extension: deregistration also preserves reservations and Git archive history. It is permanent for that identity. Over stdio, authorization requires either the agent registration_token or a tmux pane bound to the agent; over HTTP (am serve-http) the registration_token is required and pane context does not authorize. The token is the `registration_token` field returned by register_agent / create_agent_identity / macro_start_session."
 )]
 pub async fn deregister_agent(
     ctx: &McpContext,
@@ -2935,8 +3056,11 @@ pub async fn deregister_agent(
     // `X-Tmux-Socket` header and ignores any body value; stdio callers may pass
     // it explicitly. Ignored when `pane_id` is absent.
     tmux_socket_path: Option<String>,
+    // Transport the call arrived on ("stdio" | "http"); see `retire_agent`.
+    call_transport: Option<String>,
 ) -> McpResult<String> {
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
+    let transport = validated_call_transport(call_transport.as_deref())?;
     let pool = get_db_pool()?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let agent = db_outcome_to_mcp_result(
@@ -2954,6 +3078,7 @@ pub async fn deregister_agent(
         registration_token.as_deref(),
         pane_id.as_deref(),
         mcp_agent_mail_core::TmuxServer::from_validated(tmux_socket_path.as_deref()),
+        transport,
         "deregister_agent",
     )?;
 
@@ -3425,6 +3550,118 @@ mod tests {
             blocking_dispatch_zombies: 0,
             blocking_dispatch_timeouts_total: 0,
         }
+    }
+
+    // ── PR #310 follow-up: per-transport lifecycle authorization ──────────
+
+    use mcp_agent_mail_core::{CallTransport, LifecycleAuthPolicy};
+    use std::cell::Cell;
+
+    const STORED: Option<&str> = Some("tok-BlueLake");
+
+    /// A pane probe that records whether it ran and answers `bound`.
+    fn pane_probe(bound: bool) -> (std::rc::Rc<Cell<bool>>, impl FnOnce() -> bool) {
+        let probed = std::rc::Rc::new(Cell::new(false));
+        let flag = std::rc::Rc::clone(&probed);
+        (probed, move || {
+            flag.set(true);
+            bound
+        })
+    }
+
+    #[test]
+    fn lifecycle_http_pane_match_without_token_is_refused_without_probing() {
+        let policy = LifecycleAuthPolicy::for_transport(CallTransport::Http);
+        let (probed, probe) = pane_probe(true);
+        assert_eq!(
+            lifecycle_auth_decision(policy, None, STORED, probe),
+            Err(LifecycleAuthRefusal::TokenRequired)
+        );
+        assert!(
+            !probed.get(),
+            "HTTP without a token must not spawn a tmux probe"
+        );
+        // An empty token is the same as no token.
+        let (probed, probe) = pane_probe(true);
+        assert_eq!(
+            lifecycle_auth_decision(policy, Some(""), STORED, probe),
+            Err(LifecycleAuthRefusal::TokenRequired)
+        );
+        assert!(!probed.get());
+    }
+
+    #[test]
+    fn lifecycle_http_valid_token_is_allowed() {
+        let policy = LifecycleAuthPolicy::for_transport(CallTransport::Http);
+        let (probed, probe) = pane_probe(false);
+        assert_eq!(
+            lifecycle_auth_decision(policy, STORED, STORED, probe),
+            Ok(())
+        );
+        assert!(!probed.get(), "a matching token never needs the pane");
+    }
+
+    #[test]
+    fn lifecycle_stdio_pane_match_is_still_allowed() {
+        let policy = LifecycleAuthPolicy::for_transport(CallTransport::Stdio);
+        let (probed, probe) = pane_probe(true);
+        assert_eq!(lifecycle_auth_decision(policy, None, STORED, probe), Ok(()));
+        assert!(probed.get(), "stdio without a token consults the pane");
+
+        let (_, probe) = pane_probe(false);
+        assert_eq!(
+            lifecycle_auth_decision(policy, None, STORED, probe),
+            Err(LifecycleAuthRefusal::NoBoundPane)
+        );
+    }
+
+    #[test]
+    fn lifecycle_wrong_token_never_falls_back_to_pane_on_any_transport() {
+        for transport in [CallTransport::Stdio, CallTransport::Http] {
+            let policy = LifecycleAuthPolicy::for_transport(transport);
+            let (probed, probe) = pane_probe(true);
+            assert_eq!(
+                lifecycle_auth_decision(policy, Some("tok-Stolen"), STORED, probe),
+                Err(LifecycleAuthRefusal::TokenMismatch),
+                "{transport}"
+            );
+            assert!(
+                !probed.get(),
+                "{transport}: a wrong token is loud, not a pane fallback"
+            );
+        }
+        // An agent without a stored token cannot be authorized by any token.
+        let policy = LifecycleAuthPolicy::for_transport(CallTransport::Stdio);
+        let (_, probe) = pane_probe(true);
+        assert_eq!(
+            lifecycle_auth_decision(policy, Some("tok-any"), None, probe),
+            Err(LifecycleAuthRefusal::TokenMismatch)
+        );
+    }
+
+    #[test]
+    fn validated_call_transport_defaults_to_stdio_and_rejects_unknown_values() {
+        assert_eq!(
+            validated_call_transport(None).expect("absent"),
+            CallTransport::Stdio
+        );
+        assert_eq!(
+            validated_call_transport(Some("  ")).expect("blank"),
+            CallTransport::Stdio
+        );
+        assert_eq!(
+            validated_call_transport(Some("http")).expect("http"),
+            CallTransport::Http
+        );
+        assert_eq!(
+            validated_call_transport(Some(" STDIO ")).expect("stdio"),
+            CallTransport::Stdio
+        );
+        let err = validated_call_transport(Some("sse")).expect_err("unknown transport");
+        let data = err.data.expect("error payload");
+        assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
+        assert_eq!(data["error"]["data"]["field"], "call_transport");
+        assert!(err.message.contains("call_transport"), "{}", err.message);
     }
 
     // ── C1 (br-bvq1x.3.1): decomposed verdicts + strict roll-up ──────────
