@@ -1033,6 +1033,7 @@ mod tests {
                  unique stable keys; refusing ambiguous recovery"
                     .to_string(),
             tripped: false,
+            attempt_in_progress: false,
         };
         mcp_agent_mail_db::recovery_breaker::store(&db_path, &state).expect("store breaker");
 
@@ -1217,6 +1218,7 @@ mod tests {
                         last_failure_unix: i64::MAX,
                         last_failure_reason: "cross-count fixture is circuit-broken".to_string(),
                         tripped: true,
+                        attempt_in_progress: false,
                     };
                     mcp_agent_mail_db::recovery_breaker::store(&path, &state)
                         .expect("store tripped cross-count breaker");

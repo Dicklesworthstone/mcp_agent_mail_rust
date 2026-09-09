@@ -6,21 +6,20 @@
 //!
 //! The durable recovery circuit breaker (br-acusl) parked automatic
 //! recovery for a database: N consecutive automatic recovery attempts
-//! failed on the SAME database content, so the self-heal loop stopped
+//! failed in the same recovery lineage, so the self-heal loop stopped
 //! re-attempting (and stopped capturing a forensic bundle per attempt —
 //! the trj incident refilled 96 GB of dumps that way). The mailbox is
 //! degraded until an operator intervenes: reads may work, but corruption
 //! recovery will not be retried automatically until the cooldown elapses
-//! or the database content changes.
+//! or the database content changes after a completed attempt.
 //!
 //! ## Detection (pure function)
 //!
 //! For each candidate database path: read the
 //! `<db>.am-recovery-breaker.json` sidecar; emit a finding when it is
-//! `tripped` AND its recorded content fingerprint still matches the
-//! database currently on disk (a fingerprint mismatch means the content
-//! already changed — the breaker will admit the next attempt on its own,
-//! so there is nothing to surface).
+//! `tripped` AND its history still applies to the database: either the content
+//! fingerprint matches or an automatic attempt remains unfinished. Changed
+//! bytes after an unfinished attempt do not prove operator intervention.
 //!
 //! ## Fix
 //!
@@ -56,7 +55,7 @@ impl RecoveryBreakerTrippedFinding {
         let title = self.authority_error.as_ref().map_or_else(
             || {
                 format!(
-                    "automatic recovery for {} is circuit-broken after {} consecutive failures on the same database content",
+                    "automatic recovery for {} is circuit-broken after {} consecutive failures in the same recovery lineage",
                     self.db_path.display(),
                     self.consecutive_failures,
                 )
@@ -84,7 +83,7 @@ impl RecoveryBreakerTrippedFinding {
                 "operator_remediation": [
                     "am doctor repair       # bypasses the breaker; clears it on success",
                     "am doctor reconstruct  # archive-first rebuild; bypasses the breaker",
-                    "quarantine the file (move storage.sqlite3* aside) to rebuild from the Git archive; the breaker admits changed content automatically",
+                    "operator-supervised repair or reconstruction clears unfinished-attempt history on success; changing files alone does not clear an unfinished attempt",
                 ],
                 "cooldown_note": "automatic recovery half-opens on its own after AM_RECOVERY_BREAKER_COOLDOWN_SECS (default 21600s)",
             }),
@@ -128,9 +127,10 @@ fn detect_one(db_path: &Path) -> Option<RecoveryBreakerTrippedFinding> {
     if !state.tripped {
         return None;
     }
-    if state.db_fingerprint != mcp_agent_mail_db::recovery_breaker::fingerprint_db(db_path) {
-        // Content already changed (operator intervened / file replaced):
-        // the breaker will admit the next attempt on its own.
+    if !state.applies_to(&mcp_agent_mail_db::recovery_breaker::fingerprint_db(
+        db_path,
+    )) {
+        // Changed content after a completed attempt starts a new lineage.
         return None;
     }
     Some(RecoveryBreakerTrippedFinding {
@@ -236,6 +236,24 @@ mod tests {
             detect(&[db]).is_empty(),
             "changed content self-resolves; the breaker admits the next attempt"
         );
+    }
+
+    #[test]
+    fn detector_retains_unfinished_attempt_after_content_changed() {
+        let td = TempDir::new().unwrap();
+        let db = tripped_db(&td, "storage.sqlite3");
+        let mut state = mcp_agent_mail_db::recovery_breaker::load(&db)
+            .unwrap()
+            .unwrap();
+        state.attempt_in_progress = true;
+        store(&db, &state).unwrap();
+        std::fs::write(&db, b"unfinished-recovery-mutated-content").unwrap();
+        let findings = detect(std::slice::from_ref(&db));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].consecutive_failures, 3);
+
+        store(&db, &cleared_state(&fingerprint_db(&db))).unwrap();
+        assert!(detect(&[db]).is_empty());
     }
 
     #[test]

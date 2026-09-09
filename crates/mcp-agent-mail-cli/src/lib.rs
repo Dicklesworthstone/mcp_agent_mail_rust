@@ -57197,6 +57197,7 @@ startup_timeout_sec = 42
             last_failure_reason: "reservations produced 220 rows but only 215 unique stable keys"
                 .to_string(),
             tripped: false,
+            attempt_in_progress: false,
         };
         mcp_agent_mail_db::recovery_breaker::store(&db_path, &state).expect("store breaker");
         let note = doctor_recovery_breaker_note(&database_url)
@@ -58887,6 +58888,7 @@ startup_timeout_sec = 42
                 last_failure_unix: now_unix,
                 last_failure_reason: "parked recovery".to_string(),
                 tripped: true,
+                attempt_in_progress: false,
             },
         )
         .expect("plant tripped breaker authority");
@@ -58968,6 +58970,7 @@ startup_timeout_sec = 42
                         last_failure_unix: now_unix,
                         last_failure_reason: "parked recovery".to_string(),
                         tripped: true,
+                        attempt_in_progress: false,
                     },
                 )
                 .expect("plant tripped breaker authority");
@@ -72693,6 +72696,7 @@ startup_timeout_sec = 42
                 last_failure_unix: now_unix,
                 last_failure_reason: "parked recovery".to_string(),
                 tripped: true,
+                attempt_in_progress: false,
             },
         )
         .expect("plant tripped breaker authority");
@@ -73843,6 +73847,7 @@ startup_timeout_sec = 42
                         last_failure_unix: now_unix,
                         last_failure_reason: "parked CLI recovery".to_string(),
                         tripped: true,
+                        attempt_in_progress: false,
                     },
                 )
                 .expect("plant tripped breaker authority");

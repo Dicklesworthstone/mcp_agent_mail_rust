@@ -2756,9 +2756,9 @@ fn guard_raw_live_sqlite_engine_open(path: &Path, context: &str) -> std::io::Res
     let nonclean_authority = match mcp_agent_mail_db::recovery_breaker::load(path) {
         Ok(Some(state)) if state.tripped || state.consecutive_failures > 0 => {
             let fingerprint = mcp_agent_mail_db::recovery_breaker::fingerprint_db(path);
-            (state.db_fingerprint == fingerprint).then(|| {
+            state.applies_to(&fingerprint).then(|| {
                 format!(
-                    "durable recovery-breaker state records {} failed attempt(s) for these exact primary bytes{}",
+                    "durable recovery-breaker state records {} failed attempt(s) for this recovery lineage{}",
                     state.consecutive_failures,
                     if state.tripped { " and is tripped" } else { "" }
                 )
@@ -17860,6 +17860,7 @@ mod tests {
             last_failure_unix: i64::MAX,
             last_failure_reason: "synthetic repeated recovery failure".to_string(),
             tripped: true,
+            attempt_in_progress: false,
         };
         mcp_agent_mail_db::recovery_breaker::store(&db_path, &breaker_state)
             .expect("store tripped breaker");
@@ -17939,6 +17940,7 @@ mod tests {
             last_failure_unix: i64::MAX,
             last_failure_reason: "synthetic repeated recovery failure".to_string(),
             tripped: true,
+            attempt_in_progress: false,
         };
         mcp_agent_mail_db::recovery_breaker::store(&db_path, &breaker_state)
             .expect("store tripped breaker");
@@ -29842,10 +29844,15 @@ first body
                 std::fs::write(&breaker_path, b"malformed breaker authority")
                     .expect("write malformed breaker authority");
             }
-            "tripped" => {
+            "tripped" | "unfinished-changed" => {
                 let state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
                     schema: 1,
-                    db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(db_path),
+                    attempt_in_progress: breaker_kind == "unfinished-changed",
+                    db_fingerprint: if breaker_kind == "unfinished-changed" {
+                        "missing".into()
+                    } else {
+                        mcp_agent_mail_db::recovery_breaker::fingerprint_db(db_path)
+                    },
                     consecutive_failures:
                         mcp_agent_mail_db::recovery_breaker::DEFAULT_MAX_CONSECUTIVE_FAILURES,
                     last_failure_unix: i64::MAX,
@@ -29866,9 +29873,9 @@ first body
     ) {
         for family_kind in ["damaged-wal", "corrupt-primary"] {
             let breaker_kinds: &[&str] = if family_kind == "damaged-wal" {
-                &["absent", "malformed", "tripped"]
+                &["absent", "malformed", "tripped", "unfinished-changed"]
             } else {
-                &["malformed", "tripped"]
+                &["malformed", "tripped", "unfinished-changed"]
             };
             for &breaker_kind in breaker_kinds {
                 let dir = tempfile::tempdir().expect("tempdir");

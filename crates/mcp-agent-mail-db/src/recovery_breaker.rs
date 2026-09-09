@@ -16,7 +16,7 @@
 //! refuses fast — BEFORE any forensic capture — until either
 //!
 //! * the cooldown elapses (one half-open attempt is then admitted),
-//! * the database content changes (operator replaced/quarantined it), or
+//! * the database content changes with no unfinished automatic attempt, or
 //! * an operator-invoked path (doctor repair/reconstruct) runs with the
 //!   explicit [`RecoveryBreakerBypassGuard`], which is never refused.
 //!
@@ -96,6 +96,20 @@ pub struct RecoveryBreakerState {
     /// Truncated human-readable reason for the most recent failure.
     pub last_failure_reason: String,
     pub tripped: bool,
+    /// Armed before automatic recovery starts; cleared by a terminal result.
+    /// While set, changed bytes may be our own interrupted mutation and must
+    /// not reset the failure lineage. Process death cannot clear this marker.
+    #[serde(default)]
+    pub attempt_in_progress: bool,
+}
+
+impl RecoveryBreakerState {
+    /// Whether this history governs the current database generation.
+    /// An unfinished attempt may have changed the bytes before process death.
+    #[must_use]
+    pub fn applies_to(&self, fingerprint: &str) -> bool {
+        self.attempt_in_progress || self.db_fingerprint == fingerprint
+    }
 }
 
 /// What the breaker says about an automatic recovery attempt.
@@ -124,7 +138,7 @@ pub fn evaluate(
     let Some(state) = state else {
         return BreakerVerdict::Allow;
     };
-    if state.db_fingerprint != fingerprint {
+    if !state.applies_to(fingerprint) {
         // Different content ⇒ different problem (operator replaced or
         // quarantined the file, or it changed on its own). Start fresh.
         return BreakerVerdict::Allow;
@@ -157,9 +171,7 @@ pub fn record_failure(
     now_unix: i64,
 ) -> RecoveryBreakerState {
     let consecutive_failures = match prev {
-        Some(prev) if prev.db_fingerprint == fingerprint => {
-            prev.consecutive_failures.saturating_add(1)
-        }
+        Some(prev) if prev.applies_to(fingerprint) => prev.consecutive_failures.saturating_add(1),
         _ => 1,
     };
     let mut truncated_reason = reason.to_string();
@@ -179,7 +191,28 @@ pub fn record_failure(
         last_failure_unix: now_unix,
         last_failure_reason: truncated_reason,
         tripped: consecutive_failures >= config.max_consecutive_failures,
+        attempt_in_progress: false,
     }
+}
+
+/// Arm a counted attempt before entering automatic recovery. A terminal
+/// failure replaces this record without counting the same attempt twice.
+#[must_use]
+pub(crate) fn record_attempt(
+    prev: Option<&RecoveryBreakerState>,
+    fingerprint: &str,
+    config: RecoveryBreakerConfig,
+    now_unix: i64,
+) -> RecoveryBreakerState {
+    let mut state = record_failure(
+        prev,
+        fingerprint,
+        "automatic recovery attempt did not complete",
+        config,
+        now_unix,
+    );
+    state.attempt_in_progress = true;
+    state
 }
 
 /// PURE: the state written after a successful recovery. The sidecar is
@@ -193,6 +226,7 @@ pub fn cleared_state(fingerprint: &str) -> RecoveryBreakerState {
         last_failure_unix: 0,
         last_failure_reason: String::new(),
         tripped: false,
+        attempt_in_progress: false,
     }
 }
 
@@ -476,6 +510,7 @@ fn recovery_breaker_state_is_semantically_valid(state: &RecoveryBreakerState) ->
         && state.last_failure_unix >= 0
         && state.last_failure_reason.len() <= MAX_REASON_BYTES + '…'.len_utf8()
         && (!state.tripped || state.consecutive_failures > 0)
+        && (!state.attempt_in_progress || state.consecutive_failures > 0)
 }
 
 /// Persist the sidecar atomically (write-tmp-then-rename).
@@ -641,6 +676,58 @@ mod tests {
     }
 
     #[test]
+    fn unfinished_attempt_retains_changed_content_history_and_cooldown() {
+        let first = record_attempt(None, "fp-a", CFG, 1_000);
+        let second = record_attempt(Some(&first), "fp-b", CFG, 1_010);
+        let third = record_attempt(Some(&second), "fp-c", CFG, 1_020);
+        assert!(third.attempt_in_progress);
+        assert_eq!(third.consecutive_failures, 3);
+        assert!(third.tripped);
+        assert!(matches!(
+            evaluate(Some(&third), "fp-d", CFG, 1_030),
+            BreakerVerdict::Refuse {
+                consecutive_failures: 3,
+                ..
+            }
+        ));
+        assert_eq!(
+            evaluate(Some(&third), "fp-d", CFG, 1_120),
+            BreakerVerdict::AllowHalfOpen
+        );
+
+        let completed = record_failure(Some(&third), "fp-d", "terminal failure", CFG, 1_120);
+        assert_eq!(completed.consecutive_failures, 4);
+        assert!(!completed.attempt_in_progress);
+        assert_eq!(
+            evaluate(Some(&completed), "operator-replacement", CFG, 1_121),
+            BreakerVerdict::Allow
+        );
+        assert!(!cleared_state("fp-d").attempt_in_progress);
+    }
+
+    #[test]
+    fn unfinished_attempt_without_a_count_is_invalid_authority() {
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("storage.sqlite3");
+        std::fs::write(&db, b"content").unwrap();
+        let mut invalid = cleared_state(&fingerprint_db(&db));
+        invalid.attempt_in_progress = true;
+        assert_eq!(
+            store(&db, &invalid).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        std::fs::write(
+            breaker_sidecar_path(&db),
+            serde_json::to_vec(&invalid).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load(&db).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
     fn tripped_refuses_within_cooldown_and_half_opens_after() {
         let mut state = record_failure(None, "fp", "x", CFG, 0);
         state = record_failure(Some(&state), "fp", "x", CFG, 0);
@@ -681,6 +768,7 @@ mod tests {
             last_failure_unix: i64::MAX,
             last_failure_reason: "future clock".to_string(),
             tripped: true,
+            attempt_in_progress: false,
         };
         assert_eq!(
             evaluate(Some(&state), "fp", CFG, 1_000),
@@ -701,6 +789,7 @@ mod tests {
             last_failure_unix: 1_000,
             last_failure_reason: "failed twice".to_string(),
             tripped: false,
+            attempt_in_progress: false,
         };
         let lowered = RecoveryBreakerConfig {
             max_consecutive_failures: 2,

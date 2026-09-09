@@ -5098,6 +5098,7 @@ mod tests {
             .unwrap_or(i64::MAX),
             last_failure_reason: "startup fixture is circuit-broken".to_string(),
             tripped: true,
+            attempt_in_progress: false,
         };
         mcp_agent_mail_db::recovery_breaker::store(&db_path, &breaker_state)
             .expect("store tripped breaker");

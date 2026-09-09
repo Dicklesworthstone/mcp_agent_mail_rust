@@ -1445,9 +1445,9 @@ where
     // Instant-based and process-local, so a restarting or long-looping
     // daemon still re-attempts an unrepairable database forever — each
     // attempt capturing a forensic bundle. The breaker persists consecutive
-    // failures for the SAME database content in a sidecar and refuses HERE,
-    // before any capture, until the cooldown elapses, the content changes,
-    // or an operator path runs under RecoveryBreakerBypassGuard.
+    // failures for the same recovery lineage in a sidecar and refuses HERE,
+    // before any capture, until the cooldown elapses, completed-attempt content
+    // changes, or an operator path runs under RecoveryBreakerBypassGuard.
     let breaker_prior = match crate::recovery_breaker::load(primary_path) {
         Ok(state) => state,
         Err(error) if breaker_bypass => {
@@ -1511,16 +1511,17 @@ where
         ));
     };
     let _depth_guard = RecoveryAdmissionDepthGuard::enter(normalized_primary);
-    if !breaker_bypass && outcome_policy == RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome {
+    let armed_attempt = if !breaker_bypass
+        && outcome_policy == RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome
+    {
         // Arm the durable state before entering code that may panic, abort, or
         // lose power. The terminal write below replaces this provisional
         // reason without incrementing the attempt twice. A crashed half-open
         // probe therefore starts a fresh cooldown instead of immediately
         // admitting another process after restart.
-        let armed = crate::recovery_breaker::record_failure(
+        let armed = crate::recovery_breaker::record_attempt(
             breaker_prior.as_ref(),
             &breaker_fingerprint,
-            "automatic recovery attempt did not complete",
             breaker_config,
             attempt_started_unix,
         );
@@ -1533,9 +1534,33 @@ where
                 )),
             )
         })?;
-    }
+        Some(armed)
+    } else {
+        None
+    };
 
-    let operation_result = operation();
+    let operation_result = if let Some(mut armed) = armed_attempt {
+        // Preserve the original panic payload. Retargeting is best effort:
+        // if persistence fails (or the process aborts instead of unwinding),
+        // the already-durable unfinished marker still retains the lineage.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+            Ok(result) => result,
+            Err(payload) => {
+                armed.db_fingerprint = recovery_breaker_fingerprint(primary_path, None);
+                armed.last_failure_unix = now_unix();
+                if let Err(error) = crate::recovery_breaker::store(primary_path, &armed) {
+                    tracing::error!(
+                        path = %primary_path.display(),
+                        %error,
+                        "could not retarget crashed recovery; durable unfinished marker remains authoritative"
+                    );
+                }
+                std::panic::resume_unwind(payload);
+            }
+        }
+    } else {
+        operation()
+    };
     if outcome_policy == RecoveryAdmissionOutcomePolicy::GuardMutationOnly {
         return operation_result.map_err(AutomaticRecoveryRunError::Operation);
     }
@@ -1571,13 +1596,14 @@ where
             let terminal_fingerprint = recovery_breaker_fingerprint(primary_path, None);
             // A failed recovery may itself mutate the primary before returning
             // (for example, an in-place repair whose final verification fails).
-            // Carry forward only history that matched the admitted pre-image,
+            // Carry forward history that matched the admitted pre-image or
+            // belonged to an unfinished automatic attempt,
             // then retarget that lineage to the terminal bytes so the next
             // restart cannot treat our own failed mutation as operator-supplied
             // new authority and reset the breaker count.
             let mut lineage_prior = breaker_prior
                 .clone()
-                .filter(|prior| prior.db_fingerprint == breaker_fingerprint);
+                .filter(|prior| prior.applies_to(&breaker_fingerprint));
             if let Some(prior) = &mut lineage_prior {
                 prior.db_fingerprint.clone_from(&terminal_fingerprint);
             }
@@ -3967,7 +3993,7 @@ impl DbPool {
             Err(_) => true,
             Ok(Some(state)) => {
                 let fingerprint = recovery_breaker_fingerprint(sqlite_path, Some(&state));
-                state.consecutive_failures > 0 && state.db_fingerprint == fingerprint
+                state.consecutive_failures > 0 && state.applies_to(&fingerprint)
             }
             Ok(None) => false,
         };
@@ -12038,9 +12064,9 @@ where
         Ok(Some(_)) if inside_own_admission => None,
         Ok(Some(state)) if state.tripped || state.consecutive_failures > 0 => {
             let fingerprint = crate::recovery_breaker::fingerprint_db(sqlite_path);
-            (state.db_fingerprint == fingerprint).then(|| {
+            state.applies_to(&fingerprint).then(|| {
                 format!(
-                    "durable recovery-breaker state records {} failed attempt(s) for these exact primary bytes{}",
+                    "durable recovery-breaker state records {} failed attempt(s) for this recovery lineage{}",
                     state.consecutive_failures,
                     if state.tripped { " and is tripped" } else { "" }
                 )
@@ -17355,6 +17381,7 @@ mod tests {
                 last_failure_unix: recovery_breaker_now_unix(),
                 last_failure_reason: "diagnostic fixture tripped".to_string(),
                 tripped: true,
+                attempt_in_progress: false,
             },
         )
         .expect("store tripped diagnostic breaker");
@@ -17371,10 +17398,9 @@ mod tests {
         seed_settled_diagnostic_database(&db_path);
         admit_diagnostic_database_with_franken(&db_path);
         let config = crate::recovery_breaker::config_from_env();
-        let armed = crate::recovery_breaker::record_failure(
+        let armed = crate::recovery_breaker::record_attempt(
             None,
             &crate::recovery_breaker::fingerprint_db(&db_path),
-            "automatic recovery attempt did not complete",
             config,
             recovery_breaker_now_unix(),
         );
@@ -17410,13 +17436,19 @@ mod tests {
 
     #[test]
     fn guarded_read_only_breaker_authority_causally_controls_exact_family_proof() {
-        for breaker_kind in ["malformed", "tripped"] {
+        for breaker_kind in ["malformed", "tripped", "unfinished-changed"] {
             let directory = tempfile::tempdir().expect("tempdir");
             let db_path = directory
                 .path()
                 .join(format!("breaker-causal-{breaker_kind}.sqlite3"));
             seed_settled_diagnostic_database(&db_path);
             install_diagnostic_breaker(&db_path, breaker_kind);
+            if breaker_kind == "unfinished-changed" {
+                let mut state = crate::recovery_breaker::load(&db_path).unwrap().unwrap();
+                state.attempt_in_progress = true;
+                state.db_fingerprint = "missing".into();
+                crate::recovery_breaker::store(&db_path, &state).unwrap();
+            }
             let probe_calls = std::cell::Cell::new(0_u32);
 
             preflight_guarded_offline_canonical_sqlite_family_with_probe(
@@ -17453,6 +17485,7 @@ mod tests {
                     last_failure_unix: recovery_breaker_now_unix(),
                     last_failure_reason: "failure on stale bytes".to_string(),
                     tripped: true,
+                    attempt_in_progress: false,
                 }
             };
             crate::recovery_breaker::store(&db_path, &state)
@@ -22447,6 +22480,7 @@ mod tests {
                     last_failure_unix: recovery_breaker_now_unix(),
                     last_failure_reason: "startup integrity fixture tripped".to_string(),
                     tripped: true,
+                    attempt_in_progress: false,
                 };
                 crate::recovery_breaker::store(db_path, &state).expect("store tripped breaker");
             },
@@ -22530,6 +22564,7 @@ mod tests {
                     last_failure_unix: recovery_breaker_now_unix(),
                     last_failure_reason: "corrupt-primary fixture tripped".to_string(),
                     tripped: true,
+                    attempt_in_progress: false,
                 };
                 crate::recovery_breaker::store(db_path, &state).expect("store tripped breaker");
             },
@@ -22564,6 +22599,7 @@ mod tests {
                     last_failure_unix: recovery_breaker_now_unix(),
                     last_failure_reason: "healthy-family fixture tripped".to_string(),
                     tripped: true,
+                    attempt_in_progress: false,
                 };
                 crate::recovery_breaker::store(&db_path, &state).expect("store tripped breaker");
             }
@@ -22638,6 +22674,7 @@ mod tests {
                         last_failure_unix: recovery_breaker_now_unix(),
                         last_failure_reason: "full-integrity fixture tripped".to_string(),
                         tripped: true,
+                        attempt_in_progress: false,
                     };
                     crate::recovery_breaker::store(&db_path, &state)
                         .expect("store tripped breaker");
@@ -27142,6 +27179,145 @@ mod tests {
     }
 
     #[test]
+    fn abrupt_recovery_exit_preserves_lineage_across_restarts() {
+        const CHILD_PATH: &str = "AM_TEST_CRASH_LINEAGE_DB";
+        const CHILD_GENERATION: &str = "AM_TEST_CRASH_LINEAGE_GENERATION";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            // Bound the owned subprocess even if admission wedges. exit skips
+            // Rust destructors, just like abrupt process termination does.
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_secs(15));
+                std::process::exit(74);
+            });
+            let db = PathBuf::from(path);
+            let generation = std::env::var(CHILD_GENERATION).unwrap();
+            let _ = with_recovery_admission_using_clock::<(), _, _>(
+                &db,
+                "abrupt recovery",
+                || {
+                    std::fs::write(&db, generation).unwrap();
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&db)
+                        .unwrap()
+                        .sync_all()
+                        .unwrap();
+                    std::process::exit(73);
+                },
+                || 100,
+            );
+            panic!("child recovery must reach the deliberate exit");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("storage.sqlite3");
+        std::fs::write(&db, b"initial-corrupt-content").unwrap();
+        for attempt in 1..=3 {
+            let generation = format!("abrupt-repair-generation-{attempt}");
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pool::tests::abrupt_recovery_exit_preserves_lineage_across_restarts",
+                    "--nocapture",
+                ])
+                .env(CHILD_PATH, &db)
+                .env(CHILD_GENERATION, &generation)
+                .output()
+                .expect("run actual recovery subprocess");
+            assert_eq!(
+                child.status.code(),
+                Some(73),
+                "child did not reach the deliberate exit: {child:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&db).unwrap(), generation);
+            let state = crate::recovery_breaker::load(&db).unwrap().unwrap();
+            assert!(state.attempt_in_progress);
+            assert_eq!(state.consecutive_failures, attempt);
+            assert_ne!(
+                state.db_fingerprint,
+                crate::recovery_breaker::fingerprint_db(&db)
+            );
+        }
+
+        let prior = crate::recovery_breaker::load(&db).unwrap().unwrap();
+        assert!(prior.tripped);
+        let called = std::cell::Cell::new(false);
+        let error = with_recovery_admission_using_clock(
+            &db,
+            "fourth recovery after restart",
+            || {
+                called.set(true);
+                Ok(())
+            },
+            || 100,
+        )
+        .expect_err("unfinished attempt must retain history despite changed bytes");
+        assert!(!called.get());
+        assert!(error.to_string().contains("circuit-broken"));
+        assert_eq!(crate::recovery_breaker::load(&db).unwrap().unwrap(), prior);
+    }
+
+    #[test]
+    fn terminal_recovery_after_crash_completes_the_existing_lineage() {
+        for succeeds in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("storage.sqlite3");
+            std::fs::write(&db, b"pre-crash-content").unwrap();
+            let armed = crate::recovery_breaker::record_attempt(
+                None,
+                &crate::recovery_breaker::fingerprint_db(&db),
+                crate::recovery_breaker::config_from_env(),
+                100,
+            );
+            crate::recovery_breaker::store(&db, &armed).unwrap();
+            std::fs::write(&db, b"changed-by-unfinished-attempt").unwrap();
+
+            recovery_admission().reset();
+            let result = with_recovery_admission_using_clock(
+                &db,
+                "terminal recovery after crash",
+                || {
+                    std::fs::write(&db, b"terminal-content").unwrap();
+                    if succeeds {
+                        Ok(())
+                    } else {
+                        Err(SqlError::Custom("terminal failure".into()))
+                    }
+                },
+                || 200,
+            );
+            assert_eq!(result.is_ok(), succeeds);
+            let state = crate::recovery_breaker::load(&db).unwrap().unwrap();
+            assert!(!state.attempt_in_progress);
+            assert_eq!(state.consecutive_failures, if succeeds { 0 } else { 2 });
+            assert_eq!(
+                state.db_fingerprint,
+                crate::recovery_breaker::fingerprint_db(&db)
+            );
+
+            // Once there is a terminal result, an operator's replacement is
+            // again a new recovery lineage and starts at one failure.
+            std::fs::write(&db, b"operator-replacement").unwrap();
+            recovery_admission().reset();
+            let error = with_recovery_admission_using_clock::<(), _, _>(
+                &db,
+                "new operator generation",
+                || Err(SqlError::Custom("new failure".into())),
+                || 300,
+            )
+            .expect_err("new lineage must run the failing operation");
+            assert!(error.to_string().contains("new failure"));
+            assert_eq!(
+                crate::recovery_breaker::load(&db)
+                    .unwrap()
+                    .unwrap()
+                    .consecutive_failures,
+                1
+            );
+        }
+    }
+
+    #[test]
     fn crashed_half_open_probe_is_durably_rearmed_before_operation() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("storage.sqlite3");
@@ -27158,6 +27334,7 @@ mod tests {
             last_failure_unix: old_failure.max(0),
             last_failure_reason: "old failure".to_string(),
             tripped: true,
+            attempt_in_progress: false,
         };
         crate::recovery_breaker::store(&db, &prior).expect("seed elapsed breaker");
 
@@ -28084,10 +28261,9 @@ mod tests {
         let db_path = directory.path().join("armed-canonical.sqlite3");
         seed_settled_diagnostic_database(&db_path);
         let config = crate::recovery_breaker::config_from_env();
-        let armed = crate::recovery_breaker::record_failure(
+        let armed = crate::recovery_breaker::record_attempt(
             None,
             &crate::recovery_breaker::fingerprint_db(&db_path),
-            "automatic recovery attempt did not complete",
             config,
             recovery_breaker_now_unix(),
         );
@@ -28767,7 +28943,7 @@ mod tests {
     }
 
     #[test]
-    fn proactive_backup_skips_fresh_bak_without_reverifying() {
+    fn proactive_backup_refreshes_corruption_with_unchanged_mtime_and_length() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test_refresh_bad_bak.db");
         let bak_path = dir.path().join("test_refresh_bad_bak.db.bak");
@@ -28778,25 +28954,34 @@ mod tests {
         let pool = DbPool::new(&config).unwrap();
 
         write_marker_db(&db_path, "healthy-primary");
-        std::fs::write(&bak_path, b"not-a-sqlite-backup").unwrap();
-
-        // A fresh .bak is trusted without re-verification: it was fully
-        // health-checked when published, and re-reading the whole file every
-        // guard cycle was pure overhead. Even a (synthetically) corrupt fresh
-        // .bak is skipped — it gets replaced on the next refresh interval.
-        let skipped = pool
-            .create_proactive_backup(std::time::Duration::from_hours(1))
-            .expect("fresh backup should be skipped without verification");
-        assert!(
-            skipped.is_none(),
-            "fresh .bak must be skipped without re-verification"
+        pool.create_proactive_backup(std::time::Duration::ZERO)
+            .expect("publish a healthy backup before corrupting it");
+        let before = std::fs::metadata(&bak_path).unwrap();
+        let modified = before.modified().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&bak_path)
+            .unwrap();
+        use std::io::Write as _;
+        let corrupt_prefix = b"not-a-sqlite-file";
+        (&file).write_all(corrupt_prefix).unwrap();
+        file.sync_all().unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        drop(file);
+        let corrupted = std::fs::metadata(&bak_path).unwrap();
+        assert_eq!(corrupted.len(), before.len());
+        assert_eq!(corrupted.modified().unwrap(), modified);
+        assert_eq!(
+            &std::fs::read(&bak_path).unwrap()[..corrupt_prefix.len()],
+            corrupt_prefix
         );
 
-        // Once stale, the refresh path rebuilds it from the healthy primary
-        // (staged copy is fully validated before the atomic publish).
+        // Metadata freshness does not prove these are still the verified
+        // bytes. Repair immediately, retaining the damaged generation.
         let refreshed = pool
-            .create_proactive_backup(std::time::Duration::ZERO)
-            .expect("stale corrupt backup should be refreshed");
+            .create_proactive_backup(std::time::Duration::from_hours(1))
+            .expect("corrupt fresh backup must be refreshed immediately");
         assert_eq!(
             refreshed.as_deref(),
             Some(bak_path.as_path()),
@@ -28805,7 +28990,7 @@ mod tests {
         assert_eq!(
             sqlite_marker_value(&bak_path).as_deref(),
             Some("healthy-primary"),
-            "stale unhealthy .bak should be replaced from the healthy primary"
+            "fresh unhealthy .bak should be replaced from the healthy primary"
         );
     }
 
@@ -29165,6 +29350,7 @@ mod tests {
             last_failure_unix: recovery_breaker_now_unix(),
             last_failure_reason: "fixture tripped".to_string(),
             tripped: true,
+            attempt_in_progress: false,
         };
         crate::recovery_breaker::store(&db_path, &state).unwrap();
         let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
@@ -29231,6 +29417,7 @@ mod tests {
                     last_failure_unix: recovery_breaker_now_unix(),
                     last_failure_reason: "archive fixture tripped".to_string(),
                     tripped: true,
+                    attempt_in_progress: false,
                 };
                 crate::recovery_breaker::store(&db_path, &state).expect("store tripped breaker");
             }
@@ -29370,6 +29557,7 @@ mod tests {
                     last_failure_unix: recovery_breaker_now_unix(),
                     last_failure_reason: "pool init fixture tripped".to_string(),
                     tripped: true,
+                    attempt_in_progress: false,
                 };
                 crate::recovery_breaker::store(db_path, &state).expect("store tripped breaker");
             },
@@ -29497,6 +29685,7 @@ mod tests {
                     last_failure_unix: recovery_breaker_now_unix(),
                     last_failure_reason: "missing-primary pool init fixture tripped".to_string(),
                     tripped: true,
+                    attempt_in_progress: false,
                 };
                 crate::recovery_breaker::store(db_path, &state)
                     .expect("store tripped missing-primary breaker");
@@ -29597,6 +29786,7 @@ mod tests {
                     last_failure_unix: recovery_breaker_now_unix(),
                     last_failure_reason: "healthy pool-init fixture tripped".to_string(),
                     tripped: true,
+                    attempt_in_progress: false,
                 };
                 crate::recovery_breaker::store(&db_path, &state).expect("store tripped breaker");
             }
@@ -29670,6 +29860,7 @@ mod tests {
                     last_failure_unix: recovery_breaker_now_unix(),
                     last_failure_reason: "pool main-only fixture tripped".to_string(),
                     tripped: true,
+                    attempt_in_progress: false,
                 };
                 crate::recovery_breaker::store(&db_path, &state).expect("store tripped breaker");
             }
@@ -30167,6 +30358,7 @@ mod tests {
                     last_failure_unix: recovery_breaker_now_unix(),
                     last_failure_reason: "read-probe fixture tripped".to_string(),
                     tripped: true,
+                    attempt_in_progress: false,
                 };
                 crate::recovery_breaker::store(&db_path, &state).expect("store tripped breaker");
             }
@@ -30307,6 +30499,7 @@ mod tests {
             last_failure_unix: recovery_breaker_now_unix(),
             last_failure_reason: "fixture tripped before writer drain".to_string(),
             tripped: true,
+            attempt_in_progress: false,
         };
         crate::recovery_breaker::store(&db_path, &state).expect("store tripped breaker");
         let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
