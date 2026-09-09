@@ -3107,8 +3107,8 @@ impl Config {
     /// clone of the cached value, avoiding repeated env-var parsing.
     ///
     /// Use this in hot paths (tool handlers) instead of `Config::from_env()`.
-    /// For tests or CLI commands that need a fresh or mutated config, continue
-    /// using `Config::from_env()` directly.
+    /// `Config::from_env()` reparses process variables. To reload a replaced or
+    /// repaired user config file as well, first call [`Config::reset_cached`].
     ///
     /// Cloning a ~60-field struct is ~2-3 KB and takes <1 microsecond — far
     /// cheaper than parsing 40+ environment variables with string conversions.
@@ -6530,6 +6530,16 @@ mod tests {
         run_config_reload_case("rejection");
     }
 
+    #[test]
+    fn fresh_process_config_reload_isolates_concurrent_readers() {
+        run_config_reload_case("concurrent");
+    }
+
+    #[test]
+    fn fresh_process_config_reload_restores_scope_after_panic() {
+        run_config_reload_case("panic");
+    }
+
     fn replace_reload_fixture(path: &Path, token: &str, port: u16) {
         use std::io::Write as _;
 
@@ -6547,10 +6557,91 @@ mod tests {
         config.validate_user_env_authority().unwrap();
     }
 
+    fn exercise_concurrent_reload(path: &Path) {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Repeat with an accepted and a rejected old authority. The hook pauses
+        // actual Config construction after its real file snapshot is loaded.
+        for rejected in [false, true] {
+            if rejected {
+                fs::write(path, [0xff]).unwrap();
+            } else {
+                replace_reload_fixture(path, "reload-old", 8761);
+            }
+            Config::reset_cached();
+            let old = user_env_load();
+            assert_eq!(old.authority_error.is_some(), rejected);
+            std::thread::scope(|scope| {
+                let (ready_tx, ready_rx) = mpsc::channel();
+                let mut releases = Vec::new();
+                let mut readers = Vec::new();
+                for index in 0..8 {
+                    let (release_tx, release_rx) = mpsc::channel();
+                    releases.push(release_tx);
+                    let ready_tx = ready_tx.clone();
+                    readers.push(scope.spawn(move || {
+                        let pause = || {
+                            ready_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        };
+                        if index % 2 == 0 {
+                            global_config_cache_get_with_hook(pause)
+                        } else {
+                            Config::from_env_with_generation_hook(pause)
+                        }
+                    }));
+                }
+                for _ in 0..8 {
+                    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+                replace_reload_fixture(path, "reload-new", 8762);
+                Config::reset_cached();
+                assert_reload_config(&Config::get(), "reload-new", 8762);
+                assert_reload_config(&Config::from_env(), "reload-new", 8762);
+                for release in releases {
+                    release.send(()).unwrap();
+                }
+                for reader in readers {
+                    let config = reader.join().unwrap();
+                    if rejected {
+                        assert!(config.http_bearer_token.is_none());
+                        assert_eq!(config.http_port, Config::default().http_port);
+                        assert!(config.validate_user_env_authority().is_err());
+                    } else {
+                        assert_reload_config(&config, "reload-old", 8761);
+                    }
+                }
+            });
+            // Old in-flight builders must not repopulate the replacement cache.
+            assert_reload_config(&Config::get(), "reload-new", 8762);
+            assert!(user_env_authority_error().is_none());
+        }
+    }
+
     fn run_config_reload_case(case: &str) {
         const CHILD_MARKER: &str = "AM_TEST_CONFIG_RELOAD_CHILD";
         if std::env::var(CHILD_MARKER).as_deref() == Ok(case) {
             let path = user_env_authority_candidates().into_iter().next().unwrap();
+            if case == "concurrent" {
+                exercise_concurrent_reload(&path);
+                println!("{CHILD_MARKER}:{case}:executed");
+                return;
+            }
+            if case == "panic" {
+                assert_reload_config(&Config::get(), "reload-old", 8761);
+                let panic = std::panic::catch_unwind(|| {
+                    Config::from_env_with_generation_hook(|| {
+                        replace_reload_fixture(&path, "reload-new", 8762);
+                        Config::reset_cached();
+                        panic!("deliberate configuration parse interruption");
+                    });
+                });
+                assert!(panic.is_err());
+                assert_reload_config(&Config::get(), "reload-new", 8762);
+                println!("{CHILD_MARKER}:{case}:executed");
+                return;
+            }
             let before = Config::get();
             if case == "rejection" {
                 assert!(before.http_bearer_token.is_none());
@@ -6603,6 +6694,8 @@ mod tests {
         let test = match case {
             "token" => "fresh_process_config_reload_replaces_cached_token",
             "rejection" => "fresh_process_config_reload_repairs_cached_rejection",
+            "concurrent" => "fresh_process_config_reload_isolates_concurrent_readers",
+            "panic" => "fresh_process_config_reload_restores_scope_after_panic",
             _ => unreachable!("known reload case"),
         };
         let output = std::process::Command::new(std::env::current_exe().unwrap())
