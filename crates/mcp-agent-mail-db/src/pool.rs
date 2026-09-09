@@ -27095,6 +27095,53 @@ mod tests {
     }
 
     #[test]
+    fn crashed_recovery_mutations_remain_in_one_breaker_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("storage.sqlite3");
+        std::fs::write(&db, b"initial-corrupt-content").unwrap();
+
+        for attempt in 1..=3 {
+            recovery_admission().reset();
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = with_recovery_admission_using_clock::<(), _, _>(
+                    &db,
+                    "crashing recovery",
+                    || {
+                        std::fs::write(&db, format!("crashed-repair-generation-{attempt}"))
+                            .expect("mutate primary before crashing");
+                        std::panic::panic_any(attempt);
+                    },
+                    || 100,
+                );
+            }));
+            assert_eq!(*panicked.unwrap_err().downcast::<i32>().unwrap(), attempt);
+        }
+
+        let state = crate::recovery_breaker::load(&db).unwrap().unwrap();
+        assert_eq!(state.consecutive_failures, 3);
+        assert!(state.tripped);
+        assert_eq!(
+            state.db_fingerprint,
+            crate::recovery_breaker::fingerprint_db(&db)
+        );
+
+        recovery_admission().reset();
+        let fourth_called = std::cell::Cell::new(false);
+        let error = with_recovery_admission_using_clock(
+            &db,
+            "crashing recovery",
+            || {
+                fourth_called.set(true);
+                Ok(())
+            },
+            || 100,
+        )
+        .expect_err("changed bytes from crashed recovery must remain circuit-broken");
+        assert!(error.to_string().contains("circuit-broken"));
+        assert!(!fourth_called.get());
+    }
+
+    #[test]
     fn crashed_half_open_probe_is_durably_rearmed_before_operation() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("storage.sqlite3");
