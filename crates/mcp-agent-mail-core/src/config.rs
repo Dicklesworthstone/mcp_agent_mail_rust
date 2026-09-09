@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Read as _};
+use std::io::{self, Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -3637,7 +3637,12 @@ fn user_env_file_candidates(home: Option<&Path>, xdg_config_dir: Option<&Path>) 
     candidates
 }
 
-fn read_open_user_env_file_bounded(file: &mut std::fs::File, path: &Path) -> io::Result<Vec<u8>> {
+fn read_open_user_env_file_bounded(
+    file: &mut std::fs::File,
+    path: &Path,
+    after_metadata: impl FnOnce(),
+    after_read: impl FnOnce(),
+) -> io::Result<Vec<u8>> {
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
@@ -3657,6 +3662,7 @@ fn read_open_user_env_file_bounded(file: &mut std::fs::File, path: &Path) -> io:
         ));
     }
 
+    after_metadata();
     let allocation =
         usize::try_from(metadata.len().min(USER_ENV_FILE_MAX_BYTES)).unwrap_or(1024 * 1024);
     let mut bytes = Vec::with_capacity(allocation);
@@ -3670,6 +3676,40 @@ fn read_open_user_env_file_bounded(file: &mut std::fs::File, path: &Path) -> io:
                 "{} grew beyond the {}-byte user configuration limit",
                 path.display(),
                 USER_ENV_FILE_MAX_BYTES
+            ),
+        ));
+    }
+    after_read();
+
+    // A retained inode alone does not bind content: an in-place writer can
+    // rewrite it while we read. Require two bounded observations to agree,
+    // as well as stable handle metadata around both reads. This is bounded
+    // race detection, not a lock or an atomic snapshot against a writer that
+    // deliberately changes and restores bytes between observations.
+    file.rewind()?;
+    let mut confirmed = Vec::with_capacity(bytes.len());
+    file.by_ref()
+        .take(USER_ENV_FILE_MAX_BYTES + 1)
+        .read_to_end(&mut confirmed)?;
+    let after = file.metadata()?;
+    let unchanged = metadata.len() == after.len()
+        && metadata.modified()? == after.modified()?
+        && u64::try_from(bytes.len()).ok() == Some(metadata.len());
+    #[cfg(unix)]
+    let unchanged = {
+        use std::os::unix::fs::MetadataExt as _;
+        unchanged
+            && metadata.ctime() == after.ctime()
+            && metadata.ctime_nsec() == after.ctime_nsec()
+    };
+    // Platforms without Unix ctime rely on size, mtime and repeated bytes.
+    // In particular, restored/coarse mtime is never sufficient by itself.
+    if !unchanged || bytes != confirmed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} changed file identity or content generation during read",
+                path.display()
             ),
         ));
     }
@@ -3748,6 +3788,7 @@ fn read_user_env_candidate_with_hooks(
     path: &Path,
     after_parent_open: impl FnOnce(),
     after_file_open: impl FnOnce(),
+    after_read: impl FnOnce(),
 ) -> io::Result<Option<Vec<u8>>> {
     use nix::errno::Errno;
     use nix::fcntl::{AtFlags, OFlag, open, openat};
@@ -3784,9 +3825,8 @@ fn read_user_env_candidate_with_hooks(
         }
         Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
     };
-    after_file_open();
     let mut file = std::fs::File::from(file_fd);
-    let bytes = read_open_user_env_file_bounded(&mut file, path)?;
+    let bytes = read_open_user_env_file_bounded(&mut file, path, after_file_open, after_read)?;
     let opened_file = fstat(&file).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3902,6 +3942,7 @@ fn read_user_env_candidate_with_hooks(
     path: &Path,
     after_parent_open: impl FnOnce(),
     after_file_open: impl FnOnce(),
+    after_read: impl FnOnce(),
 ) -> io::Result<Option<Vec<u8>>> {
     let parent = env_authority_parent(path);
     let parent_before = match bind_user_env_parent(parent) {
@@ -3923,15 +3964,14 @@ fn read_user_env_candidate_with_hooks(
         }
         Err(error) => return Err(error),
     };
-    after_file_open();
-    let bytes = read_open_user_env_file_bounded(&mut file, path)?;
+    let bytes = read_open_user_env_file_bounded(&mut file, path, after_file_open, after_read)?;
     revalidate_open_user_env_leaf(path, file)?;
     revalidate_user_env_parent(parent, &parent_before)?;
     Ok(Some(bytes))
 }
 
 fn read_user_env_candidate(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    read_user_env_candidate_with_hooks(path, || {}, || {})
+    read_user_env_candidate_with_hooks(path, || {}, || {}, || {})
 }
 
 fn env_authority_parent(path: &Path) -> &Path {
@@ -3944,13 +3984,14 @@ fn env_authority_parent(path: &Path) -> &Path {
 ///
 /// Setup and legacy import use this fresh (uncached) seam. Keeping it beside
 /// runtime discovery ensures every caller gets the same regular-file,
-/// no-follow, parent-binding, size-bound, and identity-revalidation guarantees
-/// as normal user configuration loading.
+/// no-follow, parent-binding, size-bound, identity-revalidation, and repeated
+/// content/metadata checks as normal user configuration loading. These checks
+/// detect observed races; they do not lock out arbitrary in-place writers.
 ///
 /// # Errors
 ///
 /// Returns an error when an existing authority is unsafe, unreadable,
-/// oversized, invalid UTF-8, or changes identity during the read.
+/// oversized, invalid UTF-8, or changes identity/content generation during the read.
 pub fn read_env_authority_text(path: &Path) -> io::Result<Option<String>> {
     let Some(bytes) = read_user_env_candidate(path)? else {
         return Ok(None);
@@ -6243,6 +6284,7 @@ mod tests {
                 std::fs::rename(&replacement, &parent).unwrap();
             },
             || {},
+            || {},
         )
         .expect_err("parent replacement must invalidate the authority");
         assert!(error.to_string().contains("identity"));
@@ -6266,6 +6308,7 @@ mod tests {
                 std::fs::rename(&parent, &detached).unwrap();
                 std::fs::rename(&replacement, &parent).unwrap();
             },
+            || {},
             || {},
         )
         .expect_err("an absent leaf in a detached authority must not permit fallback");
@@ -6307,9 +6350,99 @@ mod tests {
                 std::fs::rename(&candidate, &displaced).unwrap();
                 std::fs::write(&candidate, "FOO=swapped\n").unwrap();
             },
+            || {},
         )
         .expect_err("leaf replacement must invalidate the authority");
         assert!(error.to_string().contains("identity"));
+    }
+
+    #[test]
+    fn user_env_in_place_mutation_rejects_without_legacy_fallback() {
+        for (after_first_read, replacement) in [
+            (false, "FOO=grown-after-metadata\n"),
+            (false, "FOO=x\n"),
+            (true, "FOO=after!\n"), // Same length; restored mtime cannot hide changed bytes.
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let xdg = tmp.path().join("authority");
+            let legacy = tmp.path().join(".mcp_agent_mail");
+            fs::create_dir(&xdg).unwrap();
+            fs::create_dir(&legacy).unwrap();
+            let candidate = xdg.join("config.env");
+            fs::write(&candidate, "FOO=before\n").unwrap();
+            fs::write(legacy.join(".env"), "FOO=stale\n").unwrap();
+            let identity = same_file::Handle::from_path(&candidate).unwrap();
+            let modified = fs::metadata(&candidate).unwrap().modified().unwrap();
+            let mutate = || {
+                use std::io::Write as _;
+                let mut writer = fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&candidate)
+                    .unwrap();
+                writer.write_all(replacement.as_bytes()).unwrap();
+                writer.sync_all().unwrap();
+                writer.set_modified(modified).unwrap();
+                assert_eq!(identity, same_file::Handle::from_path(&candidate).unwrap());
+                assert_eq!(
+                    fs::metadata(&candidate).unwrap().modified().unwrap(),
+                    modified
+                );
+                if after_first_read {
+                    assert_eq!(fs::metadata(&candidate).unwrap().len(), 11);
+                }
+            };
+            let mut consulted = Vec::new();
+            let load =
+                load_user_env_values_from_with_reader(Some(tmp.path()), Some(&xdg), |path| {
+                    consulted.push(path.to_path_buf());
+                    read_user_env_candidate_with_hooks(
+                        path,
+                        || {},
+                        || {
+                            if !after_first_read {
+                                mutate();
+                            }
+                        },
+                        || {
+                            if after_first_read {
+                                mutate();
+                            }
+                        },
+                    )
+                });
+            assert!(
+                load.values.is_empty(),
+                "mutation phase after_read={after_first_read}"
+            );
+            assert!(
+                load.authority_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("changed"))
+            );
+            assert_eq!(
+                consulted,
+                [candidate],
+                "rejected authority must suppress fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn user_env_read_accepts_stable_generation_at_size_bounds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let candidate = tmp.path().join("config.env");
+        for size in [0, 1, USER_ENV_FILE_MAX_BYTES] {
+            let contents = "x".repeat(usize::try_from(size).unwrap());
+            fs::write(&candidate, &contents).unwrap();
+            assert_eq!(read_env_authority_text(&candidate).unwrap(), Some(contents));
+        }
+        fs::write(
+            &candidate,
+            vec![b'x'; usize::try_from(USER_ENV_FILE_MAX_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        assert!(read_env_authority_text(&candidate).is_err());
     }
 
     #[test]
