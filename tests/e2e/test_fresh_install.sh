@@ -822,8 +822,20 @@ PY
   sed -n '/^setup_single_mcp_config() {/,/^setup_claude_code_mcp_via_cli() {/p' "${INSTALL_SH}" \
     | sed '$d' > "${GENERIC_LIB}"
   TOML_LIB="${BRKX4U4_DIR}/toml-writer.sh"
-  sed -n '/^setup_single_toml_config() {/,/^setup_single_standard_http_json_config() {/p' "${INSTALL_SH}" \
-    | sed '$d' > "${TOML_LIB}"
+  {
+    # The TOML writer shares the installer's private backup/publication path.
+    # Import those real helpers; only their logging adapters are test-local.
+    cat <<'TOML_LOGGING'
+warn() { printf '%s\n' "$*" >&2; }
+info() { printf '%s\n' "$*"; }
+TOML_LOGGING
+    sed -n '/^private_file_identity() {/,/^migrate_env_config() {/p' "${INSTALL_SH}" \
+      | sed '$d'
+    sed -n '/^ensure_real_directory_tree() {/,/^write_launchd_service_plist() {/p' "${INSTALL_SH}" \
+      | sed '$d'
+    sed -n '/^setup_single_toml_config() {/,/^setup_single_standard_http_json_config() {/p' "${INSTALL_SH}" \
+      | sed '$d'
+  } > "${TOML_LIB}"
   ALIAS_LIB="${BRKX4U4_DIR}/alias-guard.sh"
   sed -n '/^config_target_is_hardlink_aliased() {/,/^mcp_config_must_skip_shell_write() {/p' "${INSTALL_SH}" \
     | sed '$d' > "${ALIAS_LIB}"
