@@ -32581,16 +32581,13 @@ fn doctor_omp_runtime_drift(params: &mcp_agent_mail_core::setup::SetupParams) ->
         .iter()
         .filter(|status| status.slug == "omp")
         .flat_map(|status| {
-            status
-                .config_files
-                .iter()
-                .filter(|file| {
-                    file.exists
-                        && (file.omp_active_user_config_drift
-                            || file.omp_settings_config_drift
-                            || file.omp_mcp_alias_drift)
-                })
-                .map(|file| setup_status_file_drift_summary(&status.slug, file))
+            status.config_files.iter().filter_map(|file| {
+                (file.exists
+                    && (file.omp_active_user_config_drift
+                        || file.omp_settings_config_drift
+                        || file.omp_mcp_alias_drift))
+                    .then(|| setup_status_file_drift_summary(&status.slug, file))
+            })
         })
         .collect()
 }
