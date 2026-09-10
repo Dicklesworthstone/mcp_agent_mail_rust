@@ -605,9 +605,13 @@ struct MessageStats {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct MessageWatermark {
-    sequence: u64,
-    max_id: u64,
+pub struct MessageWatermark {
+    pub sequence: u64,
+    pub max_id: u64,
+    #[serde(default)]
+    pub content_revision: Option<u64>,
+    #[serde(default)]
+    pub rewrite_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -617,7 +621,10 @@ enum BackfillPlan {
     FullRebuild,
 }
 
-const BACKFILL_STATE_SCHEMA_VERSION: u32 = 1;
+// Schema v2 binds every persisted skip hint to the logical database
+// generation stored inside SQLite. A filesystem path, inode, timestamp, or
+// count/max-id tuple can all be reused by an in-place database replacement.
+const BACKFILL_STATE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct BackfillDbFingerprint {
@@ -638,18 +645,9 @@ struct IndexMetaFingerprint {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct BackfillState {
     schema_version: u32,
-    /// The canonical mailbox path the index was built for. A snapshot-backed
-    /// reader records the mailbox it snapshotted, never its temp copy.
     db_path: String,
-    /// Stat-level fingerprint of the file at `db_path` when the marker was
-    /// written. A cheap skip hint only: an inode change is NOT a database
-    /// identity change (GH#295) — `db_generation` decides that.
+    db_generation_id: String,
     db_fingerprint: BackfillDbFingerprint,
-    /// `db_identity.generation_id` of the database the index was built from:
-    /// the stable identity that survives same-path file replacement and
-    /// changes exactly when the database is re-created (GH#295, GH#296).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    db_generation: Option<String>,
     db_stats: MessageStats,
     #[serde(default)]
     message_watermark: MessageWatermark,
@@ -676,13 +674,10 @@ fn sqlite_file_backfill_fingerprint(db_path: &str) -> Option<BackfillDbFingerpri
         return None;
     }
     let metadata = std::fs::metadata(db_path).ok()?;
-    #[cfg(unix)]
-    let (device_id, inode) = {
-        use std::os::unix::fs::MetadataExt as _;
-        (Some(metadata.dev()), Some(metadata.ino()))
-    };
-    #[cfg(not(unix))]
-    let (device_id, inode) = (None, None);
+    let (device_id, inode) = crate::pool::stable_sqlite_file_identity(Path::new(db_path))
+        .map_or((None, None), |(device_id, inode)| {
+            (Some(device_id), Some(inode))
+        });
     let modified_micros = metadata
         .modified()
         .ok()
@@ -718,12 +713,19 @@ fn read_backfill_state(bridge: &TantivyBridge) -> Option<BackfillState> {
     (state.schema_version == BACKFILL_STATE_SCHEMA_VERSION).then_some(state)
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) fn bridge_matches_database(path: &str, generation: Option<&str>) -> bool {
+    get_bridge()
+        .and_then(|bridge| read_backfill_state(&bridge))
+        .is_some_and(|state| {
+            state.db_path == path && generation == Some(state.db_generation_id.as_str())
+        })
+}
+
 fn write_backfill_state(
     bridge: &TantivyBridge,
     db_path: &str,
+    db_generation_id: &str,
     fingerprint: BackfillDbFingerprint,
-    db_generation: Option<&str>,
     db_stats: MessageStats,
     message_watermark: MessageWatermark,
     index_meta_fingerprint: Option<IndexMetaFingerprint>,
@@ -739,8 +741,8 @@ fn write_backfill_state(
     let state = BackfillState {
         schema_version: BACKFILL_STATE_SCHEMA_VERSION,
         db_path: db_path.to_string(),
+        db_generation_id: db_generation_id.to_string(),
         db_fingerprint: fingerprint,
-        db_generation: db_generation.map(str::to_string),
         db_stats,
         message_watermark,
         index_meta_fingerprint,
@@ -751,6 +753,60 @@ fn write_backfill_state(
         return;
     };
     let _ = std::fs::write(path, payload);
+}
+
+fn read_backfill_db_generation(conn: &DbConn) -> Result<String, String> {
+    let generation = crate::queries::db_generation_id_conn(conn).ok_or_else(|| {
+        "backfill: durable db_identity.generation_id is unavailable; refusing to reuse or publish process-global lexical state"
+            .to_string()
+    })?;
+    if generation.len() > 128 || !generation.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(
+            "backfill: durable db_identity.generation_id is malformed; refusing process-global lexical state"
+                .to_string(),
+        );
+    }
+    Ok(generation)
+}
+
+fn verify_backfill_db_generation(conn: &DbConn, expected: &str) -> Result<(), String> {
+    let observed = read_backfill_db_generation(conn)?;
+    if observed == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "backfill: database generation changed while indexing (expected {expected}, observed {observed}); refusing to publish mixed lexical state"
+        ))
+    }
+}
+
+fn verify_backfill_path_generation(db_path: &str, expected: &str) -> Result<(), String> {
+    let verification_conn = open_backfill_conn(db_path)?;
+    verify_backfill_db_generation(&verification_conn, expected)
+}
+
+fn verify_backfill_path_snapshot(
+    db_path: &str,
+    expected_generation: &str,
+    expected_watermark: MessageWatermark,
+) -> Result<(), String> {
+    let verification_conn = open_backfill_conn(db_path)?;
+    verify_backfill_db_generation(&verification_conn, expected_generation)?;
+    let observed_watermark = fetch_db_message_watermark(&verification_conn)?;
+    if expected_watermark.content_revision.is_some()
+        && expected_watermark.rewrite_revision.is_some()
+        && observed_watermark == expected_watermark
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "backfill: message watermark changed while indexing (expected sequence/max-id {}/{}, observed {}/{}); refusing to publish a stale lexical marker",
+            expected_watermark.sequence,
+            expected_watermark.max_id,
+            observed_watermark.sequence,
+            observed_watermark.max_id
+        ))
+    }
 }
 
 fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
@@ -785,7 +841,9 @@ fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
     })
 }
 
-fn fetch_db_message_watermark(conn: &DbConn) -> Result<MessageWatermark, String> {
+pub fn fetch_db_message_watermark(
+    conn: &dyn crate::pool::SyncQuery,
+) -> Result<MessageWatermark, String> {
     let max_id_rows = match query_sync_with_lock_retry(
         conn,
         "backfill watermark max-id",
@@ -820,7 +878,32 @@ fn fetch_db_message_watermark(conn: &DbConn) -> Result<MessageWatermark, String>
     // monotonic watermark for append-only message IDs.
     .unwrap_or(max_id);
 
-    Ok(MessageWatermark { sequence, max_id })
+    let revision_rows = match query_sync_with_lock_retry(
+        conn,
+        "backfill watermark content revision",
+        "SELECT revision, rewrite_revision FROM search_content_revision WHERE singleton = 0",
+        &[],
+    ) {
+        Ok(rows) => rows,
+        Err(error)
+            if sqlite_error_is_missing_table(&error.to_string(), "search_content_revision") =>
+        {
+            Vec::new()
+        }
+        Err(error) => return Err(format!("backfill content revision query failed: {error}")),
+    };
+    let revision_at = |column| {
+        revision_rows
+            .first()
+            .and_then(|row| row.get_as::<i64>(column).ok())
+            .and_then(|revision| u64::try_from(revision).ok())
+    };
+    Ok(MessageWatermark {
+        sequence,
+        max_id,
+        content_revision: revision_at(0),
+        rewrite_revision: revision_at(1),
+    })
 }
 
 fn sqlite_error_is_missing_table(message: &str, table: &str) -> bool {
@@ -893,7 +976,7 @@ fn with_bootstrap_lock_retry<T, E: std::fmt::Display>(
 }
 
 fn query_sync_with_lock_retry(
-    conn: &DbConn,
+    conn: &dyn crate::pool::SyncQuery,
     operation: &str,
     sql: &str,
     params: &[Value],
@@ -1094,7 +1177,7 @@ fn with_tantivy_writer<T>(
 ///
 /// This is intentionally fire-and-forget safe: callers should not fail the
 /// message send operation if indexing fails.
-pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
+pub(crate) fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
     // GH#227: a newly ingested message must ALWAYS invalidate the process-wide
     // search cache — even when the lexical bridge is uninitialized, bound to a
     // different database, or the Tantivy write fails. Invalidating only on
@@ -1132,7 +1215,8 @@ pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
 ///
 /// More efficient than calling [`index_message`] repeatedly — uses a single
 /// writer and commit for the entire batch.
-pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, String> {
+#[cfg(test)]
+fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, String> {
     if messages.is_empty() {
         return Ok(0);
     }
@@ -1169,6 +1253,11 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
 
 // ── Startup backfill ─────────────────────────────────────────────────────
 
+#[cfg(test)]
+type BackfillSealHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+static BACKFILL_BEFORE_SEAL: Mutex<Option<BackfillSealHook>> = Mutex::new(None);
+
 pub(crate) fn resolve_search_sqlite_path_from_database_url(db_url: &str) -> Option<String> {
     crate::pool::resolve_mailbox_sqlite_path(db_url)
         .ok()
@@ -1184,25 +1273,9 @@ pub(crate) fn resolve_search_sqlite_path_from_database_url(db_url: &str) -> Opti
 /// interrupted runs.
 ///
 /// Returns `(indexed_count, skipped_count)` where `skipped_count` is always 0.
-pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
-    backfill_from_db_as(db_url, None)
-}
-
-/// [`backfill_from_db`] for a reader whose file at `db_url` is a private
-/// materialization of the mailbox at `identity_path` (GH#297).
-///
-/// The rows are read from `db_url`, but the persisted backfill marker and
-/// every identity comparison use `identity_path`: a snapshot-backed `am robot
-/// search` must never stamp `storage_root/search_index/backfill_state.json`
-/// with its temp path, which made every later server search report the shared
-/// index as belonging to a vanished `/tmp/...` file.
 #[allow(clippy::too_many_lines)]
-pub fn backfill_from_db_as(
-    db_url: &str,
-    identity_path: Option<&str>,
-) -> Result<(usize, usize), String> {
+pub(crate) fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     const FETCH_BATCH_SIZE: i64 = 500;
-    const COMMIT_EVERY_BATCHES: usize = 8;
 
     let Some(bridge) = get_bridge() else {
         return Ok((0, 0));
@@ -1217,38 +1290,24 @@ pub fn backfill_from_db_as(
         db_url.to_string()
     };
     let db_path = &db_path_owned;
-    let identity_path = identity_path.unwrap_or(db_path);
 
-    // The marker describes the file at the identity path (the mailbox), even
-    // when the rows are read from a private copy of it.
-    let db_fingerprint = sqlite_file_backfill_fingerprint(identity_path);
-    let initial_index_fingerprint = index_meta_fingerprint(&bridge);
-    if let (Some(fingerprint), Some(state)) = (db_fingerprint, read_backfill_state(&bridge))
-        && state.db_path == identity_path
-        && state.db_fingerprint == fingerprint
-        && state.index_meta_fingerprint == initial_index_fingerprint
-    {
-        tracing::info!(
-            db_count = state.db_stats.count,
-            db_max_id = state.db_stats.max_id,
-            index_count = state.index_stats.count,
-            index_max_id = state.index_stats.max_id,
-            "backfill: sqlite/index meta fingerprints unchanged, skipping"
-        );
-        refresh_index_health_metrics(&bridge);
-        return Ok((
-            0,
-            usize::try_from(state.db_stats.count).unwrap_or(usize::MAX),
-        ));
-    }
-
-    // br-5u3w5: the bespoke bootstrap open races live pool connections on the
-    // same WAL mailbox and can surface "database is busy" — retry it on the
-    // bootstrap budget instead of failing the whole bootstrap.
+    // Open SQLite before consulting any persisted skip hint. The logical
+    // generation lives inside the database and is the only authority that
+    // survives same-path/inode/stat reuse safely.
     let mut conn = open_backfill_conn(db_path)?;
+    let db_generation_id = if db_path == ":memory:" {
+        None
+    } else {
+        Some(read_backfill_db_generation(&conn)?)
+    };
+    let db_fingerprint = sqlite_file_backfill_fingerprint(db_path);
 
     if !backfill_table_exists(&conn, "messages")? {
         let index_stats = fetch_index_message_stats(&bridge)?;
+        drop(conn);
+        if let Some(generation) = db_generation_id.as_deref() {
+            verify_backfill_path_generation(db_path, generation)?;
+        }
         if index_stats.count > 0 {
             with_tantivy_writer(&bridge, |writer| {
                 writer
@@ -1268,27 +1327,34 @@ pub fn backfill_from_db_as(
         return Ok((0, 0));
     }
 
-    let db_generation = crate::queries::db_generation_id_conn(&conn);
     let message_watermark = fetch_db_message_watermark(&conn)?;
+    if message_watermark.content_revision.is_none() || message_watermark.rewrite_revision.is_none()
+    {
+        return Err("backfill: transactional content revision is unavailable; refusing to publish lexical state".to_string());
+    }
     let current_index_fingerprint = index_meta_fingerprint(&bridge);
-    let previous_state = read_backfill_state(&bridge);
-    if let Some(state) = previous_state.as_ref()
-        && state.db_path == identity_path
-        && state.db_generation == db_generation
+    if let Some(state) = read_backfill_state(&bridge)
+        && state.db_path == *db_path
+        && db_generation_id
+            .as_deref()
+            .is_some_and(|generation| state.db_generation_id == generation)
+        && message_watermark.content_revision.is_some()
         && state.message_watermark == message_watermark
         && state.index_meta_fingerprint == current_index_fingerprint
     {
-        // GH#295: same mailbox, same generation, same content — the file was
-        // merely replaced (VACUUM INTO + rename, backup restore, recovery
-        // promotion). Refresh the stat hint in place; the index is current.
+        drop(conn);
+        let generation = db_generation_id
+            .as_deref()
+            .expect("file-backed skip requires a durable generation");
+        verify_backfill_path_snapshot(db_path, generation, message_watermark)?;
         if let Some(fingerprint) = db_fingerprint
             && state.db_fingerprint != fingerprint
         {
             write_backfill_state(
                 &bridge,
-                identity_path,
+                db_path,
+                generation,
                 fingerprint,
-                db_generation.as_deref(),
                 state.db_stats,
                 state.message_watermark,
                 current_index_fingerprint,
@@ -1309,26 +1375,26 @@ pub fn backfill_from_db_as(
 
     let db_stats = fetch_db_message_stats(&conn)?;
     let index_stats = fetch_index_message_stats(&bridge)?;
-    // A marker written for another mailbox path or another generation of
-    // this mailbox means the indexed documents belong to a database whose
-    // numeric ids cannot be trusted against this one, however similar the
-    // counts look: rebuild instead of appending.
-    let identity_changed = previous_state.as_ref().is_some_and(|state| {
-        state.db_path != identity_path || state.db_generation != db_generation
+    // Count/max-id equality is only meaningful after a marker proves that the
+    // current index was built from this exact logical database generation.
+    // Without that proof, a same-shaped replacement must rebuild in full.
+    let state_generation_matches = read_backfill_state(&bridge).is_some_and(|state| {
+        state.db_path == *db_path
+            && db_generation_id
+                .as_deref()
+                .is_some_and(|generation| state.db_generation_id == generation)
     });
-    let plan = if identity_changed && index_stats.count > 0 {
-        tracing::info!(
-            identity_path,
-            previous_db_path = previous_state.as_ref().map(|state| state.db_path.as_str()),
-            previous_generation = previous_state
-                .as_ref()
-                .and_then(|state| state.db_generation.as_deref()),
-            current_generation = db_generation.as_deref(),
-            "backfill: database identity changed since the last backfill; rebuilding the index"
-        );
-        BackfillPlan::FullRebuild
-    } else {
+    // A changed content clock with an unchanged rewrite clock proves that only
+    // message inserts occurred. Count/prefix validation can safely retain the
+    // append path, including inserts already projected by the owning writer.
+    let rewrite_matches = read_backfill_state(&bridge).is_some_and(|state| {
+        message_watermark.rewrite_revision.is_some()
+            && state.message_watermark.rewrite_revision == message_watermark.rewrite_revision
+    });
+    let plan = if state_generation_matches && rewrite_matches {
         choose_backfill_plan(&conn, db_stats, index_stats)?
+    } else {
+        BackfillPlan::FullRebuild
     };
 
     if matches!(plan, BackfillPlan::Skip) {
@@ -1339,12 +1405,17 @@ pub fn backfill_from_db_as(
             index_max_id = index_stats.max_id,
             "backfill: Tantivy index already up-to-date, skipping"
         );
-        if let Some(fingerprint) = sqlite_file_backfill_fingerprint(identity_path) {
+        drop(conn);
+        let generation = db_generation_id
+            .as_deref()
+            .expect("file-backed skip requires a durable generation");
+        verify_backfill_path_snapshot(db_path, generation, message_watermark)?;
+        if let Some(fingerprint) = sqlite_file_backfill_fingerprint(db_path) {
             write_backfill_state(
                 &bridge,
-                identity_path,
+                db_path,
+                generation,
                 fingerprint,
-                db_generation.as_deref(),
                 db_stats,
                 message_watermark,
                 current_index_fingerprint,
@@ -1380,7 +1451,6 @@ pub fn backfill_from_db_as(
                 .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
         }
 
-        let mut pending_batches = 0_usize;
         let mut total_indexed = 0_usize;
         loop {
             // br-5u3w5: the page scan runs while live workers keep
@@ -1416,7 +1486,12 @@ pub fn backfill_from_db_as(
                         );
                         std::thread::sleep(delay);
                         match open_backfill_conn(db_path) {
-                            Ok(fresh) => conn = fresh,
+                            Ok(fresh) => {
+                                if let Some(generation) = db_generation_id.as_deref() {
+                                    verify_backfill_db_generation(&fresh, generation)?;
+                                }
+                                conn = fresh;
+                            }
                             Err(open_error) => tracing::warn!(
                                 error = %open_error,
                                 "backfill page scan could not re-open a fresh connection; retrying on the existing one"
@@ -1460,24 +1535,34 @@ pub fn backfill_from_db_as(
                     last_id = msg.id;
                 }
             }
+        }
 
-            pending_batches += 1;
-            if pending_batches >= COMMIT_EVERY_BATCHES {
-                writer
-                    .commit()
-                    .map_err(|e| format!("Tantivy commit error: {e}"))?;
-                pending_batches = 0;
+        // Pending segments are not searchable until this sole commit. A failed
+        // seal drops the retained writer and rolls back all pending operations.
+        #[cfg(test)]
+        {
+            let hook = BACKFILL_BEFORE_SEAL.lock().expect("seal hook lock").take();
+            if let Some(hook) = hook {
+                hook();
             }
         }
-
-        if pending_batches > 0 || (matches!(plan, BackfillPlan::FullRebuild) && total_indexed == 0)
-        {
-            writer
-                .commit()
-                .map_err(|e| format!("Tantivy commit error: {e}"))?;
+        if let Some(generation) = db_generation_id.as_deref() {
+            verify_backfill_path_snapshot(db_path, generation, message_watermark)?;
         }
+        writer
+            .commit()
+            .map_err(|e| format!("Tantivy commit error: {e}"))?;
         Ok(total_indexed)
     })?;
+
+    // Seal the run only after proving that the current path still names the
+    // same logical database generation scanned above. This closes the window
+    // where an in-place replacement could occur while the old open descriptor
+    // continued serving rows successfully.
+    drop(conn);
+    if let Some(generation) = db_generation_id.as_deref() {
+        verify_backfill_path_snapshot(db_path, generation, message_watermark)?;
+    }
 
     refresh_index_health_metrics(&bridge);
     crate::search_service::invalidate_search_cache(
@@ -1485,12 +1570,15 @@ pub fn backfill_from_db_as(
     );
 
     let final_index_stats = fetch_index_message_stats(&bridge).unwrap_or(db_stats);
-    if let Some(fingerprint) = sqlite_file_backfill_fingerprint(identity_path) {
+    if let (Some(fingerprint), Some(generation)) = (
+        sqlite_file_backfill_fingerprint(db_path),
+        db_generation_id.as_deref(),
+    ) {
         write_backfill_state(
             &bridge,
-            identity_path,
+            db_path,
+            generation,
             fingerprint,
-            db_generation.as_deref(),
             db_stats,
             message_watermark,
             index_meta_fingerprint(&bridge),
@@ -2622,6 +2710,16 @@ mod tests {
         let conn = DbConn::open_file(path_str).unwrap();
 
         conn.execute_sync(
+            "CREATE TABLE db_identity (singleton INTEGER PRIMARY KEY CHECK (singleton = 0), generation_id TEXT NOT NULL)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO db_identity (singleton, generation_id) VALUES (0, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, \
              human_key TEXT NOT NULL, created_at INTEGER NOT NULL)",
             &[],
@@ -2656,6 +2754,10 @@ mod tests {
         )
         .unwrap();
 
+        for migration in crate::schema::search_content_revision_migrations() {
+            conn.execute_raw(&migration.up)
+                .expect("search content revision schema");
+        }
         for (id, subject, body, importance, thread_id) in messages {
             use sqlmodel_core::Value;
             conn.execute_sync(
@@ -2765,6 +2867,265 @@ mod tests {
             Some(UNKNOWN_SENDER_DISPLAY)
         );
 
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn gh296_new_database_generation_rebuilds_same_shaped_index_contents() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+
+        let db_dir = tempfile::TempDir::new().expect("db tempdir");
+        let index_dir = tempfile::TempDir::new().expect("index tempdir");
+        let db_path = create_test_db(
+            db_dir.path(),
+            &[(1, "oldwalrus marker", "oldwalrus body", "normal", "gh296")],
+        );
+        init_bridge(index_dir.path()).expect("init bridge");
+        let (first_indexed, _) = backfill_from_db(&db_path).expect("first backfill");
+        assert_eq!(first_indexed, 1);
+
+        let replacement = DbConn::open_file(&db_path).expect("open replacement generation");
+        replacement
+            .execute_sync(
+                "UPDATE messages SET subject = 'newnarwhal marker', body_md = 'newnarwhal body' WHERE id = 1",
+                &[],
+            )
+            .expect("replace message contents without changing count/max-id");
+        replacement
+            .execute_sync(
+                "UPDATE db_identity SET generation_id = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' WHERE singleton = 0",
+                &[],
+            )
+            .expect("replace logical database generation");
+        drop(replacement);
+
+        let (second_indexed, _) = backfill_from_db(&db_path).expect("generation-safe backfill");
+        assert_eq!(
+            second_indexed, 1,
+            "a new generation with the same count/max-id must rebuild rather than skip"
+        );
+
+        let bridge = get_bridge().expect("bridge initialized");
+        let query = |text: &str| PlannerQuery {
+            text: text.to_string(),
+            doc_kind: DocKind::Message,
+            project_id: Some(1),
+            ..Default::default()
+        };
+        assert!(
+            bridge.search(&query("oldwalrus")).is_empty(),
+            "documents from the replaced generation must not survive"
+        );
+        assert_eq!(
+            bridge.search(&query("newnarwhal")).len(),
+            1,
+            "the replacement generation must supply the indexed document"
+        );
+
+        let state = read_backfill_state(&bridge).expect("schema-v2 backfill marker");
+        assert_eq!(state.schema_version, BACKFILL_STATE_SCHEMA_VERSION);
+        assert_eq!(
+            state.db_generation_id,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn gh298_revision_detects_update_delete_and_transaction_rollback() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let path = create_test_db(
+            root.path(),
+            &[
+                (1, "oldwalrus", "old body", "normal", "original"),
+                (2, "keepnarwhal", "keep body", "normal", "original"),
+            ],
+        );
+        init_bridge(index.path()).unwrap();
+        backfill_from_db(&path).unwrap();
+        let conn = crate::guard_db_conn(DbConn::open_file(&path).unwrap(), "revision regression");
+        let initial = fetch_db_message_watermark(&conn).unwrap();
+        conn.execute_raw("BEGIN").unwrap();
+        conn.execute_raw("UPDATE messages SET subject = 'rolledback' WHERE id = 1")
+            .unwrap();
+        assert_ne!(fetch_db_message_watermark(&conn).unwrap(), initial);
+        conn.execute_raw("ROLLBACK").unwrap();
+        assert_eq!(fetch_db_message_watermark(&conn).unwrap(), initial);
+        conn.execute_raw(
+            "UPDATE messages SET subject = 'newotter', thread_id = 'revised' WHERE id = 1",
+        )
+        .unwrap();
+        let updated = fetch_db_message_watermark(&conn).unwrap();
+        assert_eq!(initial.sequence, updated.sequence);
+        assert_eq!(initial.max_id, updated.max_id);
+        assert_ne!(initial.content_revision, updated.content_revision);
+        backfill_from_db(&path).unwrap();
+        let query = |text: &str| PlannerQuery {
+            text: text.to_string(),
+            doc_kind: DocKind::Message,
+            project_id: Some(1),
+            ..Default::default()
+        };
+        let bridge = get_bridge().unwrap();
+        assert!(bridge.search(&query("oldwalrus")).is_empty());
+        let matches = bridge.search(&query("newotter"));
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].thread_id.as_deref(), Some("revised"));
+        conn.execute_raw("DELETE FROM messages WHERE id = 1")
+            .unwrap();
+        let deleted = fetch_db_message_watermark(&conn).unwrap();
+        assert_eq!(updated.sequence, deleted.sequence);
+        assert_eq!(updated.max_id, deleted.max_id);
+        assert_ne!(updated.content_revision, deleted.content_revision);
+        backfill_from_db(&path).unwrap();
+        assert!(bridge.search(&query("newotter")).is_empty());
+        assert_eq!(bridge.search(&query("keepnarwhal")).len(), 1);
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn gh298_append_only_revisions_keep_incremental_and_already_indexed_paths() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let path = create_test_db(
+            root.path(),
+            &[
+                (1, "firstotter", "body", "normal", "original"),
+                (2, "secondotter", "body", "normal", "original"),
+            ],
+        );
+        init_bridge(index.path()).unwrap();
+        assert_eq!(backfill_from_db(&path).unwrap(), (2, 0));
+        let conn = crate::guard_db_conn(DbConn::open_file(&path).unwrap(), "append regression");
+        let initial = fetch_db_message_watermark(&conn).unwrap();
+        conn.execute_raw("INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES (3, 1, 1, 'thirdotter', 'body', 1000000)").unwrap();
+        let appended = fetch_db_message_watermark(&conn).unwrap();
+        assert_ne!(initial.content_revision, appended.content_revision);
+        assert_eq!(initial.rewrite_revision, appended.rewrite_revision);
+        let (indexed, _) = backfill_from_db(&path).unwrap();
+        assert_eq!(indexed, 1, "append must not rebuild the existing mailbox");
+        conn.execute_raw("INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES (4, 1, 1, 'fourthotter', 'body', 1000000)").unwrap();
+        let mut message = make_indexable(4, "fourthotter", "body");
+        message.project_slug = "test-proj".to_string();
+        message.sender_name = "BlueLake".to_string();
+        message.thread_id = None;
+        message.created_ts = 1_000_000;
+        assert!(index_message(&message).unwrap());
+        assert_eq!(backfill_from_db(&path).unwrap(), (0, 4));
+        let state = read_backfill_state(&get_bridge().unwrap()).unwrap();
+        assert_eq!(
+            state.message_watermark,
+            fetch_db_message_watermark(&conn).unwrap()
+        );
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn gh298_unknown_revision_never_publishes_and_query_errors_propagate() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let path = create_test_db(
+            root.path(),
+            &[(1, "originalotter", "body", "normal", "original")],
+        );
+        init_bridge(index.path()).unwrap();
+        backfill_from_db(&path).unwrap();
+        let bridge = get_bridge().unwrap();
+        let marker = std::fs::read(backfill_state_path(&bridge)).unwrap();
+        let conn = crate::guard_db_conn(
+            DbConn::open_file(&path).unwrap(),
+            "unknown revision regression",
+        );
+        conn.execute_raw("DELETE FROM search_content_revision")
+            .unwrap();
+        conn.execute_raw("UPDATE messages SET subject = 'unsealedotter'")
+            .unwrap();
+        assert!(
+            backfill_from_db(&path)
+                .unwrap_err()
+                .contains("revision is unavailable")
+        );
+        assert_eq!(std::fs::read(backfill_state_path(&bridge)).unwrap(), marker);
+        conn.execute_raw("DROP TABLE search_content_revision")
+            .unwrap();
+        assert!(
+            backfill_from_db(&path)
+                .unwrap_err()
+                .contains("revision is unavailable")
+        );
+        conn.execute_raw("CREATE TABLE search_content_revision (singleton INTEGER PRIMARY KEY)")
+            .unwrap();
+        assert!(
+            fetch_db_message_watermark(&conn)
+                .unwrap_err()
+                .contains("content revision query failed")
+        );
+        assert_eq!(std::fs::read(backfill_state_path(&bridge)).unwrap(), marker);
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn gh298_failed_seal_never_publishes_partial_segments_or_marker() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let rows: Vec<_> = (1..=4001)
+            .map(|id| (id, "oldcohort", "old body", "normal", "original"))
+            .collect();
+        let path = create_test_db(root.path(), &rows);
+        init_bridge(index.path()).unwrap();
+        backfill_from_db(&path).unwrap();
+        let bridge = get_bridge().unwrap();
+        let marker = std::fs::read(backfill_state_path(&bridge)).unwrap();
+        let conn = crate::guard_db_conn(DbConn::open_file(&path).unwrap(), "seal regression");
+        conn.execute_raw("UPDATE messages SET subject = 'pendingcohort'")
+            .unwrap();
+        let mutation_path = path.clone();
+        *BACKFILL_BEFORE_SEAL.lock().unwrap() = Some(Box::new(move || {
+            let conn = crate::guard_db_conn(
+                DbConn::open_file(&mutation_path).unwrap(),
+                "injected concurrent mutation",
+            );
+            conn.execute_raw("UPDATE messages SET subject = 'lateotter' WHERE id = 1")
+                .unwrap();
+        }));
+        let error = backfill_from_db(&path).unwrap_err();
+        assert!(
+            error.contains("watermark"),
+            "unexpected seal error: {error}"
+        );
+        assert_eq!(std::fs::read(backfill_state_path(&bridge)).unwrap(), marker);
+        let query = |text: &str| PlannerQuery {
+            text: text.to_string(),
+            doc_kind: DocKind::Message,
+            project_id: Some(1),
+            ..Default::default()
+        };
+        assert!(!bridge.search(&query("oldcohort")).is_empty());
+        assert!(bridge.search(&query("pendingcohort")).is_empty());
+        assert!(bridge.search(&query("lateotter")).is_empty());
+        backfill_from_db(&path).unwrap();
+        assert!(bridge.search(&query("oldcohort")).is_empty());
+        assert_eq!(bridge.search(&query("lateotter")).len(), 1);
         reset_bridge_for_tests();
     }
 

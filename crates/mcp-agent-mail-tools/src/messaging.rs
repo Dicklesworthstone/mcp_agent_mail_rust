@@ -130,8 +130,11 @@ pub(crate) fn enqueue_message_semantic_index(
 /// Index a message into the Tantivy lexical search index (fire-and-forget).
 ///
 /// Runs synchronously but is best-effort: failures are logged, never propagated.
-pub(crate) fn enqueue_message_lexical_index(msg: &mcp_agent_mail_db::search_v3::IndexableMessage) {
-    match mcp_agent_mail_db::search_v3::index_message(msg) {
+pub(crate) fn enqueue_message_lexical_index(
+    pool: &mcp_agent_mail_db::DbPool,
+    msg: &mcp_agent_mail_db::search_v3::IndexableMessage,
+) {
+    match mcp_agent_mail_db::search_service::index_message_for_pool(pool, msg) {
         Ok(true) => {
             tracing::debug!(message_id = msg.id, "indexed message in Tantivy");
         }
@@ -2576,17 +2579,20 @@ effective_free_bytes={free}"
     // them exactly once. This is the at-most-once archive-dispatch guarantee.
     if !idempotent_replay {
         enqueue_message_semantic_index(project_id, message_id, &message.subject, &message.body_md);
-        enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
-            id: message_id,
-            project_id,
-            project_slug: project.slug.clone(),
-            sender_name: sender.name.clone(),
-            subject: message.subject.clone(),
-            body_md: message.body_md.clone(),
-            thread_id: message.thread_id.clone(),
-            importance: message.importance.clone(),
-            created_ts: message.created_ts,
-        });
+        enqueue_message_lexical_index(
+            &pool,
+            &mcp_agent_mail_db::search_v3::IndexableMessage {
+                id: message_id,
+                project_id,
+                project_slug: project.slug.clone(),
+                sender_name: sender.name.clone(),
+                subject: message.subject.clone(),
+                body_md: message.body_md.clone(),
+                thread_id: message.thread_id.clone(),
+                importance: message.importance.clone(),
+                created_ts: message.created_ts,
+            },
+        );
 
         // Emit notification signals for to/cc recipients only (never bcc).
         //
@@ -3535,17 +3541,20 @@ effective_free_bytes={free}"
     // exactly once (at-most-once archive dispatch).
     if !idempotent_replay {
         enqueue_message_semantic_index(project_id, reply_id, &reply.subject, &reply.body_md);
-        enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
-            id: reply_id,
-            project_id,
-            project_slug: project.slug.clone(),
-            sender_name: sender.name.clone(),
-            subject: reply.subject.clone(),
-            body_md: reply.body_md.clone(),
-            thread_id: Some(thread_id.clone()),
-            importance: reply.importance.clone(),
-            created_ts: reply.created_ts,
-        });
+        enqueue_message_lexical_index(
+            &pool,
+            &mcp_agent_mail_db::search_v3::IndexableMessage {
+                id: reply_id,
+                project_id,
+                project_slug: project.slug.clone(),
+                sender_name: sender.name.clone(),
+                subject: reply.subject.clone(),
+                body_md: reply.body_md.clone(),
+                thread_id: Some(thread_id.clone()),
+                importance: reply.importance.clone(),
+                created_ts: reply.created_ts,
+            },
+        );
 
         // Emit notification signals for to/cc recipients only (never bcc).
         // Mirrors the send_message notification logic for parity with Python.
@@ -8197,49 +8206,73 @@ mod tests {
 
     #[test]
     fn enqueue_lexical_index_does_not_panic() {
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
         // When the global Tantivy bridge is not initialized,
         // enqueue_message_lexical_index should silently no-op.
-        enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
-            id: 1,
-            project_id: 1,
-            project_slug: "test-project".into(),
-            sender_name: "TestAgent".into(),
-            subject: "Test Subject".into(),
-            body_md: "Test body".into(),
-            thread_id: Some("thread-1".into()),
-            importance: "normal".into(),
-            created_ts: 1_000_000,
-        });
+        enqueue_message_lexical_index(
+            &pool,
+            &mcp_agent_mail_db::search_v3::IndexableMessage {
+                id: 1,
+                project_id: 1,
+                project_slug: "test-project".into(),
+                sender_name: "TestAgent".into(),
+                subject: "Test Subject".into(),
+                body_md: "Test body".into(),
+                thread_id: Some("thread-1".into()),
+                importance: "normal".into(),
+                created_ts: 1_000_000,
+            },
+        );
         // If we reach here, the function didn't panic.
     }
 
     #[test]
     fn enqueue_lexical_index_none_thread_id_does_not_panic() {
-        enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
-            id: 2,
-            project_id: 1,
-            project_slug: "proj".into(),
-            sender_name: "Agent".into(),
-            subject: "Subject".into(),
-            body_md: "Body".into(),
-            thread_id: None,
-            importance: "high".into(),
-            created_ts: 0,
-        });
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        enqueue_message_lexical_index(
+            &pool,
+            &mcp_agent_mail_db::search_v3::IndexableMessage {
+                id: 2,
+                project_id: 1,
+                project_slug: "proj".into(),
+                sender_name: "Agent".into(),
+                subject: "Subject".into(),
+                body_md: "Body".into(),
+                thread_id: None,
+                importance: "high".into(),
+                created_ts: 0,
+            },
+        );
     }
 
     #[test]
     fn enqueue_lexical_index_empty_fields_does_not_panic() {
-        enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
-            id: 0,
-            project_id: 0,
-            project_slug: String::new(),
-            sender_name: String::new(),
-            subject: String::new(),
-            body_md: String::new(),
-            thread_id: None,
-            importance: String::new(),
-            created_ts: 0,
-        });
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        enqueue_message_lexical_index(
+            &pool,
+            &mcp_agent_mail_db::search_v3::IndexableMessage {
+                id: 0,
+                project_id: 0,
+                project_slug: String::new(),
+                sender_name: String::new(),
+                subject: String::new(),
+                body_md: String::new(),
+                thread_id: None,
+                importance: String::new(),
+                created_ts: 0,
+            },
+        );
     }
 }

@@ -1458,6 +1458,7 @@ mod tests {
             safe_remediation: Some(
                 "Run `am robot search <query>` to refresh Search V3 lexical backfill".to_string(),
             ),
+            ..Default::default()
         };
 
         let diagnostics = merge_product_search_diagnostics(None, &[], &health)
@@ -1500,6 +1501,7 @@ mod tests {
             safe_remediation: Some(
                 "Run `am robot search <query>` to refresh Search V3 lexical backfill".to_string(),
             ),
+            ..Default::default()
         };
 
         let diagnostics = merge_product_search_diagnostics(None, &partial_failures, &health)

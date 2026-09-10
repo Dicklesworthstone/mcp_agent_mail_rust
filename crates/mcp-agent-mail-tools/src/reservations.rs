@@ -3151,6 +3151,7 @@ pub async fn force_release_file_reservation(
                     &message.body_md,
                 );
                 crate::messaging::enqueue_message_lexical_index(
+                    &pool,
                     &mcp_agent_mail_db::search_v3::IndexableMessage {
                         id: message_id,
                         project_id,

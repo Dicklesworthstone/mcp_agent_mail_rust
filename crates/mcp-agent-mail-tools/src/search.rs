@@ -1694,6 +1694,7 @@ mod tests {
             safe_remediation: Some(
                 "Run `am robot search <query>` to refresh Search V3 lexical backfill".to_string(),
             ),
+            ..Default::default()
         };
 
         let diagnostics =
@@ -1735,6 +1736,7 @@ mod tests {
             safe_remediation: Some(
                 "Run `am robot search <query>` to refresh Search V3 lexical backfill".to_string(),
             ),
+            ..Default::default()
         };
         let existing = SearchDiagnostics {
             degraded: true,

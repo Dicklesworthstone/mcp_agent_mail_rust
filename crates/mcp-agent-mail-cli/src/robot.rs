@@ -1128,6 +1128,7 @@ pub struct RecoveryAdmissionSnapshot {
 
 fn robot_search_index_health_from_config(
     config: &mcp_agent_mail_core::Config,
+    conn: &dyn mcp_agent_mail_db::pool::SyncQuery,
 ) -> Result<LexicalBackfillHealth, String> {
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     pool_cfg.database_url = config.database_url.clone();
@@ -1136,14 +1137,14 @@ fn robot_search_index_health_from_config(
     pool_cfg.warmup_connections = 0;
     let pool = mcp_agent_mail_db::create_pool_without_startup_init(&pool_cfg)
         .map_err(|err| format!("db pool init failed: {err}"))?;
-    Ok(mcp_agent_mail_db::search_service::lexical_backfill_health(
-        &pool,
-    ))
+    pool.observe_search_database_generation_from_conn(conn)
+        .map_err(|err| format!("search health database identity probe failed: {err}"))?;
+    Ok(mcp_agent_mail_db::search_service::lexical_backfill_health_from_conn(&pool, conn))
 }
 
 fn search_index_probe_status(health: &LexicalBackfillHealth) -> &'static str {
     match health.state.as_str() {
-        "fresh" | "in_memory" => "ok",
+        "fresh" | "in_memory" | "sql_only_snapshot" => "ok",
         "delayed" | "partial" => "degraded",
         _ => "fail",
     }
@@ -14786,7 +14787,9 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                         Some(&mut phase),
                     )?;
                     let config = mcp_agent_mail_core::Config::from_env();
-                    if let Ok(search_index) = robot_search_index_health_from_config(&config) {
+                    if let Ok(search_index) =
+                        robot_search_index_health_from_config(&config, scope.conn())
+                    {
                         enrich_status_with_search_index(&mut data, &mut actions, search_index);
                         phase.mark("search_index_health");
                     }
@@ -15385,6 +15388,16 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // safe-remediation contract so an agent knows what is safe to do.
             let mut db_error_message: Option<String> = None;
 
+            // Stage and inspect the private file-family copy before opening the
+            // FrankenSQLite connectivity connection below. On classic POSIX
+            // fcntl locking, closing any second descriptor for the same inode
+            // from this process can release locks held by the first descriptor.
+            // Preserve the historical output order by pushing this precomputed
+            // assessment only after the connectivity probe.
+            let db_file_sanity = summarize_db_file_sanity_probe(&config.database_url);
+            let db_file_sanity_unhealthy = db_file_sanity.unhealthy;
+            let db_file_sanity_degraded = db_file_sanity.degraded;
+
             // 1. DB connectivity probe
             let db_start = std::time::Instant::now();
             let db_ok = match crate::open_db_sync_read_only_with_database_url_and_path(
@@ -15430,10 +15443,9 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 probe.latency_ms = (db_ms * 100.0).round() / 100.0;
             }
 
-            // 1b. Live sqlite file sanity probe (non-mutating).
-            let db_file_sanity = summarize_db_file_sanity_probe(&config.database_url);
-            let db_file_sanity_unhealthy = db_file_sanity.unhealthy;
-            let db_file_sanity_degraded = db_file_sanity.degraded;
+            // 1b. Live sqlite file sanity probe (non-mutating). The work was
+            // completed before `db_conn` existed; only its result is appended
+            // here so existing probe ordering remains stable.
             probes.push(db_file_sanity.probe);
 
             // 1c. Core schema presence probe.
@@ -15449,7 +15461,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             probes.push(archive_db_parity.probe);
 
             // 1e. Search V3 lexical index/backfill state (read-only).
-            let search_index = robot_search_index_health_from_config(&config);
+            let search_index = db_conn.as_ref().map_or_else(
+                || Err("search health requires a live database connection".to_string()),
+                |conn| robot_search_index_health_from_config(&config, conn),
+            );
             let (search_index_snapshot, search_index_unhealthy, search_index_degraded) =
                 match search_index {
                     Ok(snapshot) => {
@@ -21164,6 +21179,7 @@ mod tests {
             active_db_identity: None,
             stale_reason: Some("indexed message count 2 differs from source count 5".into()),
             safe_remediation: Some("am robot search rollback".into()),
+            ..Default::default()
         };
         let data = SearchData {
             query: "rollback".into(),

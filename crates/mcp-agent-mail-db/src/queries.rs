@@ -5726,7 +5726,7 @@ pub async fn db_generation_id(cx: &Cx, pool: &DbPool) -> Outcome<Option<String>,
 /// may be opened immutable. Returns `None` when `db_identity` is absent or
 /// unseeded — callers then treat archive artifacts by their legacy semantics.
 #[must_use]
-pub fn db_generation_id_conn(conn: &crate::DbConn) -> Option<String> {
+pub fn db_generation_id_conn(conn: &dyn crate::pool::SyncQuery) -> Option<String> {
     let rows = conn.query_sync(SELECT_DB_GENERATION_SQL, &[]).ok()?;
     let generation = rows.first()?.get_named::<String>("generation_id").ok()?;
     if generation.is_empty() {
@@ -5734,6 +5734,39 @@ pub fn db_generation_id_conn(conn: &crate::DbConn) -> Option<String> {
     } else {
         Some(generation)
     }
+}
+
+/// Ensure and return the durable database-generation token on an existing
+/// writable connection.
+///
+/// Startup initialization calls this only after the canonical schema and
+/// migrations have completed. Reusing that already-open connection avoids an
+/// extra SQLite handle (important for FrankenSQLite's process-wide fcntl lock
+/// ownership) and makes the schema's "minted on database creation" contract
+/// true before any short-lived read/search pool can observe the file.
+///
+/// # Errors
+///
+/// Returns [`DbError`] when the identity table is unavailable, token creation
+/// fails, or the durable row cannot be read after an idempotent insert.
+pub fn ensure_db_generation_id_conn(conn: &crate::DbConn) -> std::result::Result<String, DbError> {
+    if let Some(generation) = db_generation_id_conn(conn) {
+        return Ok(generation);
+    }
+
+    let token = mcp_agent_mail_core::setup::generate_token()
+        .map_err(|error| DbError::Sqlite(format!("generate database identity: {error}")))?;
+    conn.execute_sync(
+        "INSERT OR IGNORE INTO db_identity (singleton, generation_id) VALUES (0, ?)",
+        &[Value::Text(token)],
+    )
+    .map_err(|error| DbError::Sqlite(format!("persist database identity: {error}")))?;
+
+    db_generation_id_conn(conn).ok_or_else(|| {
+        DbError::Sqlite(
+            "database identity remained unavailable after durable initialization".to_string(),
+        )
+    })
 }
 
 // =============================================================================
@@ -7618,7 +7651,7 @@ pub async fn create_message(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    if let Err(error) = index_created_message_best_effort(&conn, &row) {
+    if let Err(error) = index_created_message_best_effort(pool, &conn, &row) {
         tracing::warn!(
             message_id = row.id.unwrap_or_default(),
             error = %error,
@@ -7629,6 +7662,7 @@ pub async fn create_message(
 }
 
 fn index_created_message_best_effort(
+    pool: &DbPool,
     conn: &crate::DbConn,
     row: &MessageRow,
 ) -> std::result::Result<bool, String> {
@@ -7663,7 +7697,7 @@ fn index_created_message_best_effort(
         importance: row.importance.clone(),
         created_ts: row.created_ts,
     };
-    crate::search_v3::index_message(&message)
+    crate::search_service::index_message_for_pool(pool, &message)
 }
 
 /// Elect the next canonical message id durably inside the caller's write

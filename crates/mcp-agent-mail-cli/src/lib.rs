@@ -16096,7 +16096,7 @@ fn open_db_async_canonical_read_with_database_url(
     pool_cfg.storage_root = Some(storage_root);
     let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
         .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
-        .with_search_identity_path(&source.reported_path().display().to_string());
+        .with_ephemeral_search_index();
     Ok(CanonicalReadPool {
         pool,
         _source: source,
@@ -16121,7 +16121,7 @@ fn open_db_sync_async_canonical_read_with_database_url(
     pool_cfg.storage_root = Some(storage_root);
     let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
         .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
-        .with_search_identity_path(&source.reported_path().display().to_string());
+        .with_ephemeral_search_index();
     Ok(CanonicalReadDbPool {
         conn,
         pool,
@@ -16154,7 +16154,7 @@ fn open_db_sync_async_canonical_read_best_effort_with_database_url(
     pool_cfg.warmup_connections = 0;
     let pool = mcp_agent_mail_db::create_pool_without_startup_init(&pool_cfg)
         .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
-        .with_search_identity_path(&source.reported_path().display().to_string());
+        .with_ephemeral_search_index();
     Ok(CanonicalReadDbPool {
         conn,
         pool,
@@ -16208,7 +16208,8 @@ fn open_atc_simulate_read_pool_with_database_url(
     pool_cfg.run_migrations = false;
     pool_cfg.warmup_connections = 0;
     let pool = mcp_agent_mail_db::create_pool_without_startup_init(&pool_cfg)
-        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;
+        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
+        .with_ephemeral_search_index();
     Ok(CanonicalReadDbPool {
         conn,
         pool,
@@ -74056,6 +74057,47 @@ startup_timeout_sec = 42
                 "read-only {family_kind} probe created, removed, or renamed a live-family artifact"
             );
         }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    fn gh297_async_read_pool_snapshot_preserves_message_topic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("gh297-topic-source.sqlite3");
+        let writer = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open GH#297 source");
+        writer
+            .execute_raw(
+                "CREATE TABLE messages (\
+                    id INTEGER PRIMARY KEY, \
+                    topic TEXT COLLATE NOCASE\
+                ); \
+                INSERT INTO messages (id, topic) VALUES (1, 'search-snapshot');",
+            )
+            .expect("seed GH#297 topic");
+        drop(writer);
+
+        let snapshot = CanonicalSnapshotSource::live(db_path.clone())
+            .materialize_for_async_read_pool("GH#297 robot search")
+            .expect("materialize full async-read snapshot");
+        assert_eq!(snapshot.reported_path(), db_path);
+        assert_ne!(snapshot.actual_path(), snapshot.reported_path());
+        assert_eq!(snapshot.kind, CanonicalSnapshotSourceKind::LiveSnapshot);
+
+        let snapshot_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+            snapshot.actual_path().display().to_string(),
+        )
+        .expect("open GH#297 snapshot");
+        let row = snapshot_conn
+            .query_sync("SELECT topic FROM messages WHERE id = 1", &[])
+            .expect("query topic from async-read snapshot")
+            .into_iter()
+            .next()
+            .expect("topic row");
+        assert_eq!(
+            row.get_named::<String>("topic").expect("topic column"),
+            "search-snapshot"
+        );
     }
 
     #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]

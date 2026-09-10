@@ -383,9 +383,54 @@ fn generate_zero_result_guidance(
 
 /// Try executing a search via the Tantivy bridge. Returns `None` if the
 /// bridge is not initialized (`init_bridge` not called).
-fn try_tantivy_search(query: &SearchQuery) -> Option<Vec<SearchResult>> {
+fn try_tantivy_search(pool: &DbPool, query: &SearchQuery) -> Option<Vec<SearchResult>> {
+    // Keep source selection, rebuild/seal, and the actual read under one lease.
+    // No await occurs while this process-wide authority is held.
+    let _lease = lexical_init_guard().lock().ok()?;
+    ensure_lexical_bridge_initialized_locked(pool).ok()?;
     let bridge = crate::search_v3::get_bridge()?;
     Some(bridge.search(query))
+}
+
+/// Index a message only through its originating pool.
+///
+/// A mismatch leaves recovery to the
+/// next canonical backfill and never writes another database's index.
+pub fn index_message_for_pool(
+    pool: &DbPool,
+    message: &crate::search_v3::IndexableMessage,
+) -> Result<bool, String> {
+    invalidate_search_cache(crate::search_cache::InvalidationTrigger::IndexUpdate);
+    let _lease = lexical_init_guard()
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if !lexical_bridge_is_permitted_for_pool(pool)
+        || lexical_active_db_key()
+            .lock()
+            .map_err(|error| error.to_string())?
+            .as_deref()
+            != Some(sqlite_key_for_pool(pool).as_str())
+        || (pool.sqlite_path() != ":memory:"
+            && !crate::search_v3::bridge_matches_database(
+                pool.sqlite_path(),
+                pool.search_database_generation_id(),
+            ))
+    {
+        return Ok(false);
+    }
+    crate::search_v3::index_message(message)
+}
+
+/// Startup and request-driven rebuilds share the same single-flight authority.
+pub fn startup_lexical_backfill(
+    database_url: &str,
+    index_dir: &Path,
+) -> Result<(usize, usize), String> {
+    let _lease = lexical_init_guard()
+        .lock()
+        .map_err(|error| error.to_string())?;
+    crate::search_v3::init_or_switch_bridge(index_dir)?;
+    crate::search_v3::backfill_from_db(database_url)
 }
 
 fn query_needs_recipient_filter(query: &SearchQuery) -> bool {
@@ -964,7 +1009,23 @@ fn sanitize_search_index_owner(value: &str) -> String {
 }
 
 fn direct_surface_index_dir(pool: &DbPool) -> Result<PathBuf, DbError> {
-    pool.validated_sqlite_path("lexical search database selection")?;
+    let sqlite_path = pool.validated_sqlite_path("lexical search database selection")?;
+    if !pool.uses_shared_search_index() {
+        // Snapshot pools inherit the canonical storage root for read-side
+        // project/archive context, but that root must never confer write
+        // authority over the live search index. Keep every search sidecar in
+        // the caller-owned snapshot directory instead.
+        let parent = sqlite_path
+            .parent()
+            .ok_or_else(|| DbError::InvalidArgument {
+                field: "database_url",
+                message: format!(
+                    "ephemeral search snapshot has no parent directory: {}",
+                    sqlite_path.display()
+                ),
+            })?;
+        return Ok(parent.join("search_index"));
+    }
     let shared = pool
         .validated_storage_root("lexical search index selection")?
         .join("search_index");
@@ -975,9 +1036,10 @@ fn direct_surface_index_dir(pool: &DbPool) -> Result<PathBuf, DbError> {
 }
 
 /// Read-only snapshot of the lexical Search V3 backfill/index state.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LexicalBackfillHealth {
-    /// Stable state label: `fresh`, `partial`, `stale`, `delayed`, `in_memory`, or `unavailable`.
+    /// Stable state label: `fresh`, `partial`, `stale`, `delayed`,
+    /// `in_memory`, `sql_only_snapshot`, or `unavailable`.
     pub state: String,
     /// Current SQLite identity used to scope the process-global lexical bridge.
     pub db_identity: String,
@@ -1004,12 +1066,23 @@ pub struct LexicalBackfillHealth {
     /// Safe operator action for recovering from the reported state.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safe_remediation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker_message_watermark: Option<crate::search_v3::MessageWatermark>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_message_watermark: Option<crate::search_v3::MessageWatermark>,
+    #[serde(default)]
+    pub watermark_sample_stable: bool,
+    #[serde(default)]
+    pub watermark_matches: bool,
 }
 
 impl LexicalBackfillHealth {
     #[must_use]
     pub fn is_degraded(&self) -> bool {
-        !matches!(self.state.as_str(), "fresh" | "in_memory")
+        !matches!(
+            self.state.as_str(),
+            "fresh" | "in_memory" | "sql_only_snapshot"
+        )
     }
 }
 
@@ -1019,18 +1092,29 @@ struct LexicalBackfillStateFile {
     schema_version: u32,
     #[serde(default)]
     db_path: String,
-    /// `db_identity.generation_id` the index was built from; absent on
-    /// markers written before generation tracking. (The marker also carries a
-    /// stat-level `db_fingerprint`; the probe ignores it — an inode change is
-    /// not an identity change, GH#295.)
     #[serde(default)]
-    db_generation: Option<String>,
+    db_generation_id: String,
+    #[serde(default)]
+    message_watermark: crate::search_v3::MessageWatermark,
     #[serde(default)]
     db_stats: LexicalBackfillStateStats,
     #[serde(default)]
     index_stats: LexicalBackfillStateStats,
     #[serde(default)]
     updated_at_micros: i64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+struct LexicalBackfillDbFingerprint {
+    #[serde(default)]
+    len_bytes: u64,
+    #[serde(default)]
+    modified_micros: i64,
+    #[serde(default)]
+    device_id: Option<u64>,
+    #[serde(default)]
+    inode: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1051,7 +1135,7 @@ fn read_lexical_backfill_state_file(
         .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
     let state = serde_json::from_str::<LexicalBackfillStateFile>(&raw)
         .map_err(|err| format!("cannot parse {}: {err}", path.display()))?;
-    if state.schema_version != 1 {
+    if state.schema_version != 2 {
         return Err(format!(
             "unsupported backfill state schema version {} in {}",
             state.schema_version,
@@ -1061,91 +1145,166 @@ fn read_lexical_backfill_state_file(
     Ok(Some(state))
 }
 
-/// How the process-global lexical index relates to one pool's database.
-///
-/// Only [`Self::Foreign`] short-circuits a search to the SQL scan (GH#162):
-/// the index demonstrably belongs to *another* database that still exists
-/// (a reconstructed-archive snapshot pool while the bridge serves the live
-/// mailbox, or vice versa). [`Self::Rebind`] means the index belongs to an
-/// earlier generation of *this* mailbox, a vanished database, or a previous
-/// pool generation in this process — all of which the next search repairs by
-/// letting `ensure_lexical_bridge_initialized` rebuild/rebind (GH#295,
-/// GH#296). [`Self::Drift`] is count/watermark lag the incremental backfill
-/// absorbs; [`Self::Ready`] needs nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LexicalIndexAffinity {
-    Ready,
-    Foreign,
-    Rebind,
-    Drift,
+#[cfg(test)]
+fn sqlite_file_lexical_backfill_fingerprint(db_path: &str) -> Option<LexicalBackfillDbFingerprint> {
+    if db_path == ":memory:" {
+        return None;
+    }
+    let metadata = std::fs::metadata(db_path).ok()?;
+    let (device_id, inode) = crate::pool::stable_sqlite_file_identity(Path::new(db_path))
+        .map_or((None, None), |(device_id, inode)| {
+            (Some(device_id), Some(inode))
+        });
+    let modified_micros = metadata
+        .modified()
+        .ok()
+        .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|dur| i64::try_from(dur.as_micros()).ok())
+        .unwrap_or(0);
+    Some(LexicalBackfillDbFingerprint {
+        len_bytes: metadata.len(),
+        modified_micros,
+        device_id,
+        inode,
+    })
 }
 
 /// Inspect the Search V3 lexical index state without initializing or backfilling the bridge.
 #[must_use]
 pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
-    lexical_backfill_health_with_affinity(pool).0
+    if pool.is_sql_only_search() || pool.sqlite_path() == ":memory:" {
+        return lexical_backfill_health_metadata(pool);
+    }
+    let connection = pool
+        .validated_sqlite_path("read-only lexical health")
+        .map_err(|error| error.to_string())
+        .and_then(|path| {
+            crate::pool::open_guarded_read_only_sqlite_file(path, "read-only lexical health")
+                .map_err(|error| error.to_string())
+        });
+    match connection {
+        Ok(conn) => lexical_backfill_health_from_conn(pool, &conn),
+        Err(error) => {
+            let mut health = lexical_backfill_health_metadata(pool);
+            health.state = "unavailable".to_string();
+            health.stale_reason = Some(format!(
+                "cannot sample live search-content revision: {error}"
+            ));
+            health
+        }
+    }
 }
 
-#[allow(clippy::too_many_lines)]
-fn lexical_backfill_health_with_affinity(
+/// Bracket marker inspection through the caller's existing connection. Robot
+/// health uses this entry point and never opens an extra pooled/SQLite handle.
+#[must_use]
+pub fn lexical_backfill_health_from_conn(
     pool: &DbPool,
-) -> (LexicalBackfillHealth, LexicalIndexAffinity) {
+    conn: &dyn crate::pool::SyncQuery,
+) -> LexicalBackfillHealth {
+    let before = crate::search_v3::fetch_db_message_watermark(conn).ok();
+    let mut health = lexical_backfill_health_metadata(pool);
+    if pool.is_sql_only_search() || pool.sqlite_path() == ":memory:" {
+        return health;
+    }
+    let state =
+        read_lexical_backfill_state_file(&Path::new(&health.index_dir).join("backfill_state.json"))
+            .ok()
+            .flatten();
+    let after = crate::search_v3::fetch_db_message_watermark(conn).ok();
+    health.marker_message_watermark = state.map(|state| state.message_watermark);
+    health.live_message_watermark = after;
+    health.watermark_sample_stable = before.is_some() && before == after;
+    health.watermark_matches = health.watermark_sample_stable
+        && after.is_some_and(|value| value.content_revision.is_some())
+        && health.marker_message_watermark == after;
+    if !health.watermark_matches {
+        health.state = if health.watermark_sample_stable {
+            "stale"
+        } else {
+            "unavailable"
+        }
+        .to_string();
+        health.stale_reason = Some("canonical search-content revision differs from the marker or could not be sampled consistently".to_string());
+        health.safe_remediation = Some("Run search_messages through the canonical daemon to rebuild the lexical index, then recheck health".to_string());
+    }
+    health
+}
+
+fn lexical_backfill_health_metadata(pool: &DbPool) -> LexicalBackfillHealth {
+    let mut health = lexical_backfill_health_metadata_raw(pool);
+    health.db_identity = crate::pool::display_sqlite_identity_key(&health.db_identity);
+    health.active_db_identity = health
+        .active_db_identity
+        .as_deref()
+        .map(crate::pool::display_sqlite_identity_key);
+    health
+}
+
+fn lexical_backfill_health_metadata_raw(pool: &DbPool) -> LexicalBackfillHealth {
     let sqlite_key = sqlite_key_for_pool(pool);
     let active_key = lexical_active_db_key()
         .lock()
         .map_or(None, |guard| guard.clone());
-    // `sqlite_key` / `active_key` are process-global cache keys and carry an
-    // encoding discriminator; the report shows the operator-facing
-    // `<path>@<generation>` spelling instead.
-    let db_identity = crate::pool::display_sqlite_identity_key(&sqlite_key);
-    let active_db_identity = active_key
-        .as_deref()
-        .map(crate::pool::display_sqlite_identity_key);
+    if pool.is_sql_only_search() {
+        return LexicalBackfillHealth {
+            state: "sql_only_snapshot".to_string(),
+            db_identity: sqlite_key,
+            index_dir: String::new(),
+            indexed_messages: 0,
+            source_messages: None,
+            skipped_messages: 0,
+            last_backfill_at_micros: None,
+            rebuild_in_progress: false,
+            active_db_identity: active_key,
+            stale_reason: None,
+            safe_remediation: None,
+            ..Default::default()
+        };
+    }
     let index_dir = match direct_surface_index_dir(pool) {
         Ok(index_dir) => index_dir,
         Err(error) => {
-            return (LexicalBackfillHealth {
+            return LexicalBackfillHealth {
                 state: "unavailable".to_string(),
-                db_identity: db_identity.clone(),
+                db_identity: sqlite_key,
                 index_dir: stable_direct_surface_index_dir(pool).display().to_string(),
                 indexed_messages: 0,
                 source_messages: None,
                 skipped_messages: 0,
                 last_backfill_at_micros: None,
                 rebuild_in_progress: false,
-                active_db_identity: active_db_identity.clone(),
+                active_db_identity: active_key,
                 stale_reason: Some(error.to_string()),
                 safe_remediation: Some(
                     "Restore the configured SQLite and storage-root paths to their original filesystem authorities, then retry lexical health"
                         .to_string(),
                 ),
-            }, LexicalIndexAffinity::Drift);
+                ..Default::default()
+            };
         }
     };
     let index_dir_display = index_dir.display().to_string();
 
     if pool.sqlite_path() == ":memory:" {
-        return (
-            LexicalBackfillHealth {
-                state: "in_memory".to_string(),
-                db_identity: db_identity.clone(),
-                index_dir: index_dir_display,
-                indexed_messages: 0,
-                source_messages: None,
-                skipped_messages: 0,
-                last_backfill_at_micros: None,
-                rebuild_in_progress: false,
-                active_db_identity: active_db_identity.clone(),
-                stale_reason: Some(
-                    "lexical backfill cannot inspect pooled sqlite:///:memory: contents"
-                        .to_string(),
-                ),
-                safe_remediation: Some(
-                    "Use file-backed storage for durable Search V3 lexical diagnostics".to_string(),
-                ),
-            },
-            LexicalIndexAffinity::Ready,
-        );
+        return LexicalBackfillHealth {
+            state: "in_memory".to_string(),
+            db_identity: sqlite_key,
+            index_dir: index_dir_display,
+            indexed_messages: 0,
+            source_messages: None,
+            skipped_messages: 0,
+            last_backfill_at_micros: None,
+            rebuild_in_progress: false,
+            active_db_identity: active_key,
+            stale_reason: Some(
+                "lexical backfill cannot inspect pooled sqlite:///:memory: contents".to_string(),
+            ),
+            safe_remediation: Some(
+                "Use file-backed storage for durable Search V3 lexical diagnostics".to_string(),
+            ),
+            ..Default::default()
+        };
     }
 
     let cached_bootstrap = lexical_bootstrap_state()
@@ -1153,24 +1312,20 @@ fn lexical_backfill_health_with_affinity(
         .ok()
         .and_then(|state| state.get(&sqlite_key).cloned());
     if let Some(Err(error)) = cached_bootstrap {
-        return (
-            LexicalBackfillHealth {
-                state: "unavailable".to_string(),
-                db_identity: db_identity.clone(),
-                index_dir: index_dir_display,
-                indexed_messages: 0,
-                source_messages: None,
-                skipped_messages: 0,
-                last_backfill_at_micros: None,
-                rebuild_in_progress: false,
-                active_db_identity: active_db_identity.clone(),
-                stale_reason: Some(error),
-                safe_remediation: Some(
-                    "Retry search bootstrap or run `am doctor health`".to_string(),
-                ),
-            },
-            LexicalIndexAffinity::Drift,
-        );
+        return LexicalBackfillHealth {
+            state: "unavailable".to_string(),
+            db_identity: sqlite_key,
+            index_dir: index_dir_display,
+            indexed_messages: 0,
+            source_messages: None,
+            skipped_messages: 0,
+            last_backfill_at_micros: None,
+            rebuild_in_progress: false,
+            active_db_identity: active_key,
+            stale_reason: Some(error),
+            safe_remediation: Some("Retry search bootstrap or run `am doctor health`".to_string()),
+            ..Default::default()
+        };
     }
 
     let backfill_marker_present = has_run_lexical_backfill(&sqlite_key).unwrap_or(false);
@@ -1178,25 +1333,23 @@ fn lexical_backfill_health_with_affinity(
     let state = match read_lexical_backfill_state_file(&state_path) {
         Ok(state) => state,
         Err(error) => {
-            return (
-                LexicalBackfillHealth {
-                    state: "unavailable".to_string(),
-                    db_identity: db_identity.clone(),
-                    index_dir: index_dir_display,
-                    indexed_messages: 0,
-                    source_messages: None,
-                    skipped_messages: 0,
-                    last_backfill_at_micros: None,
-                    rebuild_in_progress: false,
-                    active_db_identity: active_db_identity.clone(),
-                    stale_reason: Some(error),
-                    safe_remediation: Some(
-                        "Run `am robot search <query>` to retry lexical bridge initialization"
-                            .to_string(),
-                    ),
-                },
-                LexicalIndexAffinity::Drift,
-            );
+            return LexicalBackfillHealth {
+                state: "unavailable".to_string(),
+                db_identity: sqlite_key,
+                index_dir: index_dir_display,
+                indexed_messages: 0,
+                source_messages: None,
+                skipped_messages: 0,
+                last_backfill_at_micros: None,
+                rebuild_in_progress: false,
+                active_db_identity: active_key,
+                stale_reason: Some(error),
+                safe_remediation: Some(
+                    "Run search_messages through the canonical daemon to retry lexical bridge initialization"
+                        .to_string(),
+                ),
+                ..Default::default()
+            };
         }
     };
 
@@ -1206,162 +1359,93 @@ fn lexical_backfill_health_with_affinity(
         } else {
             "lexical backfill has not completed for this database"
         };
-        return (LexicalBackfillHealth {
+        return LexicalBackfillHealth {
             state: "delayed".to_string(),
-            db_identity: db_identity.clone(),
+            db_identity: sqlite_key,
             index_dir: index_dir_display,
             indexed_messages: 0,
             source_messages: None,
             skipped_messages: 0,
             last_backfill_at_micros: None,
             rebuild_in_progress: false,
-            active_db_identity: active_db_identity.clone(),
+            active_db_identity: active_key,
             stale_reason: Some(reason.to_string()),
             safe_remediation: Some(
-                "Run `am robot search <query>` or wait for startup search backfill, then recheck `am robot health --format json`"
+                "Run search_messages through the canonical daemon or wait for startup search backfill, then recheck `am robot health --format json`"
                     .to_string(),
             ),
-        }, LexicalIndexAffinity::Drift);
+            ..Default::default()
+        };
     };
 
     let source_messages = state.db_stats.count;
     let indexed_messages = state.index_stats.count;
     let skipped_messages = source_messages.saturating_sub(indexed_messages);
-    let identity_path = pool.search_identity_path();
-    let current_generation = cached_db_generation_for_pool(pool);
-
-    // Identity is decided by the mailbox path and the database generation
-    // token, never by the file's inode: a same-path replacement of the file
-    // (VACUUM INTO + rename, backup restore, the daemon's own recovery
-    // promotion) keeps the generation and therefore keeps the index (GH#295).
-    let (stale_reason, affinity) = if state.db_path != identity_path {
-        if Path::new(&state.db_path).exists() {
-            (
-                Some(format!(
-                    "backfill marker belongs to {}, current database is {identity_path}",
-                    state.db_path
-                )),
-                LexicalIndexAffinity::Foreign,
-            )
-        } else {
-            // Nobody can still own an index for a database that no longer
-            // exists (typically a temp snapshot that stamped the shared
-            // marker, GH#297); reclaim it for this mailbox.
-            (
-                Some(format!(
-                    "backfill marker belongs to {}, which no longer exists; current database is {identity_path}",
-                    state.db_path
-                )),
-                LexicalIndexAffinity::Rebind,
-            )
-        }
-    } else if let (Some(recorded), Some(current)) = (
-        state.db_generation.as_deref(),
-        current_generation.as_deref(),
-    ) && recorded != current
+    // Preserve GH#295: inode replacement is not a logical database change.
+    // The persisted generation and transactional watermark decide freshness;
+    // the backfill writer may retain a filesystem fingerprint as a skip hint.
+    let stale_reason = if state.db_path != pool.sqlite_path() {
+        Some(format!(
+            "backfill marker belongs to {}, current database is {}",
+            state.db_path,
+            pool.sqlite_path()
+        ))
+    } else if state.db_generation_id.is_empty() {
+        Some("backfill marker database generation is missing".to_string())
+    } else if pool
+        .search_database_generation_id()
+        .is_some_and(|generation| state.db_generation_id != generation)
     {
-        (
-            Some(format!(
-                "backfill marker database generation changed for {identity_path} \
-                 (indexed generation {recorded}, current generation {current})"
-            )),
-            LexicalIndexAffinity::Rebind,
-        )
-    } else if let Some(active) = active_key.as_deref()
-        && active != sqlite_key.as_str()
+        Some(format!(
+            "backfill marker database generation does not match the current database {}",
+            pool.sqlite_path()
+        ))
+    } else if active_key
+        .as_deref()
+        .is_some_and(|active| active != sqlite_key.as_str())
     {
-        if lexical_key_path(active) == identity_path {
-            (
-                Some(format!(
-                    "process-global lexical bridge is bound to another generation of this database: {}",
-                    crate::pool::display_sqlite_identity_key(active)
-                )),
-                LexicalIndexAffinity::Rebind,
-            )
-        } else {
-            (
-                Some(format!(
-                    "process-global lexical bridge is active for a different database: {}",
-                    crate::pool::display_sqlite_identity_key(active)
-                )),
-                LexicalIndexAffinity::Foreign,
-            )
-        }
+        Some(format!(
+            "process-global lexical bridge is active for a different database: {}",
+            active_key.as_deref().unwrap_or_default()
+        ))
     } else if indexed_messages != source_messages {
-        (
-            Some(format!(
-                "indexed message count {indexed_messages} differs from source count {source_messages}"
-            )),
-            LexicalIndexAffinity::Drift,
-        )
+        Some(format!(
+            "indexed message count {indexed_messages} differs from source count {source_messages}"
+        ))
     } else if state.index_stats.max_id != state.db_stats.max_id {
-        (
-            Some(format!(
-                "indexed max message id {} differs from source max id {}",
-                state.index_stats.max_id, state.db_stats.max_id
-            )),
-            LexicalIndexAffinity::Drift,
-        )
-    } else if state.db_generation.is_none() && current_generation.is_some() {
-        (
-            Some(format!(
-                "backfill marker for {identity_path} predates database generation tracking"
-            )),
-            LexicalIndexAffinity::Drift,
-        )
+        Some(format!(
+            "indexed max message id {} differs from source max id {}",
+            state.index_stats.max_id, state.db_stats.max_id
+        ))
     } else {
-        (None, LexicalIndexAffinity::Ready)
+        None
     };
-    let health_state = match affinity {
-        LexicalIndexAffinity::Ready => "fresh",
-        LexicalIndexAffinity::Foreign | LexicalIndexAffinity::Rebind => "stale",
-        LexicalIndexAffinity::Drift => "partial",
-    };
-    let safe_remediation = match affinity {
-        LexicalIndexAffinity::Ready => None,
-        LexicalIndexAffinity::Foreign
-            if stale_reason
-                .as_deref()
-                .is_some_and(|reason| reason.starts_with("process-global lexical bridge")) =>
-        {
-            // GH#261: the active-bridge key is process-global state inside
-            // the daemon; an external `am robot search` runs in a different
-            // process and can never clear it, so hinting it sends operators
-            // in circles.
-            Some(
-                "Restart the server process so the lexical bridge rebinds to this database \
-                 (the active-bridge key is process-global; an external `am robot search` \
-                 cannot clear it)"
-                    .to_string(),
-            )
-        }
-        LexicalIndexAffinity::Rebind => Some(
-            "Run any search: the process rebinds the lexical index to the current database \
-             on its next lexical search (an `am robot search <query>` also refreshes the \
-             shared backfill marker)"
-                .to_string(),
-        ),
-        LexicalIndexAffinity::Foreign | LexicalIndexAffinity::Drift => {
-            Some("Run `am robot search <query>` to refresh Search V3 lexical backfill".to_string())
-        }
+    let health_state = match stale_reason.as_deref() {
+        None => "fresh",
+        Some(reason) if reason.starts_with("backfill marker belongs") => "stale",
+        Some(reason) if reason.starts_with("backfill marker database identity") => "stale",
+        Some(reason) if reason.starts_with("backfill marker database generation") => "stale",
+        Some(reason) if reason.starts_with("process-global lexical bridge") => "stale",
+        Some(_) => "partial",
     };
 
-    (
-        LexicalBackfillHealth {
-            state: health_state.to_string(),
-            db_identity,
-            index_dir: index_dir_display,
-            indexed_messages,
-            source_messages: Some(source_messages),
-            skipped_messages,
-            last_backfill_at_micros: Some(state.updated_at_micros),
-            rebuild_in_progress: false,
-            active_db_identity,
-            safe_remediation,
-            stale_reason,
-        },
-        affinity,
-    )
+    LexicalBackfillHealth {
+        state: health_state.to_string(),
+        db_identity: sqlite_key,
+        index_dir: index_dir_display,
+        indexed_messages,
+        source_messages: Some(source_messages),
+        skipped_messages,
+        last_backfill_at_micros: Some(state.updated_at_micros),
+        rebuild_in_progress: false,
+        active_db_identity: active_key,
+        safe_remediation: (health_state != "fresh").then(|| {
+            "Run search_messages through the canonical daemon to refresh its lexical index"
+                .to_string()
+        }),
+        stale_reason,
+        ..Default::default()
+    }
 }
 
 fn map_bridge_bootstrap_error(err: &str) -> DbError {
@@ -1382,88 +1466,42 @@ fn lexical_backfill_database_url(pool: &DbPool) -> String {
     }
 }
 
-/// Process-wide memo of each pool generation's mailbox generation token.
-///
-/// Lets the per-search health probe avoid re-opening the database: keyed by
-/// `pool.sqlite_identity_key()` (`path@pool-generation`), which a recovery
-/// that replaces the file also replaces.
-fn lexical_generation_cache() -> &'static Mutex<HashMap<String, String>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// `db_identity.generation_id` of the database behind `pool`.
-///
-/// Read once per pool generation. `None` for `:memory:` pools and for files whose
-/// generation cannot be read (absent, unreadable, pre-generation schema); a
-/// failed read is retried on the next call rather than memoized.
-fn cached_db_generation_for_pool(pool: &DbPool) -> Option<String> {
-    if pool.sqlite_path() == ":memory:" {
-        return None;
-    }
-    let cache_key = pool.sqlite_identity_key();
-    if let Some(generation) = lexical_generation_cache()
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&cache_key).cloned())
-    {
-        return Some(generation);
-    }
-    let generation = crate::pool::read_db_generation_id_for_path(Path::new(pool.sqlite_path()))?;
-    if let Ok(mut cache) = lexical_generation_cache().lock() {
-        cache.insert(cache_key, generation.clone());
-    }
-    Some(generation)
-}
-
-/// The Search V3 identity key of a mailbox.
-///
-/// `<mailbox path>@<generation>`, or the bare path when the generation token
-/// is unknown.
-///
-/// This is deliberately NOT `DbPool::sqlite_identity_key()`. That key carries
-/// the process-local pool cache generation, so two pools opened on the same
-/// file in one process (the startup backfill thread's and the request
-/// handlers') never compared equal and the daemon reported its own database
-/// as "a different database" forever (GH#261, GH#296). The database
-/// generation token changes exactly when the database is re-created, which
-/// is the only event that actually invalidates the lexical index.
-fn lexical_db_key(identity_path: &str, generation: Option<&str>) -> String {
-    match generation {
-        Some(generation) => format!("{identity_path}@{generation}"),
-        None => identity_path.to_string(),
-    }
-}
-
-/// The mailbox-path part of a [`lexical_db_key`].
-fn lexical_key_path(key: &str) -> &str {
-    match key.rsplit_once('@') {
-        Some((path, generation)) if !generation.is_empty() && !generation.contains(['/', '\\']) => {
-            path
-        }
-        _ => key,
-    }
-}
-
 fn sqlite_key_from_database_url(database_url: &str) -> Option<String> {
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
         return None;
     }
-    let path = crate::search_v3::resolve_search_sqlite_path_from_database_url(database_url)?;
-    let generation = crate::pool::read_db_generation_id_for_path(Path::new(&path));
-    Some(lexical_db_key(&path, generation.as_deref()))
+    crate::search_v3::resolve_search_sqlite_path_from_database_url(database_url)
 }
 
 fn sqlite_key_for_pool(pool: &DbPool) -> String {
+    let pool_key = pool.sqlite_identity_key();
     if pool.sqlite_path() == ":memory:" {
-        // Each `:memory:` pool is its own database; the pool generation is
-        // the only identity it has.
-        return pool.sqlite_identity_key();
+        return pool_key;
     }
-    lexical_db_key(
-        pool.search_identity_path(),
-        cached_db_generation_for_pool(pool).as_deref(),
-    )
+
+    // GH#296: file-backed read surfaces intentionally open short-lived pools.
+    // Their per-pool cache generations differ, but the durable `db_identity`
+    // token is stable for one logical database and is re-minted on replacement.
+    // It therefore converges request pools without trusting path strings,
+    // inode reuse, or low-resolution platform file IDs. Until a pooled
+    // connection has proved that token, preserve the private pool generation
+    // and fail closed instead of collapsing unrelated databases.
+    let Some(database_generation) = pool.search_database_generation_id() else {
+        return pool_key;
+    };
+    let Some((path_namespace, pool_generation)) = pool_key.rsplit_once('@') else {
+        return pool_key;
+    };
+    if pool_generation.parse::<u64>().is_err() {
+        return pool_key;
+    }
+
+    format!("{path_namespace}@db:{database_generation}")
+}
+
+fn lexical_bridge_is_permitted_for_pool(pool: &DbPool) -> bool {
+    pool.uses_shared_search_index()
+        && (pool.sqlite_path() == ":memory:" || pool.search_database_generation_id().is_some())
 }
 
 fn has_run_lexical_backfill(sqlite_key: &str) -> Result<bool, DbError> {
@@ -1513,25 +1551,65 @@ pub fn note_startup_lexical_backfill_completed(database_url: &str) -> Result<(),
     record_lexical_bootstrap_success(&sqlite_key)
 }
 
+/// Record startup lexical backfill completion under the live database's search identity.
+///
+/// GH#261: the URL-based [`note_startup_lexical_backfill_completed`] derives a
+/// *bare path* key, while `lexical_backfill_health` and
+/// `ensure_lexical_bridge_initialized` compare against the pool-derived search
+/// key. Those strings can never be equal, so a daemon whose startup backfill
+/// completed before its first search marked its own (only) database as "a
+/// different database" and silently served the plain-SQL fallback for its
+/// entire lifetime. Callers that have (or can resolve) a pool must use this
+/// variant so completion is recorded under exactly the stable file identity
+/// the health probe checks across short-lived query-only pools (GH#296).
+pub fn note_startup_lexical_backfill_completed_for_pool(pool: &DbPool) -> Result<(), DbError> {
+    if pool.sqlite_path() == ":memory:" {
+        return Ok(());
+    }
+    if !lexical_bridge_is_permitted_for_pool(pool) {
+        // A startup pool whose durable generation has not yet been observed
+        // cannot safely publish process-global success under a path-only or
+        // per-wrapper key. The first real search will acquire the pool,
+        // observe `db_identity`, and initialize lazily under the proven key.
+        return Ok(());
+    }
+    if crate::search_v3::get_bridge().is_none() {
+        return Ok(());
+    }
+    let sqlite_key = sqlite_key_for_pool(pool);
+    let _guard = lexical_init_guard()
+        .lock()
+        .map_err(|e| DbError::Sqlite(format!("search bootstrap init guard lock poisoned: {e}")))?;
+    record_lexical_bootstrap_success(&sqlite_key)
+}
+
 fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
     if pool.sqlite_path() == ":memory:" {
         return Ok(());
     }
     let sqlite_key = sqlite_key_for_pool(pool);
     let db_url = lexical_backfill_database_url(pool);
-    crate::search_v3::backfill_from_db_as(&db_url, Some(pool.search_identity_path()))
-        .map_err(|err| map_bridge_bootstrap_error(&err))?;
+    crate::search_v3::backfill_from_db(&db_url).map_err(|err| map_bridge_bootstrap_error(&err))?;
     mark_lexical_backfill_ran(&sqlite_key)?;
     Ok(())
 }
 
 fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
-    let sqlite_key = sqlite_key_for_pool(pool);
-    let index_dir = direct_surface_index_dir(pool)?;
     let _guard = lexical_init_guard()
         .lock()
         .map_err(|e| DbError::Sqlite(format!("search bootstrap init guard lock poisoned: {e}")))?;
+    ensure_lexical_bridge_initialized_locked(pool)
+}
 
+fn ensure_lexical_bridge_initialized_locked(pool: &DbPool) -> Result<(), DbError> {
+    if !lexical_bridge_is_permitted_for_pool(pool) {
+        return Err(DbError::Sqlite(
+            "process-global lexical bridge refused for an isolated or unproven database pool"
+                .to_string(),
+        ));
+    }
+    let sqlite_key = sqlite_key_for_pool(pool);
+    let index_dir = direct_surface_index_dir(pool)?;
     let state_lock = lexical_bootstrap_state();
     let cached_state = state_lock
         .lock()
@@ -1547,6 +1625,7 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
     // per-DB backfill marker is present.
     let bridge_ready = crate::search_v3::is_bridge_initialized_for(&index_dir);
     if matches!(cached_state, Some(Ok(())))
+        && pool.sqlite_path() == ":memory:"
         && active_key.as_deref() == Some(sqlite_key.as_str())
         && bridge_ready
         && has_run_lexical_backfill(&sqlite_key)?
@@ -1575,12 +1654,9 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
         // The lexical bridge is process-global. Re-run backfill whenever a
         // different DB becomes active so lexical results cannot drift across DB
         // boundaries in multi-pool workflows.
-        let should_backfill = !bridge_ready
-            || active_key.as_deref() != Some(sqlite_key.as_str())
-            || !has_run_lexical_backfill(&sqlite_key).map_err(|err| err.to_string())?;
-        if should_backfill {
-            run_lexical_backfill_for_pool(pool).map_err(|err| err.to_string())?;
-        }
+        // A process-local success flag cannot attest later edits or deletions.
+        // Backfill itself performs the cheap persisted content-revision check.
+        run_lexical_backfill_for_pool(pool).map_err(|err| err.to_string())?;
         Ok(true)
     })();
 
@@ -4094,10 +4170,7 @@ fn build_search_cache_key(
     cache_scope_discriminator(query).hash(&mut discriminator_hasher);
     cache_authorization_discriminator(options).hash(&mut discriminator_hasher);
     cache_engine_discriminator(engine_mode).hash(&mut discriminator_hasher);
-    // The result cache stays scoped by the pool cache generation (not the
-    // lexical identity): a replacement pool for the same file must never
-    // observe result sets cached before the replacement.
-    pool.sqlite_identity_key().hash(&mut discriminator_hasher);
+    sqlite_key_for_pool(pool).hash(&mut discriminator_hasher);
     let scope_discriminator = discriminator_hasher.finish();
     // Cursor-based pagination: hash cursor token into offset proxy.
     // Also fold in scope discriminator so product/project scope variants of
@@ -4144,6 +4217,65 @@ const fn cache_engine_discriminator(engine: SearchEngine) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn execute_message_sql_fallback(
+    cx: &Cx,
+    pool: &DbPool,
+    query: &SearchQuery,
+    options: &SearchOptions,
+    engine: SearchEngine,
+    assistance: Option<QueryAssistance>,
+    timer: std::time::Instant,
+    fallback_reason: &'static str,
+) -> Outcome<ScopedSearchResponse, DbError> {
+    let limit = pagination_fetch_limit(query, legacy_candidate_limit(query));
+    let raw_results = match legacy_sql_candidate_results(cx, pool, query, limit).await {
+        Outcome::Ok(results) => results,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let raw_results = match canonicalize_message_results(cx, pool, query, raw_results, false).await
+    {
+        Outcome::Ok(results) => results,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let raw_results = apply_cursor_window(raw_results, query);
+    let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
+    let explain = if query.explain {
+        let mut explain = build_v3_query_explain(query, engine, None);
+        explain.method = "like_fallback".to_string();
+        explain.used_like_fallback = true;
+        explain.sql = "-- canonical relational message-search fallback".to_string();
+        explain
+            .facets_applied
+            .push(format!("fallback_reason:{fallback_reason}"));
+        explain.facet_count = explain.facets_applied.len();
+        Some(explain)
+    } else {
+        None
+    };
+    let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+    if options.track_telemetry {
+        record_query("search_service_lexical_sql_fallback", latency_us);
+    }
+    global_metrics()
+        .search
+        .record_legacy_query(latency_us, false);
+    tracing::warn!(
+        target: "search.fallback",
+        fallback_reason,
+        database = %pool.sqlite_path(),
+        "serving message search from canonical relational data without using the process-global lexical bridge"
+    );
+    // Deliberately not cached. Snapshot results are transient, and an
+    // unproven database identity cannot safely participate in the global
+    // cache namespace shared by independently constructed request pools.
+    finish_scoped_response(raw_results, query, options, assistance, explain)
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Core execution
 // ────────────────────────────────────────────────────────────────────
@@ -4164,11 +4296,99 @@ pub async fn execute_search(
 ) -> Outcome<ScopedSearchResponse, DbError> {
     let timer = std::time::Instant::now();
     let product_sql_budget = product_sql_budget_state(cx, query);
-    let cache_allowed = product_sql_budget.is_none_or(|state| !state.page_limited);
+    let mut cache_allowed = product_sql_budget.is_none_or(|state| !state.page_limited);
+
+    let engine = options
+        .search_engine
+        .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
+    let assistance = query_assistance_payload(query);
+
+    // GH#297: a private archive snapshot is SQL-only for every configured
+    // engine. Lexical and semantic bridges are process-global; allowing either
+    // to initialize from a snapshot would displace or contaminate the live
+    // daemon. Keep plain message keyword behavior on the canonical relational
+    // fallback, and use the SQL planner for every structured/non-message shape.
+    // This branch intentionally precedes cache-key and database-identity work.
+    if !pool.uses_shared_search_index() {
+        if matches!(query.doc_kind, DocKind::Message) && !message_query_requires_sql_plan(query) {
+            return execute_message_sql_fallback(
+                cx,
+                pool,
+                query,
+                options,
+                engine,
+                assistance,
+                timer,
+                "isolated_snapshot_pool",
+            )
+            .await;
+        }
+        return execute_sql_plan_search(
+            cx,
+            pool,
+            query,
+            options,
+            None,
+            assistance,
+            timer,
+            product_sql_budget,
+            false,
+        )
+        .await;
+    }
+
+    let uses_lexical_candidates = matches!(
+        engine,
+        SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
+    ) && !matches!(query.doc_kind, DocKind::Agent | DocKind::Project)
+        && !message_query_requires_sql_plan(query);
+
+    // GH#296: establish the durable logical DB generation through this pool's
+    // own checked-out connection before either cache or process-global bridge
+    // selection. The observation is shared by wrappers of the same underlying
+    // pool. Opening a second ad-hoc SQLite handle here would interfere with
+    // FrankenSQLite's file-lock ownership, so acquisition is intentional.
+    let mut content_revision = None;
+    if pool.sqlite_path() != ":memory:" {
+        match pool.acquire(cx).await {
+            Outcome::Ok(conn) => {
+                content_revision = crate::search_v3::fetch_db_message_watermark(&conn)
+                    .ok()
+                    .and_then(|watermark| watermark.content_revision);
+            }
+            Outcome::Err(err) => return Outcome::Err(DbError::Sqlite(err.to_string())),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+        cache_allowed &= content_revision.is_some();
+    }
+
+    // A file-backed pool that cannot prove its persisted generation is
+    // SQL-only for lexical candidates until the identity becomes available.
+    if uses_lexical_candidates && !lexical_bridge_is_permitted_for_pool(pool) {
+        return execute_message_sql_fallback(
+            cx,
+            pool,
+            query,
+            options,
+            engine,
+            assistance,
+            timer,
+            "unproven_database_generation",
+        )
+        .await;
+    }
 
     // ── Cache lookup ──────────────────────────────────────────────────
     let cache = global_search_cache();
-    let cache_key = build_search_cache_key(pool, query, options, cache.current_epoch());
+    let cache_key = build_search_cache_key(
+        pool,
+        query,
+        options,
+        cache
+            .current_epoch()
+            .wrapping_add(content_revision.unwrap_or(0)),
+    );
 
     if cache_allowed && let Some(cached) = cache.get(&cache_key) {
         let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -4184,11 +4404,6 @@ pub async fn execute_search(
         return Outcome::Ok(cached);
     }
 
-    let engine = options
-        .search_engine
-        .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
-    let assistance = query_assistance_payload(query);
-
     if matches!(query.doc_kind, DocKind::Agent | DocKind::Project)
         || message_query_requires_sql_plan(query)
     {
@@ -4197,8 +4412,7 @@ pub async fn execute_search(
             pool,
             query,
             options,
-            cache,
-            cache_key,
+            Some((cache, cache_key)),
             assistance,
             timer,
             product_sql_budget,
@@ -4244,54 +4458,25 @@ pub async fn execute_search(
         return resp;
     }
 
-    // GH#162: When reads are served from a reconstructed archive snapshot
-    // (durability_state=degraded_read_only), the process-global Search V3 lexical
-    // bridge stays bound to the *live* database, so this pool's lexical index is
-    // foreign/empty and the Tantivy candidate path would silently return [] for
-    // messages that exist in the snapshot's relational tables. `state == "stale"`
-    // from `lexical_backfill_health` is exactly the "index belongs to a different
-    // database than this pool" signal (path / identity / active-bridge mismatch).
-    // Fall back to the SQL message scan (same path the Legacy engine uses), which
-    // reads straight from THIS pool, so plain-keyword search keeps returning real
-    // results through the degraded window. Count drift ("partial"/"delayed") is NOT
-    // foreign and is handled by the existing backfill-on-empty retry below.
+    // Preserve another existing mailbox's marker authority (GH#162). Content
+    // drift and generation replacement at this mailbox's path must instead
+    // reach the guarded rebuild below (GH#295/GH#296).
     if matches!(
         engine,
         SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
     ) && lexical_index_is_foreign_to_pool(pool)
     {
-        let limit = pagination_fetch_limit(query, legacy_candidate_limit(query));
-        let raw_results = match legacy_sql_candidate_results(cx, pool, query, limit).await {
-            Outcome::Ok(results) => results,
-            Outcome::Err(err) => return Outcome::Err(err),
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-        };
-        let raw_results =
-            match canonicalize_message_results(cx, pool, query, raw_results, false).await {
-                Outcome::Ok(results) => results,
-                Outcome::Err(err) => return Outcome::Err(err),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            };
-        let raw_results = apply_cursor_window(raw_results, query);
-        let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
-        let explain = if query.explain {
-            Some(build_v3_query_explain(query, engine, None))
-        } else {
-            None
-        };
-        let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
-        if options.track_telemetry {
-            record_query("search_service_lexical_sql_fallback", latency_us);
-        }
-        global_metrics()
-            .search
-            .record_legacy_query(latency_us, false);
-        // Deliberately NOT cached: the snapshot pool is ephemeral and this result
-        // reflects a transient degraded window; caching could leak a snapshot read
-        // into the post-recovery live cache.
-        return finish_scoped_response(raw_results, query, options, assistance.clone(), explain);
+        return execute_message_sql_fallback(
+            cx,
+            pool,
+            query,
+            options,
+            engine,
+            assistance,
+            timer,
+            "foreign_lexical_index",
+        )
+        .await;
     }
 
     if matches!(
@@ -4310,40 +4495,15 @@ pub async fn execute_search(
 
     // ── Tantivy-only fast path ──────────────────────────────────────
     if engine == SearchEngine::Lexical {
-        let explicit_lexical = matches!(options.search_engine, Some(SearchEngine::Lexical));
         let mut lexical_query = query.clone();
         lexical_query.limit = Some(pagination_fetch_limit(
             query,
             lexical_candidate_limit(query),
         ));
 
-        if let Some(mut raw_results) = try_tantivy_search(&lexical_query) {
-            if raw_results.is_empty() && !explicit_lexical && pool.sqlite_path() != ":memory:" {
-                let sqlite_key = sqlite_key_for_pool(pool);
-                let backfill_ran = match has_run_lexical_backfill(&sqlite_key) {
-                    Ok(v) => v,
-                    Err(err) => return Outcome::Err(err),
-                };
-                if !backfill_ran {
-                    if let Err(err) = run_lexical_backfill_for_pool(pool) {
-                        let latency_us =
-                            u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
-                        record_legacy_error_metrics(
-                            "search_service_lexical_backfill",
-                            latency_us,
-                            options.track_telemetry,
-                        );
-                        return Outcome::Err(err);
-                    }
-                    if let Some(rerun_results) = try_tantivy_search(&lexical_query) {
-                        raw_results = rerun_results;
-                    }
-                }
-            }
+        if let Some(raw_results) = try_tantivy_search(pool, &lexical_query) {
             let raw_results =
-                match canonicalize_message_results(cx, pool, query, raw_results, explicit_lexical)
-                    .await
-                {
+                match canonicalize_message_results(cx, pool, query, raw_results, false).await {
                     Outcome::Ok(results) => results,
                     Outcome::Err(err) => return Outcome::Err(err),
                     Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
@@ -4452,7 +4612,7 @@ pub async fn execute_search(
         // asupersync, and this crate does not enable the proc-macro helpers that
         // would replace it. Keep the hybrid orchestration behavior intact while
         // running candidate retrieval directly in the current task.
-        let lexical_results = try_tantivy_search(&lexical_query);
+        let lexical_results = try_tantivy_search(pool, &lexical_query);
         #[cfg(feature = "hybrid")]
         let (semantic_results, two_tier_telemetry) = if plan.derivation.budget.semantic_limit == 0 {
             (Vec::new(), None)
@@ -4534,19 +4694,26 @@ pub async fn execute_search(
 
 /// Whether this pool's Search V3 lexical index belongs to a *different* database.
 ///
-/// True is the reconstructed-archive-snapshot case (GH#162): the process-global
-/// Tantivy bridge cannot serve this pool, so lexical / hybrid candidate retrieval
-/// must fall back to a SQL message scan. Only [`LexicalIndexAffinity::Foreign`]
-/// counts — a marker or active bridge bound to another *existing* database.
-/// An index bound to an earlier generation of this same mailbox, to a vanished
-/// database, or to a previous pool generation in this process is
-/// [`LexicalIndexAffinity::Rebind`]: it also reads as `"stale"`, but the search
-/// must fall through to `ensure_lexical_bridge_initialized`, which rebuilds and
-/// rebinds it, instead of degrading to the SQL scan for the rest of the
-/// process's life (GH#295, GH#296).
+/// Only a marker owned by another existing mailbox requires SQL fallback
+/// (GH#162). A changed content revision, a replaced generation at the same
+/// path, or a vanished snapshot marker must reach the guarded rebuild instead
+/// of degrading to SQL for the rest of the process lifetime (GH#295/GH#296).
+/// Inspect marker metadata only: opening another SQLite handle here could
+/// disturb the caller's existing connection locks.
 fn lexical_index_is_foreign_to_pool(pool: &DbPool) -> bool {
-    pool.sqlite_path() != ":memory:"
-        && lexical_backfill_health_with_affinity(pool).1 == LexicalIndexAffinity::Foreign
+    if pool.sqlite_path() == ":memory:" || pool.is_sql_only_search() {
+        return false;
+    }
+    direct_surface_index_dir(pool)
+        .ok()
+        .and_then(|directory| {
+            read_lexical_backfill_state_file(&directory.join("backfill_state.json"))
+                .ok()
+                .flatten()
+        })
+        .is_some_and(|state| {
+            state.db_path != pool.sqlite_path() && Path::new(&state.db_path).exists()
+        })
 }
 
 /// Plain-keyword SQL message scan shared by the `Legacy`/`Shadow` engines.
@@ -4740,8 +4907,7 @@ async fn execute_sql_plan_search(
     pool: &DbPool,
     query: &SearchQuery,
     options: &SearchOptions,
-    cache: &Arc<QueryCache<ScopedSearchResponse>>,
-    cache_key: QueryCacheKey,
+    cache_entry: Option<(&Arc<QueryCache<ScopedSearchResponse>>, QueryCacheKey)>,
     assistance: Option<QueryAssistance>,
     timer: std::time::Instant,
     product_sql_budget: Option<ProductSqlBudgetState>,
@@ -4788,7 +4954,10 @@ async fn execute_sql_plan_search(
         .search
         .record_legacy_query(latency_us, false);
     let resp = finish_scoped_response(raw_results, query, options, assistance, explain);
-    if cache_allowed && let Outcome::Ok(ref val) = resp {
+    if cache_allowed
+        && let Some((cache, cache_key)) = cache_entry
+        && let Outcome::Ok(ref val) = resp
+    {
         cache.put(cache_key, val.clone());
     }
     resp
@@ -4965,75 +5134,6 @@ mod tests {
         *lexical_active_db_key()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        lexical_generation_cache()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-    }
-
-    /// Stat-level fingerprint shaped like the marker's `db_fingerprint`.
-    ///
-    /// The health probe no longer compares it (an inode change is not an identity
-    /// change, GH#295); tests use it to build markers and to prove a
-    /// replacement really changed the inode.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct LexicalBackfillDbFingerprint {
-        len_bytes: u64,
-        modified_micros: i64,
-        device_id: Option<u64>,
-        inode: Option<u64>,
-    }
-
-    fn sqlite_file_lexical_backfill_fingerprint(
-        db_path: &str,
-    ) -> Option<LexicalBackfillDbFingerprint> {
-        if db_path == ":memory:" {
-            return None;
-        }
-        let metadata = std::fs::metadata(db_path).ok()?;
-        #[cfg(unix)]
-        let (device_id, inode) = {
-            use std::os::unix::fs::MetadataExt as _;
-            (Some(metadata.dev()), Some(metadata.ino()))
-        };
-        #[cfg(not(unix))]
-        let (device_id, inode) = (None, None);
-        let modified_micros = metadata
-            .modified()
-            .ok()
-            .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
-            .and_then(|dur| i64::try_from(dur.as_micros()).ok())
-            .unwrap_or(0);
-        Some(LexicalBackfillDbFingerprint {
-            len_bytes: metadata.len(),
-            modified_micros,
-            device_id,
-            inode,
-        })
-    }
-
-    /// Create a real (FrankenSQLite-written) database at `path` carrying only
-    /// the `db_identity` generation row.
-    ///
-    /// That row is the stable identity Search V3 keys
-    /// its bridge state and backfill marker by.
-    fn seed_generation_db(path: &std::path::Path, generation: &str) {
-        let conn = crate::DbConn::open_file(path.to_str().expect("utf8 db path")).expect("open");
-        conn.execute_raw(
-            "CREATE TABLE IF NOT EXISTS db_identity (\
-                singleton INTEGER PRIMARY KEY CHECK (singleton = 0), \
-                generation_id TEXT NOT NULL)",
-        )
-        .expect("db_identity table");
-        conn.execute_raw(&format!(
-            "INSERT OR REPLACE INTO db_identity(singleton, generation_id) VALUES (0, '{generation}')"
-        ))
-        .expect("generation row");
-        // Fold the WAL into the main file so a plain file copy of this
-        // database (the snapshot fixtures) carries the row too.
-        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
-            .expect("checkpoint generation db");
-        crate::close_db_conn(conn, "seed generation db");
     }
 
     #[test]
@@ -5054,6 +5154,211 @@ mod tests {
             direct_surface_index_dir(&pool).expect("select shared index authority"),
             root.path().join("search_index")
         );
+    }
+
+    #[test]
+    fn gh297_ephemeral_snapshot_pool_cannot_select_or_mutate_shared_marker_authority() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let storage_root = root.path().join("canonical-mailbox");
+        let shared_index = storage_root.join("search_index");
+        std::fs::create_dir_all(&shared_index).expect("shared search index");
+        let shared_marker = shared_index.join("backfill_state.json");
+        let canonical_marker_before = r#"{"db_path":"canonical.sqlite3"}"#;
+        std::fs::write(&shared_marker, canonical_marker_before).expect("canonical marker");
+        std::fs::write(shared_index.join("meta.json"), "{}").expect("shared index metadata");
+
+        let snapshot_dir = tempfile::tempdir().expect("snapshot tempdir");
+        let snapshot_path = snapshot_dir.path().join("mailbox.sqlite3");
+        let config = crate::DbPoolConfig {
+            database_url: format!("sqlite:///{}", snapshot_path.display()),
+            storage_root: Some(storage_root),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::DbPool::new(&config)
+            .expect("snapshot pool")
+            .with_ephemeral_search_index();
+
+        let chosen = direct_surface_index_dir(&pool).expect("snapshot index authority");
+        let expected_snapshot_index = std::path::Path::new(pool.sqlite_path())
+            .parent()
+            .expect("snapshot database parent")
+            .join("search_index");
+        assert_eq!(chosen, expected_snapshot_index);
+        assert_ne!(chosen, shared_index);
+        assert!(
+            !chosen.exists(),
+            "selecting SQL-only snapshot policy must not create any index sidecar"
+        );
+
+        let canonical_marker: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(shared_marker).expect("canonical marker remains readable"),
+        )
+        .expect("canonical marker JSON");
+        assert_eq!(
+            canonical_marker,
+            serde_json::from_str::<serde_json::Value>(canonical_marker_before)
+                .expect("original canonical marker JSON"),
+            "snapshot indexing must not modify the canonical marker"
+        );
+        assert_eq!(canonical_marker["db_path"], "canonical.sqlite3");
+        let snapshot_path_text = snapshot_path.display().to_string();
+        assert_ne!(
+            canonical_marker["db_path"].as_str(),
+            Some(snapshot_path_text.as_str()),
+            "canonical marker db_path must never become the temporary snapshot path"
+        );
+    }
+
+    #[test]
+    fn gh297_sql_only_snapshot_search_never_switches_process_global_bridges() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let storage_root = root.path().join("canonical-mailbox");
+        let shared_index = storage_root.join("search_index");
+        let shared_marker = shared_index.join("backfill_state.json");
+        let shared_meta = shared_index.join("meta.json");
+        std::fs::create_dir_all(&shared_index).expect("canonical index directory");
+        std::fs::write(&shared_marker, b"canonical marker bytes").expect("canonical marker");
+        std::fs::write(&shared_meta, b"canonical metadata bytes").expect("canonical metadata");
+        let marker_before = std::fs::read(&shared_marker).expect("read canonical marker");
+        let meta_before = std::fs::read(&shared_meta).expect("read canonical metadata");
+
+        let snapshot_dir = tempfile::tempdir().expect("snapshot tempdir");
+        let snapshot_path = snapshot_dir.path().join("mailbox.sqlite3");
+        let pool = crate::DbPool::new(&crate::DbPoolConfig {
+            database_url: format!("sqlite:///{}", snapshot_path.display()),
+            storage_root: Some(storage_root),
+            min_connections: 0,
+            max_connections: 2,
+            ..Default::default()
+        })
+        .expect("snapshot pool")
+        .with_ephemeral_search_index();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let project = match crate::queries::ensure_project(
+                &cx,
+                &pool,
+                "/data/projects/gh297-sql-only-snapshot",
+            )
+            .await
+            {
+                Outcome::Ok(project) => project,
+                other => panic!("ensure project failed: {other:?}"),
+            };
+            let project_id = project.id.unwrap_or(0);
+            let sender = match crate::queries::register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenLake",
+                "test",
+                "test",
+                None,
+                None,
+                None,
+            )
+            .await
+            {
+                Outcome::Ok(agent) => agent,
+                other => panic!("register sender failed: {other:?}"),
+            };
+            let message = match crate::queries::create_message_with_recipients_topic(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.unwrap_or(0),
+                "zebra private snapshot",
+                "zebra private snapshot body",
+                None,
+                Some("gh297-private-topic"),
+                "normal",
+                false,
+                "[]",
+                &[],
+            )
+            .await
+            {
+                Outcome::Ok(message) => message,
+                other => panic!("create message failed: {other:?}"),
+            };
+
+            let live_key = "live-database-generation".to_string();
+            *lexical_active_db_key()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(live_key.clone());
+            assert!(
+                ensure_lexical_bridge_initialized(&pool).is_err(),
+                "defense in depth must reject direct bridge initialization for SQL-only pools"
+            );
+
+            for engine in [
+                SearchEngine::Lexical,
+                SearchEngine::Hybrid,
+                SearchEngine::Auto,
+                SearchEngine::Semantic,
+            ] {
+                let mut query = SearchQuery::messages("zebra", project_id);
+                query.explain = true;
+                let options = SearchOptions {
+                    scope_ctx: None,
+                    redaction_policy: None,
+                    track_telemetry: false,
+                    search_engine: Some(engine),
+                };
+                let response = match execute_search(&cx, &pool, &query, &options).await {
+                    Outcome::Ok(response) => response,
+                    other => panic!("{engine} snapshot search failed: {other:?}"),
+                };
+                assert!(
+                    response.results.iter().any(|row| {
+                        row.result.id == message.id.unwrap_or(0)
+                            && row.result.topic.as_deref() == Some("gh297-private-topic")
+                    }),
+                    "{engine} SQL-only search must return the topic-bearing snapshot hit"
+                );
+                let explain = response.explain.expect("SQL-only route explain");
+                assert!(explain.used_like_fallback);
+                assert!(
+                    explain
+                        .facets_applied
+                        .contains(&"fallback_reason:isolated_snapshot_pool".to_string())
+                );
+                assert_eq!(
+                    lexical_active_db_key()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .as_deref(),
+                    Some(live_key.as_str()),
+                    "{engine} snapshot search must not displace the live bridge"
+                );
+            }
+        });
+
+        assert_eq!(
+            std::fs::read(&shared_marker).expect("canonical marker after searches"),
+            marker_before
+        );
+        assert_eq!(
+            std::fs::read(&shared_meta).expect("canonical metadata after searches"),
+            meta_before
+        );
+        assert!(
+            !snapshot_dir.path().join("search_index").exists(),
+            "SQL-only snapshot search must not create a private lexical index either"
+        );
+        reset_lexical_bootstrap_tracking();
     }
 
     #[test]
@@ -5251,26 +5556,6 @@ mod tests {
         index_count: u64,
         index_max_id: u64,
     ) {
-        write_backfill_health_state_with_generation(
-            root,
-            db_path,
-            None,
-            db_count,
-            db_max_id,
-            index_count,
-            index_max_id,
-        );
-    }
-
-    fn write_backfill_health_state_with_generation(
-        root: &std::path::Path,
-        db_path: &str,
-        db_generation: Option<&str>,
-        db_count: u64,
-        db_max_id: u64,
-        index_count: u64,
-        index_max_id: u64,
-    ) {
         let index_dir = root.join("search_index");
         std::fs::create_dir_all(&index_dir).expect("search index dir");
         if db_path != ":memory:" && !std::path::Path::new(db_path).exists() {
@@ -5289,9 +5574,9 @@ mod tests {
             },
         );
         let payload = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "db_path": db_path,
-            "db_generation": db_generation,
+            "db_generation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "db_fingerprint": {
                 "len_bytes": db_fingerprint.len_bytes,
                 "modified_micros": db_fingerprint.modified_micros,
@@ -5332,8 +5617,78 @@ mod tests {
         crate::DbPool::new(&config).expect("pool")
     }
 
+    async fn acquire_and_release_for_identity(cx: &Cx, pool: &DbPool, label: &str) {
+        let conn = match pool.acquire(cx).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => panic!("{label} acquire failed: {error}"),
+            Outcome::Cancelled(_) => panic!("{label} acquire was cancelled"),
+            Outcome::Panicked(panic) => {
+                panic!("{label} acquire panicked: {}", panic.message())
+            }
+        };
+        drop(conn);
+    }
+
     #[test]
-    fn lexical_backfill_health_reports_fresh_state_file() {
+    fn gh298_health_requires_live_revision_even_when_marker_metadata_is_fresh() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        // The metadata fixture is deliberately not a SQLite database. Its
+        // matching counts cannot attest the live transactional revision.
+        write_backfill_health_state(root.path(), pool.sqlite_path(), 3, 9, 3, 9);
+        assert_eq!(lexical_backfill_health_metadata(&pool).state, "fresh");
+        let health = lexical_backfill_health(&pool);
+        assert_eq!(health.state, "unavailable");
+        assert!(!health.watermark_matches);
+        assert!(health.is_degraded());
+        assert!(!health.db_identity.starts_with("utf8:"));
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn gh296_marker_affinity_allows_same_mailbox_and_vanished_marker_rebuilds() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        write_backfill_health_state(root.path(), pool.sqlite_path(), 3, 9, 3, 9);
+        assert!(!lexical_index_is_foreign_to_pool(&pool));
+
+        let foreign_path = root.path().join("foreign.sqlite3");
+        write_backfill_health_state(
+            root.path(),
+            foreign_path.to_str().expect("UTF-8 fixture"),
+            3,
+            9,
+            3,
+            9,
+        );
+        assert!(lexical_index_is_foreign_to_pool(&pool));
+
+        let vanished_path = root.path().join("vanished.sqlite3");
+        assert!(!vanished_path.exists());
+        let marker_path = root.path().join("search_index/backfill_state.json");
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker_path).expect("read marker"))
+                .expect("parse marker");
+        marker["db_path"] = serde_json::json!(vanished_path);
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec(&marker).expect("serialize marker"),
+        )
+        .expect("write vanished marker");
+        assert!(!lexical_index_is_foreign_to_pool(&pool));
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn lexical_backfill_health_metadata_reports_fresh_state_file() {
         let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5342,7 +5697,7 @@ mod tests {
         let pool = temp_file_pool(root.path(), "mail.sqlite3");
         write_backfill_health_state(root.path(), pool.sqlite_path(), 3, 9, 3, 9);
 
-        let health = lexical_backfill_health(&pool);
+        let health = lexical_backfill_health_metadata(&pool);
 
         assert_eq!(health.state, "fresh");
         assert_eq!(health.source_messages, Some(3));
@@ -5354,7 +5709,7 @@ mod tests {
     }
 
     #[test]
-    fn lexical_backfill_health_reports_partial_state_file() {
+    fn lexical_backfill_health_metadata_reports_partial_state_file() {
         let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5363,7 +5718,7 @@ mod tests {
         let pool = temp_file_pool(root.path(), "mail.sqlite3");
         write_backfill_health_state(root.path(), pool.sqlite_path(), 5, 11, 2, 8);
 
-        let health = lexical_backfill_health(&pool);
+        let health = lexical_backfill_health_metadata(&pool);
 
         assert_eq!(health.state, "partial");
         assert_eq!(health.source_messages, Some(5));
@@ -5379,7 +5734,7 @@ mod tests {
     }
 
     #[test]
-    fn lexical_backfill_health_reports_stale_after_reconstruct_db_path_change() {
+    fn lexical_backfill_health_metadata_reports_stale_after_reconstruct_db_path_change() {
         let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5398,7 +5753,7 @@ mod tests {
             9,
         );
 
-        let health = lexical_backfill_health(&pool);
+        let health = lexical_backfill_health_metadata(&pool);
 
         assert_eq!(health.state, "stale");
         assert!(
@@ -5412,9 +5767,8 @@ mod tests {
 
     #[test]
     fn execute_search_falls_back_to_sql_when_lexical_index_is_foreign_snapshot() {
-        // GH#162: while reads are served from a reconstructed archive snapshot, the
-        // process-global Search V3 lexical bridge stays bound to the *live* DB, so
-        // this pool's lexical index is foreign (lexical_backfill_health == "stale").
+        // GH#162: reconstructed archive snapshots are explicitly SQL-only and
+        // must leave the canonical process-global lexical bridge alone.
         // A plain-keyword Lexical-engine search must still return the matching
         // message via the SQL fallback instead of silently returning [].
         let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
@@ -5422,7 +5776,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_lexical_bootstrap_tracking();
         let root = tempfile::tempdir().expect("tempdir");
-        let pool = temp_file_pool(root.path(), "mailbox.sqlite3");
+        let pool = temp_file_pool(root.path(), "mailbox.sqlite3").with_ephemeral_search_index();
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
@@ -5489,9 +5843,9 @@ mod tests {
                 1,
             );
             assert_eq!(
-                lexical_backfill_health(&pool).state,
-                "stale",
-                "precondition: lexical index must read as foreign/stale for this pool"
+                lexical_backfill_health_metadata(&pool).state,
+                "sql_only_snapshot",
+                "precondition: the snapshot pool must be explicitly SQL-only"
             );
 
             let query = SearchQuery::messages("plan", project_id);
@@ -5520,7 +5874,7 @@ mod tests {
     }
 
     #[test]
-    fn lexical_backfill_health_ignores_same_file_timestamp_churn() {
+    fn lexical_backfill_health_metadata_ignores_same_file_timestamp_churn() {
         let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5540,7 +5894,7 @@ mod tests {
             file.sync_all().expect("sync same file metadata change");
         }
 
-        let health = lexical_backfill_health(&pool);
+        let health = lexical_backfill_health_metadata(&pool);
 
         assert_eq!(health.state, "fresh");
         assert!(health.stale_reason.is_none());
@@ -5548,130 +5902,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn lexical_backfill_health_reports_partial_when_marker_predates_generation_tracking() {
-        // A marker written before generation tracking is not foreign and not
-        // a rebind: the next backfill simply stamps the generation.
-        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reset_lexical_bootstrap_tracking();
-        let root = tempfile::tempdir().expect("tempdir");
-        seed_generation_db(&root.path().join("mail.sqlite3"), "gen-tracked");
-        let pool = temp_file_pool(root.path(), "mail.sqlite3");
-        write_backfill_health_state(root.path(), pool.sqlite_path(), 3, 9, 3, 9);
-
-        let (health, affinity) = lexical_backfill_health_with_affinity(&pool);
-
-        assert_eq!(health.state, "partial");
-        assert_eq!(affinity, LexicalIndexAffinity::Drift);
-        assert!(
-            health
-                .stale_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("predates database generation tracking"))
-        );
-        assert!(!lexical_index_is_foreign_to_pool(&pool));
-        reset_lexical_bootstrap_tracking();
-    }
-
-    /// GH#295: replacing the mailbox file at the same path with a
-    /// byte-identical copy (a new inode) is not a database identity change.
-    #[test]
-    fn lexical_backfill_health_stays_fresh_after_same_path_inode_replacement() {
-        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reset_lexical_bootstrap_tracking();
-        let root = tempfile::tempdir().expect("tempdir");
-        let db_path = root.path().join("mail.sqlite3");
-        seed_generation_db(&db_path, "gen-295");
-        let pool = temp_file_pool(root.path(), "mail.sqlite3");
-        write_backfill_health_state_with_generation(
-            root.path(),
-            pool.sqlite_path(),
-            Some("gen-295"),
-            3,
-            9,
-            3,
-            9,
-        );
-        assert_eq!(lexical_backfill_health(&pool).state, "fresh");
-        let recorded = sqlite_file_lexical_backfill_fingerprint(pool.sqlite_path())
-            .expect("fingerprint before replacement");
-
-        // Same primitive as `VACUUM INTO` + rename, a backup restore, or the
-        // daemon's own corrupt-quarantine + promotion: the path is unchanged,
-        // only the inode changes.
-        let replacement = root.path().join("mail.sqlite3.new");
-        std::fs::copy(&db_path, &replacement).expect("copy database");
-        std::fs::rename(&replacement, &db_path).expect("rename replacement into place");
-        let current = sqlite_file_lexical_backfill_fingerprint(pool.sqlite_path())
-            .expect("fingerprint after replacement");
-        assert_ne!(
-            recorded.inode, current.inode,
-            "precondition: the replacement must occupy a new inode"
-        );
-
-        let (health, affinity) = lexical_backfill_health_with_affinity(&pool);
-        assert_eq!(health.state, "fresh", "{:?}", health.stale_reason);
-        assert_eq!(affinity, LexicalIndexAffinity::Ready);
-        assert!(!lexical_index_is_foreign_to_pool(&pool));
-        reset_lexical_bootstrap_tracking();
-    }
-
-    #[test]
-    fn lexical_backfill_health_reports_rebind_after_same_path_generation_change() {
-        // A re-created database at the same path (archive reconstruction)
-        // carries a new generation token: the index is stale, but it is THIS
-        // mailbox's index to rebuild, not a foreign one to refuse (GH#295).
-        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reset_lexical_bootstrap_tracking();
-        let root = tempfile::tempdir().expect("tempdir");
-        seed_generation_db(&root.path().join("mail.sqlite3"), "gen-after-reconstruct");
-        let pool = temp_file_pool(root.path(), "mail.sqlite3");
-        write_backfill_health_state_with_generation(
-            root.path(),
-            pool.sqlite_path(),
-            Some("gen-before-reconstruct"),
-            3,
-            9,
-            3,
-            9,
-        );
-
-        let (health, affinity) = lexical_backfill_health_with_affinity(&pool);
-
-        assert_eq!(health.state, "stale");
-        assert_eq!(affinity, LexicalIndexAffinity::Rebind);
-        assert!(
-            health
-                .stale_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("database generation changed"))
-        );
-        assert!(
-            health
-                .safe_remediation
-                .as_deref()
-                .is_some_and(|hint| hint.contains("rebinds the lexical index")),
-            "{:?}",
-            health.safe_remediation
-        );
-        assert!(
-            !lexical_index_is_foreign_to_pool(&pool),
-            "a same-path generation change must fall through to the rebinding bootstrap, \
-             not the permanent SQL fallback"
-        );
-        reset_lexical_bootstrap_tracking();
-    }
-
-    /// GH#297: a marker stamped with a database path that no longer exists
-    /// (a temp snapshot) is reclaimed by the mailbox, not treated as foreign.
-    #[test]
-    fn lexical_backfill_health_reclaims_marker_of_vanished_database() {
+    fn lexical_backfill_health_metadata_reports_stale_when_state_lacks_database_generation() {
         let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5679,93 +5910,76 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let pool = temp_file_pool(root.path(), "mail.sqlite3");
         write_backfill_health_state(root.path(), pool.sqlite_path(), 3, 9, 3, 9);
+
         let state_path = root.path().join("search_index").join("backfill_state.json");
         let mut state_json: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&state_path).expect("read backfill state"),
         )
         .expect("parse backfill state");
-        state_json["db_path"] =
-            serde_json::json!("/tmp/canonical-mailbox-live-snapshot-GONE/mailbox.sqlite3");
+        state_json["db_generation_id"] = serde_json::json!("");
         std::fs::write(
             &state_path,
             serde_json::to_string_pretty(&state_json).expect("serialize adjusted state"),
         )
         .expect("write adjusted backfill state");
 
-        let (health, affinity) = lexical_backfill_health_with_affinity(&pool);
+        let health = lexical_backfill_health_metadata(&pool);
 
         assert_eq!(health.state, "stale");
-        assert_eq!(affinity, LexicalIndexAffinity::Rebind);
         assert!(
             health
                 .stale_reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("no longer exists"))
+                .is_some_and(|reason| reason.contains("database generation is missing"))
         );
-        assert!(!lexical_index_is_foreign_to_pool(&pool));
         reset_lexical_bootstrap_tracking();
     }
 
-    /// GH#297: a snapshot-backed pool carries the mailbox identity.
-    ///
-    /// Bound to the live mailbox path it is identified by that path — it can use the shared index the daemon
-    /// built and never reads as "a different database".
     #[test]
-    fn snapshot_pool_bound_to_mailbox_path_shares_the_mailbox_identity() {
+    fn lexical_backfill_health_metadata_ignores_same_generation_file_identity_change() {
         let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_lexical_bootstrap_tracking();
         let root = tempfile::tempdir().expect("tempdir");
-        let live_path = root.path().join("storage.sqlite3");
-        seed_generation_db(&live_path, "gen-297");
-        let snapshot_path = root.path().join("live-snapshot").join("mailbox.sqlite3");
-        std::fs::create_dir_all(snapshot_path.parent().expect("snapshot dir")).expect("mkdir");
-        // Materialize the snapshot the way the CLI does: a `VACUUM INTO`
-        // image through the engine that owns the family (a raw file copy
-        // would leave the rows behind in the runtime engine's WAL).
-        {
-            let conn = crate::DbConn::open_file(live_path.to_str().expect("utf8 live path"))
-                .expect("open live for snapshot");
-            conn.execute_raw(&format!(
-                "VACUUM INTO '{}'",
-                snapshot_path.to_str().expect("utf8 snapshot path")
-            ))
-            .expect("vacuum into snapshot");
-            crate::close_db_conn(conn, "snapshot source");
-        }
-        let live_pool = temp_file_pool(root.path(), "storage.sqlite3");
-        let snapshot_pool = crate::DbPool::new(&crate::DbPoolConfig {
-            database_url: format!("sqlite:///{}", snapshot_path.display()),
-            storage_root: Some(root.path().to_path_buf()),
-            ..Default::default()
-        })
-        .expect("snapshot pool")
-        .with_search_identity_path(live_pool.sqlite_path());
-        write_backfill_health_state_with_generation(
-            root.path(),
-            live_pool.sqlite_path(),
-            Some("gen-297"),
-            3,
-            9,
-            3,
-            9,
-        );
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        write_backfill_health_state(root.path(), pool.sqlite_path(), 3, 9, 3, 9);
 
-        assert_eq!(
-            sqlite_key_for_pool(&snapshot_pool),
-            sqlite_key_for_pool(&live_pool),
-            "the snapshot must carry the mailbox's Search V3 identity"
-        );
-        let (health, affinity) = lexical_backfill_health_with_affinity(&snapshot_pool);
-        assert_eq!(health.state, "fresh", "{:?}", health.stale_reason);
-        assert_eq!(affinity, LexicalIndexAffinity::Ready);
-        assert!(health.db_identity.starts_with(live_pool.sqlite_path()));
+        let replacement_identity_path = root.path().join("replacement-mail.sqlite3");
+        std::fs::write(
+            &replacement_identity_path,
+            b"same path, different database identity fixture",
+        )
+        .expect("replacement identity fixture");
+        let replacement_fingerprint = sqlite_file_lexical_backfill_fingerprint(
+            replacement_identity_path
+                .to_str()
+                .expect("replacement fixture path"),
+        )
+        .expect("replacement fingerprint");
+        let state_path = root.path().join("search_index").join("backfill_state.json");
+        let mut state_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&state_path).expect("read backfill state"),
+        )
+        .expect("parse backfill state");
+        state_json["db_fingerprint"]["device_id"] =
+            serde_json::json!(replacement_fingerprint.device_id);
+        state_json["db_fingerprint"]["inode"] = serde_json::json!(replacement_fingerprint.inode);
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&state_json).expect("serialize adjusted state"),
+        )
+        .expect("write adjusted backfill state");
+
+        let health = lexical_backfill_health_metadata(&pool);
+
+        assert_eq!(health.state, "fresh");
+        assert!(health.stale_reason.is_none());
         reset_lexical_bootstrap_tracking();
     }
 
     #[test]
-    fn lexical_backfill_health_reports_unavailable_for_failed_state_file() {
+    fn lexical_backfill_health_metadata_reports_unavailable_for_failed_state_file() {
         let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5784,7 +5998,7 @@ mod tests {
         )
         .expect("write bad backfill state");
 
-        let health = lexical_backfill_health(&pool);
+        let health = lexical_backfill_health_metadata(&pool);
 
         assert_eq!(health.state, "unavailable");
         assert_eq!(health.indexed_messages, 0);
@@ -5799,7 +6013,7 @@ mod tests {
     }
 
     #[test]
-    fn lexical_backfill_health_reports_delayed_without_state_file() {
+    fn lexical_backfill_health_metadata_reports_delayed_without_state_file() {
         let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5807,7 +6021,7 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let pool = temp_file_pool(root.path(), "mail.sqlite3");
 
-        let health = lexical_backfill_health(&pool);
+        let health = lexical_backfill_health_metadata(&pool);
 
         assert_eq!(health.state, "delayed");
         assert_eq!(health.source_messages, None);
@@ -5872,87 +6086,53 @@ mod tests {
         reset_lexical_bootstrap_tracking();
     }
 
-    /// GH#261 / GH#296: both identity derivations agree in either order.
-    ///
-    /// The startup backfill thread records completion from
-    /// the database URL; request handlers probe with whatever pool wrapper
-    /// (and pool cache generation) they hold. Both derivations must land on
-    /// one identity — `<path>@<database generation>` — whichever runs first,
-    /// so the daemon's only database is never "a different database".
     #[test]
-    fn startup_completion_and_pool_identity_agree_in_either_order() {
+    fn startup_lexical_backfill_completion_for_pool_binds_pool_identity() {
+        // GH#261: recording completion under the URL-derived bare path while
+        // the health probe compares `pool.sqlite_identity_key()`
+        // ("path@generation") permanently marked a daemon's only database as
+        // foreign. The pool-keyed recording must bind exactly the identity the
+        // health probe checks.
         let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_lexical_bootstrap_tracking();
 
         let root = tempfile::tempdir().expect("tempdir");
-        let db_path = root.path().join("mail.sqlite3");
-        seed_generation_db(&db_path, "gen-296");
-        let db_url = format!("sqlite:///{}", db_path.display());
-        let expected_key = format!("{}@gen-296", db_path.display());
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
         let bridge_ready = crate::search_v3::get_bridge().is_some();
 
-        // Order A: the startup backfill wins the race; the handlers' pool
-        // only appears afterwards (the always-on daemon's normal boot).
-        note_startup_lexical_backfill_completed(&db_url).expect("record startup bootstrap");
-        let later_pool = temp_file_pool(root.path(), "mail.sqlite3");
-        assert_eq!(sqlite_key_for_pool(&later_pool), expected_key);
-        assert_eq!(
-            sqlite_key_from_database_url(&db_url).as_deref(),
-            Some(expected_key.as_str())
-        );
+        note_startup_lexical_backfill_completed_for_pool(&pool)
+            .expect("record pool-keyed startup bootstrap");
+
         let active_key = lexical_active_db_key()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+
         if bridge_ready {
-            assert_eq!(active_key.as_deref(), Some(expected_key.as_str()));
-            assert!(has_run_lexical_backfill(&expected_key).expect("backfill marker"));
+            let pool_key = pool.sqlite_identity_key();
+            assert_eq!(
+                active_key.as_deref(),
+                Some(pool_key.as_str()),
+                "startup completion must be recorded under the pool identity the health probe compares"
+            );
+            assert!(has_run_lexical_backfill(&pool_key).expect("backfill marker"));
+            let health = lexical_backfill_health(&pool);
+            assert!(
+                !health
+                    .stale_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with("process-global lexical bridge"),
+                "the daemon's own database must not be reported as a different database: {:?}",
+                health.stale_reason
+            );
         } else {
             assert!(active_key.is_none());
         }
 
-        // Order B: a fresh pool generation (a second wrapper minted later in
-        // the process, exactly what `get_or_reuse_compatible_memory_pool`
-        // produced for the recorder) must still compare equal.
-        let earlier_pool = temp_file_pool(root.path(), "mail.sqlite3");
-        assert_ne!(
-            earlier_pool.sqlite_identity_key(),
-            later_pool.sqlite_identity_key(),
-            "precondition: two wrappers carry distinct pool cache generations"
-        );
-        assert_eq!(sqlite_key_for_pool(&earlier_pool), expected_key);
-        assert_eq!(
-            sqlite_key_for_pool(&earlier_pool),
-            sqlite_key_for_pool(&later_pool)
-        );
-
         reset_lexical_bootstrap_tracking();
-    }
-
-    #[test]
-    fn lexical_key_path_strips_only_a_generation_suffix() {
-        assert_eq!(
-            lexical_key_path("/data/mail@box/storage.sqlite3@abc123"),
-            "/data/mail@box/storage.sqlite3"
-        );
-        assert_eq!(
-            lexical_key_path("/data/mail@box/storage.sqlite3"),
-            "/data/mail@box/storage.sqlite3"
-        );
-        assert_eq!(
-            lexical_key_path("/data/storage.sqlite3"),
-            "/data/storage.sqlite3"
-        );
-        assert_eq!(
-            lexical_db_key("/data/storage.sqlite3", Some("g1")),
-            "/data/storage.sqlite3@g1"
-        );
-        assert_eq!(
-            lexical_db_key("/data/storage.sqlite3", None),
-            "/data/storage.sqlite3"
-        );
     }
 
     #[test]
@@ -6046,44 +6226,6 @@ mod tests {
     }
 
     #[test]
-    fn lexical_backfill_health_reports_plain_db_identity_without_cache_namespace() {
-        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reset_lexical_bootstrap_tracking();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("mailbox.sqlite3");
-        seed_generation_db(&db_path, "gen-display");
-        let config = crate::pool::DbPoolConfig {
-            database_url: format!("sqlite:///{}", db_path.display()),
-            ..crate::pool::DbPoolConfig::default()
-        };
-        let pool = DbPool::new(&config).expect("file-backed pool");
-
-        let health = lexical_backfill_health(&pool);
-        assert_eq!(
-            health.db_identity,
-            format!("{}@gen-display", db_path.display()),
-            "db_identity must be the operator-facing `<path>@<generation>` spelling"
-        );
-        assert!(
-            !health.db_identity.starts_with("utf8:"),
-            "internal cache-key namespace must not leak into db_identity: {}",
-            health.db_identity
-        );
-        if let Some(active) = health.active_db_identity.as_deref() {
-            assert!(
-                !active.starts_with("utf8:"),
-                "internal cache-key namespace must not leak into active_db_identity: {active}"
-            );
-        }
-        // The lexical identity is the database's, not the pool wrapper's:
-        // it carries no pool cache generation (GH#296).
-        assert_eq!(sqlite_key_for_pool(&pool), health.db_identity);
-        reset_lexical_bootstrap_tracking();
-    }
-
-    #[test]
     fn sqlite_key_for_pool_is_stable_across_memory_pool_clones() {
         let config = crate::pool::DbPoolConfig {
             database_url: "sqlite:///:memory:".to_string(),
@@ -6093,6 +6235,334 @@ mod tests {
         let clone = pool.clone();
 
         assert_eq!(sqlite_key_for_pool(&pool), sqlite_key_for_pool(&clone));
+    }
+
+    #[test]
+    fn gh296_search_identity_is_stable_across_short_lived_pools_for_same_file() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let first = temp_file_pool(root.path(), "mail.sqlite3");
+        let second = temp_file_pool(root.path(), "mail.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            acquire_and_release_for_identity(&cx, &first, "first").await;
+            acquire_and_release_for_identity(&cx, &second, "second").await;
+
+            assert_ne!(
+                first.sqlite_identity_key(),
+                second.sqlite_identity_key(),
+                "precondition: independent pools must carry different cache generations"
+            );
+            assert!(first.search_database_generation_id().is_some());
+            assert_eq!(
+                first.search_database_generation_id(),
+                second.search_database_generation_id(),
+                "independent pools must observe the same persisted database generation"
+            );
+            assert_eq!(
+                sqlite_key_for_pool(&first),
+                sqlite_key_for_pool(&second),
+                "search identity must remain stable across sequential request pools for one live file"
+            );
+        });
+    }
+
+    #[test]
+    fn gh296_second_pool_reuses_lexical_binding_without_fallback_or_rebuild() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let first = temp_file_pool(root.path(), "mail.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let project = match crate::queries::ensure_project(
+                &cx,
+                &first,
+                "/data/projects/gh296-second-pool",
+            )
+            .await
+            {
+                Outcome::Ok(project) => project,
+                other => panic!("ensure project failed: {other:?}"),
+            };
+            let project_id = project.id.unwrap_or(0);
+            let sender = match crate::queries::register_agent(
+                &cx,
+                &first,
+                project_id,
+                "GreenLake",
+                "test",
+                "test",
+                None,
+                None,
+                None,
+            )
+            .await
+            {
+                Outcome::Ok(agent) => agent,
+                other => panic!("register sender failed: {other:?}"),
+            };
+            let message = match crate::queries::create_message_with_recipients(
+                &cx,
+                &first,
+                project_id,
+                sender.id.unwrap_or(0),
+                "zebra durable generation",
+                "zebra body",
+                Some("gh296-second-pool"),
+                "normal",
+                false,
+                "[]",
+                &[],
+            )
+            .await
+            {
+                Outcome::Ok(message) => message,
+                other => panic!("create message failed: {other:?}"),
+            };
+            ensure_lexical_bridge_initialized(&first).expect("initialize first lexical bridge");
+            let first_key = sqlite_key_for_pool(&first);
+
+            let second = temp_file_pool(root.path(), "mail.sqlite3");
+            acquire_and_release_for_identity(&cx, &second, "second").await;
+            assert_ne!(first.sqlite_identity_key(), second.sqlite_identity_key());
+            assert_eq!(sqlite_key_for_pool(&second), first_key);
+
+            let mut query = SearchQuery::messages("zebra", project_id);
+            query.explain = true;
+            let options = SearchOptions {
+                scope_ctx: None,
+                redaction_policy: None,
+                track_telemetry: false,
+                search_engine: Some(SearchEngine::Lexical),
+            };
+            let response = match execute_search(&cx, &second, &query, &options).await {
+                Outcome::Ok(response) => response,
+                other => panic!("second-pool lexical search failed: {other:?}"),
+            };
+            assert!(
+                response
+                    .results
+                    .iter()
+                    .any(|row| row.result.id == message.id.unwrap_or(0)),
+                "second-pool lexical execution must return the seeded hit"
+            );
+            assert_eq!(
+                response
+                    .explain
+                    .as_ref()
+                    .map(|value| value.used_like_fallback),
+                Some(false),
+                "second-pool execution must remain on the lexical bridge"
+            );
+            assert_eq!(
+                lexical_active_db_key()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_deref(),
+                Some(first_key.as_str())
+            );
+        });
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn gh298_content_revision_health_cache_and_source_leases() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let pool_a = temp_file_pool(root_a.path(), "mail.sqlite3");
+        let pool_b = temp_file_pool(root_b.path(), "mail.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            for (pool, word) in [(&pool_a, "alphaquokka"), (&pool_b, "betaquokka")] {
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(conn) => conn,
+                    Outcome::Err(error) => panic!("acquire: {error}"),
+                    _ => panic!("acquire cancelled or panicked"),
+                };
+                conn.execute_raw("INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'fixture', '/fixture', 0)").unwrap();
+                conn.execute_raw("INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES (1, 1, 'GreenLake', 'test', 'test', 0, 0)").unwrap();
+                for id in [1, 2] {
+                    conn.execute_sync("INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts) VALUES (?, 1, 1, ?, 'body', 'normal', 1000000)",
+                        &[sqlmodel_core::Value::BigInt(id), sqlmodel_core::Value::Text(word.to_string())]).unwrap();
+                }
+            }
+            let options = SearchOptions { search_engine: Some(SearchEngine::Lexical), ..Default::default() };
+            let mut query = SearchQuery::messages("alphaquokka", 1);
+            query.explain = true;
+            let initial = match execute_search(&cx, &pool_a, &query, &options).await { Outcome::Ok(response) => response, other => panic!("initial search: {other:?}") };
+            assert_eq!(initial.results.len(), 2);
+            let conn = match pool_a.acquire(&cx).await {
+                Outcome::Ok(conn) => conn,
+                Outcome::Err(error) => panic!("health connection: {error}"),
+                _ => panic!("health connection cancelled or panicked"),
+            };
+            let health = lexical_backfill_health_from_conn(&pool_a, &conn);
+            assert_eq!(health.state, "fresh", "{health:?}");
+            assert!(health.watermark_sample_stable && health.watermark_matches);
+            let watermark = health.live_message_watermark.unwrap();
+            conn.execute_raw("UPDATE messages SET subject = 'updatedotter' WHERE id = 1").unwrap();
+            let changed = lexical_backfill_health_from_conn(&pool_a, &conn);
+            assert_eq!(changed.state, "stale");
+            assert_eq!(watermark.max_id, changed.live_message_watermark.unwrap().max_id);
+            assert_eq!(watermark.sequence, changed.live_message_watermark.unwrap().sequence);
+            let response = match execute_search(&cx, &pool_a, &query, &options).await { Outcome::Ok(response) => response, other => panic!("updated search: {other:?}") };
+            assert_eq!(response.results.len(), 1, "cached pre-update results must not survive");
+            assert_eq!(response.explain.as_ref().map(|value| value.used_like_fallback), Some(false), "content edits must rebuild the canonical lexical index");
+            assert!(lexical_backfill_health_from_conn(&pool_a, &conn).watermark_matches);
+            let updated_query = SearchQuery::messages("updatedotter", 1);
+            let response = match execute_search(&cx, &pool_a, &updated_query, &options).await { Outcome::Ok(response) => response, other => panic!("new term: {other:?}") };
+            assert_eq!(response.results.len(), 1);
+            conn.execute_raw("DELETE FROM messages WHERE id = 1").unwrap();
+            assert!(!lexical_backfill_health_from_conn(&pool_a, &conn).watermark_matches);
+            let response = match execute_search(&cx, &pool_a, &updated_query, &options).await { Outcome::Ok(response) => response, other => panic!("deleted term: {other:?}") };
+            assert!(response.results.is_empty(), "explicit lexical mode must not retain deleted hits");
+
+            // A post-commit write from B must not replace A's colliding ID.
+            let foreign = crate::search_v3::IndexableMessage { id: 2, project_id: 1, project_slug: "fixture".to_string(), sender_name: "GreenLake".to_string(), subject: "foreignnarwhal".to_string(), body_md: "body".to_string(), thread_id: None, importance: "normal".to_string(), created_ts: 1_000_000 };
+            assert!(!index_message_for_pool(&pool_b, &foreign).unwrap());
+            assert_eq!(try_tantivy_search(&pool_a, &query).unwrap().len(), 1);
+
+            // A new pool for a same-path generation rollover must reach rebuild.
+            conn.execute_raw("UPDATE db_identity SET generation_id = 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' WHERE singleton = 0").unwrap();
+            drop(conn);
+            let replacement = temp_file_pool(root_a.path(), "mail.sqlite3");
+            let response = match execute_search(&cx, &replacement, &query, &options).await { Outcome::Ok(response) => response, other => panic!("generation rollover: {other:?}") };
+            assert_eq!(response.results.len(), 1);
+            assert_eq!(response.explain.as_ref().map(|value| value.used_like_fallback), Some(false), "generation changes must rebuild instead of falling back to SQL");
+        });
+        // Source selection and the actual search cannot be separated by a switch.
+        let pool_a = temp_file_pool(root_a.path(), "mail.sqlite3");
+        runtime.block_on(async {
+            acquire_and_release_for_identity(&Cx::for_testing(), &pool_a, "replacement").await;
+        });
+        std::thread::scope(|scope| {
+            for (pool, word, expected) in [(&pool_a, "alphaquokka", 1), (&pool_b, "betaquokka", 2)]
+            {
+                scope.spawn(move || {
+                    for _ in 0..4 {
+                        let results =
+                            try_tantivy_search(pool, &SearchQuery::messages(word, 1)).unwrap();
+                        assert_eq!(results.len(), expected);
+                        assert!(results.iter().all(|result| result.title == word));
+                    }
+                });
+            }
+        });
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn gh296_same_path_replacement_changes_persisted_search_generation() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let db_path = root.path().join("mail.sqlite3");
+        let replacement_path = root.path().join("replacement.sqlite3");
+        let first = temp_file_pool(root.path(), "mail.sqlite3");
+        let replacement_source = temp_file_pool(root.path(), "replacement.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+
+        let (first_key, first_generation, replacement_source_generation) =
+            runtime.block_on(async {
+                let cx = Cx::for_testing();
+                acquire_and_release_for_identity(&cx, &first, "first").await;
+                acquire_and_release_for_identity(&cx, &replacement_source, "replacement source")
+                    .await;
+                (
+                    sqlite_key_for_pool(&first),
+                    first
+                        .search_database_generation_id()
+                        .expect("first persisted generation")
+                        .to_owned(),
+                    replacement_source
+                        .search_database_generation_id()
+                        .expect("replacement source persisted generation")
+                        .to_owned(),
+                )
+            });
+        assert_ne!(first_generation, replacement_source_generation);
+        // The primary file is only a self-contained logical database after its WAL has
+        // been checkpointed. Full search keys cannot be compared across the two source
+        // paths because each key deliberately retains its normalized path namespace.
+        first
+            .wal_checkpoint()
+            .expect("checkpoint original database before in-place replacement");
+        replacement_source
+            .wal_checkpoint()
+            .expect("checkpoint replacement database before copying its primary file");
+        drop(first);
+        drop(replacement_source);
+
+        let file_identity_before = crate::pool::stable_sqlite_file_identity(&db_path);
+        std::fs::copy(&replacement_path, &db_path)
+            .expect("overwrite the original path in place with a fresh database generation");
+        let file_identity_after = crate::pool::stable_sqlite_file_identity(&db_path);
+        if file_identity_before.is_some() && file_identity_after.is_some() {
+            assert_eq!(
+                file_identity_before, file_identity_after,
+                "test precondition: in-place overwrite must retain the filesystem identity"
+            );
+        }
+
+        let replacement = temp_file_pool(root.path(), "mail.sqlite3");
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            acquire_and_release_for_identity(&cx, &replacement, "replacement").await;
+        });
+        let replacement_generation = replacement
+            .search_database_generation_id()
+            .expect("replacement persisted generation");
+        assert_eq!(
+            replacement_generation, replacement_source_generation,
+            "the checkpointed replacement file must retain its persisted generation token"
+        );
+        assert_ne!(
+            first_generation, replacement_generation,
+            "the replacement database must expose a new persisted generation"
+        );
+        assert_ne!(
+            first_key,
+            sqlite_key_for_pool(&replacement),
+            "in-place same-path replacement must never inherit prior search/cache state"
+        );
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn gh296_unavailable_file_identity_falls_back_to_pool_generation() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let first = temp_file_pool(root.path(), "missing.sqlite3");
+        let second = temp_file_pool(root.path(), "missing.sqlite3");
+
+        assert!(!std::path::Path::new(first.sqlite_path()).exists());
+        assert_eq!(sqlite_key_for_pool(&first), first.sqlite_identity_key());
+        assert_eq!(sqlite_key_for_pool(&second), second.sqlite_identity_key());
+        assert_ne!(
+            sqlite_key_for_pool(&first),
+            sqlite_key_for_pool(&second),
+            "an unprovable file identity must fail closed instead of collapsing distinct pools"
+        );
     }
 
     #[test]

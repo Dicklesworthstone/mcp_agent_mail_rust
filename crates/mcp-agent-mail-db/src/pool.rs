@@ -2990,6 +2990,22 @@ pub struct DbPool {
     /// followed). Archive recovery, reconcile, and allocator scans use this,
     /// so a symlinked storage root is still refused as archive authority.
     storage_root_alias: PathBuf,
+    /// Whether Search V3 may use the mailbox's canonical shared index.
+    ///
+    /// Caller-owned snapshot pools disable this so their temporary database
+    /// identity can never initialize, switch, or write through the
+    /// process-global lexical bridge used by the live mailbox.
+    use_shared_search_index: bool,
+    /// Durable logical generation observed from this database's `db_identity`
+    /// singleton through an already-pooled connection.
+    ///
+    /// Short-lived read pools for the same file share Search V3 state only
+    /// after proving that persisted generation token. A path, inode, or
+    /// low-resolution platform file identifier is not sufficient: each can be
+    /// reused after an in-place replacement. Wrappers of the same underlying
+    /// pool share this cell so startup and request surfaces agree without
+    /// opening a second SQLite handle merely to discover identity.
+    search_database_generation_id: Arc<OnceLock<String>>,
     /// Per-transaction ceiling for raw ATC experience rows in the isolated
     /// telemetry sidecar. Captured when the pool is created so the hot write
     /// path does not reparse process configuration for every experience.
@@ -3011,12 +3027,6 @@ pub struct DbPool {
     /// identity; `:memory:` pools resolve by their underlying pool `Arc`. See
     /// [`shared_message_id_allocator`].
     message_id_allocator: Arc<crate::id_floor::MessageIdAllocator>,
-    /// Canonical mailbox path this wrapper stands in for when `sqlite_path`
-    /// is a private read-only materialization (a CLI snapshot of the live
-    /// mailbox). Search V3 keys its process-global bridge state and the
-    /// persisted backfill marker by this path, never by the temporary file
-    /// actually opened (GH#297). `None` means the pool IS the mailbox.
-    search_identity_path: Option<String>,
     /// Retained identity and digest of this pool's last verified backup.
     /// Clones serialize backup publication and share the same authority.
     proactive_backup: Arc<Mutex<Option<ProactiveBackupWitness>>>,
@@ -3083,6 +3093,11 @@ static NEXT_POOL_CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
 type JournalSizeLimitEntry = (Weak<Pool<DbConn>>, Arc<AtomicU64>);
 
 static JOURNAL_SIZE_LIMITS: OnceLock<Mutex<HashMap<usize, JournalSizeLimitEntry>>> =
+    OnceLock::new();
+
+type SearchDatabaseGenerationEntry = (Weak<Pool<DbConn>>, Arc<OnceLock<String>>);
+
+static SEARCH_DATABASE_GENERATIONS: OnceLock<Mutex<HashMap<usize, SearchDatabaseGenerationEntry>>> =
     OnceLock::new();
 
 const JOURNAL_SIZE_LIMIT_RUNTIME_OVERRIDE: u64 = 1 << 63;
@@ -3219,6 +3234,19 @@ fn shared_journal_size_limit(pool: &Arc<Pool<DbConn>>, configured_bytes: u64) ->
     state
 }
 
+fn shared_search_database_generation_id(pool: &Arc<Pool<DbConn>>) -> Arc<OnceLock<String>> {
+    let registry = SEARCH_DATABASE_GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = registry.lock().unwrap_or_else(PoisonError::into_inner);
+    guard.retain(|_, (weak, _)| weak.strong_count() > 0);
+    let key = Arc::as_ptr(pool) as usize;
+    if let Some((_, generation)) = guard.get(&key) {
+        return generation.clone();
+    }
+    let generation = Arc::new(OnceLock::new());
+    guard.insert(key, (Arc::downgrade(pool), generation.clone()));
+    generation
+}
+
 const fn journal_size_limit_bytes(state: u64) -> u64 {
     state & !JOURNAL_SIZE_LIMIT_RUNTIME_OVERRIDE
 }
@@ -3309,6 +3337,7 @@ impl DbPool {
             checked_journal_size_limit(journal_size_limit)?,
         );
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
+        let search_database_generation_id = shared_search_database_generation_id(&pool);
         let (message_id_allocator, cache_generation) = shared_message_id_allocator(
             &pool,
             authority.sqlite_identity.as_deref(),
@@ -3322,6 +3351,8 @@ impl DbPool {
             sqlite_path: authority.sqlite_path,
             storage_root: authority.storage_root,
             storage_root_alias: authority.storage_root_alias,
+            use_shared_search_index: true,
+            search_database_generation_id,
             atc_experience_max_rows,
             init_sql,
             journal_size_limit_state,
@@ -3330,7 +3361,6 @@ impl DbPool {
             open_mode: DbPoolOpenMode::Recovering,
             stats_sampler,
             message_id_allocator,
-            search_identity_path: None,
             proactive_backup: Arc::new(Mutex::new(None)),
         })
     }
@@ -3365,6 +3395,7 @@ impl DbPool {
             .test_on_return(false);
 
         let pool = Arc::new(Pool::new(pool_config));
+        let search_database_generation_id = shared_search_database_generation_id(&pool);
         let journal_size_limit_state =
             shared_journal_size_limit(&pool, core_config.db_journal_size_limit_bytes);
         let init_sql = Self::connection_init_sql(config, query_only, configured_journal_size_limit);
@@ -3381,6 +3412,8 @@ impl DbPool {
             sqlite_path: authority.sqlite_path,
             storage_root: authority.storage_root,
             storage_root_alias: authority.storage_root_alias,
+            use_shared_search_index: true,
+            search_database_generation_id,
             atc_experience_max_rows,
             init_sql,
             journal_size_limit_state,
@@ -3393,7 +3426,6 @@ impl DbPool {
             },
             stats_sampler,
             message_id_allocator,
-            search_identity_path: None,
             proactive_backup: Arc::new(Mutex::new(None)),
         })
     }
@@ -3422,30 +3454,125 @@ impl DbPool {
         Self::new_with_options(config, true, true)
     }
 
-    /// Bind the canonical mailbox path this wrapper is a private read-only
-    /// materialization of.
+    /// Mark this pool as backed by a caller-owned ephemeral SQLite snapshot.
     ///
-    /// A CLI read surface opens a temporary snapshot of the live mailbox and
-    /// builds its pool on that snapshot. Without this binding the Search V3
-    /// layer would treat the snapshot as a *different* database: it would
-    /// refuse the shared lexical index (`backfill marker belongs to <live>`)
-    /// and, worse, stamp the shared `backfill_state.json` with the temp
-    /// snapshot's path, degrading every later server search (GH#297).
+    /// Snapshot search is forced through the relational SQL path. It must never
+    /// initialize or switch the process-global lexical bridge, because doing so
+    /// would displace the live daemon's binding even if the snapshot used a
+    /// private index directory. This must be applied before the pool is used
+    /// for search.
     #[must_use]
-    pub fn with_search_identity_path(mut self, path: &str) -> Self {
-        self.search_identity_path = Some(path.to_string());
+    pub const fn with_ephemeral_search_index(mut self) -> Self {
+        self.use_shared_search_index = false;
         self
     }
 
-    /// The path Search V3 identifies this pool's database by.
-    ///
-    /// The bound canonical mailbox path for a snapshot-backed wrapper,
-    /// otherwise the file actually opened.
     #[must_use]
-    pub fn search_identity_path(&self) -> &str {
-        self.search_identity_path
-            .as_deref()
-            .unwrap_or(&self.sqlite_path)
+    pub(crate) const fn uses_shared_search_index(&self) -> bool {
+        self.use_shared_search_index
+    }
+
+    /// Whether this pool is an intentionally isolated SQL-only search source.
+    #[must_use]
+    pub const fn is_sql_only_search(&self) -> bool {
+        !self.use_shared_search_index
+    }
+
+    /// Return the durable logical database generation observed by this pool.
+    ///
+    /// `None` fails closed: callers must not collapse independent file pools
+    /// onto shared process-global search state until a valid persisted token
+    /// has been read from the pooled database connection itself.
+    #[must_use]
+    pub(crate) fn search_database_generation_id(&self) -> Option<&str> {
+        self.search_database_generation_id.get().map(String::as_str)
+    }
+
+    /// Observe and validate the durable search identity using a connection the
+    /// caller already owns.
+    ///
+    /// This is the synchronous, no-open path for read-only CLI surfaces that
+    /// already hold the authoritative database connection. It updates only
+    /// this pool wrapper's in-memory identity cell; it does not acquire from
+    /// the pool, initialize the schema, or write to SQLite.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the connection belongs to another SQLite
+    /// authority or reports a different generation from one already observed
+    /// by this pool.
+    #[allow(clippy::result_large_err)]
+    pub fn observe_search_database_generation_from_conn(
+        &self,
+        conn: &dyn SyncQuery,
+    ) -> Result<(), SqlError> {
+        let rows = conn.query_sync("PRAGMA database_list", &[])?;
+        let observed_path = rows
+            .iter()
+            .find(|row| row.get_named::<String>("name").ok().as_deref() == Some("main"))
+            .and_then(|row| row.get_named::<String>("file").ok())
+            .ok_or_else(|| {
+                SqlError::Custom(
+                    "existing connection did not report its main SQLite authority".to_string(),
+                )
+            })?;
+        match self.sqlite_identity.as_deref() {
+            None if !observed_path.is_empty() => {
+                return Err(SqlError::Custom(format!(
+                    "existing connection belongs to file-backed SQLite authority {observed_path}, but the health pool is in-memory"
+                )));
+            }
+            Some(expected) => {
+                if observed_path.is_empty() {
+                    return Err(SqlError::Custom(format!(
+                        "existing connection is in-memory, but the health pool is bound to {}",
+                        expected.display()
+                    )));
+                }
+                let observed = normalize_sqlite_identity_path_buf(Path::new(&observed_path));
+                if observed != expected {
+                    return Err(SqlError::Custom(format!(
+                        "existing connection belongs to SQLite authority {}, but the health pool is bound to {}; refusing to mix search state",
+                        observed.display(),
+                        expected.display()
+                    )));
+                }
+            }
+            None => {}
+        }
+
+        self.observe_search_database_generation_id(conn)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn observe_search_database_generation_id(&self, conn: &dyn SyncQuery) -> Result<(), SqlError> {
+        let Some(generation) = crate::queries::db_generation_id_conn(conn) else {
+            return Ok(());
+        };
+        if generation.len() > 128 || !generation.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            tracing::warn!(
+                generation_length = generation.len(),
+                "ignoring malformed database generation identity for search isolation"
+            );
+            return Ok(());
+        }
+        if let Some(established) = self.search_database_generation_id.get() {
+            if established == &generation {
+                return Ok(());
+            }
+            return Err(SqlError::Custom(format!(
+                "database generation changed within one live pool (established {established}, observed {generation}); retiring the pool instead of mixing search/cache state"
+            )));
+        }
+        if let Err(racing_generation) = self.search_database_generation_id.set(generation)
+            && self.search_database_generation_id.get() != Some(&racing_generation)
+        {
+            return Err(SqlError::Custom(
+                "database generation changed during concurrent pool initialization; refusing mixed search/cache state"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -3895,6 +4022,21 @@ impl DbPool {
                     }
                 }
             }
+            other => other,
+        };
+
+        let out = match out {
+            Outcome::Ok(conn) => match self.observe_search_database_generation_id(&conn) {
+                Ok(()) => Outcome::Ok(conn),
+                Err(error) => {
+                    self.retire_runtime_state_after_recovery(&error.to_string());
+                    crate::close_db_conn(
+                        conn.detach(),
+                        "pool database-generation identity changed",
+                    );
+                    Outcome::Err(error)
+                }
+            },
             other => other,
         };
 
@@ -5359,6 +5501,34 @@ fn sqlite_identity_cache_namespace(path: &Path) -> String {
     }
 }
 
+/// Return the stable filesystem identity pair for an existing SQLite file.
+///
+/// The pair is device/inode on Unix. Callers must fail safely when this returns
+/// `None`: unsupported platforms, missing paths, and files whose identity
+/// cannot be inspected must never be treated as equivalent merely because
+/// their path strings match.
+#[cfg(any(feature = "tantivy-engine", test))]
+pub(crate) fn stable_sqlite_file_identity(path: &Path) -> Option<(u64, u64)> {
+    stable_sqlite_file_identity_impl(path)
+}
+
+#[cfg(all(unix, any(feature = "tantivy-engine", test)))]
+fn stable_sqlite_file_identity_impl(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(all(not(unix), any(feature = "tantivy-engine", test)))]
+fn stable_sqlite_file_identity_impl(_path: &Path) -> Option<(u64, u64)> {
+    // Windows' 64-bit BY_HANDLE_FILE_INFORMATION index is not a durable
+    // identity after its comparison handle closes and can be reused after
+    // replacement. Until the pool retains a strong 128-bit identity witness,
+    // preserve the generation-bearing key and accept a conservative fallback.
+    None
+}
+
 /// Freeze a configured path into an absolute alias that no later `chdir` can
 /// re-point.
 ///
@@ -5968,6 +6138,12 @@ async fn run_sqlite_init_once(
             }
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+
+        if let Err(err) = crate::queries::ensure_db_generation_id_conn(&runtime_conn) {
+            return Outcome::Err(SqlError::Custom(format!(
+                "sqlite init stage=ensure_database_generation_identity failed: {err}"
+            )));
         }
     }
 
@@ -12729,6 +12905,16 @@ impl SyncQuery for crate::DbConnGuard {
     }
 }
 
+impl SyncQuery for PooledConnection<DbConn> {
+    fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, SqlError> {
+        DbConn::query_sync(self, sql, params)
+    }
+
+    fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
+        DbConn::execute_raw(self, sql)
+    }
+}
+
 /// Whether the family beside `sqlite_path` is Franken-admitted, judged by its
 /// persistent namespace pair.
 ///
@@ -19251,6 +19437,80 @@ mod tests {
             fts_artifact_count, 0,
             "in-memory pool acquire should remove legacy message FTS artifacts after runtime follow-up migrations"
         );
+    }
+
+    #[test]
+    fn gh296_search_generation_observation_reuses_existing_connection_without_pool_open() {
+        const GENERATION: &str = "0123456789abcdef0123456789abcdef";
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("existing-search-generation.sqlite3");
+        let conn = DbConn::open_file(db_path.display().to_string())
+            .expect("open caller-owned database connection");
+        conn.execute_raw(
+            "CREATE TABLE db_identity (\
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 0), \
+                 generation_id TEXT NOT NULL\
+             ); \
+             INSERT INTO db_identity (singleton, generation_id) \
+             VALUES (0, '0123456789abcdef0123456789abcdef');",
+        )
+        .expect("seed durable database generation");
+
+        let pool = create_pool_without_startup_init(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(directory.path().join("archive")),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("construct unopened health pool");
+        assert_eq!(
+            pool.pool.stats().total_connections,
+            0,
+            "health pool must remain unopened before identity observation"
+        );
+
+        pool.observe_search_database_generation_from_conn(&conn)
+            .expect("observe generation from caller-owned connection");
+
+        assert_eq!(pool.search_database_generation_id(), Some(GENERATION));
+        assert_eq!(
+            pool.pool.stats().total_connections,
+            0,
+            "identity observation must not acquire or create a pooled SQLite handle"
+        );
+    }
+
+    #[test]
+    fn gh296_search_generation_observation_accepts_canonical_read_connection() {
+        const GENERATION: &str = "0123456789abcdef0123456789abcdef";
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("canonical-search-generation.sqlite3");
+        let conn = crate::CanonicalDbConn::open_file(db_path.display().to_string())
+            .expect("open canonical fixture");
+        conn.execute_raw(
+            "CREATE TABLE db_identity (singleton INTEGER PRIMARY KEY, generation_id TEXT NOT NULL); \
+             INSERT INTO db_identity VALUES (0, '0123456789abcdef0123456789abcdef');",
+        )
+        .expect("seed canonical generation");
+        let conn = GuardedReadOnlyConn::Canonical(conn);
+        let pool = create_pool_without_startup_init(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(directory.path().join("archive")),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("construct unopened health pool");
+        pool.observe_search_database_generation_from_conn(&conn)
+            .expect("observe through the upstream engine-dispatched connection");
+        assert_eq!(pool.search_database_generation_id(), Some(GENERATION));
+        assert_eq!(pool.pool.stats().total_connections, 0);
     }
 
     // ── DbPoolConfig coverage ─────────────────────────────────────────

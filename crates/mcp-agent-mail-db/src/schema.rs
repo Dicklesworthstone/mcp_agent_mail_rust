@@ -225,6 +225,12 @@ CREATE TABLE IF NOT EXISTS db_identity (
     generation_id TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS search_content_revision (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    rewrite_revision INTEGER NOT NULL CHECK (rewrite_revision >= 0)
+);
+
 -- FTS5 virtual table for message search
 -- Porter stemmer: run/running/runs → run. Unicode61: Unicode-aware tokenization.
 -- remove_diacritics 2: normalize accented characters. prefix='2 3': fast prefix queries.
@@ -2380,6 +2386,10 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // Search freshness must change in the same transaction as searchable data.
+    // Allocator/MAX(id) watermarks cannot observe edits or non-max deletions.
+    migrations.extend(search_content_revision_migrations());
+
     // These indexes are also present in the latest static DDL, which gives
     // them generated v1 migration IDs. On an existing pre-v27/v28 database,
     // however, their columns do not exist until the explicit evolution
@@ -2388,6 +2398,46 @@ pub fn schema_migrations() -> Vec<Migration> {
     migrations.extend(deferred_column_dependent_indexes);
 
     migrations
+}
+
+/// Transactional content clock shared by canonical and reconstructed mailboxes.
+#[must_use]
+pub fn search_content_revision_migrations() -> Vec<Migration> {
+    let mut statements = vec![
+        ("table".to_string(), "CREATE TABLE IF NOT EXISTS search_content_revision (singleton INTEGER PRIMARY KEY CHECK (singleton = 0), revision INTEGER NOT NULL CHECK (revision >= 0), rewrite_revision INTEGER NOT NULL CHECK (rewrite_revision >= 0))".to_string()),
+        ("seed".to_string(), "INSERT OR IGNORE INTO search_content_revision (singleton, revision, rewrite_revision) VALUES (0, 0, 0)".to_string()),
+    ];
+    for (table, events) in [
+        ("messages", ["INSERT", "UPDATE", "DELETE"]),
+        (
+            "agents",
+            ["INSERT", "UPDATE OF id, project_id, name", "DELETE"],
+        ),
+        ("projects", ["INSERT", "UPDATE OF id, slug", "DELETE"]),
+    ] {
+        for (suffix, event) in ["insert", "update", "delete"].into_iter().zip(events) {
+            let name = format!("{table}_{suffix}");
+            let rewrite = if table == "messages" && suffix == "insert" {
+                ""
+            } else {
+                ", rewrite_revision = rewrite_revision + 1"
+            };
+            statements.push((name.clone(), format!(
+                "CREATE TRIGGER IF NOT EXISTS trg_search_revision_{name} AFTER {event} ON {table} BEGIN UPDATE search_content_revision SET revision = revision + 1{rewrite} WHERE singleton = 0; END"
+            )));
+        }
+    }
+    statements
+        .into_iter()
+        .map(|(name, sql)| {
+            Migration::new(
+                format!("v29_search_content_revision_{name}"),
+                "invalidate lexical freshness transactionally on searchable changes".to_string(),
+                sql,
+                String::new(),
+            )
+        })
+        .collect()
 }
 
 /// Returns `true` if a migration creates, backfills, or drops FTS5 objects.

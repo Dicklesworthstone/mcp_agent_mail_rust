@@ -1082,13 +1082,37 @@ impl Drop for StartupSearchBackfillResetGuard {
 }
 
 fn record_startup_search_backfill_completion(config: &mcp_agent_mail_core::Config) {
-    // GH#261 / GH#296: completion is recorded under the database's own
-    // Search V3 identity (`<path>@<db_identity generation>`), which the
-    // request handlers' pools derive identically whatever pool cache
-    // generation they carry. The earlier attempt to "resolve the live pool"
-    // here minted a throwaway file-backed pool with its own generation, so
-    // the recorded key never matched the handlers' and the daemon reported
-    // its only database as foreign whenever this thread won the boot race.
+    // Publish completion only through a pool that has proved its durable
+    // database generation. An unopened pool leaves bootstrap lazy until the
+    // first request observes the generation through its own connection.
+    if !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+        let mut db_config = DbPoolConfig::from_env();
+        db_config.database_url = config.database_url.clone();
+        db_config.storage_root = Some(config.storage_root.clone());
+        match mcp_agent_mail_db::pool::get_or_reuse_compatible_memory_pool(&db_config) {
+            Ok(pool) => {
+                if let Err(error) =
+                    mcp_agent_mail_db::search_service::note_startup_lexical_backfill_completed_for_pool(
+                        &pool,
+                    )
+                {
+                    tracing::warn!(
+                        error = %error,
+                        "[startup-search] failed to record lexical bootstrap completion"
+                    );
+                }
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "[startup-search] could not resolve the live pool for lexical bootstrap \
+                     completion; leaving bootstrap state lazy until the first proven request pool"
+                );
+                return;
+            }
+        }
+    }
     if let Err(error) = mcp_agent_mail_db::search_service::note_startup_lexical_backfill_completed(
         &config.database_url,
     ) {
@@ -1108,7 +1132,10 @@ fn startup_search_backfill_spawn_failure_message(error: &std::io::Error) -> Stri
 fn run_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
     let backfill_database_url =
         normalized_startup_search_backfill_database_url(&config.database_url);
-    match mcp_agent_mail_db::search_v3::backfill_from_db(&backfill_database_url) {
+    match mcp_agent_mail_db::search_service::startup_lexical_backfill(
+        &backfill_database_url,
+        &config.storage_root.join("search_index"),
+    ) {
         Ok((indexed, _skipped)) if indexed > 0 => {
             record_startup_search_backfill_completion(config);
             tracing::info!(
@@ -1122,7 +1149,10 @@ fn run_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
         Err(err) => {
             tracing::warn!("[startup-search] Tantivy backfill failed (non-fatal): {err}");
             if recover_startup_search_backfill_db(config, &err) {
-                match mcp_agent_mail_db::search_v3::backfill_from_db(&backfill_database_url) {
+                match mcp_agent_mail_db::search_service::startup_lexical_backfill(
+                    &backfill_database_url,
+                    &config.storage_root.join("search_index"),
+                ) {
                     Ok((indexed, _)) if indexed > 0 => {
                         record_startup_search_backfill_completion(config);
                         tracing::warn!(
@@ -3413,6 +3443,14 @@ pub(crate) fn open_observability_db_pool(
     };
     let pool = mcp_agent_mail_db::create_pool(&cfg)
         .map_err(|e| format!("failed to initialize DB pool: {e}"))?;
+    let pool = if snapshot_dir.is_some() {
+        // Archive reconstruction is a caller-owned private snapshot. It may
+        // inherit the canonical storage root for archive context, but it must
+        // never acquire authority over the live search index or its marker.
+        pool.with_ephemeral_search_index()
+    } else {
+        pool
+    };
     Ok(ObservabilityDbPool {
         pool,
         _snapshot_dir: snapshot_dir,
@@ -30324,10 +30362,10 @@ first body
     }
 
     #[test]
-    fn dashboard_open_connection_uses_archive_snapshot_when_live_db_is_stale() {
+    fn gh297_archive_backed_observability_snapshot_is_private_and_sql_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage_root = dir.path().join("storage");
-        let db_path = dir.path().join("dashboard-stale.sqlite3");
+        let db_path = dir.path().join("dashboard-missing.sqlite3");
         let project_dir = storage_root.join("projects").join("ahead-project");
         let agent_dir = project_dir.join("agents").join("Alice");
         let messages_dir = project_dir.join("messages").join("2026").join("03");
@@ -30361,10 +30399,10 @@ first body
         )
         .expect("write canonical message");
 
-        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
-        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
-            .expect("init schema");
-        drop(conn);
+        assert!(
+            !db_path.exists(),
+            "fixture requires the configured live database to be absent"
+        );
 
         let database_url = format!("sqlite:///{}", db_path.display());
         let observed =
@@ -30378,6 +30416,34 @@ first body
             .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
             .expect("query snapshot messages");
         assert_eq!(rows[0].get_named::<i64>("c").unwrap_or(0), 1);
+        drop(observed);
+
+        let observed_pool = open_observability_db_pool(
+            &database_url,
+            &storage_root,
+            "GH#297 archive-backed observability pool",
+        )
+        .expect("open archive-backed observability pool");
+        let snapshot_index = observed_pool
+            ._snapshot_dir
+            .as_ref()
+            .expect("fixture must exercise the private archive-snapshot pool")
+            .path()
+            .join("search_index");
+        let search_health =
+            mcp_agent_mail_db::search_service::lexical_backfill_health(observed_pool.pool());
+        assert_eq!(
+            search_health.state, "sql_only_snapshot",
+            "archive-backed observability search must be explicitly SQL-only"
+        );
+        assert!(
+            !snapshot_index.exists(),
+            "archive-backed observability must not create a lexical index beside the snapshot"
+        );
+        assert!(
+            !db_path.exists(),
+            "archive-backed observability must not initialize the configured live database"
+        );
     }
 
     #[test]

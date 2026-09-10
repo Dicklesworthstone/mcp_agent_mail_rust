@@ -648,7 +648,20 @@ fn live_probe(path: &Path) -> Result<mcp_agent_mail_db::GuardedReadOnlyConn, Str
     .map_err(|error| error.to_string())
 }
 
-fn private_snapshot_probe(path: &Path) -> Result<mcp_agent_mail_db::DbConn, String> {
+fn private_snapshot_probe(
+    directory: &mcp_agent_mail_db::pool::CanonicalSnapshotTempDir,
+) -> Result<mcp_agent_mail_db::DbConn, String> {
+    // Reconstruction produces a standalone SQLite file without a FrankenSQLite
+    // namespace. Admit that namespace while this caller-owned snapshot is still
+    // private: a published strict read-only pool must never create its sidecars.
+    // Taking the owned directory, rather than an arbitrary path, keeps this
+    // writable initialization away from the live mailbox.
+    let path = directory.path().join("mailbox.sqlite3");
+    mcp_agent_mail_db::pool::admit_private_database_with_franken(
+        &path,
+        "archive-read snapshot admission",
+    )
+    .map_err(|error| error.to_string())?;
     let conn = mcp_agent_mail_db::DbConn::open_file_read_only(path.to_string_lossy().into_owned())
         .map_err(|error| error.to_string())?;
     conn.execute_raw("PRAGMA query_only = ON;")
@@ -733,7 +746,7 @@ fn build_snapshot(
     .map_err(AcquireError::failed)?;
     validate_reconstruction(inventory, &stats)?;
 
-    let probe = private_snapshot_probe(&snapshot_path).map_err(AcquireError::Failed)?;
+    let probe = private_snapshot_probe(&directory).map_err(AcquireError::Failed)?;
     let quick_check = probe
         .query_sync("PRAGMA quick_check", &[])
         .map_err(AcquireError::failed)?;
@@ -746,19 +759,10 @@ fn build_snapshot(
             "reconstructed archive snapshot failed PRAGMA quick_check".to_string(),
         ));
     }
-    drop(probe);
+    mcp_agent_mail_db::close_db_conn(probe, "publish admitted private archive snapshot");
 
-    // The reconstructed snapshot is a canonical, sidecar-less file in a
-    // process-private directory. The strict query-only pool below opens it
-    // through the bound FrankenSQLite opener, which requires the persistent
-    // namespace pair, so admit the private family once before handing it to
-    // the pool.
-    mcp_agent_mail_db::pool::admit_private_database_with_franken(
-        &snapshot_path,
-        "archive-read snapshot admission",
-    )
-    .map_err(AcquireError::failed)?;
-
+    // The private namespace was admitted before the read-only probe. The
+    // published pool can now open it strictly read-only without sidecar setup.
     let pool = mcp_agent_mail_db::create_query_only_pool(&mcp_agent_mail_db::DbPoolConfig {
         database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&snapshot_path),
         storage_root: Some(slot.scope.storage_root.clone()),
@@ -768,7 +772,8 @@ fn build_snapshot(
         warmup_connections: 0,
         ..Default::default()
     })
-    .map_err(AcquireError::failed)?;
+    .map_err(AcquireError::failed)?
+    .with_ephemeral_search_index();
     Ok(Arc::new(SharedSnapshot {
         pool,
         _directory: directory,
@@ -1619,14 +1624,16 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_cold_readers_share_one_immutable_query_only_snapshot() {
+    fn gh297_concurrent_cold_readers_share_one_immutable_sql_only_snapshot() {
         let _guard = TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_for_test();
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage_root = directory.path().join("archive");
-        let sqlite_path = directory.path().join("missing-live.sqlite3");
+        let canonical_directory =
+            std::fs::canonicalize(directory.path()).expect("canonicalize tempdir");
+        let storage_root = canonical_directory.join("archive");
+        let sqlite_path = canonical_directory.join("missing-live.sqlite3");
         write_archive_fixture(&storage_root);
         let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
         let scope = scope(&storage_root, &sqlite_path).expect("scope");
@@ -1665,6 +1672,17 @@ mod tests {
         assert_eq!(slot.reconstructions_max_active.load(Ordering::Acquire), 1);
 
         let snapshot = &snapshots[0];
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            let sidecar = PathBuf::from(format!("{}{suffix}", snapshot.path().display()));
+            assert!(
+                sidecar.is_file(),
+                "namespace must be admitted before publishing the read-only snapshot"
+            );
+        }
+        assert!(
+            snapshot.pool.is_sql_only_search(),
+            "published archive snapshots must never initialize a process-global search bridge"
+        );
         let family_before = snapshot_family(snapshot.path());
         let cx = Cx::for_testing();
         let runtime = RuntimeBuilder::current_thread()
