@@ -983,6 +983,14 @@ fn handle_failed_import(
     let failure_reason = original.to_string();
     let mut warnings = Vec::new();
     let staged = stage_failed_target_db_aside(&plan.target_db, timestamp, &mut warnings);
+    match stage_failed_target_storage_aside(&plan.target_storage_root) {
+        Ok(Some(path)) => warnings.push(format!(
+            "partial target storage preserved at {} (rename, not deletion)",
+            path.display()
+        )),
+        Ok(None) => {}
+        Err(error) => warnings.push(format!("failed to stage partial target storage: {error}")),
+    }
 
     let staged_note = if staged.is_empty() {
         "no partial target DB was created".to_string()
@@ -1025,11 +1033,58 @@ fn handle_failed_import(
         Err(receipt_err) => format!("failure receipt could not be written: {receipt_err}"),
     };
 
+    let database_path_free = match fs::symlink_metadata(&plan.target_db) {
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        Ok(_) => false,
+    };
+    let retry_note = if database_path_free
+        && ensure_target_storage_root_usable(&plan.target_storage_root).is_ok()
+    {
+        "the original target paths are free again, so the same command can be retried once the cause is fixed"
+    } else {
+        "partial target artifacts remain; inspect the failure receipt and choose fresh target paths before retrying"
+    };
     CliError::Other(format!(
         "legacy import failed: {failure_reason}; {staged_note}; {receipt_note}; \
-         the original target paths are free again, so the same command can be retried \
-         once the cause is fixed"
+         {retry_note}"
     ))
+}
+
+/// Preserve partial archive copies below the receipt directory, the only
+/// content accepted in a retry target. Each attempt gets a private, unique
+/// directory; existing receipts and earlier quarantines are never moved.
+fn stage_failed_target_storage_aside(storage: &Path) -> CliResult<Option<PathBuf>> {
+    if !require_storage_directory(storage, "failed target storage", true)? {
+        return Ok(None);
+    }
+    let entries = fs::read_dir(storage)?
+        .filter_map(|entry| match entry {
+            Ok(entry) if entry.file_name() == "legacy_import_receipts" => None,
+            entry => Some(entry),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let receipts = storage.join("legacy_import_receipts");
+    if !require_storage_directory(&receipts, "legacy import receipts", true)? {
+        fs::create_dir(&receipts)?;
+    }
+    require_storage_directory(&receipts, "legacy import receipts", false)?;
+    let quarantine = tempfile::Builder::new()
+        .prefix("failed-storage-")
+        .tempdir_in(&receipts)?
+        .keep();
+    for entry in entries {
+        fs::rename(entry.path(), quarantine.join(entry.file_name())).map_err(|error| {
+            CliError::Other(format!(
+                "cannot move {} into {}; earlier moved entries remain preserved there: {error}",
+                entry.path().display(),
+                quarantine.display()
+            ))
+        })?;
+    }
+    Ok(Some(quarantine))
 }
 
 /// Rename the partially created target DB and its SQLite sidecars aside as
@@ -4033,13 +4088,10 @@ mod tests {
         // target DB copy is created; the storage copy then fails on a broken
         // symlink (existing validation), which is the cleanest failure
         // injection AFTER the partial target DB exists.
-        let conn = CanonicalDbConn::open_file(source_db.display().to_string())
-            .expect("create source fixture DB");
-        conn.execute_raw("CREATE TABLE t (x INTEGER)")
-            .expect("create fixture table");
-        drop(conn);
-        fs::create_dir_all(&source_storage).expect("create source storage");
-        symlink("/does/not/exist", source_storage.join("broken-link"))
+        seed_v20_agents_fixture(&source_db);
+        let messages = source_storage.join("messages");
+        fs::create_dir_all(&messages).expect("create source storage");
+        symlink("/does/not/exist", messages.join("broken-link"))
             .expect("seed broken symlink");
 
         let opts = ImportOptions {
@@ -4111,9 +4163,60 @@ mod tests {
         assert!(!latest.integrity_check_ok);
         assert!(latest.migrated_migration_ids.is_empty());
 
-        // Retryability: the same options build a plan again (target DB path is
-        // free; target storage root holds only the receipts directory).
-        build_import_plan(&opts).expect("retry plan must build after failed import");
+        let quarantines: Vec<_> = fs::read_dir(target_storage.join("legacy_import_receipts"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir())
+            .collect();
+        assert_eq!(quarantines.len(), 1);
+        assert!(quarantines[0].join("messages").is_dir());
+        assert!(!target_storage.join("messages").exists());
+        assert!(message.contains("the original target paths are free again"));
+
+        // Correct the source failure without deleting its evidence, then run
+        // the SAME import options through copying, migration, and verification.
+        fs::rename(messages.join("broken-link"), tmp.path().join("broken-link-evidence"))
+            .unwrap();
+        fs::write(messages.join("message.md"), b"retry archive payload").unwrap();
+        let retry = build_import_plan(&opts).expect("retry plan must build after failed import");
+        let receipt = execute_import(retry, false).expect("corrected import must really succeed");
+        assert_eq!(receipt.outcome, LEGACY_IMPORT_OUTCOME_SUCCEEDED);
+        assert!(receipt.integrity_check_ok);
+        assert_eq!(fs::read(target_storage.join("messages/message.md")).unwrap(), b"retry archive payload");
+        assert!(quarantines[0].join("messages").is_dir());
+        assert_eq!(collect_status_report(&target_storage).unwrap().receipt_count, 2);
+    }
+
+    #[test]
+    fn failed_storage_quarantine_preserves_prior_receipts_and_attempts() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = root.path().join("storage");
+        let receipts = storage.join("legacy_import_receipts");
+        fs::create_dir_all(&receipts).unwrap();
+        fs::write(receipts.join("prior.json"), b"prior receipt").unwrap();
+        fs::write(storage.join("message.md"), b"first partial payload").unwrap();
+        let first = stage_failed_target_storage_aside(&storage).unwrap().unwrap();
+        ensure_target_storage_root_usable(&storage).unwrap();
+        fs::write(storage.join("message.md"), b"second partial payload").unwrap();
+        let second = stage_failed_target_storage_aside(&storage).unwrap().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fs::read(first.join("message.md")).unwrap(), b"first partial payload");
+        assert_eq!(fs::read(second.join("message.md")).unwrap(), b"second partial payload");
+        assert_eq!(fs::read(receipts.join("prior.json")).unwrap(), b"prior receipt");
+        ensure_target_storage_root_usable(&storage).unwrap();
+        assert!(stage_failed_target_storage_aside(&storage).unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_storage_quarantine_refuses_invalid_receipt_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let receipts = root.path().join("legacy_import_receipts");
+        fs::write(&receipts, b"occupied receipt path").unwrap();
+        fs::write(root.path().join("message.md"), b"partial payload").unwrap();
+        assert!(stage_failed_target_storage_aside(root.path()).is_err());
+        assert!(ensure_target_storage_root_usable(root.path()).is_err());
+        assert_eq!(fs::read(&receipts).unwrap(), b"occupied receipt path");
+        assert_eq!(fs::read(root.path().join("message.md")).unwrap(), b"partial payload");
     }
 
     #[test]
