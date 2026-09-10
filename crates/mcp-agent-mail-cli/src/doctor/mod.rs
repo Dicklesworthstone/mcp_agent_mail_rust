@@ -106,17 +106,18 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
     // behind an unrelated EOF parse failure.
     let (report_value, report_warning): (serde_json::Value, Option<String>) =
         if let Some(rp) = report_path.as_ref() {
-            match read_json_file(rp) {
+            match load_stored_doctor_report(rp) {
                 Ok(value) => (value, None),
-                Err(error) => (
+                Err(reason) => (
                     serde_json::json!({
                         "ok": null,
                         "summary": null,
                         "findings": [],
                     }),
                     Some(format!(
-                        "skipped unreadable historical report {}: {error}",
-                        rp.display()
+                        "skipped unreadable historical report {}: {}",
+                        rp.display(),
+                        reason.describe()
                     )),
                 ),
             }
@@ -130,6 +131,7 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
                 None,
             )
         };
+    let report_usable = report_path.is_some() && report_warning.is_none();
 
     let summary = report_value
         .get("summary")
@@ -143,7 +145,11 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
     // count is an explicit unknown (`null`), never a `0` indistinguishable
     // from a clean scan. A live-probe finding below still materializes a
     // concrete count.
-    let mut total_findings: Option<u64> = report_path.as_ref().map(|_| {
+    // GH#214/GH#315: a report we could not read is no evidence either way, so
+    // the count stays `null`. A concrete `0` here is indistinguishable from a
+    // clean scan, which is exactly the confusion GH#214 removed for the
+    // report-absent case.
+    let mut total_findings: Option<u64> = report_usable.then(|| {
         summary
             .get("total_findings")
             .and_then(|n| n.as_u64())
@@ -401,6 +407,8 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
         // a clean scan's `"present"` + `0`.
         "report": if report_available { "present" } else { "absent" },
         "report_available": report_available,
+        // Present on disk but unreadable => available, not usable.
+        "report_usable": report_usable,
         "report_path": report_path.map(|p| p.to_string_lossy().into_owned()),
         "report_warning": report_warning,
         "live_health": live_health,
@@ -2701,6 +2709,211 @@ fn latest_doctor_report_path() -> Option<PathBuf> {
     latest_doctor_report_path_for_root(&doctor_root)
 }
 
+/// Why a stored `report.json` could not be used as doctor history.
+///
+/// GH#315: a doctor report is *evidence about a past run*. When that evidence
+/// is unreadable we know strictly less than we did before — we do not know
+/// that the live mailbox is broken. Every variant here means "unknown", never
+/// "unhealthy".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UnusableDoctorReport {
+    /// Zero bytes (or only whitespace) on disk.
+    Empty,
+    /// Present but not valid JSON — truncated writes land here.
+    Unparseable(String),
+    /// On disk but could not be read at all (permissions, I/O error, or a
+    /// refused symlink component).
+    Unreadable(String),
+    /// Valid JSON that is not a JSON object (array, string, number, null).
+    NotAnObject,
+    /// A JSON object carrying none of the doctor report's own fields.
+    MissingReportFields,
+}
+
+impl UnusableDoctorReport {
+    fn describe(&self) -> String {
+        match self {
+            Self::Empty => "zero-byte report".to_string(),
+            Self::Unparseable(detail) => format!("malformed JSON ({detail})"),
+            Self::Unreadable(detail) => format!("unreadable ({detail})"),
+            Self::NotAnObject => "JSON value is not a report object".to_string(),
+            Self::MissingReportFields => "JSON object carries no doctor report fields".to_string(),
+        }
+    }
+}
+
+/// Parse a stored doctor report, rejecting anything that cannot be read as one.
+///
+/// A doctor report always carries at least one of `ok` / `summary` /
+/// `exit_code` / `findings` (see [`runs::write_run_artifacts`]). Demanding one
+/// of them keeps a stray `{}` — or some unrelated JSON that happens to live at
+/// `report.json` — from being scored as a clean run with zero findings.
+fn parse_stored_doctor_report(body: &str) -> Result<serde_json::Value, UnusableDoctorReport> {
+    if body.trim().is_empty() {
+        return Err(UnusableDoctorReport::Empty);
+    }
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|err| UnusableDoctorReport::Unparseable(err.to_string()))?;
+    let Some(object) = value.as_object() else {
+        return Err(UnusableDoctorReport::NotAnObject);
+    };
+    const REPORT_FIELDS: [&str; 4] = ["ok", "summary", "exit_code", "findings"];
+    if !REPORT_FIELDS
+        .iter()
+        .any(|field| object.contains_key(*field))
+    {
+        return Err(UnusableDoctorReport::MissingReportFields);
+    }
+    Ok(value)
+}
+
+/// Read a run's `report.json`, classifying an I/O failure the same way as a
+/// parse failure: unreadable evidence, not a mailbox verdict.
+fn load_stored_doctor_report(path: &Path) -> Result<serde_json::Value, UnusableDoctorReport> {
+    // Same guard `read_json_file` applies to every other piece of JSON
+    // evidence: a doctor report is only ever read from inside `.doctor/`.
+    if let Err(error) = reject_symlink_ancestor(path, "doctor report") {
+        return Err(UnusableDoctorReport::Unreadable(error.to_string()));
+    }
+    match fs::read_to_string(path) {
+        Ok(body) => parse_stored_doctor_report(&body),
+        Err(err) => Err(UnusableDoctorReport::Unreadable(err.to_string())),
+    }
+}
+
+/// A stale run whose report could not be used, with the evidence an operator
+/// needs to decide what to do about it.
+#[derive(Debug, Clone)]
+struct SkippedDoctorReport {
+    report_path: PathBuf,
+    run_id: String,
+    reason: UnusableDoctorReport,
+    /// Bytes in the run's `actions.jsonl`. Non-zero means the run recorded
+    /// real mutations before dying, so the directory is crash evidence that
+    /// must be preserved (never quarantined as no-op scaffolding).
+    recorded_action_bytes: u64,
+}
+
+impl SkippedDoctorReport {
+    fn new(report_path: PathBuf, reason: UnusableDoctorReport) -> Self {
+        let run_dir = report_path.parent().map(Path::to_path_buf);
+        let run_id = run_dir
+            .as_deref()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "<unknown-run>".to_string());
+        let recorded_action_bytes = run_dir
+            .map(|dir| dir.join("actions.jsonl"))
+            .and_then(|actions| fs::symlink_metadata(&actions).ok())
+            .filter(|metadata| metadata.file_type().is_file())
+            .map_or(0, |metadata| metadata.len());
+        Self {
+            report_path,
+            run_id,
+            reason,
+            recorded_action_bytes,
+        }
+    }
+}
+
+/// Every `.doctor/runs/<id>` directory, newest first.
+///
+/// Run ids are `<ISO8601-seconds>__<hash6>` (see [`runs::derive_run_id`]), so a
+/// reverse lexicographic sort is a reverse chronological sort. Symlinked
+/// entries are skipped for the same reason [`resolve_latest_doctor_run_dir`]
+/// refuses them: a run directory must live inside `.doctor/runs/`.
+fn doctor_run_dirs_newest_first(doctor_root: &Path) -> Vec<PathBuf> {
+    let runs_dir = doctor_root.join("runs");
+    let Ok(entries) = fs::read_dir(&runs_dir) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_type()
+                .is_ok_and(|file_type| file_type.is_dir() && !file_type.is_symlink())
+        })
+        .map(|entry| entry.path())
+        .collect();
+    dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    dirs
+}
+
+/// Walk doctor history newest-first for a report that can actually be read,
+/// skipping (and recording) every unusable one along the way.
+///
+/// `already_skipped` is the report at `.doctor/latest` when it was itself
+/// unusable; its run directory is not revisited.
+fn newest_usable_doctor_report(
+    doctor_root: &Path,
+    already_skipped: &[SkippedDoctorReport],
+) -> (
+    Option<(PathBuf, serde_json::Value)>,
+    Vec<SkippedDoctorReport>,
+) {
+    let mut skipped = Vec::new();
+    for run_dir in doctor_run_dirs_newest_first(doctor_root) {
+        let report_path = run_dir.join("report.json");
+        if already_skipped
+            .iter()
+            .any(|entry| entry.report_path == report_path)
+        {
+            continue;
+        }
+        if reject_symlink_ancestor(&run_dir, "doctor run directory").is_err() {
+            continue;
+        }
+        // A run with no report.json at all is scaffolding or an in-flight run,
+        // not damaged evidence; `fm-doctor-state-files-orphan-run-dirs` owns
+        // that case. Stay quiet about it here.
+        if !fs::symlink_metadata(&report_path).is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            continue;
+        }
+        match load_stored_doctor_report(&report_path) {
+            Ok(value) => return (Some((report_path, value)), skipped),
+            Err(reason) => skipped.push(SkippedDoctorReport::new(report_path, reason)),
+        }
+    }
+    (None, skipped)
+}
+
+/// How many unusable historical reports `am doctor health` lists before it
+/// summarizes the rest. `health` is the cheap one-line surface; `am doctor ls`
+/// is where a full run inventory belongs.
+const MAX_REPORTED_UNUSABLE_REPORTS: usize = 3;
+
+/// Print the operator-facing account of one unusable historical report.
+///
+/// Deliberately never mutates: `am doctor health` is a read-only probe, and the
+/// run directory may hold `actions.jsonl` crash evidence that `am doctor undo`
+/// still needs. Quarantining is `am doctor fix`'s job, under the `mutate()`
+/// chokepoint.
+fn print_skipped_doctor_report(skipped: &SkippedDoctorReport) {
+    ftui_runtime::ftui_println!(
+        "doctor_history: unusable report at {} ({}); live mailbox verdict above is unaffected",
+        skipped.report_path.display(),
+        skipped.reason.describe()
+    );
+    if skipped.recorded_action_bytes > 0 {
+        ftui_runtime::ftui_println!(
+            "doctor_history: run {} recorded {} of actions before its report was lost — preserved as crash evidence; inspect with: am doctor undo {} --dry-run",
+            skipped.run_id,
+            crate::format_bytes(skipped.recorded_action_bytes),
+            skipped.run_id
+        );
+    }
+}
+
+/// The single recovery instruction for damaged doctor history. Printed once
+/// per invocation, however many reports were skipped.
+fn print_doctor_history_recovery_hint() {
+    ftui_runtime::ftui_println!(
+        "doctor_history: next: am doctor  (writes a fresh report and repoints .doctor/latest; nothing needs to be deleted)"
+    );
+}
+
 fn latest_doctor_report_path_for_root(doctor_root: &Path) -> Option<PathBuf> {
     let run_dir = resolve_latest_doctor_run_dir(doctor_root)?;
     let report_path = run_dir.join("report.json");
@@ -3212,10 +3425,57 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         return Err(CliError::ExitCode(1));
     };
 
-    let s = std::fs::read_to_string(&report_path)
-        .map_err(|e| CliError::Other(format!("reading {}: {}", report_path.display(), e)))?;
-    let v: serde_json::Value = serde_json::from_str(&s)
-        .map_err(|e| CliError::Other(format!("parsing report.json: {e}")))?;
+    // GH#315: historical evidence must never be able to abort the live verdict.
+    // An old zero-byte or truncated `report.json` used to propagate a bare
+    // `parsing report.json: EOF while parsing a value at line 1 column 0` out
+    // of `handle_health` *after* every live check had already passed, so a
+    // healthy mailbox reported a hard failure with no path and no remedy.
+    // Unreadable history means "unknown", so we say exactly that, name the
+    // file, keep it on disk, and fall back to the newest report that does
+    // parse. Only a report we could actually read may set the exit code.
+    let mut skipped: Vec<SkippedDoctorReport> = Vec::new();
+    let v = match load_stored_doctor_report(&report_path) {
+        Ok(value) => value,
+        Err(reason) => {
+            skipped.push(SkippedDoctorReport::new(report_path, reason));
+            let (fallback, more_skipped) = newest_usable_doctor_report(&root, &skipped);
+            skipped.extend(more_skipped);
+            for entry in skipped.iter().take(MAX_REPORTED_UNUSABLE_REPORTS) {
+                print_skipped_doctor_report(entry);
+            }
+            let hidden = skipped.len().saturating_sub(MAX_REPORTED_UNUSABLE_REPORTS);
+            if hidden > 0 {
+                ftui_runtime::ftui_println!(
+                    "doctor_history: {hidden} older unusable report(s) not listed; see: am doctor ls"
+                );
+            }
+            print_doctor_history_recovery_hint();
+            match fallback {
+                Some((path, value)) => {
+                    ftui_runtime::ftui_println!(
+                        "doctor_history: falling back to the newest readable report at {}",
+                        path.display()
+                    );
+                    value
+                }
+                None => {
+                    // No readable history anywhere. The live mailbox checks
+                    // above are the whole verdict — exactly as they are for a
+                    // target that never ran doctor at all.
+                    if live_mailbox_degraded {
+                        ftui_runtime::ftui_println!(
+                            "ok: live mailbox degraded (leaked pages only, reclaimable); no readable doctor report"
+                        );
+                    } else {
+                        ftui_runtime::ftui_println!(
+                            "ok: live mailbox healthy; no readable doctor report"
+                        );
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    };
 
     let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
     let total = v
@@ -3415,6 +3675,453 @@ mod tests {
     const FIX_ONLY_LOCK_INVOKER_TEST: &str = "doctor::tests::fix_only_exclusive_lock_invoker_child";
     const FIX_ONLY_LOCK_HOLDER_WITNESS: &str = "FIX_ONLY_SHARED_LOCK_HOLDER_RAN";
     const FIX_ONLY_LOCK_REFUSAL_WITNESS: &str = "FIX_ONLY_EXCLUSIVE_LOCK_REFUSED";
+
+    // ---- GH#315: stale unusable doctor reports must not break live health ----
+
+    /// One synthetic `.doctor/runs/<id>`: (run id, `report.json` bytes,
+    /// `actions.jsonl` bytes). `None` means the file is absent.
+    #[cfg(unix)]
+    type DoctorRunFixture<'a> = (&'a str, Option<&'a [u8]>, Option<&'a [u8]>);
+
+    /// Build a healthy live mailbox plus a `.doctor` history whose `latest`
+    /// symlink points at `run_id`. Returns (target, storage_root, db_url).
+    #[cfg(unix)]
+    fn seed_health_target_with_latest_run(
+        runs: &[DoctorRunFixture<'_>],
+        latest_run_id: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, String) {
+        let target = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        let db_path = storage_root.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        seed_healthy_live_mailbox(&db_path);
+
+        let doctor_root = target.path().join(".doctor");
+        for (run_id, report, actions) in runs {
+            let run_dir = doctor_root.join("runs").join(run_id);
+            fs::create_dir_all(&run_dir).unwrap();
+            if let Some(bytes) = report {
+                fs::write(run_dir.join("report.json"), bytes).unwrap();
+            }
+            if let Some(bytes) = actions {
+                fs::write(run_dir.join("actions.jsonl"), bytes).unwrap();
+            }
+        }
+        std::os::unix::fs::symlink(
+            Path::new("runs").join(latest_run_id),
+            doctor_root.join("latest"),
+        )
+        .unwrap();
+
+        (target, storage_root, db_url)
+    }
+
+    #[cfg(unix)]
+    fn run_health_capturing(
+        target: &std::path::Path,
+        db_url: &str,
+        storage_root: &std::path::Path,
+    ) -> (CliResult<()>, String) {
+        let storage_root_s = storage_root.display().to_string();
+        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url),
+                ("STORAGE_ROOT", &storage_root_s),
+                // Unused port so the TUI-liveness probe stays quiet.
+                ("HTTP_PORT", "47351"),
+            ],
+            || handle_health(target),
+        );
+        let output = capture.drain_to_string();
+        drop(capture);
+        (result, output)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_health_survives_zero_byte_stale_report() {
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let run_id = "2026-08-28T00-00-00Z__empty0";
+        let (target, storage_root, db_url) = seed_health_target_with_latest_run(
+            &[(run_id, Some(b""), Some(b"{\"op\":\"rename\"}\n"))],
+            run_id,
+        );
+
+        let (result, output) = run_health_capturing(target.path(), &db_url, storage_root.path());
+
+        assert!(
+            result.is_ok(),
+            "a zero-byte stale report must not fail a healthy live mailbox: {result:?}\n{output}"
+        );
+        assert!(
+            output.contains(run_id),
+            "health must name the offending report path:\n{output}"
+        );
+        assert!(
+            output.contains("am doctor"),
+            "health must offer a concrete recovery action:\n{output}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_health_survives_truncated_stale_report() {
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let run_id = "2026-08-28T00-00-00Z__trunc0";
+        let (target, storage_root, db_url) = seed_health_target_with_latest_run(
+            &[(run_id, Some(br#"{"ok":true,"summary":{"total_find"#), None)],
+            run_id,
+        );
+
+        let (result, output) = run_health_capturing(target.path(), &db_url, storage_root.path());
+
+        assert!(
+            result.is_ok(),
+            "a truncated stale report must not fail a healthy live mailbox: {result:?}\n{output}"
+        );
+        assert!(
+            output.contains("unusable report at") && output.contains(run_id),
+            "health must name the offending report:\n{output}"
+        );
+        assert!(
+            output.contains("malformed JSON"),
+            "health must classify the damage:\n{output}"
+        );
+        assert!(
+            output.contains("ok: live mailbox healthy; no readable doctor report"),
+            "health must state the live verdict separately:\n{output}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_health_rejects_valid_json_that_is_not_a_report() {
+        // Valid JSON of the wrong shape used to be scored as a *clean* run:
+        // `ok` missing -> false, `total_findings` missing -> 0, producing a
+        // bogus "findings_present: 0 findings" exit 1.
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        for (label, body, expect) in [
+            ("array", &b"[1,2,3]"[..], "not a report object"),
+            ("empty-object", &b"{}"[..], "no doctor report fields"),
+            (
+                "unrelated-object",
+                &br#"{"hello":"world"}"#[..],
+                "no doctor report fields",
+            ),
+        ] {
+            let run_id = "2026-08-28T00-00-00Z__shape0";
+            let (target, storage_root, db_url) =
+                seed_health_target_with_latest_run(&[(run_id, Some(body), None)], run_id);
+
+            let (result, output) =
+                run_health_capturing(target.path(), &db_url, storage_root.path());
+
+            assert!(
+                result.is_ok(),
+                "{label}: wrong-shape report must not fail a healthy mailbox: {result:?}\n{output}"
+            );
+            assert!(
+                output.contains(expect),
+                "{label}: expected {expect:?} in:\n{output}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_health_falls_back_to_the_newest_readable_report() {
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let newest = "2026-08-28T00-00-00Z__empty0";
+        let middle = "2026-08-20T00-00-00Z__empty1";
+        let oldest = "2026-08-01T00-00-00Z__clean0";
+        let (target, storage_root, db_url) = seed_health_target_with_latest_run(
+            &[
+                (newest, Some(b""), None),
+                (middle, Some(b"not json at all"), None),
+                (
+                    oldest,
+                    Some(br#"{"ok":true,"summary":{"total_findings":0},"exit_code":0}"#),
+                    None,
+                ),
+            ],
+            newest,
+        );
+
+        let (result, output) = run_health_capturing(target.path(), &db_url, storage_root.path());
+
+        assert!(
+            result.is_ok(),
+            "a readable older report should decide the verdict: {result:?}\n{output}"
+        );
+        assert!(
+            output.contains("falling back to the newest readable report")
+                && output.contains(oldest),
+            "health must say which report it fell back to:\n{output}"
+        );
+        assert!(
+            output.contains(newest) && output.contains(middle),
+            "both skipped reports must stay visible:\n{output}"
+        );
+        assert!(
+            output.contains("ok: 0 findings (last run exit 0)"),
+            "the fallback report's verdict must be used:\n{output}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_health_fallback_still_reports_real_findings() {
+        // The tolerance is for *unreadable* history only. A readable report
+        // carrying findings must still exit 1.
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let newest = "2026-08-28T00-00-00Z__empty0";
+        let oldest = "2026-08-01T00-00-00Z__dirty0";
+        let (target, storage_root, db_url) = seed_health_target_with_latest_run(
+            &[
+                (newest, Some(b""), None),
+                (
+                    oldest,
+                    Some(br#"{"ok":false,"summary":{"total_findings":4},"exit_code":1}"#),
+                    None,
+                ),
+            ],
+            newest,
+        );
+
+        let (result, output) = run_health_capturing(target.path(), &db_url, storage_root.path());
+
+        assert!(
+            matches!(result, Err(CliError::ExitCode(1))),
+            "findings in the fallback report must still exit 1: {result:?}\n{output}"
+        );
+        assert!(
+            output.contains("findings_present: 4 findings"),
+            "the fallback report's findings must be reported:\n{output}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_health_preserves_and_surfaces_recorded_actions() {
+        // The reported case: report.json zero-byte, actions.jsonl non-empty.
+        // The action log is crash evidence — never disposable scaffolding —
+        // so health must name it, point at undo, and leave every byte alone.
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let run_id = "2026-08-28T00-00-00Z__actions";
+        let actions = br#"{"seq":1,"op":"rename","before":"a","after":"b"}
+{"seq":2,"op":"chmod","before":"0666","after":"0600"}
+"#;
+        let (target, storage_root, db_url) =
+            seed_health_target_with_latest_run(&[(run_id, Some(b""), Some(actions))], run_id);
+        let actions_path = target
+            .path()
+            .join(".doctor/runs")
+            .join(run_id)
+            .join("actions.jsonl");
+        let report_path = target
+            .path()
+            .join(".doctor/runs")
+            .join(run_id)
+            .join("report.json");
+
+        let (result, output) = run_health_capturing(target.path(), &db_url, storage_root.path());
+
+        assert!(
+            result.is_ok(),
+            "a healthy mailbox must not fail on lost history: {result:?}\n{output}"
+        );
+        assert!(
+            output.contains("recorded") && output.contains("crash evidence"),
+            "recorded actions must be surfaced:\n{output}"
+        );
+        assert!(
+            output.contains(&format!("am doctor undo {run_id} --dry-run")),
+            "health must offer the undo inspection path:\n{output}"
+        );
+        assert!(
+            output.contains("am doctor"),
+            "health must offer the regeneration path:\n{output}"
+        );
+        assert_eq!(
+            fs::read(&actions_path).unwrap(),
+            actions.to_vec(),
+            "health must never touch the recorded action log"
+        );
+        assert!(
+            report_path.exists(),
+            "health must leave the damaged report on disk"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_health_keeps_a_healthy_history_green() {
+        // Control: an intact report must behave exactly as before.
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let run_id = "2026-08-28T00-00-00Z__clean0";
+        let (target, storage_root, db_url) = seed_health_target_with_latest_run(
+            &[(
+                run_id,
+                Some(br#"{"ok":true,"summary":{"total_findings":0},"exit_code":0}"#),
+                None,
+            )],
+            run_id,
+        );
+
+        let (result, output) = run_health_capturing(target.path(), &db_url, storage_root.path());
+
+        assert!(
+            result.is_ok(),
+            "healthy history must pass: {result:?}\n{output}"
+        );
+        assert!(
+            output.contains("ok: 0 findings (last run exit 0)"),
+            "healthy history keeps its verdict line:\n{output}"
+        );
+        assert!(
+            !output.contains("doctor_history:"),
+            "a healthy history must stay quiet:\n{output}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_health_keeps_exit_one_for_a_dangling_latest_symlink() {
+        // `.doctor/latest` pointing at a run that does not exist resolves to
+        // no report at all. That is the orphan-run-dir case owned by
+        // `fm-doctor-state-files-orphan-run-dirs`, and it deliberately keeps
+        // its long-standing exit 1 — this change only relaxes *damaged*
+        // reports, never missing ones.
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let target = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        let db_path = storage_root.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        seed_healthy_live_mailbox(&db_path);
+
+        let doctor_root = target.path().join(".doctor");
+        fs::create_dir_all(doctor_root.join("runs")).unwrap();
+        std::os::unix::fs::symlink(
+            Path::new("runs").join("2026-08-28T00-00-00Z__missing"),
+            doctor_root.join("latest"),
+        )
+        .unwrap();
+
+        let (result, output) = run_health_capturing(target.path(), &db_url, storage_root.path());
+
+        assert!(
+            matches!(result, Err(CliError::ExitCode(1))),
+            "a dangling latest symlink keeps exit 1: {result:?}\n{output}"
+        );
+        assert!(
+            output.contains("no report.json in latest run"),
+            "the existing orphan-run diagnostic must be preserved:\n{output}"
+        );
+    }
+
+    #[test]
+    fn parse_stored_doctor_report_classifies_every_damage_shape() {
+        assert_eq!(
+            parse_stored_doctor_report(""),
+            Err(UnusableDoctorReport::Empty)
+        );
+        assert_eq!(
+            parse_stored_doctor_report("   \n\t "),
+            Err(UnusableDoctorReport::Empty)
+        );
+        assert!(matches!(
+            parse_stored_doctor_report(r#"{"ok":true"#),
+            Err(UnusableDoctorReport::Unparseable(_))
+        ));
+        assert_eq!(
+            parse_stored_doctor_report("[]"),
+            Err(UnusableDoctorReport::NotAnObject)
+        );
+        assert_eq!(
+            parse_stored_doctor_report("null"),
+            Err(UnusableDoctorReport::NotAnObject)
+        );
+        assert_eq!(
+            parse_stored_doctor_report("{}"),
+            Err(UnusableDoctorReport::MissingReportFields)
+        );
+        // Any single canonical field is enough to treat it as a report.
+        for body in [
+            r#"{"ok":true}"#,
+            r#"{"summary":{}}"#,
+            r#"{"exit_code":0}"#,
+            r#"{"findings":[]}"#,
+        ] {
+            assert!(
+                parse_stored_doctor_report(body).is_ok(),
+                "{body} should parse as a doctor report"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_run_dirs_are_ordered_newest_first() {
+        let root = tempfile::tempdir().unwrap();
+        let doctor_root = root.path().join(".doctor");
+        for run_id in [
+            "2026-08-01T00-00-00Z__aaa",
+            "2026-08-28T00-00-00Z__bbb",
+            "2026-08-20T00-00-00Z__ccc",
+        ] {
+            fs::create_dir_all(doctor_root.join("runs").join(run_id)).unwrap();
+        }
+        // A stray file in runs/ must not be mistaken for a run directory.
+        fs::write(doctor_root.join("runs").join("stray.txt"), b"x").unwrap();
+
+        let dirs = doctor_run_dirs_newest_first(&doctor_root);
+        let names: Vec<String> = dirs
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "2026-08-28T00-00-00Z__bbb".to_string(),
+                "2026-08-20T00-00-00Z__ccc".to_string(),
+                "2026-08-01T00-00-00Z__aaa".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn skipped_doctor_report_measures_recorded_actions() {
+        let root = tempfile::tempdir().unwrap();
+        let run_dir = root.path().join("runs").join("2026-08-28T00-00-00Z__zzz");
+        fs::create_dir_all(&run_dir).unwrap();
+        let report_path = run_dir.join("report.json");
+        fs::write(&report_path, b"").unwrap();
+
+        let without = SkippedDoctorReport::new(report_path.clone(), UnusableDoctorReport::Empty);
+        assert_eq!(without.recorded_action_bytes, 0);
+        assert_eq!(without.run_id, "2026-08-28T00-00-00Z__zzz");
+
+        fs::write(run_dir.join("actions.jsonl"), b"{\"seq\":1}\n").unwrap();
+        let with = SkippedDoctorReport::new(report_path, UnusableDoctorReport::Empty);
+        assert_eq!(with.recorded_action_bytes, 10);
+    }
 
     fn seed_healthy_live_mailbox(db_path: &std::path::Path) {
         let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string())
@@ -3866,6 +4573,7 @@ mod tests {
         let report = result.expect("triage envelope after successful result");
         assert_eq!(report["report_available"], true);
         assert_eq!(report["report"], "present");
+        assert_eq!(report["report_usable"], false);
         assert!(
             report["report_warning"]
                 .as_str()
@@ -3873,8 +4581,14 @@ mod tests {
             "missing historical-report warning: {report}"
         );
         assert_eq!(report["live_health"]["status"], "ok");
-        // A present (if unreadable) report keeps a concrete count.
-        assert_eq!(report["total_findings"], 0);
+        // GH#315: a report present on disk but unreadable is no evidence
+        // either way. It used to report a concrete `0` here, which is
+        // indistinguishable from a clean scan — the precise confusion GH#214
+        // removed for the report-absent case.
+        assert!(
+            report["total_findings"].is_null(),
+            "an unreadable report means UNKNOWN, not zero: {report}"
+        );
     }
 
     #[cfg(unix)]

@@ -35,6 +35,23 @@ reviewed on 2026-09-09. These changes are not published release artifacts.
 
 ### Fixed
 
+- **`am doctor health` no longer fails on unusable diagnostic history.** A
+  stale `.doctor/latest` report that is zero-byte, truncated, or not a doctor
+  report at all used to abort the command with a bare
+  `parsing report.json: EOF while parsing a value at line 1 column 0` *after*
+  every live check had already passed, so a healthy mailbox reported a hard
+  failure with no path and no remedy. Unreadable history is now reported as
+  unknown rather than unhealthy: health names the offending report and how it
+  is damaged, falls back to the newest report that does parse, and lets only a
+  report it could actually read set the exit code. Recorded `actions.jsonl`
+  bytes are surfaced as crash evidence with an `am doctor undo <run> --dry-run`
+  inspection path, and nothing on disk is moved or removed — health stays a
+  read-only probe. A readable report carrying findings still exits 1, and a
+  `latest` run with no `report.json` at all keeps its existing exit 1 under
+  `fm-doctor-state-files-orphan-run-dirs`. `am doctor triage --json` gained
+  `report_usable` and now reports `total_findings: null` for a present but
+  unreadable report, instead of a `0` indistinguishable from a clean scan.
+  (GH#315)
 - **Setup detects OMP installations selected by runtime overrides.** Automatic
   `am setup run` and `am setup status` now use the existing OMP configuration
   resolver alongside the upstream filesystem detector. Installations selected
