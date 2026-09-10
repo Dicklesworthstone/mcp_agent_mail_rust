@@ -595,7 +595,7 @@ fn handle_legacy_status(
     let fmt = output::CliOutputFormat::resolve(format, json);
     let root = resolve_search_root(search_root);
     let storage = match storage_root_override {
-        Some(path) => normalize_input_path(&path.to_string_lossy(), &root),
+        Some(path) => normalize_explicit_legacy_path("STORAGE_ROOT", &path, &root)?,
         None => resolve_storage_root(&root, None)?.path,
     };
     let report = collect_status_report(&storage)?;
@@ -766,13 +766,15 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
     let mode = ImportMode::Copy;
     let target_db = opts
         .target_db
-        .clone()
-        .map(|v| normalize_input_path(&v.to_string_lossy(), &root))
+        .as_deref()
+        .map(|path| normalize_explicit_legacy_path("target DB", path, &root))
+        .transpose()?
         .unwrap_or_else(|| default_copy_target_db(&source_db));
     let target_storage = opts
         .target_storage_root
-        .clone()
-        .map(|v| normalize_input_path(&v.to_string_lossy(), &root))
+        .as_deref()
+        .map(|path| normalize_explicit_legacy_path("target storage root", path, &root))
+        .transpose()?
         .unwrap_or_else(|| default_copy_target_storage(&source_storage));
 
     if source_db == target_db {
@@ -1739,9 +1741,7 @@ fn resolve_database_path_from_snapshot(
     snapshot: &LegacyEnvSnapshot,
 ) -> CliResult<ResolvedPath> {
     if let Some(path) = explicit {
-        let raw = path.to_string_lossy();
-        require_nonblank_legacy_authority("DATABASE_URL", &raw)?;
-        let normalized = normalize_input_path(&raw, search_root);
+        let normalized = normalize_explicit_legacy_path("DATABASE_URL", path, search_root)?;
         return Ok(ResolvedPath {
             exists: normalized.exists(),
             path: normalized,
@@ -1795,9 +1795,7 @@ fn resolve_storage_root_from_snapshot(
     snapshot: &LegacyEnvSnapshot,
 ) -> CliResult<ResolvedPath> {
     if let Some(path) = explicit {
-        let raw = path.to_string_lossy();
-        require_nonblank_legacy_authority("STORAGE_ROOT", &raw)?;
-        let normalized = normalize_input_path(&raw, search_root);
+        let normalized = normalize_explicit_legacy_path("STORAGE_ROOT", path, search_root)?;
         return Ok(ResolvedPath {
             exists: normalized.exists(),
             path: normalized,
@@ -2106,6 +2104,23 @@ fn normalize_input_path(raw: &str, base: &Path) -> PathBuf {
     } else {
         base.join(expanded)
     }
+}
+
+/// Explicit paths become string authorities for SQLite and import receipts.
+/// Reject unrepresentable bytes before normalization can redirect them to a
+/// different, replacement-character path (including bytes inherited from base).
+fn normalize_explicit_legacy_path(key: &str, path: &Path, base: &Path) -> CliResult<PathBuf> {
+    let raw = path.to_str().ok_or_else(|| {
+        CliError::InvalidArgument(format!("explicit {key} authority is not valid UTF-8"))
+    })?;
+    require_nonblank_legacy_authority(key, raw)?;
+    let normalized = normalize_input_path(raw, base);
+    if normalized.to_str().is_none() {
+        return Err(CliError::InvalidArgument(format!(
+            "resolved explicit {key} authority is not valid UTF-8"
+        )));
+    }
+    Ok(normalized)
 }
 
 fn normalize_path_for_overlap(path: &Path) -> PathBuf {
@@ -3168,6 +3183,81 @@ mod tests {
         let resolved = resolve_storage_root(tmp.path(), Some(explicit.as_path())).unwrap();
         assert_eq!(resolved.source, ResolvedSource::Explicit);
         assert_eq!(resolved.path, explicit);
+    }
+
+    #[test]
+    fn legacy_explicit_path_authorities_preserve_unicode_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Path::new("café-数据库.sqlite3");
+        let storage = Path::new("courrier-郵便");
+        fs::write(root.path().join(database), b"database sentinel").unwrap();
+        fs::create_dir(root.path().join(storage)).unwrap();
+        let resolved = resolve_legacy_authorities(root.path(), Some(database), Some(storage))
+            .expect("Unicode explicit authorities remain supported");
+        assert_eq!(resolved.database.path, root.path().join(database));
+        assert_eq!(resolved.storage.path, root.path().join(storage));
+        assert!(resolved.database.exists);
+        assert!(resolved.storage.exists);
+        assert_eq!(resolved.database.source, ResolvedSource::Explicit);
+        assert_eq!(resolved.storage.source, ResolvedSource::Explicit);
+        assert_eq!(resolved.database.raw_value.as_deref(), database.to_str());
+        assert_eq!(resolved.storage.raw_value.as_deref(), storage.to_str());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_explicit_path_authorities_reject_lossy_aliases() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let raw = PathBuf::from(std::ffi::OsString::from_vec(b"legacy-\xff".to_vec()));
+        let replacement = root.path().join("legacy-\u{fffd}");
+        fs::write(&replacement, b"unrelated replacement-path sentinel").unwrap();
+        let snapshot = LegacyEnvSnapshot::default();
+        let database = resolve_database_path_from_snapshot(
+            root.path(),
+            Some(&raw),
+            Some("fallback.sqlite3"),
+            &snapshot,
+        )
+        .expect_err("invalid explicit DB must not resolve to its lossy alias or fallback");
+        let storage = resolve_storage_root_from_snapshot(
+            root.path(),
+            Some(&raw),
+            Some("fallback-storage"),
+            &snapshot,
+        )
+        .expect_err("invalid explicit storage must not resolve to its lossy alias or fallback");
+        assert!(
+            database
+                .to_string()
+                .contains("DATABASE_URL authority is not valid UTF-8")
+        );
+        assert!(
+            storage
+                .to_string()
+                .contains("STORAGE_ROOT authority is not valid UTF-8")
+        );
+        for key in ["target DB", "target storage root"] {
+            let error = normalize_explicit_legacy_path(key, &raw, root.path())
+                .expect_err("invalid target authority must fail before any copy");
+            assert!(error.to_string().contains("not valid UTF-8"));
+        }
+        let non_unicode_base = root.path().join(&raw);
+        fs::create_dir(&non_unicode_base).unwrap();
+        let error = normalize_explicit_legacy_path(
+            "DATABASE_URL",
+            Path::new("relative.sqlite3"),
+            &non_unicode_base,
+        )
+        .expect_err("relative authority must not inherit an unrepresentable base");
+        assert!(error.to_string().contains("resolved explicit DATABASE_URL"));
+        assert_eq!(
+            fs::read(&replacement).unwrap(),
+            b"unrelated replacement-path sentinel"
+        );
+        assert!(!root.path().join("fallback.sqlite3").exists());
+        assert!(!root.path().join("fallback-storage").exists());
     }
 
     #[test]
