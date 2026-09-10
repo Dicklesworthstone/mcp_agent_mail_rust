@@ -956,6 +956,7 @@ fn ensure_target_storage_root_usable(target_storage_root: &Path) -> CliResult<()
     for entry in fs::read_dir(target_storage_root)? {
         let entry = entry?;
         if entry.file_name() == "legacy_import_receipts" {
+            require_storage_directory(&entry.path(), "legacy import receipts", false)?;
             continue;
         }
         return Err(CliError::InvalidArgument(format!(
@@ -1033,10 +1034,12 @@ fn handle_failed_import(
         Err(receipt_err) => format!("failure receipt could not be written: {receipt_err}"),
     };
 
-    let database_path_free = match fs::symlink_metadata(&plan.target_db) {
-        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-        Ok(_) => false,
-    };
+    let database_path_free = ["", "-wal", "-shm"].iter().all(|suffix| {
+        let mut path = plan.target_db.as_os_str().to_os_string();
+        path.push(suffix);
+        matches!(fs::symlink_metadata(Path::new(&path)), Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound)
+    });
     let retry_note = if database_path_free
         && ensure_target_storage_root_usable(&plan.target_storage_root).is_ok()
     {
@@ -4091,8 +4094,7 @@ mod tests {
         seed_v20_agents_fixture(&source_db);
         let messages = source_storage.join("messages");
         fs::create_dir_all(&messages).expect("create source storage");
-        symlink("/does/not/exist", messages.join("broken-link"))
-            .expect("seed broken symlink");
+        symlink("/does/not/exist", messages.join("broken-link")).expect("seed broken symlink");
 
         let opts = ImportOptions {
             auto: false,
@@ -4175,16 +4177,27 @@ mod tests {
 
         // Correct the source failure without deleting its evidence, then run
         // the SAME import options through copying, migration, and verification.
-        fs::rename(messages.join("broken-link"), tmp.path().join("broken-link-evidence"))
-            .unwrap();
+        fs::rename(
+            messages.join("broken-link"),
+            tmp.path().join("broken-link-evidence"),
+        )
+        .unwrap();
         fs::write(messages.join("message.md"), b"retry archive payload").unwrap();
         let retry = build_import_plan(&opts).expect("retry plan must build after failed import");
         let receipt = execute_import(retry, false).expect("corrected import must really succeed");
         assert_eq!(receipt.outcome, LEGACY_IMPORT_OUTCOME_SUCCEEDED);
         assert!(receipt.integrity_check_ok);
-        assert_eq!(fs::read(target_storage.join("messages/message.md")).unwrap(), b"retry archive payload");
+        assert_eq!(
+            fs::read(target_storage.join("messages/message.md")).unwrap(),
+            b"retry archive payload"
+        );
         assert!(quarantines[0].join("messages").is_dir());
-        assert_eq!(collect_status_report(&target_storage).unwrap().receipt_count, 2);
+        assert_eq!(
+            collect_status_report(&target_storage)
+                .unwrap()
+                .receipt_count,
+            2
+        );
     }
 
     #[test]
@@ -4195,16 +4208,33 @@ mod tests {
         fs::create_dir_all(&receipts).unwrap();
         fs::write(receipts.join("prior.json"), b"prior receipt").unwrap();
         fs::write(storage.join("message.md"), b"first partial payload").unwrap();
-        let first = stage_failed_target_storage_aside(&storage).unwrap().unwrap();
+        let first = stage_failed_target_storage_aside(&storage)
+            .unwrap()
+            .unwrap();
         ensure_target_storage_root_usable(&storage).unwrap();
         fs::write(storage.join("message.md"), b"second partial payload").unwrap();
-        let second = stage_failed_target_storage_aside(&storage).unwrap().unwrap();
+        let second = stage_failed_target_storage_aside(&storage)
+            .unwrap()
+            .unwrap();
         assert_ne!(first, second);
-        assert_eq!(fs::read(first.join("message.md")).unwrap(), b"first partial payload");
-        assert_eq!(fs::read(second.join("message.md")).unwrap(), b"second partial payload");
-        assert_eq!(fs::read(receipts.join("prior.json")).unwrap(), b"prior receipt");
+        assert_eq!(
+            fs::read(first.join("message.md")).unwrap(),
+            b"first partial payload"
+        );
+        assert_eq!(
+            fs::read(second.join("message.md")).unwrap(),
+            b"second partial payload"
+        );
+        assert_eq!(
+            fs::read(receipts.join("prior.json")).unwrap(),
+            b"prior receipt"
+        );
         ensure_target_storage_root_usable(&storage).unwrap();
-        assert!(stage_failed_target_storage_aside(&storage).unwrap().is_none());
+        assert!(
+            stage_failed_target_storage_aside(&storage)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4216,7 +4246,10 @@ mod tests {
         assert!(stage_failed_target_storage_aside(root.path()).is_err());
         assert!(ensure_target_storage_root_usable(root.path()).is_err());
         assert_eq!(fs::read(&receipts).unwrap(), b"occupied receipt path");
-        assert_eq!(fs::read(root.path().join("message.md")).unwrap(), b"partial payload");
+        assert_eq!(
+            fs::read(root.path().join("message.md")).unwrap(),
+            b"partial payload"
+        );
     }
 
     #[test]
