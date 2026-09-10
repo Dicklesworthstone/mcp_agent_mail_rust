@@ -945,18 +945,15 @@ fn execute_import_body(
     })
 }
 
-/// A target storage root is usable when it does not exist, or contains at most
-/// the `legacy_import_receipts` directory (left behind by a previous failed
-/// attempt whose partial artifacts were staged aside). Anything else is
-/// refused so an unrelated directory is never merged into.
+/// A target storage root may contain retained receipts and the mailbox activity
+/// lock acquired by this import. Other entries must be staged before retrying.
 fn ensure_target_storage_root_usable(target_storage_root: &Path) -> CliResult<()> {
     if !require_storage_directory(target_storage_root, "target storage root", true)? {
         return Ok(());
     }
     for entry in fs::read_dir(target_storage_root)? {
         let entry = entry?;
-        if entry.file_name() == "legacy_import_receipts" {
-            require_storage_directory(&entry.path(), "legacy import receipts", false)?;
+        if legacy_import_control_entry(&entry)? {
             continue;
         }
         return Err(CliError::InvalidArgument(format!(
@@ -967,14 +964,32 @@ fn ensure_target_storage_root_usable(target_storage_root: &Path) -> CliResult<()
     Ok(())
 }
 
+fn legacy_import_control_entry(entry: &fs::DirEntry) -> CliResult<bool> {
+    if entry.file_name() == "legacy_import_receipts" {
+        require_storage_directory(&entry.path(), "legacy import receipts", false)?;
+        return Ok(true);
+    }
+    if entry.file_name() == ".mailbox.activity.lock" {
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.file_type().is_file() || storage_metadata_is_link_like(&metadata) {
+            return Err(CliError::InvalidArgument(format!(
+                "mailbox activity lock must be a regular file: {}",
+                entry.path().display()
+            )));
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Failure path for `execute_import`: stage the partially created target DB
 /// (plus `-wal`/`-shm` sidecars) aside as `<target>.failed-<UTC ts>` siblings
 /// so the original target path is free for a retry, write a failure receipt so
 /// `am legacy status` can report the attempt, and return the original error
 /// annotated with the staged and receipt paths.
 ///
-/// Staging uses rename (never deletion), and only touches the target DB this
-/// same run just created — source paths are never moved or modified.
+/// Staging uses rename (never deletion) for partial target DB/archive entries.
+/// Source paths and the held target activity lock are never moved or modified.
 fn handle_failed_import(
     plan: &ImportPlan,
     original: &CliError,
@@ -1060,12 +1075,13 @@ fn stage_failed_target_storage_aside(storage: &Path) -> CliResult<Option<PathBuf
     if !require_storage_directory(storage, "failed target storage", true)? {
         return Ok(None);
     }
-    let entries = fs::read_dir(storage)?
-        .filter_map(|entry| match entry {
-            Ok(entry) if entry.file_name() == "legacy_import_receipts" => None,
-            entry => Some(entry),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(storage)? {
+        let entry = entry?;
+        if !legacy_import_control_entry(&entry)? {
+            entries.push(entry);
+        }
+    }
     if entries.is_empty() {
         return Ok(None);
     }
@@ -4207,6 +4223,8 @@ mod tests {
         let receipts = storage.join("legacy_import_receipts");
         fs::create_dir_all(&receipts).unwrap();
         fs::write(receipts.join("prior.json"), b"prior receipt").unwrap();
+        let activity_lock = storage.join(".mailbox.activity.lock");
+        fs::write(&activity_lock, b"held activity lock").unwrap();
         fs::write(storage.join("message.md"), b"first partial payload").unwrap();
         let first = stage_failed_target_storage_aside(&storage)
             .unwrap()
@@ -4235,6 +4253,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert_eq!(fs::read(&activity_lock).unwrap(), b"held activity lock");
     }
 
     #[test]
@@ -4250,6 +4269,20 @@ mod tests {
             fs::read(root.path().join("message.md")).unwrap(),
             b"partial payload"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_storage_quarantine_rejects_symlink_activity_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside");
+        fs::write(&outside, b"outside sentinel").unwrap();
+        let storage = root.path().join("storage");
+        fs::create_dir(&storage).unwrap();
+        std::os::unix::fs::symlink(&outside, storage.join(".mailbox.activity.lock")).unwrap();
+        assert!(ensure_target_storage_root_usable(&storage).is_err());
+        assert!(stage_failed_target_storage_aside(&storage).is_err());
+        assert_eq!(fs::read(outside).unwrap(), b"outside sentinel");
     }
 
     #[test]
