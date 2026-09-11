@@ -2380,6 +2380,55 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // A row count and the highest message ID cannot detect edits to an older
+    // message. These counters move in the source transaction, including writes
+    // made outside the Agent Mail query helpers. Rollback restores the counters
+    // along with the rows. The separate rewrite counter preserves incremental
+    // indexing for an append-only tail.
+    migrations.push(Migration::new(
+        "v29_create_lexical_change_clock".to_string(),
+        "track committed changes to lexical source documents".to_string(),
+        "CREATE TABLE IF NOT EXISTS lexical_change_clock (\
+            id INTEGER PRIMARY KEY CHECK (id = 1),\
+            revision INTEGER NOT NULL,\
+            rewrite_revision INTEGER NOT NULL\
+        )"
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v29_seed_lexical_change_clock".to_string(),
+        "initialize lexical source counters without resetting existing state".to_string(),
+        "INSERT OR IGNORE INTO lexical_change_clock (id, revision, rewrite_revision) \
+         VALUES (1, 0, 0)"
+            .to_string(),
+        String::new(),
+    ));
+    for (table, event, suffix, rewrite) in [
+        ("messages", "INSERT", "insert", false),
+        ("messages", "UPDATE", "update", true),
+        ("messages", "DELETE", "delete", true),
+        ("agents", "INSERT", "insert", true),
+        ("agents", "UPDATE OF id, name", "update", true),
+        ("agents", "DELETE", "delete", true),
+        ("projects", "INSERT", "insert", true),
+        ("projects", "UPDATE OF id, slug", "update", true),
+        ("projects", "DELETE", "delete", true),
+    ] {
+        let rewrite_increment = i32::from(rewrite);
+        migrations.push(Migration::new(
+            format!("v29_lexical_clock_{table}_{suffix}"),
+            format!("invalidate lexical documents after {table} {suffix}"),
+            format!(
+                "CREATE TRIGGER IF NOT EXISTS trg_lexical_clock_{table}_{suffix} \
+                 AFTER {event} ON {table} BEGIN \
+                 UPDATE lexical_change_clock SET revision = revision + 1, \
+                 rewrite_revision = rewrite_revision + {rewrite_increment} WHERE id = 1; END"
+            ),
+            String::new(),
+        ));
+    }
+
     // These indexes are also present in the latest static DDL, which gives
     // them generated v1 migration IDs. On an existing pre-v27/v28 database,
     // however, their columns do not exist until the explicit evolution
@@ -4603,6 +4652,21 @@ mod tests {
             "fresh DB should apply at least one migration"
         );
 
+        conn.execute_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('clock-test', '/clock-test', 1)",
+            &[],
+        )
+        .expect("exercise the installed projection trigger");
+        let revision_before = conn
+            .query_sync(
+                "SELECT revision FROM lexical_change_clock WHERE id = 1",
+                &[],
+            )
+            .unwrap()[0]
+            .get_named::<i64>("revision")
+            .unwrap();
+        assert!(revision_before > 0, "the native trigger must actually fire");
+
         // Second run is a no-op (already applied).
         let applied2 = block_on({
             let conn = &conn;
@@ -4611,6 +4675,18 @@ mod tests {
         assert!(
             applied2.is_empty(),
             "second migrate call should be idempotent"
+        );
+        let revision_after = conn
+            .query_sync(
+                "SELECT revision FROM lexical_change_clock WHERE id = 1",
+                &[],
+            )
+            .unwrap()[0]
+            .get_named::<i64>("revision")
+            .unwrap();
+        assert_eq!(
+            revision_after, revision_before,
+            "migration cannot reset a live clock"
         );
     }
 

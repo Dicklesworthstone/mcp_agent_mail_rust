@@ -40,6 +40,9 @@ pub struct TantivyBridge {
     /// any write failure so uncommitted operations cannot ride along with a
     /// later caller's commit. Read-only bridge uses never create it.
     writer: Mutex<Option<tantivy::IndexWriter>>,
+    /// Last source revision seen by this process. A marker refreshed by a
+    /// different process cannot invalidate this process's result cache.
+    observed_source: Mutex<Option<ObservedLexicalSource>>,
     handles: FieldHandles,
     index_dir: PathBuf,
 }
@@ -73,13 +76,14 @@ impl TantivyBridge {
         Ok(Self {
             index,
             writer: Mutex::new(None),
+            observed_source: Mutex::new(None),
             handles,
             index_dir: index_dir.to_owned(),
         })
     }
 
-    /// Create an in-memory index (for testing).
-    #[cfg(test)]
+    /// Create a private in-memory index, including for snapshot searches that
+    /// must not acquire publication authority over the live mailbox index.
     #[must_use]
     pub fn in_memory() -> Self {
         let (schema, handles) = build_schema();
@@ -88,6 +92,7 @@ impl TantivyBridge {
         Self {
             index,
             writer: Mutex::new(None),
+            observed_source: Mutex::new(None),
             handles,
             index_dir: PathBuf::new(),
         }
@@ -570,6 +575,9 @@ fn upsert_indexable_message(
 }
 
 fn refresh_index_health_metrics(bridge: &TantivyBridge) {
+    if bridge.index_dir().as_os_str().is_empty() {
+        return;
+    }
     static LAST_MEASURED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
     let doc_count =
@@ -608,6 +616,68 @@ struct MessageStats {
 struct MessageWatermark {
     sequence: u64,
     max_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LexicalChangeClock {
+    revision: i64,
+    rewrite_revision: i64,
+}
+
+#[derive(PartialEq, Eq)]
+struct ObservedLexicalSource {
+    path: String,
+    generation: Option<String>,
+    clock: Option<LexicalChangeClock>,
+}
+
+fn observe_lexical_source(bridge: &TantivyBridge, source: ObservedLexicalSource) {
+    if bridge.index_dir().as_os_str().is_empty() {
+        return;
+    }
+    let mut observed = bridge
+        .observed_source
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if observed.as_ref() != Some(&source) {
+        *observed = Some(source);
+        drop(observed);
+        crate::search_service::invalidate_search_cache(
+            crate::search_cache::InvalidationTrigger::IndexUpdate,
+        );
+    }
+}
+
+/// An absent clock is an old schema, never evidence that the index is fresh.
+/// Errors reading a present clock must remain errors rather than becoming a
+/// zero revision that could authorize a stale marker.
+pub(crate) fn lexical_change_clock(conn: &DbConn) -> Result<Option<LexicalChangeClock>, String> {
+    let rows = match query_sync_with_lock_retry(
+        conn,
+        "lexical change clock",
+        "SELECT revision, rewrite_revision FROM lexical_change_clock WHERE id = 1",
+        &[],
+    ) {
+        Ok(rows) => rows,
+        Err(err) if sqlite_error_is_missing_table(&err.to_string(), "lexical_change_clock") => {
+            return Ok(None);
+        }
+        Err(err) => return Err(format!("cannot read lexical change clock: {err}")),
+    };
+    let row = rows.first().ok_or("lexical change clock row is missing")?;
+    let revision = row
+        .get_named::<i64>("revision")
+        .map_err(|err| err.to_string())?;
+    let rewrite_revision = row
+        .get_named::<i64>("rewrite_revision")
+        .map_err(|err| err.to_string())?;
+    if revision < 0 || rewrite_revision < 0 || rewrite_revision > revision {
+        return Err("invalid lexical change clock counters".to_string());
+    }
+    Ok(Some(LexicalChangeClock {
+        revision,
+        rewrite_revision,
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -654,6 +724,8 @@ struct BackfillState {
     #[serde(default)]
     message_watermark: MessageWatermark,
     #[serde(default)]
+    change_clock: Option<LexicalChangeClock>,
+    #[serde(default)]
     index_meta_fingerprint: Option<IndexMetaFingerprint>,
     index_stats: MessageStats,
     updated_at_micros: i64,
@@ -698,6 +770,9 @@ fn sqlite_file_backfill_fingerprint(db_path: &str) -> Option<BackfillDbFingerpri
 }
 
 fn index_meta_fingerprint(bridge: &TantivyBridge) -> Option<IndexMetaFingerprint> {
+    if bridge.index_dir().as_os_str().is_empty() {
+        return None;
+    }
     let metadata = std::fs::metadata(bridge.index_dir().join("meta.json")).ok()?;
     let modified_micros = metadata
         .modified()
@@ -712,6 +787,9 @@ fn index_meta_fingerprint(bridge: &TantivyBridge) -> Option<IndexMetaFingerprint
 }
 
 fn read_backfill_state(bridge: &TantivyBridge) -> Option<BackfillState> {
+    if bridge.index_dir().as_os_str().is_empty() {
+        return None;
+    }
     let path = backfill_state_path(bridge);
     let raw = std::fs::read_to_string(path).ok()?;
     let state = serde_json::from_str::<BackfillState>(&raw).ok()?;
@@ -726,9 +804,13 @@ fn write_backfill_state(
     db_generation: Option<&str>,
     db_stats: MessageStats,
     message_watermark: MessageWatermark,
+    change_clock: Option<LexicalChangeClock>,
     index_meta_fingerprint: Option<IndexMetaFingerprint>,
     index_stats: MessageStats,
 ) {
+    if bridge.index_dir().as_os_str().is_empty() {
+        return;
+    }
     let path = backfill_state_path(bridge);
     let Some(parent) = path.parent() else {
         return;
@@ -743,6 +825,7 @@ fn write_backfill_state(
         db_generation: db_generation.map(str::to_string),
         db_stats,
         message_watermark,
+        change_clock,
         index_meta_fingerprint,
         index_stats,
         updated_at_micros: current_unix_micros(),
@@ -750,7 +833,13 @@ fn write_backfill_state(
     let Ok(payload) = serde_json::to_string_pretty(&state) else {
         return;
     };
-    let _ = std::fs::write(path, payload);
+    use std::io::Write as _;
+    if let Ok(mut pending) = tempfile::NamedTempFile::new_in(parent)
+        && pending.write_all(payload.as_bytes()).is_ok()
+        && pending.as_file().sync_all().is_ok()
+    {
+        let _ = pending.persist(path);
+    }
 }
 
 fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
@@ -1034,6 +1123,17 @@ fn choose_backfill_plan(
 const TANTIVY_WRITER_THREADS: usize = 1;
 const TANTIVY_WRITER_MEMORY_BUDGET_BYTES: usize = 15_000_000;
 
+#[cfg(test)]
+type BackfillScanObserver = Box<dyn FnMut(usize)>;
+
+#[cfg(test)]
+std::thread_local! {
+    // Coordinate a real second connection's commit after a paged scan has
+    // passed the former intermediate-publication boundary.
+    static BACKFILL_SCAN_OBSERVER: std::cell::RefCell<Option<BackfillScanObserver>> =
+        std::cell::RefCell::new(None);
+}
+
 /// Acquire an IndexWriter with retries. Tantivy acquires an exclusive directory lock
 /// for writers. In concurrent environments, this can fail. We retry a few times
 /// with exponential backoff to handle writers from older binaries or external tools.
@@ -1177,36 +1277,49 @@ pub(crate) fn resolve_search_sqlite_path_from_database_url(db_url: &str) -> Opti
 
 /// Backfill the Tantivy index with all messages from the database.
 ///
-/// Uses a sync `DbConn` (`FrankenSQLite`) to scan the messages table joined with
-/// agents and projects, then batch-indexes everything with a single writer.
-/// The index is rebuilt from scratch on each backfill to guarantee that stale
-/// or duplicate message documents cannot survive DB resets, migrations, or
-/// interrupted runs.
+/// Uses a sync `DbConn` (`FrankenSQLite`) to scan messages and their sender and
+/// project metadata. Unchanged transaction counters skip the scan; a proven
+/// append-only tail is indexed incrementally. Edits, deletes and identity
+/// changes rebuild the index with one publication after the scan succeeds.
 ///
-/// Returns `(indexed_count, skipped_count)` where `skipped_count` is always 0.
+/// Returns `(indexed_count, skipped_count)`. A freshness skip reports the
+/// existing message count in `skipped_count`.
 pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     backfill_from_db_as(db_url, None)
 }
 
-/// [`backfill_from_db`] for a reader whose file at `db_url` is a private
-/// materialization of the mailbox at `identity_path` (GH#297).
-///
-/// The rows are read from `db_url`, but the persisted backfill marker and
-/// every identity comparison use `identity_path`: a snapshot-backed `am robot
-/// search` must never stamp `storage_root/search_index/backfill_state.json`
-/// with its temp path, which made every later server search report the shared
-/// index as belonging to a vanished `/tmp/...` file.
-#[allow(clippy::too_many_lines)]
+/// Backfill with an explicit mailbox identity. Private snapshots must use
+/// private snapshot search; they cannot publish into the live index under
+/// either their temporary path or the mailbox's canonical identity.
 pub fn backfill_from_db_as(
     db_url: &str,
     identity_path: Option<&str>,
 ) -> Result<(usize, usize), String> {
-    const FETCH_BATCH_SIZE: i64 = 500;
-    const COMMIT_EVERY_BATCHES: usize = 8;
-
     let Some(bridge) = get_bridge() else {
         return Ok((0, 0));
     };
+    backfill_into_bridge(&bridge, db_url, identity_path)
+}
+
+/// Search a private database materialization with the same lexical parser,
+/// filters and ranking as the live index, without modifying global bridge
+/// state, live index bytes or the process-wide result cache.
+pub(crate) fn search_private_snapshot(
+    db_url: &str,
+    query: &PlannerQuery,
+) -> Result<Vec<PlannerResult>, String> {
+    let bridge = TantivyBridge::in_memory();
+    backfill_into_bridge(&bridge, db_url, None)?;
+    Ok(bridge.search(query))
+}
+
+#[allow(clippy::too_many_lines)]
+fn backfill_into_bridge(
+    bridge: &TantivyBridge,
+    db_url: &str,
+    identity_path: Option<&str>,
+) -> Result<(usize, usize), String> {
+    const FETCH_BATCH_SIZE: i64 = 500;
 
     // Open a sync connection via FrankenSQLite.
     let db_path_owned = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(db_url) {
@@ -1218,29 +1331,14 @@ pub fn backfill_from_db_as(
     };
     let db_path = &db_path_owned;
     let identity_path = identity_path.unwrap_or(db_path);
-
-    // The marker describes the file at the identity path (the mailbox), even
-    // when the rows are read from a private copy of it.
-    let db_fingerprint = sqlite_file_backfill_fingerprint(identity_path);
-    let initial_index_fingerprint = index_meta_fingerprint(&bridge);
-    if let (Some(fingerprint), Some(state)) = (db_fingerprint, read_backfill_state(&bridge))
-        && state.db_path == identity_path
-        && state.db_fingerprint == fingerprint
-        && state.index_meta_fingerprint == initial_index_fingerprint
-    {
-        tracing::info!(
-            db_count = state.db_stats.count,
-            db_max_id = state.db_stats.max_id,
-            index_count = state.index_stats.count,
-            index_max_id = state.index_stats.max_id,
-            "backfill: sqlite/index meta fingerprints unchanged, skipping"
-        );
-        refresh_index_health_metrics(&bridge);
-        return Ok((
-            0,
-            usize::try_from(state.db_stats.count).unwrap_or(usize::MAX),
-        ));
+    if identity_path != db_path && !bridge.index_dir().as_os_str().is_empty() {
+        return Err("private snapshots cannot publish into the shared lexical index".to_string());
     }
+
+    // Only a live source may write a durable marker under its identity path.
+    let db_fingerprint = sqlite_file_backfill_fingerprint(identity_path);
+    // The main file can remain unchanged while committed edits live in WAL.
+    // File metadata is only a diagnostic hint; read the transactional clock.
 
     // br-5u3w5: the bespoke bootstrap open races live pool connections on the
     // same WAL mailbox and can surface "database is busy" — retry it on the
@@ -1248,9 +1346,9 @@ pub fn backfill_from_db_as(
     let mut conn = open_backfill_conn(db_path)?;
 
     if !backfill_table_exists(&conn, "messages")? {
-        let index_stats = fetch_index_message_stats(&bridge)?;
+        let index_stats = fetch_index_message_stats(bridge)?;
         if index_stats.count > 0 {
-            with_tantivy_writer(&bridge, |writer| {
+            with_tantivy_writer(bridge, |writer| {
                 writer
                     .delete_all_documents()
                     .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
@@ -1264,33 +1362,44 @@ pub fn backfill_from_db_as(
             );
         }
         tracing::info!("backfill: messages table missing, treating database as empty");
-        refresh_index_health_metrics(&bridge);
+        refresh_index_health_metrics(bridge);
         return Ok((0, 0));
     }
 
     let db_generation = crate::queries::db_generation_id_conn(&conn);
+    let change_clock = lexical_change_clock(&conn)?;
+    observe_lexical_source(
+        bridge,
+        ObservedLexicalSource {
+            path: identity_path.to_string(),
+            generation: db_generation.clone(),
+            clock: change_clock,
+        },
+    );
     let message_watermark = fetch_db_message_watermark(&conn)?;
-    let current_index_fingerprint = index_meta_fingerprint(&bridge);
-    let previous_state = read_backfill_state(&bridge);
+    let current_index_fingerprint = index_meta_fingerprint(bridge);
+    let previous_state = read_backfill_state(bridge);
     if let Some(state) = previous_state.as_ref()
         && state.db_path == identity_path
         && state.db_generation == db_generation
+        && change_clock.is_some()
+        && state.change_clock == change_clock
         && state.message_watermark == message_watermark
         && state.index_meta_fingerprint == current_index_fingerprint
     {
-        // GH#295: same mailbox, same generation, same content — the file was
-        // merely replaced (VACUUM INTO + rename, backup restore, recovery
-        // promotion). Refresh the stat hint in place; the index is current.
+        // The transaction clock, rather than the message IDs, establishes
+        // unchanged contents even across a same-generation file replacement.
         if let Some(fingerprint) = db_fingerprint
             && state.db_fingerprint != fingerprint
         {
             write_backfill_state(
-                &bridge,
+                bridge,
                 identity_path,
                 fingerprint,
                 db_generation.as_deref(),
                 state.db_stats,
                 state.message_watermark,
+                change_clock,
                 current_index_fingerprint,
                 state.index_stats,
             );
@@ -1298,9 +1407,9 @@ pub fn backfill_from_db_as(
         tracing::info!(
             message_seq = message_watermark.sequence,
             message_max_id = message_watermark.max_id,
-            "backfill: message watermark unchanged, skipping"
+            "backfill: lexical change clock unchanged, skipping"
         );
-        refresh_index_health_metrics(&bridge);
+        refresh_index_health_metrics(bridge);
         return Ok((
             0,
             usize::try_from(state.db_stats.count).unwrap_or(usize::MAX),
@@ -1308,7 +1417,7 @@ pub fn backfill_from_db_as(
     }
 
     let db_stats = fetch_db_message_stats(&conn)?;
-    let index_stats = fetch_index_message_stats(&bridge)?;
+    let index_stats = fetch_index_message_stats(bridge)?;
     // A marker written for another mailbox path or another generation of
     // this mailbox means the indexed documents belong to a database whose
     // numeric ids cannot be trusted against this one, however similar the
@@ -1316,7 +1425,20 @@ pub fn backfill_from_db_as(
     let identity_changed = previous_state.as_ref().is_some_and(|state| {
         state.db_path != identity_path || state.db_generation != db_generation
     });
-    let plan = if identity_changed && index_stats.count > 0 {
+    let append_only_since_marker = match (previous_state.as_ref(), change_clock) {
+        (Some(state), Some(clock)) => state.change_clock.is_some_and(|previous| {
+            previous.rewrite_revision == clock.rewrite_revision
+                && clock
+                    .revision
+                    .checked_sub(previous.revision)
+                    .and_then(|delta| u64::try_from(delta).ok())
+                    .zip(db_stats.count.checked_sub(state.db_stats.count))
+                    .is_some_and(|(revision_delta, row_delta)| revision_delta == row_delta)
+                && db_stats.max_id >= state.db_stats.max_id
+        }),
+        _ => false,
+    };
+    let plan = if identity_changed || !append_only_since_marker {
         tracing::info!(
             identity_path,
             previous_db_path = previous_state.as_ref().map(|state| state.db_path.as_str()),
@@ -1324,10 +1446,14 @@ pub fn backfill_from_db_as(
                 .as_ref()
                 .and_then(|state| state.db_generation.as_deref()),
             current_generation = db_generation.as_deref(),
-            "backfill: database identity changed since the last backfill; rebuilding the index"
+            "backfill: source identity or existing documents changed; rebuilding the index"
         );
         BackfillPlan::FullRebuild
     } else {
+        // The clock delta must equal the row-count delta before treating
+        // inserts as appends: INSERT OR REPLACE can preserve count/max-ID
+        // without firing a DELETE trigger. Already-ingested pure appends may
+        // legitimately yield Skip here.
         choose_backfill_plan(&conn, db_stats, index_stats)?
     };
 
@@ -1341,17 +1467,18 @@ pub fn backfill_from_db_as(
         );
         if let Some(fingerprint) = sqlite_file_backfill_fingerprint(identity_path) {
             write_backfill_state(
-                &bridge,
+                bridge,
                 identity_path,
                 fingerprint,
                 db_generation.as_deref(),
                 db_stats,
                 message_watermark,
+                change_clock,
                 current_index_fingerprint,
                 index_stats,
             );
         }
-        refresh_index_health_metrics(&bridge);
+        refresh_index_health_metrics(bridge);
         return Ok((0, usize::try_from(db_stats.count).unwrap_or(usize::MAX)));
     }
 
@@ -1373,14 +1500,13 @@ pub fn backfill_from_db_as(
         BackfillPlan::Incremental { start_after_id } => start_after_id,
         BackfillPlan::Skip | BackfillPlan::FullRebuild => 0_i64,
     };
-    let total_indexed = with_tantivy_writer(&bridge, |writer| {
+    let total_indexed = with_tantivy_writer(bridge, |writer| {
         if matches!(plan, BackfillPlan::FullRebuild) {
             writer
                 .delete_all_documents()
                 .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
         }
 
-        let mut pending_batches = 0_usize;
         let mut total_indexed = 0_usize;
         loop {
             // br-5u3w5: the page scan runs while live workers keep
@@ -1454,46 +1580,58 @@ pub fn backfill_from_db_as(
                         .unwrap_or_else(|_| "normal".to_string()),
                     created_ts: row.get_as::<i64>(7).unwrap_or(0),
                 };
-                add_indexable_message(writer, handles, &msg)?;
+                // A live ingester may have committed this tail ID after the
+                // stats probe but before we acquired the retained writer.
+                // Upsert keeps that race from duplicating a document.
+                upsert_indexable_message(writer, handles, &msg)?;
                 total_indexed += 1;
                 if msg.id > last_id {
                     last_id = msg.id;
                 }
             }
-
-            pending_batches += 1;
-            if pending_batches >= COMMIT_EVERY_BATCHES {
-                writer
-                    .commit()
-                    .map_err(|e| format!("Tantivy commit error: {e}"))?;
-                pending_batches = 0;
-            }
+            #[cfg(test)]
+            BACKFILL_SCAN_OBSERVER.with(|observer| {
+                if let Some(observer) = observer.borrow_mut().as_mut() {
+                    observer(total_indexed);
+                }
+            });
         }
 
-        if pending_batches > 0 || (matches!(plan, BackfillPlan::FullRebuild) && total_indexed == 0)
+        // Tantivy spills buffered segments at its memory limit without making
+        // them searchable. Publish once, after every page has succeeded and
+        // a fresh source connection confirms the scan did not cross a write.
+        // The original revision goes into the marker: a later source commit
+        // remains visible as drift on the next check.
+        let seal = open_backfill_conn(db_path)?;
+        if lexical_change_clock(&seal)? != change_clock
+            || crate::queries::db_generation_id_conn(&seal) != db_generation
         {
-            writer
-                .commit()
-                .map_err(|e| format!("Tantivy commit error: {e}"))?;
+            return Err("backfill source changed during scan; index was not published".to_string());
         }
+        writer
+            .commit()
+            .map_err(|e| format!("Tantivy commit error: {e}"))?;
         Ok(total_indexed)
     })?;
 
-    refresh_index_health_metrics(&bridge);
-    crate::search_service::invalidate_search_cache(
-        crate::search_cache::InvalidationTrigger::IndexUpdate,
-    );
+    refresh_index_health_metrics(bridge);
+    if !bridge.index_dir().as_os_str().is_empty() {
+        crate::search_service::invalidate_search_cache(
+            crate::search_cache::InvalidationTrigger::IndexUpdate,
+        );
+    }
 
-    let final_index_stats = fetch_index_message_stats(&bridge).unwrap_or(db_stats);
+    let final_index_stats = fetch_index_message_stats(bridge).unwrap_or(db_stats);
     if let Some(fingerprint) = sqlite_file_backfill_fingerprint(identity_path) {
         write_backfill_state(
-            &bridge,
+            bridge,
             identity_path,
             fingerprint,
             db_generation.as_deref(),
             db_stats,
             message_watermark,
-            index_meta_fingerprint(&bridge),
+            change_clock,
+            index_meta_fingerprint(bridge),
             final_index_stats,
         );
     }
@@ -2804,11 +2942,277 @@ mod tests {
         .expect("change lower-ID subject and body");
         assert_eq!(fetch_db_message_watermark(&conn).unwrap(), before);
         backfill_from_db(&db_path).expect("refresh after committed edit");
-        assert_eq!(search("violetfinish").len(), 1, "new subject must be searchable");
-        assert_eq!(search("silverfinish").len(), 1, "new body must be searchable");
-        assert!(search("amberstart").is_empty(), "old subject must disappear");
+        assert_eq!(
+            search("violetfinish").len(),
+            1,
+            "new subject must be searchable"
+        );
+        assert_eq!(
+            search("silverfinish").len(),
+            1,
+            "new body must be searchable"
+        );
+        assert!(
+            search("amberstart").is_empty(),
+            "old subject must disappear"
+        );
         assert!(search("copperstart").is_empty(), "old body must disappear");
         assert_eq!(search("unchanged").len(), 1, "tail document survives");
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn backfill_clock_preserves_append_progress_and_refreshes_deletions() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let db_path = create_test_db(
+            tmp.path(),
+            &[
+                (1, "removefirst", "original body", "normal", "thread-one"),
+                (2, "retained", "tail body", "normal", "thread-two"),
+            ],
+        );
+        let conn = DbConn::open_file(&db_path).unwrap();
+        for migration in crate::schema::schema_migrations()
+            .into_iter()
+            .filter(|migration| migration.id.starts_with("v29_"))
+        {
+            conn.execute_sync(&migration.up, &[])
+                .expect("install real clock migration");
+        }
+        init_bridge(index_dir.path()).unwrap();
+        assert_eq!(backfill_from_db(&db_path).unwrap(), (2, 0));
+        let initial_clock = lexical_change_clock(&conn).unwrap().unwrap();
+        conn.execute_sync("BEGIN IMMEDIATE", &[]).unwrap();
+        conn.execute_sync(
+            "UPDATE messages SET body_md = 'rolledback' WHERE id = 1",
+            &[],
+        )
+        .unwrap();
+        assert_ne!(lexical_change_clock(&conn).unwrap(), Some(initial_clock));
+        conn.execute_sync("ROLLBACK", &[]).unwrap();
+        assert_eq!(lexical_change_clock(&conn).unwrap(), Some(initial_clock));
+        assert_eq!(backfill_from_db(&db_path).unwrap(), (0, 2));
+
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (3, 1, 1, 'appended', 'new tail', 2000000)",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            lexical_change_clock(&conn)
+                .unwrap()
+                .unwrap()
+                .rewrite_revision,
+            initial_clock.rewrite_revision
+        );
+        assert_eq!(
+            backfill_from_db(&db_path).unwrap(),
+            (1, 0),
+            "append only indexes its tail"
+        );
+        conn.execute_sync("DELETE FROM messages WHERE id = 1", &[])
+            .unwrap();
+        assert_eq!(backfill_from_db(&db_path).unwrap(), (2, 0));
+        let bridge = get_bridge().unwrap();
+        assert_eq!(fetch_index_message_stats(&bridge).unwrap().count, 2);
+        assert!(
+            bridge
+                .search(&PlannerQuery {
+                    text: "removefirst".to_string(),
+                    doc_kind: DocKind::Message,
+                    ..Default::default()
+                })
+                .is_empty()
+        );
+        assert_eq!(backfill_from_db(&db_path).unwrap(), (0, 2));
+        // Replacement inserts must not be mistaken for append-only growth,
+        // even when a real append in the same transaction advances MAX(id).
+        conn.execute_sync("BEGIN IMMEDIATE", &[]).unwrap();
+        conn.execute_sync(
+            "INSERT OR REPLACE INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (2, 1, 1, 'replacement', 'replacedbody', 3000000)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (4, 1, 1, 'lastappend', 'finalbody', 4000000)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync("COMMIT", &[]).unwrap();
+        assert_eq!(backfill_from_db(&db_path).unwrap(), (3, 0));
+        assert_eq!(
+            bridge
+                .search(&PlannerQuery {
+                    text: "replacement".to_string(),
+                    doc_kind: DocKind::Message,
+                    ..Default::default()
+                })
+                .len(),
+            1
+        );
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn backfill_refuses_source_mutation_without_publishing_partial_documents() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let db_path = create_test_db(
+            tmp.path(),
+            &[(1, "originalsubject", "originalbody", "normal", "thread-one")],
+        );
+        let conn = DbConn::open_file(&db_path).unwrap();
+        for migration in crate::schema::schema_migrations()
+            .into_iter()
+            .filter(|migration| migration.id.starts_with("v29_"))
+        {
+            conn.execute_sync(&migration.up, &[]).unwrap();
+        }
+        init_bridge(index_dir.path()).unwrap();
+        assert_eq!(backfill_from_db(&db_path).unwrap(), (1, 0));
+        let bridge = get_bridge().unwrap();
+        let marker_before = std::fs::read(backfill_state_path(&bridge)).unwrap();
+        let meta_before = std::fs::read(index_dir.path().join("meta.json")).unwrap();
+        conn.execute_sync("BEGIN IMMEDIATE", &[]).unwrap();
+        for id in 2..=4_102 {
+            conn.execute_sync(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                 VALUES (?, 1, 1, 'pendingtail', 'tailbody', 1000000)",
+                &[Value::BigInt(id)],
+            )
+            .unwrap();
+        }
+        conn.execute_sync("COMMIT", &[]).unwrap();
+        // Force a rebuild so failure would previously expose a partially
+        // replaced index after its first 4,000-document commit.
+        conn.execute_sync(
+            "UPDATE messages SET body_md = 'before scan' WHERE id = 1",
+            &[],
+        )
+        .unwrap();
+        let changed = std::rc::Rc::new(std::cell::Cell::new(false));
+        BACKFILL_SCAN_OBSERVER.with(|observer| {
+            let changed = changed.clone();
+            *observer.borrow_mut() = Some(Box::new(move |indexed| {
+                if indexed >= 4_000 && !changed.replace(true) {
+                    conn.execute_sync(
+                        "UPDATE messages SET subject = 'concurrentchange' WHERE id = 1",
+                        &[],
+                    )
+                    .expect("commit through a second real runtime connection");
+                }
+            }));
+        });
+        let result = backfill_from_db(&db_path);
+        BACKFILL_SCAN_OBSERVER.with(|observer| {
+            observer.borrow_mut().take();
+        });
+        assert!(changed.get(), "the source mutation must actually execute");
+        assert!(result.unwrap_err().contains("source changed during scan"));
+        assert_eq!(
+            std::fs::read(backfill_state_path(&bridge)).unwrap(),
+            marker_before
+        );
+        assert_eq!(
+            std::fs::read(index_dir.path().join("meta.json")).unwrap(),
+            meta_before
+        );
+        assert_eq!(fetch_index_message_stats(&bridge).unwrap().count, 1);
+        assert_eq!(
+            bridge
+                .search(&PlannerQuery {
+                    text: "originalsubject".to_string(),
+                    doc_kind: DocKind::Message,
+                    ..Default::default()
+                })
+                .len(),
+            1
+        );
+        assert_eq!(backfill_from_db(&db_path).unwrap(), (4_102, 0));
+        assert_eq!(fetch_index_message_stats(&bridge).unwrap().count, 4_102);
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn private_snapshot_search_keeps_live_index_and_marker_unchanged() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let db_path = create_test_db(
+            tmp.path(),
+            &[(
+                1,
+                "snapshot phrase",
+                "old snapshot body",
+                "normal",
+                "thread-one",
+            )],
+        );
+        let snapshot_path = tmp.path().join("private.sqlite3");
+        let conn = DbConn::open_file(&db_path).unwrap();
+        conn.execute_sync(
+            "VACUUM INTO ?",
+            &[Value::Text(snapshot_path.to_str().unwrap().to_string())],
+        )
+        .expect("materialize a real runtime snapshot");
+        conn.execute_sync(
+            "UPDATE messages SET subject = 'live replacement', body_md = 'current live body' WHERE id = 1",
+            &[],
+        ).unwrap();
+        init_bridge(index_dir.path()).unwrap();
+        assert_eq!(backfill_from_db(&db_path).unwrap(), (1, 0));
+        let live_bridge = get_bridge().unwrap();
+        let index_bytes = || {
+            std::fs::read_dir(index_dir.path())
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = index_bytes();
+        let epoch_before = crate::search_service::global_search_cache_epoch_for_tests();
+        let query = PlannerQuery {
+            text: "\"snapshot phrase\"".to_string(),
+            doc_kind: DocKind::Message,
+            ..Default::default()
+        };
+        let results = search_private_snapshot(snapshot_path.to_str().unwrap(), &query).unwrap();
+        assert_eq!(results.len(), 1, "snapshot retains phrase-search semantics");
+        assert_eq!(results[0].id, 1);
+        assert_eq!(
+            index_bytes(),
+            before,
+            "all canonical index and marker bytes stay unchanged"
+        );
+        assert!(Arc::ptr_eq(&live_bridge, &get_bridge().unwrap()));
+        assert_eq!(
+            crate::search_service::global_search_cache_epoch_for_tests(),
+            epoch_before
+        );
+        assert!(
+            live_bridge.search(&query).is_empty(),
+            "live contents remain current"
+        );
+        let refused = backfill_from_db_as(snapshot_path.to_str().unwrap(), Some(&db_path));
+        assert!(refused.unwrap_err().contains("cannot publish"));
+        assert_eq!(index_bytes(), before);
         reset_bridge_for_tests();
     }
 

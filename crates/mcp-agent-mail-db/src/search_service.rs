@@ -1551,6 +1551,9 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
         && bridge_ready
         && has_run_lexical_backfill(&sqlite_key)?
     {
+        // Startup completion does not establish continuing freshness. This
+        // checks the durable source clock and only scans rows when it moved.
+        run_lexical_backfill_for_pool(pool)?;
         return Ok(());
     }
 
@@ -4165,12 +4168,23 @@ pub async fn execute_search(
     let timer = std::time::Instant::now();
     let product_sql_budget = product_sql_budget_state(cx, query);
     let cache_allowed = product_sql_budget.is_none_or(|state| !state.page_limited);
+    let engine = options
+        .search_engine
+        .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
+    let needs_lexical_freshness = matches!(
+        engine,
+        SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
+    ) && matches!(query.doc_kind, DocKind::Message | DocKind::Thread)
+        && !message_query_requires_sql_plan(query);
 
     // ── Cache lookup ──────────────────────────────────────────────────
     let cache = global_search_cache();
-    let cache_key = build_search_cache_key(pool, query, options, cache.current_epoch());
+    let mut cache_key = build_search_cache_key(pool, query, options, cache.current_epoch());
 
-    if cache_allowed && let Some(cached) = cache.get(&cache_key) {
+    if cache_allowed
+        && !needs_lexical_freshness
+        && let Some(cached) = cache.get(&cache_key)
+    {
         let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
         if options.track_telemetry {
             record_query("search_service_cache_hit", latency_us);
@@ -4184,9 +4198,6 @@ pub async fn execute_search(
         return Outcome::Ok(cached);
     }
 
-    let engine = options
-        .search_engine
-        .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
     let assistance = query_assistance_payload(query);
 
     if matches!(query.doc_kind, DocKind::Agent | DocKind::Project)
@@ -4242,6 +4253,40 @@ pub async fn execute_search(
             cache.put(cache_key, val.clone());
         }
         return resp;
+    }
+
+    // A private snapshot has its own source authority even when its reported
+    // mailbox identity matches the live pool. Keep lexical syntax and ranking
+    // in a private Tantivy index; never backfill the shared live index from an
+    // older materialization. Semantic indexes remain bound to the live source,
+    // so snapshot reads use their own lexical candidates.
+    #[cfg(feature = "tantivy-engine")]
+    if needs_lexical_freshness && pool.search_identity_path() != pool.sqlite_path() {
+        let mut snapshot_query = query.clone();
+        snapshot_query.limit = Some(pagination_fetch_limit(
+            query,
+            lexical_candidate_limit(query),
+        ));
+        let raw_results = match crate::search_v3::search_private_snapshot(
+            &lexical_backfill_database_url(pool),
+            &snapshot_query,
+        ) {
+            Ok(results) => results,
+            Err(error) => return Outcome::Err(map_bridge_bootstrap_error(&error)),
+        };
+        let raw_results =
+            match canonicalize_message_results(cx, pool, query, raw_results, false).await {
+                Outcome::Ok(results) => results,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
+        let raw_results = apply_cursor_window(raw_results, query);
+        let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
+        let explain = query
+            .explain
+            .then(|| build_v3_query_explain(query, SearchEngine::Lexical, None));
+        return finish_scoped_response(raw_results, query, options, assistance, explain);
     }
 
     // GH#162: When reads are served from a reconstructed archive snapshot
@@ -4306,6 +4351,16 @@ pub async fn execute_search(
             options.track_telemetry,
         );
         return Outcome::Err(err);
+    }
+
+    // Backfill can invalidate cached candidates after edits made by another
+    // process. Compute the key after that check, never return an earlier cached
+    // miss before the source revision has been observed.
+    if needs_lexical_freshness {
+        cache_key = build_search_cache_key(pool, query, options, cache.current_epoch());
+        if cache_allowed && let Some(cached) = cache.get(&cache_key) {
+            return Outcome::Ok(cached);
+        }
     }
 
     // ── Tantivy-only fast path ──────────────────────────────────────
@@ -5407,6 +5462,91 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("backfill marker belongs"))
         );
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[cfg(feature = "tantivy-engine")]
+    #[test]
+    fn execute_search_refreshes_cached_edits_and_preserves_snapshot_authority() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for engine in [SearchEngine::Lexical, SearchEngine::Auto] {
+            reset_lexical_bootstrap_tracking();
+            crate::search_v3::reset_bridge_for_tests();
+            let root = tempfile::tempdir().unwrap();
+            let pool = temp_file_pool(root.path(), "freshness.sqlite3");
+            runtime.block_on(async {
+                let cx = Cx::for_testing();
+                let project = crate::queries::ensure_project(&cx, &pool, "/search-freshness")
+                    .await.into_result().unwrap();
+                let project_id = project.id.unwrap();
+                let sender = crate::queries::register_agent(
+                    &cx, &pool, project_id, "BlueLake", "codex", "test", None, None, None,
+                ).await.into_result().unwrap();
+                let conn = crate::DbConn::open_file(pool.sqlite_path()).unwrap();
+                for (id, subject, body) in [
+                    (1, "amberstart", "copperstart"),
+                    (2, "unchanged", "tail message"),
+                ] {
+                    conn.execute_sync(
+                        "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                         VALUES (?, ?, ?, ?, ?, 1000000)",
+                        &[
+                            Value::BigInt(id), Value::BigInt(project_id),
+                            Value::BigInt(sender.id.unwrap()),
+                            Value::Text(subject.to_string()), Value::Text(body.to_string()),
+                        ],
+                    ).unwrap();
+                }
+                let snapshot_path = root.path().join("private-snapshot.sqlite3");
+                conn.execute_sync("VACUUM INTO ?", &[
+                    Value::Text(snapshot_path.to_str().unwrap().to_string()),
+                ]).expect("capture full-schema private snapshot");
+                let options = SearchOptions { search_engine: Some(engine), ..Default::default() };
+                for (mutation, queries) in [
+                    (None, vec![("amberstart", 1), ("violetfinish", 0)]),
+                    (Some("UPDATE messages SET subject = 'violetfinish', body_md = 'silverfinish' WHERE id = 1"),
+                     vec![("violetfinish", 1), ("silverfinish", 1), ("amberstart", 0), ("copperstart", 0)]),
+                    (Some("DELETE FROM messages WHERE id = 1"), vec![("violetfinish", 0), ("unchanged", 1)]),
+                ] {
+                    if let Some(sql) = mutation {
+                        conn.execute_sync(sql, &[]).expect("external runtime mutation");
+                    }
+                    for (text, expected_count) in queries {
+                        let query = SearchQuery::messages(text, project_id);
+                        for _ in 0..2 {
+                            let response = execute_search(&cx, &pool, &query, &options)
+                                .await.into_result().unwrap();
+                            assert_eq!(response.results.len(), expected_count, "{engine:?}: {text}");
+                        }
+                    }
+                }
+                let marker = root.path().join("search_index/backfill_state.json");
+                let meta = root.path().join("search_index/meta.json");
+                let marker_before = std::fs::read(&marker).unwrap();
+                let meta_before = std::fs::read(&meta).unwrap();
+                let snapshot_pool = DbPool::new(&crate::DbPoolConfig {
+                    database_url: format!("sqlite:///{}", snapshot_path.display()),
+                    storage_root: Some(root.path().to_path_buf()),
+                    min_connections: 0, max_connections: 1,
+                    warmup_connections: 0, run_migrations: false,
+                    ..Default::default()
+                }).unwrap().with_search_identity_path(pool.sqlite_path());
+                for (text, expected_count) in [("amberstart", 1), ("violetfinish", 0)] {
+                    let response = execute_search(&cx, &snapshot_pool,
+                        &SearchQuery::messages(text, project_id), &options)
+                        .await.into_result().unwrap();
+                    assert_eq!(response.results.len(), expected_count, "snapshot {engine:?}: {text}");
+                }
+                assert_eq!(std::fs::read(&marker).unwrap(), marker_before);
+                assert_eq!(std::fs::read(&meta).unwrap(), meta_before);
+            });
+        }
+        crate::search_v3::reset_bridge_for_tests();
         reset_lexical_bootstrap_tracking();
     }
 
