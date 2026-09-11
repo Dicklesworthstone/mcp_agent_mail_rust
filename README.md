@@ -562,13 +562,29 @@ mcp-agent-mail serve --reuse-running    # Reuse existing server on same port
 ### CLI Operator Tool
 
 ```bash
-am                                      # Auto-detect agents, refresh MCP config, start server + TUI
+am                                      # Start server + TUI (non-interactive: robot status)
 am serve-http --port 9000               # Different port
+am serve-http --setup                   # Explicitly update detected MCP clients before serving
 am serve-http --host 0.0.0.0            # Bind to all interfaces
 am serve-http --no-auth                 # Skip authentication (local dev)
 am serve-http --path api                # Use /api/ transport instead of /mcp/
 am --help                               # Full operator CLI
 ```
+
+Server startup preserves existing MCP client configuration by default, including
+project and user-level URLs. Use `am setup run` to configure clients separately,
+or `am serve-http --setup` to update detected clients to that launch's endpoint.
+The setup flag can rewrite existing entries; omit it for temporary test servers.
+
+For CLI deployments that require an explicitly supplied sending credential, set
+`AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN=1`. `am mail send` then requires
+`--sender-token`, `--sender-token-file`, or `AGENT_MAIL_SENDER_TOKEN`; it refuses
+to borrow a token from persisted agent identity state. The same resolver applies
+to queued-send replay and contact handshakes (use the environment variable where
+the command has no token flag). The default retains automatic token reuse.
+This controls CLI token selection; it does not establish MCP session ownership
+or isolate hostile processes sharing the same OS account. Server-side verified
+send enforcement remains `MESSAGING_FAIL_CLOSED_SEND_PROFILE=true`.
 
 When an interactive `am` finds a healthy Agent Mail service already serving the
 configured endpoint, it attaches a read-only terminal view to that service's

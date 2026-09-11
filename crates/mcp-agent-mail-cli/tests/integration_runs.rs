@@ -4955,6 +4955,358 @@ fn list_projects_with_agents_shows_agent_names() {
 // ---- Serve commands (dry checks) ----
 
 #[test]
+fn explicit_sender_token_mode_refuses_persisted_identity_and_accepts_explicit_sources() {
+    check_explicit_sender_token_mode(false);
+}
+
+#[test]
+fn offline_registration_issues_and_persists_native_sender_credentials() {
+    check_explicit_sender_token_mode(true);
+}
+
+fn check_explicit_sender_token_mode(direct_registration: bool) {
+    let env = TestEnv::new();
+    let project = env.hostile_repo().to_str().unwrap();
+    let run = |args: &[&str], explicit_mode: bool, token_env: Option<&str>| {
+        let mut command = Command::new(am_bin());
+        command
+            .env_clear()
+            .envs(env.isolated_env())
+            .env("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "true")
+            .current_dir(project)
+            .args(args);
+        if explicit_mode {
+            command.env("AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN", "1");
+        }
+        if let Some(token) = token_env {
+            command.env("AGENT_MAIL_SENDER_TOKEN", token);
+        }
+        command.output().expect("run actual token-policy CLI")
+    };
+    let registration_args = [
+        if direct_registration {
+            "agents"
+        } else {
+            "macros"
+        },
+        if direct_registration {
+            "register"
+        } else {
+            "start-session"
+        },
+        "--project",
+        project,
+        if direct_registration {
+            "--name"
+        } else {
+            "--agent-name"
+        },
+        "BlueLake",
+        "--program",
+        "codex-cli",
+        "--model",
+        "test",
+        "--json",
+    ];
+    let registration = run(&registration_args, false, None);
+    assert!(
+        registration.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registration.stderr)
+    );
+    let identity: Value = serde_json::from_slice(&registration.stdout).unwrap();
+    let agent = if direct_registration {
+        &identity
+    } else {
+        &identity["agent"]
+    };
+    let token = agent["registration_token"]
+        .as_str()
+        .expect("real registration token");
+    let send = [
+        "mail",
+        "send",
+        "--project",
+        project,
+        "--from",
+        "BlueLake",
+        "--to",
+        "BlueLake",
+        "--subject",
+        "explicit identity",
+        "--body",
+        "durable body",
+        "--json",
+    ];
+    // The existing fail-closed *server* profile requires a valid token, proving
+    // default CLI success actually used the persisted registration credential.
+    let default_send = run(&send, false, None);
+    assert!(
+        default_send.status.success(),
+        "{}",
+        String::from_utf8_lossy(&default_send.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&default_send.stdout).unwrap();
+    assert_eq!(receipt["receipt_mode"], "redacted");
+    assert_eq!(receipt["verified_sender"], true);
+    assert!(receipt["id"].as_i64().is_some_and(|id| id > 0));
+    for forbidden in ["subject", "body_md", "attachments", "deliveries"] {
+        assert!(receipt.get(forbidden).is_none(), "leaked {forbidden}");
+    }
+    let before_db = file_snapshot(&env.db_path);
+    let before_archive = snapshot_tree(&env.storage_root);
+    for token_env in [None, Some(" \t ")] {
+        let refused = run(&send, true, token_env);
+        assert!(!refused.status.success());
+        let error = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            error.contains("persisted identity tokens are not reused"),
+            "{error}"
+        );
+        assert!(!error.contains(token));
+        assert_eq!(file_snapshot(&env.db_path), before_db);
+        assert_eq!(snapshot_tree(&env.storage_root), before_archive);
+    }
+    let token_path = env.tmp.path().join("sender-token");
+    std::fs::write(&token_path, format!("  {token}\n")).unwrap();
+    for (flag, value) in [
+        ("--sender-token", token),
+        ("--sender-token-file", token_path.to_str().unwrap()),
+    ] {
+        let mut args = send.to_vec();
+        args.extend([flag, value]);
+        let sent = run(&args, true, None);
+        assert!(
+            sent.status.success(),
+            "{}",
+            String::from_utf8_lossy(&sent.stderr)
+        );
+    }
+    let sent = run(&send, true, Some(token));
+    assert!(
+        sent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    let rows = conn
+        .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+        .unwrap();
+    let count = rows[0].get_named::<i64>("n").unwrap();
+    conn.close_sync().unwrap();
+    assert_eq!(
+        count, 4,
+        "only default and three explicitly authorized sends persist"
+    );
+    if direct_registration {
+        // A second process re-registers the existing project/agent through the
+        // same native tool, rotates its proof, and can immediately reuse it.
+        let registered_again = run(&registration_args, false, None);
+        assert!(
+            registered_again.status.success(),
+            "{}",
+            String::from_utf8_lossy(&registered_again.stderr)
+        );
+        let refreshed: Value = serde_json::from_slice(&registered_again.stdout).unwrap();
+        assert_eq!(refreshed["id"], agent["id"]);
+        assert!(
+            refreshed["registration_token"]
+                .as_str()
+                .is_some_and(|fresh| !fresh.is_empty() && fresh != token)
+        );
+        let sent = run(&send, false, None);
+        assert!(
+            sent.status.success(),
+            "{}",
+            String::from_utf8_lossy(&sent.stderr)
+        );
+        let receipt: Value = serde_json::from_slice(&sent.stdout).unwrap();
+        assert_eq!(receipt["verified_sender"], true);
+
+        let archived_projects: Vec<_> = std::fs::read_dir(env.storage_root.join("projects"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(archived_projects.len(), 1);
+        let archived_project: Value = serde_json::from_slice(
+            &std::fs::read(archived_projects[0].join("project.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(archived_project["human_key"], project);
+        let profile =
+            std::fs::read_to_string(archived_projects[0].join("agents/BlueLake/profile.json"))
+                .unwrap();
+        let archived: Value = serde_json::from_str(&profile).unwrap();
+        assert_eq!(archived["name"], "BlueLake");
+        assert!(archived.get("registration_token").is_none());
+        assert!(!profile.contains(token));
+        assert!(!profile.contains(refreshed["registration_token"].as_str().unwrap()));
+
+        let before_db = file_snapshot(&env.db_path);
+        let before_archive = snapshot_tree(&env.storage_root);
+        let denied = Command::new(am_bin())
+            .env_clear()
+            .envs(env.isolated_env())
+            .env("AM_REGISTRATION_PROOF_GATE_ENABLED", "true")
+            .current_dir(project)
+            .args(registration_args)
+            .output()
+            .unwrap();
+        assert!(!denied.status.success());
+        assert!(String::from_utf8_lossy(&denied.stderr).contains("proof"));
+        assert_eq!(file_snapshot(&env.db_path), before_db);
+        assert_eq!(snapshot_tree(&env.storage_root), before_archive);
+        let owner = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+            &env.storage_root,
+            mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+        )
+        .unwrap()
+        .expect("real owner lock");
+        let owned_archive = snapshot_tree(&env.storage_root);
+        let denied = run(&registration_args, false, None);
+        assert!(!denied.status.success());
+        let error = String::from_utf8_lossy(&denied.stderr);
+        assert!(
+            error.contains("Refusing local SQLite fallback")
+                || error.contains("mailbox activity lock is busy"),
+            "{error}"
+        );
+        assert_eq!(file_snapshot(&env.db_path), before_db);
+        assert_eq!(snapshot_tree(&env.storage_root), owned_archive);
+        drop(owner);
+    }
+}
+
+#[test]
+fn serve_http_preserves_existing_client_configs_by_default() {
+    check_serve_http_client_config_setup(false);
+}
+
+#[test]
+fn serve_http_updates_client_configs_only_with_explicit_setup() {
+    check_serve_http_client_config_setup(true);
+}
+
+fn check_serve_http_client_config_setup(setup: bool) {
+    let env = TestEnv::new();
+    let project = env.hostile_repo();
+    // Detection keys Claude installation off its config root, not ~/.claude.json.
+    std::fs::create_dir_all(env.home_dir.join(".claude/projects")).unwrap();
+    std::fs::create_dir_all(env.xdg_config_home.join("claude-code/projects")).unwrap();
+    let seed = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .current_dir(project)
+        .args([
+            "setup",
+            "run",
+            "--yes",
+            "--agent",
+            "claude,cursor",
+            "--no-hooks",
+            "--token",
+            "isolated-startup-test-token",
+            "--port",
+            "8765",
+        ])
+        .output()
+        .expect("seed actual client setup");
+    assert!(
+        seed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    let config_paths = [
+        project.join("cursor.mcp.json"),
+        env.home_dir.join(".cursor/mcp.json"),
+        env.home_dir.join(".claude.json"),
+        env.user_config_env_path(),
+    ];
+    let mut before: Vec<_> = config_paths
+        .iter()
+        .map(|path| {
+            (
+                path.clone(),
+                std::fs::read(path).expect("read seeded config"),
+            )
+        })
+        .collect();
+    let cache_dir = env.storage_root.join(".setup-self-heal");
+    let cache_existed = cache_dir.exists();
+    if !setup && cache_existed {
+        for entry in std::fs::read_dir(&cache_dir).unwrap() {
+            let path = entry.unwrap().path();
+            before.push((path.clone(), std::fs::read(path).unwrap()));
+        }
+    }
+    let port = unused_loopback_port();
+    let log_path = env.tmp.path().join("serve-http.log");
+    let log = std::fs::File::create(&log_path).expect("create server log");
+    let mut command = Command::new(am_bin());
+    command
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("AM_ATC_ENABLED", "false")
+        .env("HTTP_PORT", port.to_string())
+        .current_dir(project)
+        .args(["serve-http", "--no-tui", "--port", &port.to_string()])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().expect("clone server log"))
+        .stderr(log);
+    if setup {
+        command.arg("--setup");
+    }
+    let mut child = command.spawn().expect("start actual HTTP server");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut healthy = false;
+    while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+        if let Ok(mut socket) =
+            std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100))
+        {
+            let _ = socket.set_read_timeout(Some(Duration::from_millis(200)));
+            let _ = socket.set_write_timeout(Some(Duration::from_millis(200)));
+            if socket.write_all(format!("GET /health/liveness HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").as_bytes()).is_ok() {
+                let mut response = [0; 256];
+                if let Ok(count) = socket.read(&mut response) {
+                    healthy = String::from_utf8_lossy(&response[..count]).starts_with("HTTP/1.1 200");
+                }
+            }
+        }
+        if healthy {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    // Reap this test's own server before assertions, including startup failures.
+    let _ = child.kill();
+    let _ = child.wait();
+    let log = std::fs::read_to_string(&log_path).expect("read server log");
+    assert!(healthy, "server never reached HTTP liveness:\n{log}");
+    for (path, bytes) in before {
+        let after = std::fs::read(&path).unwrap();
+        if setup && path != env.user_config_env_path() {
+            let content = String::from_utf8_lossy(&after);
+            assert!(
+                content.contains(&format!("http://127.0.0.1:{port}/mcp/")),
+                "explicit setup did not update {}:\n{content}\n{log}",
+                path.display()
+            );
+            assert!(!content.contains("http://127.0.0.1:8765/mcp/"));
+        } else {
+            assert_eq!(after, bytes, "startup rewrote {}:\n{log}", path.display());
+        }
+    }
+    if !setup {
+        assert_eq!(
+            cache_dir.exists(),
+            cache_existed,
+            "startup created a setup cache"
+        );
+    }
+}
+
+#[test]
 fn legacy_am_serve_reports_migration_preflight() {
     let env = TestEnv::new();
     let out = run_am(&env.base_env(), Some(env.tmp.path()), &["serve"], None);

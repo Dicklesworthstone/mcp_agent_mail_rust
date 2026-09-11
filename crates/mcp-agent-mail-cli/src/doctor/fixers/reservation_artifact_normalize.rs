@@ -34,7 +34,7 @@ use mcp_agent_mail_core::reservation_artifact::{
 use serde::Serialize;
 use serde_json::Value;
 use sqlmodel_sqlite::SqliteConnection;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub const FM_ID: &str = "fm-archive-state-files-reservation-artifact-generation-normalize";
@@ -290,7 +290,21 @@ fn read_current_generation(conn: &SqliteConnection) -> Option<String> {
         .filter(|generation| !generation.is_empty())
 }
 
-fn read_live_reservations(conn: &SqliteConnection) -> Option<HashSet<(String, i64)>> {
+struct ReservationAuthority {
+    live_reservations: HashSet<(String, i64)>,
+    project_keys: HashMap<String, String>,
+}
+
+fn read_live_reservations(conn: &SqliteConnection) -> Option<ReservationAuthority> {
+    let projects = conn
+        .query_sync("SELECT slug, human_key FROM projects", &[])
+        .ok()?;
+    let mut project_keys = HashMap::with_capacity(projects.len());
+    for row in projects {
+        let slug = row.get_named::<String>("slug").ok()?;
+        let human_key = row.get_named::<String>("human_key").ok()?;
+        project_keys.insert(slug, human_key);
+    }
     let rows = conn
         .query_sync(
             "SELECT p.slug AS project_slug, fr.id AS reservation_id
@@ -307,13 +321,16 @@ fn read_live_reservations(conn: &SqliteConnection) -> Option<HashSet<(String, i6
             reservations.insert((project, id));
         }
     }
-    Some(reservations)
+    Some(ReservationAuthority {
+        live_reservations: reservations,
+        project_keys,
+    })
 }
 
 fn scan_artifacts(
     storage_root: &Path,
     current_generation: &str,
-    live_reservations: &HashSet<(String, i64)>,
+    authority: &ReservationAuthority,
 ) -> (Vec<LegacyMigration>, Vec<QuarantineArtifact>) {
     let projects = storage_root.join(PROJECTS_DIR);
     if !is_non_symlink_dir(&projects) {
@@ -357,7 +374,9 @@ fn scan_artifacts(
                 continue;
             };
             let path = entry.path();
-            let Some(mut json) = read_matching_artifact_json(&path, parsed.id, &project) else {
+            let human_key = authority.project_keys.get(&project).map(String::as_str);
+            let Some(mut json) = read_matching_artifact_json(&path, parsed.id, &project, human_key)
+            else {
                 continue;
             };
             let content_generation = json
@@ -378,7 +397,10 @@ fn scan_artifacts(
             if parsed.generation.is_some() {
                 continue;
             }
-            if !live_reservations.contains(&(project.clone(), parsed.id)) {
+            if !authority
+                .live_reservations
+                .contains(&(project.clone(), parsed.id))
+            {
                 continue;
             }
 
@@ -391,6 +413,7 @@ fn scan_artifacts(
                     &destination,
                     parsed.id,
                     &project,
+                    human_key,
                     current_generation,
                 ) {
                     quarantines.push(QuarantineArtifact {
@@ -426,11 +449,21 @@ fn scan_artifacts(
     (migrations, quarantines)
 }
 
-fn read_matching_artifact_json(path: &Path, id: i64, project: &str) -> Option<Value> {
+fn read_matching_artifact_json(
+    path: &Path,
+    id: i64,
+    project: &str,
+    human_key: Option<&str>,
+) -> Option<Value> {
     let raw = std::fs::read(path).ok()?;
     let json: Value = serde_json::from_slice(&raw).ok()?;
     let object = json.as_object()?;
-    (object.get("id")?.as_i64()? == id && object.get("project")?.as_str()? == project)
+    let embedded_project = object.get("project")?.as_str()?;
+    // The archive directory is a slug; payloads may carry its human key.
+    // Accept that alias only from the freshly selected doctor DB authority,
+    // never by guessing a slug from an arbitrary path (GH#271).
+    (object.get("id")?.as_i64()? == id
+        && (embedded_project == project || Some(embedded_project) == human_key))
         .then_some(json)
 }
 
@@ -438,6 +471,7 @@ fn is_matching_current_artifact(
     path: &Path,
     id: i64,
     project: &str,
+    human_key: Option<&str>,
     current_generation: &str,
 ) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -448,7 +482,7 @@ fn is_matching_current_artifact(
     };
     parsed.id == id
         && parsed.generation.as_deref() == Some(current_generation)
-        && read_matching_artifact_json(path, id, project).is_some()
+        && read_matching_artifact_json(path, id, project, human_key).is_some()
 }
 
 fn quarantine_destination(
@@ -514,10 +548,10 @@ mod tests {
         let conn = CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
         conn.execute_raw(&format!(
             "CREATE TABLE db_identity (singleton INTEGER PRIMARY KEY CHECK (singleton = 0), generation_id TEXT NOT NULL);
-             CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE, human_key TEXT NOT NULL);
              CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL);
              INSERT INTO db_identity (singleton, generation_id) VALUES (0, '{CURRENT_GENERATION}');
-             INSERT INTO projects (id, slug) VALUES (1, 'live-project');
+             INSERT INTO projects (id, slug, human_key) VALUES (1, 'live-project', '/data/projects/live-project');
              INSERT INTO file_reservations (id, project_id) VALUES (7, 1);"
         ))
         .expect("seed");
@@ -587,6 +621,55 @@ mod tests {
         let rendered = finding.to_finding();
         assert!(rendered.remediation.auto_fixable);
         assert_eq!(rendered.remediation.estimated_actions, 3);
+    }
+
+    #[test]
+    fn human_key_aliases_normalize_and_undo_without_touching_unrelated_projects() {
+        let (td, db_path, reservation_dir) = fixture();
+        let legacy = reservation_dir.join("id-7.json");
+        let foreign = reservation_dir.join(format!("id-8-g{FOREIGN_GENERATION}.json"));
+        let unrelated = reservation_dir.join(format!("id-10-g{FOREIGN_GENERATION}.json"));
+        std::fs::write(
+            &legacy,
+            r#"{"id":7,"project":"/data/projects/live-project","agent":"legacy"}"#,
+        )
+        .unwrap();
+        std::fs::write(&foreign, format!(r#"{{"id":8,"project":"/data/projects/live-project","db_generation":"{FOREIGN_GENERATION}"}}"#)).unwrap();
+        std::fs::write(&unrelated, format!(r#"{{"id":10,"project":"/data/projects/unrelated","db_generation":"{FOREIGN_GENERATION}"}}"#)).unwrap();
+        let legacy_before = std::fs::read(&legacy).unwrap();
+        let foreign_before = std::fs::read(&foreign).unwrap();
+        let unrelated_before = std::fs::read(&unrelated).unwrap();
+
+        let findings = detect(Some(td.path()), std::slice::from_ref(&db_path));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].legacy_migrations.len(), 1);
+        assert_eq!(findings[0].quarantines.len(), 1);
+        assert_eq!(findings[0].quarantines[0].source, foreign);
+        let context = ctx(&td);
+        let outcome = fix(&context, &findings[0]).unwrap();
+        assert_eq!(outcome.actions_taken, 3);
+        assert_eq!(std::fs::read(&unrelated).unwrap(), unrelated_before);
+        assert_eq!(
+            std::fs::read(&outcome.quarantined_paths[0]).unwrap(),
+            foreign_before
+        );
+        let normalized = reservation_dir.join(format!("id-7-g{CURRENT_GENERATION}.json"));
+        let normalized_json: Value =
+            serde_json::from_slice(&std::fs::read(&normalized).unwrap()).unwrap();
+        assert_eq!(normalized_json["project"], "/data/projects/live-project");
+        assert_eq!(normalized_json["db_generation"], CURRENT_GENERATION);
+        assert!(detect(Some(td.path()), std::slice::from_ref(&db_path)).is_empty());
+        crate::doctor::undo::run_undo_with_scopes(
+            td.path(),
+            "normalize",
+            false,
+            true,
+            &[td.path().to_path_buf()],
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
+        assert_eq!(std::fs::read(&foreign).unwrap(), foreign_before);
+        assert_eq!(std::fs::read(&unrelated).unwrap(), unrelated_before);
     }
 
     #[test]
@@ -793,7 +876,7 @@ mod tests {
         std::fs::write(
             reservation_dir.join(format!("id-7-g{CURRENT_GENERATION}.json")),
             format!(
-                r#"{{"id":7,"project":"live-project","db_generation":"{CURRENT_GENERATION}"}}"#
+                r#"{{"id":7,"project":"/data/projects/live-project","db_generation":"{CURRENT_GENERATION}"}}"#
             ),
         )
         .expect("stamped peer");

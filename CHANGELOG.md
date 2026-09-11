@@ -14,8 +14,8 @@ metadata, checked-in Beads records, and executed release receipts; dates in the
 recent timeline are GitHub publication dates in UTC.
 The additional review on 2026-09-09 covers the configuration fixes after the
 v0.3.35 tag and OMP runtime detection below. The 2026-09-11 review adds the
-br-2xdhw search workstream and refreshes publication metadata: v0.3.35 was
-published on 2026-09-09 and is the latest GitHub Release.
+br-2xdhw search workstream and CLI issue fixes, and refreshes publication
+metadata: v0.3.35 was published on 2026-09-09 and is the latest GitHub Release.
 
 ## Release Timeline
 
@@ -36,6 +36,25 @@ reviewed through 2026-09-11. These changes are not published release artifacts.
 
 ### Fixed
 
+- **Starting a server preserves MCP client configuration.** Bare interactive
+  `am` and `am serve-http` no longer repoint existing project/user clients to a
+  temporary server. Use `am setup run` or the new `am serve-http --setup` flag
+  when client configuration should change.
+  ([#318](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/318))
+- **Verified CLI sends accept redacted delivery receipts.** The fail-closed
+  send profile could deliver a message and then report an unexpected response
+  shape. The CLI now recognizes native redacted receipts, keeps the message ID
+  and verification result, and omits message contents from its output.
+- **Offline agent registration uses the native identity workflow.**
+  `am agents register` now issues and persists a sender credential and archives
+  the agent profile, matching the server-backed path. Registration-proof and
+  mailbox-owner refusals remain enforced before local mutation.
+- **Reservation normalization recognizes authoritative project human keys.**
+  The doctor accepts an artifact's project slug or its matching database human
+  key, allowing proven legacy migration and stale-generation quarantine while
+  leaving unrelated project payloads untouched. Reconstruct dry-run candidate
+  validation remains separate work.
+  ([#271](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/271))
 - **Lexical search notices edits and deletions below the highest message ID.**
   Transactional change counters invalidate stale hits and cached misses without
   rescanning an unchanged mailbox. Append-only changes retain incremental
@@ -107,6 +126,17 @@ reviewed through 2026-09-11. These changes are not published release artifacts.
   backup/replace helpers and checks source identity around the backup.
   ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f9e4ee92a78f0c212b81c611b94019f41ac1a063),
   [br-atwzh](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/ce66a70cadc20de9baab37b1c348daeaa02934f5/.beads/issues.jsonl#L1965))
+
+### Added
+
+- **Explicit sender-token selection for CLI deployments.** Set
+  `AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN=1` to require a token supplied by
+  flag, file or environment and refuse persisted-identity token reuse. The
+  shared policy covers send, queued-send replay and contact handshakes;
+  automatic reuse remains the default. This is a CLI credential-selection
+  policy, not MCP session identity or isolation between processes sharing an
+  OS account.
+  ([#280](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/280))
 
 ## [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.35) — 2026-09-09 [Release]
 

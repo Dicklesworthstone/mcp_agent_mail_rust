@@ -379,6 +379,9 @@ pub enum Commands {
         /// Disable the interactive TUI and run headless.
         #[arg(long)]
         no_tui: bool,
+        /// Update detected MCP client configs to this server before serving (opt-in).
+        #[arg(long)]
+        setup: bool,
         /// Extra Host header to accept (repeatable; also reads HTTP_ALLOWED_HOSTS).
         #[arg(long = "allowed-host", value_name = "HOST")]
         allowed_host: Vec<String>,
@@ -3882,9 +3885,15 @@ fn dispatch_command(command: Commands) -> CliResult<()> {
             path,
             no_auth,
             no_tui,
+            setup,
             allowed_host,
             takeover,
-        } => handle_serve_http(host, port, path, no_auth, no_tui, allowed_host, takeover),
+        } => handle_serve_http(
+            build_http_config(host, port, path, no_auth, allowed_host),
+            no_tui,
+            takeover,
+            setup,
+        ),
         Commands::ServeStdio => handle_serve_stdio(),
         Commands::Capabilities { format, json } => handle_capabilities(format, json),
         Commands::Agent { action } => handle_agent(action),
@@ -4134,9 +4143,8 @@ fn dispatch_command(command: Commands) -> CliResult<()> {
 /// Default behavior when `am` is invoked with no subcommand.
 ///
 /// **Interactive terminal (human operator):**
-/// 1. Auto-detect installed coding agents and configure their MCP connections
-/// 2. Clear the port if something is already listening
-/// 3. Start the HTTP server with the TUI
+/// Check server ownership and start the HTTP server with the TUI, preserving
+/// existing MCP client configuration. Client setup is an explicit operation.
 ///
 /// **Non-interactive (coding agent, pipe, CI):**
 /// Automatically switches to `am robot status` for a JSON/TOON dashboard
@@ -4150,9 +4158,14 @@ fn handle_default_launch() -> CliResult<()> {
         return handle_noninteractive_default_status();
     }
 
-    // Interactive: full server launch experience (setup self-heal + port check + serve).
+    // Interactive: port check + serve, without implicitly reconfiguring clients.
     // takeover=false: bare `am` never kills a live peer serving this storage root.
-    handle_serve_http(None, None, None, false, false, Vec::new(), false)
+    handle_serve_http(
+        build_http_config(None, None, None, false, Vec::new()),
+        false,
+        false,
+        false,
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -7348,15 +7361,11 @@ mod managed_standby_tests {
 }
 
 fn handle_serve_http(
-    host: Option<String>,
-    port: Option<u16>,
-    path: Option<String>,
-    no_auth: bool,
+    mut config: Config,
     no_tui: bool,
-    allowed_host: Vec<String>,
     takeover: bool,
+    setup: bool,
 ) -> CliResult<()> {
-    let mut config = build_http_config(host, port, path, no_auth, allowed_host);
     config.validate_user_env_authority()?;
     if no_tui {
         config.tui_enabled = false;
@@ -7511,15 +7520,16 @@ fn handle_serve_http(
     let preflight_report =
         mcp_agent_mail_server::startup_checks::run_http_startup_preflight_probes(&config);
     if !preflight_report.is_ok() {
-        // Defer setup self-heal until after preflight passes. Otherwise a
+        // Defer explicitly requested setup until after preflight passes. Otherwise a
         // crashed startup (#93) would silently rewrite Codex/Gemini/Claude
         // MCP client configs to point at a port that never opened, leaving
         // every client wedged after a single failed `am serve-http` run.
         return Err(CliError::Other(preflight_report.format_errors()));
     }
-    if !running_under_managed_service()
-        && let Err(e) = run_setup_self_heal_for_server(&config)
-    {
+    // Starting a temporary server is not authority to repoint existing clients
+    // to its endpoint (GH#318). The same rule applies to the default port and
+    // bare interactive launch; setup requires the operator's explicit request.
+    if setup && let Err(e) = run_setup_self_heal_for_server(&config) {
         output::warn(&format!(
             "Agent setup self-heal encountered an issue (non-fatal): {e}"
         ));
@@ -8863,6 +8873,8 @@ fn setup_self_heal_cache_path(config: &Config, project_dir: &Path) -> PathBuf {
 
 /// Environment variable carrying a `mail send` sender token (non-echoing path).
 const AGENT_MAIL_SENDER_TOKEN_ENV: &str = "AGENT_MAIL_SENDER_TOKEN";
+const AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN_ENV: &str =
+    "AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN";
 
 /// On-disk record of a registered agent's sender token for one project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8957,9 +8969,11 @@ fn persist_sender_identity_token_from_agent_payload(
 ///   3. `AGENT_MAIL_SENDER_TOKEN` environment variable
 ///   4. persisted identity state from `agents register` / `macros start-session`
 ///
-/// Returns `Ok(None)` when no source yields a token (send proceeds unverified,
-/// preserving prior behavior). Returns an error only when an explicitly-named
-/// `--sender-token-file` cannot be read.
+/// In the default mode, returns `Ok(None)` when no source yields a token.
+/// With `AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN=1`, refuses before reading
+/// persisted identity state if the first three sources yield no token. This
+/// applies equally to send, queued replay and contact-handshake callers.
+/// An explicitly named unreadable or empty token file always fails.
 fn resolve_sender_token(
     config: &Config,
     project_key: &str,
@@ -8991,6 +9005,13 @@ fn resolve_sender_token(
         if !env_tok.is_empty() {
             return Ok(Some(env_tok));
         }
+    }
+    if env_var_is_truthy(AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN_ENV) {
+        return Err(CliError::InvalidArgument(format!(
+            "{AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN_ENV} is enabled: provide \
+             --sender-token, --sender-token-file, or {AGENT_MAIL_SENDER_TOKEN_ENV}; \
+             persisted identity tokens are not reused"
+        )));
     }
     Ok(load_sender_identity_token(config, project_key, sender))
 }
@@ -38811,49 +38832,46 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             }
 
             reject_local_registration_if_proof_gate_enabled("agents register")?;
+            let _mailbox_mutation_locks = acquire_cli_mailbox_mutation_locks(
+                &database_url,
+                Some(&server_config.storage_root),
+            )?;
             let ctx = context::AsyncCliContext::open()?;
-            let cx = asupersync::Cx::for_request();
+            let cx = asupersync::Cx::current().ok_or_else(|| {
+                CliError::Other("agents register requires an active async context".into())
+            })?;
 
-            // Resolve project
+            // Preserve CLI slug/human-key resolution and absolute-path creation,
+            // then use the native tool for token rotation and archived identity.
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
-
-            // Resolve or generate agent name
-            let agent_name = name
-                .map(|value| value.trim().to_string())
-                .unwrap_or_else(mcp_agent_mail_core::models::generate_agent_name);
-
-            let row = match mcp_agent_mail_db::queries::register_agent(
-                &cx,
-                &ctx.pool,
-                proj.id.unwrap_or(0),
-                &agent_name,
-                &program,
-                &model,
-                task.as_deref(),
-                Some(attachments_policy.as_str()),
+            let mcp_ctx = McpContext::new(cx, 1);
+            // Absolute-path registration may have just created this project;
+            // persist its canonical archive metadata as the session macro does.
+            mcp_agent_mail_tools::identity::ensure_project(&mcp_ctx, proj.human_key.clone(), None)
+                .await
+                .map_err(mcp_error_to_cli_error)?;
+            let result = mcp_agent_mail_tools::identity::register_agent(
+                &mcp_ctx,
+                proj.human_key,
+                program,
+                model,
+                name,
+                task,
+                Some(attachments_policy),
+                None,
+                None,
+                None,
                 None,
             )
             .await
-            {
-                asupersync::Outcome::Ok(r) => r,
-                asupersync::Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument {
-                    message,
-                    ..
-                }) => {
-                    return Err(CliError::InvalidArgument(message));
-                }
-                asupersync::Outcome::Err(e) => {
-                    return Err(CliError::Other(format!("register_agent failed: {e}")));
-                }
-                asupersync::Outcome::Cancelled(_) => {
-                    return Err(CliError::Other("request cancelled".into()));
-                }
-                asupersync::Outcome::Panicked(p) => {
-                    return Err(CliError::Other(format!("internal panic: {}", p.message())));
-                }
-            };
-
-            render_agent_row(&row, fmt);
+            .map_err(mcp_error_to_cli_error)?;
+            let payload = parse_tool_json_payload("register_agent", &result)?;
+            persist_sender_identity_token_from_agent_payload(
+                &server_config,
+                &project_key,
+                &payload,
+            );
+            render_agent_payload(&payload, fmt);
             Ok(())
         }
 
@@ -40305,6 +40323,39 @@ fn truncate_str(s: &str, max: usize) -> String {
 }
 
 fn server_message_payload_to_cli_json(payload: serde_json::Value) -> Option<serde_json::Value> {
+    use mcp_agent_mail_tools::messaging::{
+        RedactedReplyMessageReceipt, RedactedSendMessageReceipt,
+    };
+
+    if payload
+        .get("receipt_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("redacted")
+    {
+        let message_id = payload.get("message_id")?.as_i64().filter(|id| *id > 0)?;
+        let replay = payload
+            .get("idempotent_replay")
+            .and_then(serde_json::Value::as_bool);
+        // A verified send may intentionally omit the message payload. Decode
+        // the native receipt contract instead of reporting a committed send as
+        // failed, and serialize only its allowed fields to preserve redaction.
+        let mut receipt = if payload.get("reply_to").is_some() {
+            serde_json::to_value(
+                serde_json::from_value::<RedactedReplyMessageReceipt>(payload).ok()?,
+            )
+            .ok()?
+        } else {
+            serde_json::to_value(
+                serde_json::from_value::<RedactedSendMessageReceipt>(payload).ok()?,
+            )
+            .ok()?
+        };
+        receipt["id"] = message_id.into();
+        if let Some(replay) = replay {
+            receipt["idempotent_replay"] = replay.into();
+        }
+        return Some(receipt);
+    }
     let delivery_payload = payload
         .get("deliveries")
         .and_then(|v| v.as_array())
@@ -41902,6 +41953,41 @@ mod mail_server_cli_bridge_tests {
                 .and_then(|v| v.as_str()),
             Some("GreenStone")
         );
+    }
+
+    #[test]
+    fn server_message_payload_bridge_preserves_redacted_receipts() {
+        let payload = serde_json::json!({
+            "receipt_mode": "redacted", "project": "/tmp/project", "message_id": 42,
+            "project_id": 1, "sender_id": 2, "thread_id": "br-42",
+            "created_ts": "2026-09-11T04:00:00Z", "verified_sender": true,
+            "target_outcomes": [], "idempotent_replay": true,
+            "subject": "must not echo", "body_md": "must not echo",
+            "attachments": ["must not echo"], "deliveries": ["must not echo"]
+        });
+        for reply in [false, true] {
+            let mut input = payload.clone();
+            if reply {
+                input["reply_to"] = 41.into();
+            }
+            let bridged = server_message_payload_to_cli_json(input).expect("redacted receipt");
+            assert_eq!(bridged["id"], 42);
+            assert_eq!(bridged["message_id"], 42);
+            assert_eq!(bridged["verified_sender"], true);
+            assert_eq!(bridged["idempotent_replay"], true);
+            assert_eq!(bridged.get("reply_to").is_some(), reply);
+            for forbidden in ["subject", "body_md", "attachments", "deliveries", "to"] {
+                assert!(bridged.get(forbidden).is_none(), "leaked {forbidden}");
+            }
+        }
+        for invalid_id in [serde_json::Value::Null, 0.into(), (-1).into(), "42".into()] {
+            let mut malformed = payload.clone();
+            malformed["message_id"] = invalid_id;
+            assert!(server_message_payload_to_cli_json(malformed).is_none());
+        }
+        let mut malformed = payload;
+        malformed["target_outcomes"] = "not an array".into();
+        assert!(server_message_payload_to_cli_json(malformed).is_none());
     }
 
     #[test]
@@ -47523,6 +47609,7 @@ http_headers = { Authorization = "Bearer secret" }
                 path,
                 no_auth,
                 no_tui,
+                setup,
                 allowed_host,
                 takeover,
             } => {
@@ -47531,6 +47618,7 @@ http_headers = { Authorization = "Bearer secret" }
                 assert_eq!(path.as_deref(), Some("/api/x/"));
                 assert!(!no_auth);
                 assert!(!no_tui);
+                assert!(!setup, "startup must preserve client configs by default");
                 assert!(
                     allowed_host.is_empty(),
                     "--allowed-host defaults to empty (loopback-only)"
@@ -47567,6 +47655,15 @@ http_headers = { Authorization = "Bearer secret" }
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn clap_parses_serve_http_explicit_setup() {
+        let cli = Cli::try_parse_from(["am", "serve-http", "--setup"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::ServeHttp { setup: true, .. })
+        ));
     }
 
     #[test]
@@ -65571,7 +65668,7 @@ startup_timeout_sec = 42
     #[test]
     fn help_serve_http_lists_flags() {
         let h = help_text_for(&["am", "serve-http", "--help"]);
-        for flag in ["--host", "--port", "--path", "--no-auth"] {
+        for flag in ["--host", "--port", "--path", "--no-auth", "--setup"] {
             assert!(
                 h.contains(flag),
                 "serve-http help missing flag '{flag}'\n{h}"

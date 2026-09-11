@@ -18,6 +18,9 @@ Options:
       --no-tui
           Disable the interactive TUI and run headless
 
+      --setup
+          Update detected MCP client configs to this server before serving (opt-in)
+
       --allowed-host <HOST>
           Extra Host header to accept (repeatable; also reads HTTP_ALLOWED_HOSTS)
 
