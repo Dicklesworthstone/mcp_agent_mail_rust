@@ -5667,6 +5667,9 @@ mod tests {
             assert_eq!(std::fs::read(&marker).unwrap(), marker_before);
             assert_eq!(std::fs::read(&meta).unwrap(), meta_before);
 
+            // FrankenSQLite's namespace owner prevents admitting a replacement
+            // while the old pool is live. Drain it before the supervised retry.
+            drop(pool);
             let fresh_pool = DbPool::new(&config).unwrap();
             for (text, expected) in [("newgeneration", 1), ("oldgeneration", 0)] {
                 let response = execute_search(&cx, &fresh_pool,

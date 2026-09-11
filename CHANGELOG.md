@@ -13,8 +13,9 @@ entries are retained. This review uses git diffs, tag targets, GitHub release
 metadata, checked-in Beads records, and executed release receipts; dates in the
 recent timeline are GitHub publication dates in UTC.
 The additional review on 2026-09-09 covers the configuration fixes after the
-v0.3.35 tag and OMP runtime detection below. Release metadata was checked again:
-v0.3.35 is tag-only; v0.3.34 remains the latest published GitHub Release.
+v0.3.35 tag and OMP runtime detection below. The 2026-09-11 review adds the
+br-2xdhw search workstream and refreshes publication metadata: v0.3.35 was
+published on 2026-09-09 and is the latest GitHub Release.
 
 ## Release Timeline
 
@@ -22,7 +23,7 @@ Recent releases; the earlier version history continues below.
 
 | Version | Published (UTC) | Status | Delivered capability |
 |---------|-----------------|--------|----------------------|
-| [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.35) | — | **Tag only** | Tagged source: lifecycle tokens over HTTP (PR #310 option c); bounded tmux probe readers |
+| [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.35) | 2026-09-09 | **Release** | Lifecycle tokens over HTTP (PR #310 option c); bounded tmux probe readers; six-platform binary assets |
 | [v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.34) | 2026-09-08 | **Release** | Windows UNC snapshots, bounded tmux identity probes, six-platform binaries and matching GHCR images |
 | [v0.3.33](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.33) | 2026-09-07 | **Release** | FrankenSQLite 0.3.18 and signed self-update manifest verification |
 
@@ -31,10 +32,32 @@ Recent releases; the earlier version history continues below.
 ## Unreleased
 
 Changes after the [v0.3.35 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.35),
-reviewed on 2026-09-09. These changes are not published release artifacts.
+reviewed through 2026-09-11. These changes are not published release artifacts.
 
 ### Fixed
 
+- **Lexical search notices edits and deletions below the highest message ID.**
+  Transactional change counters invalidate stale hits and cached misses without
+  rescanning an unchanged mailbox. Append-only changes retain incremental
+  backfill; edits, deletions, and replaced source files rebuild the index.
+  A source changed during rebuilding cannot publish partial results or a fresh
+  completion marker. Older databases without counters use a pinned read and
+  content verification. This is the independent br-2xdhw implementation of the
+  problem discussed in [PR #316](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/pull/316).
+  ([freshness implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/8a0675864ea4c81ad25a41937c392e265ba95462))
+- **Private snapshots and concurrent mailboxes keep separate search contents.**
+  Snapshot searches use a private disk-backed Tantivy index, preserving lexical
+  syntax without rewriting the live index or its completion marker. Message
+  indexing now takes an explicit mailbox and committed message ID, rereads the
+  current row, and rejects updates for another source; delayed notifications
+  cannot overwrite newer text with a caller's stale copy.
+  ([source binding](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f2da49585d77bd98dadf1ba31f5050c9c2013c2a))
+- **Committed delivery does not wait behind a lexical rebuild.** Best-effort
+  indexing skips a busy index and invalidates cached search results. The durable
+  change counter lets the next search catch up from the committed mailbox.
+  Each backfill pass stops at its initial maximum message ID, so continuing
+  deliveries cannot make the scan follow an ever-growing tail.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/1d87eacc512fcb6447986f624bd18787696d393b))
 - **`am doctor health` no longer fails on unusable diagnostic history.** A
   stale `.doctor/latest` report that is zero-byte, truncated, or not a doctor
   report at all used to abort the command with a bare
@@ -85,11 +108,14 @@ reviewed on 2026-09-09. These changes are not published release artifacts.
   ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f9e4ee92a78f0c212b81c611b94019f41ac1a063),
   [br-atwzh](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/ce66a70cadc20de9baab37b1c348daeaa02934f5/.beads/issues.jsonl#L1965))
 
-## [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.35) — 2026-09-09 [Tag only]
+## [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.35) — 2026-09-09 [Release]
 
 The tag was created at 04:12:42 UTC from
 [this source commit](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/56bb26d747ebd87bbb233d5a19cf268ade522d82).
-No published GitHub Release was available when checked on 2026-09-09.
+The GitHub Release was published at 05:54:10 UTC with six platform archives,
+checksums, a checksum signature, and the update manifest. Publication metadata
+was verified again on 2026-09-11; asset listing alone is not a new installation
+or platform-validation receipt.
 
 This patch closes the authorization gap left after PR #310: the agent
 lifecycle tools require the registration token when called over HTTP. It also

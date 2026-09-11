@@ -1657,14 +1657,18 @@ fn backfill_into_bridge_locked(
     }
 
     let handles = bridge.handles();
+    let scan_max_id = i64::try_from(db_stats.max_id)
+        .map_err(|_| "backfill maximum message ID exceeds SQLite integer range".to_string())?;
 
     // Paged reads avoid loading the full mailbox into memory during startup.
     // Keep this query JOIN-free to avoid parity-cert fallback overhead on
-    // FrankenSQLite for join-heavy startup scans.
+    // FrankenSQLite for join-heavy startup scans. Bound this pass by the
+    // initial maximum ID so a stream of new deliveries cannot extend it
+    // indefinitely; the source seal rejects drift and a later pass catches up.
     let sql = "SELECT id, project_id, sender_id, subject, body_md, \
                thread_id, importance, created_ts \
                FROM messages \
-               WHERE id > ? \
+               WHERE id > ? AND id <= ? \
                ORDER BY id \
                LIMIT ?";
     let sender_name_map = fetch_id_text_map(&conn, "SELECT id, name AS value FROM agents")?;
@@ -1696,7 +1700,11 @@ fn backfill_into_bridge_locked(
             let rows = loop {
                 match conn.query_sync(
                     sql,
-                    &[Value::BigInt(last_id), Value::BigInt(FETCH_BATCH_SIZE)],
+                    &[
+                        Value::BigInt(last_id),
+                        Value::BigInt(scan_max_id),
+                        Value::BigInt(FETCH_BATCH_SIZE),
+                    ],
                 ) {
                     Ok(rows) => break rows,
                     Err(err) => {
@@ -3454,7 +3462,7 @@ mod tests {
             &path,
             index.path(),
             &PlannerQuery {
-                text: "deferrednotification".to_string(),
+                text: "deferrednotification AND \"durable committed body\"".to_string(),
                 doc_kind: DocKind::Message,
                 ..Default::default()
             },
@@ -3463,7 +3471,7 @@ mod tests {
         .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, 2);
-        assert_eq!(results[0].body, "durable committed body");
+        assert_eq!(results[0].title, "deferrednotification");
         assert_eq!(backfill_from_db(&path).unwrap(), (0, 2));
         reset_bridge_for_tests();
     }
@@ -3521,15 +3529,24 @@ mod tests {
         )
         .unwrap();
         let changed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let scanned = std::rc::Rc::new(std::cell::Cell::new(0));
         BACKFILL_SCAN_OBSERVER.with(|observer| {
             let changed = changed.clone();
+            let scanned = scanned.clone();
             *observer.borrow_mut() = Some(Box::new(move |indexed| {
+                scanned.set(indexed);
                 if indexed >= 4_000 && !changed.replace(true) {
                     conn.execute_sync(
                         "UPDATE messages SET subject = 'concurrentchange' WHERE id = 1",
                         &[],
                     )
                     .expect("commit through a second real runtime connection");
+                    conn.execute_sync(
+                        "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                         VALUES (5000, 1, 1, 'arrivedduringbackfill', 'later delivery', 2000000)",
+                        &[],
+                    )
+                    .expect("append above the scan bound during real backfill");
                 }
             }));
         });
@@ -3538,6 +3555,7 @@ mod tests {
             observer.borrow_mut().take();
         });
         assert!(changed.get(), "the source mutation must actually execute");
+        assert_eq!(scanned.get(), 4_102, "a scan must not chase new tail IDs");
         assert!(result.unwrap_err().contains("source changed during scan"));
         assert_eq!(
             std::fs::read(backfill_state_path(&bridge)).unwrap(),
@@ -3558,8 +3576,18 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(backfill_from_db(&db_path).unwrap(), (4_102, 0));
-        assert_eq!(fetch_index_message_stats(&bridge).unwrap().count, 4_102);
+        assert_eq!(backfill_from_db(&db_path).unwrap(), (4_103, 0));
+        assert_eq!(fetch_index_message_stats(&bridge).unwrap().count, 4_103);
+        assert_eq!(
+            bridge
+                .search(&PlannerQuery {
+                    text: "arrivedduringbackfill".to_string(),
+                    doc_kind: DocKind::Message,
+                    ..Default::default()
+                })
+                .len(),
+            1
+        );
         reset_bridge_for_tests();
     }
 
