@@ -4952,6 +4952,189 @@ fn list_projects_with_agents_shows_agent_names() {
     );
 }
 
+#[test]
+fn reconstruct_preview_and_repair_agree_on_reservation_lifecycle_merge() {
+    check_reconstruct_preview_reservations(false);
+}
+
+#[test]
+fn reconstruct_preview_and_repair_refuse_ambiguous_reservation_stable_keys() {
+    check_reconstruct_preview_reservations(true);
+}
+
+fn check_reconstruct_preview_reservations(ambiguous_source: bool) {
+    let preview_env = TestEnv::new();
+    let repair_env = TestEnv::new();
+    let project_dir = preview_env.storage_root.join("projects/parity-project");
+    let profile_dir = project_dir.join("agents/BlueLake");
+    let reservations_dir = project_dir.join("file_reservations");
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    std::fs::create_dir_all(&reservations_dir).unwrap();
+    std::fs::write(
+        project_dir.join("project.json"),
+        r#"{"slug":"parity-project","human_key":"/reconstruct-parity","created_at":0}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        r#"{"name":"BlueLake","program":"codex-cli","model":"test","inception_ts":"2026-08-27T05:00:00Z","last_active_ts":"2026-08-27T05:00:00Z"}"#,
+    )
+    .unwrap();
+    let mut reservation = json!({
+        "id": 174, "project": "/reconstruct-parity", "agent": "BlueLake",
+        "path_pattern": "src/parity/**", "exclusive": true, "reason": "preview parity",
+        "created_ts": "2026-08-27T06:22:00Z", "expires_ts": "2026-08-27T07:22:00Z",
+        "released_ts": null,
+    });
+    std::fs::write(
+        reservations_dir.join("id-174-g11111111111111111111111111111111.json"),
+        serde_json::to_vec(&reservation).unwrap(),
+    )
+    .unwrap();
+    mcp_agent_mail_db::reconstruct_from_archive(&preview_env.db_path, &preview_env.storage_root)
+        .expect("build real source from active archive generation");
+    reservation["released_ts"] = "2026-08-27T07:00:00Z".into();
+    std::fs::write(
+        reservations_dir.join("id-174-g22222222222222222222222222222222.json"),
+        serde_json::to_vec(&reservation).unwrap(),
+    )
+    .unwrap();
+    // The DB has a later lifecycle update than either archived generation.
+    // A real salvage merge must preserve it without duplicating the identity.
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(preview_env.db_path.to_str().unwrap())
+        .unwrap();
+    conn.execute_raw(
+        "UPDATE file_reservations SET released_ts = 1787901000000000; \
+         INSERT INTO file_reservation_releases (reservation_id, released_ts) \
+         SELECT id, released_ts FROM file_reservations;",
+    )
+    .unwrap();
+    if ambiguous_source {
+        // A healthy SQLite image with an ambiguous semantic identity. Merely
+        // classifying salvage as readable cannot detect this promotion refusal.
+        conn.execute_raw(
+            "INSERT INTO file_reservations \
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+             SELECT 999, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts \
+             FROM file_reservations; \
+             INSERT INTO file_reservation_releases (reservation_id, released_ts) \
+             VALUES (999, 1787901000000000);",
+        )
+        .unwrap();
+    }
+    conn.close_sync().unwrap();
+    assert!(
+        mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(
+            &preview_env.db_path
+        )
+        .unwrap(),
+        "the negative must be semantic ambiguity, not SQLite corruption"
+    );
+
+    // Independent byte-identical input copies; the actual repair cannot alter
+    // what the preview inspected or accidentally validate its scratch output.
+    std::fs::copy(&preview_env.db_path, &repair_env.db_path).unwrap();
+    let mut pending = vec![preview_env.storage_root.clone()];
+    while let Some(source) = pending.pop() {
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let destination = repair_env
+                .storage_root
+                .join(path.strip_prefix(&preview_env.storage_root).unwrap());
+            if entry.file_type().unwrap().is_dir() {
+                std::fs::create_dir_all(&destination).unwrap();
+                pending.push(path);
+            } else {
+                assert!(entry.file_type().unwrap().is_file());
+                std::fs::copy(path, destination).unwrap();
+            }
+        }
+    }
+    assert_eq!(
+        std::fs::read(&preview_env.db_path).unwrap(),
+        std::fs::read(&repair_env.db_path).unwrap()
+    );
+    assert_eq!(
+        snapshot_tree(&preview_env.storage_root),
+        snapshot_tree(&repair_env.storage_root)
+    );
+    let before = snapshot_tree(preview_env.tmp.path());
+    let run = |env: &TestEnv, mode: &str| {
+        Command::new(am_bin())
+            .env_clear()
+            .envs(env.isolated_env())
+            .current_dir(env.hostile_repo())
+            .args(["doctor", "reconstruct", mode, "--json"])
+            .output()
+            .unwrap()
+    };
+    let preview = run(&preview_env, "--dry-run");
+    let preview_json: Value = serde_json::from_slice(&preview.stdout).unwrap_or_else(|error| {
+        panic!(
+            "preview stdout must be a single JSON value ({error}):\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&preview.stdout),
+            String::from_utf8_lossy(&preview.stderr)
+        )
+    });
+    assert_eq!(snapshot_tree(preview_env.tmp.path()), before);
+    assert_eq!(preview_json["actions_taken"], 0);
+    assert_eq!(preview_json["salvage"]["status"], "would_merge");
+    let repair_before = std::fs::read(&repair_env.db_path).unwrap();
+    let repair_archive_before = snapshot_tree(&repair_env.storage_root);
+    let repaired = run(&repair_env, "--yes");
+    if ambiguous_source {
+        assert!(!preview.status.success());
+        assert!(!repaired.status.success());
+        assert_eq!(preview_json["candidate_validation"]["would_refuse"], true);
+        let preview_error = preview_json["candidate_validation"]["detail"]
+            .as_str()
+            .unwrap();
+        let repair_error = String::from_utf8_lossy(&repaired.stderr);
+        for expected in ["unique stable keys", "src/parity/**", "BlueLake"] {
+            assert!(preview_error.contains(expected), "{preview_error}");
+            assert!(repair_error.contains(expected), "{repair_error}");
+        }
+        assert_eq!(std::fs::read(&repair_env.db_path).unwrap(), repair_before);
+        // Repair is allowed to retain forensics; authoritative archive files
+        // still cannot be rewritten by a refused candidate.
+        let repair_archive_after = snapshot_tree(&repair_env.storage_root);
+        for (path, original) in repair_archive_before {
+            assert_eq!(repair_archive_after.get(&path), Some(&original), "{}", path.display());
+        }
+    } else {
+        assert!(
+            preview.status.success(),
+            "{}",
+            String::from_utf8_lossy(&preview.stderr)
+        );
+        assert!(
+            repaired.status.success(),
+            "{}",
+            String::from_utf8_lossy(&repaired.stderr)
+        );
+        assert_eq!(preview_json["candidate_validation"]["status"], "valid");
+        let conn = mcp_agent_mail_db::DbConn::open_file(repair_env.db_path.to_str().unwrap())
+            .expect("reopen promoted candidate through the runtime engine");
+        let rows = conn
+            .query_sync(
+                "SELECT path_pattern, released_ts FROM file_reservations",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "lifecycle variants must share one identity");
+        assert_eq!(
+            rows[0].get_named::<String>("path_pattern").unwrap(),
+            "src/parity/**"
+        );
+        assert_eq!(
+            rows[0].get_named::<i64>("released_ts").unwrap(),
+            1_787_901_000_000_000
+        );
+        conn.close_sync().unwrap();
+    }
+}
+
 // ---- Serve commands (dry checks) ----
 
 #[test]

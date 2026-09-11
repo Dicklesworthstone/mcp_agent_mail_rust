@@ -83279,21 +83279,24 @@ impl DoctorReconstructSalvagePreview {
     }
 }
 
-/// Run the real command's salvage selection and validation without writing
-/// anything, so `--dry-run` and `-y` cannot disagree about whether a recovery
-/// is possible (GH#302).
-fn doctor_reconstruct_salvage_preview(db_path: &Path) -> DoctorReconstructSalvagePreview {
+fn doctor_reconstruct_salvage_attempt(db_path: &Path) -> Option<DoctorSalvageAttempt> {
     let candidates = doctor_salvage_artifact_candidates(db_path);
-    if candidates.is_empty() {
-        return DoctorReconstructSalvagePreview::NoCandidate;
-    }
-    match attempt_best_doctor_salvage_artifact_from_candidates(db_path, candidates) {
-        DoctorSalvageAttempt::Failed(detail) => {
-            DoctorReconstructSalvagePreview::NotMaterializable(detail)
+    (!candidates.is_empty())
+        .then(|| attempt_best_doctor_salvage_artifact_from_candidates(db_path, candidates))
+}
+
+/// Describe the same retained source that the candidate builder will consume.
+fn doctor_reconstruct_salvage_preview(
+    attempt: Option<&DoctorSalvageAttempt>,
+) -> DoctorReconstructSalvagePreview {
+    match attempt {
+        None => DoctorReconstructSalvagePreview::NoCandidate,
+        Some(DoctorSalvageAttempt::Failed(detail)) => {
+            DoctorReconstructSalvagePreview::NotMaterializable(detail.clone())
         }
-        DoctorSalvageAttempt::Succeeded(artifact) => {
-            let source = artifact.db_path.clone();
-            match mcp_agent_mail_db::classify_salvage_source(&source) {
+        Some(DoctorSalvageAttempt::Succeeded(artifact)) => {
+            let source = artifact.reported_path.clone();
+            match mcp_agent_mail_db::classify_salvage_source(&artifact.db_path) {
                 mcp_agent_mail_db::SalvageSourceVerdict::Mergeable => {
                     DoctorReconstructSalvagePreview::WouldMerge(source)
                 }
@@ -83306,6 +83309,53 @@ fn doctor_reconstruct_salvage_preview(db_path: &Path) -> DoctorReconstructSalvag
             }
         }
     }
+}
+
+/// Build the actual archive/salvage candidate in both preview and repair modes.
+/// The caller chooses a fresh scratch path; this never promotes a generation.
+fn build_doctor_reconstruct_candidate(
+    candidate_path: &Path,
+    storage_root: &Path,
+    salvage_attempt: Option<&DoctorSalvageAttempt>,
+) -> CliResult<mcp_agent_mail_db::ReconstructStats> {
+    let salvage_db_path = salvage_attempt.and_then(|attempt| match attempt {
+        DoctorSalvageAttempt::Succeeded(artifact) => Some(artifact.db_path.as_path()),
+        DoctorSalvageAttempt::Failed(_) => None,
+    });
+    let reconstruct = salvage_db_path.map_or_else(
+        || mcp_agent_mail_db::reconstruct_from_archive(candidate_path, storage_root),
+        |private_salvage_db_path| {
+            mcp_agent_mail_db::reconstruct_from_archive_with_private_salvage(
+                candidate_path,
+                storage_root,
+                private_salvage_db_path,
+            )
+        },
+    );
+    let mut stats = reconstruct.map_err(|error| {
+        preserve_doctor_temp_sqlite_artifact(candidate_path);
+        CliError::Other(format!(
+            "reconstruction failed (original database is untouched): {error}"
+        ))
+    })?;
+    if !mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(candidate_path)
+        .map_err(|error| {
+            CliError::Other(format!(
+                "failed to run full integrity check on reconstructed database {}: {error}",
+                candidate_path.display()
+            ))
+        })?
+    {
+        preserve_doctor_temp_sqlite_artifact(candidate_path);
+        return Err(CliError::Other(format!(
+            "reconstructed database at {} did not pass full integrity checks; original database is untouched",
+            candidate_path.display()
+        )));
+    }
+    if let Some(DoctorSalvageAttempt::Failed(detail)) = salvage_attempt {
+        stats.warnings.push(detail.clone());
+    }
+    Ok(stats)
 }
 
 fn handle_doctor_reconstruct_with(
@@ -83405,13 +83455,46 @@ fn handle_doctor_reconstruct_with(
     }
 
     if dry_run {
-        // Walk the archive to report what would be recovered, without writing.
-        ftui_runtime::ftui_println!("Dry run — scanning archive at {}", storage_root.display());
+        // Build only in a private scratch directory, never beside the live DB
+        // or inside its archive. Promotion's actual semantic evidence collector
+        // catches conflicts that archive file counts cannot predict (GH#271).
+        ftui_runtime::ftui_eprintln!(
+            "Dry run — validating reconstruction at {}",
+            storage_root.display()
+        );
         let stats = scan_archive_stats(&storage_root);
-        // GH#302: run the SAME salvage validation the real command runs. The
-        // dry run used to skip it entirely and promise a recovery that the
-        // real `am doctor reconstruct -y` then refused on the salvage source.
-        let salvage_preview = doctor_reconstruct_salvage_preview(&db_path);
+        let scratch = canonical_snapshot_tempdir("am-reconstruct-preview-", "reconstruct preview")?;
+        let candidate_path = scratch.path().join("candidate.sqlite3");
+        let salvage_attempt = doctor_reconstruct_salvage_attempt(&db_path);
+        let salvage_preview = doctor_reconstruct_salvage_preview(salvage_attempt.as_ref());
+        let candidate = build_doctor_reconstruct_candidate(
+            &candidate_path,
+            &storage_root,
+            salvage_attempt.as_ref(),
+        )
+        .and_then(|recovered| {
+            mcp_agent_mail_db::forensics::validate_recovery_candidate_continuity(
+                &storage_root,
+                &db_path,
+                path_is_real_file(&db_path).then_some(db_path.as_path()),
+                &candidate_path,
+            )
+            .map_err(|error| CliError::Other(error.to_string()))?;
+            Ok(recovered)
+        });
+        let validation = match &candidate {
+            Ok(recovered) => serde_json::json!({
+                "status": "valid", "would_refuse": false,
+                "recovered": {
+                    "projects": recovered.projects, "agents": recovered.agents,
+                    "messages": recovered.messages, "recipients": recovered.recipients,
+                },
+                "warnings": recovered.warnings,
+            }),
+            Err(error) => serde_json::json!({
+                "status": "would_refuse", "would_refuse": true, "detail": error.to_string(),
+            }),
+        };
         if json {
             ftui_runtime::ftui_println!(
                 "{}",
@@ -83430,6 +83513,8 @@ fn handle_doctor_reconstruct_with(
                         "unparseable_canonical_message_files": stats.unparseable_canonical_message_files,
                     },
                     "salvage": salvage_preview.to_json(),
+                    "candidate_validation": validation,
+                    "actions_taken": 0,
                 })
             );
         } else {
@@ -83456,14 +83541,15 @@ fn handle_doctor_reconstruct_with(
             }
             ftui_runtime::ftui_println!("  Database path: {}", db_path.display());
             ftui_runtime::ftui_println!("  Salvage:       {}", salvage_preview.summary());
-            ftui_runtime::ftui_println!("No changes made.");
+            match &candidate {
+                Ok(_) => ftui_runtime::ftui_println!(
+                    "  Candidate:     passed full integrity and promotion continuity checks"
+                ),
+                Err(error) => ftui_runtime::ftui_println!("  Candidate:     WOULD REFUSE: {error}"),
+            }
+            ftui_runtime::ftui_println!("No mailbox changes made; no candidate promoted.");
         }
-        if let DoctorReconstructSalvagePreview::WouldRefuse { detail, .. } = &salvage_preview {
-            output::warn(&format!(
-                "`am doctor reconstruct -y` would REFUSE with: {detail}"
-            ));
-        }
-        return Ok(());
+        return candidate.map(|_| ());
     }
 
     if !confirm_mutating_doctor_action(
@@ -83501,58 +83587,9 @@ fn handle_doctor_reconstruct_with(
     // Attempt salvage through a guarded private snapshot of the original DB
     // (no rename yet), or from nearby offline doctor artifacts when an
     // operator already moved the primary aside.
-    let salvage_candidates = doctor_salvage_artifact_candidates(&db_path);
-    let salvage_attempt = if salvage_candidates.is_empty() {
-        None
-    } else {
-        Some(attempt_best_doctor_salvage_artifact_from_candidates(
-            &db_path,
-            salvage_candidates,
-        ))
-    };
-    let salvage_db_path = salvage_attempt.as_ref().and_then(|attempt| match attempt {
-        DoctorSalvageAttempt::Succeeded(artifact) => Some(artifact.db_path.as_path()),
-        DoctorSalvageAttempt::Failed(_) => None,
-    });
-
-    // Reconstruct into the TEMP path — original DB is still untouched.
-    let reconstruct = salvage_db_path.map_or_else(
-        || mcp_agent_mail_db::reconstruct_from_archive(&temp_db_path, &storage_root),
-        |private_salvage_db_path| {
-            mcp_agent_mail_db::reconstruct_from_archive_with_private_salvage(
-                &temp_db_path,
-                &storage_root,
-                private_salvage_db_path,
-            )
-        },
-    );
-    let mut stats = match reconstruct {
-        Ok(stats) => stats,
-        Err(e) => {
-            // Clean up the partial temp file; original DB is safe.
-            preserve_doctor_temp_sqlite_artifact(&temp_db_path);
-            return Err(CliError::Other(format!(
-                "reconstruction failed (original database is untouched): {e}"
-            )));
-        }
-    };
-
-    // Validate the reconstructed temp DB before swapping.
-    if !mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(&temp_db_path)
-        .map_err(|error| {
-            CliError::Other(format!(
-                "failed to run full integrity check on reconstructed database {}: {error}",
-                temp_db_path.display()
-            ))
-        })?
-    {
-        preserve_doctor_temp_sqlite_artifact(&temp_db_path);
-        return Err(CliError::Other(format!(
-            "reconstructed database at {} did not pass full integrity checks; \
-             original database is untouched",
-            temp_db_path.display()
-        )));
-    }
+    let salvage_attempt = doctor_reconstruct_salvage_attempt(&db_path);
+    let stats =
+        build_doctor_reconstruct_candidate(&temp_db_path, &storage_root, salvage_attempt.as_ref())?;
 
     mcp_agent_mail_db::promote_recovery_candidate(&db_path, &temp_db_path, &storage_root).map_err(
         |err| {
@@ -83611,15 +83648,6 @@ fn handle_doctor_reconstruct_with(
             Err(error) => ftui_runtime::ftui_eprintln!(
                 "  Warning: post-swap archive id-floor scan failed: {error}"
             ),
-        }
-    }
-
-    if let Some(attempt) = &salvage_attempt {
-        match attempt {
-            DoctorSalvageAttempt::Failed(detail) => {
-                stats.warnings.push(detail.clone());
-            }
-            DoctorSalvageAttempt::Succeeded(_) => {}
         }
     }
 

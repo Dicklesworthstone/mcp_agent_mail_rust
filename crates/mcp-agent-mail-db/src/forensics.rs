@@ -3158,6 +3158,36 @@ fn collect_recovery_receipt_evidence(
 
 const RECOVERY_RECEIPT_SINGLETON_PENDING_FILE: &str = "recovery-admission.receipt.pending";
 
+/// Validate a built recovery candidate using the promotion receipt's actual
+/// source/candidate stable-key, lifecycle and continuity checks (GH#271).
+///
+/// Reads source-neutral snapshots without creating receipt directories or
+/// intents, acquiring promotion authority, or modifying either generation.
+/// This is a preview of current evidence; promotion must revalidate after
+/// acquiring its own admission and writer barrier.
+///
+/// # Errors
+///
+/// Returns the same receipt-admission or semantic-evidence refusal as promotion.
+pub fn validate_recovery_candidate_continuity(
+    storage_root: &Path,
+    db_path: &Path,
+    source_path: Option<&Path>,
+    candidate_path: &Path,
+) -> Result<(), SqlError> {
+    let authority_path = recovery_receipt_db_authority_path(db_path)?;
+    verify_recovery_receipt_state_for_promotion(storage_root, &authority_path)?;
+    let receipts_dir = recovery_receipts_dir(storage_root, &authority_path)?;
+    let archive_identity_overrides = archive_canonical_project_identities(storage_root);
+    collect_recovery_receipt_evidence(
+        &receipts_dir,
+        source_path,
+        candidate_path,
+        &archive_identity_overrides,
+    )?;
+    Ok(())
+}
+
 /// Build and durably persist a promotion intent from deterministic stable-key
 /// snapshots. Any lost coordination/security key aborts before the live path
 /// can be replaced.
