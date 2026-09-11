@@ -1274,8 +1274,8 @@ fn with_tantivy_writer<T>(
 
 /// Index a committed message from its explicit source mailbox.
 ///
-/// Returns `Ok(true)` if the message was indexed, `Ok(false)` if the bridge
-/// is not initialized (search V3 disabled), or `Err` on write failure.
+/// Returns `Ok(true)` if indexed, `Ok(false)` when the bridge is absent, busy,
+/// or bound to another source, and `Err` on write failure.
 ///
 /// This is intentionally fire-and-forget safe: callers should not fail the
 /// message send operation if indexing fails.
@@ -1298,10 +1298,14 @@ pub fn index_messages_batch(db_url: &str, message_ids: &[i64]) -> Result<usize, 
         let Some(bridge) = get_bridge() else {
             return Ok(0);
         };
-        let _source_guard = bridge
-            .source_operation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Delivery has already committed its row and change-clock increment.
+        // Never make that successful delivery wait for a corpus rebuild; the
+        // next search observes the clock and catches up this skipped update.
+        let _source_guard = match bridge.source_operation.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(0),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
         let Some(state) = read_backfill_state(&bridge) else {
             return Ok(0);
         };
@@ -3393,6 +3397,74 @@ mod tests {
                 }
             });
         }
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn committed_ingestion_skips_busy_rebuild_and_search_catches_up() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let source = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let path = create_test_db(
+            source.path(),
+            &[(1, "existing", "original body", "normal", "thread-one")],
+        );
+        let conn = DbConn::open_file(&path).unwrap();
+        for migration in crate::schema::schema_migrations()
+            .into_iter()
+            .filter(|migration| migration.id.starts_with("v29_"))
+        {
+            conn.execute_sync(&migration.up, &[]).unwrap();
+        }
+        init_bridge(index.path()).unwrap();
+        backfill_from_db(&path).unwrap();
+        let bridge = get_bridge().unwrap();
+        let marker = std::fs::read(backfill_state_path(&bridge)).unwrap();
+        let meta = std::fs::read(index.path().join("meta.json")).unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (2, 1, 1, 'deferrednotification', 'durable committed body', 2000000)",
+            &[],
+        )
+        .unwrap();
+        let epoch = crate::search_service::global_search_cache_epoch_for_tests();
+        std::thread::scope(|scope| {
+            let rebuild_guard = bridge.source_operation.lock().unwrap();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let source_path = &path;
+            let worker = scope.spawn(move || {
+                sender.send(index_message(source_path, 2)).unwrap();
+            });
+            let completed = receiver.recv_timeout(std::time::Duration::from_secs(5));
+            // Release even on timeout so a regression cannot orphan the worker.
+            drop(rebuild_guard);
+            worker.join().unwrap();
+            assert_eq!(
+                completed.expect("delivery must complete while rebuild owns the guard"),
+                Ok(false)
+            );
+        });
+        assert!(crate::search_service::global_search_cache_epoch_for_tests() > epoch);
+        assert_eq!(std::fs::read(backfill_state_path(&bridge)).unwrap(), marker);
+        assert_eq!(std::fs::read(index.path().join("meta.json")).unwrap(), meta);
+        let results = search_database(
+            &path,
+            index.path(),
+            &PlannerQuery {
+                text: "deferrednotification".to_string(),
+                doc_kind: DocKind::Message,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, 2);
+        assert_eq!(results[0].body, "durable committed body");
+        assert_eq!(backfill_from_db(&path).unwrap(), (0, 2));
         reset_bridge_for_tests();
     }
 
