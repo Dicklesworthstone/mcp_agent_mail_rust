@@ -158,7 +158,7 @@ pub mod search_v3 {
     /// Tantivy is disabled, so lexical indexing is skipped deterministically.
     /// The search cache must still be invalidated on ingestion (GH#227): the
     /// SQL search paths cache result sets in the same process-wide cache.
-    pub fn index_message(_msg: &IndexableMessage) -> Result<bool, String> {
+    pub fn index_message(_db_url: &str, _message_id: i64) -> Result<bool, String> {
         crate::search_service::invalidate_search_cache(
             crate::search_cache::InvalidationTrigger::IndexUpdate,
         );
@@ -167,8 +167,8 @@ pub mod search_v3 {
 
     /// Tantivy is disabled, so batch lexical indexing is skipped deterministically.
     /// See `index_message` for why the cache is still invalidated (GH#227).
-    pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, String> {
-        if !messages.is_empty() {
+    pub fn index_messages_batch(_db_url: &str, message_ids: &[i64]) -> Result<usize, String> {
+        if !message_ids.is_empty() {
             crate::search_service::invalidate_search_cache(
                 crate::search_cache::InvalidationTrigger::IndexUpdate,
             );
@@ -177,7 +177,12 @@ pub mod search_v3 {
     }
 
     pub(crate) fn resolve_search_sqlite_path_from_database_url(db_url: &str) -> Option<String> {
-        crate::pool::resolve_mailbox_sqlite_path(db_url)
+        let database_url = if Path::new(db_url).is_absolute() {
+            std::borrow::Cow::Owned(format!("sqlite:///{db_url}"))
+        } else {
+            std::borrow::Cow::Borrowed(db_url)
+        };
+        crate::pool::resolve_mailbox_sqlite_path(&database_url)
             .ok()
             .map(|resolved| resolved.canonical_path)
     }

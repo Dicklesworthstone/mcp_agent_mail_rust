@@ -507,19 +507,7 @@ async fn send_contact_notice(
         &message.subject,
         &message.body_md,
     );
-    crate::messaging::enqueue_message_lexical_index(
-        &mcp_agent_mail_db::search_v3::IndexableMessage {
-            id: message.id.unwrap_or(0),
-            project_id: target_project_id,
-            project_slug: target_project.slug.clone(),
-            sender_name: from_row.name.clone(),
-            subject: message.subject.clone(),
-            body_md: message.body_md.clone(),
-            thread_id: message.thread_id.clone(),
-            importance: message.importance.clone(),
-            created_ts: message.created_ts,
-        },
-    );
+    crate::messaging::enqueue_message_lexical_index(pool.sqlite_path(), message.id.unwrap_or(0));
 
     // Write message to archive
     let config = mcp_agent_mail_core::Config::get();

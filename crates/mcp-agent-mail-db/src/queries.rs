@@ -7618,7 +7618,7 @@ pub async fn create_message(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    if let Err(error) = index_created_message_best_effort(&conn, &row) {
+    if let Err(error) = index_created_message_best_effort(pool, &row) {
         tracing::warn!(
             message_id = row.id.unwrap_or_default(),
             error = %error,
@@ -7629,41 +7629,13 @@ pub async fn create_message(
 }
 
 fn index_created_message_best_effort(
-    conn: &crate::DbConn,
+    pool: &DbPool,
     row: &MessageRow,
 ) -> std::result::Result<bool, String> {
     let Some(message_id) = row.id else {
         return Ok(false);
     };
-    let project_slug = conn
-        .query_sync(
-            "SELECT slug FROM projects WHERE id = ? LIMIT 1",
-            &[Value::BigInt(row.project_id)],
-        )
-        .ok()
-        .and_then(|rows| rows.first().and_then(|row| row.get_as::<String>(0).ok()))
-        .unwrap_or_default();
-    let sender_name = conn
-        .query_sync(
-            "SELECT name FROM agents WHERE id = ? LIMIT 1",
-            &[Value::BigInt(row.sender_id)],
-        )
-        .ok()
-        .and_then(|rows| rows.first().and_then(|row| row.get_as::<String>(0).ok()))
-        .unwrap_or_else(|| UNKNOWN_SENDER_DISPLAY.to_string());
-
-    let message = crate::search_v3::IndexableMessage {
-        id: message_id,
-        project_id: row.project_id,
-        project_slug,
-        sender_name,
-        subject: row.subject.clone(),
-        body_md: row.body_md.clone(),
-        thread_id: row.thread_id.clone(),
-        importance: row.importance.clone(),
-        created_ts: row.created_ts,
-    };
-    crate::search_v3::index_message(&message)
+    crate::search_v3::index_message(pool.sqlite_path(), message_id)
 }
 
 /// Elect the next canonical message id durably inside the caller's write

@@ -383,9 +383,24 @@ fn generate_zero_result_guidance(
 
 /// Try executing a search via the Tantivy bridge. Returns `None` if the
 /// bridge is not initialized (`init_bridge` not called).
-fn try_tantivy_search(query: &SearchQuery) -> Option<Vec<SearchResult>> {
-    let bridge = crate::search_v3::get_bridge()?;
-    Some(bridge.search(query))
+fn try_tantivy_search(
+    pool: &DbPool,
+    query: &SearchQuery,
+) -> Result<Option<Vec<SearchResult>>, DbError> {
+    #[cfg(feature = "tantivy-engine")]
+    {
+        crate::search_v3::search_database(
+            &lexical_backfill_database_url(pool),
+            &direct_surface_index_dir(pool)?,
+            query,
+        )
+        .map_err(|error| map_bridge_bootstrap_error(&error))
+    }
+    #[cfg(not(feature = "tantivy-engine"))]
+    {
+        let _ = (pool, query);
+        Ok(None)
+    }
 }
 
 fn query_needs_recipient_filter(query: &SearchQuery) -> bool {
@@ -4359,6 +4374,16 @@ pub async fn execute_search(
     if needs_lexical_freshness {
         cache_key = build_search_cache_key(pool, query, options, cache.current_epoch());
         if cache_allowed && let Some(cached) = cache.get(&cache_key) {
+            let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+            if options.track_telemetry {
+                record_query("search_service_cache_hit", latency_us);
+            }
+            tracing::debug!(
+                target: "search.cache",
+                latency_us,
+                query = %query.text,
+                "search cache hit after lexical freshness check"
+            );
             return Outcome::Ok(cached);
         }
     }
@@ -4372,7 +4397,11 @@ pub async fn execute_search(
             lexical_candidate_limit(query),
         ));
 
-        if let Some(mut raw_results) = try_tantivy_search(&lexical_query) {
+        let candidates = match try_tantivy_search(pool, &lexical_query) {
+            Ok(results) => results,
+            Err(error) => return Outcome::Err(error),
+        };
+        if let Some(mut raw_results) = candidates {
             if raw_results.is_empty() && !explicit_lexical && pool.sqlite_path() != ":memory:" {
                 let sqlite_key = sqlite_key_for_pool(pool);
                 let backfill_ran = match has_run_lexical_backfill(&sqlite_key) {
@@ -4390,8 +4419,10 @@ pub async fn execute_search(
                         );
                         return Outcome::Err(err);
                     }
-                    if let Some(rerun_results) = try_tantivy_search(&lexical_query) {
-                        raw_results = rerun_results;
+                    match try_tantivy_search(pool, &lexical_query) {
+                        Ok(Some(rerun_results)) => raw_results = rerun_results,
+                        Ok(None) => {}
+                        Err(error) => return Outcome::Err(error),
                     }
                 }
             }
@@ -4507,7 +4538,10 @@ pub async fn execute_search(
         // asupersync, and this crate does not enable the proc-macro helpers that
         // would replace it. Keep the hybrid orchestration behavior intact while
         // running candidate retrieval directly in the current task.
-        let lexical_results = try_tantivy_search(&lexical_query);
+        let lexical_results = match try_tantivy_search(pool, &lexical_query) {
+            Ok(results) => results,
+            Err(error) => return Outcome::Err(error),
+        };
         #[cfg(feature = "hybrid")]
         let (semantic_results, two_tier_telemetry) = if plan.derivation.budget.semantic_limit == 0 {
             (Vec::new(), None)
@@ -4989,18 +5023,7 @@ mod tests {
     fn gh227_index_message_invalidates_search_cache_without_bridge() {
         let cache = global_search_cache();
         let epoch_before = cache.current_epoch();
-        let msg = crate::search_v3::IndexableMessage {
-            id: 733,
-            project_id: 1,
-            project_slug: "fleet".to_string(),
-            sender_name: "BlueLake".to_string(),
-            subject: "decision relay".to_string(),
-            body_md: "asyncEligible flag flipped".to_string(),
-            thread_id: None,
-            importance: "normal".to_string(),
-            created_ts: 1,
-        };
-        let result = crate::search_v3::index_message(&msg);
+        let result = crate::search_v3::index_message(":memory:", 733);
         assert!(result.is_ok(), "index_message must not fail the send path");
         assert!(
             cache.current_epoch() > epoch_before,
@@ -5525,8 +5548,9 @@ mod tests {
                         }
                     }
                 }
-                let marker = root.path().join("search_index/backfill_state.json");
-                let meta = root.path().join("search_index/meta.json");
+                let active_index = crate::search_v3::get_bridge().unwrap();
+                let marker = active_index.index_dir().join("backfill_state.json");
+                let meta = active_index.index_dir().join("meta.json");
                 let marker_before = std::fs::read(&marker).unwrap();
                 let meta_before = std::fs::read(&meta).unwrap();
                 let snapshot_pool = DbPool::new(&crate::DbPoolConfig {
