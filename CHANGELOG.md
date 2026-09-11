@@ -36,6 +36,14 @@ reviewed through 2026-09-11. These changes are not published release artifacts.
 
 ### Fixed
 
+- **Reconstruction dry-run validates a real candidate.** The doctor now
+  builds the same archive-and-salvage candidate as reconstruction in private
+  scratch space, checks full integrity and the promotion receipt's stable-key
+  continuity rules, and reports accepted candidate counts or an actionable
+  refusal. JSON output is a single document and refused previews exit nonzero.
+  The live database and archive remain untouched; promotion still revalidates
+  under its own locks.
+  ([#271](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/271))
 - **Starting a server preserves MCP client configuration.** Bare interactive
   `am` and `am serve-http` no longer repoint existing project/user clients to a
   temporary server. Use `am setup run` or the new `am serve-http --setup` flag
@@ -52,8 +60,7 @@ reviewed through 2026-09-11. These changes are not published release artifacts.
 - **Reservation normalization recognizes authoritative project human keys.**
   The doctor accepts an artifact's project slug or its matching database human
   key, allowing proven legacy migration and stale-generation quarantine while
-  leaving unrelated project payloads untouched. Reconstruct dry-run candidate
-  validation remains separate work.
+  leaving unrelated project payloads untouched.
   ([#271](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/271))
 - **Lexical search notices edits and deletions below the highest message ID.**
   Transactional change counters invalidate stale hits and cached misses without

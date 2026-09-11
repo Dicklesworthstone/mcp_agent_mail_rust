@@ -2576,7 +2576,7 @@ pub enum DoctorCommand {
     /// database from the archived messages and agent profiles. Use this when
     /// the database is corrupt and no healthy backup exists.
     Reconstruct {
-        /// Preview what would be recovered without writing.
+        /// Build and validate a temporary candidate without changing the mailbox.
         #[arg(long)]
         dry_run: bool,
         /// Auto-confirm (skip interactive prompt).
@@ -60590,6 +60590,7 @@ startup_timeout_sec = 42
             false,
             true,
             false,
+            false,
         );
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -60617,6 +60618,7 @@ startup_timeout_sec = 42
             Some(&linked_storage),
             false,
             true,
+            false,
             false,
         )
         .expect_err("symlinked storage root should be rejected");
@@ -60651,6 +60653,7 @@ startup_timeout_sec = 42
             Some(&storage_root),
             false,
             true,
+            false,
             false,
         )
         .expect_err("symlinked destination should be rejected");
@@ -60688,9 +60691,15 @@ startup_timeout_sec = 42
         symlink(&real_parent, &linked_parent).unwrap();
 
         let db_path = linked_parent.join("reconstructed.sqlite3");
-        let err =
-            handle_doctor_reconstruct_with(Some(&db_path), Some(&storage_root), false, true, false)
-                .expect_err("symlinked destination parent should be rejected");
+        let err = handle_doctor_reconstruct_with(
+            Some(&db_path),
+            Some(&storage_root),
+            false,
+            true,
+            false,
+            false,
+        )
+        .expect_err("symlinked destination parent should be rejected");
 
         match err {
             CliError::Other(msg) => {
@@ -60712,8 +60721,14 @@ startup_timeout_sec = 42
         std::fs::create_dir_all(&projects_dir).unwrap();
         let db_path = tmp.path().join("test.db");
 
-        let result =
-            handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), true, false, true);
+        let result = handle_doctor_reconstruct_with(
+            Some(&db_path),
+            Some(tmp.path()),
+            true,
+            false,
+            true,
+            false,
+        );
         assert!(result.is_ok());
     }
 
@@ -60728,7 +60743,7 @@ startup_timeout_sec = 42
         let db_path = tmp.path().join("empty-json.sqlite3");
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), true, true, true)
+        handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), true, true, true, false)
             .expect("empty archive should emit a structured skip");
         let output = capture.drain_to_string();
         let payload: serde_json::Value =
@@ -60758,7 +60773,7 @@ startup_timeout_sec = 42
         let db_path = tmp.path().join("empty-archive-reconstruct.sqlite3");
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), false, true, false)
+        handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), false, true, false, false)
             .expect("empty archive should be a non-mutating skip");
         let output = capture.drain_to_string();
 
@@ -60966,7 +60981,7 @@ startup_timeout_sec = 42
         let db_path = tmp.path().join("reconstructed.db");
 
         let result =
-            handle_doctor_reconstruct_with(Some(&db_path), Some(storage), false, true, true);
+            handle_doctor_reconstruct_with(Some(&db_path), Some(storage), false, true, true, false);
         assert!(result.is_ok(), "reconstruct failed: {result:?}");
         assert!(db_path.exists(), "reconstructed DB file should exist");
 
@@ -61039,6 +61054,7 @@ startup_timeout_sec = 42
                     false,
                     true,
                     true,
+                    false,
                 );
                 let output = capture.drain_to_string();
                 assert!(result.is_ok(), "reconstruct failed: {result:?}");
@@ -61196,6 +61212,7 @@ startup_timeout_sec = 42
                     false,
                     true,
                     true,
+                    false,
                 );
                 let output = capture.drain_to_string();
                 assert!(
@@ -61302,6 +61319,7 @@ startup_timeout_sec = 42
                     false,
                     true,
                     true,
+                    false,
                 );
                 let output = capture.drain_to_string();
                 assert!(result.is_ok(), "reconstruct failed: {result:?}");
@@ -61895,8 +61913,15 @@ startup_timeout_sec = 42
         std::fs::write(threads_dir.join("thread-1.md"), "# Thread thread-1\n").unwrap();
 
         let capture = ftui_runtime::StdioCapture::install().expect("install capture");
-        handle_doctor_reconstruct_with(Some(&db_path), Some(&storage_root), true, false, true)
-            .expect("dry run should succeed");
+        handle_doctor_reconstruct_with(
+            Some(&db_path),
+            Some(&storage_root),
+            true,
+            false,
+            true,
+            false,
+        )
+        .expect("dry run should succeed");
         let output = capture.drain_to_string();
         let payload = output
             .lines()
@@ -81637,6 +81662,7 @@ fn handle_doctor_repair_with_options(
                 false,
                 yes,
                 false,
+                false,
             );
         }
         if dry_run {
@@ -81691,6 +81717,7 @@ fn handle_doctor_repair_with_options(
                     Some(storage_root),
                     false,
                     yes,
+                    false,
                     false,
                 );
             }
@@ -81770,6 +81797,7 @@ fn handle_doctor_repair_with_options(
                         false,
                         yes,
                         false,
+                        false,
                     );
                 }
                 ftui_runtime::ftui_println!(
@@ -81798,6 +81826,7 @@ fn handle_doctor_repair_with_options(
                         Some(storage_root),
                         false,
                         yes,
+                        false,
                         false,
                     );
                 }
@@ -81887,6 +81916,7 @@ fn handle_doctor_repair_with_options(
                 false,
                 yes,
                 false,
+                false,
             );
         }
         Err(error) => {
@@ -81935,6 +81965,7 @@ fn handle_doctor_repair_with_options(
                 Some(storage_root),
                 false,
                 yes,
+                false,
                 false,
             );
         }
@@ -82346,11 +82377,13 @@ fn handle_doctor_reconstruct_locked_with_path(
                 &storage_root,
                 &db_path,
             ) {
-                Ok(chain_error) => output::info(&format!(
+                Ok(chain_error) => ftui_runtime::ftui_eprintln!(
                     "--reseed-receipt-chain would quarantine the receipt chain (broken: {chain_error})"
-                )),
+                ),
                 Err(refusal) => {
-                    output::info(&format!("--reseed-receipt-chain would refuse: {refusal}"));
+                    return Err(CliError::Other(format!(
+                        "--reseed-receipt-chain would refuse: {refusal}"
+                    )));
                 }
             }
         } else {
@@ -82366,7 +82399,14 @@ fn handle_doctor_reconstruct_locked_with_path(
             ));
         }
     }
-    handle_doctor_reconstruct_with(Some(&db_path), Some(&storage_root), dry_run, yes, json)
+    handle_doctor_reconstruct_with(
+        Some(&db_path),
+        Some(&storage_root),
+        dry_run,
+        yes,
+        json,
+        dry_run && reseed_receipt_chain,
+    )
 }
 
 #[cfg(test)]
@@ -83279,21 +83319,24 @@ impl DoctorReconstructSalvagePreview {
     }
 }
 
-/// Run the real command's salvage selection and validation without writing
-/// anything, so `--dry-run` and `-y` cannot disagree about whether a recovery
-/// is possible (GH#302).
-fn doctor_reconstruct_salvage_preview(db_path: &Path) -> DoctorReconstructSalvagePreview {
+fn doctor_reconstruct_salvage_attempt(db_path: &Path) -> Option<DoctorSalvageAttempt> {
     let candidates = doctor_salvage_artifact_candidates(db_path);
-    if candidates.is_empty() {
-        return DoctorReconstructSalvagePreview::NoCandidate;
-    }
-    match attempt_best_doctor_salvage_artifact_from_candidates(db_path, candidates) {
-        DoctorSalvageAttempt::Failed(detail) => {
-            DoctorReconstructSalvagePreview::NotMaterializable(detail)
+    (!candidates.is_empty())
+        .then(|| attempt_best_doctor_salvage_artifact_from_candidates(db_path, candidates))
+}
+
+/// Describe the same retained source that the candidate builder will consume.
+fn doctor_reconstruct_salvage_preview(
+    attempt: Option<&DoctorSalvageAttempt>,
+) -> DoctorReconstructSalvagePreview {
+    match attempt {
+        None => DoctorReconstructSalvagePreview::NoCandidate,
+        Some(DoctorSalvageAttempt::Failed(detail)) => {
+            DoctorReconstructSalvagePreview::NotMaterializable(detail.clone())
         }
-        DoctorSalvageAttempt::Succeeded(artifact) => {
-            let source = artifact.db_path.clone();
-            match mcp_agent_mail_db::classify_salvage_source(&source) {
+        Some(DoctorSalvageAttempt::Succeeded(artifact)) => {
+            let source = artifact.reported_path.clone();
+            match mcp_agent_mail_db::classify_salvage_source(&artifact.db_path) {
                 mcp_agent_mail_db::SalvageSourceVerdict::Mergeable => {
                     DoctorReconstructSalvagePreview::WouldMerge(source)
                 }
@@ -83308,12 +83351,60 @@ fn doctor_reconstruct_salvage_preview(db_path: &Path) -> DoctorReconstructSalvag
     }
 }
 
+/// Build the actual archive/salvage candidate in both preview and repair modes.
+/// The caller chooses a fresh scratch path; this never promotes a generation.
+fn build_doctor_reconstruct_candidate(
+    candidate_path: &Path,
+    storage_root: &Path,
+    salvage_attempt: Option<&DoctorSalvageAttempt>,
+) -> CliResult<mcp_agent_mail_db::ReconstructStats> {
+    let salvage_db_path = salvage_attempt.and_then(|attempt| match attempt {
+        DoctorSalvageAttempt::Succeeded(artifact) => Some(artifact.db_path.as_path()),
+        DoctorSalvageAttempt::Failed(_) => None,
+    });
+    let reconstruct = salvage_db_path.map_or_else(
+        || mcp_agent_mail_db::reconstruct_from_archive(candidate_path, storage_root),
+        |private_salvage_db_path| {
+            mcp_agent_mail_db::reconstruct_from_archive_with_private_salvage(
+                candidate_path,
+                storage_root,
+                private_salvage_db_path,
+            )
+        },
+    );
+    let mut stats = reconstruct.map_err(|error| {
+        preserve_doctor_temp_sqlite_artifact(candidate_path);
+        CliError::Other(format!(
+            "reconstruction failed (original database is untouched): {error}"
+        ))
+    })?;
+    if !mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(candidate_path)
+        .map_err(|error| {
+            CliError::Other(format!(
+                "failed to run full integrity check on reconstructed database {}: {error}",
+                candidate_path.display()
+            ))
+        })?
+    {
+        preserve_doctor_temp_sqlite_artifact(candidate_path);
+        return Err(CliError::Other(format!(
+            "reconstructed database at {} did not pass full integrity checks; original database is untouched",
+            candidate_path.display()
+        )));
+    }
+    if let Some(DoctorSalvageAttempt::Failed(detail)) = salvage_attempt {
+        stats.warnings.push(detail.clone());
+    }
+    Ok(stats)
+}
+
 fn handle_doctor_reconstruct_with(
     db_path_override: Option<&Path>,
     storage_root_override: Option<&Path>,
     dry_run: bool,
     yes: bool,
     json: bool,
+    preview_reseed_broken_chain: bool,
 ) -> CliResult<()> {
     // Caller must acquire mailbox activity locks before invoking this helper
     // because it can replace the live SQLite file and reconcile archive state.
@@ -83405,13 +83496,64 @@ fn handle_doctor_reconstruct_with(
     }
 
     if dry_run {
-        // Walk the archive to report what would be recovered, without writing.
-        ftui_runtime::ftui_println!("Dry run — scanning archive at {}", storage_root.display());
+        // Build only in a private scratch directory, never beside the live DB
+        // or inside its archive. Promotion's actual semantic evidence collector
+        // catches conflicts that archive file counts cannot predict (GH#271).
+        ftui_runtime::ftui_eprintln!(
+            "Dry run — validating reconstruction at {}",
+            storage_root.display()
+        );
         let stats = scan_archive_stats(&storage_root);
-        // GH#302: run the SAME salvage validation the real command runs. The
-        // dry run used to skip it entirely and promise a recovery that the
-        // real `am doctor reconstruct -y` then refused on the salvage source.
-        let salvage_preview = doctor_reconstruct_salvage_preview(&db_path);
+        let temp_root = std::fs::canonicalize(std::env::temp_dir()).map_err(|error| {
+            CliError::Other(format!(
+                "cannot resolve reconstruct preview temporary directory: {error}"
+            ))
+        })?;
+        let archive_root = std::fs::canonicalize(&storage_root).map_err(|error| {
+            CliError::Other(format!(
+                "cannot resolve reconstruct preview archive: {error}"
+            ))
+        })?;
+        if temp_root.starts_with(&archive_root) {
+            return Err(CliError::InvalidArgument(
+                "reconstruct preview temporary directory must be outside the mailbox archive; set TMPDIR to a separate directory".to_string(),
+            ));
+        }
+        let scratch = canonical_snapshot_tempdir_in(
+            &temp_root,
+            "am-reconstruct-preview-",
+            "reconstruct preview",
+        )?;
+        let candidate_path = scratch.path().join("candidate.sqlite3");
+        let salvage_attempt = doctor_reconstruct_salvage_attempt(&db_path);
+        let salvage_preview = doctor_reconstruct_salvage_preview(salvage_attempt.as_ref());
+        let candidate = build_doctor_reconstruct_candidate(
+            &candidate_path,
+            &storage_root,
+            salvage_attempt.as_ref(),
+        )
+        .and_then(|recovered| {
+            let continuity = mcp_agent_mail_db::forensics::validate_recovery_candidate_continuity(
+                &storage_root,
+                &db_path,
+                path_is_real_file(&db_path).then_some(db_path.as_path()),
+                &candidate_path,
+                preview_reseed_broken_chain,
+            )
+            .map_err(|error| CliError::Other(error.to_string()))?;
+            Ok((recovered, continuity))
+        });
+        let validation = match &candidate {
+            Ok((recovered, continuity)) => serde_json::json!({
+                "status": "valid", "would_refuse": false,
+                "recovered": continuity,
+                "parse_errors": recovered.parse_errors,
+                "warnings": recovered.warnings,
+            }),
+            Err(error) => serde_json::json!({
+                "status": "would_refuse", "would_refuse": true, "detail": error.to_string(),
+            }),
+        };
         if json {
             ftui_runtime::ftui_println!(
                 "{}",
@@ -83430,6 +83572,9 @@ fn handle_doctor_reconstruct_with(
                         "unparseable_canonical_message_files": stats.unparseable_canonical_message_files,
                     },
                     "salvage": salvage_preview.to_json(),
+                    "candidate_validation": validation,
+                    "would_reseed_receipt_chain": preview_reseed_broken_chain,
+                    "actions_taken": 0,
                 })
             );
         } else {
@@ -83456,14 +83601,15 @@ fn handle_doctor_reconstruct_with(
             }
             ftui_runtime::ftui_println!("  Database path: {}", db_path.display());
             ftui_runtime::ftui_println!("  Salvage:       {}", salvage_preview.summary());
-            ftui_runtime::ftui_println!("No changes made.");
+            match &candidate {
+                Ok(_) => ftui_runtime::ftui_println!(
+                    "  Candidate:     passed full integrity and promotion continuity checks"
+                ),
+                Err(error) => ftui_runtime::ftui_println!("  Candidate:     WOULD REFUSE: {error}"),
+            }
+            ftui_runtime::ftui_println!("No mailbox changes made; no candidate promoted.");
         }
-        if let DoctorReconstructSalvagePreview::WouldRefuse { detail, .. } = &salvage_preview {
-            output::warn(&format!(
-                "`am doctor reconstruct -y` would REFUSE with: {detail}"
-            ));
-        }
-        return Ok(());
+        return candidate.map(|_| ());
     }
 
     if !confirm_mutating_doctor_action(
@@ -83501,58 +83647,9 @@ fn handle_doctor_reconstruct_with(
     // Attempt salvage through a guarded private snapshot of the original DB
     // (no rename yet), or from nearby offline doctor artifacts when an
     // operator already moved the primary aside.
-    let salvage_candidates = doctor_salvage_artifact_candidates(&db_path);
-    let salvage_attempt = if salvage_candidates.is_empty() {
-        None
-    } else {
-        Some(attempt_best_doctor_salvage_artifact_from_candidates(
-            &db_path,
-            salvage_candidates,
-        ))
-    };
-    let salvage_db_path = salvage_attempt.as_ref().and_then(|attempt| match attempt {
-        DoctorSalvageAttempt::Succeeded(artifact) => Some(artifact.db_path.as_path()),
-        DoctorSalvageAttempt::Failed(_) => None,
-    });
-
-    // Reconstruct into the TEMP path — original DB is still untouched.
-    let reconstruct = salvage_db_path.map_or_else(
-        || mcp_agent_mail_db::reconstruct_from_archive(&temp_db_path, &storage_root),
-        |private_salvage_db_path| {
-            mcp_agent_mail_db::reconstruct_from_archive_with_private_salvage(
-                &temp_db_path,
-                &storage_root,
-                private_salvage_db_path,
-            )
-        },
-    );
-    let mut stats = match reconstruct {
-        Ok(stats) => stats,
-        Err(e) => {
-            // Clean up the partial temp file; original DB is safe.
-            preserve_doctor_temp_sqlite_artifact(&temp_db_path);
-            return Err(CliError::Other(format!(
-                "reconstruction failed (original database is untouched): {e}"
-            )));
-        }
-    };
-
-    // Validate the reconstructed temp DB before swapping.
-    if !mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(&temp_db_path)
-        .map_err(|error| {
-            CliError::Other(format!(
-                "failed to run full integrity check on reconstructed database {}: {error}",
-                temp_db_path.display()
-            ))
-        })?
-    {
-        preserve_doctor_temp_sqlite_artifact(&temp_db_path);
-        return Err(CliError::Other(format!(
-            "reconstructed database at {} did not pass full integrity checks; \
-             original database is untouched",
-            temp_db_path.display()
-        )));
-    }
+    let salvage_attempt = doctor_reconstruct_salvage_attempt(&db_path);
+    let stats =
+        build_doctor_reconstruct_candidate(&temp_db_path, &storage_root, salvage_attempt.as_ref())?;
 
     mcp_agent_mail_db::promote_recovery_candidate(&db_path, &temp_db_path, &storage_root).map_err(
         |err| {
@@ -83611,15 +83708,6 @@ fn handle_doctor_reconstruct_with(
             Err(error) => ftui_runtime::ftui_eprintln!(
                 "  Warning: post-swap archive id-floor scan failed: {error}"
             ),
-        }
-    }
-
-    if let Some(attempt) = &salvage_attempt {
-        match attempt {
-            DoctorSalvageAttempt::Failed(detail) => {
-                stats.warnings.push(detail.clone());
-            }
-            DoctorSalvageAttempt::Succeeded(_) => {}
         }
     }
 

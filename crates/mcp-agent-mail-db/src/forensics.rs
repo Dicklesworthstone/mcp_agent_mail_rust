@@ -2920,6 +2920,22 @@ fn collect_recovery_receipt_evidence(
     archive_identity_overrides: &BTreeMap<String, String>,
 ) -> Result<RecoveryReceiptEvidence, SqlError> {
     let chain = verify_finalized_recovery_receipt_chain(receipts_dir)?;
+    collect_recovery_receipt_evidence_with_chain(
+        receipts_dir,
+        source_path,
+        candidate_path,
+        archive_identity_overrides,
+        chain,
+    )
+}
+
+fn collect_recovery_receipt_evidence_with_chain(
+    receipts_dir: &Path,
+    source_path: Option<&Path>,
+    candidate_path: &Path,
+    archive_identity_overrides: &BTreeMap<String, String>,
+    chain: Option<VerifiedRecoveryReceiptChain>,
+) -> Result<RecoveryReceiptEvidence, SqlError> {
     let (mut source_sets, mut source_snapshot_failure_sha256) = match source_path {
         Some(path) => {
             match collect_recovery_continuity_sets_with_overrides(path, archive_identity_overrides)
@@ -3157,6 +3173,65 @@ fn collect_recovery_receipt_evidence(
 }
 
 const RECOVERY_RECEIPT_SINGLETON_PENDING_FILE: &str = "recovery-admission.receipt.pending";
+
+/// Counts from the validated candidate's semantic inventory, including salvage.
+#[derive(Debug, Serialize)]
+pub struct RecoveryCandidateContinuity {
+    pub projects: usize,
+    pub agents: usize,
+    pub messages: usize,
+    pub recipients: usize,
+    pub reservations: usize,
+    /// False when the source is absent, corrupt, or lacks verifiable recovery lineage.
+    pub source_verified: bool,
+}
+
+/// Validate a built recovery candidate using the promotion receipt's actual
+/// source/candidate stable-key, lifecycle and continuity checks (GH#271).
+///
+/// Reads source-neutral snapshots without creating receipt directories or
+/// intents, acquiring promotion authority, or modifying either generation.
+/// This is a preview of current evidence; promotion must revalidate after
+/// acquiring its own admission and writer barrier.
+/// When `reseed_broken_chain` is requested, require the real quarantine's
+/// read-only admission check and model its absence of a predecessor chain.
+///
+/// # Errors
+///
+/// Returns the same receipt-admission or semantic-evidence refusal as promotion.
+pub fn validate_recovery_candidate_continuity(
+    storage_root: &Path,
+    db_path: &Path,
+    source_path: Option<&Path>,
+    candidate_path: &Path,
+    reseed_broken_chain: bool,
+) -> Result<RecoveryCandidateContinuity, SqlError> {
+    let authority_path = recovery_receipt_db_authority_path(db_path)?;
+    let receipts_dir = recovery_receipts_dir(storage_root, &authority_path)?;
+    let chain = if reseed_broken_chain {
+        broken_recovery_receipt_chain_error_in(&receipts_dir)?;
+        None
+    } else {
+        verify_recovery_receipt_state_for_promotion(storage_root, &authority_path)?;
+        verify_finalized_recovery_receipt_chain(&receipts_dir)?
+    };
+    let archive_identity_overrides = archive_canonical_project_identities(storage_root);
+    let evidence = collect_recovery_receipt_evidence_with_chain(
+        &receipts_dir,
+        source_path,
+        candidate_path,
+        &archive_identity_overrides,
+        chain,
+    )?;
+    Ok(RecoveryCandidateContinuity {
+        projects: evidence.candidate.projects.count,
+        agents: evidence.candidate.agents.count,
+        messages: evidence.candidate.messages.count,
+        recipients: evidence.candidate.message_recipients.count,
+        reservations: evidence.candidate.reservations.count,
+        source_verified: source_path.is_some() && evidence.source_snapshot_failure_sha256.is_none(),
+    })
+}
 
 /// Build and durably persist a promotion intent from deterministic stable-key
 /// snapshots. Any lost coordination/security key aborts before the live path
@@ -4506,6 +4581,68 @@ mod tests {
                 .iter()
                 .all(|key| key == "gone-identity"),
             "the deduplicated surviving identity must not be reported as lost"
+        );
+    }
+
+    #[test]
+    fn candidate_preview_and_receipt_refuse_the_same_duplicate_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.sqlite3");
+        let candidate = temp.path().join("candidate.sqlite3");
+        let storage = temp.path().join("archive");
+        std::fs::create_dir(&storage).unwrap();
+        seed_recovery_receipt_db(&source, true);
+        seed_recovery_receipt_db(&candidate, true);
+        let receipts = super::recovery_receipts_dir(&storage, &source).unwrap();
+        let source_before = std::fs::read(&source).unwrap();
+        let valid = super::validate_recovery_candidate_continuity(
+            &storage,
+            &source,
+            Some(&source),
+            &candidate,
+            false,
+        )
+        .unwrap();
+        assert_eq!(valid.reservations, 1);
+        assert!(valid.source_verified);
+        assert!(!receipts.exists(), "preview must not create receipt state");
+        let conn = crate::CanonicalDbConn::open_file(candidate.to_str().unwrap()).unwrap();
+        conn.execute_raw(
+            "INSERT INTO file_reservations \
+             SELECT 99, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts \
+             FROM file_reservations; \
+             INSERT INTO file_reservation_releases VALUES (99, 777777);",
+        ).unwrap();
+        drop(conn);
+        let candidate_before = std::fs::read(&candidate).unwrap();
+        let preview_error = super::validate_recovery_candidate_continuity(
+            &storage,
+            &source,
+            Some(&source),
+            &candidate,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !receipts.exists(),
+            "refused preview must not create an intent"
+        );
+        let receipt_error =
+            super::prepare_recovery_receipt(&storage, &source, Some(&source), &candidate)
+                .unwrap_err()
+                .to_string();
+        assert_eq!(preview_error, receipt_error);
+        assert!(
+            preview_error.contains("reservations produced 2 rows but only 1 unique stable keys"),
+            "{preview_error}"
+        );
+        assert!(preview_error.contains("src/**"), "{preview_error}");
+        assert_eq!(std::fs::read(&source).unwrap(), source_before);
+        assert_eq!(std::fs::read(&candidate).unwrap(), candidate_before);
+        assert_eq!(
+            super::pending_recovery_receipt_paths(&receipts).unwrap(),
+            [] as [std::path::PathBuf; 0]
         );
     }
 

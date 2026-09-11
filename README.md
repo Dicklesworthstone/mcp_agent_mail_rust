@@ -1676,6 +1676,7 @@ am doctor repair --yes          # Auto-confirm everything (CI/automation)
 
 # Archive-first recovery
 am doctor reconstruct           # Rebuild SQLite from the Git archive (+ salvage what it can)
+am doctor reconstruct --dry-run --json  # Build and validate a private preview candidate
 
 # Full auto-remediation
 am doctor fix --dry-run         # Preview all safe/automatic fixes
@@ -1689,6 +1690,17 @@ am doctor support-bundle --stdout-log /tmp/am.stdout --stderr-log /tmp/am.stderr
 am doctor backups               # List available backups
 am doctor restore /path/to/backup.sqlite3
 ```
+
+`am doctor reconstruct --dry-run` builds a candidate in temporary scratch space
+using the same archive and salvage merge as reconstruction. It checks full
+integrity and the promotion receipt's stable-key continuity rules without
+changing the mailbox or publishing a recovery receipt. Budget temporary disk
+space and runtime for a full rebuild. With `--json`, `candidate_validation`
+reports the accepted candidate's counts or the refusal detail; a refused
+preview exits nonzero. With `--reseed-receipt-chain`, it checks that the broken
+chain can be quarantined and validates the candidate against the resulting
+fresh lineage without moving the live receipts. A successful preview does not reserve promotion authority:
+the real operation rechecks the source and candidate under its own locks.
 
 `am doctor locks --json` is the read-only owner report. Repair and reconstruct
 refuse a live, wedged, or unsafe-to-touch owner by default. A separate

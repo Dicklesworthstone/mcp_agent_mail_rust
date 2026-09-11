@@ -4952,6 +4952,329 @@ fn list_projects_with_agents_shows_agent_names() {
     );
 }
 
+#[test]
+fn reconstruct_preview_and_repair_agree_on_reservation_lifecycle_merge() {
+    check_reconstruct_preview_reservations(false, false);
+}
+
+#[test]
+fn reconstruct_preview_and_repair_refuse_ambiguous_reservation_stable_keys() {
+    check_reconstruct_preview_reservations(true, false);
+}
+
+#[test]
+fn reconstruct_preview_models_receipt_reseed_without_touching_chain() {
+    check_reconstruct_preview_reservations(false, true);
+}
+
+fn check_reconstruct_preview_reservations(ambiguous_source: bool, check_reseed: bool) {
+    let preview_env = TestEnv::new();
+    let repair_env = TestEnv::new();
+    let project_dir = preview_env.storage_root.join("projects/parity-project");
+    let profile_dir = project_dir.join("agents/BlueLake");
+    let reservations_dir = project_dir.join("file_reservations");
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    std::fs::create_dir_all(&reservations_dir).unwrap();
+    std::fs::write(
+        project_dir.join("project.json"),
+        r#"{"slug":"parity-project","human_key":"/reconstruct-parity","created_at":0}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        r#"{"name":"BlueLake","program":"codex-cli","model":"test","inception_ts":"2026-08-27T05:00:00Z","last_active_ts":"2026-08-27T05:00:00Z"}"#,
+    )
+    .unwrap();
+    let mut reservation = json!({
+        "id": 174, "project": "/reconstruct-parity", "agent": "BlueLake",
+        "db_generation": "11111111111111111111111111111111",
+        "path_pattern": "src/parity/**", "exclusive": true, "reason": "preview parity",
+        "created_ts": "2026-08-27T06:22:00Z", "expires_ts": "2026-08-27T07:22:00Z",
+        "released_ts": null,
+    });
+    std::fs::write(
+        reservations_dir.join("id-174-g11111111111111111111111111111111.json"),
+        serde_json::to_vec(&reservation).unwrap(),
+    )
+    .unwrap();
+    mcp_agent_mail_db::reconstruct_from_archive(&preview_env.db_path, &preview_env.storage_root)
+        .expect("build real source from active archive generation");
+    reservation["released_ts"] = "2026-08-27T07:00:00Z".into();
+    reservation["db_generation"] = "22222222222222222222222222222222".into();
+    std::fs::write(
+        reservations_dir.join("id-174-g22222222222222222222222222222222.json"),
+        serde_json::to_vec(&reservation).unwrap(),
+    )
+    .unwrap();
+    // The DB has a conflicting later release. Archive-first reconstruction
+    // must keep the archive's terminal state, warn, and preserve one identity.
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(preview_env.db_path.to_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        conn.query_sync("SELECT COUNT(*) AS n FROM file_reservations", &[])
+            .unwrap()[0]
+            .get_named::<i64>("n")
+            .unwrap(),
+        1,
+        "the fixture must contain an actual active reservation before salvage"
+    );
+    conn.execute_raw(
+        "UPDATE file_reservations SET released_ts = 1787901000000000; \
+         INSERT INTO file_reservation_releases (reservation_id, released_ts) \
+         SELECT id, released_ts FROM file_reservations;",
+    )
+    .unwrap();
+    if ambiguous_source {
+        // A healthy SQLite image with an ambiguous semantic identity. Merely
+        // classifying salvage as readable cannot detect this promotion refusal.
+        conn.execute_raw(
+            "INSERT INTO file_reservations \
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+             SELECT 999, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts \
+             FROM file_reservations; \
+             INSERT INTO file_reservation_releases (reservation_id, released_ts) \
+             VALUES (999, 1787901000000000);",
+        )
+        .unwrap();
+    }
+    drop(conn);
+    assert!(
+        mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(
+            &preview_env.db_path
+        )
+        .unwrap(),
+        "the negative must be semantic ambiguity, not SQLite corruption"
+    );
+
+    // Independent byte-identical input copies; the actual repair cannot alter
+    // what the preview inspected or accidentally validate its scratch output.
+    std::fs::copy(&preview_env.db_path, &repair_env.db_path).unwrap();
+    let mut pending = vec![preview_env.storage_root.clone()];
+    while let Some(source) = pending.pop() {
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let destination = repair_env
+                .storage_root
+                .join(path.strip_prefix(&preview_env.storage_root).unwrap());
+            if entry.file_type().unwrap().is_dir() {
+                std::fs::create_dir_all(&destination).unwrap();
+                pending.push(path);
+            } else {
+                assert!(entry.file_type().unwrap().is_file());
+                std::fs::copy(path, destination).unwrap();
+            }
+        }
+    }
+    assert_eq!(
+        std::fs::read(&preview_env.db_path).unwrap(),
+        std::fs::read(&repair_env.db_path).unwrap()
+    );
+    let preview_archive = snapshot_tree(&preview_env.storage_root);
+    let repair_archive = snapshot_tree(&repair_env.storage_root);
+    assert_eq!(
+        preview_archive.keys().collect::<Vec<_>>(),
+        repair_archive.keys().collect::<Vec<_>>()
+    );
+    for (path, original) in &preview_archive {
+        let copied = &repair_archive[path];
+        // Copy timestamps differ; the before/after preview check below still
+        // requires exact metadata preservation on the original tree.
+        assert_eq!(copied.kind, original.kind);
+        assert_eq!(copied.content_hash, original.content_hash);
+        assert_eq!(copied.len, original.len);
+        assert_eq!(copied.mode, original.mode);
+    }
+    let before = snapshot_tree(preview_env.tmp.path());
+    let run = |env: &TestEnv, mode: &str| {
+        Command::new(am_bin())
+            .env_clear()
+            .envs(env.isolated_env())
+            .current_dir(env.hostile_repo())
+            .args(["doctor", "reconstruct", mode, "--json"])
+            .output()
+            .unwrap()
+    };
+    let preview = run(&preview_env, "--dry-run");
+    let preview_json: Value = serde_json::from_slice(&preview.stdout).unwrap_or_else(|error| {
+        panic!(
+            "preview stdout must be a single JSON value ({error}):\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&preview.stdout),
+            String::from_utf8_lossy(&preview.stderr)
+        )
+    });
+    assert_eq!(snapshot_tree(preview_env.tmp.path()), before);
+    assert_eq!(preview_json["actions_taken"], 0);
+    assert_eq!(preview_json["salvage"]["status"], "would_merge");
+    #[cfg(unix)]
+    {
+        let unsafe_scratch = Command::new(am_bin())
+            .env_clear()
+            .envs(preview_env.isolated_env())
+            .env("TMPDIR", &preview_env.storage_root)
+            .current_dir(preview_env.hostile_repo())
+            .args(["doctor", "reconstruct", "--dry-run", "--json"])
+            .output()
+            .unwrap();
+        assert!(!unsafe_scratch.status.success());
+        assert!(
+            String::from_utf8_lossy(&unsafe_scratch.stderr)
+                .contains("temporary directory must be outside the mailbox archive")
+        );
+        assert_eq!(snapshot_tree(preview_env.tmp.path()), before);
+    }
+    let repair_before = std::fs::read(&repair_env.db_path).unwrap();
+    let repair_archive_before = snapshot_tree(&repair_env.storage_root);
+    let repaired = run(&repair_env, "--yes");
+    if ambiguous_source {
+        assert!(!preview.status.success());
+        assert!(!repaired.status.success());
+        assert_eq!(preview_json["candidate_validation"]["would_refuse"], true);
+        let preview_error = preview_json["candidate_validation"]["detail"]
+            .as_str()
+            .unwrap();
+        let repair_error = String::from_utf8_lossy(&repaired.stderr);
+        for expected in ["unique stable keys", "src/parity/**", "BlueLake"] {
+            assert!(preview_error.contains(expected), "{preview_error}");
+            assert!(repair_error.contains(expected), "{repair_error}");
+        }
+        assert_eq!(std::fs::read(&repair_env.db_path).unwrap(), repair_before);
+        // Repair is allowed to retain forensics; authoritative archive files
+        // still cannot be rewritten by a refused candidate.
+        let repair_archive_after = snapshot_tree(&repair_env.storage_root);
+        for (path, original) in repair_archive_before {
+            assert_eq!(
+                repair_archive_after.get(&path),
+                Some(&original),
+                "{}",
+                path.display()
+            );
+        }
+    } else {
+        assert!(
+            preview.status.success(),
+            "{}",
+            String::from_utf8_lossy(&preview.stderr)
+        );
+        assert!(
+            repaired.status.success(),
+            "{}",
+            String::from_utf8_lossy(&repaired.stderr)
+        );
+        assert_eq!(preview_json["candidate_validation"]["status"], "valid");
+        assert_eq!(
+            preview_json["candidate_validation"]["recovered"]["reservations"],
+            1
+        );
+        assert_eq!(
+            preview_json["candidate_validation"]["recovered"]["source_verified"],
+            true
+        );
+        assert!(
+            preview_json["candidate_validation"]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning.as_str().is_some_and(|text| {
+                    text.contains("conflicting row/ledger release timestamp")
+                        && text.contains("keeping the archive candidate")
+                })),
+            "preview must report the existing archive-first release precedence: {preview_json}"
+        );
+        let conn = mcp_agent_mail_db::DbConn::open_file(repair_env.db_path.to_str().unwrap())
+            .expect("reopen promoted candidate through the runtime engine");
+        let rows = conn
+            .query_sync(
+                "SELECT path_pattern, released_ts FROM file_reservations",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "lifecycle variants must share one identity");
+        assert_eq!(
+            rows[0].get_named::<String>("path_pattern").unwrap(),
+            "src/parity/**"
+        );
+        assert_eq!(
+            rows[0].get_named::<i64>("released_ts").unwrap(),
+            1_787_814_000_000_000
+        );
+        conn.close_sync().unwrap();
+        if check_reseed {
+            let run_reseed = |mode: &str| {
+                Command::new(am_bin())
+                    .env_clear()
+                    .envs(repair_env.isolated_env())
+                    .current_dir(repair_env.hostile_repo())
+                    .args([
+                        "doctor",
+                        "reconstruct",
+                        mode,
+                        "--json",
+                        "--reseed-receipt-chain",
+                    ])
+                    .output()
+                    .unwrap()
+            };
+            let healthy_before = snapshot_tree(repair_env.tmp.path());
+            let refused = run_reseed("--dry-run");
+            assert!(!refused.status.success());
+            assert!(String::from_utf8_lossy(&refused.stderr).contains("verifies cleanly"));
+            assert_eq!(snapshot_tree(repair_env.tmp.path()), healthy_before);
+
+            // The successful real reconstruction above created a real receipt.
+            // Add structural corruption without deleting or rewriting its proof.
+            let receipt_path = healthy_before
+                .keys()
+                .find(|path| path.to_string_lossy().ends_with(".receipt.json"))
+                .expect("successful promotion wrote a receipt");
+            let broken_path = repair_env
+                .tmp
+                .path()
+                .join(receipt_path)
+                .with_file_name("broken.receipt.json");
+            std::fs::write(&broken_path, b"{}").unwrap();
+            let broken_before = snapshot_tree(repair_env.tmp.path());
+            let reseed_preview = run_reseed("--dry-run");
+            assert!(
+                reseed_preview.status.success(),
+                "{}",
+                String::from_utf8_lossy(&reseed_preview.stderr)
+            );
+            let preview: Value = serde_json::from_slice(&reseed_preview.stdout).unwrap();
+            assert_eq!(preview["candidate_validation"]["status"], "valid");
+            assert_eq!(preview["would_reseed_receipt_chain"], true);
+            assert_eq!(preview["actions_taken"], 0);
+            assert_eq!(snapshot_tree(repair_env.tmp.path()), broken_before);
+
+            let reseeded = run_reseed("--yes");
+            assert!(
+                reseeded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&reseeded.stderr)
+            );
+            let conn = mcp_agent_mail_db::DbConn::open_file(repair_env.db_path.to_str().unwrap())
+                .expect("reopen after the previewed receipt reseed");
+            assert_eq!(
+                conn.query_sync("SELECT COUNT(*) AS n FROM file_reservations", &[])
+                    .unwrap()[0]
+                    .get_named::<i64>("n")
+                    .unwrap(),
+                1
+            );
+            conn.close_sync().unwrap();
+            assert!(
+                snapshot_tree(repair_env.tmp.path()).keys().any(|path| {
+                    path.to_string_lossy().contains(".broken-")
+                        && path
+                            .file_name()
+                            .is_some_and(|name| name == "broken.receipt.json")
+                }),
+                "the real reseed must preserve the broken chain in quarantine"
+            );
+        }
+    }
+}
+
 // ---- Serve commands (dry checks) ----
 
 #[test]
