@@ -5574,6 +5574,108 @@ mod tests {
         reset_lexical_bootstrap_tracking();
     }
 
+    #[cfg(all(unix, feature = "tantivy-engine"))]
+    #[test]
+    fn execute_search_refuses_replaced_source_behind_retained_pool() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        crate::search_v3::reset_bridge_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("retained-pool.sqlite3");
+        let config = crate::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(root.path().to_path_buf()),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let project = crate::queries::ensure_project(&cx, &pool, "/retained-pool")
+                .await.into_result().unwrap();
+            let project_id = project.id.unwrap();
+            let sender = crate::queries::register_agent(
+                &cx, &pool, project_id, "BlueLake", "codex", "test", None, None, None,
+            ).await.into_result().unwrap();
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_sync(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                 VALUES (1, ?, ?, 'oldgeneration', 'old body', 1000000)",
+                &[Value::BigInt(project_id), Value::BigInt(sender.id.unwrap())],
+            ).unwrap();
+            conn.execute_raw(
+                "INSERT OR REPLACE INTO db_identity(singleton, generation_id) VALUES (0, 'pool-before')",
+            ).unwrap();
+            drop(conn);
+            let options = SearchOptions {
+                search_engine: Some(SearchEngine::Lexical), ..Default::default()
+            };
+            let initial = execute_search(&cx, &pool,
+                &SearchQuery::messages("oldgeneration", project_id), &options)
+                .await.into_result().unwrap();
+            assert_eq!(initial.results.len(), 1);
+            let bridge = crate::search_v3::get_bridge().unwrap();
+            let marker = bridge.index_dir().join("backfill_state.json");
+            let meta = bridge.index_dir().join("meta.json");
+            let marker_before = std::fs::read(&marker).unwrap();
+            let meta_before = std::fs::read(&meta).unwrap();
+
+            let retained = pool.acquire(&cx).await.into_result().unwrap();
+            let replacement_path = root.path().join("replacement.sqlite3");
+            retained.execute_sync("VACUUM INTO ?", &[
+                Value::Text(replacement_path.to_str().unwrap().to_string()),
+            ]).unwrap();
+            let replacement = crate::DbConn::open_file(replacement_path.to_str().unwrap()).unwrap();
+            replacement.execute_raw(
+                "UPDATE messages SET subject = 'newgeneration', body_md = 'replacement body' WHERE id = 1",
+            ).unwrap();
+            replacement.execute_raw(
+                "UPDATE db_identity SET generation_id = 'pool-after' WHERE singleton = 0",
+            ).unwrap();
+            replacement.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            crate::close_db_conn(replacement, "replacement before retained-pool promotion");
+            retained.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            for suffix in ["", "-wal", "-shm"] {
+                let source = root.path().join(format!("retained-pool.sqlite3{suffix}"));
+                if source.exists() {
+                    std::fs::rename(source, root.path().join(format!("preserved-original{suffix}")))
+                        .unwrap();
+                }
+            }
+            std::fs::rename(&replacement_path, &db_path).unwrap();
+            assert_eq!(crate::queries::db_generation_id_conn(&retained).as_deref(),
+                Some("pool-before"), "precondition: checkout retains the old physical source");
+            drop(retained);
+
+            let outcome = execute_search(&cx, &pool,
+                &SearchQuery::messages("newgeneration", project_id), &options).await;
+            assert!(matches!(&outcome, Outcome::Err(error) if error.to_string().contains("replaced")),
+                "a retained old pool must refuse before publishing replacement candidates: {outcome:?}");
+            assert_eq!(std::fs::read(&marker).unwrap(), marker_before);
+            assert_eq!(std::fs::read(&meta).unwrap(), meta_before);
+
+            let fresh_pool = DbPool::new(&config).unwrap();
+            for (text, expected) in [("newgeneration", 1), ("oldgeneration", 0)] {
+                let response = execute_search(&cx, &fresh_pool,
+                    &SearchQuery::messages(text, project_id), &options)
+                    .await.into_result().unwrap();
+                assert_eq!(response.results.len(), expected, "fresh pool retry: {text}");
+                if let Some(hit) = response.results.first() {
+                    assert_eq!(hit.result.body_md, "replacement body");
+                }
+            }
+        });
+        crate::search_v3::reset_bridge_for_tests();
+        reset_lexical_bootstrap_tracking();
+    }
+
     #[test]
     fn execute_search_falls_back_to_sql_when_lexical_index_is_foreign_snapshot() {
         // GH#162: while reads are served from a reconstructed archive snapshot, the
