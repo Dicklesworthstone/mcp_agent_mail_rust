@@ -2769,6 +2769,50 @@ mod tests {
     }
 
     #[test]
+    fn backfill_refreshes_lower_id_content_changes() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let db_path = create_test_db(
+            tmp.path(),
+            &[
+                (1, "amberstart", "copperstart", "normal", "thread-one"),
+                (2, "unchanged", "tail message", "normal", "thread-two"),
+            ],
+        );
+        init_bridge(index_dir.path()).expect("initialize real Tantivy index");
+        assert_eq!(backfill_from_db(&db_path).expect("initial backfill").0, 2);
+        let bridge = get_bridge().expect("initialized bridge");
+        let search = |text: &str| {
+            bridge.search(&PlannerQuery {
+                text: text.to_string(),
+                doc_kind: DocKind::Message,
+                project_id: Some(1),
+                ..Default::default()
+            })
+        };
+        assert_eq!(search("amberstart").len(), 1);
+        let conn = DbConn::open_file(&db_path).expect("open real runtime writer");
+        let before = fetch_db_message_watermark(&conn).expect("initial watermark");
+        conn.execute_sync(
+            "UPDATE messages SET subject = 'violetfinish', body_md = 'silverfinish' WHERE id = 1",
+            &[],
+        )
+        .expect("change lower-ID subject and body");
+        assert_eq!(fetch_db_message_watermark(&conn).unwrap(), before);
+        backfill_from_db(&db_path).expect("refresh after committed edit");
+        assert_eq!(search("violetfinish").len(), 1, "new subject must be searchable");
+        assert_eq!(search("silverfinish").len(), 1, "new body must be searchable");
+        assert!(search("amberstart").is_empty(), "old subject must disappear");
+        assert!(search("copperstart").is_empty(), "old body must disappear");
+        assert_eq!(search("unchanged").len(), 1, "tail document survives");
+        reset_bridge_for_tests();
+    }
+
+    #[test]
     fn fetch_db_message_watermark_handles_empty_messages_without_coalesce() {
         let conn = DbConn::open_memory().expect("open in-memory db");
         conn.execute_sync(
