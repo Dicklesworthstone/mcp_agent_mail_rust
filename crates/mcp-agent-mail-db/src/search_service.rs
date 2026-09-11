@@ -5668,7 +5668,7 @@ mod tests {
                     .await.into_result().unwrap();
                 assert_eq!(response.results.len(), expected, "fresh pool retry: {text}");
                 if let Some(hit) = response.results.first() {
-                    assert_eq!(hit.result.body_md, "replacement body");
+                    assert_eq!(hit.result.body, "replacement body");
                 }
             }
         });
