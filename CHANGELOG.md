@@ -36,6 +36,12 @@ reviewed through 2026-09-11. These changes are not published release artifacts.
 
 ### Fixed
 
+- **Overview batches counts across projects.** `am robot overview`
+  replaces per-project message-count queries with one grouped query and counts
+  active reservations from one fleet-wide candidate scan. Release-ledger
+  filtering and orphan-project visibility are preserved. `--counts` uses the
+  same aggregation; separate CLI processes do not share the snapshot cache.
+  ([#274](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/274))
 - **Reconstruction dry-run validates a real candidate.** The doctor now
   builds the same archive-and-salvage candidate as reconstruction in private
   scratch space, checks full integrity and the promotion receipt's stable-key

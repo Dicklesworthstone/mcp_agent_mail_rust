@@ -9749,10 +9749,12 @@ fn overview_totals(projects: &[OverviewProject]) -> (usize, usize, usize) {
 }
 
 fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
-    fn decode_count(row: &sqlmodel_core::Row, label: &str) -> Result<i64, CliError> {
-        row.get_by_name("cnt")
+    fn decode_count(row: &sqlmodel_core::Row, column: &str) -> Result<i64, CliError> {
+        row.get_by_name(column)
             .and_then(sqlmodel_core::Value::as_i64)
-            .ok_or_else(|| CliError::Other(format!("{label} query returned a non-integer count")))
+            .ok_or_else(|| {
+                CliError::Other(format!("overview {column} returned a non-integer count"))
+            })
     }
 
     let now_us = mcp_agent_mail_db::now_micros();
@@ -9788,21 +9790,54 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
         )
         .map_err(|e| CliError::Other(format!("overview projects query: {e}")))?;
 
-    // Reservation-derived orphan projects come from a flat candidate scan;
-    // ledger-released rows are subtracted in Rust (GH#274).
-    let orphan_res_rows = conn
+    // One candidate scan supplies both counts and orphan visibility. Subtract
+    // the release ledger in Rust, avoiding an engine-sensitive anti-join.
+    let reservation_rows = conn
         .query_sync(
             &format!(
                 "SELECT fr.project_id AS raw_project_id, fr.id AS id
                  FROM file_reservations fr
-                 LEFT JOIN projects p ON p.id = fr.project_id
-                 WHERE p.id IS NULL
-                   AND ({active_reservation_predicate})
+                 WHERE ({active_reservation_predicate})
                    AND fr.expires_ts > ?"
             ),
             &[Value::BigInt(now_us)],
         )
-        .map_err(|e| CliError::Other(format!("overview orphan reservations query: {e}")))?;
+        .map_err(|e| CliError::Other(format!("overview reservations query: {e}")))?;
+    let mut reservation_counts = HashMap::<i64, usize>::new();
+    for row in &reservation_rows {
+        let id = decode_count(row, "id")?;
+        let pid = decode_count(row, "raw_project_id")?;
+        if !release_ledger.contains(id) {
+            *reservation_counts.entry(pid).or_default() += 1;
+        }
+    }
+
+    // Aggregate recipient counts once for the fleet. Repeating these joins for
+    // every project dominates cold CLI polling on large mailboxes (GH#274).
+    let count_rows = conn
+        .query_sync(
+            "SELECT m.project_id AS project_id,
+                    SUM(CASE WHEN mr.read_ts IS NULL THEN 1 ELSE 0 END) AS unread,
+                    SUM(CASE WHEN mr.read_ts IS NULL AND m.importance IN ('urgent', 'high')
+                             THEN 1 ELSE 0 END) AS urgent,
+                    SUM(CASE WHEN m.ack_required = 1 AND mr.ack_ts IS NULL AND m.created_ts < ?
+                             THEN 1 ELSE 0 END) AS ack_overdue
+             FROM message_recipients mr JOIN messages m ON m.id = mr.message_id
+             GROUP BY m.project_id",
+            &[Value::BigInt(micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US))],
+        )
+        .map_err(|e| CliError::Other(format!("overview message counts query failed: {e}")))?;
+    let mut message_counts = HashMap::new();
+    for row in &count_rows {
+        message_counts.insert(
+            decode_count(row, "project_id")?,
+            (
+                decode_count(row, "unread")?,
+                decode_count(row, "urgent")?,
+                decode_count(row, "ack_overdue")?,
+            ),
+        );
+    }
 
     let mut project_rows: Vec<(i64, String)> = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -9816,13 +9851,9 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
         project_rows.push((pid, slug));
     }
     let known_pids: HashSet<i64> = project_rows.iter().map(|(pid, _)| *pid).collect();
-    let mut orphan_res_pids: Vec<i64> = orphan_res_rows
-        .iter()
-        .filter(|row| {
-            !row.get_named::<i64>("id")
-                .is_ok_and(|id| release_ledger.contains(id))
-        })
-        .filter_map(|row| row.get_named::<i64>("raw_project_id").ok())
+    let mut orphan_res_pids: Vec<i64> = reservation_counts
+        .keys()
+        .copied()
         .filter(|pid| !known_pids.contains(pid))
         .collect();
     orphan_res_pids.sort_unstable();
@@ -9834,77 +9865,15 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
 
     let mut projects = Vec::new();
     for (pid, slug) in project_rows {
-        // Count unread messages across all agents in project
-        let unread: i64 = conn
-            .query_sync(
-                "SELECT COUNT(*) AS cnt FROM message_recipients mr
-                 JOIN messages m ON m.id = mr.message_id
-                WHERE m.project_id = ? AND mr.read_ts IS NULL",
-                &[Value::BigInt(pid)],
-            )
-            .map_err(|e| CliError::Other(format!("overview unread query failed: {e}")))?
-            .first()
-            .map(|row| decode_count(row, "overview unread"))
-            .transpose()?
-            .unwrap_or(0);
-
-        // Count urgent/high unread messages
-        let urgent: i64 = conn
-            .query_sync(
-                "SELECT COUNT(*) AS cnt FROM message_recipients mr
-                 JOIN messages m ON m.id = mr.message_id
-                 WHERE m.project_id = ? AND m.importance IN ('urgent', 'high')
-                 AND mr.read_ts IS NULL",
-                &[Value::BigInt(pid)],
-            )
-            .map_err(|e| CliError::Other(format!("overview urgent query failed: {e}")))?
-            .first()
-            .map(|row| decode_count(row, "overview urgent"))
-            .transpose()?
-            .unwrap_or(0);
-
-        // Count actionable ack-overdue items using the same 30m threshold as status/inbox.
-        let ack_overdue: i64 = conn
-            .query_sync(
-                "SELECT COUNT(*) AS cnt FROM message_recipients mr
-                 JOIN messages m ON m.id = mr.message_id
-                 WHERE m.project_id = ? AND m.ack_required = 1 AND mr.ack_ts IS NULL
-                   AND m.created_ts < ?",
-                &[
-                    Value::BigInt(pid),
-                    Value::BigInt(micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US)),
-                ],
-            )
-            .map_err(|e| CliError::Other(format!("overview ack-overdue query failed: {e}")))?
-            .first()
-            .map(|row| decode_count(row, "overview ack-overdue"))
-            .transpose()?
-            .unwrap_or(0);
-
-        // Count active reservations (candidate rows minus ledger releases)
-        let reservations: i64 = conn
-            .query_sync(
-                &format!(
-                    "SELECT fr.id
-                     FROM file_reservations fr
-                     WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?"
-                ),
-                &[Value::BigInt(pid), Value::BigInt(now_us)],
-            )
-            .map_err(|e| CliError::Other(format!("overview reservations query failed: {e}")))?
-            .iter()
-            .filter(|row| {
-                !row.get_named::<i64>("id")
-                    .is_ok_and(|id| release_ledger.contains(id))
-            })
-            .count() as i64;
+        let (unread, urgent, ack_overdue) = message_counts.get(&pid).copied().unwrap_or_default();
+        let reservations = reservation_counts.get(&pid).copied().unwrap_or_default();
 
         projects.push(OverviewProject {
             slug,
             unread: unread as usize,
             urgent: urgent as usize,
             ack_overdue: ack_overdue as usize,
-            reservations: reservations as usize,
+            reservations,
         });
     }
 

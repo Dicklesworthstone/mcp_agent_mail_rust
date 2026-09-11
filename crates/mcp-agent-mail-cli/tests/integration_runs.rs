@@ -664,6 +664,169 @@ fn seed_startup_recovery_orphan_recipient(env: &TestEnv) {
         .expect("checkpoint startup recovery orphan fixture");
 }
 
+#[test]
+fn robot_overview_cold_processes_preserve_project_counts_after_mutations() {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    conn.execute_raw("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE")
+        .unwrap();
+    let now = mcp_agent_mail_db::now_micros();
+    for pid in 1..=50_i64 {
+        insert_project(
+            &conn,
+            pid,
+            &format!("project-{pid:02}"),
+            &format!("/projects/{pid}"),
+        );
+        insert_agent(&conn, pid, pid, "Reader", "codex-cli", "gpt-5");
+        for offset in 0..6_i64 {
+            let id = pid * 10 + offset;
+            insert_message(&conn, id, pid, pid, "overview fixture", "body");
+            insert_recipient(&conn, id, pid);
+            conn.execute_sync(
+                "UPDATE messages SET importance = ?, ack_required = 1 WHERE id = ?",
+                &[
+                    SqlValue::Text(if offset < 2 { "urgent" } else { "normal" }.into()),
+                    SqlValue::BigInt(id),
+                ],
+            )
+            .unwrap();
+            if offset >= 3 {
+                conn.execute_sync(
+                    "UPDATE message_recipients SET read_ts = ?, ack_ts = ? WHERE message_id = ?",
+                    &[
+                        SqlValue::BigInt(now),
+                        SqlValue::BigInt(now),
+                        SqlValue::BigInt(id),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        conn.execute_sync(
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts)
+             VALUES (?, ?, ?, 'src/**', 1, 'overview', ?, ?)",
+            &[SqlValue::BigInt(pid), SqlValue::BigInt(pid), SqlValue::BigInt(pid),
+              SqlValue::BigInt(now), SqlValue::BigInt(now + 3_600_000_000)],
+        ).unwrap();
+    }
+    insert_project(&conn, 51, "empty-project", "/projects/empty");
+    // An active reservation alone must keep its missing project visible.
+    conn.execute_sync(
+        "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts)
+         VALUES (100, 100, 1, 'orphan/**', 1, 'orphan', ?, ?)",
+        &[SqlValue::BigInt(now), SqlValue::BigInt(now + 3_600_000_000)],
+    ).unwrap();
+    // Expired and ledger-released orphan leases must not invent projects.
+    conn.execute_sync(
+        "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts)
+         VALUES (101, 101, 1, 'expired/**', 1, 'expired', ?, ?),
+                (102, 102, 1, 'released/**', 1, 'released', ?, ?)",
+        &[SqlValue::BigInt(now - 2_000_000), SqlValue::BigInt(now - 1_000_000),
+          SqlValue::BigInt(now), SqlValue::BigInt(now + 3_600_000_000)],
+    ).unwrap();
+    conn.execute_sync(
+        "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (102, ?)",
+        &[SqlValue::BigInt(now)],
+    )
+    .unwrap();
+    conn.execute_raw("COMMIT").unwrap();
+    conn.close_sync().unwrap();
+
+    let mut child_env = env.isolated_env();
+    child_env.push(("AM_INTERFACE_MODE".into(), "cli".into()));
+    let overview = |counts: bool| {
+        let args = if counts {
+            vec!["robot", "overview", "--counts", "--json"]
+        } else {
+            vec!["robot", "overview", "--json"]
+        };
+        let started = Instant::now();
+        let out = run_am(&child_env, Some(env.hostile_repo()), &args, None);
+        eprintln!(
+            "GH274 cold CLI {args:?}: {:?}; binary={}",
+            started.elapsed(),
+            am_bin().display()
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut payload =
+            serde_json::from_slice::<Value>(&out.stdout).expect("one overview JSON envelope");
+        let object = payload.as_object_mut().expect("overview object");
+        object.remove("_meta");
+        object.remove("_alerts");
+        object.remove("_actions");
+        payload
+    };
+    let first = overview(false);
+    let second = overview(false);
+    assert_eq!(first, second, "separate CLI processes must agree");
+    assert_eq!(first["project_count"], 52);
+    let projects = first["projects"].as_array().unwrap();
+    for pid in 1..=50 {
+        let slug = format!("project-{pid:02}");
+        let row = projects.iter().find(|row| row["slug"] == slug).unwrap();
+        assert_eq!(row["unread"], 3);
+        assert_eq!(row["urgent"], 2);
+        assert_eq!(row["ack_overdue"], 3);
+        assert_eq!(row["reservations"], 1);
+    }
+    let orphan = projects
+        .iter()
+        .find(|row| row["slug"] == "[unknown-project-100]")
+        .unwrap();
+    assert_eq!(orphan["reservations"], 1);
+    assert_eq!(orphan["unread"], 0);
+    let empty = projects
+        .iter()
+        .find(|row| row["slug"] == "empty-project")
+        .unwrap();
+    assert_eq!(empty["unread"], 0);
+    assert_eq!(empty["reservations"], 0);
+    assert_eq!(
+        overview(true),
+        json!({"project_count": 52, "unread": 150, "urgent": 100, "ack_overdue": 150})
+    );
+
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    insert_message(&conn, 999, 1, 1, "new message after cold polling", "body");
+    insert_recipient(&conn, 999, 1);
+    conn.execute_sync(
+        "UPDATE message_recipients SET read_ts = ?, ack_ts = ? WHERE message_id = 10",
+        &[SqlValue::BigInt(now), SqlValue::BigInt(now)],
+    )
+    .unwrap();
+    conn.execute_sync(
+        "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (1, ?)",
+        &[SqlValue::BigInt(now)],
+    )
+    .unwrap();
+    conn.close_sync().unwrap();
+    let updated = overview(false);
+    for row in updated["projects"].as_array().unwrap() {
+        if row["slug"] == "project-01" {
+            assert_eq!(row["unread"], 3);
+            assert_eq!(row["urgent"], 1);
+            assert_eq!(row["ack_overdue"], 2);
+            assert_eq!(row["reservations"], 0);
+        } else {
+            let original = projects
+                .iter()
+                .find(|old| old["slug"] == row["slug"])
+                .unwrap();
+            assert_eq!(row, original, "unrelated projects must remain unchanged");
+        }
+    }
+    assert_eq!(
+        overview(true),
+        json!({"project_count": 52, "unread": 150, "urgent": 99, "ack_overdue": 149})
+    );
+}
+
 fn seed_startup_recovery_archive_only(env: &TestEnv) {
     let project_path = env.tmp.path().join("reconstructed-project");
     std::fs::create_dir_all(&project_path).expect("create reconstruct project path");

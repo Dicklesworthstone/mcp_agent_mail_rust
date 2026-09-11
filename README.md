@@ -793,7 +793,7 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 | `am robot status` | Dashboard synthesis | `--format`, `--project`, `--agent` |
 | `am robot inbox` | Actionable inbox with urgency/ack synthesis | `--urgent`, `--ack-overdue`, `--unread`, `--all`, `--limit`, `--include-bodies` |
 | `am robot timeline` | Event stream since last check | `--since`, `--kind`, `--source` |
-| `am robot overview` | Cross-project summary | `--format`, `--project`, `--agent`, `--counts` |
+| `am robot overview` | Cross-project summary | `--format`, `--counts` |
 | `am robot thread <id>` | Full thread rendering | `--limit`, `--since`, `--format` |
 | `am robot search <query>` | Full-text search with facets/relevance | `--kind`, `--importance`, `--since`, `--format` |
 | `am robot message <id>` | Single-message deep view | `--format`, `--project`, `--agent` |
@@ -815,6 +815,12 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 - **`toon`** (default at TTY): Token-efficient, compact, optimized for agent parsing
 - **`json`** (default when piped): Machine-readable envelope with `_meta`, `_alerts`, `_actions`
 - **`md`** (thread/message-focused): Human-readable narrative for deep context
+
+`am robot overview` summarizes the whole mailbox; the global `--project` and
+`--agent` flags do not scope this command. Message counts use one grouped query,
+and active reservations use one candidate scan with release-ledger filtering.
+`--counts` returns totals from the same aggregation. The snapshot cache is
+process-local, so separate CLI invocations each read the database.
 
 `am robot atc` reads the live ATC snapshot over `/mail/ws-state` when the local server is running and falls back to a local SQLite rollup/liveness view when that snapshot is unavailable. Use `--since` to trim recent decisions/executions, `--stratum` to focus open-stratum counts, and `--summary-only` for the compact health view.
 
