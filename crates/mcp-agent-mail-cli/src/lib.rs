@@ -43601,6 +43601,43 @@ mod tests {
         assert!(inspection_called.get());
     }
 
+    fn isolated_project_test_tempdir() -> tempfile::TempDir {
+        let preferred = std::env::temp_dir();
+        let mut candidates = vec![preferred.clone()];
+        #[cfg(unix)]
+        candidates.extend([PathBuf::from("/tmp"), PathBuf::from("/var/tmp")]);
+        candidates.extend(preferred.ancestors().skip(1).map(Path::to_path_buf));
+        for parent in candidates {
+            // Git, Beads and share discovery must see only the fixture's
+            // state even when TMPDIR is nested inside the source checkout.
+            if parent.ancestors().any(|ancestor| {
+                [
+                    ".git",
+                    ".beads",
+                    ".agent-mail-project-id",
+                    "Cargo.toml",
+                    "package.json",
+                    "pyproject.toml",
+                    "wrangler.toml",
+                    "netlify.toml",
+                    ".github",
+                    "scripts",
+                ]
+                .iter()
+                .any(|marker| std::fs::symlink_metadata(ancestor.join(marker)).is_ok())
+            }) {
+                continue;
+            }
+            if let Ok(dir) = tempfile::Builder::new()
+                .prefix("am-cli-isolated-")
+                .tempdir_in(parent)
+            {
+                return dir;
+            }
+        }
+        panic!("no writable temporary directory outside project ancestors");
+    }
+
     fn canonical_test_tempdir(prefix: &str) -> tempfile::TempDir {
         let temp_root = std::fs::canonicalize(std::env::temp_dir())
             .expect("canonicalize system temporary directory");
@@ -50265,7 +50302,7 @@ http_headers = { Authorization = "Bearer secret" }
             .unwrap_or_else(|e| e.into_inner());
         let capture = ftui_runtime::StdioCapture::install().expect("install capture");
 
-        let temp = tempfile::TempDir::new().expect("tempdir");
+        let temp = isolated_project_test_tempdir();
         let bundle_dir = temp.path().join("bundle");
         std::fs::create_dir_all(&bundle_dir).expect("create bundle dir");
         std::fs::write(bundle_dir.join("manifest.json"), "{}").expect("write manifest");
@@ -66779,7 +66816,7 @@ startup_timeout_sec = 42
 
     #[test]
     fn beads_issue_awareness_counts_from_missing_beads_dir_errors() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = isolated_project_test_tempdir();
         let err =
             beads_issue_awareness_counts_from(Some(dir.path())).expect_err("expected no .beads");
         assert!(
@@ -69358,7 +69395,7 @@ startup_timeout_sec = 42
         let _guard = stdio_capture_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = isolated_project_test_tempdir();
         let result = handle_project_mark_identity(dir.path(), false);
         assert!(result.is_ok(), "mark-identity failed: {result:?}");
 
@@ -72618,7 +72655,7 @@ startup_timeout_sec = 42
         let _guard = stdio_capture_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let cwd_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = isolated_project_test_tempdir();
         let _cwd = CwdGuard::chdir(cwd_dir.path());
 
         let storage_dir = tempfile::tempdir().unwrap();

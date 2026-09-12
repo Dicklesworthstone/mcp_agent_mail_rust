@@ -1,7 +1,7 @@
 //! Corruption-specific DB circuit breaker (br-bvq1x.11.3 / K3).
 //!
 //! Once a HARD, edit-blocking corruption-class error (A1) is observed on the
-//! write path, this breaker trips and STAYS tripped: subsequent writes are
+//! database path, this breaker trips and STAYS tripped: subsequent writes are
 //! refused immediately — without touching the database again — so agents stop
 //! hammering a corrupt store (re-emitting scary errors and risking worse
 //! damage). The refusal carries the corruption keywords of the triggering
@@ -17,9 +17,9 @@
 //!
 //! ## Scope: writes only, server only
 //!
-//! The breaker is checked solely inside `run_with_mvcc_retry` (the async
-//! server write path), so reads (which do not go through it) are never
-//! affected. It is also process-local: the CLI/doctor sync write path runs in a
+//! The refusal applies solely to the async server write retry path. Read
+//! retries observe corruption but remain available when the breaker is open.
+//! It is also process-local: the CLI/doctor sync write path runs in a
 //! separate process whose breaker is never tripped, so recovery via `am doctor`
 //! is never blocked.
 
@@ -61,13 +61,16 @@ impl CorruptionCircuitBreaker {
     pub fn trip(&self, class: DbErrorClass, message: impl Into<String>) {
         self.trip_count.fetch_add(1, Ordering::Relaxed);
         if !self.tripped.swap(true, Ordering::SeqCst) {
+            let message = message.into();
+            tracing::error!(
+                class = class.as_str(),
+                error = %message,
+                "database corruption circuit breaker opened; writes refused, reads remain available"
+            );
             let now = now_micros_u64();
             self.tripped_at_us.store(now, Ordering::Relaxed);
             if let Ok(mut guard) = self.detail.lock() {
-                *guard = Some(TripDetail {
-                    class,
-                    message: message.into(),
-                });
+                *guard = Some(TripDetail { class, message });
             }
         }
     }
@@ -229,5 +232,35 @@ mod tests {
         assert_eq!(snap.trip_count, 2);
         // First cause is preserved.
         assert_eq!(snap.class.as_deref(), Some("wal_sidecar_corruption"));
+    }
+
+    #[test]
+    fn cursor_probe_limitation_does_not_trip_but_distinct_corruption_does() {
+        let cursor = "database disk image is malformed: table_seek called on index page (type LeafIndex, page 1560, root 22): cursor is_table flag likely incorrect";
+        for message in [
+            cursor,
+            "database disk image is malformed: index_seek called on table page (type LeafTable, page 1560, root 22): cursor is_table flag likely incorrect",
+        ] {
+            let breaker = CorruptionCircuitBreaker::default();
+            assert!(!breaker.observe_error(&DbError::Sqlite(message.to_string())));
+            assert!(!breaker.is_tripped());
+        }
+        for message in [
+            "database disk image is malformed".to_string(),
+            format!(
+                "{cursor}; page 7 is referenced multiple times (freelist trunk[1] leaf[0]; index messages root -> child[0])"
+            ),
+            format!("{cursor}; database disk image is malformed: freelist mismatch"),
+        ] {
+            let breaker = CorruptionCircuitBreaker::default();
+            assert!(breaker.observe_error(&DbError::Sqlite(message)));
+            assert!(breaker.is_tripped());
+        }
+        let breaker = CorruptionCircuitBreaker::default();
+        assert!(breaker.observe_error(&DbError::IntegrityCorruption {
+            message: cursor.to_string(),
+            details: Vec::new(),
+        }));
+        assert!(breaker.is_tripped());
     }
 }

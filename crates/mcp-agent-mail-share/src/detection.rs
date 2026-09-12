@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn detect_environment_minimal() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::isolated_test_tempdir();
         let env = detect_environment(None, dir.path());
         assert_eq!(env.cwd, dir.path());
         assert!(!env.is_git_repo);
@@ -888,7 +888,7 @@ mod tests {
     fn detect_github_pages_ignores_symlinked_docs_dir() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::git::isolated_test_tempdir();
         let real_docs = dir.path().join("real-docs");
         std::fs::create_dir(&real_docs).expect("create real docs");
         symlink(&real_docs, dir.path().join("docs")).expect("symlink docs");

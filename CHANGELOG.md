@@ -38,6 +38,31 @@ reviewed through 2026-09-12. These changes are not published release artifacts.
 
 ### Fixed
 
+- **Engine cursor-state errors no longer falsely block all writes.** Complete
+  recognized cursor-type diagnostics are engine limitations; explicit or mixed
+  corruption evidence still trips the breaker. WAL/SHM classification matches
+  complete tokens so a freelist "walk" is not mistaken for WAL damage.
+  ([#320](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/320))
+- **Prepared UPDATE and DELETE bind indexed predicates correctly.** The engine
+  numbers parameters before compiling reordered index probes, preventing a later
+  WHERE condition from using an earlier parameter's value. CREATE TABLE storage
+  also normalizes the prefix that canonical SQLite requires for ADD COLUMN,
+  preserving the original table body and expression parentheses.
+  ([engine fix](https://github.com/Dicklesworthstone/frankensqlite/commit/c76b22ec557344bf173f61e8f63580670d99ee62))
+- **Reservation reads remain available when corruption blocks writes.** The
+  six reservation lookup/list paths no longer apply the write breaker's
+  refusal. Reads still report errors and trip the breaker when they discover
+  corruption; reservation mutations remain blocked.
+  ([#319](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/319))
+- **Committed message retries do not depend on scanning the archive.** Matching
+  idempotency keys replay the original result even when IDs are exhausted or
+  a cold archive scan would fail. Fresh messages still validate the archive
+  and elect their ID transactionally, with the scan outside the transaction.
+- **Readiness responses do not wait for optional diagnostic refreshes.** Project
+  and message counts plus ATC sidecar checks refresh on the existing HTTP
+  runtime, with only one refresh in flight. Responses expose cached or unknown
+  values and sample age; failed refreshes do not make old counts appear fresh.
+  The database readiness checks remain required.
 - **Doctor reads committed WAL state without rebuilding away corruption.**
   Unix probes can stage a live FrankenSQLite family through the engine's
   shared file descriptors, retaining namespace and checkpoint locks while
@@ -47,7 +72,7 @@ reviewed through 2026-09-12. These changes are not published release artifacts.
   establish physical integrity.
 - **Deferred WAL commits remain visible after an external reader releases.**
   The complete FrankenSQLite dependency family is pinned to immutable
-  revision `dedf3e1be376b9b8bd90e458912aa9b226b86bf9`, carrying the upstream WAL
+  revision `c76b22ec557344bf173f61e8f63580670d99ee62`, carrying the upstream WAL
   lifetime repair while retaining Asupersync 0.4.9. Commits remain independent
   of reader-blocked checkpoint completion; subsequent maintenance makes the
   committed row visible to a fresh canonical reader.

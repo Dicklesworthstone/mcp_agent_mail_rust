@@ -4061,6 +4061,34 @@ async fn run_with_mvcc_retry_with_budget<T, F, Fut>(
     cx: &Cx,
     operation: &'static str,
     max: u32,
+    op: F,
+) -> Outcome<T, DbError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Outcome<T, DbError>>,
+{
+    run_with_mvcc_retry_inner(cx, operation, max, true, op).await
+}
+
+/// Retry a read without applying the corruption breaker's write refusal.
+/// Corruption returned by the read still trips the breaker for later writes.
+async fn run_read_with_mvcc_retry<T, F, Fut>(
+    cx: &Cx,
+    operation: &'static str,
+    op: F,
+) -> Outcome<T, DbError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Outcome<T, DbError>>,
+{
+    run_with_mvcc_retry_inner(cx, operation, *MVCC_MAX_RETRIES, false, op).await
+}
+
+async fn run_with_mvcc_retry_inner<T, F, Fut>(
+    cx: &Cx,
+    operation: &'static str,
+    max: u32,
+    refuse_when_breaker_open: bool,
     mut op: F,
 ) -> Outcome<T, DbError>
 where
@@ -4069,10 +4097,12 @@ where
 {
     // K3 (br-bvq1x.11.3): if the corruption circuit breaker is open, refuse the
     // write immediately — without touching the database again — so agents stop
-    // hammering a corrupt store. Reads do not go through this wrapper, and the
+    // hammering a corrupt store. Read retries skip this refusal, and the
     // CLI/doctor sync path runs in a separate process, so recovery is never
     // gated.
-    if let Some(refusal) = crate::corruption_circuit_breaker().refusal_error() {
+    if refuse_when_breaker_open
+        && let Some(refusal) = crate::corruption_circuit_breaker().refusal_error()
+    {
         return Outcome::Err(refusal);
     }
 
@@ -4136,8 +4166,8 @@ where
                 return Outcome::Err(exhausted(e));
             }
             other => {
-                // K3: a hard, edit-blocking corruption surfaced on the write
-                // path — trip the breaker so subsequent writes are refused
+                // K3: a hard, edit-blocking corruption surfaced on a database
+                // operation — trip the breaker so subsequent writes are refused
                 // until the database is verified healthy again.
                 if let Outcome::Err(ref e) = other {
                     crate::corruption_circuit_breaker().observe_error(e);
@@ -8018,18 +8048,28 @@ async fn create_message_with_recipients_impl(
         // inside the retried transaction, so a rolled-back attempt never
         // burns an id.
         let id_allocator = pool.message_id_allocator();
-        let storage_root = match pool.validated_storage_root("message creation archive allocator") {
-            Ok(storage_root) => storage_root,
-            Err(error) => return Outcome::Err(error),
+        let mut archive_seed = if idempotency.is_some() {
+            // Warm keyed sends need only the authoritative insert transaction;
+            // this lookup performs no archive validation or filesystem work.
+            match id_allocator.cached_archive_seed() {
+                Ok(seed) => seed,
+                Err(error) => return Outcome::Err(error),
+            }
+        } else {
+            // No key can replay, so preserve the ordinary one-transaction path.
+            let storage_root =
+                match pool.validated_storage_root("message creation archive allocator") {
+                    Ok(root) => root,
+                    Err(error) => return Outcome::Err(error),
+                };
+            Some(match id_allocator.archive_seed(cx, storage_root).await {
+                Outcome::Ok(seed) => seed,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            })
         };
-        let archive_seed = match id_allocator.archive_seed(cx, storage_root).await {
-            Outcome::Ok(seed) => seed,
-            Outcome::Err(error) => return Outcome::Err(error),
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-        };
-
-        let created_outcome =
+        let created_outcome = loop {
             match run_with_mvcc_retry(cx, "create_message_with_recipients", || {
                 create_message_with_recipients_tx(
                     cx,
@@ -8052,11 +8092,34 @@ async fn create_message_with_recipients_impl(
             })
             .await
             {
-                Outcome::Ok(created) => created,
+                Outcome::Ok(Some(created)) => break created,
+                Outcome::Ok(None) => {
+                    // The key check found a fresh request and rolled back.
+                    // Scan without holding transaction/page authority, then
+                    // repeat the authoritative check in the insert transaction.
+                    let storage_root =
+                        match pool.validated_storage_root("message creation archive allocator") {
+                            Ok(root) => root,
+                            Err(error) => return Outcome::Err(error),
+                        };
+                    archive_seed = Some(
+                        match pool
+                            .message_id_allocator()
+                            .archive_seed(cx, storage_root)
+                            .await
+                        {
+                            Outcome::Ok(seed) => seed,
+                            Outcome::Err(error) => return Outcome::Err(error),
+                            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+                        },
+                    );
+                }
                 Outcome::Err(e) => return Outcome::Err(e),
                 Outcome::Cancelled(r) => return Outcome::Cancelled(r),
                 Outcome::Panicked(p) => return Outcome::Panicked(p),
-            };
+            }
+        };
         // A replay or conflict short-circuits: nothing new was written this call,
         // so the post-commit visibility probe (which re-proves a fresh insert
         // landed) and the writer-count sample below must be skipped entirely.
@@ -8301,10 +8364,10 @@ async fn create_message_with_recipients_tx(
     attachments: &str,
     recipients: &[(i64, &str)],
     now: i64,
-    archive_seed: i64,
+    archive_seed: Option<i64>,
     idempotency: Option<IdempotencyClaim<'_>>,
     idempotency_expires_ts: i64,
-) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
+) -> Outcome<Option<IdempotentOutcome<MessageRow>>, DbError> {
     // Use MVCC concurrent transaction for page-level parallelism.
     try_in_tx!(cx, tracked, begin_concurrent_tx(cx, tracked).await);
 
@@ -8323,13 +8386,13 @@ async fn create_message_with_recipients_tx(
                     &result_json,
                     "create_message_with_recipients",
                 ) {
-                    Ok(row) => Outcome::Ok(IdempotentOutcome::Replayed(row)),
+                    Ok(row) => Outcome::Ok(Some(IdempotentOutcome::Replayed(row))),
                     Err(e) => Outcome::Err(e),
                 };
             }
             Outcome::Ok(IdempotencyCheck::Conflict(info)) => {
                 rollback_tx(cx, tracked).await;
-                return Outcome::Ok(IdempotentOutcome::Conflict(info));
+                return Outcome::Ok(Some(IdempotentOutcome::Conflict(info)));
             }
             Outcome::Err(e) => {
                 rollback_tx(cx, tracked).await;
@@ -8346,6 +8409,19 @@ async fn create_message_with_recipients_tx(
         }
     }
 
+    // None requests archive seeding from the caller outside this transaction.
+    // The caller must repeat this same authoritative key check with the seed.
+    let Some(archive_seed) = archive_seed else {
+        // Unlike best-effort error cleanup, this rollback is a required phase
+        // boundary: never start filesystem work while transaction release is
+        // unproven. The existing retry wrapper can retry a refused rollback.
+        try_in_tx!(
+            cx,
+            tracked,
+            map_sql_outcome(tracked.execute(cx, "ROLLBACK", &[]).await)
+        );
+        return Outcome::Ok(None);
+    };
     try_in_tx!(
         cx,
         tracked,
@@ -8543,7 +8619,7 @@ async fn create_message_with_recipients_tx(
     // COMMIT (single fsync)
     try_in_tx!(cx, tracked, commit_tx(cx, tracked).await);
 
-    Outcome::Ok(IdempotentOutcome::Fresh(row))
+    Outcome::Ok(Some(IdempotentOutcome::Fresh(row)))
 }
 
 // ── Idempotency key helpers (br-idempotency-keys-mutating-tools-h0x9k) ───────
@@ -12809,7 +12885,7 @@ pub async fn get_reservation_conflict_snapshot(
         ));
     }
 
-    run_with_mvcc_retry(cx, "get_reservation_conflict_snapshot", || async {
+    run_read_with_mvcc_retry(cx, "get_reservation_conflict_snapshot", || async {
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(conn) => conn,
             Outcome::Err(error) => return Outcome::Err(error),
@@ -13392,7 +13468,7 @@ pub async fn get_active_reservations(
     pool: &DbPool,
     project_id: i64,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
-    run_with_mvcc_retry(cx, "get_active_reservations", || {
+    run_read_with_mvcc_retry(cx, "get_active_reservations", || {
         get_active_reservations_once(cx, pool, project_id)
     })
     .await
@@ -13512,7 +13588,7 @@ pub async fn list_released_unexpired_reservations(
     pool: &DbPool,
     project_id: i64,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
-    run_with_mvcc_retry(cx, "list_released_unexpired_reservations", || {
+    run_read_with_mvcc_retry(cx, "list_released_unexpired_reservations", || {
         list_released_unexpired_reservations_once(cx, pool, project_id)
     })
     .await
@@ -14183,7 +14259,7 @@ pub async fn list_file_reservations(
     project_id: i64,
     active_only: bool,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
-    run_with_mvcc_retry(cx, "list_file_reservations", || {
+    run_read_with_mvcc_retry(cx, "list_file_reservations", || {
         list_file_reservations_once(cx, pool, project_id, active_only, None, 0, false)
     })
     .await
@@ -14203,7 +14279,7 @@ pub async fn list_file_reservations_page(
     limit: usize,
     offset: usize,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
-    run_with_mvcc_retry(cx, "list_file_reservations_page", || {
+    run_read_with_mvcc_retry(cx, "list_file_reservations_page", || {
         list_file_reservations_once(cx, pool, project_id, active_only, Some(limit), offset, true)
     })
     .await
@@ -14467,7 +14543,7 @@ pub async fn list_unreleased_file_reservations(
     pool: &DbPool,
     project_id: i64,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
-    run_with_mvcc_retry(cx, "list_unreleased_file_reservations", || {
+    run_read_with_mvcc_retry(cx, "list_unreleased_file_reservations", || {
         list_unreleased_file_reservations_once(cx, pool, project_id)
     })
     .await
@@ -25237,6 +25313,178 @@ mod tests {
             .expect("read released_ts");
             assert_eq!(rows.len(), 1);
             assert!(rows[0].get(0).and_then(value_as_i64).is_some());
+        });
+    }
+
+    #[test]
+    fn reservation_reads_survive_corruption_write_breaker() {
+        // Isolate the process-global breaker from concurrently running tests.
+        const CHILD: &str = "AM_TEST_RESERVATION_READ_BREAKER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "queries::tests::reservation_reads_survive_corruption_write_breaker",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated breaker regression failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let (cx, pool, _dir) = setup_test_pool("reservation-read-breaker.db");
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/reservation-read-breaker")
+                .await
+                .into_result()
+                .unwrap();
+            let project_id = project.id.unwrap();
+            let agent = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "test",
+                None,
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let agent_id = agent.id.unwrap();
+            create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["src/**"],
+                3600,
+                true,
+                "active",
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let released = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["docs/**"],
+                3600,
+                true,
+                "released",
+            )
+            .await
+            .into_result()
+            .unwrap();
+            release_reservations_by_ids(&cx, &pool, &[released[0].id.unwrap()])
+                .await
+                .into_result()
+                .unwrap();
+
+            crate::corruption_circuit_breaker().observe_error(&DbError::Sqlite(
+                "database disk image is malformed".to_string(),
+            ));
+            assert!(crate::corruption_circuit_breaker().is_tripped());
+            let snapshot = get_reservation_conflict_snapshot(
+                &cx,
+                &pool,
+                "/tmp/reservation-read-breaker",
+                "BlueLake",
+                100,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert_eq!(snapshot.reservations.len(), 1);
+            assert_eq!(
+                get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .len(),
+                1,
+            );
+            assert_eq!(
+                list_released_unexpired_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .len(),
+                1,
+            );
+            assert_eq!(
+                list_file_reservations(&cx, &pool, project_id, false)
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .len(),
+                2,
+            );
+            assert_eq!(
+                list_file_reservations_page(&cx, &pool, project_id, true, 10, 0)
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .len(),
+                1,
+            );
+            assert_eq!(
+                list_unreleased_file_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .len(),
+                1,
+            );
+            let refusal = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["new/**"],
+                3600,
+                true,
+                "blocked",
+            )
+            .await
+            .into_result()
+            .unwrap_err();
+            assert!(
+                refusal
+                    .to_string()
+                    .contains("corruption circuit breaker open")
+            );
+            assert_eq!(
+                list_file_reservations(&cx, &pool, project_id, false)
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .len(),
+                2,
+            );
+            crate::reset_corruption_circuit_breaker();
+            let observed: Outcome<(), DbError> =
+                run_read_with_mvcc_retry(&cx, "read_corruption_observation", || async {
+                    Outcome::Err(DbError::Sqlite(
+                        "database disk image is malformed".to_string(),
+                    ))
+                })
+                .await;
+            assert!(matches!(observed, Outcome::Err(_)));
+            assert!(crate::corruption_circuit_breaker().is_tripped());
         });
     }
 

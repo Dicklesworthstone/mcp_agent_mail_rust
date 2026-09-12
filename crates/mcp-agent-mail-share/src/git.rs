@@ -64,8 +64,63 @@ pub(crate) fn is_shared_ancestor_boundary(_path: &Path) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) fn isolated_test_tempdir() -> tempfile::TempDir {
+    isolated_test_tempdir_from(&std::env::temp_dir())
+}
+
+#[cfg(test)]
+fn isolated_test_tempdir_from(preferred: &Path) -> tempfile::TempDir {
+    // RCH may put TMPDIR below the source checkout. These fixtures need a
+    // genuinely unowned directory, not a fake .git marker or a skipped assertion.
+    let mut candidates = vec![preferred.to_path_buf()];
+    #[cfg(unix)]
+    candidates.extend([PathBuf::from("/tmp"), PathBuf::from("/var/tmp")]);
+    candidates.extend(preferred.ancestors().skip(1).map(Path::to_path_buf));
+    for parent in candidates {
+        if parent
+            .ancestors()
+            .any(|ancestor| std::fs::symlink_metadata(ancestor.join(".git")).is_ok())
+            || [
+                "Cargo.toml",
+                "package.json",
+                "pyproject.toml",
+                "wrangler.toml",
+                "netlify.toml",
+                ".github",
+                "docs",
+                "scripts",
+            ]
+            .iter()
+            .any(|marker| find_ancestor_path(&parent, marker).is_some())
+        {
+            continue;
+        }
+        if let Ok(dir) = tempfile::Builder::new()
+            .prefix("am-share-isolated-")
+            .tempdir_in(&parent)
+        {
+            return dir;
+        }
+    }
+    panic!("no writable temporary directory outside repository/hosting ancestors");
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolated_test_tempdir_escapes_checkout_tmpdir() {
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::create_dir(checkout.path().join(".git")).unwrap();
+        std::fs::write(checkout.path().join("Cargo.toml"), "[workspace]").unwrap();
+        let redirected_tmp = checkout.path().join(".rch-tmp");
+        std::fs::create_dir(&redirected_tmp).unwrap();
+        let isolated = isolated_test_tempdir_from(&redirected_tmp);
+        assert!(!isolated.path().starts_with(checkout.path()));
+        assert_eq!(find_ancestor_path(isolated.path(), ".git"), None);
+        assert_eq!(find_ancestor_path(isolated.path(), "Cargo.toml"), None);
+    }
 
     #[cfg(unix)]
     #[test]

@@ -5102,15 +5102,10 @@ mod tests {
 
     /// Canonical `ALTER TABLE ... ADD COLUMN` splices the new column into the
     /// stored `CREATE TABLE` text at an offset computed from the canonical
-    /// prefix. FrankenSQLite through 0.3.16 stores the statement
-    /// as written, `IF NOT EXISTS` included, so canonical SQLite corrupts the
-    /// text ("near NUL: syntax error") when it adds a column to a table the
-    /// runtime engine created that way. Real Python-era mailboxes were
-    /// written by C SQLite and carry the canonical prefix; this pins the
-    /// engine gap until FrankenSQLite normalizes the stored text (br-l1q6z
-    /// engine class).
+    /// prefix. Earlier FrankenSQLite versions retained `IF NOT EXISTS`,
+    /// causing canonical SQLite to splice at the wrong offset. Keep this
+    /// native-create/canonical-alter contract in the normal suite (br-ivf5p).
     #[test]
-    #[ignore = "FrankenSQLite through 0.3.16 stores CREATE TABLE IF NOT EXISTS verbatim; canonical ADD COLUMN then fails (re-probed on 0.3.16 2026-09-04)"]
     fn runtime_engine_created_table_text_is_alterable_by_canonical_sqlite() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("engine-ddl.sqlite3");

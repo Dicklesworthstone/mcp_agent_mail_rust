@@ -527,7 +527,7 @@ mod tests {
     fn symlinked_workflow_file_is_ignored() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::isolated_test_tempdir();
         let workflows = dir.path().join(".github").join("workflows");
         std::fs::create_dir_all(&workflows).unwrap();
         let outside = tempfile::tempdir().unwrap();

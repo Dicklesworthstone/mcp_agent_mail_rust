@@ -202,28 +202,28 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
-# Immutable native WAL and read-only snapshot fixes. Keep the engine family
+# Immutable WAL, read-only snapshot, DDL and prepared binding fixes. Keep the engine family
 # together; this revision retains asupersync 0.4.9 compatibility and GH411.
-fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-ast = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-btree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-core = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-error = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-ext-fts5 = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-ext-icu = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-ext-json = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-ext-misc = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-ext-rtree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-func = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-mvcc = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-observability = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-pager = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-parser = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-planner = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-vdbe = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-vfs = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
-fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dedf3e1be376b9b8bd90e458912aa9b226b86bf9" }
+fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-ast = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-btree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-core = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-error = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-ext-fts5 = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-ext-icu = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-ext-json = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-ext-misc = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-ext-rtree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-func = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-mvcc = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-observability = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-pager = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-parser = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-planner = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-vdbe = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-vfs = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
+fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
 # 2026-08-22 registry adoption (asupersync =0.4.9 universe):
 # - asupersync resolves from crates.io (=0.4.9; fastmcp 0.7.1 pins =0.4.9).
 # - fsqlite's 20 members use the immutable public revision above until its
