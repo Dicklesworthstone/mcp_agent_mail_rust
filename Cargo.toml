@@ -21,7 +21,7 @@ version = "0.3.35"
 edition = "2024"
 license = "LicenseRef-MIT-Rider"
 license-file = "LICENSE"
-rust-version = "1.95"
+rust-version = "1.100"
 repository = "https://github.com/Dicklesworthstone/mcp_agent_mail_rust"
 authors = ["Jeff Emanuel"]
 

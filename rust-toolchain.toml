@@ -1,6 +1,5 @@
 [toolchain]
-# nightly-2026-08-25 matches the fastmcp 0.6.0 registry release
-# (rust-version = 1.100 floors across its crates) and the fastmcp_rust
-# sibling's own pin.
+# The pinned compiler provides Rust 1.100, required by the fastmcp 0.7.1
+# registry dependency and declared in the workspace package metadata.
 channel = "nightly-2026-08-31"
 components = ["rustfmt", "clippy"]

@@ -37,6 +37,16 @@ is already latest stable.
 - Release gates pending: complete workspace tests, check, strict Clippy,
   formatting, security audit, six-platform portable builds, signed artifacts,
   installation/update checks, and applicable distribution venue verification.
+- Corrected the workspace Rust minimum from 1.95 to 1.100, matching the
+  already-selected FastMCP 0.7.1 manifest. The pinned nightly is unchanged.
+  `cargo metadata --locked --no-deps` confirms all 12 active members inherit
+  1.100; this is a metadata check, not a compiler or runtime test result.
+- The ongoing full workspace run has reproduced four previously retained
+  doctor failures: WAL-only CHECK violation setup, WAL-only schema-version
+  visibility, structural-corruption authority with a live owner, and live
+  physical-copy admission. The last explicitly refuses an active namespace
+  to preserve process-wide file locks. Existing assertions and that guard
+  remain unchanged. Publication is blocked; the final failure count is pending.
 - Initial post-Comrak `cargo audit --json` completed with zero vulnerabilities.
   Audit success is separate from the focused Markdown test result above and
   does not establish whole-workspace runtime compatibility.
