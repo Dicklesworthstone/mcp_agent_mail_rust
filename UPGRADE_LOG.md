@@ -11,10 +11,13 @@ newer packages grouped into 18 coherent upgrade units. Preserve Tantivy's git
 revision and the gated FrankenSearch path dependencies. FrankenSQLite 0.3.18
 is already latest stable.
 
-- In progress: Comrak 0.54.0 → 0.55.0. Fixes two autolink denial-of-service
+- Updated: Comrak 0.54.0 → 0.55.0. Fixes two autolink denial-of-service
   issues ([GHSA-xg9p-p4jc-c46g](https://github.com/kivikakk/comrak/security/advisories/GHSA-xg9p-p4jc-c46g)).
-  No use of its deprecated `tagfilter` option was found. Remote Markdown tests
-  must pass before the next dependency update.
+  No use of its deprecated `tagfilter` option was found. Strict-RCH Markdown
+  regression selection passed 152 tests (5008 unselected), remote exit 0 on
+  `am-release-css` at 2026-09-12 01:15:04 UTC. Full workspace nextest then
+  started at source `046976941fa4933b8209decc591975c454713518`; its result is
+  pending. Focused success does not establish whole-workspace compatibility.
 - Pending, individually tested: indexmap 2.14.2; plist 1.10.1; smallvec 1.16.1;
   toml_edit 0.25.15; tru 0.2.4; franken-agent-detection 0.2.4;
   tokenizers 0.23.2; wide 1.7.0; blake2 0.11.0; dirs 7.0.0;
@@ -35,8 +38,8 @@ is already latest stable.
   formatting, security audit, six-platform portable builds, signed artifacts,
   installation/update checks, and applicable distribution venue verification.
 - Initial post-Comrak `cargo audit --json` completed with zero vulnerabilities.
-  Actual Markdown tests are still compiling remotely; audit success does not
-  establish runtime compatibility.
+  Audit success is separate from the focused Markdown test result above and
+  does not establish whole-workspace runtime compatibility.
   This is not a clean security audit: separate warnings include unsound
   `lru 0.16.4` (RUSTSEC-2026-0253) through the gated FrankenSearch lexical
   crate's registry Tantivy 0.26.1, unmaintained `paste` and `rustls-pemfile`,
