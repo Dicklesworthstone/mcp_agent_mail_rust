@@ -1547,9 +1547,20 @@ pub fn refresh_live_lexical_index(pool: &DbPool) -> Result<(), DbError> {
         let _guard = lexical_init_guard()
             .lock()
             .map_err(|error| DbError::Sqlite(format!("search bootstrap lock poisoned: {error}")))?;
-        crate::search_v3::backfill_read_only_live(&lexical_backfill_database_url(pool), &index_dir)
-            .map_err(|error| map_bridge_bootstrap_error(&error))?;
-        record_lexical_bootstrap_success(&sqlite_key_for_pool(pool))?;
+        let sqlite_key = sqlite_key_for_pool(pool);
+        if let Err(error) = crate::search_v3::backfill_read_only_live(
+            &lexical_backfill_database_url(pool),
+            &index_dir,
+        ) {
+            lexical_bootstrap_state()
+                .lock()
+                .map_err(|error| {
+                    DbError::Sqlite(format!("search bootstrap state lock poisoned: {error}"))
+                })?
+                .insert(sqlite_key, Err(error.clone()));
+            return Err(map_bridge_bootstrap_error(&error));
+        }
+        record_lexical_bootstrap_success(&sqlite_key)?;
     }
     Ok(())
 }
@@ -1621,7 +1632,8 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
         // The lexical bridge is process-global. Re-run backfill whenever a
         // different DB becomes active so lexical results cannot drift across DB
         // boundaries in multi-pool workflows.
-        let should_backfill = !bridge_ready
+        let should_backfill = matches!(cached_state, Some(Err(_)))
+            || !bridge_ready
             || active_key.as_deref() != Some(sqlite_key.as_str())
             || !has_run_lexical_backfill(&sqlite_key).map_err(|err| err.to_string())?;
         if should_backfill {
