@@ -9348,6 +9348,218 @@ fn stage_sqlite_family_for_health_probe_once(
     stage_sqlite_family_for_health_probe_once_in(source, None)
 }
 
+#[cfg(unix)]
+fn native_health_copy_error(error: impl std::fmt::Display) -> std::io::Error {
+    let detail = error.to_string();
+    let kind = if detail.to_ascii_lowercase().contains("busy") {
+        std::io::ErrorKind::WouldBlock
+    } else {
+        std::io::ErrorKind::Other
+    };
+    std::io::Error::new(kind, detail)
+}
+
+/// Read physical bytes through the engine's shared descriptor domain. This
+/// synchronous diagnostic already performs blocking filesystem I/O; bounded
+/// Unix preads run inline rather than creating another async runtime.
+#[cfg(unix)]
+fn copy_native_health_file(
+    file: &fsqlite::fsqlite_vfs::UnixFile,
+    cx: &fsqlite_types::cx::Cx,
+    mut destination: Option<&mut std::fs::File>,
+) -> std::io::Result<[u8; 32]> {
+    use fsqlite::fsqlite_vfs::VfsFile as _;
+    use sha2::Digest as _;
+    use std::future::Future as _;
+    use std::io::Write as _;
+    let len = file.file_size(cx).map_err(native_health_copy_error)?;
+    let mut digest = sha2::Sha256::new();
+    digest.update(len.to_le_bytes());
+    let mut offset = 0_u64;
+    let mut buffer = [0_u8; 8192];
+    while offset < len {
+        let count = usize::try_from((len - offset).min(buffer.len() as u64))
+            .map_err(native_health_copy_error)?;
+        let read = {
+            let mut read = std::pin::pin!(file.read(cx, &mut buffer[..count], offset));
+            match read
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            {
+                std::task::Poll::Ready(result) => result.map_err(native_health_copy_error)?,
+                std::task::Poll::Pending => {
+                    return Err(std::io::Error::other(
+                        "native physical health copy requires inline Unix reads",
+                    ));
+                }
+            }
+        };
+        if read != count {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "native physical health source changed during read",
+            ));
+        }
+        digest.update(&buffer[..read]);
+        if let Some(output) = destination.as_deref_mut() {
+            output.write_all(&buffer[..read])?;
+        }
+        offset += read as u64;
+    }
+    Ok(digest.finalize().into())
+}
+
+/// A physical copy of an admitted live family. Namespace ownership and VFS
+/// locks stay alive until every source handle closes. SHM is derived state:
+/// the private canonical reader rebuilds it from the copied WAL, so this path
+/// never copies or reads the concurrently mapped source SHM bytes.
+#[cfg(unix)]
+fn stage_native_family_for_health_probe(
+    source: &Path,
+    root: Option<&Path>,
+) -> std::io::Result<Option<SqliteHealthProbeSource>> {
+    use fsqlite::fsqlite_vfs::shm::{
+        SHM_SEGMENT_SIZE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, WAL_READ_LOCK_BASE,
+    };
+    use fsqlite::fsqlite_vfs::{UnixVfs, Vfs as _, VfsFile as _};
+    use fsqlite_types::flags::VfsOpenFlags;
+
+    let metadata_seal = || -> std::io::Result<_> {
+        let mut seal = Vec::new();
+        for suffix in [
+            "",
+            "-journal",
+            "-wal",
+            "-shm",
+            "-wal-cert",
+            "-wal-cert-head",
+            "-fsqlite-ns-gate",
+            "-fsqlite-ns-use",
+        ] {
+            let path = if suffix.is_empty() {
+                source.to_path_buf()
+            } else {
+                sqlite_sidecar_path(source, suffix)
+            };
+            let witness = match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_file() && meta.nlink() == 1 => {
+                    Some((meta.dev(), meta.ino(), meta.len(), meta.modified()?))
+                }
+                Ok(_) => {
+                    return Err(std::io::Error::other(
+                        "native physical health copy refuses non-regular or hard-linked family members",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            if matches!(suffix, "" | "-shm" | "-fsqlite-ns-gate" | "-fsqlite-ns-use")
+                && witness.is_none()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "native physical health copy requires existing main, SHM and namespace files",
+                ));
+            }
+            seal.push((suffix, witness));
+        }
+        Ok(seal)
+    };
+    let before = metadata_seal()?;
+    let binding =
+        acquire_guarded_read_only_namespace_binding(source, "native physical health copy")
+            .map_err(native_health_copy_error)?;
+    let cx = fsqlite_types::cx::Cx::new();
+    cx.mark_blocking_io_inline_safe();
+    let vfs = UnixVfs::new();
+    let (mut main, _) = vfs
+        .open(
+            &cx,
+            Some(source),
+            VfsOpenFlags::MAIN_DB | VfsOpenFlags::READONLY,
+        )
+        .map_err(native_health_copy_error)?;
+    binding
+        .validate_identity(main.file_identity().map_err(native_health_copy_error)?)
+        .map_err(native_health_copy_error)?;
+    main.lock(&cx, fsqlite_types::LockLevel::Shared)
+        .map_err(native_health_copy_error)?;
+
+    // Attach only an existing region, retaining its descriptor/DMS lifetime.
+    // Slot zero fences main-file backfill; a nonzero slot ALSO fences WAL
+    // reset. Neither lock writes a read mark. Writers may still append; the
+    // repeated complete byte seals below detect that and retry the copy.
+    let shm_region = main
+        .shm_map(&cx, 0, SHM_SEGMENT_SIZE, false)
+        .map_err(native_health_copy_error)?;
+    main.shm_lock(
+        &cx,
+        WAL_READ_LOCK_BASE,
+        2,
+        SQLITE_SHM_LOCK | SQLITE_SHM_SHARED,
+    )
+    .map_err(native_health_copy_error)?;
+    let prefix = health_probe_dir_prefix_for_this_process();
+    let directory = match root {
+        Some(root) => CanonicalSnapshotTempDir::new_in(&prefix, root)?,
+        None => CanonicalSnapshotTempDir::new(&prefix)?,
+    };
+    let staged_path = directory.path().join(HEALTH_PROBE_STAGED_STEM);
+    let mut sidecars = Vec::new();
+    for suffix in ["-journal", "-wal", "-wal-cert", "-wal-cert-head"] {
+        if before
+            .iter()
+            .any(|(name, witness)| *name == suffix && witness.is_some())
+        {
+            let path = sqlite_sidecar_path(source, suffix);
+            let (file, _) = vfs
+                .open(&cx, Some(&path), VfsOpenFlags::READONLY)
+                .map_err(native_health_copy_error)?;
+            sidecars.push((suffix, file));
+        }
+    }
+    let mut expected = Vec::new();
+    for (suffix, file) in
+        std::iter::once(("", &main)).chain(sidecars.iter().map(|(suffix, file)| (*suffix, file)))
+    {
+        let path = if suffix.is_empty() {
+            staged_path.clone()
+        } else {
+            sqlite_sidecar_path(&staged_path, suffix)
+        };
+        let mut output = mcp_agent_mail_core::disk::create_new_private_file_no_follow(&path)?;
+        expected.push(copy_native_health_file(file, &cx, Some(&mut output))?);
+        output.sync_all()?;
+    }
+    for ((_, file), digest) in std::iter::once(("", &main))
+        .chain(sidecars.iter().map(|(suffix, file)| (*suffix, file)))
+        .zip(expected)
+    {
+        if copy_native_health_file(file, &cx, None)? != digest {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "native physical health family changed during copy",
+            ));
+        }
+    }
+    binding
+        .validate_path_identity()
+        .map_err(native_health_copy_error)?;
+    if metadata_seal()? != before {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "native physical health family identity changed during copy",
+        ));
+    }
+    drop(sidecars);
+    drop(shm_region);
+    main.close(&cx).map_err(native_health_copy_error)?;
+    Ok(Some(SqliteHealthProbeSource {
+        _directory: directory,
+        path: staged_path,
+    }))
+}
+
 /// [`stage_sqlite_family_for_health_probe_once`], staging into an explicit
 /// root instead of the shared [`snapshot_temp_root`].
 fn stage_sqlite_family_for_health_probe_once_in(
@@ -9357,7 +9569,7 @@ fn stage_sqlite_family_for_health_probe_once_in(
     match std::fs::symlink_metadata(source) {
         Ok(metadata) if metadata.file_type().is_file() =>
         {
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             if metadata.nlink() != 1 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -9375,7 +9587,7 @@ fn stage_sqlite_family_for_health_probe_once_in(
     // before any copy opens the main inode, retaining gate-then-use flock
     // admission until every source descriptor has closed. This belongs here
     // so health, forensics and doctor callers share the same protection.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     let _namespace_guards = match inspect_namespace_sidecar_shape(source, "physical health copy")
         .map_err(|error| std::io::Error::other(error.to_string()))?
     {
@@ -9387,6 +9599,13 @@ fn stage_sqlite_family_for_health_probe_once_in(
             ));
         }
         NamespaceSidecarShape::Complete => {
+            // Prefer the native descriptor domain while a mailbox owner is
+            // alive. An idle source without SHM can still use the exclusive
+            // namespace raw-copy path below; never create SHM to admit it.
+            let native_error = match stage_native_family_for_health_probe(source, root) {
+                Ok(staged) => return Ok(staged),
+                Err(error) => error,
+            };
             let mut guards = Vec::with_capacity(2);
             for suffix in FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES {
                 let path = sqlite_sidecar_path(source, suffix);
@@ -9403,7 +9622,7 @@ fn stage_sqlite_family_for_health_probe_once_in(
                     if error.kind() == std::io::ErrorKind::WouldBlock {
                         std::io::Error::new(
                             std::io::ErrorKind::WouldBlock,
-                            "database is busy: physical health copying requires an idle FrankenSQLite namespace; live connections must retain their locks",
+                            format!("database is busy: native physical health copy failed ({native_error}); raw copying requires an idle FrankenSQLite namespace so live connections retain their locks"),
                         )
                     } else {
                         error
@@ -9435,7 +9654,7 @@ fn stage_sqlite_family_for_health_probe_once_in(
         let source_sidecar = sqlite_sidecar_path(source, suffix);
         match std::fs::symlink_metadata(&source_sidecar) {
             Ok(metadata) if metadata.file_type().is_file() => {
-                #[cfg(target_os = "linux")]
+                #[cfg(unix)]
                 if metadata.nlink() != 1 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -9463,15 +9682,17 @@ fn stage_sqlite_family_for_health_probe_once_in(
 /// health probe, retrying up to three times when a sidecar appears or
 /// disappears between classification and copy.
 ///
-/// The copy carries `-journal`, `-wal`, `-shm`, `-wal-cert`, and
-/// `-wal-cert-head` but deliberately not the FrankenSQLite namespace sidecars
+/// The copy carries `-journal`, `-wal`, `-wal-cert`, and `-wal-cert-head`.
+/// The native live-copy path omits derived `-shm`; the idle raw-copy path
+/// retains it. Neither copies the FrankenSQLite namespace sidecars
 /// (`-fsqlite-ns-gate` / `-fsqlite-ns-use`): those describe the live inode's
 /// engine authority, which the private copy must not inherit. Returns
 /// `Ok(None)` when `source` is not a regular file or a sidecar slot holds a
 /// non-file.
 ///
-/// On Linux an admitted family must have an idle, complete namespace pair:
-/// busy admission returns a lock error before opening the source inode.
+/// On Unix a live admitted family uses native shared-descriptor reads under
+/// main/backfill/reset fences and repeated byte seals. An idle complete
+/// namespace can instead admit a raw copy, including when SHM is missing.
 /// Hard-linked sources and sidecars are refused because another pathname can
 /// carry live locks which this pathname's namespace cannot protect.
 #[allow(clippy::result_large_err)]
@@ -9488,12 +9709,18 @@ pub fn stage_sqlite_family_for_health_probe(
     for _ in 0..3 {
         match stage_sqlite_family_for_health_probe_once(source) {
             Ok(staged) => return Ok(staged),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
                 // WAL/SHM files can legitimately appear or disappear between
                 // metadata classification and a no-follow open. Retry the
                 // complete private copy instead of treating that race as
                 // corruption or falling back to a writable live open.
                 last_not_found = Some(error);
+                std::thread::yield_now();
             }
             Err(error) => {
                 return Err(SqlError::Custom(format!(
@@ -30158,6 +30385,51 @@ mod tests {
             .collect();
         found.sort();
         found
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_health_staging_preserves_hot_wal_bytes_and_reads_committed_rows() {
+        use fsqlite::fsqlite_vfs::{UnixVfs, Vfs as _};
+        use fsqlite_types::flags::VfsOpenFlags;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("hot.sqlite3");
+        let writer = DbConn::open_file(source.to_str().unwrap()).unwrap();
+        writer.execute_raw("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE hot(value INTEGER);").unwrap();
+        writer
+            .execute_raw("INSERT INTO hot VALUES (1); PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        writer.execute_raw("INSERT INTO hot VALUES (2);").unwrap();
+        let cx = fsqlite_types::cx::Cx::new();
+        cx.mark_blocking_io_inline_safe();
+        let vfs = UnixVfs::new();
+        let physical_hashes = || {
+            [source.clone(), sqlite_sidecar_path(&source, "-wal")]
+                .into_iter()
+                .map(|path| {
+                    let (file, _) = vfs.open(&cx, Some(&path), VfsOpenFlags::READONLY).unwrap();
+                    copy_native_health_file(&file, &cx, None).unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = physical_hashes();
+        let staged = stage_native_family_for_health_probe(&source, Some(dir.path()))
+            .expect("native copy of hot WAL")
+            .expect("physical source");
+        assert!(!sqlite_sidecar_path(staged.path(), "-shm").exists());
+        assert!(!sqlite_sidecar_path(staged.path(), "-fsqlite-ns-gate").exists());
+        let canonical = crate::CanonicalDbConn::open_file(staged.path().to_str().unwrap()).unwrap();
+        let rows = canonical
+            .query_sync("SELECT COUNT(*) AS count FROM hot", &[])
+            .unwrap();
+        assert_eq!(rows[0].get_named::<i64>("count").unwrap(), 2);
+        assert_eq!(physical_hashes(), before, "physical source bytes changed");
+        writer
+            .execute_raw("INSERT INTO hot VALUES (3);")
+            .expect("writer remains usable after staging");
+        drop(canonical);
+        crate::close_db_conn(writer, "native physical health fixture");
     }
 
     #[cfg(target_os = "linux")]

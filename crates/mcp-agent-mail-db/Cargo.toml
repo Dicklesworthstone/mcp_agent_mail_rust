@@ -51,6 +51,7 @@ dirs = { workspace = true, optional = true }
 # through sqlmodel-frankensqlite. The cli manifest guard test checks that no
 # connection is opened through fsqlite directly.
 fsqlite.workspace = true
+fsqlite-types.workspace = true
 sqlmodel.workspace = true
 sqlmodel-core.workspace = true
 sqlmodel-query.workspace = true

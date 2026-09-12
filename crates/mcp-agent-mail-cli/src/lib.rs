@@ -16375,8 +16375,11 @@ pub(crate) fn open_db_sync_robot_with_database_url(
 pub(crate) fn open_db_sync_robot_attachments_with_database_url(
     database_url: &str,
 ) -> CliResult<mcp_agent_mail_db::DbConn> {
-    if let Ok(conn) = open_db_sync_robot_attachments_best_effort_with_database_url(database_url) {
-        return Ok(conn);
+    match open_db_sync_robot_attachments_best_effort_with_database_url(database_url) {
+        Ok(conn) => return Ok(conn),
+        Err(error) => {
+            tracing::debug!(%error, "robot attachment read-only admission failed before full initialization");
+        }
     }
     match open_db_sync_with_database_url(database_url) {
         Ok(conn) => Ok(conn),
@@ -21406,6 +21409,13 @@ fn handle_migrate_with_database_url_locked(database_url: &str) -> CliResult<()> 
                     "Warning: failed to switch journal_mode to WAL after migration: {e}"
                 );
             }
+            // Enter a real read while this migration still owns a writable
+            // connection. The WAL mode transition alone may leave its shared
+            // index uninitialized; a later read-only client cannot recover it.
+            // This also verifies that the completed mailbox schema is usable
+            // before the command reports success.
+            conn.query_sync("SELECT COUNT(*) AS project_count FROM projects", &[])
+                .map_err(|e| CliError::Other(format!("post-migration mailbox read failed: {e}")))?;
             // Legacy Python: `migrate` is an explicit schema-create command.
             ftui_runtime::ftui_println!("✓ Database schema created from model definitions!");
             ftui_runtime::ftui_println!(
@@ -57902,6 +57912,28 @@ startup_timeout_sec = 42
     #[cfg(unix)]
     #[test]
     fn doctor_read_only_probe_still_fails_on_structurally_corrupt_main_db() {
+        const CORRUPT_PATH: &str = "AM_DOCTOR_PHYSICAL_CORRUPTION_PATH";
+        const CORRUPT_PAGE: &str = "AM_DOCTOR_PHYSICAL_CORRUPTION_PAGE";
+        if let Some(path) = std::env::var_os(CORRUPT_PATH) {
+            let path = PathBuf::from(path);
+            let page: u64 = std::env::var(CORRUPT_PAGE).unwrap().parse().unwrap();
+            let wal = std::fs::read(sqlite_sidecar_path(&path, "-wal")).unwrap();
+            assert!(wal.len() >= 32, "corruption fixture must retain WAL");
+            let page_size =
+                usize::try_from(u32::from_be_bytes(wal[8..12].try_into().unwrap())).unwrap();
+            assert!(page_size.is_power_of_two() && (512..=65536).contains(&page_size));
+            for frame in wal[32..].chunks_exact(24 + page_size) {
+                let frame_page = u32::from_be_bytes(frame[..4].try_into().unwrap());
+                assert_ne!(
+                    u64::from(frame_page),
+                    page,
+                    "WAL must not mask damaged main page"
+                );
+            }
+            corrupt_main_file_page_in_place(&path, page);
+            println!("PHYSICAL_CORRUPTION_CHILD_RAN");
+            return;
+        }
         let dir = tempfile::tempdir().expect("tempdir");
         let slug = "hot-wal-corrupt";
         seed_matching_archive_project(dir.path(), slug);
@@ -57917,7 +57949,24 @@ startup_timeout_sec = 42
             .expect("look up agents root page");
         let root_page = rows[0].get_named::<i64>("rootpage").expect("rootpage");
         assert!(root_page > 1, "agents root page must not be page 1");
-        corrupt_main_file_page_in_place(&db_path, u64::try_from(root_page).expect("page"));
+        // Keep raw corruption descriptors out of the native owner's process:
+        // closing one here would erase its process-wide fcntl lock claims.
+        let damaged = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "tests::doctor_read_only_probe_still_fails_on_structurally_corrupt_main_db",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CORRUPT_PATH, &db_path)
+            .env(CORRUPT_PAGE, root_page.to_string())
+            .output()
+            .expect("run isolated physical corruption injector");
+        assert!(
+            damaged.status.success(),
+            "corruption injector failed: {}",
+            String::from_utf8_lossy(&damaged.stderr)
+        );
+        assert!(String::from_utf8_lossy(&damaged.stdout).contains("PHYSICAL_CORRUPTION_CHILD_RAN"));
 
         let db_url = format!("sqlite:///{}", db_path.display());
         let strategy = doctor_database_fix_strategy_read_only(&db_url, dir.path())
@@ -66746,31 +66795,29 @@ startup_timeout_sec = 42
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
         let beads_dir = std::fs::canonicalize(&beads_dir).expect("canonicalize .beads");
 
-        let (mut storage, _paths) =
-            beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
-
-        let open_issue = beads_rust::model::Issue {
-            id: "br-test-open".to_string(),
-            title: "Open issue".to_string(),
-            status: beads_rust::model::Status::Open,
-            ..Default::default()
-        };
-        storage
-            .create_issue(&open_issue, "test")
-            .expect("insert open issue");
-
-        let in_progress_issue = beads_rust::model::Issue {
-            id: "br-test-progress".to_string(),
-            title: "In progress issue".to_string(),
-            status: beads_rust::model::Status::InProgress,
-            ..Default::default()
-        };
-        storage
-            .create_issue(&in_progress_issue, "test")
-            .expect("insert in-progress issue");
-        // `open_storage` owns the Beads write lock; release the fixture
-        // writer before asking the CLI's separate `br` process to query it.
-        drop(storage);
+        // The production integration uses the installed CLI, whose schema can
+        // differ from the embedded library. Seed through that same real CLI
+        // so this exercises supported creation and querying end to end.
+        for args in [
+            vec!["init".to_string(), "--prefix".to_string(), "br".to_string()],
+            vec!["create".to_string(), "Open issue".to_string()],
+            vec![
+                "create".to_string(),
+                "In progress issue".to_string(),
+                "--status".to_string(),
+                "in_progress".to_string(),
+            ],
+        ] {
+            let output = br_json_command(&beads_dir, &args)
+                .expect("fixture command")
+                .output()
+                .expect("run real br fixture command");
+            assert!(
+                output.status.success(),
+                "br fixture {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
 
         let (ready, open, in_progress) =
             beads_issue_awareness_counts_from(Some(dir.path())).expect("counts");
@@ -75276,27 +75323,25 @@ startup_timeout_sec = 42
             result_tx.send(result).expect("send open result");
         });
 
-        let message_count = match result_rx.recv_timeout(std::time::Duration::from_secs(1)) {
-            Ok(result) => {
-                result.expect("robot attachments helper should fall back to read-only open")
-            }
-            Err(err) => {
-                let _ = release_tx.send(());
-                open_thread.join().expect("join open thread after timeout");
-                lock_thread.join().expect("join lock thread after timeout");
-                panic!(
-                    "robot attachments open should not wait for canonical init under reserved lock: {err}"
-                );
-            }
-        };
+        let result = result_rx.recv_timeout(std::time::Duration::from_secs(1));
+        // Retire the fixture workers on error as well as timeout before an
+        // assertion can unwind and drop their database or release channel.
+        let release = release_tx.send(());
+        let reader_join = open_thread.join();
+        let writer_join = lock_thread.join();
+        assert!(
+            release.is_ok() && reader_join.is_ok() && writer_join.is_ok(),
+            "robot result={result:?}; release={release:?}; reader joined={}; writer joined={}",
+            reader_join.is_ok(),
+            writer_join.is_ok(),
+        );
+        let message_count = result
+            .expect("robot attachments open should not wait for canonical init under reserved lock")
+            .expect("robot attachments helper should fall back to read-only open");
         assert_eq!(
             message_count, 1,
             "robot attachments fallback should preserve readable attachment rows"
         );
-
-        release_tx.send(()).expect("release lock thread");
-        open_thread.join().expect("join open thread");
-        lock_thread.join().expect("join lock thread");
     }
 
     #[test]

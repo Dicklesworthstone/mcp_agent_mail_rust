@@ -2264,6 +2264,7 @@ fn default_copy_target_storage(source_storage: &Path) -> PathBuf {
     source_storage.with_file_name(format!("{name}-rust-copy"))
 }
 
+#[cfg(test)]
 fn open_canonical_read_only(path: &Path) -> CliResult<CanonicalDbConn> {
     let path_text = path.to_string_lossy().into_owned();
     let config = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConfig::file(path_text)
@@ -2406,11 +2407,29 @@ fn verify_canonical_quick_check(conn: &CanonicalDbConn, path: &Path, label: &str
     Ok(())
 }
 
-/// Verify a TARGET database (a fresh artifact this run created) is readable.
-/// Uses a plain read-only open; side effects on our own target are harmless
-/// and a non-immutable open sees any WAL content the migration left behind.
+/// Verify a TARGET database through a private physical copy. Migration has
+/// already admitted the target into the native engine's namespace; a direct
+/// canonical open must not disturb its retained WAL/SHM lifetime or locks.
 fn verify_canonical_sqlite_readable(path: &Path, label: &str) -> CliResult<()> {
-    let conn = open_canonical_read_only(path)?;
+    let staged = mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(path)
+        .map_err(|error| {
+            CliError::Other(format!(
+                "{label} canonical verification could not stage {}: {error}",
+                path.display()
+            ))
+        })?
+        .ok_or_else(|| {
+            CliError::Other(format!(
+                "{label} canonical verification needs a regular database at {}",
+                path.display()
+            ))
+        })?;
+    let conn =
+        CanonicalDbConn::open_file(staged.path().to_string_lossy().as_ref()).map_err(|error| {
+            CliError::Other(format!(
+                "{label} canonical verification could not open its private copy: {error}"
+            ))
+        })?;
     verify_canonical_quick_check(&conn, path, label)
 }
 

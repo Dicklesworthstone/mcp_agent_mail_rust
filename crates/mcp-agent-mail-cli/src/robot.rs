@@ -24014,25 +24014,31 @@ mod tests {
                 });
 
                 let result = match result_rx.recv_timeout(std::time::Duration::from_secs(1)) {
-                    Ok(result) => result,
-                    Err(err) => {
-                        return Err(format!(
-                            "robot attachments should not block on canonical init under reserved lock: {err}"
-                        ));
-                    }
+                    Ok(result) => result.map_err(|err| {
+                        format!("robot attachments should succeed via best-effort fallback: {err}")
+                    }),
+                    Err(err) => Err(format!(
+                        "robot attachments should not block on canonical init under reserved lock: {err}"
+                    )),
                 };
-                handle_thread
-                    .join()
-                    .map_err(|_| "join robot thread".to_string())?;
-
-                result.map_err(|err| {
-                    format!("robot attachments should succeed via best-effort fallback: {err}")
-                })
+                // Even on timeout, retire both workers before restoring the
+                // process environment or dropping the database fixture. Keep
+                // the latency failure alongside cleanup failures so a writer
+                // panic cannot hide the original read-path error.
+                let release = release_tx.send(());
+                let reader_join = handle_thread.join();
+                let writer_join = lock_thread.join();
+                if release.is_err() || reader_join.is_err() || writer_join.is_err() {
+                    return Err(format!(
+                        "robot result={result:?}; release={release:?}; reader joined={}; writer joined={}",
+                        reader_join.is_ok(),
+                        writer_join.is_ok(),
+                    ));
+                }
+                result
             },
         );
 
-        release_tx.send(()).expect("release lock thread");
-        lock_thread.join().expect("join lock thread");
         assert!(robot_result.is_ok(), "{robot_result:?}");
     }
 

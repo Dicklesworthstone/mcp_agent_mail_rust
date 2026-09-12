@@ -239,8 +239,12 @@ mod tests {
             let release_path = PathBuf::from(
                 std::env::var(WAL_WRITER_RELEASE_ENV).expect("integrity WAL writer release path"),
             );
-            let writer = mcp_agent_mail_db::DbConn::open_file(db_path)
-                .expect("open cross-process integrity WAL writer");
+            // Stock SQLite is the corruption injector, not the detector:
+            // FrankenSQLite does not implement ignore_check_constraints.
+            // A separate process avoids closing canonical descriptors over
+            // any native reader's process-wide locks.
+            let writer = mcp_agent_mail_db::CanonicalDbConn::open_file(db_path)
+                .expect("open cross-process canonical corruption injector");
             writer
                 .execute_raw(
                     "PRAGMA wal_autocheckpoint = 0;
