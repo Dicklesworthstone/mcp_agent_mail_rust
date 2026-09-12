@@ -66788,6 +66788,19 @@ startup_timeout_sec = 42
         );
     }
 
+    fn run_beads_fixture_command(beads_dir: &Path, args: &[&str]) {
+        let args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+        let output = br_json_command(beads_dir, &args)
+            .expect("fixture command")
+            .output()
+            .expect("run real br fixture command");
+        assert!(
+            output.status.success(),
+            "br fixture {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
     #[test]
     fn beads_issue_awareness_counts_from_temp_beads_dir_reports_counts() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -66799,24 +66812,11 @@ startup_timeout_sec = 42
         // differ from the embedded library. Seed through that same real CLI
         // so this exercises supported creation and querying end to end.
         for args in [
-            vec!["init".to_string(), "--prefix".to_string(), "br".to_string()],
-            vec!["create".to_string(), "Open issue".to_string()],
-            vec![
-                "create".to_string(),
-                "In progress issue".to_string(),
-                "--status".to_string(),
-                "in_progress".to_string(),
-            ],
+            &["init", "--prefix", "br"][..],
+            &["create", "Open issue"][..],
+            &["create", "In progress issue", "--status", "in_progress"][..],
         ] {
-            let output = br_json_command(&beads_dir, &args)
-                .expect("fixture command")
-                .output()
-                .expect("run real br fixture command");
-            assert!(
-                output.status.success(),
-                "br fixture {args:?} failed: {}",
-                String::from_utf8_lossy(&output.stderr),
-            );
+            run_beads_fixture_command(&beads_dir, args);
         }
 
         let (ready, open, in_progress) =
@@ -67365,10 +67365,7 @@ startup_timeout_sec = 42
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
         let beads_dir = std::fs::canonicalize(&beads_dir).expect("canonicalize .beads");
 
-        // Initialize a fresh beads storage (creates the DB)
-        let storage =
-            beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
-        drop(storage);
+        run_beads_fixture_command(&beads_dir, &["init", "--prefix", "br"]);
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
         let result = handle_beads_status(Some(dir.path().to_path_buf()), None, true);
@@ -67398,9 +67395,7 @@ startup_timeout_sec = 42
         std::fs::create_dir_all(&nested).expect("create nested dir");
         let beads_dir = std::fs::canonicalize(&beads_dir).expect("canonicalize .beads");
 
-        let storage =
-            beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
-        drop(storage);
+        run_beads_fixture_command(&beads_dir, &["init", "--prefix", "br"]);
 
         let _cwd = CwdGuard::chdir(&nested);
         let capture = ftui_runtime::StdioCapture::install().unwrap();
@@ -67427,31 +67422,15 @@ startup_timeout_sec = 42
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
         let beads_dir = std::fs::canonicalize(&beads_dir).expect("canonicalize .beads");
 
-        let (mut storage, _paths) =
-            beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
-        storage
-            .create_issue(
-                &beads_rust::model::Issue {
-                    id: "br-deferred".to_string(),
-                    title: "Deferred issue".to_string(),
-                    status: beads_rust::model::Status::Deferred,
-                    ..Default::default()
-                },
-                "test",
-            )
-            .expect("insert deferred issue");
-        storage
-            .create_issue(
-                &beads_rust::model::Issue {
-                    id: "br-custom".to_string(),
-                    title: "Custom issue".to_string(),
-                    status: beads_rust::model::Status::Custom("triage".to_string()),
-                    ..Default::default()
-                },
-                "test",
-            )
-            .expect("insert custom issue");
-        drop(storage);
+        run_beads_fixture_command(&beads_dir, &["init", "--prefix", "br"]);
+        run_beads_fixture_command(
+            &beads_dir,
+            &["create", "Deferred issue", "--status", "deferred"],
+        );
+        run_beads_fixture_command(
+            &beads_dir,
+            &["create", "Custom issue", "--status", "triage"],
+        );
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
         let result = handle_beads_status(Some(dir.path().to_path_buf()), None, true);
@@ -67476,9 +67455,7 @@ startup_timeout_sec = 42
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
         let beads_dir = std::fs::canonicalize(&beads_dir).expect("canonicalize .beads");
 
-        let storage =
-            beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
-        drop(storage);
+        run_beads_fixture_command(&beads_dir, &["init", "--prefix", "br"]);
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
         let result = handle_beads_ready(Some(dir.path().to_path_buf()), 20, None, true);
