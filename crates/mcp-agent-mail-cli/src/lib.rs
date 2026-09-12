@@ -15755,25 +15755,15 @@ fn vacuum_live_franken_sqlite_into_snapshot(
     let destination_text = sqlite_snapshot_path_text(destination, context, "destination")?;
     prepare_sqlite_snapshot_destination(destination, context)?;
     #[cfg(unix)]
-    if sqlite_family_is_franken_admitted(source) {
+    if sqlite_family_is_franken_admitted(source)
+        && let Ok(Some(staged)) =
+            mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(source)
+    {
         // Preserve committed page-one metadata and damaged physical pages.
         // A logical VACUUM rebuild can lose WAL-only header fields and repair
         // the very index damage a canonical diagnostic needs to observe.
         // The staging layer owns native source locks; canonical SQLite only
         // opens the resulting private family and folds its WAL into a backup.
-        let staged = mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(source)
-            .map_err(|error| {
-                CliError::Other(format!(
-                    "{context} guarded live snapshot failed from {}: {error}",
-                    source.display()
-                ))
-            })?
-            .ok_or_else(|| {
-                CliError::Other(format!(
-                    "{context} guarded live snapshot failed: no regular source family at {}",
-                    source.display()
-                ))
-            })?;
         let staged_text = sqlite_snapshot_path_text(staged.path(), context, "staged source")?;
         let snapshot =
             mcp_agent_mail_db::CanonicalDbConn::open_file(staged_text).map_err(|error| {
@@ -15788,6 +15778,10 @@ fn vacuum_live_franken_sqlite_into_snapshot(
         })?;
         return Ok(());
     }
+    // A live rollback-journal owner may have no SHM and therefore cannot
+    // admit the physical copy. Keep the guarded logical export available
+    // for read availability; callers still classify that fallback as a
+    // logical snapshot, never as proof of physical integrity.
     // Engine-dispatching: a Franken-admitted source exports through the bound
     // FrankenSQLite opener; a source without a namespace pair (restored from a
     // backup, reconstructed from the archive, written by canonical tooling)

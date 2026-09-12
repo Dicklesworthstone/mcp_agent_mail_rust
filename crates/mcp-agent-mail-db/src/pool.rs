@@ -9348,7 +9348,7 @@ fn stage_sqlite_family_for_health_probe_once(
     stage_sqlite_family_for_health_probe_once_in(source, None)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn native_health_copy_error(error: impl std::fmt::Display) -> std::io::Error {
     let detail = error.to_string();
     let kind = if detail.to_ascii_lowercase().contains("busy") {
@@ -9362,7 +9362,7 @@ fn native_health_copy_error(error: impl std::fmt::Display) -> std::io::Error {
 /// Read physical bytes through the engine's shared descriptor domain. This
 /// synchronous diagnostic already performs blocking filesystem I/O; bounded
 /// Unix preads run inline rather than creating another async runtime.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn copy_native_health_file(
     file: &fsqlite::fsqlite_vfs::UnixFile,
     cx: &fsqlite_types::cx::Cx,
@@ -9413,7 +9413,7 @@ fn copy_native_health_file(
 /// locks stay alive until every source handle closes. SHM is derived state:
 /// the private canonical reader rebuilds it from the copied WAL, so this path
 /// never copies or reads the concurrently mapped source SHM bytes.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn stage_native_family_for_health_probe(
     source: &Path,
     root: Option<&Path>,
@@ -9569,7 +9569,7 @@ fn stage_sqlite_family_for_health_probe_once_in(
     match std::fs::symlink_metadata(source) {
         Ok(metadata) if metadata.file_type().is_file() =>
         {
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             if metadata.nlink() != 1 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -9587,7 +9587,7 @@ fn stage_sqlite_family_for_health_probe_once_in(
     // before any copy opens the main inode, retaining gate-then-use flock
     // admission until every source descriptor has closed. This belongs here
     // so health, forensics and doctor callers share the same protection.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     let _namespace_guards = match inspect_namespace_sidecar_shape(source, "physical health copy")
         .map_err(|error| std::io::Error::other(error.to_string()))?
     {
@@ -9654,7 +9654,7 @@ fn stage_sqlite_family_for_health_probe_once_in(
         let source_sidecar = sqlite_sidecar_path(source, suffix);
         match std::fs::symlink_metadata(&source_sidecar) {
             Ok(metadata) if metadata.file_type().is_file() => {
-                #[cfg(target_os = "linux")]
+                #[cfg(unix)]
                 if metadata.nlink() != 1 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -9690,7 +9690,7 @@ fn stage_sqlite_family_for_health_probe_once_in(
 /// `Ok(None)` when `source` is not a regular file or a sidecar slot holds a
 /// non-file.
 ///
-/// On Linux a live admitted family uses native shared-descriptor reads under
+/// On Unix a live admitted family uses native shared-descriptor reads under
 /// main/backfill/reset fences and repeated byte seals. An idle complete
 /// namespace can instead admit a raw copy, including when SHM is missing.
 /// Hard-linked sources and sidecars are refused because another pathname can
@@ -30387,7 +30387,7 @@ mod tests {
         found
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn native_health_staging_preserves_hot_wal_bytes_and_reads_committed_rows() {
         use fsqlite::fsqlite_vfs::{UnixVfs, Vfs as _};
