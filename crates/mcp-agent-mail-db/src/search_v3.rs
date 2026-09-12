@@ -1077,6 +1077,15 @@ fn open_backfill_conn(db_path: &str) -> Result<crate::DbConnGuard, String> {
     Ok(conn)
 }
 
+fn open_read_only_backfill_conn(db_path: &str) -> Result<crate::DbConnGuard, String> {
+    crate::pool::open_guarded_read_only_franken_existing_file(
+        Path::new(db_path),
+        "live lexical refresh",
+    )
+    .map(|conn| crate::guard_db_conn(conn, "read-only search backfill connection"))
+    .map_err(|error| error.to_string())
+}
+
 /// Old schemas lack transactional change counters. Keep their scan in one
 /// read transaction and compare its indexed contents with a fresh transaction
 /// before publishing. The extra passes are limited to those old schemas and
@@ -1439,6 +1448,24 @@ pub fn backfill_from_db_as(
     backfill_into_bridge(&bridge, db_url, identity_path)
 }
 
+/// Refresh the actual live source without opening it with write permissions.
+/// Every scan retry and the publication seal repeat guarded native admission.
+pub(crate) fn backfill_read_only_live(db_url: &str, index_dir: &Path) -> Result<(), String> {
+    init_or_switch_bridge(index_dir)?;
+    let bridge = get_bridge().ok_or("lexical bridge disappeared during live refresh")?;
+    if !same_index_dir(bridge.index_dir(), index_dir) {
+        return Err("lexical bridge changed during live refresh".to_string());
+    }
+    let _source_guard = bridge
+        .source_operation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    with_backfill_source_retry(|| {
+        backfill_into_bridge_locked_with_opener(&bridge, db_url, None, open_read_only_backfill_conn)
+    })?;
+    Ok(())
+}
+
 /// Search a private database materialization with the same lexical parser,
 /// filters and ranking as the live index, without modifying global bridge
 /// state, live index bytes or the process-wide result cache.
@@ -1502,6 +1529,16 @@ fn backfill_into_bridge_locked(
     db_url: &str,
     identity_path: Option<&str>,
 ) -> Result<(usize, usize), String> {
+    backfill_into_bridge_locked_with_opener(bridge, db_url, identity_path, open_backfill_conn)
+}
+
+#[allow(clippy::too_many_lines)]
+fn backfill_into_bridge_locked_with_opener(
+    bridge: &TantivyBridge,
+    db_url: &str,
+    identity_path: Option<&str>,
+    open_connection: fn(&str) -> Result<crate::DbConnGuard, String>,
+) -> Result<(usize, usize), String> {
     const FETCH_BATCH_SIZE: i64 = 500;
 
     // Open a sync connection via FrankenSQLite.
@@ -1526,7 +1563,7 @@ fn backfill_into_bridge_locked(
     // br-5u3w5: the bespoke bootstrap open races live pool connections on the
     // same WAL mailbox and can surface "database is busy" — retry it on the
     // bootstrap budget instead of failing the whole bootstrap.
-    let mut conn = open_backfill_conn(db_path)?;
+    let mut conn = open_connection(db_path)?;
 
     if !backfill_table_exists(&conn, "messages")? {
         if db_path != ":memory:" {
@@ -1750,7 +1787,7 @@ fn backfill_into_bridge_locked(
                             "backfill page scan hit lock/busy error; retrying on a fresh connection"
                         );
                         std::thread::sleep(delay);
-                        match open_backfill_conn(db_path) {
+                        match open_connection(db_path) {
                             Ok(fresh) => conn = fresh,
                             Err(open_error) => tracing::warn!(
                                 error = %open_error,
@@ -1811,7 +1848,7 @@ fn backfill_into_bridge_locked(
         // a fresh source connection confirms the scan did not cross a write.
         // The original revision goes into the marker: a later source commit
         // remains visible as drift on the next check.
-        let seal = open_backfill_conn(db_path)?;
+        let seal = open_connection(db_path)?;
         if let Some(expected) = legacy_digest {
             seal.execute_sync("BEGIN DEFERRED", &[])
                 .map_err(|error| format!("legacy backfill seal transaction: {error}"))?;
@@ -3680,6 +3717,82 @@ mod tests {
                 .len(),
             1
         );
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn read_only_live_backfill_preserves_source_and_publishes_real_rows() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let source = tempfile::TempDir::new().unwrap();
+        let index = tempfile::TempDir::new().unwrap();
+        let db_path = create_test_db(
+            source.path(),
+            &[(
+                1,
+                "guarded refresh",
+                "persistent result",
+                "normal",
+                "thread-one",
+            )],
+        );
+        let source_bytes = || {
+            std::fs::read_dir(source.path())
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = source_bytes();
+        backfill_read_only_live(&db_path, index.path()).expect("guarded native refresh");
+        assert_eq!(
+            source_bytes(),
+            before,
+            "all database and sidecar bytes stay unchanged"
+        );
+        let bridge = get_bridge().unwrap();
+        let state = read_backfill_state(&bridge).expect("durable live marker");
+        assert_eq!(state.db_path, db_path);
+        assert_eq!(state.db_stats.count, 1);
+        let results = bridge.search(&PlannerQuery {
+            text: "guarded".to_string(),
+            doc_kind: DocKind::Message,
+            ..Default::default()
+        });
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, 1);
+        backfill_read_only_live(&db_path, index.path()).expect("repeat guarded refresh");
+        assert_eq!(
+            source_bytes(),
+            before,
+            "a freshness skip is source-neutral too"
+        );
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn read_only_live_backfill_refuses_missing_namespace_without_writable_fallback() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let source = tempfile::TempDir::new().unwrap();
+        let index = tempfile::TempDir::new().unwrap();
+        let db_path = source.path().join("canonical.sqlite3");
+        let conn = crate::CanonicalDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_raw("CREATE TABLE original (id INTEGER);")
+            .unwrap();
+        drop(conn);
+        let before = std::fs::read(&db_path).unwrap();
+        let error = backfill_read_only_live(db_path.to_str().unwrap(), index.path()).unwrap_err();
+        assert!(error.contains("namespace"), "unexpected refusal: {error}");
+        assert_eq!(std::fs::read(&db_path).unwrap(), before);
+        assert_eq!(std::fs::read_dir(source.path()).unwrap().count(), 1);
+        assert!(!index.path().join("backfill_state.json").exists());
         reset_bridge_for_tests();
     }
 

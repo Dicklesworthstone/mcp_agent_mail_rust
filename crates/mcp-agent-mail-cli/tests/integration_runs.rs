@@ -3613,6 +3613,193 @@ fn installed_binary_parity_probe_compares_source_and_installed_am() {
 }
 
 #[test]
+fn robot_search_locked_live_index_returns_private_results_with_refresh_alert() {
+    let env = TestEnv::new();
+    let project_path = env.tmp.path().join("locked-index-project");
+    std::fs::create_dir_all(&project_path).unwrap();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    insert_project(
+        &conn,
+        1,
+        "locked-index-project",
+        project_path.to_str().unwrap(),
+    );
+    insert_agent(&conn, 1, 1, "Recipient", "test", "test");
+    insert_message(&conn, 1, 1, 1, "original message", "original body");
+    insert_recipient(&conn, 1, 1);
+    mcp_agent_mail_db::close_db_conn(conn, "seed locked index fixture");
+    let index_dir = env.storage_root.join("search_index");
+    mcp_agent_mail_db::search_v3::init_or_switch_bridge(&index_dir).unwrap();
+    assert_eq!(
+        mcp_agent_mail_db::search_v3::backfill_from_db(&env.database_url())
+            .unwrap()
+            .0,
+        1
+    );
+    // The production backfill retains the actual Tantivy writer in this
+    // process while the child CLI attempts its independent refresh.
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    insert_message(&conn, 2, 1, 1, "pending refresh", "private availability");
+    insert_recipient(&conn, 2, 1);
+    mcp_agent_mail_db::close_db_conn(conn, "commit pending index message");
+    let source_bytes = || {
+        ["", "-wal", "-shm", "-fsqlite-ns-gate", "-fsqlite-ns-use"]
+            .into_iter()
+            .map(|suffix| {
+                (
+                    suffix,
+                    std::fs::read(format!("{}{suffix}", env.db_path.display())).ok(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let before = source_bytes();
+    let index_before = snapshot_tree(&index_dir);
+    let output = run_am(
+        &env.isolated_env(),
+        Some(&project_path),
+        &[
+            "robot",
+            "search",
+            "pending",
+            "--project",
+            "locked-index-project",
+            "--agent",
+            "Recipient",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "private search failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        robot_total_results(&result, "locked index private search"),
+        1
+    );
+    assert_ne!(
+        robot_search_index_state(&result, "locked index health"),
+        "fresh"
+    );
+    assert!(
+        result["_alerts"].as_array().unwrap().iter().any(|alert| {
+            let summary = alert["summary"].as_str().unwrap_or_default();
+            summary.contains("Live lexical refresh failed")
+                && summary.to_lowercase().contains("writer")
+        }),
+        "missing explicit writer refusal: {result}"
+    );
+    assert!(source_bytes() == before, "source family bytes changed");
+    assert_eq!(
+        snapshot_tree(&index_dir),
+        index_before,
+        "locked live index changed"
+    );
+    let replacement = tempfile::TempDir::new().unwrap();
+    mcp_agent_mail_db::search_v3::init_or_switch_bridge(replacement.path()).unwrap();
+    let recovered = run_am(
+        &env.isolated_env(),
+        Some(&project_path),
+        &[
+            "robot",
+            "search",
+            "pending",
+            "--project",
+            "locked-index-project",
+            "--agent",
+            "Recipient",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert!(
+        recovered.status.success(),
+        "refresh after writer release: {}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let recovered: Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!(robot_total_results(&recovered, "recovered search"), 1);
+    assert_eq!(
+        robot_search_index_state(&recovered, "recovered index"),
+        "fresh"
+    );
+    assert!(
+        source_bytes() == before,
+        "recovery changed source family bytes"
+    );
+}
+
+#[test]
+fn robot_search_sidecarless_canonical_source_stays_private_and_unchanged() {
+    let env = TestEnv::new();
+    let project_path = env.tmp.path().join("restored-project");
+    std::fs::create_dir_all(&project_path).unwrap();
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(env.db_path.to_str().unwrap())
+        .expect("open canonical recovery fixture");
+    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+        .expect("initialize canonical recovery schema");
+    conn.execute_sync(
+        "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'restored-project', ?, 0)",
+        &[SqlValue::Text(project_path.to_str().unwrap().to_string())],
+    ).unwrap();
+    conn.execute_raw(
+        "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts) VALUES (1, 1, 'Recipient', 'test', 'test', '', 0, 0);
+         INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts) VALUES (1, 1, 1, 'canonical recovery', 'restored content', 'normal', 0, 1704067200000000);
+         INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 1, 'to');",
+    ).unwrap();
+    drop(conn);
+    let before = file_snapshot(&env.db_path);
+    let output = run_am(
+        &env.isolated_env(),
+        Some(&project_path),
+        &[
+            "robot",
+            "search",
+            "canonical",
+            "--project",
+            "restored-project",
+            "--agent",
+            "Recipient",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "canonical search failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(robot_total_results(&result, "canonical private search"), 1);
+    assert_eq!(file_snapshot(&env.db_path), before);
+    for suffix in ["-wal", "-shm", "-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+        assert!(
+            !PathBuf::from(format!("{}{suffix}", env.db_path.display())).exists(),
+            "search created source sidecar {suffix}"
+        );
+    }
+    assert!(
+        !env.storage_root
+            .join("search_index/backfill_state.json")
+            .exists()
+    );
+    let index_dir = result
+        .get("search_index")
+        .or_else(|| result.get("data").and_then(|data| data.get("search_index")))
+        .and_then(|health| health.get("index_dir"))
+        .and_then(Value::as_str)
+        .expect("search reports its persistent index directory");
+    assert!(!Path::new(index_dir).join("backfill_state.json").exists());
+}
+
+#[test]
 fn startup_recovery_crash_replay_writes_artifacts_and_smokes_repair_and_reconstruct() {
     let env = TestEnv::new();
     let env_vars = env.isolated_env();

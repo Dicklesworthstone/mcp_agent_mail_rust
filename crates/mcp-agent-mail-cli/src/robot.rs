@@ -15179,6 +15179,27 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                         .to_string(),
                 )
             })?;
+            // A private snapshot remains the result authority. Only a snapshot
+            // of the live DB authorizes a separate guarded read-only refresh
+            // from that live source; archive/staged fallback truth must never
+            // publish into the persistent mailbox index.
+            let mut live_refresh_error = None;
+            if read_db._source.kind == crate::CanonicalSnapshotSourceKind::LiveSnapshot
+                && crate::sqlite_family_is_franken_admitted(read_db._source.reported_path())
+            {
+                let live_config = mcp_agent_mail_db::DbPoolConfig {
+                    database_url: crate::sqlite_url_from_path(read_db._source.reported_path()),
+                    storage_root: Some(read_db.pool().storage_root().to_path_buf()),
+                    run_migrations: false,
+                    warmup_connections: 0,
+                    ..mcp_agent_mail_db::DbPoolConfig::default()
+                };
+                let live_pool =
+                    mcp_agent_mail_db::create_pool_without_startup_init(&live_config)
+                        .map_err(|error| CliError::Other(format!("live search source: {error}")))?;
+                live_refresh_error =
+                    mcp_agent_mail_db::search_service::refresh_live_lexical_index(&live_pool).err();
+            }
             let data = build_search(
                 search_conn,
                 read_db.pool(),
@@ -15193,6 +15214,15 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let mut env = RobotEnvelope::new(cmd_name, format, data);
             env._meta.project = Some(project_slug);
             env = enrich_envelope_with_search_index_alert(env, search_index.as_ref());
+            if let Some(error) = live_refresh_error {
+                env = env.with_alert(
+                    "warn",
+                    format!(
+                        "Live lexical refresh failed; results use the private snapshot: {error}"
+                    ),
+                    Some("am robot health --format json".to_string()),
+                );
+            }
             format_output(&env, format)?
         }
         RobotSubcommand::Reservations {

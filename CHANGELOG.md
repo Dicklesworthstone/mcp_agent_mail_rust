@@ -38,6 +38,13 @@ reviewed through 2026-09-12. These changes are not published release artifacts.
 
 ### Fixed
 
+- **Robot search refreshes a reconstructed mailbox's live lexical index.**
+  Native live mailboxes use guarded read-only database connections for the
+  refresh, while query results remain based on a private snapshot. If the
+  index writer is busy, search still returns those results with a refresh
+  warning and unavailable index health. A later successful refresh restores
+  health. Canonical and archive fallback snapshots cannot publish into the
+  live index.
 - **Search retries a rebuild interrupted by mailbox writes.** Interactive
   lexical search retries when a source change invalidates an unpublished
   backfill, with a bounded retry budget. The rejected writer is rolled back;
