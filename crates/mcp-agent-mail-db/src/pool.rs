@@ -16942,14 +16942,22 @@ mod tests {
     }
 
     fn assert_full_migration_ledger_applied(sqlite_path: &str) {
-        let conn = open_sqlite_file_with_lock_retry_canonical(sqlite_path)
-            .expect("open canonical sqlite file");
-        let applied = conn
-            .query_sync(
-                &format!("SELECT id FROM {}", schema::MIGRATIONS_TABLE_NAME),
-                &[],
-            )
-            .expect("query migration ledger")
+        // Keep the independent canonical oracle on a guarded private copy.
+        // Closing canonical SQLite on this live native family can remove its
+        // WAL and release same-process locks held by the runtime connection
+        // that the caller deliberately continues exercising below.
+        let (rows, _) = with_canonical_diagnostic_conn_raw(
+            Path::new(sqlite_path),
+            "migration ledger assertion",
+            |conn| {
+                conn.query_sync(
+                    &format!("SELECT id FROM {}", schema::MIGRATIONS_TABLE_NAME),
+                    &[],
+                )
+            },
+        )
+        .expect("query canonical migration ledger without disturbing runtime family");
+        let applied = rows
             .into_iter()
             .filter_map(|row| row.get_named::<String>("id").ok())
             .collect::<std::collections::BTreeSet<_>>();
