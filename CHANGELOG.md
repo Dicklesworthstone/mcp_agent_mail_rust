@@ -16,6 +16,8 @@ The additional review on 2026-09-09 covers the configuration fixes after the
 v0.3.35 tag and OMP runtime detection below. The 2026-09-11 review adds the
 br-2xdhw search workstream and CLI issue fixes, and refreshes publication
 metadata: v0.3.35 was published on 2026-09-09 and is the latest GitHub Release.
+The 2026-09-12 review checks the remaining post-tag import and contact changes;
+the next release and dependency validation are still in progress.
 
 ## Release Timeline
 
@@ -32,10 +34,25 @@ Recent releases; the earlier version history continues below.
 ## Unreleased
 
 Changes after the [v0.3.35 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.35),
-reviewed through 2026-09-11. These changes are not published release artifacts.
+reviewed through 2026-09-12. These changes are not published release artifacts.
 
 ### Fixed
 
+- **Explicit legacy paths cannot silently select a UTF-8 alias.** Import and
+  status commands reject non-UTF-8 source, destination, and resolved path
+  authorities before converting them to database or receipt strings.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/acdac5aa389be45d99603189214af67ed5b0830b))
+- **Failed imports retain the held mailbox lock while staging partial output.**
+  Retry readiness checks include leftover WAL/SHM files and validate retained
+  receipt directories. Partial archive contents are staged without moving the
+  activity lock; a retry is reported ready only when its target is usable.
+  ([retry checks](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/d4ee8de9383192eb750f201269ac05f4d6a06f54),
+  [lock preservation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/5766634ae01f0b71cb25077f91e551615d1b536c))
+- **Contact-response errors explain the request direction.** A missing directed
+  request now identifies the two agents and projects and explains which agent
+  belongs in `from_agent`. The tool does not retry the reverse direction or
+  approve a different request.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/58979629fe0b94b4d84a4fb6aeb25c1086fe4b18))
 - **Overview batches counts across projects.** `am robot overview`
   replaces per-project message-count queries with one grouped query and counts
   active reservations from one fleet-wide candidate scan. Release-ledger

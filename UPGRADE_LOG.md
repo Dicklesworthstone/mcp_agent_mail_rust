@@ -1,5 +1,50 @@
 # Dependency Upgrade Log
 
+## September 12, 2026 — next release (br-xql74)
+
+Status: in progress; no new version, tag, or publication yet. Baseline source
+`5d2f6af863de1d021fb6ee862fb5f928f6168d0e`, version 0.3.35.
+The older June entries below are historical evidence, not current release gates.
+
+Live registry research covered 89 direct packages: 54 already current and 35
+newer packages grouped into 18 coherent upgrade units. Preserve Tantivy's git
+revision and the gated FrankenSearch path dependencies. FrankenSQLite 0.3.18
+is already latest stable.
+
+- In progress: Comrak 0.54.0 → 0.55.0. Fixes two autolink denial-of-service
+  issues ([GHSA-xg9p-p4jc-c46g](https://github.com/kivikakk/comrak/security/advisories/GHSA-xg9p-p4jc-c46g)).
+  No use of its deprecated `tagfilter` option was found. Remote Markdown tests
+  must pass before the next dependency update.
+- Pending, individually tested: indexmap 2.14.2; plist 1.10.1; smallvec 1.16.1;
+  toml_edit 0.25.15; tru 0.2.4; franken-agent-detection 0.2.4;
+  tokenizers 0.23.2; wide 1.7.0; blake2 0.11.0; dirs 7.0.0;
+  winsafe 0.0.29; beads_rust 0.5.12; SQLModel family 0.4.3; FTUI family 0.7.0.
+- Constrained: latest FastMCP 0.9.0 requires asupersync exactly 0.4.10 and
+  Rust 1.100, while even latest beads_rust requires asupersync exactly 0.4.9.
+  The Rust floor is a declared-MSRV concern, not yet a compiler refusal: the
+  pinned nightly can be newer than the workspace's advertised Rust 1.95 floor.
+  Latest asupersync 0.4.11 satisfies neither exact pin. Keep the coherent
+  existing runtime family; do not substitute mutable sibling checkouts.
+- Compatible FastMCP candidate: 0.8.1 keeps asupersync exactly 0.4.9 and
+  isolates `block_on` runtimes per thread, directly relevant to AM dispatch.
+  The installed nightly is Rust 1.100.0-nightly and satisfies its floor.
+  Existing explicit-context runner calls appear compatible; compile and real
+  transport tests are pending. Both current and candidate FastMCP clients pin
+  TOML exactly 1.1.4, preventing a standalone upgrade to TOML 1.1.6.
+- Release gates pending: complete workspace tests, check, strict Clippy,
+  formatting, security audit, six-platform portable builds, signed artifacts,
+  installation/update checks, and applicable distribution venue verification.
+- Initial post-Comrak `cargo audit --json` completed with zero vulnerabilities.
+  Actual Markdown tests are still compiling remotely; audit success does not
+  establish runtime compatibility.
+- Venue preflight: GitHub Actions permissions report `enabled=false`.
+  Homebrew is already at 0.3.35 with four platform hashes. GHCR `latest` has
+  amd64/arm64 images labelled 0.3.34 at source `0125f0505fa0ba604dbbbb580fad56d283e46488`.
+  The three probed Agent Mail package names return crates.io 404 and every
+  active workspace member remains `publish=false`; gated path/git dependencies
+  still prevent treating this as an existing crates.io publication stream.
+
+
 **Date:** 2026-06-11 | **Project:** mcp_agent_mail_rust | **Language:** Rust
 
 ## Summary
