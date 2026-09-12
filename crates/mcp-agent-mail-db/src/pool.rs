@@ -9602,9 +9602,10 @@ fn stage_sqlite_family_for_health_probe_once_in(
             // Prefer the native descriptor domain while a mailbox owner is
             // alive. An idle source without SHM can still use the exclusive
             // namespace raw-copy path below; never create SHM to admit it.
-            if let Ok(staged) = stage_native_family_for_health_probe(source, root) {
-                return Ok(staged);
-            }
+            let native_error = match stage_native_family_for_health_probe(source, root) {
+                Ok(staged) => return Ok(staged),
+                Err(error) => error,
+            };
             let mut guards = Vec::with_capacity(2);
             for suffix in FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES {
                 let path = sqlite_sidecar_path(source, suffix);
@@ -9621,7 +9622,7 @@ fn stage_sqlite_family_for_health_probe_once_in(
                     if error.kind() == std::io::ErrorKind::WouldBlock {
                         std::io::Error::new(
                             std::io::ErrorKind::WouldBlock,
-                            "database is busy: physical health copying requires an idle FrankenSQLite namespace; live connections must retain their locks",
+                            format!("database is busy: native physical health copy failed ({native_error}); raw copying requires an idle FrankenSQLite namespace so live connections retain their locks"),
                         )
                     } else {
                         error
