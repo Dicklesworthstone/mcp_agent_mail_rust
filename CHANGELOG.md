@@ -47,11 +47,21 @@ reviewed through 2026-09-12. These changes are not published release artifacts.
   establish physical integrity.
 - **Deferred WAL commits remain visible after an external reader releases.**
   The complete FrankenSQLite dependency family is pinned to immutable
-  revision `fa6eebc318ee41230ecd7f85febce7a6f0f2326c`, carrying the upstream WAL
+  revision `dedf3e1be376b9b8bd90e458912aa9b226b86bf9`, carrying the upstream WAL
   lifetime repair while retaining Asupersync 0.4.9. Commits remain independent
   of reader-blocked checkpoint completion; subsequent maintenance makes the
   committed row visible to a fresh canonical reader.
   ([upstream repair](https://github.com/Dicklesworthstone/frankensqlite/commit/fa6eebc318ee41230ecd7f85febce7a6f0f2326c))
+- **Read-only mailbox probes work alongside live writers and empty WALs.**
+  The engine binds an existing WAL under shared locks, admits protected empty
+  snapshots without writing reader marks, and distinguishes an active rollback
+  journal owner from an abandoned journal requiring recovery. Cold checkpoints
+  initialize through the normal recovery protocol. Migration completion also
+  initializes the WAL index before reporting success.
+- **VACUUM exports reopen as standalone read-only databases.** Exported images
+  carry the standalone journal header while preserving application and schema
+  metadata. Canonical import verification uses a private physical copy so it
+  cannot disturb the migrated database's native locks.
 - **Robot search refreshes a reconstructed mailbox's live lexical index.**
   Native live mailboxes use guarded read-only database connections for the
   refresh, while query results remain based on a private snapshot. If the
