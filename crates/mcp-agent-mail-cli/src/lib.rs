@@ -15754,34 +15754,6 @@ fn vacuum_live_franken_sqlite_into_snapshot(
 ) -> CliResult<()> {
     let destination_text = sqlite_snapshot_path_text(destination, context, "destination")?;
     prepare_sqlite_snapshot_destination(destination, context)?;
-    #[cfg(unix)]
-    if sqlite_family_is_franken_admitted(source)
-        && let Ok(Some(staged)) =
-            mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(source)
-    {
-        // Preserve committed page-one metadata and damaged physical pages.
-        // A logical VACUUM rebuild can lose WAL-only header fields and repair
-        // the very index damage a canonical diagnostic needs to observe.
-        // The staging layer owns native source locks; canonical SQLite only
-        // opens the resulting private family and folds its WAL into a backup.
-        let staged_text = sqlite_snapshot_path_text(staged.path(), context, "staged source")?;
-        let snapshot =
-            mcp_agent_mail_db::CanonicalDbConn::open_file(staged_text).map_err(|error| {
-                CliError::Other(format!(
-                    "{context} private physical snapshot open failed: {error}"
-                ))
-            })?;
-        snapshot.backup_to_path(destination_text).map_err(|error| {
-            CliError::Other(format!(
-                "{context} private physical snapshot backup failed: {error}"
-            ))
-        })?;
-        return Ok(());
-    }
-    // A live rollback-journal owner may have no SHM and therefore cannot
-    // admit the physical copy. Keep the guarded logical export available
-    // for read availability; callers still classify that fallback as a
-    // logical snapshot, never as proof of physical integrity.
     // Engine-dispatching: a Franken-admitted source exports through the bound
     // FrankenSQLite opener; a source without a namespace pair (restored from a
     // backup, reconstructed from the archive, written by canonical tooling)
@@ -16403,8 +16375,11 @@ pub(crate) fn open_db_sync_robot_with_database_url(
 pub(crate) fn open_db_sync_robot_attachments_with_database_url(
     database_url: &str,
 ) -> CliResult<mcp_agent_mail_db::DbConn> {
-    if let Ok(conn) = open_db_sync_robot_attachments_best_effort_with_database_url(database_url) {
-        return Ok(conn);
+    match open_db_sync_robot_attachments_best_effort_with_database_url(database_url) {
+        Ok(conn) => return Ok(conn),
+        Err(error) => {
+            tracing::debug!(%error, "robot attachment read-only admission failed before full initialization");
+        }
     }
     match open_db_sync_with_database_url(database_url) {
         Ok(conn) => Ok(conn),
@@ -21434,6 +21409,13 @@ fn handle_migrate_with_database_url_locked(database_url: &str) -> CliResult<()> 
                     "Warning: failed to switch journal_mode to WAL after migration: {e}"
                 );
             }
+            // Enter a real read while this migration still owns a writable
+            // connection. The WAL mode transition alone may leave its shared
+            // index uninitialized; a later read-only client cannot recover it.
+            // This also verifies that the completed mailbox schema is usable
+            // before the command reports success.
+            conn.query_sync("SELECT COUNT(*) AS project_count FROM projects", &[])
+                .map_err(|e| CliError::Other(format!("post-migration mailbox read failed: {e}")))?;
             // Legacy Python: `migrate` is an explicit schema-create command.
             ftui_runtime::ftui_println!("✓ Database schema created from model definitions!");
             ftui_runtime::ftui_println!(
@@ -66813,31 +66795,29 @@ startup_timeout_sec = 42
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
         let beads_dir = std::fs::canonicalize(&beads_dir).expect("canonicalize .beads");
 
-        let (mut storage, _paths) =
-            beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
-
-        let open_issue = beads_rust::model::Issue {
-            id: "br-test-open".to_string(),
-            title: "Open issue".to_string(),
-            status: beads_rust::model::Status::Open,
-            ..Default::default()
-        };
-        storage
-            .create_issue(&open_issue, "test")
-            .expect("insert open issue");
-
-        let in_progress_issue = beads_rust::model::Issue {
-            id: "br-test-progress".to_string(),
-            title: "In progress issue".to_string(),
-            status: beads_rust::model::Status::InProgress,
-            ..Default::default()
-        };
-        storage
-            .create_issue(&in_progress_issue, "test")
-            .expect("insert in-progress issue");
-        // `open_storage` owns the Beads write lock; release the fixture
-        // writer before asking the CLI's separate `br` process to query it.
-        drop(storage);
+        // The production integration uses the installed CLI, whose schema can
+        // differ from the embedded library. Seed through that same real CLI
+        // so this exercises supported creation and querying end to end.
+        for args in [
+            vec!["init".to_string(), "--prefix".to_string(), "br".to_string()],
+            vec!["create".to_string(), "Open issue".to_string()],
+            vec![
+                "create".to_string(),
+                "In progress issue".to_string(),
+                "--status".to_string(),
+                "in_progress".to_string(),
+            ],
+        ] {
+            let output = br_json_command(&beads_dir, &args)
+                .expect("fixture command")
+                .output()
+                .expect("run real br fixture command");
+            assert!(
+                output.status.success(),
+                "br fixture {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
 
         let (ready, open, in_progress) =
             beads_issue_awareness_counts_from(Some(dir.path())).expect("counts");
@@ -75343,27 +75323,25 @@ startup_timeout_sec = 42
             result_tx.send(result).expect("send open result");
         });
 
-        let message_count = match result_rx.recv_timeout(std::time::Duration::from_secs(1)) {
-            Ok(result) => {
-                result.expect("robot attachments helper should fall back to read-only open")
-            }
-            Err(err) => {
-                let _ = release_tx.send(());
-                open_thread.join().expect("join open thread after timeout");
-                lock_thread.join().expect("join lock thread after timeout");
-                panic!(
-                    "robot attachments open should not wait for canonical init under reserved lock: {err}"
-                );
-            }
-        };
+        let result = result_rx.recv_timeout(std::time::Duration::from_secs(1));
+        // Retire the fixture workers on error as well as timeout before an
+        // assertion can unwind and drop their database or release channel.
+        let release = release_tx.send(());
+        let reader_join = open_thread.join();
+        let writer_join = lock_thread.join();
+        assert!(
+            release.is_ok() && reader_join.is_ok() && writer_join.is_ok(),
+            "robot result={result:?}; release={release:?}; reader joined={}; writer joined={}",
+            reader_join.is_ok(),
+            writer_join.is_ok(),
+        );
+        let message_count = result
+            .expect("robot attachments open should not wait for canonical init under reserved lock")
+            .expect("robot attachments helper should fall back to read-only open");
         assert_eq!(
             message_count, 1,
             "robot attachments fallback should preserve readable attachment rows"
         );
-
-        release_tx.send(()).expect("release lock thread");
-        open_thread.join().expect("join open thread");
-        lock_thread.join().expect("join lock thread");
     }
 
     #[test]
