@@ -15754,6 +15754,40 @@ fn vacuum_live_franken_sqlite_into_snapshot(
 ) -> CliResult<()> {
     let destination_text = sqlite_snapshot_path_text(destination, context, "destination")?;
     prepare_sqlite_snapshot_destination(destination, context)?;
+    #[cfg(unix)]
+    if sqlite_family_is_franken_admitted(source) {
+        // Preserve committed page-one metadata and damaged physical pages.
+        // A logical VACUUM rebuild can lose WAL-only header fields and repair
+        // the very index damage a canonical diagnostic needs to observe.
+        // The staging layer owns native source locks; canonical SQLite only
+        // opens the resulting private family and folds its WAL into a backup.
+        let staged = mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(source)
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "{context} guarded live snapshot failed from {}: {error}",
+                    source.display()
+                ))
+            })?
+            .ok_or_else(|| {
+                CliError::Other(format!(
+                    "{context} guarded live snapshot failed: no regular source family at {}",
+                    source.display()
+                ))
+            })?;
+        let staged_text = sqlite_snapshot_path_text(staged.path(), context, "staged source")?;
+        let snapshot =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(staged_text).map_err(|error| {
+                CliError::Other(format!(
+                    "{context} private physical snapshot open failed: {error}"
+                ))
+            })?;
+        snapshot.backup_to_path(destination_text).map_err(|error| {
+            CliError::Other(format!(
+                "{context} private physical snapshot backup failed: {error}"
+            ))
+        })?;
+        return Ok(());
+    }
     // Engine-dispatching: a Franken-admitted source exports through the bound
     // FrankenSQLite opener; a source without a namespace pair (restored from a
     // backup, reconstructed from the archive, written by canonical tooling)
@@ -57902,6 +57936,28 @@ startup_timeout_sec = 42
     #[cfg(unix)]
     #[test]
     fn doctor_read_only_probe_still_fails_on_structurally_corrupt_main_db() {
+        const CORRUPT_PATH: &str = "AM_DOCTOR_PHYSICAL_CORRUPTION_PATH";
+        const CORRUPT_PAGE: &str = "AM_DOCTOR_PHYSICAL_CORRUPTION_PAGE";
+        if let Some(path) = std::env::var_os(CORRUPT_PATH) {
+            let path = PathBuf::from(path);
+            let page: u64 = std::env::var(CORRUPT_PAGE).unwrap().parse().unwrap();
+            let wal = std::fs::read(sqlite_sidecar_path(&path, "-wal")).unwrap();
+            assert!(wal.len() >= 32, "corruption fixture must retain WAL");
+            let page_size =
+                usize::try_from(u32::from_be_bytes(wal[8..12].try_into().unwrap())).unwrap();
+            assert!(page_size.is_power_of_two() && (512..=65536).contains(&page_size));
+            for frame in wal[32..].chunks_exact(24 + page_size) {
+                let frame_page = u32::from_be_bytes(frame[..4].try_into().unwrap());
+                assert_ne!(
+                    u64::from(frame_page),
+                    page,
+                    "WAL must not mask damaged main page"
+                );
+            }
+            corrupt_main_file_page_in_place(&path, page);
+            println!("PHYSICAL_CORRUPTION_CHILD_RAN");
+            return;
+        }
         let dir = tempfile::tempdir().expect("tempdir");
         let slug = "hot-wal-corrupt";
         seed_matching_archive_project(dir.path(), slug);
@@ -57917,7 +57973,24 @@ startup_timeout_sec = 42
             .expect("look up agents root page");
         let root_page = rows[0].get_named::<i64>("rootpage").expect("rootpage");
         assert!(root_page > 1, "agents root page must not be page 1");
-        corrupt_main_file_page_in_place(&db_path, u64::try_from(root_page).expect("page"));
+        // Keep raw corruption descriptors out of the native owner's process:
+        // closing one here would erase its process-wide fcntl lock claims.
+        let damaged = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "tests::doctor_read_only_probe_still_fails_on_structurally_corrupt_main_db",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CORRUPT_PATH, &db_path)
+            .env(CORRUPT_PAGE, root_page.to_string())
+            .output()
+            .expect("run isolated physical corruption injector");
+        assert!(
+            damaged.status.success(),
+            "corruption injector failed: {}",
+            String::from_utf8_lossy(&damaged.stderr)
+        );
+        assert!(String::from_utf8_lossy(&damaged.stdout).contains("PHYSICAL_CORRUPTION_CHILD_RAN"));
 
         let db_url = format!("sqlite:///{}", db_path.display());
         let strategy = doctor_database_fix_strategy_read_only(&db_url, dir.path())
