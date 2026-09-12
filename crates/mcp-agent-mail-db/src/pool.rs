@@ -22614,7 +22614,6 @@ mod tests {
             "integer",
             "timestamp migration should convert TEXT project timestamp to INTEGER"
         );
-        assert_full_migration_ledger_applied(db_path_str.as_ref());
         assert_messages_recipients_json_runtime_schema(&verify_conn);
         let recipients_rows = verify_conn
             .query_sync("SELECT recipients_json FROM messages WHERE id = 1", &[])
@@ -22626,6 +22625,12 @@ mod tests {
             "{}",
             "normal pool startup should backfill recipients_json for legacy rows"
         );
+        // Complete every native assertion before the independent canonical
+        // ledger probe. A resting rollback-mode legacy family may have no SHM;
+        // releasing its native owners permits the guarded idle-family copy.
+        drop(verify_conn);
+        drop(pool);
+        assert_full_migration_ledger_applied(db_path_str.as_ref());
     }
 
     #[test]

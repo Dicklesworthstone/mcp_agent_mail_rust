@@ -66789,7 +66789,10 @@ startup_timeout_sec = 42
     }
 
     fn run_beads_fixture_command(beads_dir: &Path, args: &[&str]) {
-        let args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+        let args = args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
         let output = br_json_command(beads_dir, &args)
             .expect("fixture command")
             .output()
