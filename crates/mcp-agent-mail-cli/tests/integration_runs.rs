@@ -3032,6 +3032,9 @@ fn projects_adopt_apply_duplicate_agent_name_conflict_exits_nonzero() {
         .expect("open sqlite db");
     insert_agent(&conn, 101, 1, "GreenCastle", "test", "test");
     insert_agent(&conn, 202, 2, "greencastle", "test", "test");
+    // Seeding is complete; the child must own schema initialization before it
+    // can evaluate the duplicate-name conflict this test exercises.
+    drop(conn);
 
     let source_archive_file = env
         .storage_root
