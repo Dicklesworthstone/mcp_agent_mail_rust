@@ -38,6 +38,20 @@ reviewed through 2026-09-12. These changes are not published release artifacts.
 
 ### Fixed
 
+- **Doctor reads committed WAL state without rebuilding away corruption.**
+  Unix probes can stage a live FrankenSQLite family through the engine's
+  shared file descriptors, retaining namespace and checkpoint locks while
+  checking source bytes and identity. Private canonical checks now see
+  WAL-only schema versions and damaged physical pages without releasing a
+  live writer's locks. Logical VACUUM exports remain separate and cannot
+  establish physical integrity.
+- **Deferred WAL commits remain visible after an external reader releases.**
+  The complete FrankenSQLite dependency family is pinned to immutable
+  revision `fa6eebc318ee41230ecd7f85febce7a6f0f2326c`, carrying the upstream WAL
+  lifetime repair while retaining Asupersync 0.4.9. Commits remain independent
+  of reader-blocked checkpoint completion; subsequent maintenance makes the
+  committed row visible to a fresh canonical reader.
+  ([upstream repair](https://github.com/Dicklesworthstone/frankensqlite/commit/fa6eebc318ee41230ecd7f85febce7a6f0f2326c))
 - **Robot search refreshes a reconstructed mailbox's live lexical index.**
   Native live mailboxes use guarded read-only database connections for the
   refresh, while query results remain based on a private snapshot. If the
