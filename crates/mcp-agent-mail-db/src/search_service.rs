@@ -1534,8 +1534,10 @@ fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
     }
     let sqlite_key = sqlite_key_for_pool(pool);
     let db_url = lexical_backfill_database_url(pool);
-    crate::search_v3::backfill_from_db_as(&db_url, Some(pool.search_identity_path()))
-        .map_err(|err| map_bridge_bootstrap_error(&err))?;
+    crate::search_v3::with_backfill_source_retry(|| {
+        crate::search_v3::backfill_from_db_as(&db_url, Some(pool.search_identity_path()))
+    })
+    .map_err(|err| map_bridge_bootstrap_error(&err))?;
     mark_lexical_backfill_ran(&sqlite_key)?;
     Ok(())
 }

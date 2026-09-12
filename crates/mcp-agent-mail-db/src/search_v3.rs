@@ -966,6 +966,32 @@ fn sqlite_error_is_missing_table(message: &str, table: &str) -> bool {
 /// burst; it is only ever consumed while the mailbox is saturated during
 /// first-search bootstrap.
 const BOOTSTRAP_LOCK_MAX_RETRIES: usize = 12;
+const BACKFILL_SOURCE_CHANGED: &str =
+    "backfill source changed during scan; index was not published";
+
+/// A rejected scan has already rolled back its unpublished writer changes.
+/// Interactive searches may retry that whole scan on a fresh connection;
+/// they must never publish the rejected scan or treat it as a successful empty index.
+pub(crate) fn with_backfill_source_retry<T>(
+    mut operation: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    let mut retry = 0;
+    loop {
+        match operation() {
+            Err(error)
+                if error == BACKFILL_SOURCE_CHANGED && retry < BOOTSTRAP_LOCK_MAX_RETRIES =>
+            {
+                tracing::warn!(
+                    retry = retry + 1,
+                    "search source changed; restarting the rejected backfill"
+                );
+                std::thread::sleep(bootstrap_lock_retry_delay(retry));
+                retry += 1;
+            }
+            result => return result,
+        }
+    }
+}
 
 /// Exponential backoff for [`with_bootstrap_lock_retry`]:
 /// 25/50/100/200/400/800/1600ms then capped at 2s — ≈13s total across all
@@ -1426,7 +1452,7 @@ pub(crate) fn search_private_snapshot(
     let directory =
         tempfile::tempdir().map_err(|error| format!("private lexical index: {error}"))?;
     let bridge = TantivyBridge::open_scoped(directory.path(), false)?;
-    backfill_into_bridge(&bridge, db_url, None)?;
+    with_backfill_source_retry(|| backfill_into_bridge(&bridge, db_url, None))?;
     Ok(bridge.search(query))
 }
 
@@ -1453,7 +1479,7 @@ pub(crate) fn search_database(
         return search_private_snapshot(db_url, query).map(Some);
     }
     if !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(db_url) {
-        backfill_into_bridge_locked(&bridge, db_url, None)?;
+        with_backfill_source_retry(|| backfill_into_bridge_locked(&bridge, db_url, None))?;
     }
     Ok(Some(bridge.search(query)))
 }
@@ -1790,9 +1816,7 @@ fn backfill_into_bridge_locked(
             seal.execute_sync("BEGIN DEFERRED", &[])
                 .map_err(|error| format!("legacy backfill seal transaction: {error}"))?;
             if legacy_backfill_content_digest(&seal)? != expected {
-                return Err(
-                    "backfill source changed during scan; index was not published".to_string(),
-                );
+                return Err(BACKFILL_SOURCE_CHANGED.to_string());
             }
         }
         if lexical_change_clock(&seal)? != change_clock
@@ -1802,7 +1826,7 @@ fn backfill_into_bridge_locked(
                     .is_none_or(|current| !same_backfill_source_file(initial, current))
             })
         {
-            return Err("backfill source changed during scan; index was not published".to_string());
+            return Err(BACKFILL_SOURCE_CHANGED.to_string());
         }
         writer
             .commit()
@@ -3479,6 +3503,74 @@ mod tests {
     #[test]
     fn backfill_refuses_source_mutation_without_publishing_partial_documents() {
         assert_backfill_refuses_source_mutation(true);
+    }
+
+    #[test]
+    fn interactive_search_retries_rejected_scan_and_returns_committed_edit() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let db_path = create_test_db(
+            tmp.path(),
+            &[(1, "beforechange", "body", "normal", "thread-one")],
+        );
+        let conn = DbConn::open_file(&db_path).unwrap();
+        for migration in crate::schema::schema_migrations()
+            .into_iter()
+            .filter(|migration| migration.id.starts_with("v29_"))
+        {
+            conn.execute_sync(&migration.up, &[]).unwrap();
+        }
+        init_bridge(index_dir.path()).unwrap();
+        let scans = std::rc::Rc::new(std::cell::Cell::new(0));
+        BACKFILL_SCAN_OBSERVER.with(|observer| {
+            let scans = scans.clone();
+            *observer.borrow_mut() = Some(Box::new(move |_| {
+                scans.set(scans.get() + 1);
+                if scans.get() == 1 {
+                    conn.execute_sync(
+                        "UPDATE messages SET subject = 'afterchange' WHERE id = 1",
+                        &[],
+                    )
+                    .expect("commit a real edit during the first scan");
+                }
+            }));
+        });
+        let result = search_database(
+            &db_path,
+            index_dir.path(),
+            &PlannerQuery {
+                text: "afterchange".to_string(),
+                doc_kind: DocKind::Message,
+                ..Default::default()
+            },
+        );
+        BACKFILL_SCAN_OBSERVER.with(|observer| {
+            observer.borrow_mut().take();
+        });
+        let rows = result
+            .expect("retry the rejected scan")
+            .expect("active bridge");
+        assert_eq!(
+            scans.get(),
+            2,
+            "one rejected scan followed by one successful scan"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "the newly committed subject must be searchable"
+        );
+        assert_eq!(
+            fetch_index_message_stats(&get_bridge().unwrap())
+                .unwrap()
+                .count,
+            1
+        );
+        reset_bridge_for_tests();
     }
 
     #[test]
