@@ -71,8 +71,11 @@ is already latest stable.
   synchronized source hashes and is excluded as final-candidate evidence.
   Final retry/recovery additions and the broader search-service selection
   passed all 232 tests through strict RCH (6796 unselected, remote exit 0).
-  Source hashes match the frozen candidate. Workspace check and Clippy remain
-  pending for this repair. Logs and SHA-256 receipts are retained under
+  Source hashes match the frozen candidate. Workspace/all-target check and
+  strict Clippy passed remotely at 13:50:16 and 13:52:22 UTC; formatting and
+  diff checks passed. UBS remains reviewed nonzero: 119 critical, 4597 warnings
+  and 1324 informational findings, with no suppression. Five other runtime
+  failures still block release. Logs and SHA-256 receipts are retained under
   `/data/projects/am-release-20260912/live-refresh-*`.
 - Fixed source-change retry and relevance cursor behavior passed 135 focused
   tests through strict RCH, including the real mutation-during-scan and
