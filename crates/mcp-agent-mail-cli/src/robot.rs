@@ -15179,6 +15179,25 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                         .to_string(),
                 )
             })?;
+            // A private snapshot remains the result authority. Only a snapshot
+            // of the live DB authorizes a separate guarded read-only refresh
+            // from that live source; archive/staged fallback truth must never
+            // publish into the persistent mailbox index.
+            if read_db._source.kind == crate::CanonicalSnapshotSourceKind::LiveSnapshot {
+                let live_config = mcp_agent_mail_db::DbPoolConfig {
+                    database_url: crate::sqlite_url_from_path(read_db._source.reported_path()),
+                    storage_root: Some(read_db.pool().storage_root().to_path_buf()),
+                    run_migrations: false,
+                    warmup_connections: 0,
+                    ..mcp_agent_mail_db::DbPoolConfig::default()
+                };
+                let live_pool =
+                    mcp_agent_mail_db::create_pool_without_startup_init(&live_config)
+                        .map_err(|error| CliError::Other(format!("live search source: {error}")))?;
+                mcp_agent_mail_db::search_service::refresh_live_lexical_index(&live_pool).map_err(
+                    |error| CliError::Other(format!("live search index refresh: {error}")),
+                )?;
+            }
             let data = build_search(
                 search_conn,
                 read_db.pool(),

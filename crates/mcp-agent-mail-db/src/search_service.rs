@@ -1532,6 +1532,28 @@ pub fn note_startup_lexical_backfill_completed(database_url: &str) -> Result<(),
     record_lexical_bootstrap_success(&sqlite_key)
 }
 
+/// Refresh a live mailbox's persistent lexical index using only guarded,
+/// read-only native database connections. A private materialization cannot
+/// authorize publication under the live mailbox identity.
+pub fn refresh_live_lexical_index(pool: &DbPool) -> Result<(), DbError> {
+    if pool.sqlite_path() == ":memory:" || pool.search_identity_path() != pool.sqlite_path() {
+        return Err(DbError::Sqlite(
+            "live lexical refresh requires the actual file-backed mailbox source".to_string(),
+        ));
+    }
+    #[cfg(feature = "tantivy-engine")]
+    {
+        let index_dir = direct_surface_index_dir(pool)?;
+        let _guard = lexical_init_guard()
+            .lock()
+            .map_err(|error| DbError::Sqlite(format!("search bootstrap lock poisoned: {error}")))?;
+        crate::search_v3::backfill_read_only_live(&lexical_backfill_database_url(pool), &index_dir)
+            .map_err(|error| map_bridge_bootstrap_error(&error))?;
+        record_lexical_bootstrap_success(&sqlite_key_for_pool(pool))?;
+    }
+    Ok(())
+}
+
 fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
     if pool.sqlite_path() == ":memory:" {
         return Ok(());
