@@ -41,6 +41,7 @@ fastmcp-protocol = "0.7.1"
 # request-Cx / blocking-pool APIs, SQLite cancel correctness, owned-OTLP).
 asupersync = { version = "=0.4.9", features = ["tls-webpki-roots"] }
 fsqlite = "=0.3.18"
+fsqlite-types = "=0.3.18"
 
 sqlmodel = "=0.4.0"
 sqlmodel-core = "=0.4.0"
@@ -201,12 +202,33 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
+# Immutable native WAL ownership fix. Keep the full engine family together;
+# this revision accepts the workspace's asupersync 0.4.9 and includes GH411.
+fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-ast = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-btree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-core = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-error = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-ext-fts5 = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-ext-icu = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-ext-json = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-ext-misc = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-ext-rtree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-func = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-mvcc = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-observability = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-pager = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-parser = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-planner = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-vdbe = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-vfs = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
+fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "fa6eebc318ee41230ecd7f85febce7a6f0f2326c" }
 # 2026-08-22 registry adoption (asupersync =0.4.9 universe):
 # - asupersync resolves from crates.io (=0.4.9; fastmcp 0.7.1 pins =0.4.9).
-# - fsqlite family resolves from crates.io (0.3.18, all 20 locked members in
-#   lockstep) — the machine-specific
-#   /data/projects/frankensqlite path patches are GONE (they broke source
-#   builds on any host without that mount).
+# - fsqlite's 20 members use the immutable public revision above until its
+#   WAL ownership repairs are available in a qualified registry release.
+#   No mutable sibling checkout is required to build this project.
 # - sqlmodel family resolves from crates.io (=0.4.0, published 2026-08-21,
 #   accepting asupersync ^0.4.9 + fsqlite ^0.3.7) — the ../sqlmodel-rel-0327
 #   cleanup trigger fired, so those eight patch lines are gone too.
