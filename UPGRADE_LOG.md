@@ -22,6 +22,15 @@ is already latest stable.
   toml_edit 0.25.15; tru 0.2.4; franken-agent-detection 0.2.4;
   tokenizers 0.23.2; wide 1.7.0; blake2 0.11.0; dirs 7.0.0;
   winsafe 0.0.29; beads_rust 0.5.12; SQLModel family 0.4.3; FTUI family 0.7.0.
+- Prepared, runtime validation pending: ChaCha20 0.10.1 → 0.10.2, replacing
+  the yanked version and fixing an SSE2 portability defect. Only that package's
+  version/checksum changes in Cargo.lock; an unrelated resolver change to
+  tempfile's getrandom edge was manually restored, and `cargo tree --locked`
+  accepted the preserved graph. The dependency is used through Asupersync and
+  FrankenSQLite, not the share module's external `age` executable.
+  DB/conformance tests are queued behind the ongoing baseline run, with
+  source/lockfile guards and refusal if the baseline exceeds the updater's
+  ten-failure circuit breaker. No runtime pass is claimed for this update.
 - Constrained: latest FastMCP 0.9.0 requires asupersync exactly 0.4.10 and
   Rust 1.100, while even latest beads_rust requires asupersync exactly 0.4.9.
   The Rust floor is a declared-MSRV concern, not yet a compiler refusal: the
