@@ -38,6 +38,15 @@ reviewed through 2026-09-12. These changes are not published release artifacts.
 
 ### Fixed
 
+- **Search retries a rebuild interrupted by mailbox writes.** Interactive
+  lexical search retries when a source change invalidates an unpublished
+  backfill, with a bounded retry budget. The rejected writer is rolled back;
+  unrelated errors still fail immediately.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/30755f68db1ee7f674c239f46d791ef5d1e8c3a9))
+- **Relevance pagination recognizes its boundary after corpus growth.**
+  When the boundary message is still present, its ID anchors the next page
+  even if newly indexed messages changed its BM25 score. This prevents the
+  preceding page from replaying solely because those scores shifted.
 - **Explicit legacy paths cannot silently select a UTF-8 alias.** Import and
   status commands reject non-UTF-8 source, destination, and resolved path
   authorities before converting them to database or receipt strings.

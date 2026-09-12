@@ -61,6 +61,43 @@ fn conformance_fixture_root() -> PathBuf {
     crate_root().join("tests/conformance/fixtures")
 }
 
+/// The Python capture resolved this relative identity against its checkout.
+/// Relocate only the expected path-derived values; keep every returned field
+/// under comparison, including the complete slug and the UID digest.
+fn relocate_identity_fixture(uri: &str, mut expected: Value) -> Value {
+    if uri != "resource://identity/abs-path-backend" {
+        return expected;
+    }
+    assert_eq!(
+        expected["human_key"], "/data/projects/mcp_agent_mail_rust/abs-path-backend",
+        "the relocation must match the recorded fixture origin"
+    );
+    let manifest_dir = crate_root();
+    let workspace = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("conformance crate must be inside the workspace crates directory");
+    let path = workspace.join("abs-path-backend");
+    let path = path.to_str().expect("fixture workspace must be UTF-8");
+    let slug = path
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_ascii_lowercase();
+    let digest = <sha1::Sha1 as sha1::Digest>::digest(path.as_bytes());
+    let mut uid = String::with_capacity(20);
+    for &byte in &digest[..10] {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        uid.push(char::from(HEX[usize::from(byte >> 4)]));
+        uid.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    expected["human_key"] = Value::String(path.to_string());
+    expected["slug"] = Value::String(slug);
+    expected["project_uid"] = Value::String(uid);
+    expected
+}
+
 /// Recursively null out auto-increment integer ID fields in a JSON value.
 /// This handles the fact that fixture cases run sequentially in a shared DB,
 /// so auto-increment IDs depend on execution order.
@@ -1675,8 +1712,8 @@ fn run_fixtures_against_rust_server_router() {
                     });
                     let actual = decode_json_from_resource_contents(uri, &read_result.contents)
                         .unwrap_or_else(|e| panic!("resource {uri} case {}: {e}", case.name));
-                    let (actual, expected) =
-                        normalize_pair(actual, expected_ok.clone(), &case.normalize);
+                    let expected = relocate_identity_fixture(uri, expected_ok.clone());
+                    let (actual, expected) = normalize_pair(actual, expected, &case.normalize);
                     if let Some(mismatch) =
                         supported_compatibility_mismatch(&actual, &expected, "$")
                     {

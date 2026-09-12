@@ -528,7 +528,11 @@ fn apply_cursor_window(mut results: Vec<SearchResult>, query: &SearchQuery) -> V
 
     if let Some(index) = results.iter().position(|result| {
         result.id == cursor.id
-            && cursor_sort_score(result, query.ranking).to_bits() == cursor.score.to_bits()
+            // Corpus growth changes BM25 scores even for unchanged messages.
+            // A visible relevance boundary is identified by its document ID;
+            // comparing its old score can replay the entire preceding page.
+            && (query.ranking == RankingMode::Relevance
+                || cursor_sort_score(result, query.ranking).to_bits() == cursor.score.to_bits())
     }) {
         results.drain(..=index);
         return results;
@@ -6871,6 +6875,29 @@ mod tests {
         assert_eq!(
             remaining.iter().map(|result| result.id).collect::<Vec<_>>(),
             vec![30]
+        );
+    }
+
+    #[test]
+    fn relevance_cursor_uses_present_boundary_after_corpus_score_change() {
+        let first_page = vec![result_with_score(1, 0.9), result_with_score(2, 0.8)];
+        let query = SearchQuery {
+            ranking: RankingMode::Relevance,
+            cursor: compute_next_cursor(&first_page, 2, RankingMode::Relevance),
+            ..SearchQuery::default()
+        };
+        assert!(query.cursor.is_some());
+        let remaining = apply_cursor_window(
+            vec![
+                result_with_score(1, 0.5),
+                result_with_score(2, 0.4),
+                result_with_score(3, 0.3),
+            ],
+            &query,
+        );
+        assert_eq!(
+            remaining.iter().map(|result| result.id).collect::<Vec<_>>(),
+            vec![3]
         );
     }
 

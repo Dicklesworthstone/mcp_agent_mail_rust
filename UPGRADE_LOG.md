@@ -16,25 +16,28 @@ is already latest stable.
   No use of its deprecated `tagfilter` option was found. Strict-RCH Markdown
   regression selection passed 152 tests (5008 unselected), remote exit 0 on
   `am-release-css` at 2026-09-12 01:15:04 UTC. Full workspace nextest then
-  started at source `046976941fa4933b8209decc591975c454713518`; its result is
-  pending. Focused success does not establish whole-workspace compatibility.
+  started at source `046976941fa4933b8209decc591975c454713518` and finished
+  with 17,484 passed, 19 failed and 39 skipped. Remote nextest exited 100;
+  the outer RCH exited 103 because its post-run source receipt detected local
+  changes and generated artifacts. This baseline has no frozen-source verdict.
 - Pending, individually tested: indexmap 2.14.2; plist 1.10.1; smallvec 1.16.1;
   toml_edit 0.25.15; tru 0.2.4; franken-agent-detection 0.2.4;
   tokenizers 0.23.2; wide 1.7.0; blake2 0.11.0; dirs 7.0.0;
   winsafe 0.0.29; beads_rust 0.5.12; SQLModel family 0.4.3; FTUI family 0.7.0.
-- Prepared, runtime validation pending: ChaCha20 0.10.1 → 0.10.2, replacing
+- Updated, whole-workspace validation pending: ChaCha20 0.10.1 → 0.10.2, replacing
   the yanked version and fixing an SSE2 portability defect. Only that package's
   version/checksum changes in Cargo.lock; an unrelated resolver change to
   tempfile's getrandom edge was manually restored, and `cargo tree --locked`
   accepted the preserved graph. The dependency is used through Asupersync and
   FrankenSQLite, not the share module's external `age` executable.
-  DB/conformance tests are queued behind the ongoing baseline run, with
-  source/lockfile guards and refusal if the baseline exceeds the updater's
-  ten-failure circuit breaker. No runtime pass is claimed for this update.
+  The queued DB/conformance gate refused after the baseline exceeded the
+  ten-failure circuit breaker; that queue ran no tests. After the user's
+  instruction to fix the bugs, focused DB/search/cursor/load validation passed
+  135 tests with this lockfile. The complete fixture-router test subsequently
+  passed in the 14-test portability selection.
 - Constrained: latest FastMCP 0.9.0 requires asupersync exactly 0.4.10 and
   Rust 1.100, while even latest beads_rust requires asupersync exactly 0.4.9.
-  The Rust floor is a declared-MSRV concern, not yet a compiler refusal: the
-  pinned nightly can be newer than the workspace's advertised Rust 1.95 floor.
+  The workspace's Rust minimum was corrected to 1.100 as described below.
   Latest asupersync 0.4.11 satisfies neither exact pin. Keep the coherent
   existing runtime family; do not substitute mutable sibling checkouts.
 - Compatible FastMCP candidate: 0.8.1 keeps asupersync exactly 0.4.9 and
@@ -50,12 +53,28 @@ is already latest stable.
   already-selected FastMCP 0.7.1 manifest. The pinned nightly is unchanged.
   `cargo metadata --locked --no-deps` confirms all 12 active members inherit
   1.100; this is a metadata check, not a compiler or runtime test result.
-- The ongoing full workspace run has reproduced four previously retained
-  doctor failures: WAL-only CHECK violation setup, WAL-only schema-version
-  visibility, structural-corruption authority with a live owner, and live
-  physical-copy admission. The last explicitly refuses an active namespace
-  to preserve process-wide file locks. Existing assertions and that guard
-  remain unchanged. Publication is blocked; the final failure count is pending.
+- Remaining release failures include WAL-only CHECK violation setup, WAL-only
+  schema-version visibility, structural-corruption authority with a live owner,
+  live physical-copy admission, canonical-reader close/checkpoint visibility,
+  and reconstructed-mailbox search freshness. The physical-copy guard preserves
+  process-wide file locks. Existing assertions and that guard remain unchanged.
+- Fixed source-change retry and relevance cursor behavior passed 135 focused
+  tests through strict RCH, including the real mutation-during-scan and
+  pagination-under-writes regressions (3808 tests unselected, remote exit 0).
+  The first repair run retained one pagination failure out of 99 tests before
+  the cursor correction. Logs are in `/data/projects/am-release-20260912/`.
+  The conformance/server/share portability selection passed all 14 tests
+  (5959 unselected, remote exit 0), including the eight previously failing
+  environment-sensitive tests. Its first build failed because the new fixture
+  helper assumed SHA-1's digest implemented LowerHex; explicit byte encoding
+  corrected that compile error. The rerun used the normal remote checkout,
+  not a relocated source-content checkout. Publication remains blocked.
+- The repaired candidate passed strict-RCH workspace/all-target `cargo check`
+  and Clippy with `-D warnings` (remote exits 0 at 03:39:27 and 03:41:32 UTC).
+  `cargo fmt --check` and `git diff --check` also passed. UBS remains a reviewed
+  nonzero scan under the previously approved exception: 131 critical findings,
+  1789 warnings and 436 informational findings; no suppression or clean-scan
+  claim. The final digest-encoding correction was manually reviewed.
 - Initial post-Comrak `cargo audit --json` completed with zero vulnerabilities.
   Audit success is separate from the focused Markdown test result above and
   does not establish whole-workspace runtime compatibility.
