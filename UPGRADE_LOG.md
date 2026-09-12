@@ -37,6 +37,18 @@ is already latest stable.
 - Initial post-Comrak `cargo audit --json` completed with zero vulnerabilities.
   Actual Markdown tests are still compiling remotely; audit success does not
   establish runtime compatibility.
+  This is not a clean security audit: separate warnings include unsound
+  `lru 0.16.4` (RUSTSEC-2026-0253) through the gated FrankenSearch lexical
+  crate's registry Tantivy 0.26.1, unmaintained `paste` and `rustls-pemfile`,
+  and yanked `chacha20 0.10.1`. Compatible remediation is under investigation.
+  Follow-up: ChaCha20 0.10.2 is compatible and fixes an SSE2 portability bug;
+  its isolated update/test is pending. LRU's patched range is >=0.18.2;
+  even Tantivy 0.26.2 retains `lru ^0.16.3`, and the gated source pins
+  Tantivy exactly 0.26.1. Its sole `LruCache<usize, Block>` does not supply
+  the advisory's panicking-key destructor trigger, but it remains unpatched.
+  Preserve that constraint and warning rather than suppressing it or dropping
+  the production lexical backend. A fix needs a separately reviewed immutable
+  sibling revision or backport.
 - Venue preflight: GitHub Actions permissions report `enabled=false`.
   Homebrew is already at 0.3.35 with four platform hashes. GHCR `latest` has
   amd64/arm64 images labelled 0.3.34 at source `0125f0505fa0ba604dbbbb580fad56d283e46488`.
