@@ -450,16 +450,20 @@ mod tests {
         if run_in_isolated_process() {
             return;
         }
-        let writer = std::thread::spawn(|| {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
             let guard = begin_write_activity();
-            std::thread::sleep(Duration::from_millis(200));
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             drop(guard);
         });
-        std::thread::sleep(Duration::from_millis(50));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(
             try_acquire_promotion_barrier_if_idle().is_none(),
             "drift reconcile must defer while a foreign writer is in flight"
         );
+        release_tx.send(()).unwrap();
         writer.join().expect("writer thread");
         let barrier = try_acquire_promotion_barrier_if_idle();
         assert!(barrier.is_some(), "idle process must grant the barrier");
@@ -523,17 +527,15 @@ mod tests {
         if run_in_isolated_process() {
             return;
         }
-        let writer_started = Arc::new(AtomicBool::new(false));
-        let started_clone = Arc::clone(&writer_started);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let writer = std::thread::spawn(move || {
             let guard = begin_write_activity();
-            started_clone.store(true, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(400));
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             drop(guard);
         });
-        while !writer_started.load(Ordering::SeqCst) {
-            std::thread::yield_now();
-        }
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let (barrier, outcome) = acquire_promotion_barrier_draining(Duration::from_millis(50));
         assert!(
             matches!(
@@ -545,6 +547,7 @@ mod tests {
             "expected timeout with one straggler, got {outcome:?}"
         );
         drop(barrier);
+        release_tx.send(()).unwrap();
         writer.join().expect("writer thread");
     }
 
