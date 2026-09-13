@@ -5859,6 +5859,124 @@ fn serve_http_preserves_existing_client_configs_by_default() {
 }
 
 #[test]
+fn robot_metrics_reads_live_server_calls_and_labels_offline_fallback() {
+    let env = TestEnv::new();
+    let port = unused_loopback_port();
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let log_path = env.tmp.path().join("metrics-server.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut server = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("AM_ATC_ENABLED", "false")
+        .env("HTTP_PORT", port.to_string())
+        .current_dir(env.hostile_repo())
+        .args([
+            "serve-http",
+            "--no-tui",
+            "--no-auth",
+            "--port",
+            &port.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .expect("start real metrics server");
+    // Reap the owned server even when an assertion or startup probe fails.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline && server.try_wait().unwrap().is_none(),
+                "server failed to start: {}",
+                std::fs::read_to_string(&log_path).unwrap()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        let metrics = || {
+            let output = Command::new(am_bin())
+                .env_clear()
+                .envs(env.isolated_env())
+                .env("HTTP_PORT", port.to_string())
+                .current_dir(env.hostile_repo())
+                .args(["robot", "metrics", "--json"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_slice::<Value>(&output.stdout).expect("metrics JSON")
+        };
+        let before = metrics();
+        assert_eq!(before["source"], "live-server", "{before}");
+        let calls_before = before["total_calls"].as_u64().unwrap();
+        for id in 1..=3 {
+            let body = tool_call(id, "health_check", json!({})).to_string();
+            let mut socket =
+                std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            write!(socket, "POST /mcp/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAccept: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            let mut response = String::new();
+            socket.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(response.contains("\"result\""), "{response}");
+            assert!(!response.contains("\"isError\":true"), "{response}");
+        }
+        let after = metrics();
+        assert_eq!(after["source"], "live-server", "{after}");
+        assert_eq!(
+            after["total_calls"].as_u64().unwrap(),
+            calls_before + 3,
+            "{after}"
+        );
+        let health = after["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "health_check")
+            .expect("actual server health calls in metrics");
+        assert_eq!(health["calls"], 3, "{health}");
+    }));
+    let _ = server.kill();
+    server.wait().expect("reap metrics server");
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+    let offline = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("HTTP_PORT", port.to_string())
+        .current_dir(env.hostile_repo())
+        .args(["robot", "metrics", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        offline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    let offline: Value = serde_json::from_slice(&offline.stdout).unwrap();
+    assert_eq!(offline["source"], "local-process", "{offline}");
+    assert_eq!(offline["total_calls"], 0, "{offline}");
+    assert!(
+        offline["source_detail"]
+            .as_str()
+            .is_some_and(|detail| !detail.is_empty())
+    );
+}
+
+#[test]
 fn serve_http_updates_client_configs_only_with_explicit_setup() {
     check_serve_http_client_config_setup(true);
 }
