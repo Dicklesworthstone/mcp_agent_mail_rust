@@ -4945,6 +4945,7 @@ async fn spawn_http_server_instance(
         server_capabilities,
         config.clone(),
         Arc::clone(&request_diagnostics),
+        Some(runtime_handle.clone()),
     ));
     let _ = state.self_ref.set(Arc::downgrade(&state));
 
@@ -5678,43 +5679,50 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 // Cached health-check counts (Fix: avoid running COUNT(*) on every /health)
 // ---------------------------------------------------------------------------
 
-/// TTL for cached project/message counts returned by the readiness endpoint.
-const HEALTH_COUNT_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Optional readiness diagnostics refresh at most once per interval. Their
+/// sample ages are separate from attempt times, so failed refreshes cannot
+/// make stale observations appear fresh.
+const HEALTH_ENRICHMENT_CACHE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
-struct HealthCountCacheEntry {
-    database_url: String,
-    storage_root: PathBuf,
-    counts: Option<(u64, u64)>,
+struct HealthSample<T> {
+    observed_at: Instant,
+    value: T,
 }
 
-type HealthCountCacheValue = (Instant, Option<HealthCountCacheEntry>);
-
-/// Cached `(last_refresh, project_count, message_count)`.  Both counts are
-/// `Option` so we can distinguish "never fetched" from "fetch failed".
-static HEALTH_COUNT_CACHE: std::sync::LazyLock<Mutex<HealthCountCacheValue>> =
-    std::sync::LazyLock::new(|| {
-        // Start with `None` — the read path checks `cached.is_some()` before
-        // trusting the TTL, so the first call always refreshes regardless of
-        // the initial Instant.  (Using `Instant::now() - TTL` would panic if
-        // the server starts within ~31s of system boot on Linux, where
-        // CLOCK_MONOTONIC starts from zero.)
-        Mutex::new((Instant::now(), None))
-    });
-
-/// Cached ATC sidecar footprint snapshot for `/health`. Inspecting the sidecar
-/// includes a real SQLite quick-check and row count, so it must share the
-/// readiness endpoint's short observability cadence rather than run per probe.
-#[derive(Debug, Clone)]
-struct AtcExperienceHealthCacheEntry {
-    database_url: String,
-    health: Option<mcp_agent_mail_db::pool::AtcSidecarHealth>,
+/// Owned by one HTTP state/configuration, never shared across mailboxes.
+#[derive(Debug, Default)]
+struct HealthEnrichmentCache {
+    database_path: serde_json::Value,
+    last_attempt: Option<Instant>,
+    refreshing: bool,
+    counts: Option<HealthSample<(u64, u64)>>,
+    atc: Option<HealthSample<mcp_agent_mail_db::pool::AtcSidecarHealth>>,
 }
 
-type AtcExperienceHealthCacheValue = (Instant, Option<AtcExperienceHealthCacheEntry>);
+/// Also resets the gate if the runtime rejects/drops a queued closure or a
+/// probe panics. The existing runtime owns the blocking work's lifetime.
+struct HealthEnrichmentRefreshGuard(Arc<Mutex<HealthEnrichmentCache>>);
 
-static ATC_EXPERIENCE_HEALTH_CACHE: std::sync::LazyLock<Mutex<AtcExperienceHealthCacheValue>> =
-    std::sync::LazyLock::new(|| Mutex::new((Instant::now(), None)));
+impl Drop for HealthEnrichmentRefreshGuard {
+    fn drop(&mut self) {
+        let mut cache = lock_mutex(&self.0);
+        cache.last_attempt = Some(Instant::now());
+        cache.refreshing = false;
+    }
+}
+
+type HealthEnrichmentWork = Box<dyn FnOnce() + Send>;
+type HealthEnrichmentScheduler = Box<dyn Fn(HealthEnrichmentWork) + Send + Sync>;
+
+fn health_enrichment_scheduler(runtime: RuntimeHandle) -> HealthEnrichmentScheduler {
+    // Keep the actual runtime owner, but erase its type before placing it in
+    // HttpState. Otherwise every nested HTTP future's Send proof traverses
+    // RuntimeInner and exceeds the compiler's trait recursion depth.
+    Box::new(move |work| {
+        let _task = runtime.spawn_blocking(work);
+    })
+}
 
 /// TTL for cached semantic readiness validation.
 ///
@@ -11201,6 +11209,9 @@ struct HttpState {
     /// Reused snapshot state for `/mail/ws-state` polling when no live TUI is active.
     ws_state_fallback: Arc<tui_bridge::TuiSharedState>,
     request_diagnostics: Arc<HttpRequestRuntimeDiagnostics>,
+    health_enrichment: Arc<Mutex<HealthEnrichmentCache>>,
+    /// Schedules only on the listener's real runtime, retained by the closure.
+    health_refresh_scheduler: Option<HealthEnrichmentScheduler>,
     /// Weak self-reference for async blocking dispatch.
     /// Set immediately after `Arc::new(HttpState::new(...))`.
     self_ref: std::sync::OnceLock<std::sync::Weak<HttpState>>,
@@ -11345,6 +11356,7 @@ impl HttpState {
         server_capabilities: fastmcp_protocol::ServerCapabilities,
         config: mcp_agent_mail_core::Config,
         request_diagnostics: Arc<HttpRequestRuntimeDiagnostics>,
+        health_refresh_runtime: Option<RuntimeHandle>,
     ) -> Self {
         let handler = Arc::new(HttpRequestHandler::with_config(HttpHandlerConfig {
             base_path: config.http_path.clone(),
@@ -11371,6 +11383,10 @@ impl HttpState {
             };
         let ws_state_fallback = tui_bridge::TuiSharedState::new(&config);
         apply_latest_boot_archive_preflight_snapshot(&ws_state_fallback);
+        let health_enrichment = Arc::new(Mutex::new(HealthEnrichmentCache {
+            database_path: health_database_basename(&config.database_url),
+            ..HealthEnrichmentCache::default()
+        }));
         Self {
             router,
             server_info,
@@ -11386,8 +11402,53 @@ impl HttpState {
             web_root,
             ws_state_fallback,
             request_diagnostics,
+            health_enrichment,
+            health_refresh_scheduler: health_refresh_runtime.map(health_enrichment_scheduler),
             self_ref: std::sync::OnceLock::new(),
         }
+    }
+
+    fn schedule_health_enrichment_refresh(&self) {
+        if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&self.config.database_url) {
+            return;
+        }
+        let Some(schedule) = self.health_refresh_scheduler.as_ref() else {
+            return;
+        };
+        {
+            let mut cache = lock_mutex(&self.health_enrichment);
+            if cache.refreshing
+                || cache
+                    .last_attempt
+                    .is_some_and(|attempt| attempt.elapsed() < HEALTH_ENRICHMENT_CACHE_TTL)
+            {
+                return;
+            }
+            cache.refreshing = true;
+        }
+        let guard = HealthEnrichmentRefreshGuard(Arc::clone(&self.health_enrichment));
+        let database_url = self.config.database_url.clone();
+        // Explicitly use the listener's pool. Ambient spawn_blocking can run
+        // inline under a request Cx with no pool and would stall /health again.
+        // A missing/stopped pool drops the closure and its refresh guard;
+        // there is no inline fallback or separately created runtime/thread.
+        schedule(Box::new(move || {
+            if let Some(counts) = fetch_health_live_counts(&database_url) {
+                lock_mutex(&guard.0).counts = Some(HealthSample {
+                    observed_at: Instant::now(),
+                    value: counts,
+                });
+            }
+            // Publish counts before the optional sidecar quick-check, whose
+            // own lock wait must not hold up either the response or counts.
+            if let Some(health) = fetch_atc_experience_health(&database_url) {
+                lock_mutex(&guard.0).atc = Some(HealthSample {
+                    observed_at: Instant::now(),
+                    value: health,
+                });
+            }
+            drop(guard);
+        }));
     }
 
     async fn handle(&self, req: Http1Request) -> Http1Response {
@@ -11724,13 +11785,8 @@ impl HttpState {
                 let mut body = serde_json::json!({"status":"ready"});
                 // Enrich readiness response with database identity so
                 // operators can verify the correct DB file is active.
-                enrich_readiness_response(
-                    &self.config.database_url,
-                    self.config.storage_root.as_path(),
-                    self.config.atc_experience_max_rows,
-                    self.config.atc_write_mode,
-                    &mut body,
-                );
+                self.schedule_health_enrichment_refresh();
+                enrich_readiness_response(&self.config, &self.health_enrichment, &mut body);
                 // Keep generic readiness distinct from the heavier durability
                 // verdict. The dedicated /health/durability route still runs
                 // the mailbox verdict engine, while /health must not join
@@ -16449,42 +16505,11 @@ fn fetch_atc_experience_health(
     ))
 }
 
-fn cached_atc_experience_health(
-    database_url: &str,
-) -> Option<mcp_agent_mail_db::pool::AtcSidecarHealth> {
-    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
-        return None;
-    }
-
-    let guard = lock_mutex(&ATC_EXPERIENCE_HEALTH_CACHE);
-    let (last_refresh, cached_entry) = &*guard;
-    let cached_for_database = cached_entry
-        .as_ref()
-        .filter(|entry| entry.database_url == database_url)
-        .cloned();
-    if let Some(entry) = cached_for_database.as_ref()
-        && last_refresh.elapsed() < HEALTH_COUNT_CACHE_TTL
-    {
-        return entry.health.clone();
-    }
-
-    drop(guard);
-    let fresh = fetch_atc_experience_health(database_url);
-    let health = fresh.or_else(|| cached_for_database.and_then(|entry| entry.health));
-    *lock_mutex(&ATC_EXPERIENCE_HEALTH_CACHE) = (
-        Instant::now(),
-        Some(AtcExperienceHealthCacheEntry {
-            database_url: database_url.to_string(),
-            health: health.clone(),
-        }),
-    );
-    health
-}
-
 fn atc_experience_health_json(
     database_url: &str,
     atc_experience_max_rows: i64,
     atc_write_mode: mcp_agent_mail_core::config::AtcWriteMode,
+    sample: Option<&HealthSample<mcp_agent_mail_db::pool::AtcSidecarHealth>>,
 ) -> serde_json::Value {
     let write_mode = atc_write_mode.to_string();
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
@@ -16500,11 +16525,31 @@ fn atc_experience_health_json(
             "total_bytes": 0,
             "size_share_basis_points": serde_json::Value::Null,
             "quick_check": "not_run",
+            "sample_age_ms": serde_json::Value::Null,
+            "sample_stale": serde_json::Value::Null,
         });
     }
 
-    match cached_atc_experience_health(database_url) {
-        Some(health) => {
+    sample.map_or_else(
+        || {
+            serde_json::json!({
+                "storage": "unavailable",
+                "write_mode": write_mode,
+                "row_cap": atc_experience_max_rows,
+                "row_cap_enforced": atc_experience_max_rows > 0,
+                "raw_row_count": serde_json::Value::Null,
+                "sidecar_present": serde_json::Value::Null,
+                "sidecar_bytes": serde_json::Value::Null,
+                "primary_bytes": serde_json::Value::Null,
+                "total_bytes": serde_json::Value::Null,
+                "size_share_basis_points": serde_json::Value::Null,
+                "quick_check": "not_run",
+                "sample_age_ms": serde_json::Value::Null,
+                "sample_stale": serde_json::Value::Null,
+            })
+        },
+        |sample| {
+            let health = &sample.value;
             let quick_check = match health.quick_check_ok {
                 Some(true) => "ok",
                 Some(false) => "corrupt",
@@ -16522,44 +16567,17 @@ fn atc_experience_health_json(
                 "total_bytes": health.total_size_bytes,
                 "size_share_basis_points": health.size_share_basis_points,
                 "quick_check": quick_check,
+                "sample_age_ms": health_sample_age_ms(sample),
+                "sample_stale": sample.observed_at.elapsed() >= HEALTH_ENRICHMENT_CACHE_TTL,
             })
-        }
-        None => serde_json::json!({
-            "storage": "unavailable",
-            "write_mode": write_mode,
-            "row_cap": atc_experience_max_rows,
-            "row_cap_enforced": atc_experience_max_rows > 0,
-            "raw_row_count": serde_json::Value::Null,
-            "sidecar_present": false,
-            "sidecar_bytes": serde_json::Value::Null,
-            "primary_bytes": serde_json::Value::Null,
-            "total_bytes": serde_json::Value::Null,
-            "size_share_basis_points": serde_json::Value::Null,
-            "quick_check": "not_run",
-        }),
-    }
+        },
+    )
 }
 
-/// Enrich a readiness JSON response with database identity metadata so
-/// operators can verify the correct DB file is active at a glance.
-///
-/// Adds: `database_path` (basename only), `project_count`, `message_count`,
-/// and `version`. Count queries are best-effort — if they fail the
-/// corresponding fields are set to `null` rather than degrading the overall
-/// readiness signal.
-fn enrich_readiness_response(
-    database_url: &str,
-    storage_root: &Path,
-    atc_experience_max_rows: i64,
-    atc_write_mode: mcp_agent_mail_core::config::AtcWriteMode,
-    body: &mut serde_json::Value,
-) {
-    // Version — always available at compile time.
-    body["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
-
-    // Database basename (security: never expose the full filesystem path).
-    let db_basename: serde_json::Value = match resolve_server_database_url_sqlite_path(database_url)
-    {
+fn health_database_basename(database_url: &str) -> serde_json::Value {
+    // Resolve once at state creation, never during optional enrichment.
+    // Security: expose only the basename, not the full filesystem path.
+    match resolve_server_database_url_sqlite_path(database_url) {
         Some(p) => p
             .file_name()
             .map(|n| serde_json::Value::String(n.to_string_lossy().into_owned()))
@@ -16568,42 +16586,29 @@ fn enrich_readiness_response(
             serde_json::json!(":memory:")
         }
         None => serde_json::Value::Null,
-    };
-    body["database_path"] = db_basename;
+    }
+}
 
-    // Cached COUNT queries — avoid running COUNT(*) on every /health poll.
-    // The cache has a short TTL (HEALTH_COUNT_CACHE_TTL) so operators still
-    // see reasonably fresh numbers while load-balancer probes stay fast.
-    let cached_counts = {
-        let guard = lock_mutex(&HEALTH_COUNT_CACHE);
-        let (last_refresh, cached_entry) = &*guard;
-        let cached_for_mailbox = cached_entry
-            .as_ref()
-            .filter(|entry| {
-                entry.database_url == database_url && entry.storage_root.as_path() == storage_root
-            })
-            .cloned();
-        if let Some(entry) = cached_for_mailbox.as_ref()
-            && last_refresh.elapsed() < HEALTH_COUNT_CACHE_TTL
-        {
-            entry.counts
-        } else {
-            // Cache is stale — release the lock before doing I/O, then
-            // re-acquire to write the refreshed value.
-            drop(guard);
-            let fresh = fetch_health_live_counts(database_url);
-            let counts =
-                fresh.or_else(|| cached_for_mailbox.as_ref().and_then(|entry| entry.counts));
-            *lock_mutex(&HEALTH_COUNT_CACHE) = (
-                Instant::now(),
-                Some(HealthCountCacheEntry {
-                    database_url: database_url.to_string(),
-                    storage_root: storage_root.to_path_buf(),
-                    counts,
-                }),
-            );
-            counts
-        }
+fn health_sample_age_ms<T>(sample: &HealthSample<T>) -> u64 {
+    u64::try_from(sample.observed_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Read cached optional diagnostics only. A cold cache reports unknown values;
+/// failed refreshes preserve previous counts with their actual sample age.
+/// Neither missing nor stale optional observations change readiness admission.
+fn enrich_readiness_response(
+    config: &mcp_agent_mail_core::Config,
+    cache: &Mutex<HealthEnrichmentCache>,
+    body: &mut serde_json::Value,
+) {
+    body["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+    let cache = lock_mutex(cache);
+    body["database_path"] = cache.database_path.clone();
+    let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
+    let cached_counts = if is_memory {
+        Some((0, 0))
+    } else {
+        cache.counts.as_ref().map(|sample| sample.value)
     };
     if let Some((projects, messages)) = cached_counts {
         body["project_count"] = serde_json::json!(projects);
@@ -16612,8 +16617,21 @@ fn enrich_readiness_response(
         body["project_count"] = serde_json::Value::Null;
         body["message_count"] = serde_json::Value::Null;
     }
-    body["atc_experience_store"] =
-        atc_experience_health_json(database_url, atc_experience_max_rows, atc_write_mode);
+    body["counts_sample_age_ms"] =
+        serde_json::json!(cache.counts.as_ref().map(health_sample_age_ms));
+    body["counts_sample_stale"] = serde_json::json!(
+        cache
+            .counts
+            .as_ref()
+            .map(|sample| sample.observed_at.elapsed() >= HEALTH_ENRICHMENT_CACHE_TTL)
+    );
+    body["enrichment_refresh_in_flight"] = serde_json::json!(cache.refreshing);
+    body["atc_experience_store"] = atc_experience_health_json(
+        &config.database_url,
+        config.atc_experience_max_rows,
+        config.atc_write_mode,
+        cache.atc.as_ref(),
+    );
 }
 
 #[allow(clippy::too_many_lines)]
@@ -17858,7 +17876,6 @@ mod tests {
     static TUI_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static TOOL_DISPATCH_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
     static HEALTH_ROUTE_TEST_LOCK: Mutex<()> = Mutex::new(());
-    static HEALTH_COUNT_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static DISPATCH_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
     static COMPOSE_WRITE_BARRIER_TEST_LOCK: Mutex<()> = Mutex::new(());
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -20044,8 +20061,8 @@ first body
             let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
             assert_eq!(body["status"], "ready");
             assert_eq!(body["durability_state"], "not_probed");
-            assert_eq!(body["project_count"], serde_json::json!(0));
-            assert_eq!(body["message_count"], serde_json::json!(0));
+            assert!(body["project_count"].is_null());
+            assert!(body["message_count"].is_null());
 
             let conn =
                 DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open probed db");
@@ -20762,6 +20779,7 @@ first body
             server_capabilities,
             config,
             Arc::new(HttpRequestRuntimeDiagnostics::default()),
+            None,
         )
     }
 
@@ -20782,13 +20800,9 @@ first body
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear_startup_readiness_fast_path();
         *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
-        *lock_mutex(&HEALTH_COUNT_CACHE) = (Instant::now(), None);
-        *lock_mutex(&ATC_EXPERIENCE_HEALTH_CACHE) = (Instant::now(), None);
         let result = f();
         clear_startup_readiness_fast_path();
         *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
-        *lock_mutex(&HEALTH_COUNT_CACHE) = (Instant::now(), None);
-        *lock_mutex(&ATC_EXPERIENCE_HEALTH_CACHE) = (Instant::now(), None);
         result
     }
 
@@ -20849,24 +20863,6 @@ first body
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         f()
-    }
-
-    fn with_serialized_health_count_cache<F, T>(f: F) -> T
-    where
-        F: FnOnce() -> T,
-    {
-        let _route_lock = HEALTH_ROUTE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _lock = HEALTH_COUNT_CACHE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *lock_mutex(&HEALTH_COUNT_CACHE) = (Instant::now(), None);
-        *lock_mutex(&ATC_EXPERIENCE_HEALTH_CACHE) = (Instant::now(), None);
-        let result = f();
-        *lock_mutex(&HEALTH_COUNT_CACHE) = (Instant::now(), None);
-        *lock_mutex(&ATC_EXPERIENCE_HEALTH_CACHE) = (Instant::now(), None);
-        result
     }
 
     fn make_request(method: Http1Method, uri: &str, headers: &[(&str, &str)]) -> Http1Request {
@@ -28594,80 +28590,310 @@ first body
         });
     }
 
+    fn health_enrichment_fixture(root: &Path) -> mcp_agent_mail_core::Config {
+        let primary_path = root.join("storage.sqlite3");
+        let primary = DbConn::open_file(primary_path.to_str().expect("primary path"))
+            .expect("open primary fixture");
+        primary
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("create primary schema");
+        primary
+            .execute_raw("INSERT INTO projects (slug, human_key, created_at) VALUES ('health', '/health-fixture', 1);")
+            .expect("seed primary project");
+        mcp_agent_mail_db::close_db_conn(primary, "seed health enrichment fixture");
+        let sidecar_path = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(
+            primary_path.to_str().expect("primary path"),
+        );
+        let sidecar = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar_path)
+            .expect("open sidecar fixture");
+        sidecar
+            .execute_raw("CREATE TABLE atc_experiences (id INTEGER PRIMARY KEY, state TEXT); INSERT INTO atc_experiences (state) VALUES ('resolved');")
+            .expect("seed sidecar fixture");
+        drop(sidecar);
+        mcp_agent_mail_core::Config {
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&primary_path),
+            storage_root: root.join("archive"),
+            integrity_check_on_startup: false,
+            atc_experience_max_rows: 2,
+            atc_write_mode: mcp_agent_mail_core::config::AtcWriteMode::Live,
+            ..Default::default()
+        }
+    }
+
+    fn wait_for_health_enrichment(state: &HttpState) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let cache = lock_mutex(&state.health_enrichment);
+            if cache.last_attempt.is_some() && !cache.refreshing {
+                return;
+            }
+            drop(cache);
+            assert!(
+                Instant::now() < deadline,
+                "optional health refresh did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
-    fn health_readiness_count_cache_is_keyed_by_database_url() {
-        with_serialized_health_count_cache(|| {
-            *lock_mutex(&HEALTH_COUNT_CACHE) = (
-                Instant::now(),
-                Some(HealthCountCacheEntry {
-                    database_url: "sqlite:///tmp/other.sqlite3".to_string(),
-                    storage_root: PathBuf::from("/tmp/other-storage"),
-                    counts: Some((7, 9)),
-                }),
-            );
+    #[allow(clippy::too_many_lines)]
+    fn health_enrichment_cold_and_expired_requests_do_not_wait_for_runtime_probe() {
+        with_serialized_health_route(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let config = health_enrichment_fixture(dir.path());
+            let runtime = RuntimeBuilder::new()
+                .worker_threads(1)
+                .blocking_threads(1, 1)
+                .build()
+                .expect("runtime");
+            let pool = runtime
+                .handle()
+                .blocking_handle()
+                .expect("owned blocking pool");
+            let mut state = build_state(config);
+            state.health_refresh_scheduler = Some(health_enrichment_scheduler(runtime.handle()));
 
-            let current_storage = PathBuf::from("/tmp/current-storage");
-            let mut body = serde_json::json!({});
-            enrich_readiness_response(
-                "sqlite:///:memory:",
-                current_storage.as_path(),
-                50_000,
-                mcp_agent_mail_core::config::AtcWriteMode::Off,
-                &mut body,
-            );
+            for expired in [false, true] {
+                if expired {
+                    let primary =
+                        resolve_server_database_url_sqlite_path(&state.config.database_url)
+                            .expect("primary path");
+                    let sidecar_path =
+                        mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(primary.to_str().unwrap());
+                    let sidecar = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar_path)
+                        .expect("reopen sidecar");
+                    sidecar
+                        .execute_raw("INSERT INTO atc_experiences (state) VALUES ('second');")
+                        .expect("second observation");
+                    drop(sidecar);
+                    let old = Instant::now()
+                        .checked_sub(HEALTH_ENRICHMENT_CACHE_TTL + Duration::from_secs(1))
+                        .expect("expired sample time");
+                    let mut cache = lock_mutex(&state.health_enrichment);
+                    cache.last_attempt = Some(old);
+                    cache.counts.as_mut().expect("first counts").observed_at = old;
+                    cache
+                        .atc
+                        .as_mut()
+                        .expect("first sidecar sample")
+                        .observed_at = old;
+                }
 
-            assert_eq!(body["project_count"], serde_json::json!(0));
-            assert_eq!(body["message_count"], serde_json::json!(0));
-
-            let guard = lock_mutex(&HEALTH_COUNT_CACHE);
-            let (_, entry) = &*guard;
-            let entry = entry.as_ref().expect("health count cache entry");
-            assert_eq!(entry.database_url, "sqlite:///:memory:");
-            assert_eq!(entry.storage_root, current_storage);
-            assert_eq!(entry.counts, Some((0, 0)));
+                // Occupy the actual runtime pool, not a substitute probe. A
+                // refresh must remain queued until these requests finish.
+                let (started_tx, started_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let blocker = runtime
+                    .handle()
+                    .spawn_blocking(move || {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.recv_timeout(Duration::from_secs(15));
+                    })
+                    .expect("occupy owned pool");
+                started_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("blocker started");
+                std::thread::scope(|scope| {
+                    for _ in 0..8 {
+                        scope.spawn(|| state.schedule_health_enrichment_refresh());
+                    }
+                });
+                assert_eq!(
+                    pool.pending_count(),
+                    1,
+                    "concurrent callers share one refresh"
+                );
+                for path in [
+                    "/health",
+                    "/health/readiness",
+                    "/health",
+                    "/health/readiness",
+                ] {
+                    let started = Instant::now();
+                    let response =
+                        block_on(state.handle(make_request(Http1Method::Get, path, &[])));
+                    assert_eq!(response.status, 200);
+                    assert!(
+                        started.elapsed() < Duration::from_secs(2),
+                        "readiness waited on optional enrichment"
+                    );
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&response.body).expect("health JSON");
+                    assert_eq!(body["enrichment_refresh_in_flight"], true);
+                    assert_eq!(body["durability_state"], "not_probed");
+                    if expired {
+                        assert_eq!(body["project_count"], 1);
+                        assert_eq!(body["counts_sample_stale"], true);
+                        assert_eq!(body["atc_experience_store"]["raw_row_count"], 1);
+                        assert_eq!(body["atc_experience_store"]["sample_stale"], true);
+                    } else {
+                        assert!(body["project_count"].is_null());
+                        assert!(body["counts_sample_age_ms"].is_null());
+                        assert!(body["atc_experience_store"]["raw_row_count"].is_null());
+                        assert!(body["atc_experience_store"]["sample_age_ms"].is_null());
+                    }
+                    assert_eq!(
+                        pool.pending_count(),
+                        1,
+                        "one refresh despite repeated requests"
+                    );
+                    assert!(
+                        !blocker.is_done(),
+                        "requests completed while the real pool was blocked"
+                    );
+                }
+                release_tx.send(()).expect("release pool");
+                assert!(blocker.wait_timeout(Duration::from_secs(5)));
+                wait_for_health_enrichment(&state);
+                let mut body = serde_json::json!({});
+                enrich_readiness_response(&state.config, &state.health_enrichment, &mut body);
+                assert_eq!(body["project_count"], 1);
+                assert_eq!(body["message_count"], 0);
+                assert_eq!(body["counts_sample_stale"], false);
+                let atc = &body["atc_experience_store"];
+                assert_eq!(atc["raw_row_count"], if expired { 2 } else { 1 });
+                assert_eq!(atc["storage"], "sidecar");
+                assert_eq!(atc["quick_check"], "ok");
+                assert_eq!(atc["write_mode"], "live");
+                assert_eq!(atc["row_cap"], 2);
+                assert_eq!(atc["row_cap_enforced"], true);
+                assert_eq!(atc["sample_stale"], false);
+                assert!(atc["sample_age_ms"].as_u64().is_some());
+                assert!(
+                    atc["size_share_basis_points"]
+                        .as_u64()
+                        .is_some_and(|share| share > 0)
+                );
+                assert_eq!(pool.pending_count(), 0);
+            }
         });
     }
 
     #[test]
-    fn health_readiness_count_cache_reuses_stale_counts_when_refresh_fails() {
-        with_serialized_health_count_cache(|| {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let storage_root = dir.path().join("storage");
-            let database_url = "postgres://localhost/db".to_string();
-            let expected_counts = Some((11, 13));
-            *lock_mutex(&HEALTH_COUNT_CACHE) = (
-                Instant::now(),
-                Some(HealthCountCacheEntry {
-                    database_url: database_url.clone(),
-                    storage_root: storage_root.clone(),
-                    counts: expected_counts,
-                }),
-            );
-
+    fn health_enrichment_unavailable_runtime_never_runs_probe_inline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = health_enrichment_fixture(dir.path());
+        assert_eq!(fetch_health_live_counts(&config.database_url), Some((1, 0)));
+        assert!(fetch_atc_experience_health(&config.database_url).is_some());
+        let no_pool = RuntimeBuilder::new()
+            .worker_threads(1)
+            .build()
+            .expect("runtime without pool");
+        assert!(no_pool.handle().blocking_handle().is_none());
+        let (stopped, shutdown_waiter) = {
+            let runtime = RuntimeBuilder::new()
+                .worker_threads(1)
+                .blocking_threads(1, 1)
+                .build()
+                .expect("runtime to stop");
+            let handle = runtime.handle();
+            let waiter = runtime.clone();
+            // A retained RuntimeHandle is a strong owner. Explicitly close
+            // admission; dropping only Runtime would leave it operational.
+            assert!(!runtime.shutdown_timeout(Duration::ZERO));
+            (handle, waiter)
+        };
+        for handle in [None, Some(no_pool.handle()), Some(stopped)] {
+            let mut state = build_state(config.clone());
+            state.health_refresh_scheduler = handle.map(health_enrichment_scheduler);
+            state.schedule_health_enrichment_refresh();
             let mut body = serde_json::json!({});
-            enrich_readiness_response(
-                &database_url,
-                &storage_root,
-                50_000,
-                mcp_agent_mail_core::config::AtcWriteMode::Off,
-                &mut body,
-            );
+            enrich_readiness_response(&state.config, &state.health_enrichment, &mut body);
+            assert!(body["project_count"].is_null());
+            assert!(body["counts_sample_age_ms"].is_null());
+            assert!(body["atc_experience_store"]["raw_row_count"].is_null());
+            assert!(body["atc_experience_store"]["sample_age_ms"].is_null());
+            assert_eq!(body["enrichment_refresh_in_flight"], false);
+        }
+        assert!(shutdown_waiter.shutdown_timeout(Duration::from_secs(5)));
+    }
 
-            assert_eq!(body["project_count"], serde_json::json!(11));
-            assert_eq!(body["message_count"], serde_json::json!(13));
-
-            let guard = lock_mutex(&HEALTH_COUNT_CACHE);
-            let (_, entry) = &*guard;
-            let entry = entry.as_ref().expect("health count cache entry");
-            assert_eq!(entry.database_url, database_url);
-            assert_eq!(entry.storage_root, storage_root);
-            assert_eq!(entry.counts, expected_counts);
+    #[test]
+    fn health_enrichment_cache_is_scoped_to_http_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = health_enrichment_fixture(dir.path());
+        let first = build_state(config.clone());
+        lock_mutex(&first.health_enrichment).counts = Some(HealthSample {
+            observed_at: Instant::now(),
+            value: (7, 9),
         });
+        // A new server for the same URL must not inherit another instance's
+        // in-flight work or observations of an older database.
+        let second = build_state(config);
+        let mut body = serde_json::json!({});
+        enrich_readiness_response(&second.config, &second.health_enrichment, &mut body);
+        assert!(body["project_count"].is_null());
+        assert!(body["counts_sample_age_ms"].is_null());
+        assert!(body["atc_experience_store"]["sidecar_present"].is_null());
+        assert!(!lock_mutex(&second.health_enrichment).refreshing);
+        assert_eq!(
+            lock_mutex(&first.health_enrichment)
+                .counts
+                .as_ref()
+                .unwrap()
+                .value,
+            (7, 9)
+        );
+    }
+
+    #[test]
+    fn health_enrichment_failed_count_refresh_preserves_sample_age() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = health_enrichment_fixture(dir.path());
+        let runtime = RuntimeBuilder::new()
+            .worker_threads(1)
+            .blocking_threads(1, 1)
+            .build()
+            .expect("runtime");
+        let mut state = build_state(config);
+        state.health_refresh_scheduler = Some(health_enrichment_scheduler(runtime.handle()));
+        state.schedule_health_enrichment_refresh();
+        wait_for_health_enrichment(&state);
+        assert_eq!(
+            lock_mutex(&state.health_enrichment)
+                .counts
+                .as_ref()
+                .unwrap()
+                .value,
+            (1, 0)
+        );
+        let primary = resolve_server_database_url_sqlite_path(&state.config.database_url)
+            .expect("primary path");
+        let conn = DbConn::open_file(primary.to_str().unwrap()).expect("open primary");
+        conn.execute_raw("ALTER TABLE messages RENAME TO paused_messages;")
+            .expect("make count query unavailable");
+        mcp_agent_mail_db::close_db_conn(conn, "failed count refresh fixture");
+        assert_eq!(fetch_health_live_counts(&state.config.database_url), None);
+        let old = Instant::now()
+            .checked_sub(HEALTH_ENRICHMENT_CACHE_TTL + Duration::from_secs(1))
+            .expect("expired sample time");
+        {
+            let mut cache = lock_mutex(&state.health_enrichment);
+            cache.last_attempt = Some(old);
+            cache.counts.as_mut().unwrap().observed_at = old;
+        }
+        state.schedule_health_enrichment_refresh();
+        wait_for_health_enrichment(&state);
+        let mut body = serde_json::json!({});
+        enrich_readiness_response(&state.config, &state.health_enrichment, &mut body);
+        assert_eq!(body["project_count"], 1);
+        assert_eq!(body["message_count"], 0);
+        assert_eq!(body["counts_sample_stale"], true);
+        assert!(
+            body["counts_sample_age_ms"]
+                .as_u64()
+                .is_some_and(|age| age >= 31_000)
+        );
+        let cache = lock_mutex(&state.health_enrichment);
+        assert_eq!(cache.counts.as_ref().unwrap().observed_at, old);
+        assert!(cache.last_attempt.unwrap() > old);
+        assert!(!cache.refreshing);
     }
 
     #[test]
     fn health_atc_experience_store_reports_sidecar_rows_and_size_share() {
-        with_serialized_health_count_cache(|| {
+        with_serialized_health_route(|| {
             let dir = tempfile::tempdir().expect("tempdir");
             let primary_path = dir.path().join("storage.sqlite3");
             let primary_path_str = primary_path.to_string_lossy().into_owned();
@@ -28690,10 +28916,16 @@ first body
                 .expect("seed ATC experience");
             drop(sidecar);
 
+            let database_url = format!("sqlite:///{primary_path_str}");
+            let sample = HealthSample {
+                observed_at: Instant::now(),
+                value: fetch_atc_experience_health(&database_url).expect("real sidecar health"),
+            };
             let body = atc_experience_health_json(
-                format!("sqlite:///{primary_path_str}").as_str(),
+                &database_url,
                 2,
                 mcp_agent_mail_core::config::AtcWriteMode::Live,
+                Some(&sample),
             );
             assert_eq!(body["storage"], "sidecar");
             assert_eq!(body["write_mode"], "live");

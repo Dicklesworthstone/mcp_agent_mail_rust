@@ -352,6 +352,32 @@ fn is_safe_path(root: &Path, resolved: &Path) -> bool {
 mod tests {
     use super::*;
 
+    fn isolated_test_tempdir() -> tempfile::TempDir {
+        let preferred = std::env::temp_dir();
+        let mut candidates = vec![preferred.clone()];
+        #[cfg(unix)]
+        candidates.extend([PathBuf::from("/tmp"), PathBuf::from("/var/tmp")]);
+        candidates.extend(preferred.ancestors().skip(1).map(Path::to_path_buf));
+        for parent in candidates {
+            // Negative discovery fixtures must not inherit the checkout when
+            // a runner redirects TMPDIR beneath it.
+            if parent.ancestors().any(|ancestor| {
+                [".git", "Cargo.toml", "crates"]
+                    .iter()
+                    .any(|marker| std::fs::symlink_metadata(ancestor.join(marker)).is_ok())
+            }) {
+                continue;
+            }
+            if let Ok(dir) = tempfile::Builder::new()
+                .prefix("am-web-isolated-")
+                .tempdir_in(parent)
+            {
+                return dir;
+            }
+        }
+        panic!("no writable temporary directory outside source-tree ancestors");
+    }
+
     #[test]
     fn mime_types_cover_common_web_assets() {
         assert_eq!(
@@ -429,7 +455,7 @@ mod tests {
 
     #[test]
     fn current_dir_web_candidates_include_detected_workspace_root() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = isolated_test_tempdir();
         let root = dir.path().join("workspace");
         std::fs::create_dir_all(root.join("crates/server")).unwrap();
         std::fs::write(root.join("Cargo.toml"), "[workspace]").unwrap();
@@ -441,7 +467,7 @@ mod tests {
 
     #[test]
     fn current_dir_web_candidates_ignore_unmarked_directories() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = isolated_test_tempdir();
         let nested = dir.path().join("scratch/notes");
         std::fs::create_dir_all(&nested).unwrap();
 
@@ -454,7 +480,7 @@ mod tests {
     fn current_dir_web_candidates_ignore_symlinked_crates_marker() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = isolated_test_tempdir();
         let root = dir.path().join("workspace");
         let nested = root.join("subdir");
         let outside = dir.path().join("outside-crates");
