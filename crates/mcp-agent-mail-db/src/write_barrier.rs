@@ -417,31 +417,39 @@ pub(crate) fn clear_promotion_recency_for_test() {
 }
 
 #[cfg(test)]
-pub(crate) fn reset_for_test() {
-    if let Some(barrier) = BARRIER.get() {
-        let mut state = barrier.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.writers = 0;
-        state.promotion_active = false;
-    }
-    if let Some(map) = LAST_PROMOTIONS.get() {
-        map.lock().unwrap_or_else(PoisonError::into_inner).clear();
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // The barrier is process-global, so these tests serialize on a local
-    // mutex to avoid cross-test interference within this module.
-    static TEST_SERIAL: Mutex<()> = Mutex::new(());
+    // A module-local mutex cannot exclude pool tests using the same global
+    // barrier. Run each test in a fresh process instead of resetting live state.
+    fn run_in_isolated_process() -> bool {
+        const CHILD: &str = "AM_TEST_WRITE_BARRIER_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named libtest thread");
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .output()
+            .expect("run isolated barrier test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "isolated {name} did not pass exactly one test: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        true
+    }
 
     #[test]
     fn drift_acquire_defers_while_foreign_writer_active() {
-        let _serial = TEST_SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
-        reset_for_test();
+        if run_in_isolated_process() {
+            return;
+        }
         let writer = std::thread::spawn(|| {
             let guard = begin_write_activity();
             std::thread::sleep(Duration::from_millis(200));
@@ -459,8 +467,9 @@ mod tests {
 
     #[test]
     fn write_activity_blocks_idle_promotion_even_on_same_thread() {
-        let _serial = TEST_SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
-        reset_for_test();
+        if run_in_isolated_process() {
+            return;
+        }
         let _activity = begin_write_activity();
         let barrier = try_acquire_promotion_barrier_if_idle();
         assert!(
@@ -471,8 +480,9 @@ mod tests {
 
     #[test]
     fn migrated_write_guard_cannot_leave_a_false_self_exemption() {
-        let _serial = TEST_SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
-        reset_for_test();
+        if run_in_isolated_process() {
+            return;
+        }
         let migrated = begin_write_activity();
         std::thread::spawn(move || drop(migrated))
             .join()
@@ -487,8 +497,9 @@ mod tests {
 
     #[test]
     fn new_writers_block_until_promotion_releases() {
-        let _serial = TEST_SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
-        reset_for_test();
+        if run_in_isolated_process() {
+            return;
+        }
         let barrier = try_acquire_promotion_barrier_if_idle().expect("idle acquire");
         let entered = Arc::new(AtomicBool::new(false));
         let entered_clone = Arc::clone(&entered);
@@ -509,8 +520,9 @@ mod tests {
 
     #[test]
     fn draining_acquire_times_out_but_holds_barrier() {
-        let _serial = TEST_SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
-        reset_for_test();
+        if run_in_isolated_process() {
+            return;
+        }
         let writer_started = Arc::new(AtomicBool::new(false));
         let started_clone = Arc::clone(&writer_started);
         let writer = std::thread::spawn(move || {
@@ -538,27 +550,54 @@ mod tests {
 
     #[test]
     fn draining_acquire_observes_drain() {
-        let _serial = TEST_SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
-        reset_for_test();
-        let writer = std::thread::spawn(|| {
-            let guard = begin_write_activity();
-            std::thread::sleep(Duration::from_millis(100));
-            drop(guard);
+        if run_in_isolated_process() {
+            return;
+        }
+        // Register the writer before starting recovery. Release it only after
+        // recovery has closed admission, so Idle cannot satisfy this proof.
+        let writer = begin_write_activity();
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let recovery = std::thread::spawn(move || {
+            let (barrier, outcome) = acquire_promotion_barrier_draining(Duration::from_secs(5));
+            drained_tx.send(outcome).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(barrier);
         });
-        std::thread::sleep(Duration::from_millis(30));
-        let (barrier, outcome) = acquire_promotion_barrier_draining(Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !barrier().state.lock().unwrap().promotion_active {
+            assert!(Instant::now() < deadline, "recovery never closed admission");
+            std::thread::yield_now();
+        }
+        assert_eq!(active_writer_count(), 1);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let late_writer = std::thread::spawn(move || {
+            let _guard = begin_write_activity();
+            entered_tx.send(()).unwrap();
+        });
+        drop(writer);
+        let outcome = drained_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(
-            matches!(outcome, DrainOutcome::Drained { .. } | DrainOutcome::Idle),
+            matches!(outcome, DrainOutcome::Drained { .. }),
             "expected drain before timeout, got {outcome:?}"
         );
-        drop(barrier);
-        writer.join().expect("writer thread");
+        assert_eq!(active_writer_count(), 0);
+        assert_eq!(
+            entered_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "late writer entered during promotion"
+        );
+        release_tx.send(()).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        late_writer.join().expect("late writer thread");
+        recovery.join().expect("recovery thread");
     }
 
     #[test]
     fn nested_barrier_is_passthrough() {
-        let _serial = TEST_SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
-        reset_for_test();
+        if run_in_isolated_process() {
+            return;
+        }
         let outer = try_acquire_promotion_barrier_if_idle().expect("outer");
         let (inner, outcome) = acquire_promotion_barrier_draining(Duration::from_millis(10));
         assert_eq!(outcome, DrainOutcome::Idle);
@@ -591,8 +630,9 @@ mod tests {
 
     #[test]
     fn promotion_recency_is_recorded() {
-        let _serial = TEST_SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
-        reset_for_test();
+        if run_in_isolated_process() {
+            return;
+        }
         let path = Path::new("/tmp/write-barrier-test.sqlite3");
         assert!(time_since_last_promotion(path).is_none());
         record_promotion(path);
