@@ -631,6 +631,19 @@ impl MessageIdAllocator {
         !self.is_retired() && !self.archive_floor.is_initialized()
     }
 
+    /// Read an already-published seed without validating or scanning the
+    /// archive. Retired generations must never lend their cached floor.
+    pub(crate) fn cached_archive_seed(&self) -> Result<Option<i64>, DbError> {
+        if self.is_retired() {
+            return Err(Self::retired_error());
+        }
+        let seed = self.archive_floor.get().copied();
+        if self.is_retired() {
+            return Err(Self::retired_error());
+        }
+        Ok(seed)
+    }
+
     fn retired_error() -> DbError {
         DbError::Internal("message id allocator was retired after database recovery".to_string())
     }
@@ -1184,6 +1197,8 @@ mod tests {
         let alloc = MessageIdAllocator::new();
         let cx = Cx::for_testing();
         let scans = std::cell::Cell::new(0_u32);
+        assert_eq!(alloc.cached_archive_seed().unwrap(), None);
+        assert!(alloc.needs_archive_seed());
         let first = expect_seeded(block_on(alloc.archive_seed_with(&cx, || async {
             scans.set(scans.get() + 1);
             Outcome::Ok(50)
@@ -1196,6 +1211,13 @@ mod tests {
         assert_eq!(second, 50);
         assert_eq!(scans.get(), 1, "the archive scan must run exactly once");
         assert!(!alloc.needs_archive_seed());
+        assert_eq!(alloc.cached_archive_seed().unwrap(), Some(50));
+        assert!(alloc.retire());
+        assert!(alloc.cached_archive_seed().is_err());
+
+        let cold = MessageIdAllocator::new();
+        assert!(cold.retire());
+        assert!(cold.cached_archive_seed().is_err());
     }
 
     #[test]

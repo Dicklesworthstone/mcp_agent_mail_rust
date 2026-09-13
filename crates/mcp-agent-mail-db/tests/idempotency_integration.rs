@@ -135,6 +135,28 @@ fn send_idem(
     key: &str,
     fingerprint: &str,
 ) -> IdempotentOutcome<MessageRow> {
+    send_idem_result(
+        pool,
+        project_id,
+        sender_id,
+        recipient_id,
+        body,
+        key,
+        fingerprint,
+    )
+    .into_result()
+    .expect("idempotent send succeeds")
+}
+
+fn send_idem_result(
+    pool: &DbPool,
+    project_id: i64,
+    sender_id: i64,
+    recipient_id: i64,
+    body: &str,
+    key: &str,
+    fingerprint: &str,
+) -> Outcome<IdempotentOutcome<MessageRow>, mcp_agent_mail_db::DbError> {
     let pool = pool.clone();
     let body = body.to_string();
     let key = key.to_string();
@@ -147,7 +169,7 @@ fn send_idem(
             key: &key,
             fingerprint: &fingerprint,
         };
-        match queries::create_message_with_recipients_idempotent(
+        queries::create_message_with_recipients_idempotent(
             &cx,
             &pool,
             project_id,
@@ -162,10 +184,6 @@ fn send_idem(
             claim,
         )
         .await
-        {
-            Outcome::Ok(outcome) => outcome,
-            other => panic!("create_message_with_recipients_idempotent failed: {other:?}"),
-        }
     })
 }
 
@@ -275,6 +293,136 @@ fn send_message_idempotent_replays_same_id_and_writes_once() {
         count_rows(&db_path, "SELECT COUNT(*) FROM idempotency_keys"),
         1,
         "exactly one idempotency key must be recorded"
+    );
+}
+
+#[test]
+fn concurrent_first_message_claims_create_once_and_replay() {
+    let (pool, _dir, db_path) = make_pool();
+    let project = setup_project(&pool);
+    let sender = setup_agent(&pool, project, "GreenCastle");
+    let recipient = setup_agent(&pool, project, "BlueLake");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    // Start both participants before joining either one at the barrier.
+    let workers: [_; 2] = std::array::from_fn(|_| {
+        let pool = pool.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            send_idem(&pool, project, sender, recipient, "hello", "race", "same")
+        })
+    });
+    let outcomes: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| matches!(result, IdempotentOutcome::Fresh(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| result.is_replayed())
+            .count(),
+        1
+    );
+    assert_eq!(count_rows(&db_path, "SELECT COUNT(*) FROM messages"), 1);
+    assert_eq!(
+        count_rows(&db_path, "SELECT COUNT(*) FROM idempotency_keys"),
+        1
+    );
+    assert!(matches!(
+        send_idem(
+            &pool,
+            project,
+            sender,
+            recipient,
+            "changed",
+            "race",
+            "different"
+        ),
+        IdempotentOutcome::Conflict(_),
+    ));
+}
+
+#[test]
+fn message_replay_survives_exhausted_ids_and_cold_invalid_archive() {
+    let (pool, _dir, db_path) = make_pool();
+    let project = setup_project(&pool);
+    let sender = setup_agent(&pool, project, "GreenCastle");
+    let recipient = setup_agent(&pool, project, "BlueLake");
+    let fresh = send_idem(&pool, project, sender, recipient, "hello", "K1", "fp-A");
+    let IdempotentOutcome::Fresh(original) = fresh else {
+        panic!("first send must create the message");
+    };
+    let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
+    conn.execute_raw(
+        "UPDATE sqlite_sequence SET seq = 9223372036854775807 WHERE name = 'messages'",
+    )
+    .unwrap();
+    drop(conn);
+    let sequence = || {
+        count_rows(
+            &db_path,
+            "SELECT MAX(seq) FROM sqlite_sequence WHERE name = 'messages'",
+        )
+    };
+    assert_eq!(sequence(), i64::MAX);
+    assert!(matches!(
+        send_idem(&pool, project, sender, recipient, "hello", "K1", "fp-A"),
+        IdempotentOutcome::Replayed(row) if row.id == original.id,
+    ));
+    assert!(matches!(
+        send_idem(&pool, project, sender, recipient, "changed", "K1", "fp-B"),
+        IdempotentOutcome::Conflict(_),
+    ));
+    let error = send_idem_result(&pool, project, sender, recipient, "fresh", "K2", "fp-C")
+        .into_result()
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("exhausted the positive i64 row-id range")
+    );
+    assert_eq!(sequence(), i64::MAX);
+
+    let storage = pool.storage_root().to_path_buf();
+    drop(pool);
+    let bad = storage.join("projects/proj/messages/2026/05/01__40.md");
+    std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+    std::fs::write(&bad, "not canonical frontmatter").unwrap();
+    let cold = DbPool::new(&DbPoolConfig {
+        database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(storage),
+        run_migrations: false,
+        warmup_connections: 0,
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(cold.message_id_allocator().needs_archive_seed());
+    assert!(matches!(
+        send_idem(&cold, project, sender, recipient, "hello", "K1", "fp-A"),
+        IdempotentOutcome::Replayed(row) if row.id == original.id,
+    ));
+    assert!(matches!(
+        send_idem(&cold, project, sender, recipient, "changed", "K1", "fp-B"),
+        IdempotentOutcome::Conflict(_),
+    ));
+    assert!(cold.message_id_allocator().needs_archive_seed());
+    let error = send_idem_result(&cold, project, sender, recipient, "fresh", "K3", "fp-D")
+        .into_result()
+        .unwrap_err();
+    assert!(error.to_string().contains("frontmatter"));
+    assert!(cold.message_id_allocator().needs_archive_seed());
+    assert_eq!(sequence(), i64::MAX);
+    assert_eq!(count_rows(&db_path, "SELECT COUNT(*) FROM messages"), 1);
+    assert_eq!(
+        count_rows(&db_path, "SELECT COUNT(*) FROM idempotency_keys"),
+        1
     );
 }
 
