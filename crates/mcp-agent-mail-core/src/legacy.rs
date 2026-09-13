@@ -1,4 +1,11 @@
-//! Legacy Python installation detection and migration/import commands.
+//! RETIRED, UNCOMPILED HISTORICAL COPY — do not wire this module into a crate.
+//!
+//! The maintained implementation is `crates/mcp-agent-mail-cli/src/legacy.rs`.
+//! This copy predates the legacy import authority and filesystem safety fixes;
+//! it is retained only as historical source (br-wqtdq). Make fixes in the CLI
+//! implementation, never here. The compile error below prevents accidental reuse.
+//!
+//! Historical legacy Python installation detection and migration/import commands.
 //!
 //! Command surface:
 //! - `am legacy detect`
@@ -7,6 +14,10 @@
 //! - `am upgrade`
 
 #![forbid(unsafe_code)]
+
+compile_error!(
+    "Retired legacy import copy: use crates/mcp-agent-mail-cli/src/legacy.rs; see br-wqtdq"
+);
 
 use crate::{CliError, CliResult, SetupCommand, handle_setup, output};
 use chrono::Utc;
