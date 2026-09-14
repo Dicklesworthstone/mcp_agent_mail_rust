@@ -152,20 +152,34 @@ e2e_assert_contains "help lists agents subcommand" "$AM_HELP_OUT" "agents"
 # ===========================================================================
 # Case 7: am doctor check runs without hard failure on fresh system
 # ===========================================================================
-e2e_case_banner "am doctor check exits cleanly on fresh system"
+e2e_case_banner "am doctor check reports health or findings without crashing"
 
 set +e
-DOCTOR_OUT="$("$FAKE_DEST/am" doctor check 2>&1)"
+DOCTOR_OUT="$(env -i HOME="$FAKE_HOME" PATH="$PATH" NO_COLOR=1 \
+  AM_INTERFACE_MODE=cli STORAGE_ROOT="$STORAGE_ROOT" \
+  DATABASE_URL="sqlite:///${FAKE_HOME}/doctor-uninitialized.sqlite3" \
+  HTTP_HOST=127.0.0.1 HTTP_PORT=1 "$FAKE_DEST/am" doctor check 2>&1)"
 DOCTOR_RC=$?
 set -e
 
 e2e_save_artifact "case_07_doctor_check.txt" "$DOCTOR_OUT"
 # Doctor may return non-zero if no storage exists yet, but should not crash
 # Accept exit codes 0 (all green) or 1 (warnings) — NOT segfault/panic
-if [ "$DOCTOR_RC" -le 1 ]; then
-  e2e_assert_exit_code "am doctor check (0 or 1)" "0" "0"
+e2e_assert_exit_code_in "am doctor check accepts health or findings" "$DOCTOR_RC" 0 1
+DOCTOR_STATE="invalid_output"
+if [ "$DOCTOR_RC" -eq 0 ] && printf '%s' "$DOCTOR_OUT" | grep -Fq 'All checks passed.'; then
+  DOCTOR_STATE="healthy"
+  e2e_pass "doctor reports healthy checks"
+elif [ "$DOCTOR_RC" -eq 1 ] && printf '%s' "$DOCTOR_OUT" | grep -Fq 'Some checks failed.'; then
+  DOCTOR_STATE="findings_on_fresh_system"
+  e2e_pass "doctor reports findings on the uninitialized system; not a healthy verdict"
 else
-  e2e_assert_exit_code "am doctor check should not panic" "0" "$DOCTOR_RC"
+  e2e_fail "doctor output does not match its observed exit code $DOCTOR_RC"
+fi
+e2e_save_artifact "case_07_doctor_exit.json" \
+  "{\"actual_exit_code\":$DOCTOR_RC,\"expected_exit_codes\":[0,1],\"state\":\"$DOCTOR_STATE\"}"
+if printf '%s' "$DOCTOR_OUT" | grep -Eiq 'panicked at|fatal runtime error|segmentation fault'; then
+  e2e_fail "doctor output reports a crash despite its exit code"
 fi
 
 # ===========================================================================

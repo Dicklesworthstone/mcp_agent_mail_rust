@@ -126,6 +126,55 @@ else
     record_fail "s7_wait_for_timeout_returns_nonzero" "timeout condition unexpectedly succeeded"
 fi
 
+assert_cmd "s8_exit_code_evidence" "allowed exit sets preserve actual codes and reject malformed inputs" \
+    python3 - "${SCRIPT_DIR}/../../../scripts/e2e_lib.sh" "${WORK}" <<'PY'
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+harness = pathlib.Path(sys.argv[1]).resolve()
+work = pathlib.Path(sys.argv[2])
+cases = [
+    ("0", ["0", "1"], True),
+    ("1", ["0", "1"], True),
+    ("2", ["0", "1"], False),
+    ("139", ["0", "1"], False),
+    ("1", [], False),
+    ("1", ["1", "oops"], False),
+    ("1", [""], False),
+    ("1", ["256"], False),
+    ("01", ["0", "1"], False),
+]
+for index, (actual, allowed, passes) in enumerate(cases):
+    trace = work / f"exit-code-{index}.jsonl"
+    result = subprocess.run(
+        ["bash", "-c", '''
+source "$1"
+_E2E_TRACE_FILE="$2"
+actual="$3"
+shift 3
+e2e_assert_exit_code_in "observed command" "$actual" "$@"
+printf 'COUNTERS=%s,%s\n' "$_E2E_PASS" "$_E2E_FAIL"
+e2e_pass "ordinary assertion has no exit fields"
+''', "exit-code-self-test", str(harness), str(trace), actual, *allowed],
+        env={**os.environ, "AM_E2E_KEEP_TMP": "1"},
+        capture_output=True, text=True, check=True,
+    )
+    events = [json.loads(line) for line in trace.read_text().splitlines()]
+    assertion = next(e for e in events if e["kind"] in ("assert_pass", "assert_fail"))
+    assert assertion["actual_exit_code"] == actual, assertion
+    assert assertion["expected_exit_codes"] == allowed, assertion
+    assert assertion["kind"] == ("assert_pass" if passes else "assert_fail"), assertion
+    assert f"actual exit={actual}" in assertion["message"], assertion
+    expected_counters = "1,0" if passes else "0,1"
+    assert f"COUNTERS={expected_counters}" in result.stdout, result.stdout
+    ordinary = events[-1]
+    assert "actual_exit_code" not in ordinary and "expected_exit_codes" not in ordinary, ordinary
+print("9 allowed-exit cases passed; actual=1 is preserved, signals and malformed sets fail")
+PY
+
 log_summary "lib_self_test" "${TOTAL}" "${PASS}" "${FAIL}" "${WORK}" "bash tests/e2e/lib/lib_self_test.sh"
 if [ "${FAIL}" -ne 0 ]; then
     exit 1
