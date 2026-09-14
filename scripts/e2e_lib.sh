@@ -502,6 +502,34 @@ e2e_assert_exit_code() {
 # Temp workspace management
 # ---------------------------------------------------------------------------
 
+# Assert membership without replacing an accepted nonzero exit with a fake zero.
+# Arguments: label, observed exit code, one or more allowed exit codes.
+e2e_assert_exit_code_in() {
+    local label="$1" actual="$2"
+    shift 2
+    local code matched=0 valid=1 separator=""
+    local _E2E_EXIT_EXPECTED_JSON="[" _E2E_EXIT_ACTUAL="$actual"
+    [ "$#" -gt 0 ] || valid=0
+    for code in "$@"; do
+        _E2E_EXIT_EXPECTED_JSON+="${separator}\"$(_e2e_json_escape "$code")\""
+        separator=","
+        if [[ ! "$code" =~ ^(0|[1-9][0-9]{0,2})$ ]] || [ "$code" -gt 255 ]; then
+            valid=0
+        fi
+        [ "$actual" != "$code" ] || matched=1
+    done
+    _E2E_EXIT_EXPECTED_JSON+="]"
+    if [[ ! "$actual" =~ ^(0|[1-9][0-9]{0,2})$ ]] || [ "$actual" -gt 255 ]; then
+        valid=0
+    fi
+    local message="$label (expected exits={${*:-empty}}, actual exit=$actual)"
+    if [ "$valid" -eq 1 ] && [ "$matched" -eq 1 ]; then
+        e2e_pass "$message"
+    else
+        e2e_fail "$message; exit not allowed or invalid exit-code set"
+    fi
+}
+
 # Create a temp directory and register it for cleanup
 e2e_mktemp() {
     local prefix="${1:-e2e}"
@@ -1300,6 +1328,9 @@ _e2e_trace_event() {
 
     # Build optional v2 fields (br-1xt0m.1.13.13)
     local v2_fields=""
+    if [ -n "${_E2E_EXIT_EXPECTED_JSON:-}" ]; then
+        v2_fields="${v2_fields},\"expected_exit_codes\":${_E2E_EXIT_EXPECTED_JSON},\"actual_exit_code\":\"$(_e2e_json_escape "$_E2E_EXIT_ACTUAL")\""
+    fi
     if [ -n "$assertion_id" ]; then
         v2_fields="${v2_fields},\"assertion_id\":\"$(_e2e_json_escape "$assertion_id")\""
     fi
