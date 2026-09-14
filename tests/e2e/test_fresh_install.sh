@@ -164,13 +164,16 @@ set -e
 
 e2e_save_artifact "case_07_doctor_check.txt" "$DOCTOR_OUT"
 # Doctor may return non-zero if no storage exists yet, but should not crash
-# Accept exit codes 0 (all green) or 1 (warnings) — NOT segfault/panic
+# Accept exit codes 0 (healthy) or 1 (findings) — NOT segfault/panic.
 e2e_assert_exit_code_in "am doctor check accepts health or findings" "$DOCTOR_RC" 0 1
 DOCTOR_STATE="invalid_output"
-if [ "$DOCTOR_RC" -eq 0 ] && printf '%s' "$DOCTOR_OUT" | grep -Fq 'All checks passed.'; then
+if grep -Eiq 'panicked at|fatal runtime error|segmentation fault' <<< "$DOCTOR_OUT"; then
+  DOCTOR_STATE="crash_output"
+  e2e_fail "doctor output reports a crash despite its exit code"
+elif [ "$DOCTOR_RC" -eq 0 ] && grep -Fq 'All checks passed.' <<< "$DOCTOR_OUT"; then
   DOCTOR_STATE="healthy"
   e2e_pass "doctor reports healthy checks"
-elif [ "$DOCTOR_RC" -eq 1 ] && printf '%s' "$DOCTOR_OUT" | grep -Fq 'Some checks failed.'; then
+elif [ "$DOCTOR_RC" -eq 1 ] && grep -Fq 'Some checks failed.' <<< "$DOCTOR_OUT"; then
   DOCTOR_STATE="findings_on_fresh_system"
   e2e_pass "doctor reports findings on the uninitialized system; not a healthy verdict"
 else
@@ -178,9 +181,6 @@ else
 fi
 e2e_save_artifact "case_07_doctor_exit.json" \
   "{\"actual_exit_code\":$DOCTOR_RC,\"expected_exit_codes\":[0,1],\"state\":\"$DOCTOR_STATE\"}"
-if printf '%s' "$DOCTOR_OUT" | grep -Eiq 'panicked at|fatal runtime error|segmentation fault'; then
-  e2e_fail "doctor output reports a crash despite its exit code"
-fi
 
 # ===========================================================================
 # Case 8: mcp-agent-mail serve-stdio responds to MCP initialize
