@@ -12466,11 +12466,13 @@ mod tests {
         F: FnOnce(Cx) -> Fut,
         Fut: std::future::Future<Output = T>,
     {
-        let cx = Cx::for_testing();
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        rt.block_on(f(cx))
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs storage test context");
+            f(cx).await
+        })
     }
 
     #[test]
