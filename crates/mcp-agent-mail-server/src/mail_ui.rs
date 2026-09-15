@@ -29,6 +29,14 @@ use serde::{Deserialize, Serialize};
 use crate::markdown;
 use crate::templates;
 
+/// Keep the owner alive while fixtures exercise the real message allocator.
+#[cfg(test)]
+fn message_fixture_runtime() -> asupersync::runtime::Runtime {
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build mail UI message fixture runtime")
+}
+
 /// Mail UI request budget helper.
 ///
 /// `asupersync::Budget` deadlines are absolute timestamps in asupersync's
@@ -836,7 +844,8 @@ first body
 
     #[test]
     fn render_attachments_lists_message_attachments() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("attachments");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -931,7 +940,8 @@ first body
 
     #[test]
     fn render_attachments_preserves_messages_with_malformed_attachment_json() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("attachments-malformed");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -978,7 +988,8 @@ first body
 
     #[test]
     fn render_attachments_preserves_messages_when_agent_rows_are_missing() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("attachments-orphaned-agents");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -1042,7 +1053,8 @@ first body
 
     #[test]
     fn render_message_renders_sender_recipients_and_thread_preview() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("message");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -1116,7 +1128,8 @@ first body
 
     #[test]
     fn render_message_root_seed_uses_numeric_thread_reference() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("message-root-thread");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -1181,7 +1194,8 @@ first body
 
     #[test]
     fn render_inbox_root_seed_uses_numeric_thread_reference() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("inbox-root-thread");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -1265,7 +1279,8 @@ first body
 
     #[test]
     fn render_message_does_not_client_render_raw_markdown_fallback() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("message-no-client-markdown");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -1310,7 +1325,8 @@ first body
 
     #[test]
     fn render_message_preserves_orphaned_sender_with_placeholder() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("message-orphaned-sender");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -2722,7 +2738,8 @@ mod auth_route_hardening_regression_suite {
 
     #[test]
     fn regression_thread_route_decodes_percent_encoded_thread_id() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool();
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -3721,7 +3738,8 @@ mod message_route_authorization_tests {
 
     #[test]
     fn project_message_route_blocks_cross_project_idor_access() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool();
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -5886,7 +5904,8 @@ mod fresh_eyes_regression_tests {
 
     #[test]
     fn unified_message_aggregation_deduplicates_multi_recipient_mail() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("mail-ui-unified");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -5969,7 +5988,8 @@ mod fresh_eyes_regression_tests {
 
     #[test]
     fn unified_message_aggregation_root_seed_uses_numeric_thread_reference() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("mail-ui-unified-root-thread");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -6035,7 +6055,8 @@ mod fresh_eyes_regression_tests {
 
     #[test]
     fn unified_message_aggregation_importance_filter_overfetches_past_newer_non_matching_rows() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("mail-ui-unified-filter-overfetch");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -6096,7 +6117,8 @@ mod fresh_eyes_regression_tests {
 
     #[test]
     fn render_api_unified_inbox_root_seed_includes_thread_reference() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("mail-ui-unified-api-root-thread");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -6159,7 +6181,8 @@ mod fresh_eyes_regression_tests {
 
     #[test]
     fn render_api_unified_inbox_preserves_importance_filter() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("mail-ui-unified-api-filter");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -6267,7 +6290,8 @@ mod fresh_eyes_regression_tests {
 
     #[test]
     fn handle_mark_read_deduplicates_ids_and_excludes_already_read_rows_from_count() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("mail-ui-mark-read-counts");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -6830,7 +6854,8 @@ mod overseer_form_validation_tests {
 
     #[test]
     fn handle_overseer_send_records_explicit_recipients_and_audit_metadata() {
-        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("mail-ui-overseer-audit");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
