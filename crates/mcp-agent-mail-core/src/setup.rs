@@ -773,6 +773,61 @@ pub fn resolve_token(explicit: Option<&str>, env_file: &Path) -> Result<String, 
     generate_token()
 }
 
+/// A setup token bound to the file generation from which it was resolved.
+/// Explicit tokens choose the replacement value, but do not bypass concurrent
+/// edits or unsafe file authorities. This intentionally does not implement
+/// `Debug`: its contents include a credential.
+pub struct ResolvedSetupToken {
+    token: String,
+    path: PathBuf,
+    authority: Option<SetupDirectoryAuthority>,
+    snapshot: Option<SetupFileSnapshot>,
+}
+
+impl ResolvedSetupToken {
+    /// Borrow the credential for the client configurations in this setup run.
+    #[must_use]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+}
+
+/// Resolve a token for a later compare-and-swap save, without creating files.
+pub fn resolve_token_for_save(
+    explicit: Option<&str>,
+    env_file: &Path,
+) -> Result<ResolvedSetupToken, SetupError> {
+    let path = std::path::absolute(env_file)?;
+    validate_setup_file_target(&path, "token env file")?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let authority = if check_setup_real_directory(parent, "token env file", false)? {
+        Some(open_setup_directory_authority(parent)?)
+    } else {
+        None
+    };
+    let snapshot = read_setup_file_with_authority(&path, "token env file", authority.as_ref())?;
+    let token = if let Some(token) = explicit.filter(|token| !token.is_empty()) {
+        token.to_owned()
+    } else if let Some(token) = snapshot
+        .as_ref()
+        .and_then(|snapshot| token_from_env_text(&snapshot.content))
+    {
+        token
+    } else if let Some(token) =
+        utf8_env_value_for_setup("HTTP_BEARER_TOKEN")?.filter(|token| !token.is_empty())
+    {
+        token
+    } else {
+        generate_token()?
+    };
+    Ok(ResolvedSetupToken {
+        token,
+        path,
+        authority,
+        snapshot,
+    })
+}
+
 /// Resolve an existing bearer token without generating or writing a replacement.
 pub fn resolve_existing_token(
     explicit: Option<&str>,
@@ -794,32 +849,56 @@ fn read_env_file_token(path: &Path) -> Result<Option<String>, SetupError> {
     let Some(content) = crate::config::read_env_authority_text(path)? else {
         return Ok(None);
     };
+    Ok(token_from_env_text(&content))
+}
+
+fn token_from_env_text(content: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
         if let Some(val) = trimmed.strip_prefix("HTTP_BEARER_TOKEN=") {
             let val = val.trim().trim_matches('"').trim_matches('\'');
             if !val.is_empty() {
-                return Ok(Some(val.to_string()));
+                return Some(val.to_string());
             }
         }
     }
-    Ok(None)
+    None
 }
 
-/// Save the bearer token to a .env file (create or update).
-pub fn save_token_to_env_file(env_path: &Path, token: &str) -> Result<(), SetupError> {
+/// Save only if the token authority still matches the resolution generation.
+/// On drift the caller must resolve again and rebuild its client config plan.
+pub fn save_token_to_env_file(resolved: &ResolvedSetupToken) -> Result<(), SetupError> {
+    let env_path = &resolved.path;
+    let token = resolved.token();
     if token.contains('\n') || token.contains('\r') {
         return Err(SetupError::Other("Token must not contain newlines".into()));
     }
-    ensure_setup_parent_dir(env_path, "token env file")?;
-    with_secret_config_git_protection(env_path, |authority| {
+    let verify = |authority: Option<&SetupDirectoryAuthority>| {
+        let observed = read_setup_file_with_authority(env_path, "token env file", authority)?;
+        let matches = match (&resolved.snapshot, &observed) {
+            (None, None) => true,
+            (Some(expected), Some(observed)) => setup_snapshots_match(expected, observed),
+            _ => false,
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(invalid_setup_path(
+                "token env file",
+                env_path,
+                "changed since token resolution; retry setup",
+            ))
+        }
+    };
+    verify(resolved.authority.as_ref())?;
+    with_secret_config_git_protection_bound(env_path, resolved.authority.as_ref(), |authority| {
+        verify(Some(authority))?;
         validate_setup_file_target(env_path, "token env file")?;
 
         // Keep token reads under the same no-follow, regular-file-only contract as
         // setup config reads. An `exists()` + `read_to_string()` pair leaves a
         // symlink/FIFO substitution window between validation and the read.
-        let existing_file =
-            read_setup_file_with_authority(env_path, "token env file", Some(authority))?;
+        let existing_file = &resolved.snapshot;
         let existing_content = existing_file
             .as_ref()
             .map(|snapshot| snapshot.content.as_str());
@@ -3802,17 +3881,31 @@ fn with_secret_config_git_protection<T>(
     path: &Path,
     operation: impl FnOnce(&SetupDirectoryAuthority) -> Result<T, SetupError>,
 ) -> Result<T, SetupError> {
+    with_secret_config_git_protection_bound(path, None, operation)
+}
+
+fn with_secret_config_git_protection_bound<T>(
+    path: &Path,
+    authority: Option<&SetupDirectoryAuthority>,
+    operation: impl FnOnce(&SetupDirectoryAuthority) -> Result<T, SetupError>,
+) -> Result<T, SetupError> {
     ensure_setup_parent_dir(path, "secret config")?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let authority = open_setup_directory_authority(parent)?;
-    revalidate_setup_directory_authority(parent, &authority)?;
+    let owned_authority;
+    let authority = if let Some(authority) = authority {
+        authority
+    } else {
+        owned_authority = open_setup_directory_authority(parent)?;
+        &owned_authority
+    };
+    revalidate_setup_directory_authority(parent, authority)?;
 
     let Some((repo_root, relative)) = resolve_secret_git_context(path, true)? else {
-        let result = operation(&authority)?;
-        revalidate_setup_directory_authority(parent, &authority)?;
+        let result = operation(authority)?;
+        revalidate_setup_directory_authority(parent, authority)?;
         return Ok(result);
     };
     let secret_mutex = crate::GitRepoLocks::global().lock_for(&repo_root);
@@ -3833,11 +3926,11 @@ fn with_secret_config_git_protection<T>(
     }
 
     check_secret_config_git_exposure_locked(path, &repo_root, &relative, true)?;
-    revalidate_setup_directory_authority(parent, &authority)?;
-    let result = operation(&authority)?;
-    revalidate_setup_directory_authority(parent, &authority)?;
+    revalidate_setup_directory_authority(parent, authority)?;
+    let result = operation(authority)?;
+    revalidate_setup_directory_authority(parent, authority)?;
     check_secret_config_git_exposure_locked(path, &repo_root, &relative, true)?;
-    revalidate_setup_directory_authority(parent, &authority)?;
+    revalidate_setup_directory_authority(parent, authority)?;
     Ok(result)
 }
 

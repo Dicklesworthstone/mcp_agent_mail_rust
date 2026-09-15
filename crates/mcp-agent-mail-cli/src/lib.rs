@@ -8412,12 +8412,15 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
     // write a live credential into the project dir (security issue #148).
     // With an empty token the config writers omit the Authorization header
     // entirely, and the env-file token is left untouched.
-    let resolved_token = if config.http_bearer_token.is_none() {
-        String::new()
+    let token_resolution = if config.http_bearer_token.is_none() {
+        None
     } else {
-        setup::resolve_token(None, &config_env_file)
-            .map_err(|e| CliError::Other(format!("setup token resolution failed: {e}")))?
+        Some(setup::resolve_token_for_save(None, &config_env_file)
+            .map_err(|e| CliError::Other(format!("setup token resolution failed: {e}")))?)
     };
+    let resolved_token = token_resolution
+        .as_ref()
+        .map_or_else(String::new, |resolved| resolved.token().to_owned());
     let agent_name = std::env::var("AGENT_MAIL_AGENT").unwrap_or_default();
     let skip_hooks = agent_name.is_empty();
 
@@ -8516,8 +8519,8 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
     }
 
     // Never persist an empty token (would clobber a real one under `--no-auth`).
-    if !resolved_token.is_empty() {
-        setup::save_token_to_env_file(&config_env_file, &resolved_token)
+    if let Some(resolved) = &token_resolution {
+        setup::save_token_to_env_file(resolved)
             .map_err(|e| CliError::Other(format!("setup self-heal token save failed: {e}")))?;
     }
 
@@ -16491,8 +16494,9 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             let config_env_file = canonical_setup_config_env_path()?;
 
             // Resolve token
-            let resolved_token = setup::resolve_token(token.as_deref(), &config_env_file)
+            let token_resolution = setup::resolve_token_for_save(token.as_deref(), &config_env_file)
                 .map_err(|e| CliError::Other(format!("setup token resolution failed: {e}")))?;
+            let resolved_token = token_resolution.token().to_owned();
 
             // Parse agent filter
             let agents = match agent {
@@ -16588,7 +16592,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
 
             // Save token to canonical config.env (unless dry-run)
             if !dry_run {
-                setup::save_token_to_env_file(&config_env_file, &resolved_token).map_err(|e| {
+                setup::save_token_to_env_file(&token_resolution).map_err(|e| {
                     CliError::Other(format!(
                         "Could not save token to {}: {e}",
                         config_env_file.display()
