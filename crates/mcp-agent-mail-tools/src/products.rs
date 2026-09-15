@@ -1648,7 +1648,7 @@ mod tests {
                     .build()
                     .expect("build runtime");
                 rt.block_on(async {
-                    let cx = Cx::for_testing();
+                    let cx = Cx::current().expect("runtime installs product search context");
                     let pool = seed_pool();
 
                     let healthy_project = match mcp_agent_mail_db::queries::ensure_project(
@@ -1956,7 +1956,7 @@ mod tests {
                     .build()
                     .expect("build runtime");
                 rt.block_on(async {
-                    let cx = Cx::for_testing();
+                    let cx = Cx::current().expect("runtime installs product thread limit context");
                     let pool = seed_pool();
 
                     let first_project = match mcp_agent_mail_db::queries::ensure_project(
@@ -2199,7 +2199,7 @@ mod tests {
                     .build()
                     .expect("build runtime");
                 rt.block_on(async {
-                    let cx = Cx::for_testing();
+                    let cx = Cx::current().expect("runtime installs product thread context");
                     let pool = seed_pool();
 
                     let healthy_project = match mcp_agent_mail_db::queries::ensure_project(
@@ -2379,7 +2379,7 @@ mod tests {
                     .build()
                     .expect("build runtime");
                 rt.block_on(async {
-                    let cx = Cx::for_testing();
+                    let cx = Cx::current().expect("runtime installs product inbox context");
                     let pool = seed_pool();
 
                     let healthy_project = match mcp_agent_mail_db::queries::ensure_project(
@@ -2550,7 +2550,7 @@ mod tests {
                     .build()
                     .expect("build runtime");
                 rt.block_on(async {
-                    let cx = Cx::for_testing();
+                    let cx = Cx::current().expect("runtime installs orphaned product inbox context");
                     let pool = seed_pool();
 
                     let healthy_project = match mcp_agent_mail_db::queries::ensure_project(
@@ -2839,7 +2839,8 @@ archive body
                     .build()
                     .expect("build runtime");
                 rt.block_on(async {
-                    let cx = Cx::for_testing();
+                    let cx =
+                        Cx::current().expect("runtime installs malformed product message context");
                     let pool = seed_pool();
                     let project = match mcp_agent_mail_db::queries::ensure_project(
                         &cx,

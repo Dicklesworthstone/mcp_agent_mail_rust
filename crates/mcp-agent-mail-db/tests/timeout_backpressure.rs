@@ -206,10 +206,13 @@ struct DiagnosticsResult {
     remediation_hints: Vec<String>,
 }
 
-fn seed_corpus(cx: &Cx, pool: &DbPool) -> i64 {
-    let cx = cx.clone();
+fn seed_corpus(pool: &DbPool) -> i64 {
     let pool = pool.clone();
-    common::spin_poll(async {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build corpus seeding runtime");
+    runtime.block_on(async move {
+        let cx = Cx::current().expect("runtime installs corpus seeding context");
         let project_id = match queries::ensure_project(&cx, &pool, "/tmp/test-bp").await {
             Outcome::Ok(p) => p.id.expect("project id"),
             other => panic!("ensure_project failed: {other:?}"),
@@ -268,15 +271,13 @@ fn seed_corpus(cx: &Cx, pool: &DbPool) -> i64 {
     })
 }
 
-fn seed_product_corpus(
-    cx: &Cx,
-    pool: &DbPool,
-    project_count: usize,
-    messages_per_project: usize,
-) -> i64 {
-    let cx = cx.clone();
+fn seed_product_corpus(pool: &DbPool, project_count: usize, messages_per_project: usize) -> i64 {
     let pool = pool.clone();
-    common::spin_poll(async move {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build product corpus seeding runtime");
+    runtime.block_on(async move {
+        let cx = Cx::current().expect("runtime installs product corpus seeding context");
         let product = match queries::ensure_product(
             &cx,
             &pool,
@@ -750,8 +751,7 @@ fn health_signals_from_snapshot_correctly_classifies() {
 #[test]
 fn search_with_cost_quota_budget() {
     let (pool, _dir) = make_pool();
-    let cx_setup = Cx::for_testing();
-    let project_id = seed_corpus(&cx_setup, &pool);
+    let project_id = seed_corpus(&pool);
 
     // Normal search with unlimited budget → should succeed
     let pool_c = pool.clone();
@@ -805,8 +805,7 @@ fn search_with_cost_quota_budget() {
 #[test]
 fn execute_search_with_budget_options() {
     let (pool, _dir) = make_pool();
-    let cx_setup = Cx::for_testing();
-    let project_id = seed_corpus(&cx_setup, &pool);
+    let project_id = seed_corpus(&pool);
 
     // execute_search with explain=true should populate explain metadata
     let pool_c = pool.clone();
@@ -857,8 +856,7 @@ fn execute_search_with_budget_options() {
 #[test]
 fn product_search_budget_many_project_p95_and_diagnostics() {
     let (pool, _dir) = make_pool();
-    let cx_setup = Cx::for_testing();
-    let product_id = seed_product_corpus(&cx_setup, &pool, 16, 8);
+    let product_id = seed_product_corpus(&pool, 16, 8);
     let requested_limit = 20usize;
     let pool_c = pool.clone();
     let seed_probe_count = block_on_with_budget(Budget::new(), move |cx| async move {
@@ -1201,8 +1199,7 @@ fn diagnostics_facet_parsing_edge_cases() {
 #[test]
 fn search_with_combined_budget_constraints() {
     let (pool, _dir) = make_pool();
-    let cx_setup = Cx::for_testing();
-    let project_id = seed_corpus(&cx_setup, &pool);
+    let project_id = seed_corpus(&pool);
 
     // Combined: cost_quota + poll_quota — search should still work
     let pool_c = pool.clone();
