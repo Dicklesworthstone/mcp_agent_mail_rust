@@ -18260,6 +18260,75 @@ mod tests {
     // ── D3 (br-bvq1x.4.3): retry budget exhaustion wrapping ──────────
 
     #[test]
+    fn write_retry_returns_single_pool_connection_before_backoff() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let (_dir, pool) =
+            create_file_pool_with_schema_for_test_with_max("retry-releases-lease", 1);
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build retry regression runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async {
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("warm pool");
+            conn.execute_raw("PRAGMA busy_timeout = 0")
+                .expect("disable writer lock wait for deterministic conflict");
+        });
+        let blocker = crate::DbConn::open_file(pool.sqlite_path()).expect("open competing writer");
+        blocker
+            .execute_raw("BEGIN IMMEDIATE")
+            .expect("hold writer lock");
+        let blocker = Arc::new(Mutex::new(blocker));
+        let observed = Arc::new(AtomicU64::new(0));
+        let observer_pool = pool.clone();
+        let observer_count = Arc::clone(&observed);
+        let observer_blocker = Arc::clone(&blocker);
+        let capture = EventCapture {
+            retry_observer: Some(Arc::new(move || {
+                // The retry warning occurs after the failed attempt is dropped
+                // and before sleep. A warmed one-slot pool must already admit
+                // an unrelated read; no timing or scheduler luck is involved.
+                let cx = Cx::for_testing();
+                let mut acquire = std::pin::pin!(acquire_conn(&cx, &observer_pool));
+                let mut context = Context::from_waker(Waker::noop());
+                let Poll::Ready(Outcome::Ok(conn)) = acquire.as_mut().poll(&mut context) else {
+                    panic!("failed writer retained the only pool connection during backoff");
+                };
+                let rows = conn
+                    .query_sync("SELECT COUNT(*) FROM projects", &[])
+                    .expect("unrelated reader proceeds while writer is blocked");
+                assert_eq!(rows.first().and_then(row_first_i64), Some(0));
+                drop(conn);
+                observer_count.fetch_add(1, Ordering::Relaxed);
+                observer_blocker
+                    .lock()
+                    .expect("blocker lock")
+                    .execute_raw("ROLLBACK")
+                    .expect("release competing writer");
+            })),
+            ..EventCapture::default()
+        };
+        let outcome = tracing::subscriber::with_default(capture, || {
+            rt.block_on(ensure_product(
+                &cx,
+                &pool,
+                Some("retry-lease-product"),
+                None,
+            ))
+        });
+        assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+        assert_eq!(
+            observed.load(Ordering::Relaxed),
+            1,
+            "must exercise a real write conflict"
+        );
+    }
+
+    #[test]
     fn mvcc_retry_exhaustion_wraps_error_with_budget_context() {
         use asupersync::runtime::RuntimeBuilder;
         let rt = RuntimeBuilder::current_thread()
