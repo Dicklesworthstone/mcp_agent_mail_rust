@@ -346,6 +346,83 @@ fi
 # ===========================================================================
 # Case 2: Server lists tools
 # ===========================================================================
+e2e_case_banner "Initialize proposals negotiate and retain usable stdio sessions"
+if python3 - "$WORK" "$E2E_ARTIFACT_DIR" <<'PY'
+import json
+import os
+from pathlib import Path
+import selectors
+import subprocess
+import sys
+
+work, artifacts = map(Path, sys.argv[1:])
+receipts = []
+scenarios = [(version, False) for version in ["2024-11-05", "2025-03-26", "2025-06-18", "2099-01-01", 2025]]
+scenarios.append(("2025-06-18", True))
+for index, (proposal, mixed_era) in enumerate(scenarios):
+    case = work / f"negotiation-{index}"
+    case.mkdir()
+    env = dict(os.environ, DATABASE_URL=f"sqlite://{case / 'mail.sqlite3'}",
+               STORAGE_ROOT=str(case / "archive"), RUST_LOG="error")
+    stderr_path = artifacts / f"negotiation-{index}.stderr.txt"
+    receipt = {"proposal": proposal, "mixed_era": mixed_era, "responses": [], "stderr": str(stderr_path)}
+    receipts.append(receipt)
+    with stderr_path.open("w") as stderr:
+        process = subprocess.Popen(["am", "serve-stdio"], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=stderr, env=env, text=True)
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+
+        def send(message):
+            process.stdin.write(json.dumps(message) + "\n")
+            process.stdin.flush()
+
+        def response(request_id):
+            assert selector.select(30), f"{proposal}: response timeout"
+            line = process.stdout.readline()
+            assert line, f"{proposal}: server exited before response"
+            result = json.loads(line)
+            receipt["responses"].append(result)
+            assert result.get("id") == request_id, result
+            return result
+
+        try:
+            send({"jsonrpc": "2.0", "id": 101, "method": "initialize", "params": {
+                "protocolVersion": proposal, "capabilities": {},
+                "clientInfo": {"name": "e2e-negotiation", "version": "1.0"}}})
+            initialized = response(101)
+            if isinstance(proposal, str):
+                assert "error" not in initialized, initialized
+                assert initialized["result"]["protocolVersion"] == "2024-11-05", initialized
+                send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                send({"jsonrpc": "2.0", "id": 102, "method": "tools/list", "params": {}})
+                catalog = response(102)
+                assert "error" not in catalog, catalog
+                assert any(tool["name"] == "send_message" for tool in catalog["result"]["tools"])
+                if mixed_era:
+                    send({"jsonrpc": "2.0", "id": 103, "method": "tools/list", "params": {
+                        "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}})
+                    rejected = response(103)
+                    assert rejected["error"]["code"] == -32600, rejected
+            else:
+                assert initialized["error"]["code"] == -32600, initialized
+            process.stdin.close()
+            receipt["exit_code"] = process.wait(timeout=30)
+            assert receipt["exit_code"] == (1 if mixed_era else 0), receipt
+        finally:
+            selector.close()
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            receipt.setdefault("exit_code", process.returncode)
+            (artifacts / "negotiation-receipts.json").write_text(json.dumps(receipts, indent=2) + "\n")
+PY
+then
+    e2e_pass "proposal negotiation, initialized session, tools and malformed/mixed-era controls"
+else
+    e2e_fail "stdio proposal negotiation regression (see negotiation receipts and stderr)"
+fi
+
 e2e_case_banner "Server lists tools via tools/list"
 
 TOOLS_REQ='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
