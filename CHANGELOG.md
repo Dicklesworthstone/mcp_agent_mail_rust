@@ -18,6 +18,8 @@ br-2xdhw search workstream and CLI issue fixes, and refreshes publication
 metadata: v0.3.35 was published on 2026-09-09 and is the latest GitHub Release.
 The 2026-09-12 review checks the remaining post-tag import and contact changes;
 the next release and dependency validation are still in progress.
+The 2026-09-15 review adds release-test reliability changes and rechecks the
+published v0.3.35 asset inventory. Unreleased source is not a completed release.
 
 ## Release Timeline
 
@@ -34,7 +36,7 @@ Recent releases; the earlier version history continues below.
 ## Unreleased
 
 Changes after the [v0.3.35 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.35),
-reviewed through 2026-09-12. These changes are not published release artifacts.
+reviewed through 2026-09-15. These changes are not published release artifacts.
 
 ### Fixed
 
@@ -232,6 +234,20 @@ reviewed through 2026-09-12. These changes are not published release artifacts.
   policy, not MCP session identity or isolation between processes sharing an
   OS account.
   ([#280](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/280))
+
+### Release verification
+
+- **Fresh-install tests preserve the doctor's actual exit status.** Healthy
+  output and reported findings are checked separately, and panic output cannot
+  pass as an expected findings exit. Structured traces retain both the actual
+  status and allowed status set.
+  ([exit assertions](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/d2e6ae20a4a70f9199533442c6d818b32720491b),
+  [crash classification](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/2a73f0f745803173ba82a3a36c6e412ade3c5598))
+- **Robot metrics have a live-server regression.** The integration test starts
+  a real HTTP server, sends MCP health calls, and checks that the metrics report
+  the live server as their source and include those calls. Offline fallback has
+  separate assertions.
+  ([regression](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/a89eba7300b0d5d7113530c6245cd7bb34038dfb))
 
 ## [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.35) — 2026-09-09 [Release]
 
