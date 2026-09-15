@@ -1,20 +1,10 @@
 //! Shared test helpers for mcp-agent-mail-db integration tests.
 //!
-//! Provides a spin-loop `block_on` that correctly drives futures to completion
-//! without relying on the asupersync runtime's `thread::park()` mechanism.
-//!
-//! ## Why not use the runtime?
-//!
-//! All `SQLite` operations in this crate are synchronous (wrapped in
-//! immediately-ready futures).  The asupersync runtime's `block_on` uses
-//! `thread::park()` on `Poll::Pending`, which requires a proper waker to
-//! `unpark` the thread.  Since no I/O driver or timer is registered with
-//! `Cx::for_testing()`, a `Pending` return from internal bookkeeping (pool
-//! acquire, `OnceCell` init) would park the thread forever.
-//!
-//! The spin-loop executor avoids this by repeatedly polling without parking,
-//! which is safe because the futures resolve in very few polls (typically 0-1).
+//! Ordinary database tests run inside an owned runtime so message allocation
+//! can use its blocking pool. Budget-specific tests retain a bounded spin
+//! executor for explicitly constructed contexts.
 
+use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Budget, Cx};
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
@@ -57,18 +47,23 @@ fn spin_block_on_future<F: Future>(future: F) -> F::Output {
     }
 }
 
-/// Run an async function with a `Cx::for_testing()` context.
+/// Run an async function with the current runtime's context.
 ///
-/// Replacement for the runtime-based `block_on` that was causing hangs
-/// (see br-2em1l).
+/// Poll the root future directly: spawning it and then waiting on its join
+/// handle caused the scheduler deadlock recorded in br-2em1l.
 #[allow(dead_code)]
 pub fn block_on<F, Fut, T>(f: F) -> T
 where
     F: FnOnce(Cx) -> Fut,
     Fut: Future<Output = T>,
 {
-    let cx = Cx::for_testing();
-    spin_block_on_future(f(cx))
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("build database test runtime");
+    runtime.block_on(async {
+        let cx = Cx::current().expect("runtime installs database test context");
+        f(cx).await
+    })
 }
 
 /// Run an async function with a budget-constrained `Cx`.

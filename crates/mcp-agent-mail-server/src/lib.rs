@@ -36919,7 +36919,11 @@ mod atc_identity_tests {
         };
         let sender_id = agent.id.expect("atc agent id");
         let target_id = target.id.expect("target agent id");
-        let msg = match block_on(async {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build ATC probe test runtime");
+        let msg = match runtime.block_on(async {
+            let cx = Cx::current().expect("runtime installs ATC probe test context");
             queries::create_message_with_recipients(
                 &cx,
                 &pool,

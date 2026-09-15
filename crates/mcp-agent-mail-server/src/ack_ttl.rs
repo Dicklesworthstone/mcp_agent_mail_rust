@@ -542,7 +542,11 @@ mod tests {
         };
         let recipient_id = recipient.id.expect("recipient id");
 
-        let _msg = match block_on(async {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build ack TTL fixture runtime");
+        let _msg = match runtime.block_on(async {
+            let cx = Cx::current().expect("runtime installs ack TTL fixture context");
             queries::create_message_with_recipients(
                 &cx,
                 &pool,
@@ -990,8 +994,13 @@ mod tests {
         };
         let recip2_id = recip2.id.expect("recip2 id");
 
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build overdue message fixture runtime");
+
         // Create message 1 → recip1
-        match block_on(async {
+        match runtime.block_on(async {
+            let cx = Cx::current().expect("runtime installs overdue message fixture context");
             queries::create_message_with_recipients(
                 &cx,
                 &pool,
@@ -1012,7 +1021,8 @@ mod tests {
         }
 
         // Create message 2 → recip2
-        match block_on(async {
+        match runtime.block_on(async {
+            let cx = Cx::current().expect("runtime installs overdue message fixture context");
             queries::create_message_with_recipients(
                 &cx,
                 &pool,

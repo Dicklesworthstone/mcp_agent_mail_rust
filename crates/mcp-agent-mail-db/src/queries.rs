@@ -4039,6 +4039,8 @@ fn is_plain_write_contention_error(e: &DbError) -> bool {
 /// stale snapshot across retries causes `fcw_base_drift` rejection where
 /// `snapshot_high` permanently lags behind `commit_seq`.  Callers achieve
 /// this by placing `begin_concurrent_tx` inside the closure passed here.
+/// Acquire pooled connections inside that closure too: failed attempts must
+/// return their lease before backoff so readers and other writers can proceed.
 async fn run_with_mvcc_retry<T, F, Fut>(
     cx: &Cx,
     operation: &'static str,
@@ -4363,9 +4365,18 @@ pub async fn ensure_project(
         ));
     }
 
+    drop(conn);
+
     // Use an explicit write transaction and conflict-safe insert so project creation
     // participates in concurrent writer mode.
     let fresh = match run_with_mvcc_retry(cx, "ensure_project", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let tracked = self::tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         let row = ProjectRow::new(slug.clone(), resolved_human_key.clone());
@@ -5296,6 +5307,7 @@ pub async fn refresh_project_sibling_suggestions(
     cx: &Cx,
     pool: &DbPool,
 ) -> Outcome<ProjectSiblingRefreshSummary, DbError> {
+    run_with_mvcc_retry(cx, "refresh_project_sibling_suggestions", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(conn) => conn,
         Outcome::Err(error) => return Outcome::Err(error),
@@ -5304,7 +5316,6 @@ pub async fn refresh_project_sibling_suggestions(
     };
     let tracked = tracked(&*conn);
 
-    run_with_mvcc_retry(cx, "refresh_project_sibling_suggestions", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
         if cx.checkpoint().is_err() {
             rollback_tx(cx, &tracked).await;
@@ -5537,6 +5548,7 @@ pub async fn update_project_sibling_status(
     } else {
         (other_id, project_id)
     };
+    run_with_mvcc_retry(cx, "update_project_sibling_status", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(conn) => conn,
         Outcome::Err(error) => return Outcome::Err(error),
@@ -5545,7 +5557,6 @@ pub async fn update_project_sibling_status(
     };
     let tracked = tracked(&*conn);
 
-    run_with_mvcc_retry(cx, "update_project_sibling_status", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Timestamp each whole-transaction attempt once it owns the write
@@ -5800,16 +5811,15 @@ pub async fn register_agent(
     }
     let now = now_micros();
     let (provisional, durable) = {
-        let conn = match acquire_conn(cx, pool).await {
-            Outcome::Ok(c) => c,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        };
-
         let (provisional, inserted_new) = {
-            let tracked = tracked(&*conn);
             match run_with_mvcc_retry(cx, "register_agent", || async {
+                let conn = match acquire_conn(cx, pool).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                };
+                let tracked = tracked(&*conn);
                 try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
                 let program_s = program.to_string();
@@ -5930,7 +5940,6 @@ pub async fn register_agent(
                 Outcome::Panicked(p) => return Outcome::Panicked(p),
             }
         };
-        drop(conn);
         let durable = match finalize_register_agent_post_commit_probe(
             cx,
             pool,
@@ -6635,25 +6644,14 @@ pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbErr
         return Outcome::Ok(());
     }
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => {
-            re_enqueue_touches(&cache_scope, &pending);
-            return Outcome::Err(e);
-        }
-        Outcome::Cancelled(r) => {
-            re_enqueue_touches(&cache_scope, &pending);
-            return Outcome::Cancelled(r);
-        }
-        Outcome::Panicked(p) => {
-            re_enqueue_touches(&cache_scope, &pending);
-            return Outcome::Panicked(p);
-        }
-    };
-
-    let tracked = tracked(&*conn);
-
     let flush_outcome = run_with_mvcc_retry(cx, "flush_deferred_touches", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Batch UPDATE using VALUES CTE without UPDATE ... FROM so it remains
@@ -6775,6 +6773,7 @@ pub async fn consume_proof_nonce(
     retain_until: i64,
     now: i64,
 ) -> Outcome<NonceOutcome, DbError> {
+    run_with_mvcc_retry(cx, "consume_proof_nonce", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -6783,7 +6782,6 @@ pub async fn consume_proof_nonce(
     };
     let tracked = tracked(&*conn);
 
-    run_with_mvcc_retry(cx, "consume_proof_nonce", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Prune expired nonces (housekeeping; keeps the table bounded).
@@ -6857,6 +6855,7 @@ pub async fn set_agent_contact_policy(
     agent_id: i64,
     policy: &str,
 ) -> Outcome<AgentRow, DbError> {
+    let agent = match run_with_mvcc_retry(cx, "set_agent_contact_policy", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -6865,7 +6864,6 @@ pub async fn set_agent_contact_policy(
     };
 
     let tracked = tracked(&*conn);
-    let agent = match run_with_mvcc_retry(cx, "set_agent_contact_policy", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         if try_in_tx!(
@@ -7000,6 +6998,7 @@ pub async fn set_agent_retired_at(
     agent_id: i64,
     retired_at: Option<i64>,
 ) -> Outcome<AgentRow, DbError> {
+    let agent = match run_with_mvcc_retry(cx, "set_agent_retired_at", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(conn) => conn,
         Outcome::Err(error) => return Outcome::Err(error),
@@ -7007,7 +7006,6 @@ pub async fn set_agent_retired_at(
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
     let tracked = tracked(&*conn);
-    let agent = match run_with_mvcc_retry(cx, "set_agent_retired_at", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         if try_in_tx!(
@@ -7099,6 +7097,7 @@ pub async fn deregister_agent(
     agent_id: i64,
     deregistered_at: i64,
 ) -> Outcome<AgentRow, DbError> {
+    let agent = match run_with_mvcc_retry(cx, "deregister_agent", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(conn) => conn,
         Outcome::Err(error) => return Outcome::Err(error),
@@ -7106,7 +7105,6 @@ pub async fn deregister_agent(
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
     let tracked = tracked(&*conn);
-    let agent = match run_with_mvcc_retry(cx, "deregister_agent", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         let rows = try_in_tx!(
@@ -7226,15 +7224,14 @@ pub async fn set_agent_contact_policy_by_name(
         ));
     }
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
     let agent = match run_with_mvcc_retry(cx, "set_agent_contact_policy_by_name", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
         let now = now_micros();
 
@@ -7563,15 +7560,6 @@ pub async fn create_message(
 ) -> Outcome<MessageRow, DbError> {
     let now = now_micros();
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
-
     // mcp_agent_mail#176 / br-sa58k: the canonical id is elected durably
     // inside the insert transaction below (see `create_message_with_recipients`
     // for the full rationale), so it can never be re-issued — by this process,
@@ -7592,6 +7580,13 @@ pub async fn create_message(
     };
 
     let row = match run_with_mvcc_retry(cx, "create_message", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
         let message_id = try_in_tx!(
             cx,
@@ -9722,6 +9717,10 @@ pub async fn append_message_delivery_signal_receipt(
     signal_path_digest: &str,
     observed_ts: i64,
 ) -> Outcome<(), DbError> {
+    let delivery_route = delivery_route.to_string();
+    let signal_path_digest = signal_path_digest.to_string();
+
+    run_with_mvcc_retry(cx, "append_message_delivery_signal_receipt", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(conn) => conn,
         Outcome::Err(error) => return Outcome::Err(error),
@@ -9729,10 +9728,6 @@ pub async fn append_message_delivery_signal_receipt(
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
     let tracked = tracked(&*conn);
-    let delivery_route = delivery_route.to_string();
-    let signal_path_digest = signal_path_digest.to_string();
-
-    run_with_mvcc_retry(cx, "append_message_delivery_signal_receipt", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
         let insert_params = [
             Value::BigInt(message_id),
@@ -11329,6 +11324,8 @@ pub async fn add_recipients(
     message_id: i64,
     recipients: &[(i64, &str)], // (agent_id, kind)
 ) -> Outcome<(), DbError> {
+    // Batch all recipient inserts in a single transaction (1 fsync instead of N).
+    run_with_mvcc_retry(cx, "add_recipients", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -11338,8 +11335,6 @@ pub async fn add_recipients(
 
     let tracked = tracked(&*conn);
 
-    // Batch all recipient inserts in a single transaction (1 fsync instead of N).
-    run_with_mvcc_retry(cx, "add_recipients", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         for (agent_id, kind) in recipients {
@@ -11372,6 +11367,7 @@ pub async fn mark_message_read(
 ) -> Outcome<i64, DbError> {
     let now = now_micros();
 
+    run_with_mvcc_retry(cx, "mark_message_read", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -11380,7 +11376,6 @@ pub async fn mark_message_read(
     };
 
     let tracked = tracked(&*conn);
-    run_with_mvcc_retry(cx, "mark_message_read", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Idempotent: set read_ts if NULL. Acknowledgements are intentionally
@@ -11485,6 +11480,7 @@ pub async fn mark_messages_read_batch(
 
     let now = now_micros();
 
+    run_with_mvcc_retry(cx, "mark_messages_read_batch", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -11493,7 +11489,6 @@ pub async fn mark_messages_read_batch(
     };
 
     let tracked = tracked(&*conn);
-    run_with_mvcc_retry(cx, "mark_messages_read_batch", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Batch UPDATE: mark all messages read in one pass per chunk.
@@ -11543,6 +11538,7 @@ pub async fn mark_all_messages_read_in_project(
 ) -> Outcome<i64, DbError> {
     let now = now_micros();
 
+    run_with_mvcc_retry(cx, "mark_all_messages_read_in_project", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -11551,7 +11547,6 @@ pub async fn mark_all_messages_read_in_project(
     };
 
     let tracked = tracked(&*conn);
-    run_with_mvcc_retry(cx, "mark_all_messages_read_in_project", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Identify which messages are actually unread for this agent in this project.
@@ -11682,6 +11677,7 @@ pub async fn mark_messages_read_bulk(
     }
     let now = now_micros();
 
+    run_with_mvcc_retry(cx, "mark_messages_read_bulk", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -11690,7 +11686,6 @@ pub async fn mark_messages_read_bulk(
     };
     let tracked = tracked(&*conn);
 
-    run_with_mvcc_retry(cx, "mark_messages_read_bulk", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Select the exact unread rows this call will transition (oldest-first
@@ -11922,12 +11917,20 @@ pub async fn prune_settled_messages(
     if ids.is_empty() {
         return Outcome::Ok(report);
     }
+    drop(conn);
 
     for chunk in ids.chunks(batch_size) {
         let ph = placeholders(chunk.len());
         let chunk_params: Vec<Value> = chunk.iter().copied().map(Value::BigInt).collect();
 
         let batch_outcome = run_with_mvcc_retry(cx, "prune_settled_messages_batch", || async {
+            let conn = match acquire_conn(cx, pool).await {
+                Outcome::Ok(c) => c,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
+            let tracked = self::tracked(&*conn);
             try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
             // Capture affected recipients before their rows are removed so
@@ -12069,6 +12072,7 @@ async fn acknowledge_message_impl(
     let idempotency_expires_ts =
         now.saturating_add(idempotency_retention_secs().saturating_mul(1_000_000));
 
+    run_with_mvcc_retry(cx, "acknowledge_message", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -12077,7 +12081,6 @@ async fn acknowledge_message_impl(
     };
 
     let tracked = tracked(&*conn);
-    run_with_mvcc_retry(cx, "acknowledge_message", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Idempotency key check (br-idempotency-keys-mutating-tools-h0x9k): a
@@ -12267,6 +12270,7 @@ pub async fn acknowledge_messages_batch(
 
     let now = now_micros();
 
+    run_with_mvcc_retry(cx, "acknowledge_messages_batch", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -12275,7 +12279,6 @@ pub async fn acknowledge_messages_batch(
     };
 
     let tracked = tracked(&*conn);
-    run_with_mvcc_retry(cx, "acknowledge_messages_batch", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         for chunk in unique_message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
@@ -14136,6 +14139,8 @@ pub async fn renew_reservations(
     let now = now_micros();
     let extend = extend_seconds.saturating_mul(1_000_000);
 
+    // Retry the whole read-modify-write with an attempt-local connection.
+    run_with_mvcc_retry(cx, "renew_reservations", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -14145,9 +14150,7 @@ pub async fn renew_reservations(
 
     let tracked = tracked(&*conn);
 
-    // Wrap entire read-modify-write in a transaction so partial renewals
-    // cannot occur if the process crashes or is cancelled mid-loop.
-    run_with_mvcc_retry(cx, "renew_reservations", || async {
+    // Partial renewals cannot occur if the process crashes or is cancelled.
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Fetch candidate reservations first (so tools can report old/new expiry).
@@ -14705,6 +14708,7 @@ pub async fn request_contact(
         None
     };
 
+    run_with_mvcc_retry(cx, "request_contact", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -14713,7 +14717,6 @@ pub async fn request_contact(
     };
 
     let tracked = tracked(&*conn);
-    run_with_mvcc_retry(cx, "request_contact", || async {
         try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
 
         // FrankenConnection does not consistently support `ON CONFLICT ... DO UPDATE`.
@@ -14840,6 +14843,7 @@ pub async fn respond_contact(
         None
     };
 
+    run_with_mvcc_retry(cx, "respond_contact", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -14848,7 +14852,6 @@ pub async fn respond_contact(
     };
 
     let tracked = tracked(&*conn);
-    run_with_mvcc_retry(cx, "respond_contact", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         let existing_sql = format!(
@@ -15264,7 +15267,15 @@ pub async fn ensure_product(
             }
 
             // Product doesn't exist, create it.
+            drop(conn);
             run_with_mvcc_retry(cx, "ensure_product", || async {
+                let conn = match acquire_conn(cx, pool).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                };
+                let tracked = self::tracked(&*conn);
                 try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
                 let insert_sql = "INSERT INTO products (product_uid, name, created_at) \
                                   VALUES (?, ?, ?) ON CONFLICT(product_uid) DO NOTHING";
@@ -15317,6 +15328,7 @@ pub async fn link_product_to_projects(
     product_id: i64,
     project_ids: &[i64],
 ) -> Outcome<usize, DbError> {
+    run_with_mvcc_retry(cx, "link_product_to_projects", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -15326,7 +15338,6 @@ pub async fn link_product_to_projects(
 
     let tracked = tracked(&*conn);
 
-    run_with_mvcc_retry(cx, "link_product_to_projects", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         let mut linked = 0usize;
@@ -16183,6 +16194,7 @@ pub async fn insert_system_agent(
 ) -> Outcome<AgentRow, DbError> {
     let now = now_micros();
 
+    let found = match run_with_mvcc_retry(cx, "insert_system_agent", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -16191,7 +16203,6 @@ pub async fn insert_system_agent(
     };
 
     let tracked = tracked(&*conn);
-    let found = match run_with_mvcc_retry(cx, "insert_system_agent", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
         // Agent names are unique per project case-insensitively through the
         // v10b index `agents(project_id, name COLLATE NOCASE)`. An upsert with
@@ -16438,6 +16449,7 @@ pub async fn append_atc_experience(
     };
 
     {
+        match run_with_mvcc_retry(cx, "append_atc_experience", || async {
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(c) => c,
             Outcome::Err(e) => return Outcome::Err(e),
@@ -16446,7 +16458,6 @@ pub async fn append_atc_experience(
         };
 
         let tracked = tracked(&*conn);
-        match run_with_mvcc_retry(cx, "append_atc_experience", || async {
             try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
             let insert_sql = "INSERT INTO atc_experiences \
@@ -16774,6 +16785,7 @@ pub async fn transition_atc_experience(
     };
 
     let pooled_outcome = {
+        run_with_mvcc_retry(cx, "transition_atc_experience", || async {
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(c) => c,
             Outcome::Err(e) => return Outcome::Err(e),
@@ -16782,7 +16794,6 @@ pub async fn transition_atc_experience(
         };
 
         let tracked = tracked(&*conn);
-        run_with_mvcc_retry(cx, "transition_atc_experience", || async {
             transition_atc_experience_tx(
                 cx,
                 &tracked,
@@ -17136,6 +17147,7 @@ pub async fn overwrite_resolved_atc_experience_outcome(
         Err(error) => return Outcome::Err(error),
     };
 
+    run_with_mvcc_retry(cx, "overwrite_resolved_atc_experience_outcome", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -17144,7 +17156,6 @@ pub async fn overwrite_resolved_atc_experience_outcome(
     };
 
     let tracked = tracked(&*conn);
-    run_with_mvcc_retry(cx, "overwrite_resolved_atc_experience_outcome", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         let rows = try_in_tx!(
