@@ -238,7 +238,7 @@ Parallel agent work changes the economics of supervision. One human operator can
 
 **SQLite for live state, Git for the durable ledger.** The accepted write path mutates SQLite first so inboxes, resources, TUI, web, and robot views see one fresh operational state. The same write then emits human-readable message, profile, and reservation artifacts into the per-project Git archive for audit and recovery.
 
-**Advisory, not mandatory.** File reservations are advisory leases, not hard locks. The pre-commit guard enforces them at commit time, but agents can always override if needed. Deadlocks become impossible while accidental conflicts still get caught. Reservations expire on a TTL, so crashed agents don't hold files hostage forever.
+**Advisory, not mandatory.** File reservations are advisory leases, not hard locks. The pre-commit guard enforces them at commit time, but agents can override if needed. Acquiring a reservation reports conflicts instead of waiting for another agent to release its lease. Reservations expire on a TTL; they do not prevent deadlocks in the storage or runtime layers.
 
 **Resilient to agent death.** Agents die all the time: context windows overflow, sessions crash, memory gets wiped. Any agent can vanish without breaking the system. No ringleader agents, no single points of failure. Semi-persistent identities exist for coordination but don't create hard dependencies.
 
@@ -250,7 +250,7 @@ Parallel agent work changes the economics of supervision. One human operator can
 
 ## Rust vs. Python: Stress Test Results
 
-The Python implementation had three recurring failure modes under real multi-agent workloads: Git lock file contention from concurrent writes, SQLite pool exhaustion under sustained load, and cascading failures when many agents hit the server simultaneously. The Rust rewrite was designed specifically to eliminate these, and a dedicated stress test suite proves it.
+The Python implementation had three recurring failure modes under real multi-agent workloads: Git lock file contention from concurrent writes, SQLite pool exhaustion under sustained load, and cascading failures when many agents hit the server simultaneously. The Rust rewrite addresses these through batching, bounded pools, and backpressure. The measurements below are retained results from the original stress campaign, not a passing verdict for the current release candidate or a guarantee for every workload.
 
 ### The 10-Test Gauntlet
 
@@ -277,7 +277,7 @@ The Python implementation had three recurring failure modes under real multi-age
 
 ### What Makes the Difference
 
-- **Git lock contention eliminated.** The commit coalescer batches rapid-fire writes into far fewer git commits (9.1x reduction observed). Lock-free git plumbing commits avoid `index.lock` entirely in most cases.
+- **Fewer Git lock acquisitions.** The commit coalescer batches rapid-fire writes into fewer git commits (9.1x reduction in the recorded run). Git plumbing commits avoid `index.lock` in the normal archive path; other Git operations can still contend.
 - **Pool exhaustion handled gracefully.** Even with 4x more threads than pool connections (60 vs 15), all 600 operations succeeded with 0 timeouts. WAL mode + a bounded 20s `busy_timeout` lets writers queue rather than fail (and give up before the 30s client deadline).
 - **Stale lock recovery works.** Crashed-process lock files are detected via PID checking and cleaned up automatically, so a dead agent never holds the archive hostage.
 - **Write-behind queue backpressure is clean.** 2000 rapid-fire enqueues from 20 threads &mdash; all accepted with 0 fallbacks or errors.

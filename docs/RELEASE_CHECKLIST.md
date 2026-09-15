@@ -4,11 +4,43 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 
 **Primary Beads:** br-3vwi.12.1, br-3vwi.12.2
 **Track:** br-3vwi.12 (Rollout governance, release gates, feedback loop)
-**Last Updated:** 2026-02-13
+**Last Updated:** 2026-09-15
+
+## Current Release Procedure
+
+Release builds and publication use the maintainer's DSR infrastructure with
+strict RCH execution. Do not enable or dispatch GitHub Actions. The February
+rollout checkboxes below are historical implementation notes, not evidence that
+the current candidate passes. Start a fresh candidate record with its source
+commit, dependency revisions, exact commands, binary hashes, and terminal results.
+
+- [ ] Resolve release-blocking bugs and run workspace check, strict Clippy,
+  formatting, full nextest, and the real transport/recovery/installer gates.
+  A build refusal, skipped dependency, or interrupted run is not a pass.
+- [ ] Build both `am` and `mcp-agent-mail` for Linux x86_64 GNU, Linux aarch64
+  GNU, Linux x86_64 musl, macOS aarch64, macOS x86_64, and Windows x86_64 MSVC.
+  Retain native execution receipts; cross-compilation alone is not native proof.
+- [ ] Update the changelog from verified commits and synchronize the version
+  only after the candidate gates pass. Keep the gated sibling dependency revision.
+- [ ] Verify archive contents, checksums, `release-manifest.json`, signed
+  `SHA256SUMS`, and installation using the actual packaged binaries.
+- [ ] Publish and verify the GitHub assets, Homebrew formula, and applicable
+  container images. Workspace crates currently declare `publish = false`;
+  crates.io publication is inapplicable unless that product decision changes.
+- [ ] Refresh ACFS's raw-installer checksums when the version changes, separately
+  from release-archive checksums; synchronize the ACFS repository if they change.
+- [ ] Push the release source to `main` and synchronize the legacy branch as
+  required by `AGENTS.md`. Verify public downloads and installation after publishing.
+
+The runtime router, `TOOL_CLUSTER_MAP`, `ALL_SCREEN_IDS`, the Clap command tree,
+and Cargo workspace membership are the inventory authorities. Run the existing
+`docs_drift_ci` conformance target against the candidate rather than relying on
+literal counts in an old release checklist. `am robot tui-dump` and the top-level
+`am tui-dump` route share the same implementation; the alias is not another robot verb.
 
 ---
 
-## Staged Rollout Gate Matrix
+## Historical February Rollout Gate Matrix
 
 - [ ] Phase 0 packet complete: CI + local validation evidence attached
 - [ ] Phase 1 packet complete: 24-48h canary metrics + incident log review attached
@@ -25,7 +57,7 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 | Dual-mode E2E correctness | Pass rate = `100%` (`fail=0`) for `E2E dual-mode` and `E2E mode matrix` | `am e2e run --project . dual_mode`, `am e2e run --project . mode_matrix`, and CI gate report | `tests/artifacts/dual_mode/*/run_summary.json` |
 | Security/privacy | Pass rate = `100%` (`fail=0`) for `E2E security/privacy` | `am e2e run --project . security_privacy` and CI gate report | `tests/artifacts/security_privacy/*/*` |
 | Accessibility | Pass rate = `100%` (`fail=0`) for `E2E TUI accessibility` | `am e2e run --project . tui_a11y` and CI gate report | `tests/artifacts/tui_a11y/*/*` |
-| Cross-platform native command portability | Pass rate = `100%` (`fail=0`) for native command matrix on Linux/macOS/Windows | CI job `native-command-matrix` in `.github/workflows/ci.yml` | `tests/artifacts/cli/native_command_matrix/<os>/summary.json` |
+| Cross-platform native command portability | Pass rate = `100%` (`fail=0`) for native command matrix on Linux/macOS/Windows | Native command matrix executed on admitted RCH workers | `tests/artifacts/cli/native_command_matrix/<os>/summary.json` |
 | Performance budgets | `perf_security_regressions=status:pass` + `perf_guardrails=status:pass` with no budget/delta violations | `cargo test -p mcp-agent-mail-cli --test perf_security_regressions -- --nocapture`, `cargo test -p mcp-agent-mail-cli --test perf_guardrails -- --nocapture`, and CI gate report | `tests/artifacts/cli/perf_security/*`, `tests/artifacts/cli/perf_guardrails/*`, benchmark artifacts |
 | Determinism | Golden/export checks report zero mismatches | `am golden verify` and static export tests | `benches/golden/checksums.sha256`, `tests/artifacts/share/*/*` |
 | Reliability incident-corpus regression | `release_ready=true` in `release_scorecard.json` (every reliability suite `fail=0` AND every historical incident class pass with fresh corpus evidence) | `am e2e run --project . --tag reliability --release-scorecard` | `tests/artifacts/release_scorecard/<ts>/release_scorecard.json`, `tests/artifacts/incident_corpus/<ts>/scorecard.json` |
@@ -37,9 +69,9 @@ Release owners should publish one operator-readable verdict after the component 
 
 ```bash
 am ci --report tests/artifacts/ci/gate_report.json
-am doctor --json > tests/artifacts/release/doctor.json
+am doctor check --json > tests/artifacts/release/doctor.json
 am robot health --format json > tests/artifacts/release/robot_health.json
-# Produce installer/checksum/provenance evidence from the dist workflow or release job.
+# Produce installer/checksum/provenance evidence from the manual DSR release.
 am release health \
   --ci-report tests/artifacts/ci/gate_report.json \
   --doctor-report tests/artifacts/release/doctor.json \
@@ -96,18 +128,18 @@ jq '.release_ready, .problems' tests/artifacts/release_scorecard/*/release_score
 - [x] `am serve-http --path api` / `am serve-http --path mcp` switches transport modes
 - [x] `am serve-http --no-auth` disables authentication for local dev
 - [x] Auth token auto-discovered from `~/.mcp_agent_mail/.env`
-- [x] All 37 MCP tools respond correctly
+- [ ] Every tool registered by the candidate router passes conformance and real transport checks
 - [x] All 25 MCP resources return correct data
 - [x] Startup probes catch and report common failures (port, storage, DB)
 - [x] Graceful shutdown flushes commit queue
 - [x] Native deploy verification path available: `am share deploy verify-live <url> --bundle <bundle_dir>`
 
-## Dual-Mode Interface (ADR-001)
+## Dual-Mode Interface (ADR-001, amended by ADR-002)
 
 - [x] MCP binary (`mcp-agent-mail`) denies CLI-only commands with exit 2
 - [x] CLI binary (`am`) accepts all 22+ command families
 - [x] Denial message includes command name, allowed commands, and remediation hint
-- [x] No env variable (`INTERFACE_MODE`, etc.) can bypass the denial gate
+- [ ] Default MCP mode denies CLI-only commands; explicit `AM_INTERFACE_MODE=cli` selects the CLI surface, as required by accepted ADR-002
 - [x] Case variants of allowed commands are denied (e.g., `Serve`, `CONFIG`)
 - [x] `mcp-agent-mail serve --help` exits 0
 - [x] `mcp-agent-mail config` exits 0
@@ -146,23 +178,23 @@ jq '.release_ready, .problems' tests/artifacts/release_scorecard/*/release_score
 
 - [x] Mode matrix harness: 22 CLI-allow + 16 MCP-deny + 2 MCP-allow
   ```bash
-  cargo test -p mcp-agent-mail-cli --test mode_matrix_harness
+  RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli --test mode_matrix_harness
   ```
 - [x] Semantic conformance: 10 SC tests (DB parity, validation, drift report)
   ```bash
-  cargo test -p mcp-agent-mail-cli --test semantic_conformance
+  RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli --test semantic_conformance
   ```
 - [x] Perf/security regressions: 13 tests (latency budgets, bypass attempts)
   ```bash
-  cargo test -p mcp-agent-mail-cli --test perf_security_regressions
+  RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli --test perf_security_regressions
   ```
 - [x] Perf migration guardrails: native-vs-legacy budgets + unavailable rationale capture
   ```bash
-  cargo test -p mcp-agent-mail-cli --test perf_guardrails
+  RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli --test perf_guardrails
   ```
 - [x] Help snapshots match golden fixtures
   ```bash
-  cargo test -p mcp-agent-mail-cli --test help_snapshots
+  RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli --test help_snapshots
   ```
 - [x] E2E dual-mode: 84+ assertions (7 sections)
   ```bash
@@ -272,13 +304,10 @@ wc -l "${SOAK_TREND}"
 
 2. Or run individual gates:
    ```bash
-   cargo test --workspace
-   cargo test -p mcp-agent-mail-conformance
-   cargo test -p mcp-agent-mail-cli --test mode_matrix_harness
-   cargo test -p mcp-agent-mail-cli --test semantic_conformance
-   cargo test -p mcp-agent-mail-cli --test perf_security_regressions
-   cargo test -p mcp-agent-mail-cli --test perf_guardrails
-   cargo test -p mcp-agent-mail-cli --test help_snapshots
+   RCH_REQUIRE_REMOTE=1 rch exec -- cargo check --locked --workspace --all-targets
+   RCH_REQUIRE_REMOTE=1 rch exec -- cargo clippy --locked --workspace --all-targets -- -D warnings
+   RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked --workspace
+   cargo fmt --check
    am e2e run --project . dual_mode
    am e2e run --project . mode_matrix
    am e2e run --project . security_privacy
@@ -298,12 +327,12 @@ wc -l "${SOAK_TREND}"
 
 3. Manual smoke test:
    ```bash
-   # MCP denial gate works:
-   mcp-agent-mail share 2>&1        # Should exit 2 with denial message
+   # Explicit MCP mode denies CLI-only commands:
+   AM_INTERFACE_MODE=mcp mcp-agent-mail share 2>&1  # Exit 2
 
    # CLI accepts all commands:
    am share --help                  # Should exit 0
-   am doctor check --json           # Should exit 0 with JSON output
+   am doctor check --json           # Exit 0 healthy, 1 findings; inspect JSON
 
    # Native deployment validation path:
    am share deploy verify-live https://example.github.io/agent-mail --bundle /tmp/agent-mail-bundle --json > /tmp/verify-live.json
@@ -328,11 +357,18 @@ wc -l "${SOAK_TREND}"
 
 5. Test headless mode:
    ```bash
-   mcp-agent-mail serve --no-tui &
-   curl -s http://127.0.0.1:8765/mcp/ \
+   # Use an isolated candidate server; retain its PID for supervised shutdown.
+   AM_INTERFACE_MODE=mcp mcp-agent-mail serve --no-tui &
+   candidate_pid=$!
+   curl --fail-with-body -sS http://127.0.0.1:8765/mcp/ \
+     -H 'Content-Type: application/json' \
      -H "Authorization: Bearer $HTTP_BEARER_TOKEN" \
-     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-   # Should return 37 tools
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
+     | jq -e '.result.tools | map(.name) | index("send_message") != null'
+   # Full inventory parity is checked by docs_drift_ci against the live registry.
+   # Stop only the candidate process started above when the smoke test is done.
+   kill -TERM "$candidate_pid"
+   wait "$candidate_pid"
    ```
 
 ---
@@ -358,7 +394,7 @@ wc -l "${SOAK_TREND}"
 | "not an MCP server command" in MCP logs | Medium | Misrouted command | Check binary path in config |
 | "database is locked" spike | Medium | Pool exhaustion under new load | Increase pool size |
 | Panic/backtrace in denial stderr | Critical | Bug in denial gate | Activate kill-switch |
-| CLI command succeeds on MCP binary | Critical | Denial gate bypass | Activate kill-switch immediately |
+| CLI command succeeds with explicit `AM_INTERFACE_MODE=mcp` | Critical | Denial gate bypass | Investigate and stop promotion; CLI opt-in success is expected |
 
 ### Escalation Path
 
@@ -377,11 +413,15 @@ grep -i "panic\|backtrace" /var/log/mcp-agent-mail/*.log
 
 # Tool latency percentiles (via MCP resource)
 curl -s http://127.0.0.1:8765/mcp/ \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $HTTP_BEARER_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"resource://tooling/metrics"}}' \
   | jq '.result.contents[0].text | fromjson | .tools[] | {name, call_count, p95_ms}'
 
 # Active locks
 curl -s http://127.0.0.1:8765/mcp/ \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $HTTP_BEARER_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"resource://tooling/locks"}}' \
   | jq '.result.contents[0].text | fromjson | .summary'
 ```
@@ -429,7 +469,7 @@ am ci --report "tests/artifacts/ci/${run_ts}/case_02_report.json"
 jq '.decision, .release_eligible, .summary' "tests/artifacts/ci/${run_ts}/case_02_report.json"
 ```
 
-Latest non-quick artifact snapshot:
+Historical non-quick artifact snapshot (February 13, not a current candidate gate):
 - `tests/artifacts/ci/20260213_031050/case_02_report.json`
 - `decision="no-go"`, `release_eligible=false`, `summary={total:13, pass:4, fail:9, skip:0}`
 
@@ -448,7 +488,7 @@ Owner rotation (weekly, Monday 00:00 UTC handoff):
 | Phase 2 (50% -> 100%) |  |  |  |  |  |
 | Phase 3 (GA confirmation) |  |  |  |  |  |
 
-## Post-Launch Telemetry Feedback Loop (br-3vwi.12.3)
+## Historical February Post-Launch Telemetry Feedback Loop (br-3vwi.12.3)
 
 - [x] Latest release-candidate gate artifact is non-quick and stored at `tests/artifacts/ci/20260213_031050/case_02_report.json`
 - [x] Current reference non-quick artifact reviewed: `tests/artifacts/ci/20260213_031050/case_02_report.json` (mode=`full`, reviewed 2026-02-13T03:17Z)

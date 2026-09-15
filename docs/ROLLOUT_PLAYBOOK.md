@@ -3,19 +3,26 @@
 **Primary Beads:** br-3vwi.12.1, br-3vwi.12.2
 **Track:** br-3vwi.12 (Rollout governance, release gates, feedback loop)
 **Depends on:** security/privacy E2E, stress/soak harness, CI gate automation, dual-mode invariants
-**Last Updated:** 2026-02-11
+**Last Updated:** 2026-09-15
+
+The phase timings and February result tables below describe the original rollout
+plan. They do not certify a current release. Follow the current procedure in
+[Release Checklist](RELEASE_CHECKLIST.md#current-release-procedure): manual DSR
+publication, strict RCH builds, and fresh evidence for the exact candidate.
+GitHub Actions must remain disabled.
 
 ---
 
 ## 1. Overview
 
 This playbook covers the phased rollout of the dual-mode interface
-(`mcp-agent-mail` for MCP, `mcp-agent-mail-cli` for operator CLI) and the
+(`mcp-agent-mail` for MCP, `am` for operator CLI) and the
 kill-switch procedure for rolling back if incidents occur.
 
 **Key invariant:** MCP mode is the default. The MCP binary rejects CLI-only
-commands with exit code 2 and a remediation message. There is no runtime mode
-switch (see ADR-001).
+commands with exit code 2 and a remediation message in MCP mode. Explicit
+`AM_INTERFACE_MODE=cli` selects the CLI interface; accepted ADR-002 supersedes
+ADR-001's original prohibition on runtime opt-in. No heuristic mode switch exists.
 
 ### 1.1 V2 Surface Cohorts and Feature-Flag Boundaries
 
@@ -61,22 +68,22 @@ root.
 ### 2.1 Unit and Integration Tests
 
 ```bash
-cargo test --workspace
-# Expected: 1000+ tests, 0 failures
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked --workspace
+# Expected: every selected test passes; retain the actual count and source receipt.
 ```
 
 ### 2.2 Clippy (Zero Warnings)
 
 ```bash
-cargo clippy --workspace --all-targets
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo clippy --locked --workspace --all-targets -- -D warnings
 # Expected: 0 errors, 0 warnings
 ```
 
 ### 2.3 Conformance Tests
 
 ```bash
-cargo test -p mcp-agent-mail-conformance
-# Expected: the conformance output matches the current 37-tool / 25-resource surface
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-conformance
+# Inventory derives from the runtime registry, including Rust-native tools.
 ```
 
 ### 2.4 Dual-Mode E2E Suite
@@ -122,17 +129,18 @@ am e2e run --project . cli
 ### 2.8 Stress Tests
 
 ```bash
-cargo test -p mcp-agent-mail-db --test stress -- --nocapture
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-db --test stress
 # Expected: all 9 stress scenarios pass (concurrent agents, pool exhaustion, etc.)
 ```
 
 ### 2.9 CI Pipeline and Machine-Readable Gate Report
 
-If `.github/workflows/ci.yml` is active, verify the latest main branch CI run
-shows green across all jobs: `build`, `test`, `clippy`, `conformance`, `e2e`.
+Run the gate commands through the admitted RCH workers and retain their logs.
+The local `am ci` report is distinct from GitHub Actions; do not enable or
+dispatch Actions. Ensure any build commands invoked by the gate runner obey
+the same remote-only policy.
 
 ```bash
-gh run list --branch main --limit 1
 am ci --report tests/artifacts/ci/gate_report.json
 jq '.decision, .release_eligible, .summary.fail' tests/artifacts/ci/gate_report.json
 # Expected: "go", true, 0
@@ -176,8 +184,8 @@ am share deploy verify-live https://example.github.io/agent-mail \
 ```bash
 am e2e run --project . tui_full_traversal
 am e2e run --project . soak_harness
-cargo test -p mcp-agent-mail-cli --test perf_security_regressions -- --nocapture
-cargo test -p mcp-agent-mail-cli --test perf_guardrails -- --nocapture
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli --test perf_security_regressions
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli --test perf_guardrails
 # Expected: no regressions, no budget failures
 ```
 
@@ -215,7 +223,7 @@ Promotion from each phase requires all of:
 
 ## 3. Phased Rollout Plan
 
-### Phase 0: Internal Validation (Current)
+### Phase 0: Internal Validation
 
 **Scope:** Development and CI environments only.
 **Blast radius:** Zero external users.
@@ -244,8 +252,9 @@ Promotion from each phase requires all of:
 4. Run a smoke test:
    ```bash
    # MCP binary rejects CLI commands
-   mcp-agent-mail share 2>&1 | grep "is not an MCP server command"
-   echo $?  # must be 2
+   denial_status=0
+   AM_INTERFACE_MODE=mcp mcp-agent-mail share || denial_status=$?
+   test "$denial_status" -eq 2
 
    # CLI binary works
    am doctor check --json | jq .status  # must be "healthy"
@@ -329,32 +338,21 @@ Initiate kill-switch if ANY of:
    cat "${LATEST_TUI_RUN}/lag_flash_gate_triage.md"
    ```
 
-3. **Revert to previous binary version:**
-   ```bash
-   # Option A: Git revert to last known-good commit
-   git log --oneline -5  # identify the pre-dual-mode commit
-   git checkout <known-good-sha> -- crates/mcp-agent-mail/src/
-   git checkout <known-good-sha> -- crates/mcp-agent-mail-cli/src/
-   cargo build --release -p mcp-agent-mail -p mcp-agent-mail-cli
+3. **Stage the previous verified release:** Download its signed manifest and
+   archives into a new directory, verify signatures and hashes, and preserve the
+   current installation and mailbox. Do not rewrite the shared source checkout or
+   overwrite installed binaries as a rollback shortcut. Confirm that the older
+   binary supports the current mailbox schema before selecting it in the supervisor.
 
-   # Option B: If pre-built binaries are archived
-   cp /path/to/backup/mcp-agent-mail /usr/local/bin/
-   cp /path/to/backup/am /usr/local/bin/
-   ```
-
-4. **Restart affected servers:**
-   ```bash
-   # Graceful restart (flushes commit queue)
-   # Send SIGTERM, wait for clean exit, then restart
-   pkill -TERM -f "mcp-agent-mail serve"
-   sleep 5
-   am serve-http
-   ```
+4. **Restart only the affected service:** Use that deployment's supervisor to
+   drain and stop its identified owner, confirm `am doctor drain` reports
+   `safe_to_mutate`, select the staged binary, and restart. Do not kill every
+   process matching a name or bypass the live-owner guard.
 
 5. **Verify rollback:**
    ```bash
    # Server is responding
-   curl -sf http://127.0.0.1:8765/mcp/ > /dev/null
+   curl -sf http://127.0.0.1:8765/health | jq -e '.status == "ready"'
 
    # Doctor passes
    am doctor check --json | jq .status
@@ -413,7 +411,7 @@ into routine operational monitoring.
 
 ```bash
 # Server responding
-curl -sf http://127.0.0.1:8765/mcp/ -o /dev/null
+curl -sf http://127.0.0.1:8765/health | jq -e '.status == "ready"'
 
 # Doctor check
 am doctor check --json 2>/dev/null | jq -e '.status == "healthy"'
@@ -425,7 +423,7 @@ am doctor check --json 2>/dev/null | jq -e '.status == "healthy"'
 # Verify MCP binary still denies CLI commands correctly
 for cmd in share guard doctor archive migrate; do
   exit_code=0
-  mcp-agent-mail "$cmd" 2>/dev/null || exit_code=$?
+  AM_INTERFACE_MODE=mcp mcp-agent-mail "$cmd" 2>/dev/null || exit_code=$?
   [ "$exit_code" -eq 2 ] || echo "ALERT: $cmd returned $exit_code (expected 2)"
 done
 ```
@@ -479,9 +477,13 @@ rollback path.
 
 ### 6.1 Simulate Deployment
 
+Use an isolated test mailbox and an unused port. Never run this drill against
+a shared production mailbox. Retain the exact child PID; do not find a process
+to terminate by name.
+
 ```bash
 # Build both binaries
-cargo build -p mcp-agent-mail -p mcp-agent-mail-cli
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo build --locked -p mcp-agent-mail -p mcp-agent-mail-cli
 
 # Start server
 am serve-http &
@@ -498,8 +500,10 @@ am e2e run --project . dual_mode
 ### 6.2 Simulate Failure and Rollback
 
 ```bash
-# Kill the server (simulating crash)
-kill -9 $SERVER_PID
+# Stop only the test child from the preceding step, then wait for its exit.
+# Abrupt-crash coverage belongs in the isolated recovery test suite.
+kill -TERM "$SERVER_PID"
+wait "$SERVER_PID"
 
 # Verify server is down
 curl -sf http://127.0.0.1:8765/mcp/ && echo "STILL UP" || echo "DOWN - OK"
@@ -512,8 +516,9 @@ sleep 3
 am doctor check --json | jq .status
 
 # Verify denial path still works post-restart
-mcp-agent-mail share 2>&1 | grep "is not an MCP server command"
-echo "Exit code: $?"
+denial_status=0
+AM_INTERFACE_MODE=mcp mcp-agent-mail share || denial_status=$?
+test "$denial_status" -eq 2
 ```
 
 ### 6.3 Record Dry-Run Results
@@ -544,7 +549,7 @@ cp tests/artifacts/dual_mode/*/run_summary.json tests/artifacts/dry_run/
 | Artifact | Source Bead | Location |
 |----------|------------|----------|
 | Dual-mode E2E results | br-3vwi.12.1 (and prior dual-mode work) | `tests/artifacts/dual_mode/*/` |
-| CI gate logs | br-3vwi.12.1 (and prior CI gate work) | `.github/workflows/ci.yml` outputs |
+| Candidate gate logs | br-3vwi.12.1 (and prior CI gate work) | Retained RCH terminal logs and gate report for the candidate |
 | Golden snapshots | br-3vwi.12.1 (and prior snapshot work) | `tests/fixtures/golden_snapshots/` |
 | Denial UX contract | br-3vwi.12.1 (rollout gate reference) | `docs/SPEC-denial-ux-contract.md` |
 | Mode invariants | br-3vwi.12.1 (rollout gate reference) | `docs/ADR-001-dual-mode-invariants.md` |
@@ -555,9 +560,10 @@ cp tests/artifacts/dual_mode/*/run_summary.json tests/artifacts/dry_run/
 
 ---
 
-## 9. Post-Launch Telemetry Review Loop
+## 9. Historical February Post-Launch Telemetry Review Loop
 
-This section operationalizes `br-3vwi.12.3` and records the latest review snapshot.
+This section preserves the `br-3vwi.12.3` February review snapshots. These
+results and blocker names are historical, not the current release verdict.
 
 ### 9.1 Review Windows and Evidence
 
