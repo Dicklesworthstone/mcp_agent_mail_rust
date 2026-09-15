@@ -3858,7 +3858,7 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
     };
     // Serialize the tracked-file probe and any .gitignore update. Callers that
     // also mutate credential bytes must use
-    // `with_secret_config_git_protection` so this same authority remains held
+    // `with_secret_config_git_protection_bound` so this authority remains held
     // through the write and post-write verification.
     let secret_mutex = secure_gitignore.then(|| crate::GitRepoLocks::global().lock_for(&repo_root));
     let _secret_mutex_guard = secret_mutex.as_ref().map(|mutex| {
@@ -3889,19 +3889,11 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
     check_secret_config_git_exposure_locked(path, &repo_root, &relative, secure_gitignore)
 }
 
-fn with_secret_config_git_protection<T>(
-    path: &Path,
-    operation: impl FnOnce(&SetupDirectoryAuthority) -> Result<T, SetupError>,
-) -> Result<T, SetupError> {
-    with_secret_config_git_protection_bound(path, None, operation)
-}
-
 fn with_secret_config_git_protection_bound<T>(
     path: &Path,
     authority: Option<&SetupDirectoryAuthority>,
     operation: impl FnOnce(&SetupDirectoryAuthority) -> Result<T, SetupError>,
 ) -> Result<T, SetupError> {
-    ensure_setup_parent_dir(path, "secret config")?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -3910,6 +3902,7 @@ fn with_secret_config_git_protection_bound<T>(
     let authority = if let Some(authority) = authority {
         authority
     } else {
+        ensure_setup_parent_dir(path, "secret config")?;
         owned_authority = open_setup_directory_authority(parent)?;
         &owned_authority
     };
@@ -4122,7 +4115,7 @@ fn transform_config_atomic_inner(
         .is_some_and(|snapshot| snapshot.link_count != 1);
 
     if secret_write && !secret_protected {
-        return with_secret_config_git_protection(path, |authority| {
+        return with_secret_config_git_protection_bound(path, Some(authority), |authority| {
             // Re-read and re-render after acquiring the repository authority.
             // Otherwise the caller could carry stale bytes across the lock
             // boundary and overwrite a concurrent, serialized config update.
@@ -8991,6 +8984,78 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn transform_config_atomic_does_not_recreate_displaced_parent_for_secret_lock() {
+        let tmp = setup_real_tempdir();
+        let parent = tmp.path().join("live");
+        let displaced = tmp.path().join("displaced");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("config.json");
+        std::fs::write(&path, "owner=original\n").unwrap();
+
+        transform_config_atomic(&path, 0o600, true, false, |existing| {
+            std::fs::rename(&parent, &displaced)?;
+            Ok(format!(
+                "{}Authorization=Bearer protected-secret\n",
+                existing.unwrap_or_default()
+            ))
+        })
+        .expect_err("a displaced parent must not be recreated while acquiring secret authority");
+
+        assert!(!parent.exists());
+        assert_eq!(
+            std::fs::read_to_string(displaced.join("config.json")).unwrap(),
+            "owner=original\n"
+        );
+        assert_eq!(std::fs::read_dir(&displaced).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transform_config_atomic_refuses_parent_replacement_before_secret_lock() {
+        use std::cell::Cell;
+
+        let tmp = setup_real_tempdir();
+        let parent = tmp.path().join("live");
+        let displaced = tmp.path().join("displaced");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("config.json");
+        std::fs::write(&path, "owner=original\n").unwrap();
+        let calls = Cell::new(0_u8);
+
+        let error = transform_config_atomic(&path, 0o600, true, false, |existing| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                std::fs::rename(&parent, &displaced)?;
+                std::fs::create_dir(&parent)?;
+                std::fs::write(&path, "owner=replacement\n")?;
+            }
+            Ok(format!(
+                "{}Authorization=Bearer protected-secret\n",
+                existing.unwrap_or_default()
+            ))
+        })
+        .expect_err("acquiring the secret lock must retain the original parent authority");
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "must refuse before transforming a new parent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "owner=replacement\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(displaced.join("config.json")).unwrap(),
+            "owner=original\n"
+        );
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&displaced).unwrap().count(), 1);
+        assert!(!error.to_string().contains("protected-secret"));
+    }
+
     #[test]
     fn write_config_atomic_refuses_to_overwrite_non_utf8_config() {
         let tmp = setup_real_tempdir();
@@ -9442,7 +9507,7 @@ mod tests {
         let repo_root = std::fs::canonicalize(tmp.path()).unwrap();
         let path = tmp.path().join("secret.json");
 
-        with_secret_config_git_protection(&path, |authority| {
+        with_secret_config_git_protection_bound(&path, None, |authority| {
             let contender_repo = repo_root.clone();
             let competing_add = std::thread::spawn(move || -> std::io::Result<bool> {
                 match crate::RepoFlock::acquire_with_timeout(
