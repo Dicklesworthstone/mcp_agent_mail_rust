@@ -94,6 +94,35 @@ fn pool_minimal_config_single_connection() {
 }
 
 #[test]
+fn cancelled_query_keeps_request_cancellation_while_pool_is_exhausted() {
+    let (pool, _dir) = make_pool(1, 1);
+    block_on(|cx| async move {
+        let held = unwrap_acquire!(pool.acquire(&cx).await, "hold the only connection");
+        let cancelled = Cx::for_request_with_budget(asupersync::Budget::INFINITE);
+        let dispatch_clone = cancelled.clone();
+        dispatch_clone.set_cancel_requested(true);
+
+        let started = std::time::Instant::now();
+        let read = queries::list_project_rows(&cancelled, &pool).await;
+        assert!(matches!(read, Outcome::Cancelled(_)), "{read:?}");
+        let write =
+            queries::ensure_project(&cancelled, &pool, "/workspace/cancelled-pool-query").await;
+        assert!(matches!(write, Outcome::Cancelled(_)), "{write:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "cancelled queries must not wait for the 30-second pool timeout"
+        );
+        drop(held);
+
+        let rows = queries::list_project_rows(&cx, &pool)
+            .await
+            .into_result()
+            .expect("healthy request can reuse the connection");
+        assert!(rows.is_empty(), "cancelled write must not create a project");
+    });
+}
+
+#[test]
 fn pool_minimal_config_ensure_project_works() {
     let (pool, _dir) = make_pool(1, 1);
     let key = format!("/tmp/pool_min_{}", unique_suffix());
