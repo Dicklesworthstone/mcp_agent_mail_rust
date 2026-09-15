@@ -4876,11 +4876,13 @@ mod tests {
             ..DbPoolConfig::default()
         };
         let pool = DbPool::new(&cfg).expect("messaging test pool");
-        let cx = Cx::for_testing();
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        rt.block_on(f(cx, pool));
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs messaging test context");
+            f(cx, pool).await;
+        });
     }
 
     async fn ensure_project_row(cx: &Cx, pool: &DbPool, human_key: &str) -> ProjectRow {
@@ -4924,7 +4926,7 @@ mod tests {
                 Config::reset_cached();
                 let rt = RuntimeBuilder::current_thread().build().expect("runtime");
                 rt.block_on(async {
-                    let cx = Cx::for_testing();
+                    let cx = Cx::current().expect("runtime installs inbox receipt test context");
                     let ctx = McpContext::new(cx.clone(), 1);
                     let pool = DbPool::new(&DbPoolConfig {
                         database_url: database_url.clone(),
@@ -5032,11 +5034,11 @@ mod tests {
             ],
             || {
                 Config::reset_cached();
-                let cx = Cx::for_testing();
                 let rt = RuntimeBuilder::current_thread()
                     .build()
                     .expect("build runtime");
                 rt.block_on(async {
+                    let cx = Cx::current().expect("runtime installs durable reply test context");
                     let ctx = McpContext::new(cx.clone(), 1);
                     let project_key = format!(
                         "/data/projects/ack-fast-{}",
@@ -5172,11 +5174,11 @@ mod tests {
             ],
             || {
                 Config::reset_cached();
-                let cx = Cx::for_testing();
                 let rt = RuntimeBuilder::current_thread()
                     .build()
                     .expect("build runtime");
                 rt.block_on(async {
+                    let cx = Cx::current().expect("runtime installs recipient replacement context");
                     let ctx = McpContext::new(cx.clone(), 1);
                     let project_key = format!(
                         "/data/projects/messaging-upsert-{}",
