@@ -5308,13 +5308,13 @@ pub async fn refresh_project_sibling_suggestions(
     pool: &DbPool,
 ) -> Outcome<ProjectSiblingRefreshSummary, DbError> {
     run_with_mvcc_retry(cx, "refresh_project_sibling_suggestions", || async {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(conn) => conn,
-        Outcome::Err(error) => return Outcome::Err(error),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-    };
-    let tracked = tracked(&*conn);
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let tracked = tracked(&*conn);
 
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
         if cx.checkpoint().is_err() {
@@ -5549,13 +5549,13 @@ pub async fn update_project_sibling_status(
         (other_id, project_id)
     };
     run_with_mvcc_retry(cx, "update_project_sibling_status", || async {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(conn) => conn,
-        Outcome::Err(error) => return Outcome::Err(error),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-    };
-    let tracked = tracked(&*conn);
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let tracked = tracked(&*conn);
 
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
@@ -6774,13 +6774,13 @@ pub async fn consume_proof_nonce(
     now: i64,
 ) -> Outcome<NonceOutcome, DbError> {
     run_with_mvcc_retry(cx, "consume_proof_nonce", || async {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-    let tracked = tracked(&*conn);
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let tracked = tracked(&*conn);
 
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
@@ -8018,15 +8018,6 @@ async fn create_message_with_recipients_impl(
     let idempotency_expires_ts =
         now.saturating_add(idempotency_retention_secs().saturating_mul(1_000_000));
     let (row, writer_post_commit_counts) = {
-        let conn = match acquire_conn(cx, pool).await {
-            Outcome::Ok(c) => c,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        };
-
-        let tracked = tracked(&*conn);
-
         // mcp_agent_mail#176 / br-sa58k: the canonical message id is elected
         // durably inside the insert transaction (see
         // `create_message_with_recipients_tx`) rather than relying on the
@@ -8064,9 +8055,16 @@ async fn create_message_with_recipients_impl(
                 Outcome::Panicked(payload) => return Outcome::Panicked(payload),
             })
         };
-        let created_outcome = loop {
-            match run_with_mvcc_retry(cx, "create_message_with_recipients", || {
-                create_message_with_recipients_tx(
+        let (created_outcome, conn) = loop {
+            match run_with_mvcc_retry(cx, "create_message_with_recipients", || async {
+                let conn = match acquire_conn(cx, pool).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                };
+                let tracked = tracked(&*conn);
+                match create_message_with_recipients_tx(
                     cx,
                     &tracked,
                     project_id,
@@ -8084,11 +8082,21 @@ async fn create_message_with_recipients_impl(
                     idempotency,
                     idempotency_expires_ts,
                 )
+                .await
+                {
+                    // Retain only the successful writer for its post-commit
+                    // sample. Failed attempts release their lease before sleep.
+                    Outcome::Ok(created) => Outcome::Ok((created, conn)),
+                    Outcome::Err(e) => Outcome::Err(e),
+                    Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => Outcome::Panicked(p),
+                }
             })
             .await
             {
-                Outcome::Ok(Some(created)) => break created,
-                Outcome::Ok(None) => {
+                Outcome::Ok((Some(created), conn)) => break (created, conn),
+                Outcome::Ok((None, conn)) => {
+                    drop(conn);
                     // The key check found a fresh request and rolled back.
                     // Scan without holding transaction/page authority, then
                     // repeat the authoritative check in the insert transaction.
@@ -8115,6 +8123,7 @@ async fn create_message_with_recipients_impl(
                 Outcome::Panicked(p) => return Outcome::Panicked(p),
             }
         };
+        let tracked = tracked(&*conn);
         // A replay or conflict short-circuits: nothing new was written this call,
         // so the post-commit visibility probe (which re-proves a fresh insert
         // landed) and the writer-count sample below must be skipped entirely.
@@ -9721,13 +9730,13 @@ pub async fn append_message_delivery_signal_receipt(
     let signal_path_digest = signal_path_digest.to_string();
 
     run_with_mvcc_retry(cx, "append_message_delivery_signal_receipt", || async {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(conn) => conn,
-        Outcome::Err(error) => return Outcome::Err(error),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-    };
-    let tracked = tracked(&*conn);
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
         let insert_params = [
             Value::BigInt(message_id),
@@ -11326,14 +11335,14 @@ pub async fn add_recipients(
 ) -> Outcome<(), DbError> {
     // Batch all recipient inserts in a single transaction (1 fsync instead of N).
     run_with_mvcc_retry(cx, "add_recipients", || async {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
 
-    let tracked = tracked(&*conn);
+        let tracked = tracked(&*conn);
 
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
@@ -11481,14 +11490,14 @@ pub async fn mark_messages_read_batch(
     let now = now_micros();
 
     run_with_mvcc_retry(cx, "mark_messages_read_batch", || async {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
 
-    let tracked = tracked(&*conn);
+        let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Batch UPDATE: mark all messages read in one pass per chunk.
@@ -12271,14 +12280,14 @@ pub async fn acknowledge_messages_batch(
     let now = now_micros();
 
     run_with_mvcc_retry(cx, "acknowledge_messages_batch", || async {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
 
-    let tracked = tracked(&*conn);
+        let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         for chunk in unique_message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
@@ -14844,14 +14853,14 @@ pub async fn respond_contact(
     };
 
     run_with_mvcc_retry(cx, "respond_contact", || async {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
 
-    let tracked = tracked(&*conn);
+        let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         let existing_sql = format!(
@@ -16786,14 +16795,14 @@ pub async fn transition_atc_experience(
 
     let pooled_outcome = {
         run_with_mvcc_retry(cx, "transition_atc_experience", || async {
-        let conn = match acquire_conn(cx, pool).await {
-            Outcome::Ok(c) => c,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        };
+            let conn = match acquire_conn(cx, pool).await {
+                Outcome::Ok(c) => c,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
 
-        let tracked = tracked(&*conn);
+            let tracked = tracked(&*conn);
             transition_atc_experience_tx(
                 cx,
                 &tracked,
@@ -18162,6 +18171,7 @@ mod tests {
     struct EventCapture {
         events: Arc<Mutex<Vec<CapturedEvent>>>,
         next_id: Arc<AtomicU64>,
+        retry_observer: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     impl EventCapture {
@@ -18227,6 +18237,12 @@ mod tests {
         fn event(&self, event: &Event<'_>) {
             let mut fields = EventFieldCapture::default();
             event.record(&mut fields);
+            if fields.fields.iter().any(|(name, value)| {
+                name == "message" && value.contains("retrying whole transaction")
+            }) && let Some(observer) = &self.retry_observer
+            {
+                observer();
+            }
             self.events
                 .lock()
                 .expect("event capture lock poisoned")
