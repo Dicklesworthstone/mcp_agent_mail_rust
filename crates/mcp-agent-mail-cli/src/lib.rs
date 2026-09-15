@@ -8415,8 +8415,10 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
     let token_resolution = if config.http_bearer_token.is_none() {
         None
     } else {
-        Some(setup::resolve_token_for_save(None, &config_env_file)
-            .map_err(|e| CliError::Other(format!("setup token resolution failed: {e}")))?)
+        Some(
+            setup::resolve_token_for_save(None, &config_env_file)
+                .map_err(|e| CliError::Other(format!("setup token resolution failed: {e}")))?,
+        )
     };
     let resolved_token = token_resolution
         .as_ref()
@@ -16494,8 +16496,9 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             let config_env_file = canonical_setup_config_env_path()?;
 
             // Resolve token
-            let token_resolution = setup::resolve_token_for_save(token.as_deref(), &config_env_file)
-                .map_err(|e| CliError::Other(format!("setup token resolution failed: {e}")))?;
+            let token_resolution =
+                setup::resolve_token_for_save(token.as_deref(), &config_env_file)
+                    .map_err(|e| CliError::Other(format!("setup token resolution failed: {e}")))?;
             let resolved_token = token_resolution.token().to_owned();
 
             // Parse agent filter

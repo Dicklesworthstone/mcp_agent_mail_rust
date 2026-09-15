@@ -806,6 +806,16 @@ pub fn resolve_token_for_save(
         None
     };
     let snapshot = read_setup_file_with_authority(&path, "token env file", authority.as_ref())?;
+    if snapshot.as_ref().is_some_and(|snapshot| {
+        u64::try_from(snapshot.content.len()).unwrap_or(u64::MAX)
+            > crate::config::ENV_AUTHORITY_FILE_MAX_BYTES
+    }) {
+        return Err(invalid_setup_path(
+            "token env file",
+            &path,
+            "exceeds the environment authority size limit",
+        ));
+    }
     let token = if let Some(token) = explicit.filter(|token| !token.is_empty()) {
         token.to_owned()
     } else if let Some(token) = snapshot
@@ -2916,13 +2926,15 @@ fn snapshot_setup_authority_leaf(
     snapshot_open_setup_file(file.into_std(), display_path, label).map(Some)
 }
 
-#[cfg(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux"))))]
 fn setup_snapshots_match(expected: &SetupFileSnapshot, observed: &SetupFileSnapshot) -> bool {
+    #[cfg(any(unix, windows))]
+    let same_identity = expected.device == observed.device && expected.inode == observed.inode;
+    #[cfg(not(any(unix, windows)))]
+    let same_identity = false;
     expected.content == observed.content
         && expected.permissions == observed.permissions
         && expected.link_count == observed.link_count
-        && expected.device == observed.device
-        && expected.inode == observed.inode
+        && same_identity
 }
 
 #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
@@ -9997,10 +10009,92 @@ mod tests {
     }
 
     #[test]
+    fn token_save_refuses_content_changed_since_resolution() {
+        for explicit in [None, Some("operator-token")] {
+            let tmp = setup_real_tempdir();
+            let path = tmp.path().join("config.env");
+            std::fs::write(&path, "HTTP_BEARER_TOKEN=old\nOTHER=old\n").unwrap();
+            let resolved = resolve_token_for_save(explicit, &path).unwrap();
+            let newer = "HTTP_BEARER_TOKEN=newer\nOTHER=newer\n";
+            std::fs::write(&path, newer).unwrap();
+            let error = save_token_to_env_file(&resolved).unwrap_err();
+            assert!(error.to_string().contains("retry setup"), "{error}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+        }
+    }
+
+    #[test]
+    fn token_save_refuses_absent_to_present_authority() {
+        let tmp = setup_real_tempdir();
+        let path = tmp.path().join("config.env");
+        let resolved = resolve_token_for_save(None, &path).unwrap();
+        assert!(!path.exists(), "resolution must be read-only");
+        let newer = "HTTP_BEARER_TOKEN=concurrent-writer\n";
+        std::fs::write(&path, newer).unwrap();
+        let error = save_token_to_env_file(&resolved).unwrap_err();
+        assert!(error.to_string().contains("retry setup"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+    }
+
+    #[test]
+    fn token_save_refuses_replaced_identity_with_identical_bytes() {
+        let tmp = setup_real_tempdir();
+        let path = tmp.path().join("config.env");
+        let retained = tmp.path().join("previous.env");
+        let original = "HTTP_BEARER_TOKEN=same-content\n";
+        std::fs::write(&path, original).unwrap();
+        let resolved = resolve_token_for_save(None, &path).unwrap();
+        std::fs::rename(&path, &retained).unwrap();
+        std::fs::write(&path, original).unwrap();
+        let error = save_token_to_env_file(&resolved).unwrap_err();
+        assert!(error.to_string().contains("retry setup"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&retained).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_save_refuses_replaced_parent_since_resolution() {
+        let tmp = setup_real_tempdir();
+        let parent = tmp.path().join("authority");
+        let retained = tmp.path().join("retained-authority");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("config.env");
+        let original = "HTTP_BEARER_TOKEN=original\n";
+        std::fs::write(&path, original).unwrap();
+        let resolved = resolve_token_for_save(None, &path).unwrap();
+        std::fs::rename(&parent, &retained).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        let replacement = "HTTP_BEARER_TOKEN=replacement\n";
+        std::fs::write(&path, replacement).unwrap();
+        assert!(save_token_to_env_file(&resolved).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), replacement);
+        assert_eq!(
+            std::fs::read_to_string(retained.join("config.env")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn token_save_resolve_again_allows_idempotent_setup() {
+        let tmp = setup_real_tempdir();
+        let path = tmp.path().join("config.env");
+        for _ in 0..2 {
+            let resolved = resolve_token_for_save(Some("operator-token"), &path).unwrap();
+            save_token_to_env_file(&resolved).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "HTTP_BEARER_TOKEN=operator-token\n"
+            );
+        }
+    }
+
+    #[test]
     fn save_token_to_env_file_creates() {
         let tmp = setup_real_tempdir();
         let env_path = tmp.path().join(".env");
-        save_token_to_env_file(&env_path, "my-token-123").unwrap();
+        let resolved = resolve_token_for_save(Some("my-token-123"), &env_path).unwrap();
+        save_token_to_env_file(&resolved).unwrap();
         let content = std::fs::read_to_string(&env_path).unwrap();
         assert!(content.contains("HTTP_BEARER_TOKEN=my-token-123"));
     }
@@ -10015,7 +10109,8 @@ mod tests {
         writeln!(f, "MORE=stuff").unwrap();
         drop(f);
 
-        save_token_to_env_file(&env_path, "new-token").unwrap();
+        let resolved = resolve_token_for_save(Some("new-token"), &env_path).unwrap();
+        save_token_to_env_file(&resolved).unwrap();
         let content = std::fs::read_to_string(&env_path).unwrap();
         assert!(content.contains("HTTP_BEARER_TOKEN=new-token"));
         assert!(!content.contains("old-token"));
@@ -10034,7 +10129,8 @@ mod tests {
         std::fs::write(&env_path, "HTTP_BEARER_TOKEN=exact-token\n").unwrap();
         std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        save_token_to_env_file(&env_path, "exact-token").unwrap();
+        let resolved = resolve_token_for_save(Some("exact-token"), &env_path).unwrap();
+        save_token_to_env_file(&resolved).unwrap();
 
         let mode = std::fs::metadata(&env_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "idempotent setup must repair secret mode");
@@ -10069,7 +10165,8 @@ mod tests {
                 .success()
         );
 
-        let error = save_token_to_env_file(&env_path, "already-tracked")
+        let resolved = resolve_token_for_save(Some("already-tracked"), &env_path).unwrap();
+        let error = save_token_to_env_file(&resolved)
             .expect_err("idempotence must not bypass tracked-secret refusal");
         assert!(error.to_string().contains("Git-tracked config"), "{error}");
         assert_eq!(std::fs::read_to_string(env_path).unwrap(), original);
@@ -10084,7 +10181,8 @@ mod tests {
         std::fs::write(&outside, "HTTP_BEARER_TOKEN=outside\n").unwrap();
         std::fs::hard_link(&outside, &env_path).unwrap();
 
-        save_token_to_env_file(&env_path, "new-token").unwrap();
+        let resolved = resolve_token_for_save(Some("new-token"), &env_path).unwrap();
+        save_token_to_env_file(&resolved).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&outside).unwrap(),
@@ -10113,7 +10211,8 @@ mod tests {
             "fixture must begin as one inode"
         );
 
-        save_token_to_env_file(&env_path, "exact-token").unwrap();
+        let resolved = resolve_token_for_save(Some("exact-token"), &env_path).unwrap();
+        save_token_to_env_file(&resolved).unwrap();
 
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), original);
         assert_eq!(std::fs::read_to_string(&env_path).unwrap(), original);
@@ -10135,7 +10234,9 @@ mod tests {
         std::fs::write(&outside, "HTTP_BEARER_TOKEN=outside\n").unwrap();
         symlink(&outside, &linked).unwrap();
 
-        let err = save_token_to_env_file(&linked, "new-token").unwrap_err();
+        let err = resolve_token_for_save(Some("new-token"), &linked)
+            .err()
+            .expect("symlinked credential must be refused during resolution");
 
         assert!(err.to_string().contains("must not be a symlink"), "{err}");
         assert_eq!(
@@ -10155,7 +10256,9 @@ mod tests {
         std::fs::create_dir(&outside_dir).unwrap();
         symlink(&outside_dir, &linked_dir).unwrap();
 
-        let err = save_token_to_env_file(&linked_dir.join(".env"), "new-token").unwrap_err();
+        let err = resolve_token_for_save(Some("new-token"), &linked_dir.join(".env"))
+            .err()
+            .expect("symlinked parent must be refused during resolution");
 
         assert!(
             err.to_string()
@@ -10622,7 +10725,8 @@ http_headers = { Authorization = "Bearer tok" }
         let tmp = setup_real_tempdir();
         let env_path = tmp.path().join(".env");
         std::fs::write(&env_path, "OTHER=value\n").unwrap();
-        save_token_to_env_file(&env_path, "new-token").unwrap();
+        let resolved = resolve_token_for_save(Some("new-token"), &env_path).unwrap();
+        save_token_to_env_file(&resolved).unwrap();
         let content = std::fs::read_to_string(&env_path).unwrap();
         assert!(content.contains("OTHER=value"));
         assert!(content.contains("HTTP_BEARER_TOKEN=new-token"));
@@ -10633,7 +10737,8 @@ http_headers = { Authorization = "Bearer tok" }
     fn save_token_to_env_file_creates_parent_dirs() {
         let tmp = setup_real_tempdir();
         let env_path = tmp.path().join("deep").join("nested").join(".env");
-        save_token_to_env_file(&env_path, "tok").unwrap();
+        let resolved = resolve_token_for_save(Some("tok"), &env_path).unwrap();
+        save_token_to_env_file(&resolved).unwrap();
         assert!(env_path.exists());
         let content = std::fs::read_to_string(&env_path).unwrap();
         assert_eq!(content, "HTTP_BEARER_TOKEN=tok\n");
