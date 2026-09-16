@@ -2085,7 +2085,11 @@ pub enum MailCommand {
         /// AGENT_MAIL_SENDER_TOKEN env var). If --from was registered via
         /// `am agents register` / `am macros start-session`, the token is reused
         /// automatically and none of these flags are needed.
-        #[arg(long = "sender-token", value_name = "TOKEN")]
+        #[arg(
+            long = "sender-token",
+            value_name = "TOKEN",
+            allow_hyphen_values = true
+        )]
         sender_token: Option<String>,
         /// Read the sender token from this file (contents trimmed). Avoids
         /// echoing the raw token on the command line. Overrides
@@ -65010,6 +65014,46 @@ startup_timeout_sec = 42
                 action: MailCommand::Status { project_path },
             } => assert_eq!(project_path, PathBuf::from("/tmp/proj")),
             other => panic!("expected Mail Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_mail_send_hyphen_prefixed_sender_token() {
+        for token in ["-F_native-token", "--native-token", "ordinary_native-token"] {
+            let cli = Cli::try_parse_from([
+                "am",
+                "mail",
+                "send",
+                "--project",
+                "/tmp/proj",
+                "--from",
+                "BlueLake",
+                "--to",
+                "RedFox",
+                "--subject",
+                "Release",
+                "--body",
+                "Ready",
+                "--sender-token",
+                token,
+                "--topic",
+                "release.v31",
+            ])
+            .expect("sender credentials are opaque values, including leading hyphens");
+            match cli.command.expect("expected command") {
+                Commands::Mail {
+                    action:
+                        MailCommand::Send {
+                            sender_token,
+                            topic,
+                            ..
+                        },
+                } => {
+                    assert_eq!(sender_token.as_deref(), Some(token));
+                    assert_eq!(topic.as_deref(), Some("release.v31"));
+                }
+                other => panic!("expected Mail Send, got {other:?}"),
+            }
         }
     }
 
