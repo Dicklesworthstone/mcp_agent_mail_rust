@@ -15,6 +15,42 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Bytes per MiB.
 const MIB: u64 = 1024 * 1024;
 
+/// Read the Windows hard-link count from an already-open file authority.
+///
+/// The capability metadata wrapper supplies stable handle information. Cloning
+/// the handle keeps this independent of subsequent pathname replacement.
+#[cfg(windows)]
+pub fn windows_file_link_count(file: &std::fs::File) -> io::Result<u64> {
+    let retained = cap_std::fs::File::from_std(file.try_clone()?);
+    Ok(cap_fs_ext::MetadataExt::nlink(&retained.metadata()?))
+}
+
+/// Move a Windows filesystem object without replacing an occupied name.
+///
+/// Do not enable replacement or cross-volume copy/delete, and do not alter
+/// source attributes before attempting the move. Unsupported path encodings
+/// fail before calling the string-based Windows wrapper.
+#[cfg(windows)]
+pub fn windows_rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    fn checked_path(path: &Path) -> io::Result<&str> {
+        path.to_str()
+            .filter(|text| !text.contains('\0'))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Windows recovery move requires Unicode paths without NUL bytes",
+                )
+            })
+    }
+
+    winsafe::MoveFileEx(
+        checked_path(source)?,
+        Some(checked_path(destination)?),
+        winsafe::co::MOVEFILE::WRITE_THROUGH,
+    )
+    .map_err(|error| io::Error::from_raw_os_error(error.raw().cast_signed()))
+}
+
 /// Return whether `path` is one of macOS's protected compatibility aliases.
 ///
 /// macOS presents `/var`, `/tmp`, and `/etc` as root-owned symlinks into
@@ -1187,6 +1223,61 @@ pub fn is_platform_temp_firmlink(link: &Path, resolved: &Path) -> bool {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_link_count_tracks_the_handle_after_path_replacement() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        let alias = dir.path().join("alias");
+        let moved = dir.path().join("moved");
+        std::fs::write(&source, b"original").unwrap();
+        let authority = open_regular_file_no_follow(&source).unwrap();
+        assert_eq!(windows_file_link_count(&authority).unwrap(), 1);
+        std::fs::hard_link(&source, &alias).unwrap();
+        windows_rename_noreplace(&source, &moved).unwrap();
+        std::fs::write(&source, b"replacement").unwrap();
+
+        assert_eq!(windows_file_link_count(&authority).unwrap(), 2);
+        let replacement = open_regular_file_no_follow(&source).unwrap();
+        assert_eq!(windows_file_link_count(&replacement).unwrap(), 1);
+        assert_eq!(std::fs::read(&alias).unwrap(), b"original");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_move_collision_preserves_readonly_source_and_destination() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        std::fs::write(&source, b"source bytes").unwrap();
+        std::fs::write(&destination, b"sentinel bytes").unwrap();
+        let mut permissions = std::fs::metadata(&source).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&source, permissions).unwrap();
+
+        let error = windows_rename_noreplace(&source, &destination).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(std::fs::metadata(&source).unwrap().permissions().readonly());
+        assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"sentinel bytes");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_move_rejects_nul_before_touching_the_source() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        std::fs::write(&source, b"source bytes").unwrap();
+        let mut nul_destination = destination.as_os_str().to_os_string();
+        nul_destination.push("\0suffix");
+
+        let error = windows_rename_noreplace(&source, Path::new(&nul_destination)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
+        assert!(!destination.exists());
+    }
 
     #[test]
     fn bounded_control_file_read_rejects_oversized_input() {

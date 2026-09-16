@@ -277,12 +277,7 @@ fn breaker_authority_link_count(file: &std::fs::File) -> std::io::Result<u64> {
 
     #[cfg(windows)]
     {
-        // Stable Rust does not expose BY_HANDLE_FILE_INFORMATION's link count.
-        // Keep the existing Windows breaker path available; a follow-up must
-        // add a safe stable wrapper before this platform can reject hard links
-        // as strictly as Unix does.
-        let _ = file;
-        Ok(1)
+        mcp_agent_mail_core::disk::windows_file_link_count(file)
     }
 
     #[cfg(not(any(unix, windows)))]
