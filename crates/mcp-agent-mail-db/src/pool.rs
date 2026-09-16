@@ -10881,11 +10881,7 @@ pub(crate) fn recovery_file_link_count(file: &std::fs::File) -> std::io::Result<
 
     #[cfg(windows)]
     {
-        let _ = file;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "stable Windows cannot prove exclusive recovery candidate hard-link ownership",
-        ))
+        mcp_agent_mail_core::disk::windows_file_link_count(file)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -13242,7 +13238,8 @@ fn copy_file_without_overwrite(source: &Path, destination: &Path) -> std::io::Re
 
 /// Atomically move one filesystem object without replacing an occupied target.
 ///
-/// Linux and Apple targets use the kernel's no-replace rename primitive.
+/// Linux and Apple targets use the kernel's no-replace rename primitive;
+/// Windows uses MoveFileEx without replacement or cross-volume copy flags.
 /// Platforms without a safe atomic primitive fail closed: a
 /// hard-link-then-unlink fallback is not a move because an unlink failure can
 /// leave the source and destination aliasing one inode. In particular,
@@ -13275,11 +13272,7 @@ pub fn rename_noreplace_preserving_source(
 
     #[cfg(windows)]
     {
-        let _ = (source, destination);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "atomic no-replace recovery move is unavailable on Windows",
-        ))
+        mcp_agent_mail_core::disk::windows_rename_noreplace(source, destination)
     }
 
     #[cfg(not(any(

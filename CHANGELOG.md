@@ -40,6 +40,12 @@ reviewed through 2026-09-15. These changes are not published release artifacts.
 
 ### Fixed
 
+- **Stdio clients can propose newer MCP protocol versions.** Initialization
+  negotiates the supported version and leaves a usable session instead of
+  rejecting a valid proposal before negotiation. Malformed proposals and
+  messages mixing incompatible protocol eras still fail explicitly.
+  ([#321](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/321),
+  [implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/eb90c26c))
 - **Setup refuses to overwrite a token file changed during configuration.**
   Token resolution retains the original file contents, identity, and parent
   directory authority through the save. Concurrent edits, replacements, and

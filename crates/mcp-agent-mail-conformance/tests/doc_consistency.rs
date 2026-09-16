@@ -389,7 +389,6 @@ fn live_docs_reject_stale_search_naming() {
 }
 
 #[test]
-#[ignore = "Demonstrates that an intentional README count mutation is caught by the guard"]
 fn intentionally_mutated_readme_is_rejected() {
     let counts = live_counts();
     let readme = read_file(workspace_root().join(README_RELATIVE));
@@ -414,4 +413,47 @@ fn intentionally_mutated_readme_is_rejected() {
         err.contains("README hero tool count"),
         "negative test should report the failing claim: {err}"
     );
+}
+
+/// Validate plain doctor command examples against the shipped CLI.
+///
+/// Recipes can include trailing redirection or a pipeline. Parse their argv;
+/// do not execute a doctor's repair while validating documentation.
+fn validate_doctor_recipes(doc: &str) -> Result<usize, String> {
+    use clap::CommandFactory;
+
+    let mut checked = 0;
+    for (index, line) in doc.lines().enumerate() {
+        let line = line.trim();
+        if !line.starts_with("am doctor ") {
+            continue;
+        }
+        let args: Vec<_> = line
+            .split_whitespace()
+            .take_while(|word| !word.starts_with(['|', '>', '<', '#']) && !word.starts_with("2>"))
+            .collect();
+        mcp_agent_mail_cli::Cli::command()
+            .try_get_matches_from(args)
+            .map_err(|error| format!("invalid doctor recipe on line {}: {error}", index + 1))?;
+        checked += 1;
+    }
+    Ok(checked)
+}
+
+#[test]
+fn release_doctor_recipes_parse_with_live_cli() {
+    for relative in ["docs/RELEASE_CHECKLIST.md", "docs/ROLLOUT_PLAYBOOK.md"] {
+        let doc = read_file(workspace_root().join(relative));
+        let count =
+            validate_doctor_recipes(&doc).unwrap_or_else(|error| panic!("{relative}: {error}"));
+        assert!(count > 0, "{relative}: no doctor recipes were checked");
+
+        // Reproduce the obsolete placement of --json on the doctor root.
+        let mutated = doc.replace("am doctor check --json", "am doctor --json");
+        assert_ne!(mutated, doc, "{relative}: negative control did not mutate");
+        assert!(
+            validate_doctor_recipes(&mutated).is_err(),
+            "{relative}: obsolete doctor syntax escaped the CLI parser"
+        );
+    }
 }

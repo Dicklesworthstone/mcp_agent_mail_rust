@@ -277,12 +277,7 @@ fn breaker_authority_link_count(file: &std::fs::File) -> std::io::Result<u64> {
 
     #[cfg(windows)]
     {
-        // Stable Rust does not expose BY_HANDLE_FILE_INFORMATION's link count.
-        // Keep the existing Windows breaker path available; a follow-up must
-        // add a safe stable wrapper before this platform can reject hard links
-        // as strictly as Unix does.
-        let _ = file;
-        Ok(1)
+        mcp_agent_mail_core::disk::windows_file_link_count(file)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -1004,6 +999,49 @@ mod tests {
                 & 0o777,
             0o400
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hard_linked_breaker_authority_preserves_sentinels() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let db = td.path().join("storage.sqlite3");
+        std::fs::write(&db, b"content").unwrap();
+        let state = cleared_state(&fingerprint_db(&db));
+
+        for (authority, sentinel, contents) in [
+            (
+                breaker_lock_path(&db),
+                td.path().join("lock-sentinel"),
+                b"lock evidence".as_slice(),
+            ),
+            (
+                breaker_sidecar_path(&db),
+                td.path().join("state-sentinel"),
+                b"state evidence".as_slice(),
+            ),
+        ] {
+            std::fs::write(&sentinel, contents).unwrap();
+            std::fs::hard_link(&sentinel, &authority).unwrap();
+            let mut permissions = std::fs::metadata(&sentinel).unwrap().permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&sentinel, permissions).unwrap();
+
+            let error = if authority == breaker_lock_path(&db) {
+                try_acquire_file_lock(&db).unwrap_err()
+            } else {
+                store(&db, &state).unwrap_err()
+            };
+            assert!(error.to_string().contains("hard links"), "{error}");
+            assert!(
+                std::fs::metadata(&sentinel)
+                    .unwrap()
+                    .permissions()
+                    .readonly()
+            );
+            assert_eq!(std::fs::read(&sentinel).unwrap(), contents);
+            assert_eq!(std::fs::read(&authority).unwrap(), contents);
+        }
     }
 
     #[test]

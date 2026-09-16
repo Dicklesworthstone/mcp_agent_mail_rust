@@ -774,6 +774,7 @@ pub fn resolve_token(explicit: Option<&str>, env_file: &Path) -> Result<String, 
 }
 
 /// A setup token bound to the file generation from which it was resolved.
+///
 /// Explicit tokens choose the replacement value, but do not bypass concurrent
 /// edits or unsafe file authorities. This intentionally does not implement
 /// `Debug`: its contents include a credential.
