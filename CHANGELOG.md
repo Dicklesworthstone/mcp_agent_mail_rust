@@ -40,6 +40,17 @@ reviewed through 2026-09-15. These changes are not published release artifacts.
 
 ### Fixed
 
+- **Share snapshots preserve an occupied destination.** Publication now uses
+  an atomic no-clobber operation, retains the private completed image when
+  publication fails, and flushes the parent directory on Unix before reporting
+  success. Collision and durability failures remain explicit.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f0970cf0))
+- **End-to-end checks isolate their artifacts and mailbox state.** HTTP
+  subsuites write separate traces; guard fixtures respect active reservations;
+  macro sessions complete the MCP handshake and wait for actual responses.
+  Missing responses no longer count as successful macro calls.
+  ([HTTP](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/c7a530a9),
+  [guard and macros](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/db4cade2))
 - **Stdio clients can propose newer MCP protocol versions.** Initialization
   negotiates the supported version and leaves a usable session instead of
   rejecting a valid proposal before negotiation. Malformed proposals and
