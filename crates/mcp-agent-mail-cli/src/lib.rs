@@ -51915,7 +51915,7 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
-    fn migrate_output_matches_legacy_lines_exactly() {
+    fn migrate_output_preserves_database_and_recommends_doctor() {
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -51947,7 +51947,7 @@ http_headers = { Authorization = "Bearer secret" }
                     .copied()
                     .filter(|line| {
                         line.contains("Database schema created")
-                            || line.contains("delete storage.sqlite3")
+                            || line.contains("Keep the database and migration backup")
                     })
                     .collect();
                 assert_eq!(
@@ -51962,9 +51962,14 @@ http_headers = { Authorization = "Bearer secret" }
                     migrate_lines[0]
                 );
                 assert!(
-                    migrate_lines[1].contains("delete storage.sqlite3"),
+                    migrate_lines[1]
+                        == "Keep the database and migration backup; run `am doctor check` if problems remain.",
                     "line 1: {:?}",
                     migrate_lines[1]
+                );
+                assert!(
+                    !out.contains("delete storage.sqlite3"),
+                    "migration must never recommend deleting the database: {out}"
                 );
             },
         );
