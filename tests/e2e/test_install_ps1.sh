@@ -546,4 +546,47 @@ try {
 }
 '
 
+e2e_case_banner "Archive members permit release documentation without weakening safety"
+run_pwsh_case \
+    "case_archive_documentation" \
+    "ZIP inventory permits optional docs and rejects unexpected, duplicate, nested, or linked members" \
+'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($InstallPath, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw "installer parse errors" }
+$fn = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | Where-Object Name -eq "Assert-ExactArchiveMembers" | Select-Object -First 1
+Invoke-Expression $fn.Extent.Text
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$root = Join-Path ([System.IO.Path]::GetTempPath()) ("am-archive-docs-" + [guid]::NewGuid().ToString("N"))
+[void][System.IO.Directory]::CreateDirectory($root)
+$cases = @(
+    @{ Name="exact"; Entries=@("am.exe", "mcp-agent-mail.exe"); Accept=$true },
+    @{ Name="docs"; Entries=@("am.exe", "mcp-agent-mail.exe", "README.md", "LICENSE"); Accept=$true },
+    @{ Name="readme"; Entries=@("am.exe", "mcp-agent-mail.exe", "README.md"); Accept=$true },
+    @{ Name="duplicate"; Entries=@("am.exe", "mcp-agent-mail.exe", "README.md", "README.md"); Accept=$false },
+    @{ Name="extra"; Entries=@("am.exe", "mcp-agent-mail.exe", "README.txt"); Accept=$false },
+    @{ Name="nested"; Entries=@("am.exe", "mcp-agent-mail.exe", "../README.md"); Accept=$false },
+    @{ Name="missing"; Entries=@("am.exe", "README.md", "LICENSE"); Accept=$false },
+    @{ Name="link"; Entries=@("am.exe", "mcp-agent-mail.exe", "README.md"); Accept=$false }
+)
+foreach ($case in $cases) {
+    $path = Join-Path $root ($case.Name + ".zip")
+    $zip = [System.IO.Compression.ZipFile]::Open($path, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($name in $case.Entries) {
+            $entry = $zip.CreateEntry($name)
+            $writer = [System.IO.StreamWriter]::new($entry.Open())
+            try { $writer.Write("release fixture") } finally { $writer.Dispose() }
+            if ($case.Name -eq "link" -and $name -eq "README.md") { $entry.ExternalAttributes = -1577123840 }
+        }
+    } finally { $zip.Dispose() }
+    $accepted = $true
+    try { Assert-ExactArchiveMembers -ArchivePath $path } catch { $accepted = $false }
+    if ($accepted -ne $case.Accept) { throw "wrong archive verdict for $($case.Name)" }
+}
+Write-Host "All eight archive cases passed; retained $root"
+'
+
 e2e_summary

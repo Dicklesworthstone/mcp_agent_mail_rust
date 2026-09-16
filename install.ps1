@@ -515,13 +515,15 @@ function Assert-ExactArchiveMembers {
         $entries = @($archive.Entries)
         $names = @($entries | ForEach-Object { $_.FullName })
         $namesAreExact = (
-            $entries.Count -eq 2 -and
+            $entries.Count -ge 2 -and $entries.Count -le 4 -and
             $names -ccontains "am.exe" -and
-            $names -ccontains "mcp-agent-mail.exe"
+            $names -ccontains "mcp-agent-mail.exe" -and
+            @($names | Where-Object { $_ -cnotin @("am.exe", "mcp-agent-mail.exe", "README.md", "LICENSE") }).Count -eq 0 -and
+            @($names | Sort-Object -Unique -CaseSensitive).Count -eq $entries.Count
         )
         if (-not $namesAreExact) {
             $observed = if ($names.Count -eq 0) { "<empty>" } else { $names -join ", " }
-            throw "Release archive members are '$observed'; expected exactly flat am.exe and mcp-agent-mail.exe."
+            throw "Release archive members are '$observed'; expected flat am.exe and mcp-agent-mail.exe with optional README.md and LICENSE, without duplicates."
         }
 
         foreach ($entry in $entries) {

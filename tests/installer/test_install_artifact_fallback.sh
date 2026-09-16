@@ -58,6 +58,8 @@ extract_function() {
     echo 'LOG_FILE=/tmp/unused-installer-verification-test.log'
     echo 'ISSUES_URL=https://example.invalid/issues'
     echo 'COSIGN_BIN='
+    echo 'MINISIGN_TRUST_MIN_VERSION=0.3.31'
+    echo 'RELEASE_TRUST_MODEL='
     echo 'BINARY_TRANSACTION_ACTIVE_INSTALL_DIR='
     echo 'BINARY_TRANSACTION_RECOVERY_ACTIVE=0'
     echo 'BINARY_TRANSACTION_EXIT_RECOVERY_ATTEMPTED=0'
@@ -87,6 +89,7 @@ extract_function() {
     extract_function error_support_hint
     echo 'verbose() { :; }'
     extract_function establish_release_contract
+    extract_function establish_release_trust_model
     extract_function capture_command_with_timeout
     extract_function set_artifact_url
     extract_function artifact_url_for_target_ext
@@ -625,7 +628,9 @@ CHECKSUM="${CHECKSUM_OVERRIDE:-}"
 CHECKSUM_URL=""
 SIGSTORE_BUNDLE_URL=""
 COSIGN_OIDC_ISSUER='https://token.actions.githubusercontent.com'
-VERSION="${REQUESTED_VERSION:-v9.9.9}"
+# These witness cases exercise the legacy Sigstore path; modern minisign is
+# covered by the real signed release installer and updater checks.
+VERSION="${REQUESTED_VERSION:-v0.3.30}"
 establish_release_contract
 
 download_to_file() {
@@ -678,7 +683,7 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
     archive_sha256=$(shasum -a 256 "$archive_file" | awk '{print $1}')
 fi
-artifact_url="https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/download/v9.9.9/$archive_name"
+artifact_url="https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/download/v0.3.30/$archive_name"
 
 run_verification_case() {
     local name="$1"
@@ -689,10 +694,10 @@ run_verification_case() {
         ARCHIVE_SHA256="$archive_sha256" ARTIFACT_NAME="$archive_name" \
         ARTIFACT_URL="$artifact_url" COSIGN_LOG="$tmp/$name.cosign.log" \
         CHECKSUM_OVERRIDE="${CHECKSUM_OVERRIDE:-}" WITNESS_MODE="${WITNESS_MODE:-valid}" \
-        REQUESTED_VERSION="${REQUESTED_VERSION:-v9.9.9}" \
+        REQUESTED_VERSION="${REQUESTED_VERSION:-v0.3.30}" \
         COSIGN_VERSION_MODE="${COSIGN_VERSION_MODE:-normal}" \
         COSIGN_VERSION_OUTPUT="${COSIGN_VERSION_OUTPUT:-GitVersion: v3.1.3}" \
-        COSIGN_CERTIFICATE_IDENTITY="${COSIGN_CERTIFICATE_IDENTITY:-https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/v9.9.9}" \
+        COSIGN_CERTIFICATE_IDENTITY="${COSIGN_CERTIFICATE_IDENTITY:-https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/v0.3.30}" \
         COSIGN_VERIFY_RC="${COSIGN_VERIFY_RC:-0}" \
         SIGSTORE_ROOT_FILE="${SIGSTORE_ROOT_FILE:-}" \
         SIGSTORE_REKOR_PUBLIC_KEY="${SIGSTORE_REKOR_PUBLIC_KEY:-}" \
@@ -842,7 +847,7 @@ printf '%s\n' \
     '--bundle' \
     "$tmp/verify_success/release.sigstore.json" \
     '--certificate-identity' \
-    'https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/v9.9.9' \
+    'https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/v0.3.30' \
     '--certificate-oidc-issuer' \
     'https://token.actions.githubusercontent.com' \
     "$archive_file" >"$expected_cosign_log"
@@ -882,9 +887,9 @@ for invalid_version in 'v9.9.9+build' 'release-v9.9.9' 'v9.9.9/../../other'; do
 done
 
 if CHECKSUM_OVERRIDE="$archive_sha256" WITNESS_MODE=valid COSIGN_VERIFY_RC=0 \
-    COSIGN_CERTIFICATE_IDENTITY='https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/v9.9.8' \
+    COSIGN_CERTIFICATE_IDENTITY='https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/v0.3.29' \
     run_verification_case verify_wrong_tag bash; then
-    echo "FAIL: a valid older-tag certificate must not authenticate v9.9.9" >&2
+    echo "FAIL: a valid older-tag certificate must not authenticate v0.3.30" >&2
     exit 1
 fi
 if ! grep -q 'Sigstore verification failed' "$tmp/verify_wrong_tag.out"; then
@@ -944,6 +949,14 @@ tar -cf "$member_root/extra.tar" -C "$member_root/extra" am mcp-agent-mail READM
 tar -cf "$member_root/nested.tar" -C "$member_root/nested" bundle/am bundle/mcp-agent-mail
 tar -cf "$member_root/missing.tar" -C "$member_root/missing" am
 tar -cf "$member_root/symlink.tar" -C "$member_root/symlink" am mcp-agent-mail
+printf '%s\n' documentation >"$member_root/exact/README.md"
+printf '%s\n' license >"$member_root/exact/LICENSE"
+tar -cf "$member_root/documented.tar" -C "$member_root/exact" am mcp-agent-mail README.md LICENSE
+tar -cf "$member_root/readme-only.tar" -C "$member_root/exact" am mcp-agent-mail README.md
+tar -cf "$member_root/duplicate-doc.tar" -C "$member_root/exact" am mcp-agent-mail README.md README.md
+tar -cf "$member_root/duplicate-binary.tar" -C "$member_root/exact" am mcp-agent-mail am
+ln -s "$member_root/exact/README.md" "$member_root/symlink/README.md"
+tar -cf "$member_root/symlink-doc.tar" -C "$member_root/exact" am mcp-agent-mail -C "$member_root/symlink" README.md
 
 run_member_case() {
     local archive="$1"
@@ -958,7 +971,9 @@ run_member_case() {
 }
 
 run_member_case "$member_root/exact.tar"
-for bad_archive in extra nested missing symlink; do
+run_member_case "$member_root/documented.tar"
+run_member_case "$member_root/readme-only.tar"
+for bad_archive in extra nested missing symlink duplicate-doc duplicate-binary symlink-doc; do
     if run_member_case "$member_root/$bad_archive.tar"; then
         echo "FAIL: $bad_archive archive inventory must be rejected" >&2
         exit 1
@@ -1691,7 +1706,8 @@ for required_text in \
     '"--certificate-identity", $CosignIdentity' \
     "'^v?(?<version>[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?)$'" \
     '$CosignIdentity = $releaseContract.CertificateIdentity' \
-    '$entries.Count -eq 2' \
+    '$entries.Count -ge 2 -and $entries.Count -le 4' \
+    'Sort-Object -Unique -CaseSensitive' \
     '$versions.Count -ne 1' \
     'Assert-ExactBinaryVersion -BinaryPath $serverSource -ExpectedOutput "mcp-agent-mail $requestedNormalized" -Phase "Staged"' \
     'Assert-ExactBinaryVersion -BinaryPath $serverExe -ExpectedOutput "mcp-agent-mail $ExpectedVersion" -Phase "Post-install"' \
@@ -1704,7 +1720,7 @@ for required_text in \
     '-PostInstallVerifier $postInstallVerifier' \
     'Installed binary bytes differ from the verified staged pair.' \
     'Archive-member and exact-version checks remain mandatory.' \
-    'UNSAFE: archive checksum and Sigstore verification skipped (-NoVerify)' \
+    'UNSAFE: archive checksum and signature verification skipped (-NoVerify)' \
     'malicious bytes can run arbitrary code.'; do
     if ! grep -Fq -- "$required_text" "$INSTALL_PS1"; then
         echo "FAIL: PowerShell fail-closed control missing: $required_text" >&2

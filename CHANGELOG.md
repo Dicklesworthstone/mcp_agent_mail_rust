@@ -6,20 +6,10 @@ Versions marked **[Release]** have published [GitHub Releases](https://github.co
 
 Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_PLAN.md), and per-release sign-off packets should start from [docs/RELEASE_READINESS_TEMPLATE.md](docs/RELEASE_READINESS_TEMPLATE.md).
 
-**Scope window:** the latest evidence review covers
-[v0.3.33 → v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.33...v0.3.34),
-including publication and the adjacent container-history correction. Earlier
-entries are retained. This review uses git diffs, tag targets, GitHub release
-metadata, checked-in Beads records, and executed release receipts; dates in the
-recent timeline are GitHub publication dates in UTC.
-The additional review on 2026-09-09 covers the configuration fixes after the
-v0.3.35 tag and OMP runtime detection below. The 2026-09-11 review adds the
-br-2xdhw search workstream and CLI issue fixes, and refreshes publication
-metadata: v0.3.35 was published on 2026-09-09 and is the latest GitHub Release.
-The 2026-09-12 review checks the remaining post-tag import and contact changes;
-the next release and dependency validation are still in progress.
-The 2026-09-15 review adds release-test reliability changes and rechecks the
-published v0.3.35 asset inventory. Unreleased source is not a completed release.
+The latest review covers [v0.3.35 → v0.3.36](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.35...v0.3.36)
+and the installer correction on `main`. Entries use git diffs, tag targets,
+GitHub publication metadata, Beads records, and executed release receipts.
+Publication dates are UTC; post-tag installer changes are identified separately.
 
 ## Release Timeline
 
@@ -27,6 +17,7 @@ Recent releases; the earlier version history continues below.
 
 | Version | Published (UTC) | Status | Delivered capability |
 |---------|-----------------|--------|----------------------|
+| [v0.3.36](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.36) | 2026-09-16 | **Release** | Windows/WAL recovery, contention and search fixes; six signed platform archives and matching GHCR images |
 | [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.35) | 2026-09-09 | **Release** | Lifecycle tokens over HTTP (PR #310 option c); bounded tmux probe readers; six-platform binary assets |
 | [v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.34) | 2026-09-08 | **Release** | Windows UNC snapshots, bounded tmux identity probes, six-platform binaries and matching GHCR images |
 | [v0.3.33](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.33) | 2026-09-07 | **Release** | FrankenSQLite 0.3.18 and signed self-update manifest verification |
@@ -35,10 +26,17 @@ Recent releases; the earlier version history continues below.
 
 ## Unreleased
 
-## v0.3.36 — release candidate
+- **The installers on `main` accept the release's documentation files.**
+  Signed DSR archives include `README.md` and `LICENSE` alongside the two
+  binaries. Bash and PowerShell now permit exactly those optional regular
+  files, while rejecting unexpected paths, duplicate entries, missing binaries,
+  and links. This correction follows the v0.3.36 tag: use the documented
+  installer URL on `main`, not the installer script frozen at that tag.
+
+## v0.3.36 — 2026-09-16 [Release]
 
 Changes after the [v0.3.35 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.35),
-reviewed through 2026-09-16. These changes are not published release artifacts.
+reviewed through 2026-09-16 and published as six platform archives.
 
 ### Fixed
 
@@ -304,7 +302,16 @@ reviewed through 2026-09-16. These changes are not published release artifacts.
 - The final pre-version-bump workspace run passed **17,547 tests**, with
   **36 existing skips** and no failures. The recorded source remained unchanged
   throughout the run. Workspace/all-target check, strict Clippy, and formatting
-  checks passed. Cross-platform release binaries and publication are pending.
+  checks passed. All six released targets passed runtime checks: native Linux
+  x86_64 GNU/musl, GNU ARM64 under QEMU, native Windows, native Apple Silicon,
+  and Intel Mac under Rosetta. Both container architectures passed 22 real
+  HTTP/persistence checks. Signed v0.3.35-to-v0.3.36 upgrade and forced reinstall
+  preserved the existing mailbox and archive. GitHub assets were downloaded
+  anonymously and verified against the established minisign key.
+- **Mac builds require macOS 13 or newer.** Zig crashed during final linking;
+  LLVM 22 successfully linked the preserved optimized objects through RCH.
+  The minimum matches the native dependencies' deployment target. Linux GNU
+  builds require glibc 2.28; the musl build is static. No GitHub Actions ran.
 - **Fresh-install tests preserve the doctor's actual exit status.** Healthy
   output and reported findings are checked separately, and panic output cannot
   pass as an expected findings exit. Structured traces retain both the actual

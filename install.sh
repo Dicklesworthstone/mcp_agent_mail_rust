@@ -8123,7 +8123,8 @@ verify_release_archive() {
 }
 
 # Verify the archive inventory without extracting it. Release archives are
-# deliberately flat and contain exactly two non-empty regular files. This gate
+# deliberately flat and contain the two binaries plus optional README/LICENSE
+# regular files emitted by DSR. This gate
 # remains mandatory under --no-verify: that flag bypasses cryptographic witness
 # verification, not archive-shape safety or release-version identity.
 verify_archive_members_exact() {
@@ -8137,12 +8138,14 @@ verify_archive_members_exact() {
     return 1
   fi
 
-  actual_members=$(LC_ALL=C sort "$members_file")
+  actual_members=$(awk '$0 != "README.md" && $0 != "LICENSE"' "$members_file" | LC_ALL=C sort)
   expected_members=$(printf '%s\n' "$BIN_CLI" "$BIN_SERVER" | LC_ALL=C sort)
   member_count=$(wc -l <"$members_file" | tr -d '[:space:]')
-  if [ "$member_count" != "2" ] || [ "$actual_members" != "$expected_members" ]; then
+  if [ "$member_count" -lt 2 ] || [ "$member_count" -gt 4 ] || \
+    [ "$actual_members" != "$expected_members" ] || \
+    [ "$(LC_ALL=C sort -u "$members_file" | wc -l | tr -d '[:space:]')" != "$member_count" ]; then
     err "Release archive members are invalid."
-    err "Expected exactly the flat files: $BIN_CLI and $BIN_SERVER"
+    err "Expected flat $BIN_CLI and $BIN_SERVER, with optional README.md and LICENSE (no duplicates)."
     return 1
   fi
 
@@ -8151,8 +8154,8 @@ verify_archive_members_exact() {
     return 1
   fi
   regular_count=$(awk 'substr($0, 1, 1) == "-" { count++ } END { print count + 0 }' "$details_file")
-  if [ "$regular_count" != "2" ]; then
-    err "Release archive must contain exactly two regular files (no links or directories)."
+  if [ "$regular_count" != "$member_count" ]; then
+    err "Release archive members must all be regular files (no links or directories)."
     return 1
   fi
 
