@@ -13947,11 +13947,28 @@ fn allocate_reconstruction_quarantine_path(
 
 #[allow(clippy::result_large_err)]
 fn rollback_quarantined_candidate_moves(moved: &[(PathBuf, PathBuf)]) -> Result<(), SqlError> {
+    rollback_quarantined_candidate_moves_with_sync(moved, sync_recovery_parent)
+}
+
+#[allow(clippy::result_large_err)]
+fn rollback_quarantined_candidate_moves_with_sync(
+    moved: &[(PathBuf, PathBuf)],
+    mut sync_parent: impl FnMut(&Path) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
     let mut rollback_errors = Vec::new();
-    let mut restored_any = false;
+    let mut restored_parents = Vec::new();
     for (source, target) in moved.iter().rev() {
         match rename_noreplace_preserving_source(target, source) {
-            Ok(()) => restored_any = true,
+            Ok(()) => {
+                for path in [source, target] {
+                    if !restored_parents
+                        .iter()
+                        .any(|prior: &&PathBuf| prior.parent() == path.parent())
+                    {
+                        restored_parents.push(path);
+                    }
+                }
+            }
             Err(error) => {
                 rollback_errors.push(format!(
                     "{} -> {}: {error}",
@@ -13961,14 +13978,13 @@ fn rollback_quarantined_candidate_moves(moved: &[(PathBuf, PathBuf)]) -> Result<
             }
         }
     }
-    if restored_any
-        && let Some((source, _)) = moved.first()
-        && let Err(error) = sync_recovery_parent(source)
-    {
-        rollback_errors.push(format!(
-            "failed to durably sync restored SQLite family beside {}: {error}",
-            source.display()
-        ));
+    for path in restored_parents {
+        if let Err(error) = sync_parent(path) {
+            rollback_errors.push(format!(
+                "failed to durably sync restored SQLite family beside {}: {error}",
+                path.display()
+            ));
+        }
     }
     if rollback_errors.is_empty() {
         Ok(())
@@ -22205,6 +22221,66 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&second_source).unwrap(), b"second generation");
         assert_eq!(std::fs::read(&destination).unwrap(), b"new generation");
+    }
+
+    #[test]
+    fn quarantine_rollback_preserves_collision_and_syncs_independent_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut moved = Vec::new();
+        for name in ["first", "collision", "last"] {
+            let parent = dir.path().join(name);
+            std::fs::create_dir(&parent).unwrap();
+            let source = parent.join("source.sqlite3");
+            let target = parent.join("quarantined.sqlite3");
+            std::fs::write(&target, name.as_bytes()).unwrap();
+            moved.push((source, target));
+        }
+        std::fs::write(&moved[1].0, b"new evidence").unwrap();
+        let mut synced = Vec::new();
+        let error = rollback_quarantined_candidate_moves_with_sync(&moved, |path| {
+            sync_recovery_parent(path)?;
+            synced.push(path.parent().unwrap().to_path_buf());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("collision"));
+        assert_eq!(std::fs::read(&moved[1].0).unwrap(), b"new evidence");
+        assert_eq!(std::fs::read(&moved[1].1).unwrap(), b"collision");
+        for (index, contents) in [(0, b"first".as_slice()), (2, b"last".as_slice())] {
+            assert_eq!(std::fs::read(&moved[index].0).unwrap(), contents);
+            assert!(!moved[index].1.exists());
+            assert!(synced.contains(&moved[index].0.parent().unwrap().to_path_buf()));
+        }
+        assert_eq!(synced.len(), 2);
+    }
+
+    #[test]
+    fn quarantine_rollback_reports_sync_failure_and_still_syncs_other_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let original_parent = dir.path().join("original");
+        let quarantine_parent = dir.path().join("quarantine");
+        std::fs::create_dir(&original_parent).unwrap();
+        std::fs::create_dir(&quarantine_parent).unwrap();
+        let source = original_parent.join("source.sqlite3");
+        let target = quarantine_parent.join("source.sqlite3");
+        std::fs::write(&target, b"retained generation").unwrap();
+        let mut synced = Vec::new();
+        let error = rollback_quarantined_candidate_moves_with_sync(
+            &[(source.clone(), target.clone())],
+            |path| {
+                synced.push(path.parent().unwrap().to_path_buf());
+                if path.parent() == Some(original_parent.as_path()) {
+                    Err(SqlError::Custom("injected parent sync failure".to_owned()))
+                } else {
+                    sync_recovery_parent(path)
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected parent sync failure"));
+        assert_eq!(std::fs::read(&source).unwrap(), b"retained generation");
+        assert!(!target.exists());
+        assert_eq!(synced, [original_parent, quarantine_parent]);
     }
 
     #[cfg(unix)]
