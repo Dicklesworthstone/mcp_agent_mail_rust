@@ -35,11 +35,23 @@ Recent releases; the earlier version history continues below.
 
 ## Unreleased
 
+## v0.3.36 — release candidate
+
 Changes after the [v0.3.35 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.35),
 reviewed through 2026-09-16. These changes are not published release artifacts.
 
 ### Fixed
 
+- **Filesystem and TUI regression tests use private, real fixtures.** Missing
+  paths no longer depend on host-global directories, permission-denial tests
+  drop root privileges before attempting writes, and healthy TUI snapshots
+  initialize a real database. Existing golden output remains unchanged.
+  ([tests](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/eeff5d0f))
+- **Explicit sender credentials accept leading hyphens.** Generated tokens
+  beginning with `-` are now accepted as `--sender-token` values instead of
+  being parsed as command-line options. Following options still parse normally;
+  token validation and explicit-identity requirements are unchanged.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/2a00d06b))
 - **Windows recovery can flush and reopen promoted databases.** Recovery now
   opens directory and database flush handles with the write access Windows
   requires, without truncating their contents. SQLite path validation waits
@@ -289,6 +301,10 @@ reviewed through 2026-09-16. These changes are not published release artifacts.
 
 ### Release verification
 
+- The final pre-version-bump workspace run passed **17,547 tests**, with
+  **36 existing skips** and no failures. The recorded source remained unchanged
+  throughout the run. Workspace/all-target check, strict Clippy, and formatting
+  checks passed. Cross-platform release binaries and publication are pending.
 - **Fresh-install tests preserve the doctor's actual exit status.** Healthy
   output and reported findings are checked separately, and panic output cannot
   pass as an expected findings exit. Structured traces retain both the actual
