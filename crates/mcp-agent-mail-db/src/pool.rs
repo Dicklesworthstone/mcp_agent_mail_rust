@@ -28554,11 +28554,13 @@ mod tests {
 
     /// Restores a directory's permissions when dropped so a failed assertion
     /// never leaves the tempdir undeletable.
+    #[cfg(unix)]
     struct RestoreDirMode {
         path: PathBuf,
         mode: u32,
     }
 
+    #[cfg(unix)]
     impl Drop for RestoreDirMode {
         fn drop(&mut self) {
             use std::os::unix::fs::PermissionsExt;
@@ -28573,6 +28575,7 @@ mod tests {
     /// created; before this fix that error propagated out of
     /// `ensure_sqlite_file_healthy_with_archive` and failed startup even
     /// though the live database was fine.
+    #[cfg(unix)]
     #[test]
     fn archive_drift_reconcile_failure_keeps_healthy_primary_serving() {
         use std::os::unix::fs::PermissionsExt;
@@ -28744,9 +28747,8 @@ mod tests {
         );
     }
 
-    fn primary_inode(path: &Path) -> u64 {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path).expect("stat primary").ino()
+    fn primary_identity(path: &Path) -> same_file::Handle {
+        same_file::Handle::from_path(path).expect("retain primary file identity")
     }
 
     /// GH#284: an archive that is a couple of messages ahead of a healthy
@@ -28765,7 +28767,7 @@ mod tests {
             "---json\n{\"id\":3,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"Third\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:06:00Z\",\"attachments\":[]}\n---\n\nthird body\n",
         )
         .unwrap();
-        let inode_before = primary_inode(&primary);
+        let identity_before = primary_identity(&primary);
         clear_pending_archive_drift(&primary);
 
         assert!(
@@ -28775,8 +28777,8 @@ mod tests {
         );
         assert_eq!(count_messages(&primary), 3, "both missing messages applied");
         assert_eq!(
-            primary_inode(&primary),
-            inode_before,
+            primary_identity(&primary),
+            identity_before,
             "an incremental apply writes into the live file; a reconstruct would have swapped it"
         );
         assert!(!has_pending_archive_drift(&primary));
@@ -28803,7 +28805,7 @@ mod tests {
         let storage_root = dir.path().join("storage");
         let msg_dir = seed_reconstructed_primary_from_archive(&primary, &storage_root);
         push_archive_ahead(&msg_dir);
-        let inode_before = primary_inode(&primary);
+        let identity_before = primary_identity(&primary);
         clear_pending_archive_drift(&primary);
         let overrides = [("AM_ARCHIVE_DELTA_APPLY_MAX_MESSAGES", "0")];
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(&overrides, || {
@@ -28811,8 +28813,8 @@ mod tests {
         });
         assert_eq!(count_messages(&primary), 2);
         assert_ne!(
-            primary_inode(&primary),
-            inode_before,
+            primary_identity(&primary),
+            identity_before,
             "with the incremental path disabled the reconstructed candidate is promoted"
         );
     }

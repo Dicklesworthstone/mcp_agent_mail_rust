@@ -1,5 +1,41 @@
 # Dependency Upgrade Log
 
+## September 16, 2026 — release qualification update
+
+Version remains 0.3.35; the next application release is not published. This
+section supersedes the current-status statements in the historical September 12
+notes below.
+
+- The original WAL/doctor failures were repaired. The final September 12
+  workspace run at `0259279b` passed **17,510 tests, zero failures, 39 skipped**.
+  That result includes Comrak 0.55.0 and ChaCha20 0.10.2, but does not qualify
+  the subsequent September 15–16 changes.
+- FastMCP remains 0.7.1 with all eight packages pinned to immutable revision
+  `c14d26b49f132625f4141b72669b157467b9aac2`. This backports protocol negotiation
+  for GH #321 while preserving the exact Asupersync 0.4.9 runtime family.
+  The fresh consumer passed 18 stdio assertions and real HTTP initialization
+  for four proposed protocol versions, including subsequent tool discovery.
+- FrankenSQLite remains 0.3.18 with all 20 packages pinned to immutable revision
+  `2633b38a26bde68db23172b12aa402ed698cc309`, published as
+  `am-sql-compat-20260916`. It retains the SQL/WAL compatibility corrections
+  and fixes a Windows namespace probe that compared a file identity with its
+  mutex. Native Windows namespace tests passed 42/42; Linux generation tests
+  passed 3/3 and strict VFS Clippy passed. Adoption changed only the 20 engine
+  source revisions in Cargo.lock; unrelated package versions and edges were
+  preserved.
+- Windows consumer qualification subsequently exposed Unix-only imports in
+  archive recovery test helpers (br-dlurv). The helpers are corrected, but the
+  rebuilt consumer and native recovery tests remain pending. Engine tests alone
+  do not qualify the application.
+- The current Linux full run selects 17,540 tests across 149 binaries and is
+  still running. Current-pin rollback tests, final compiler gates, macOS native
+  qualification, six-platform release binaries, signatures, installation, and
+  venue publication remain open. The retained logs are under
+  `/data/projects/am-release-20260912/`.
+- The unadopted dependency candidates below remain deferred while release bugs
+  are fixed. Their September 12 version research is historical, not a claim
+  that every listed package is still latest or has been individually validated.
+
 ## September 12, 2026 — next release (br-xql74)
 
 Status: in progress; no new version, tag, or publication yet. Baseline source
