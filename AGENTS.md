@@ -80,7 +80,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | Crate | Purpose |
 |-------|---------|
 | `asupersync` (`=0.4.9`, crates.io) | Structured async runtime (channels, sync, regions, HTTP, testing) |
-| `fastmcp-rust` (`0.7.1`, crates.io; imported as `fastmcp`) | MCP protocol implementation (JSON-RPC, stdio, HTTP transport) |
+| `fastmcp-rust` (`0.7.1`, immutable Git backport `c14d26b4`; imported as `fastmcp`) | MCP protocol implementation; full family pinned for legacy stdio version negotiation while retaining Asupersync 0.4.9 |
 | `sqlmodel` (`=0.4.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; the FrankenSQLite driver (`fsqlite =0.3.18`) is the runtime `DbConn` |
 | `sqlmodel-sqlite` (`=0.4.0`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
 | `ftui` / `ftui-*` (`0.5.0`, FrankenTUI) | TUI rendering for operations console |

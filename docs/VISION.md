@@ -2,6 +2,9 @@
 
 > Synthesized from 10 days of user direction (Feb 4-14, 2026).
 > Later statements override earlier ones where they conflict.
+> This is a product-direction document, not a release verification receipt.
+> Current operational safety rules in `AGENTS.md` and accepted ADRs take precedence
+> over the original February ambitions below.
 
 ---
 
@@ -16,7 +19,7 @@
 These principles are non-negotiable and override all other design considerations:
 
 1. **Total Auto** — If something can be detected, configured, or resolved automatically, it must be. Never ask the user to do something the system can do itself.
-2. **Just Works** — Running `am` with no arguments must do everything: kill stale processes on the port, start the server, detect agents, configure MCP, launch the TUI. No manual exports, no env files, no `--flags`.
+2. **Just Works** — Running `am` with no arguments should start the server, detect agents, configure MCP, and launch the TUI. An occupied port or live mailbox owner requires an ownership-aware diagnostic or supervised restart, never indiscriminate process termination.
 3. **No Scripts** — Everything is baked into the `am` binary. No shell wrappers, no `scripts/am`. The binary IS the product.
 4. **Showcase Quality** — The TUI must match the frankentui demo showcase in every way: visual polish, rounded borders, focus-aware panels, gradient text, rich charts, mouse support, semantic color tokens. "Same level of quality and attention to detail."
 5. **Zero Garbling** — ANSI escape codes must never appear as visible characters. Emoji widths must "just work" automatically without library users thinking about it.
@@ -29,7 +32,7 @@ These principles are non-negotiable and override all other design considerations
 
 ```
 $ am
-  1. Detect if port 8765 is in use → kill stale process (notify user)
+  1. Detect if port 8765 is in use → identify the owner and report a safe restart path
   2. Auto-discover all installed coding agents (Claude Code, Cursor, Codex, etc.)
   3. Generate/update MCP config files for each detected agent
   4. Start HTTP MCP server on 127.0.0.1:8765
@@ -52,7 +55,7 @@ No subcommands needed for the default flow. Subcommands exist for targeted opera
 
 The TUI must be visually indistinguishable in quality from the frankentui demo showcase. Every screen must use frankentui's rich widget library natively — no ANSI string building, no manual cell rendering, no Paragraph widgets where Table/Sparkline/MiniBar should be used.
 
-### 16 Screens (All Fully Implemented)
+### 16 Registered Screens and Their Intended Behavior
 
 | # | Screen | What It Shows | Key Widgets |
 |---|--------|---------------|-------------|
@@ -93,7 +96,7 @@ This was requested multiple times and must be implemented exactly like the frank
 2. **Global scope**: Searches across message subjects, bodies, agent names, thread IDs — everything.
 3. **Live preview**: Selected result shows full message body in adjacent preview panel.
 4. **Faceted filtering**: Filter by project, agent, date range, importance level.
-5. **Two-tier semantic search**: Fast potion-128M pass gives instant results; background MiniLM-L6 pass upgrades rankings with smooth visual re-ordering as better results arrive.
+5. **Optional semantic search**: Portable releases use lexical Search V3. Semantic retrieval and reranking require the `hybrid` feature and available models; the two-tier semantic ranking vision is not a default-release capability claim.
 6. **Debounce**: Short debounce (50-100ms) to avoid hammering SQLite on every keystroke.
 
 ---
@@ -135,7 +138,7 @@ Replaces the legacy 4,000-line bash installer entirely. Built into `am` binary.
 
 ### What `am` Does on Startup (and `am setup` explicitly)
 
-1. **Detect installed agents** via `coding_agent_session_search`:
+1. **Detect installed agents** via `franken-agent-detection`:
    - Claude Code (check `~/.claude/`)
    - Cursor (check `~/.cursor/`)
    - Codex CLI (check `~/.codex/`)
@@ -159,7 +162,7 @@ Replaces the legacy 4,000-line bash installer entirely. Built into `am` binary.
 
 ### Conflict: Scripts vs Binary
 
-**Resolution (later wins):** No `scripts/am` wrapper. The `am` binary handles everything directly. If a `scripts/am` exists, it should be removed. The binary reads `.env` files, manages tokens, detects agents — all natively in Rust.
+**Resolution (later wins):** The `am` binary is the supported entrypoint. It reads `.env` files, manages tokens, and detects agents natively in Rust. Any retirement of old wrappers remains subject to the repository's no-deletion rule.
 
 ---
 
@@ -172,21 +175,21 @@ Replaces the legacy 4,000-line bash installer entirely. Built into `am` binary.
 
 ### frankensqlite Integration (Implemented, Hardening Ongoing)
 
-**Current state:** `DbConn` and canonical verification/recovery paths now use `sqlmodel-frankensqlite`, and the Rust binaries no longer link `libsqlite3`.
+**Current state:** Runtime `DbConn` uses `sqlmodel-frankensqlite`. Canonical verification and recovery cross-checks use the statically bundled C SQLite driver; they are separate from runtime mailbox queries.
 
 > **Reality note (2026-09-01):** the runtime mailbox path is FrankenSQLite only (`DbConn`, test-enforced), but the binaries still statically bundle C SQLite through `sqlmodel-sqlite` (a non-optional dependency of the db and cli crates) for verification and recovery cross-checks (`CanonicalDbConn`: doctor double-probe, reconstruct, legacy import). `BEGIN CONCURRENT` is implemented but opt-in (`FSQLITE_CONCURRENT_MODE`, default off; 85 `BEGIN IMMEDIATE` sites remain) pending the upstream MVCC snapshot-drift fix, and the `fsqlite_raptorq_enabled` config flag has no readers yet.
 
 **Next hardening work:**
-- Keep closing any remaining engine feature gaps directly in FrankenSQLite rather than reintroducing C SQLite
-- Replace all `BEGIN IMMEDIATE` with `BEGIN CONCURRENT` for page-level MVCC (128 concurrent writers)
-- Enable RaptorQ erasure-coded WAL self-healing for automatic corruption recovery
+- Close runtime engine gaps in FrankenSQLite while retaining independent canonical recovery checks.
+- Qualify `BEGIN CONCURRENT` against the recovery and contention suites before changing its opt-in default.
+- Evaluate erasure-coded WAL recovery only after a wired implementation and real corruption tests exist.
 - MVCC conflict detection already wired (`is_mvcc_conflict()` in error.rs)
 
 **Non-negotiable:** Never reintroduce a production/runtime dependency on C SQLite. The direction is forward — toward full FrankenSQLite ownership and hardening.
 
 ### asupersync Everywhere
 
-Zero tokio in source code. All async via `Cx` + structured concurrency. HTTP via `asupersync::http::h1::HttpClient`. The only transitive tokio dependency is optional via `coding-agent-search` feature.
+Runtime concurrency uses `Cx` and asupersync structured concurrency; HTTP uses `asupersync::http::h1`. The dependency policy forbids Tokio in the shipped runtime. Validate each release's selected feature graph rather than inferring it from an unused optional dependency in the lockfile.
 
 ---
 
@@ -219,7 +222,7 @@ VS16 (U+FE0F) variation selectors must be stripped before width calculation in `
 ## Testing Philosophy
 
 - **Real tests, no mocks** — All tests use real SQLite databases, real git repos, real file I/O
-- **Conformance testing** against Python fixtures — 37 tools, 25 resources, byte-level output comparison
+- **Conformance testing** — 38 compatibility tools plus 7 Rust-native tools, and 25 logical resources. The behavior fixtures capture 37 compatibility tools; retained schema and topic-bearing router coverage cover `fetch_topic`. Description differences are reported rather than enforced byte-for-byte.
 - **E2E test scripts** with detailed logging across all transports (stdio, HTTP, CLI)
 - **Stress tests** — Concurrent operations, pool exhaustion recovery, cache coherency under load
 - **Property tests** — Fuzzing for edge cases in parsing, validation, serialization
@@ -238,13 +241,13 @@ VS16 (U+FE0F) variation selectors must be stripped before width calculation in `
 
 ## Priority Stack (What to Fix/Build First)
 
-1. **`am` just works** — Bare `am` command launches server + TUI + auto-setup. Kill stale port. No manual steps.
+1. **`am` just works** — Bare `am` launches server + TUI + auto-setup, with ownership-aware handling of an occupied port.
 2. **Fix ANSI garbling** — Zero garbled output anywhere in the TUI. Ever.
 3. **Search-as-you-type** — The most-requested missing feature. Must work like frankentui showcase search.
 4. **Visual polish to showcase quality** — Theme system, semantic colors, focus states, rounded borders, mouse support.
 5. **All 16 screens fully implemented** — No placeholder stubs. Every screen uses real widgets with real data.
 6. **Robot mode CLI** — Agent-optimized `am robot` subcommands with JSON/TOON/Markdown output.
-7. **frankensqlite full migration** — Once triggers land, switch DbConn and unlock MVCC concurrent writes.
+7. **FrankenSQLite hardening** — Runtime migration is complete; qualify recovery, WAL durability, and optional concurrent writes before enabling new defaults.
 
 ---
 

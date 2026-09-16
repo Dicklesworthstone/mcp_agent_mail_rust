@@ -202,6 +202,16 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
+# Negotiate legacy stdio initialize proposals before pinning the protocol era.
+# Keep the 0.7.1 family together on this qualified Asupersync 0.4.9 backport.
+fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "c14d26b49f132625f4141b72669b157467b9aac2" }
+fastmcp-core = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "c14d26b49f132625f4141b72669b157467b9aac2" }
+fastmcp-server = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "c14d26b49f132625f4141b72669b157467b9aac2" }
+fastmcp-transport = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "c14d26b49f132625f4141b72669b157467b9aac2" }
+fastmcp-protocol = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "c14d26b49f132625f4141b72669b157467b9aac2" }
+fastmcp-console = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "c14d26b49f132625f4141b72669b157467b9aac2" }
+fastmcp-client = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "c14d26b49f132625f4141b72669b157467b9aac2" }
+fastmcp-derive = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "c14d26b49f132625f4141b72669b157467b9aac2" }
 # Immutable WAL, read-only snapshot, DDL and prepared binding fixes. Keep the engine family
 # together; this revision retains asupersync 0.4.9 compatibility and GH411.
 fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c76b22ec557344bf173f61e8f63580670d99ee62" }
@@ -232,7 +242,8 @@ fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev 
 # - sqlmodel family resolves from crates.io (=0.4.0, published 2026-08-21,
 #   accepting asupersync ^0.4.9 + fsqlite ^0.3.7) — the ../sqlmodel-rel-0327
 #   cleanup trigger fired, so those eight patch lines are gone too.
-# - fastmcp family resolves from crates.io (0.7.1).
+# - fastmcp 0.7.1 uses the immutable negotiation backport above until a
+#   qualified registry release carries the repair on Asupersync 0.4.9.
 #
 # beads_rust =0.5.4 is published and resolves from crates.io. Do not patch it
 # to a mutable sibling: even an unused patch adds that checkout to remote

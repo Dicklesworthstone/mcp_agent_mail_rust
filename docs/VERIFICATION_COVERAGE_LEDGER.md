@@ -37,7 +37,16 @@ This pass does **not** try to finish the remaining substitute-compensation polic
   - [guard_env_tests.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-guard/tests/guard_env_tests.rs)
   - [conformance.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-conformance/tests/conformance.rs)
 
-## Current Topology At A Glance
+## Current Workspace and Historical Inventory
+
+The September 15, 2026 workspace has 12 members (including test helpers).
+`crates/mcp-agent-mail-dashboard-wasm` is excluded and built standalone;
+`experimental/mcp-agent-mail-wasm` is a deferred prototype. Agent detection
+uses the external `franken-agent-detection` crate. `Cargo.toml` is authoritative.
+
+The numeric tables and per-crate inventory below preserve the original
+`br-aazao.1` survey. They include a since-removed agent-detect crate and are
+historical evidence, not current counts or release completion claims.
 
 - Cargo workspace crates: `11`
 - Additional in-tree, non-workspace surfaces: `2` (`mcp-agent-mail-agent-detect` under `crates/`, `mcp-agent-mail-wasm` under `experimental/`)

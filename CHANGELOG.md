@@ -40,6 +40,18 @@ reviewed through 2026-09-15. These changes are not published release artifacts.
 
 ### Fixed
 
+- **Setup refuses to overwrite a token file changed during configuration.**
+  Token resolution retains the original file contents, identity, and parent
+  directory authority through the save. Concurrent edits, replacements, and
+  newly created files require a fresh setup attempt, including when the token
+  was supplied explicitly. Existing permission and Git-secret protections
+  remain enforced.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/feefb9bbd30c4b1782ac6b52c092d41a8b9ddc6b))
+- **Contended writes release their pool connection before retry backoff.**
+  Each retry acquires its own connection, allowing unrelated reads and writes
+  to use a small pool while the failed operation waits. Successful message
+  writes retain their connection for the post-commit consistency sample.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/69fe649a8704a40f11031d93e2b93a79f5cad9a0))
 - **Engine cursor-state errors no longer falsely block all writes.** Complete
   recognized cursor-type diagnostics are engine limitations; explicit or mixed
   corruption evidence still trips the breaker. WAL/SHM classification matches
