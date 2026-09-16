@@ -565,15 +565,10 @@ stop_server() {
 }
 
 # ---------------------------------------------------------------------------
-# Subsuite runner (copy artifacts into this suite's artifact dir)
+# Subsuite runner (isolate each child's artifacts under this run)
 # ---------------------------------------------------------------------------
 
-list_artifact_runs() {
-    local suite="$1"
-    ls -1 "${E2E_PROJECT_ROOT}/tests/artifacts/${suite}" 2>/dev/null | sort || true
-}
-
-run_subsuite_and_copy() {
+run_subsuite() {
     local suite="$1"
     local script="${E2E_PROJECT_ROOT}/tests/e2e/test_${suite}.sh"
     if [ ! -f "${script}" ]; then
@@ -583,20 +578,18 @@ run_subsuite_and_copy() {
 
     e2e_case_banner "Subsuite: ${suite}"
 
-    local before after rc
-    before="$(list_artifact_runs "${suite}" | tail -n 1 || true)"
+    # A caller-supplied AM_E2E_ARTIFACT_DIR otherwise reaches every child,
+    # mixing its trace/events.jsonl with the parent's and invalidating both
+    # manifests. Use this invocation's own child directory, never infer it by
+    # scanning a shared timestamp directory that another run can also update.
+    local child_artifacts="${E2E_ARTIFACT_DIR}/subsuite/${suite}"
+    local rc
     set +e
-    AM_E2E_KEEP_TMP="${AM_E2E_KEEP_TMP}" bash "${script}"
+    AM_E2E_KEEP_TMP="${AM_E2E_KEEP_TMP}" \
+        AM_E2E_ARTIFACT_DIR="${child_artifacts}" \
+        E2E_SUITE="${suite}" bash "${script}"
     rc=$?
     set -e
-
-    after="$(list_artifact_runs "${suite}" | tail -n 1 || true)"
-    if [ -n "${after}" ] && [ "${after}" != "${before}" ]; then
-        e2e_copy_artifact "${E2E_PROJECT_ROOT}/tests/artifacts/${suite}/${after}" "subsuite/${suite}/${after}"
-        e2e_pass "copied subsuite artifacts: ${suite}/${after}"
-    else
-        e2e_log "no new subsuite artifact dir detected for ${suite} (before='${before}' after='${after}')"
-    fi
 
     if [ "${rc}" -ne 0 ]; then
         e2e_fail "subsuite failed: ${suite} (rc=${rc})"
@@ -1464,14 +1457,14 @@ stop_server "${PID7}"
 trap - EXIT
 
 # ---------------------------------------------------------------------------
-# Focused subsuites (copied into this artifact dir)
+# Focused subsuites (isolated under this artifact dir)
 # ---------------------------------------------------------------------------
 
 if [ "${AM_E2E_HTTP_INCLUDE_FOCUSED_SUBSUITES:-1}" = "1" ]; then
-    e2e_banner "Focused subsuites (copied)"
+    e2e_banner "Focused subsuites"
 
     for suite in jwt rate_limit peer_addr mail_ui http_streamable; do
-        run_subsuite_and_copy "${suite}" || e2e_fatal "subsuite failed: ${suite}"
+        run_subsuite "${suite}" || e2e_fatal "subsuite failed: ${suite}"
     done
 else
     e2e_case_banner "Focused subsuites disabled"
