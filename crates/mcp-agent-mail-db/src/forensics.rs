@@ -758,10 +758,12 @@ fn sync_recovery_directory(path: &Path) -> std::io::Result<()> {
 fn sync_recovery_directory(path: &Path) -> std::io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt as _;
 
-    // FILE_FLAG_BACKUP_SEMANTICS is required to obtain a directory handle.
+    // FILE_FLAG_BACKUP_SEMANTICS obtains a directory handle; FlushFileBuffers
+    // additionally requires GENERIC_WRITE, even when no bytes are written.
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     std::fs::OpenOptions::new()
         .read(true)
+        .write(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)?
         .sync_all()
@@ -2626,7 +2628,14 @@ pub(crate) fn sync_recovery_parent_directory(db_path: &Path) -> Result<(), SqlEr
 /// Make an activated recovery database and its directory entry durable before
 /// the receipt promotion marker can be committed.
 pub(crate) fn sync_activated_recovery_database(db_path: &Path) -> Result<(), SqlError> {
-    let file = std::fs::File::open(db_path)
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // Windows FlushFileBuffers rejects a read-only handle. Opening for write
+    // grants the flush authority without truncating or modifying file bytes.
+    #[cfg(windows)]
+    options.write(true);
+    let file = options
+        .open(db_path)
         .map_err(|error| recovery_receipt_error("activated database open", db_path, error))?;
     file.sync_all()
         .map_err(|error| recovery_receipt_error("activated database file sync", db_path, error))?;

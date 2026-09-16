@@ -6763,6 +6763,12 @@ pub(crate) fn validate_sqlite_target_path(path: &Path, label: &str) -> Result<()
     let mut current = PathBuf::new();
     for component in anchored.components() {
         current.push(component.as_os_str());
+        // A Windows drive/UNC prefix is not a filesystem entry by itself.
+        // Wait for RootDir before inspecting it, especially for verbatim
+        // paths where `\\?\C:` is invalid but `\\?\C:\` is the real root.
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         let metadata = match std::fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -17058,6 +17064,27 @@ mod tests {
             Path::new("/usr"),
             Path::new("/private/usr")
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sqlite_target_validation_accepts_verbatim_root() {
+        let directory = tempfile::tempdir().expect("private directory");
+        let database = directory.path().join("mailbox.sqlite3");
+        std::fs::write(&database, b"preserved database bytes").expect("seed database");
+        let canonical = database.canonicalize().expect("canonical Windows path");
+        assert!(matches!(
+            canonical.components().next(),
+            Some(Component::Prefix(prefix)) if prefix.kind().is_verbatim()
+        ));
+        validate_sqlite_target_path(&canonical, "canonical Windows database")
+            .expect("inspect the complete rooted path, not its bare device prefix");
+        validate_sqlite_target_path(&database, "configured Windows database")
+            .expect("ordinary configured paths remain valid");
+        assert_eq!(
+            std::fs::read(&database).unwrap(),
+            b"preserved database bytes"
+        );
     }
 
     #[cfg(unix)]
@@ -28514,9 +28541,18 @@ mod tests {
         let msg_dir = proj_dir.join("messages").join("2026").join("03");
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::create_dir_all(&msg_dir).unwrap();
+        // A rooted Unix spelling is drive-relative on Windows and is rightly
+        // rejected as malformed project metadata by incremental recovery.
+        let project_root = storage_root.parent().unwrap().join("project-source");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let project_root = project_root.canonicalize().unwrap();
         std::fs::write(
             proj_dir.join("project.json"),
-            r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+            serde_json::to_vec(&serde_json::json!({
+                "slug": "ahead-project",
+                "human_key": project_root,
+            }))
+            .unwrap(),
         )
         .unwrap();
         std::fs::write(
@@ -28529,8 +28565,13 @@ mod tests {
             "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"First\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:00:00Z\",\"attachments\":[]}\n---\n\nfirst body\n",
         )
         .unwrap();
-        crate::reconstruct::reconstruct_from_archive(primary, storage_root)
+        let stats = crate::reconstruct::reconstruct_from_archive(primary, storage_root)
             .expect("seed initial reconstructed db");
+        assert_eq!(
+            stats.parse_errors, 0,
+            "the seeded archive must be valid on this platform: {:?}",
+            stats.warnings
+        );
         msg_dir
     }
 
@@ -28773,7 +28814,9 @@ mod tests {
         assert!(
             reconcile_archive_state_before_init(&primary, &storage_root)
                 .expect("reconcile archive-ahead primary"),
-            "the reconcile must report that it brought the database up to date"
+            "the reconcile must bring the database up to date; health reason: {:?}, pending drift: {}",
+            take_last_unhealthy_reason(&primary),
+            has_pending_archive_drift(&primary)
         );
         assert_eq!(count_messages(&primary), 3, "both missing messages applied");
         assert_eq!(
@@ -28809,7 +28852,12 @@ mod tests {
         clear_pending_archive_drift(&primary);
         let overrides = [("AM_ARCHIVE_DELTA_APPLY_MAX_MESSAGES", "0")];
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(&overrides, || {
-            assert!(reconcile_archive_state_before_init(&primary, &storage_root).unwrap());
+            assert!(
+                reconcile_archive_state_before_init(&primary, &storage_root).unwrap(),
+                "archive reconstruction did not run; health reason: {:?}, pending drift: {}",
+                take_last_unhealthy_reason(&primary),
+                has_pending_archive_drift(&primary)
+            );
         });
         assert_eq!(count_messages(&primary), 2);
         assert_ne!(

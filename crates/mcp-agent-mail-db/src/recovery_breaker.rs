@@ -909,17 +909,15 @@ mod tests {
 
         let contender = try_acquire_file_lock(&db)
             .map(|_unexpected_owner| ())
-            .map_err(|error| (error.kind(), error.to_string()));
+            .map_err(|error| (error.raw_os_error(), error.to_string()));
         std::fs::write(&release, b"release").expect("release holder");
         let status = holder.wait().expect("wait for breaker-lock holder");
         assert!(status.success(), "breaker-lock holder failed: {status}");
-        let (contender_kind, contender_message) =
+        let (contender_code, contender_message) =
             contender.expect_err("a second process must not enter the breaker transition");
-        assert!(
-            matches!(
-                contender_kind,
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Other
-            ),
+        assert_eq!(
+            contender_code,
+            fs2::lock_contended_error().raw_os_error(),
             "unexpected lock error: {contender_message}"
         );
         try_acquire_file_lock(&db).expect("lock must release when the owner process exits");

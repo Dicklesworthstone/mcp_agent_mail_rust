@@ -40,6 +40,12 @@ reviewed through 2026-09-16. These changes are not published release artifacts.
 
 ### Fixed
 
+- **Windows recovery can flush and reopen promoted databases.** Recovery now
+  opens directory and database flush handles with the write access Windows
+  requires, without truncating their contents. SQLite path validation waits
+  for a complete drive or UNC root before inspecting canonical verbatim
+  paths. Native Windows regressions cover repeated promotion, receipt failure
+  rollback, and preservation of a committed recovery generation.
 - **Backup retention follows the configured database.** Custom database
   names and locations now receive the same inventory, verified-snapshot
   pinning, and rotation as the default mailbox. Timestamped backups use their
