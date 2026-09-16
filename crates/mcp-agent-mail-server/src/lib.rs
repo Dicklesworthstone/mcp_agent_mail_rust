@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+// The transaction retry future owns its pooled connection. Proving Send for
+// callers traverses that future and the driver's nested transaction futures.
+#![recursion_limit = "256"]
 #![allow(
     clippy::cast_precision_loss,
     clippy::missing_const_for_fn,
