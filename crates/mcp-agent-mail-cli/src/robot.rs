@@ -5989,15 +5989,10 @@ fn build_robot_inbox_server_request(
 }
 
 fn robot_inbox_server_urls(config: &mcp_agent_mail_core::Config) -> Vec<String> {
-    if let Ok(agent_mail_url) = std::env::var("AGENT_MAIL_URL")
-        && !agent_mail_url.trim().is_empty()
-    {
-        return crate::check_inbox_server_urls_for_agent_mail_url(
-            &agent_mail_url,
-            &config.http_path,
-        );
-    }
-    crate::check_inbox_server_urls(&config.http_host, config.http_port, &config.http_path)
+    crate::check_inbox_server_urls_for_agent_mail_url(
+        &crate::local_server_url(config),
+        &config.http_path,
+    )
 }
 
 fn robot_inbox_server_arguments(request: &RobotInboxServerRequest) -> serde_json::Value {

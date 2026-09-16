@@ -26,6 +26,12 @@ Recent releases; the earlier version history continues below.
 
 ## Unreleased
 
+- **CLI commands discover a mailbox daemon's nondefault port.** Mail, inbox,
+  registration and other proxy commands use verified listener hints for the
+  mailbox's sole exclusive owner when no endpoint was explicitly configured.
+  Explicit endpoints retain precedence; failed requests report the verified
+  listener as a remediation hint. Dead or ambiguous listeners are ignored.
+  (#323)
 - **Browser health polling no longer runs slow snapshot work on HTTP workers.**
   `/mail/ws-state` now uses the existing bounded mail dispatch pool and request
   timeout. Saturated dispatch returns HTTP 503 while liveness remains available;

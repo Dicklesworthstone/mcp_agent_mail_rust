@@ -6134,6 +6134,183 @@ fn legacy_am_serve_reports_migration_preflight() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_discovers_nondefault_mailbox_daemon_port() {
+    struct OwnedServer(std::process::Child);
+    impl Drop for OwnedServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let env = TestEnv::new();
+    let project = env.hostile_repo.to_str().unwrap();
+    let port = unused_loopback_port();
+    let log_path = env.tmp.path().join("discovered-daemon.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let command = || {
+        let mut cmd = Command::new(am_bin());
+        cmd.env_clear()
+            .envs(env.isolated_env())
+            .env_remove("HTTP_HOST")
+            .env_remove("HTTP_PORT")
+            .env("TMPDIR", env.tmp.path())
+            .env("AM_ATC_ENABLED", "false")
+            .current_dir(&env.hostile_repo);
+        cmd
+    };
+    let mut server_command = command();
+    server_command
+        .args([
+            "serve-http",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--no-tui",
+            "--no-auth",
+        ])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log);
+    let mut server = OwnedServer(server_command.spawn().unwrap());
+    let registration = [
+        "macros",
+        "start-session",
+        "--project",
+        project,
+        "--agent-name",
+        "BlueLake",
+        "--program",
+        "codex-cli",
+        "--model",
+        "test",
+        "--json",
+    ];
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "{}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            // Seed only the explicit private endpoint. Verify discovery with a
+            // read before permitting an automatically routed mutation.
+            let out = command()
+                .env("HTTP_PORT", port.to_string())
+                .args(registration)
+                .output()
+                .unwrap();
+            if out.status.success() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "registration failed: {}\n{}",
+                String::from_utf8_lossy(&out.stderr),
+                std::fs::read_to_string(&log_path).unwrap()
+            );
+        }
+        assert!(Instant::now() < deadline, "daemon did not bind");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let out = command()
+        .args(["agents", "list", "--project", project, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("BlueLake"));
+    let out = command().args(registration).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let send = [
+        "mail",
+        "send",
+        "--project",
+        project,
+        "--from",
+        "BlueLake",
+        "--to",
+        "BlueLake",
+        "--subject",
+        "discovered-port-proof",
+        "--body",
+        "durable port discovery body",
+        "--json",
+    ];
+    let out = command().args(send).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let inbox = [
+        "inbox",
+        "--project",
+        project,
+        "--agent",
+        "BlueLake",
+        "--all",
+        "--include-bodies",
+        "--json",
+    ];
+    let out = command().args(inbox).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("discovered-port-proof"));
+
+    // A deliberately unavailable explicit port must not be silently replaced.
+    // The owned-mailbox refusal still queues the user's unsent message.
+    let out = command().env("HTTP_PORT", "1").args(send).output().unwrap();
+    assert!(!out.status.success());
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains("UNSENT"), "{error}");
+    assert!(error.contains(":1/"), "{error}");
+    assert!(
+        error.contains(&format!("AGENT_MAIL_URL=http://127.0.0.1:{port}/mcp/")),
+        "{error}"
+    );
+    let out = command()
+        .env("HTTP_PORT", "1")
+        .env("AGENT_MAIL_URL", format!("http://127.0.0.1:{port}/mcp/"))
+        .args(inbox)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("discovered-port-proof"));
+
+    // Once the listener is gone its hint is stale; local reopen still sees
+    // the message committed through the actual daemon.
+    drop(server);
+    let out = command()
+        .env("HTTP_PORT", "1")
+        .args(inbox)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("discovered-port-proof"));
+}
+
 #[test]
 fn serve_http_help_exits_zero() {
     let env = TestEnv::new();

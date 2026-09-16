@@ -9986,6 +9986,73 @@ fn local_server_url_from_parts(host: &str, port: u16, http_path: &str) -> String
     format!("http://{connect_host}:{port}{http_path}")
 }
 
+/// Resolve the CLI endpoint, discovering this mailbox's owner if unconfigured.
+///
+/// Never infer authority from argv text.
+pub(crate) fn local_server_url(config: &Config) -> String {
+    use mcp_agent_mail_core::config::env_value;
+
+    if let Some(url) = env_value("AGENT_MAIL_URL").filter(|url| !url.trim().is_empty()) {
+        return normalize_agent_mail_url(&url, &config.http_path);
+    }
+    let configured =
+        || local_server_url_from_parts(&config.http_host, config.http_port, &config.http_path);
+    if ["HTTP_HOST", "HTTP_PORT"]
+        .iter()
+        .any(|key| env_value(key).is_some())
+        || config.http_host != Config::default().http_host
+        || config.http_port != Config::default().http_port
+        || mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url)
+    {
+        return configured();
+    }
+    let Ok(sqlite_path) = resolve_mailbox_activity_sqlite_path(&config.database_url) else {
+        return configured();
+    };
+    let ownership =
+        mcp_agent_mail_db::pool::inspect_mailbox_ownership(&sqlite_path, &config.storage_root);
+    let Some(pid) = sole_proxy_mailbox_owner(&ownership) else {
+        return configured();
+    };
+    let Some((host, port)) = mcp_agent_mail_server::startup_checks::verified_listener_for_pid(pid)
+    else {
+        return configured();
+    };
+    // Recheck mailbox ownership after listener discovery, before using the URL.
+    let current =
+        mcp_agent_mail_db::pool::inspect_mailbox_ownership(&sqlite_path, &config.storage_root);
+    if sole_proxy_mailbox_owner(&current) != Some(pid) {
+        return configured();
+    }
+    local_server_url_from_parts(&host, port, &config.http_path)
+}
+
+fn sole_proxy_mailbox_owner(
+    ownership: &mcp_agent_mail_db::pool::MailboxOwnershipState,
+) -> Option<u32> {
+    use mcp_agent_mail_db::pool::MailboxOwnershipDisposition;
+    if !matches!(
+        ownership.disposition,
+        MailboxOwnershipDisposition::ActiveOtherOwner
+            | MailboxOwnershipDisposition::DeletedExecutable
+    ) {
+        return None;
+    }
+    let [pid] = ownership.competing_pids.as_slice() else {
+        return None;
+    };
+    ownership
+        .processes
+        .iter()
+        .find(|process| {
+            process.pid == *pid
+                && process.holds_exclusive_lock
+                && process.holds_storage_root_lock
+                && process.holds_sqlite_lock
+        })
+        .map(|process| process.pid)
+}
+
 pub(crate) fn local_server_bearer_token(config: &mcp_agent_mail_core::Config) -> Option<String> {
     config
         .http_bearer_token
@@ -19330,11 +19397,7 @@ fn emit_cli_reservation_read_attestation(attestation: &robot::ReservationReadAtt
 fn try_proxy_file_reservations_mutation(action: &FileReservationsCommand) -> CliResult<bool> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
-    let server_url = local_server_url_from_parts(
-        &server_config.http_host,
-        server_config.http_port,
-        &server_config.http_path,
-    );
+    let server_url = local_server_url(&server_config);
     let bearer = local_server_bearer_token(&server_config);
 
     let Some((tool_name, command_label, arguments)) = file_reservations_proxy_request(action)
@@ -20397,11 +20460,7 @@ fn handle_contacts_with_conn(
 fn try_proxy_contacts_mutation(action: &ContactsCommand) -> CliResult<bool> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
-    let server_url = local_server_url_from_parts(
-        &server_config.http_host,
-        server_config.http_port,
-        &server_config.http_path,
-    );
+    let server_url = local_server_url(&server_config);
     let bearer = local_server_bearer_token(&server_config);
 
     let (tool_name, command_label, arguments) = match action {
@@ -20665,11 +20724,7 @@ async fn try_proxy_contact_handshake(
 ) -> CliResult<Option<serde_json::Value>> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
-    let server_url = local_server_url_from_parts(
-        &server_config.http_host,
-        server_config.http_port,
-        &server_config.http_path,
-    );
+    let server_url = local_server_url(&server_config);
     let bearer = local_server_bearer_token(&server_config);
 
     let mut arguments = serde_json::Map::new();
@@ -37470,11 +37525,7 @@ fn write_pending_send_receipt(
 async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
-    let server_url = local_server_url_from_parts(
-        &server_config.http_host,
-        server_config.http_port,
-        &server_config.http_path,
-    );
+    let server_url = local_server_url(&server_config);
     let bearer = local_server_bearer_token(&server_config);
 
     match action {
@@ -38178,11 +38229,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             // its worst-case fallback) snapshot + migrate + rebuild a fresh
             // Tantivy index for a single query, which scales with mailbox
             // size, not answer size.
-            let server_url = local_server_url_from_parts(
-                &server_config.http_host,
-                server_config.http_port,
-                &server_config.http_path,
-            );
+            let server_url = local_server_url(&server_config);
             let bearer = local_server_bearer_token(&server_config);
             match try_call_server_tool(
                 &server_url,
@@ -38780,11 +38827,7 @@ fn handle_agents(action: AgentsCommand) -> CliResult<()> {
 
 async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
-    let server_url = local_server_url_from_parts(
-        &server_config.http_host,
-        server_config.http_port,
-        &server_config.http_path,
-    );
+    let server_url = local_server_url(&server_config);
     let bearer = local_server_bearer_token(&server_config);
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
 
@@ -39770,11 +39813,7 @@ fn handle_macros(action: MacroCommand) -> CliResult<()> {
 #[allow(clippy::too_many_lines)]
 async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
-    let server_url = local_server_url_from_parts(
-        &server_config.http_host,
-        server_config.http_port,
-        &server_config.http_path,
-    );
+    let server_url = local_server_url(&server_config);
     let bearer = local_server_bearer_token(&server_config);
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
 
@@ -42214,6 +42253,49 @@ mod mail_server_cli_bridge_tests {
         assert!(message.contains("mail send could not be proxied"));
         assert!(message.contains("Refusing local SQLite fallback"));
         assert!(message.contains("another Agent Mail server owns the mailbox database"));
+    }
+
+    #[test]
+    fn sole_proxy_mailbox_owner_requires_both_locks_and_exclusive_ownership() {
+        use mcp_agent_mail_db::pool::{
+            MailboxOwnershipDisposition as D, MailboxOwnershipProcess, MailboxOwnershipState,
+        };
+        let mut ownership = MailboxOwnershipState {
+            disposition: D::ActiveOtherOwner,
+            storage_lock_path: String::new(),
+            sqlite_lock_path: String::new(),
+            processes: vec![MailboxOwnershipProcess {
+                pid: 42,
+                command: None,
+                executable_path: None,
+                executable_deleted: false,
+                holds_storage_root_lock: true,
+                holds_sqlite_lock: true,
+                holds_exclusive_lock: true,
+                holds_database_file: true,
+            }],
+            competing_pids: vec![42],
+            readers: vec![],
+            supervised_restart_required: false,
+            detail: String::new(),
+        };
+        assert_eq!(super::sole_proxy_mailbox_owner(&ownership), Some(42));
+        for disposition in [D::Unowned, D::SplitBrain, D::StaleLiveProcess] {
+            ownership.disposition = disposition;
+            assert_eq!(super::sole_proxy_mailbox_owner(&ownership), None);
+        }
+        ownership.disposition = D::ActiveOtherOwner;
+        ownership.competing_pids.push(43);
+        assert_eq!(super::sole_proxy_mailbox_owner(&ownership), None);
+        ownership.competing_pids.pop();
+        ownership.processes[0].holds_sqlite_lock = false;
+        assert_eq!(super::sole_proxy_mailbox_owner(&ownership), None);
+        ownership.processes[0].holds_sqlite_lock = true;
+        ownership.processes[0].holds_storage_root_lock = false;
+        assert_eq!(super::sole_proxy_mailbox_owner(&ownership), None);
+        ownership.processes[0].holds_storage_root_lock = true;
+        ownership.processes[0].holds_exclusive_lock = false;
+        assert_eq!(super::sole_proxy_mailbox_owner(&ownership), None);
     }
 
     #[test]
@@ -77437,8 +77519,7 @@ fn handle_verify(args: VerifyArgs) -> CliResult<()> {
         return Ok(());
     }
 
-    let server_url =
-        local_server_url_from_parts(&config.http_host, config.http_port, &config.http_path);
+    let server_url = local_server_url(&config);
     handle_am_run_with(
         &config,
         Some(server_url.as_str()),
@@ -77460,8 +77541,7 @@ fn handle_verify(args: VerifyArgs) -> CliResult<()> {
 
 fn handle_am_run(args: AmRunArgs) -> CliResult<()> {
     let config = Config::from_env();
-    let server_url =
-        local_server_url_from_parts(&config.http_host, config.http_port, &config.http_path);
+    let server_url = local_server_url(&config);
     handle_am_run_with(
         &config,
         Some(server_url.as_str()),
@@ -87027,11 +87107,21 @@ fn reject_local_fallback_with_ownership_probe(
         return Ok(());
     }
 
+    let endpoint_hint = sole_proxy_mailbox_owner(&ownership)
+        .and_then(mcp_agent_mail_server::startup_checks::verified_listener_for_pid)
+        .map(|(host, port)| {
+            let config = Config::from_env();
+            let url = local_server_url_from_parts(&host, port, &config.http_path);
+            format!(
+                " Verified mailbox listener: {url}. Select it explicitly with AGENT_MAIL_URL={url}."
+            )
+        })
+        .unwrap_or_default();
     Err(CliError::Other(format!(
         "{command_label} could not be proxied through the running Agent Mail daemon at \
          {server_url}: {server_error}. Refusing local SQLite fallback because {}. \
          Check HTTP_HOST/HTTP_PORT/HTTP_PATH/HTTP_BEARER_TOKEN for the CLI, or restart \
-         the daemon if its HTTP endpoint is wedged.",
+         the daemon if its HTTP endpoint is wedged.{endpoint_hint}",
         ownership.detail
     )))
 }
@@ -87493,8 +87583,7 @@ fn handle_products(action: ProductsCommand) -> CliResult<()> {
 
 async fn handle_products_async(action: ProductsCommand) -> CliResult<()> {
     let config = Config::from_env();
-    let server_url =
-        local_server_url_from_parts(&config.http_host, config.http_port, &config.http_path);
+    let server_url = local_server_url(&config);
     let bearer = config.http_bearer_token.as_deref();
 
     let cx = asupersync::Cx::for_request();

@@ -61,6 +61,22 @@ curl http://127.0.0.1:9000/health
 returns a health payload or status response proving the server bound to the
 requested port.
 
+CLI mail, inbox, agent, contact and reservation commands discover a custom
+port when the same mailbox has one exclusive daemon owner and its recorded
+listener hint still matches the operating system's listener PID. This needs
+the same temporary directory and readable process/listener information.
+Dead or ambiguous listeners are not selected. Explicit `AGENT_MAIL_URL`,
+`HTTP_HOST` or `HTTP_PORT` settings take precedence over discovery. If that
+explicit endpoint fails, the ownership refusal names the verified listener
+and an `AGENT_MAIL_URL` override you can use to reach it.
+
+To select the endpoint explicitly across repositories, export
+`AGENT_MAIL_URL=http://127.0.0.1:9000/mcp/` in your shell, or set `HTTP_PORT`
+in the user configuration file (`$XDG_CONFIG_HOME/mcp-agent-mail/config.env`).
+`am config set-port` updates the working-directory `.env`; it does not export
+a variable into other shells. Process variables override user configuration,
+which overrides the working-directory `.env`.
+
 **Troubleshooting:** If the port is already in use, choose another `--port`
 instead of killing the existing server. If you expect auth to be enabled, drop
 `--no-auth` and make sure `HTTP_BEARER_TOKEN` resolves from your env file.

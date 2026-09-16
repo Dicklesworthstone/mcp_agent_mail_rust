@@ -1036,6 +1036,66 @@ pub fn listener_port_holder_pids_with_hint(host: &str, port: u16) -> Vec<u32> {
     listener_port_holder_pids(host, port)
 }
 
+/// Discover the sole recorded listener currently owned by `pid`.
+///
+/// Hints are candidates, never authority: the operating system must confirm
+/// socket ownership. Callers must separately verify the PID's mailbox locks.
+/// Ambiguous listeners are deliberately not selected.
+#[must_use]
+pub fn verified_listener_for_pid(pid: u32) -> Option<(String, u16)> {
+    let directory = listener_pid_hint_path("127.0.0.1", 0)
+        .parent()?
+        .to_path_buf();
+    let mut found = None;
+    for (index, entry) in std::fs::read_dir(directory).ok()?.enumerate() {
+        if index >= 1024 {
+            return None;
+        }
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let Some((encoded, port)) = name
+            .to_str()
+            .and_then(|s| s.strip_suffix(".pid"))
+            .and_then(|s| s.rsplit_once('-'))
+        else {
+            continue;
+        };
+        let Ok(port) = port.parse::<u16>() else {
+            continue;
+        };
+        if !encoded.is_ascii() || encoded.len() % 2 != 0 {
+            continue;
+        }
+        let bytes: Result<Vec<_>, _> = (0..encoded.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&encoded[i..i + 2], 16))
+            .collect();
+        let Ok(bytes) = bytes else { continue };
+        let Ok(host) = String::from_utf8(bytes) else {
+            continue;
+        };
+        // Do not let a hint introduce DNS lookups or remote destinations.
+        let address = host.trim_matches(['[', ']']);
+        if address != "localhost" && address.parse::<std::net::IpAddr>().is_err() {
+            continue;
+        }
+        // A daemon can run longer than the generic hint TTL. This path has a
+        // known mailbox owner and verifies its live socket, so hint age alone
+        // must not disable discovery of a healthy long-running daemon.
+        if read_listener_pid_hint_inner(&host, port, false).is_none_or(|hint| hint.pid != pid) {
+            continue;
+        }
+        if listener_port_holder_pids(&host, port) != [pid] {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some((host, port));
+    }
+    found
+}
+
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn agent_mail_pids_all_stopped(pids: &[u32]) -> bool {
@@ -1133,6 +1193,14 @@ fn parse_listener_pid_hint(content: &str) -> Option<ListenerPidHint> {
 }
 
 fn read_listener_pid_hint(host: &str, port: u16) -> Option<ListenerPidHint> {
+    read_listener_pid_hint_inner(host, port, true)
+}
+
+fn read_listener_pid_hint_inner(
+    host: &str,
+    port: u16,
+    enforce_age: bool,
+) -> Option<ListenerPidHint> {
     let path = listener_pid_hint_path(host, port);
     match path_existing_prefix_has_symlink(&path) {
         Ok(true) => {
@@ -1158,7 +1226,7 @@ fn read_listener_pid_hint(host: &str, port: u16) -> Option<ListenerPidHint> {
     let hint = parse_listener_pid_hint(&content)?;
     // Reject stale hints to prevent PID recycling attacks.
     // If no timestamp is present (old format), accept the hint but log a warning.
-    if let Some(created) = hint.created_epoch_secs {
+    if enforce_age && let Some(created) = hint.created_epoch_secs {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -4604,6 +4672,44 @@ mod tests {
         let path = listener_pid_hint_path("::1", 8765);
         let file_name = path.file_name().expect("file name");
         assert_eq!(file_name.to_string_lossy(), "3a3a31-8765.pid");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_listener_for_pid_requires_one_live_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpdir = dir.path().to_string_lossy().into_owned();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("TMPDIR", tmpdir.as_str())],
+            || {
+                let pid = std::process::id();
+                assert!(verified_listener_for_pid(pid).is_none());
+                let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = first.local_addr().unwrap().port();
+                let hint_path = write_listener_pid_hint("127.0.0.1", port);
+                let old_hint = ListenerPidHint {
+                    pid,
+                    exe_path: current_executable_hint_path(),
+                    created_epoch_secs: Some(0),
+                };
+                std::fs::write(hint_path, format_listener_pid_hint(&old_hint)).unwrap();
+                assert!(read_listener_pid_hint("127.0.0.1", port).is_none());
+                assert_eq!(
+                    verified_listener_for_pid(pid),
+                    Some(("127.0.0.1".into(), port))
+                );
+                assert!(verified_listener_for_pid(u32::MAX).is_none());
+                let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let _ = write_listener_pid_hint("127.0.0.1", second.local_addr().unwrap().port());
+                assert!(
+                    verified_listener_for_pid(pid).is_none(),
+                    "ambiguous listeners"
+                );
+                drop(first);
+                drop(second);
+                assert!(verified_listener_for_pid(pid).is_none(), "stale hints");
+            },
+        );
     }
 
     #[test]
