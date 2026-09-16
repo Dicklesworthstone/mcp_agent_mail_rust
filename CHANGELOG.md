@@ -26,6 +26,13 @@ Recent releases; the earlier version history continues below.
 
 ## Unreleased
 
+- **Failed staged health probes retain a small private diagnostic report.**
+  Doctor output includes the JSON report path after the temporary database
+  copy is removed. Reports preserve the failure reason and its conclusive or
+  inconclusive classification, cap text fields to keep each report below
+  32 KiB, and contain no database copy. A report-write failure does not change
+  the health verdict. The existing independent confirmation requirement before
+  reconstruction remains in place. ([GH #300](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/300); `br-fw21x`)
 - **The installers on `main` accept the release's documentation files.**
   Signed DSR archives include `README.md` and `LICENSE` alongside the two
   binaries. Bash and PowerShell now permit exactly those optional regular

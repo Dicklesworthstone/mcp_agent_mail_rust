@@ -10140,15 +10140,22 @@ pub struct UnhealthyProbeReason {
     /// `true` when the failing check ran against a private staged copy of the
     /// SQLite family rather than against the live path.
     pub staged_copy: bool,
+    /// Private, bounded JSON evidence retained after the staged copy is gone.
+    /// Failure to retain this optional report never changes the probe verdict.
+    pub diagnostic_path: Option<PathBuf>,
 }
 
 impl std::fmt::Display for UnhealthyProbeReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.staged_copy {
-            write!(f, "staged private-copy probe: {}", self.detail)
+            write!(f, "staged private-copy probe: {}", self.detail)?;
         } else {
-            f.write_str(&self.detail)
+            f.write_str(&self.detail)?;
         }
+        if let Some(path) = &self.diagnostic_path {
+            write!(f, "; diagnostic report: {}", path.display())?;
+        }
+        Ok(())
     }
 }
 
@@ -10175,6 +10182,7 @@ fn note_unhealthy_reason_with(path: &Path, detail: impl Into<String>, conclusive
         detail: detail.into(),
         conclusive,
         staged_copy: false,
+        diagnostic_path: None,
     };
     if let Ok(mut reasons) = unhealthy_probe_reasons().lock() {
         reasons.insert(path.to_path_buf(), reason);
@@ -10184,12 +10192,60 @@ fn note_unhealthy_reason_with(path: &Path, detail: impl Into<String>, conclusive
 /// Re-key a reason recorded for a staged private copy under the live path it
 /// stood in for, so the caller who probed the live path can read it.
 fn transfer_unhealthy_reason(from: &Path, to: &Path) {
-    if let Ok(mut reasons) = unhealthy_probe_reasons().lock()
-        && let Some(mut reason) = reasons.remove(from)
-    {
-        reason.staged_copy = true;
+    let Some(mut reason) = unhealthy_probe_reasons()
+        .lock()
+        .ok()
+        .and_then(|mut reasons| reasons.remove(from))
+    else {
+        return;
+    };
+    reason.staged_copy = true;
+    // Do not hold the process-wide reason map lock during filesystem I/O.
+    match retain_unhealthy_probe_report(&std::env::temp_dir(), from, to, &reason) {
+        Ok(path) => reason.diagnostic_path = Some(path),
+        Err(error) => tracing::warn!(%error, "could not retain staged health probe report"),
+    }
+    if let Ok(mut reasons) = unhealthy_probe_reasons().lock() {
         reasons.insert(to.to_path_buf(), reason);
     }
+}
+
+/// Retain the observed failure, not another copy of the mailbox. Each text
+/// field is bounded before JSON escaping (at most six bytes per character),
+/// keeping the entire report below 32 KiB even for hostile paths or errors.
+/// NamedTempFile creates the report exclusively with owner-only permissions.
+fn retain_unhealthy_probe_report(
+    directory: &Path,
+    staged: &Path,
+    live: &Path,
+    reason: &UnhealthyProbeReason,
+) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
+
+    let bounded = |text: &str, limit: usize| {
+        serde_json::json!({
+            "text": text.chars().take(limit).collect::<String>(),
+            "truncated": text.chars().nth(limit).is_some(),
+        })
+    };
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "live_path": bounded(&live.to_string_lossy(), 1024),
+        "staged_path": bounded(&staged.to_string_lossy(), 1024),
+        "reason": bounded(&reason.detail, 2048),
+        "conclusive": reason.conclusive,
+        "staged_copy": reason.staged_copy,
+        "contains_database_copy": false,
+    });
+    let bytes = serde_json::to_vec(&report)?;
+    let mut file = tempfile::Builder::new()
+        .prefix("mcp-agent-mail-health-failure-")
+        .suffix(".json")
+        .tempfile_in(directory)?;
+    file.write_all(&bytes)?;
+    file.as_file().sync_all()?;
+    let (_, path) = file.keep().map_err(|error| error.error)?;
+    Ok(path)
 }
 
 /// The reason the most recent health probe of `path` decided "unhealthy".
@@ -25511,6 +25567,34 @@ mod tests {
             "a garbage file is not healthy"
         );
         let reason = take_last_unhealthy_reason(&db_path).expect("reason recorded");
+        let report_path = reason.diagnostic_path.as_ref().expect("retained report");
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path).expect("read report"))
+                .expect("JSON report");
+        assert_eq!(report["reason"]["text"], reason.detail);
+        assert_eq!(report["conclusive"], reason.conclusive);
+        assert_eq!(report["contains_database_copy"], false);
+        let staged_path = report["staged_path"]["text"].as_str().expect("staged path");
+        assert!(
+            !Path::new(staged_path).exists(),
+            "staged copy was cleaned up"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("live bytes"),
+            vec![b'x'; 4096]
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(report_path)
+                    .expect("report metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         assert!(
             reason.staged_copy,
             "the reason is marked as coming from the staged copy: {reason:?}"
@@ -25551,10 +25635,8 @@ mod tests {
         let reason = take_last_unhealthy_reason(&live).expect("reason recorded");
         assert!(!reason.conclusive, "staging failure is not evidence");
         assert!(reason.staged_copy);
-        assert_eq!(
-            reason.to_string(),
-            "staged private-copy probe: the SQLite family could not be staged"
-        );
+        assert_eq!(reason.detail, "the SQLite family could not be staged");
+        assert!(reason.to_string().contains("; diagnostic report: "));
 
         note_conclusive_unhealthy_reason(&staged, "canonical SQLite quick_check reported problems");
         transfer_unhealthy_reason(&staged, &live);
@@ -25567,6 +25649,44 @@ mod tests {
             take_last_unhealthy_reason(&staged).is_none(),
             "the staged key is emptied by the transfer"
         );
+    }
+
+    #[test]
+    fn unhealthy_probe_report_bounds_escaped_unicode_and_preserves_classification() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reason = UnhealthyProbeReason {
+            detail: "\0🦫".repeat(10_000),
+            conclusive: false,
+            staged_copy: true,
+            diagnostic_path: None,
+        };
+        let long_path = PathBuf::from("\u{1}🦫".repeat(10_000));
+        let path = retain_unhealthy_probe_report(dir.path(), &long_path, &long_path, &reason)
+            .expect("bounded report");
+        let bytes = std::fs::read(path).expect("read report");
+        assert!(bytes.len() < 32 * 1024);
+        let report: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        for field in ["reason", "live_path", "staged_path"] {
+            assert_eq!(report[field]["truncated"], true);
+        }
+        assert_eq!(
+            report["reason"]["text"]
+                .as_str()
+                .expect("reason")
+                .chars()
+                .count(),
+            2048
+        );
+        assert_eq!(report["conclusive"], false);
+        // A regular file cannot serve as the output directory, even as root.
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"preserve").expect("blocker");
+        assert!(retain_unhealthy_probe_report(&blocker, &long_path, &long_path, &reason).is_err());
+        assert_eq!(
+            std::fs::read(blocker).expect("blocker survives"),
+            b"preserve"
+        );
+        assert!(!reason.conclusive);
     }
 
     /// A directory squatting in the `-wal` slot is not part of any SQLite
