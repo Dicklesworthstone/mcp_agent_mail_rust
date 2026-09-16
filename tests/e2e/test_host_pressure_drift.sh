@@ -119,10 +119,28 @@ AM_HOST_DISK_FREE_WARN_PCT=0 AM_HOST_DISK_FREE_CRIT_PCT=0 \
     AM_HOST_MEM_AVAIL_WARN_PCT=0 AM_HOST_MEM_AVAIL_CRIT_PCT=0 \
     AM_HOST_WAL_STALE_WARN_SECS=999999999 AM_HOST_WAL_STALE_CRIT_SECS=999999999 \
     amrun "${ART}/j1a.json" robot health --include-host --format json
-check "host section carries disk/inode/load/mem/db fields" "${ART}/j1a.json" \
-    '([.host|keys[]]) as $k | (["cpu_count","disk_free_bytes","disk_free_pct","inodes_free","load_per_cpu","mem_available_pct","db_file_bytes","db_dir_writable","host_pressure_likely","status","reasons"] | all(. as $n | ($k|index($n)) != null))'
+check "host section carries disk/inode/load/mem fields" "${ART}/j1a.json" \
+    '([.host|keys[]]) as $k | (["cpu_count","disk_free_bytes","disk_free_pct","inodes_free","load_per_cpu","mem_available_pct","db_dir_writable","host_pressure_likely","status","reasons"] | all(. as $n | ($k|index($n)) != null))'
+check "absent database does not invent a file size" "${ART}/j1a.json" \
+    '.host | has("db_file_bytes") | not'
 check "host_pressure_likely is false when no threshold is breached (hermetic)" \
     "${ART}/j1a.json" '.host.host_pressure_likely == false'
+
+e2e_case_banner "J1a existing database reports its actual file size"
+db_bytes="$(python3 - "${WORK}/mb.sqlite3" <<'PY'
+import pathlib
+import sqlite3
+import sys
+
+path = pathlib.Path(sys.argv[1])
+with sqlite3.connect(path) as connection:
+    connection.execute("CREATE TABLE host_probe_fixture (id INTEGER PRIMARY KEY)")
+print(path.stat().st_size)
+PY
+)"
+amrun "${ART}/j1a_existing.json" robot health --include-host --format json
+check "existing database size matches the filesystem" "${ART}/j1a_existing.json" \
+    '.host.db_file_bytes == $expected and $expected > 0' --argjson expected "$db_bytes"
 
 e2e_case_banner "J1b host_pressure_likely fires ONLY on threshold evidence"
 AM_HOST_DISK_FREE_CRIT_PCT=99.9 amrun "${ART}/j1b.json" robot health --include-host --format json
