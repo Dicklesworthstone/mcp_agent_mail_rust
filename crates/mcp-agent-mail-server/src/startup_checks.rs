@@ -3165,8 +3165,12 @@ fn shared_runtime_startup_probes(config: &Config) -> Vec<ProbeResult> {
 /// logged at warn level and otherwise ignored — rotation failures must never
 /// prevent the server from starting.
 fn rotate_backups_best_effort(config: &Config) {
+    let Some(database_path) = resolve_server_database_url_sqlite_path(&config.database_url) else {
+        return;
+    };
     let keep = crate::backup_rotation::resolved_keep_per_kind();
-    match crate::backup_rotation::rotate_storage_backups(&config.storage_root, keep) {
+    match crate::backup_rotation::rotate_storage_backups(&config.storage_root, &database_path, keep)
+    {
         Ok(report) if report.evicted() > 0 => {
             tracing::info!(
                 staged = report.staged,

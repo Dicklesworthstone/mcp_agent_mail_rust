@@ -462,7 +462,7 @@ pub struct BackupInventoryArtifact {
     pub bytes: u64,
 }
 
-/// Classify a `storage_root`-relative filename into a [`BackupKind`].
+/// Classify a filename belonging to the configured database into a [`BackupKind`].
 ///
 /// Returns `None` for the live DB, Codex DB, and any file that doesn't
 /// match our known backup patterns. This is the *single* place that
@@ -471,29 +471,23 @@ pub struct BackupInventoryArtifact {
 /// recovery-retention reclaim planner) even though it classifies here so
 /// inventory consumers still see it.
 #[must_use]
-pub fn classify_backup_file(file_name: &str) -> Option<BackupKind> {
-    // Explicitly never-delete live state.
-    if matches!(
-        file_name,
-        "storage.sqlite3" | "storage.sqlite3-wal" | "storage.sqlite3-shm" | "mailbox.sqlite3"
-    ) {
-        return None;
-    }
-    // Leave the Codex sidecar DB alone.
-    if file_name.starts_with("storage.codex.sqlite3") {
-        return None;
-    }
-
-    // Only files named like the storage DB (or its WAL/SHM siblings) are
-    // eligible. This is the primary guard against touching unrelated files.
-    let stem_families = [
-        ("storage.sqlite3", "storage.sqlite3."),
-        ("storage.sqlite3-wal", "storage.sqlite3-wal."),
-        ("storage.sqlite3-shm", "storage.sqlite3-shm."),
-    ];
-    let (family_stem, after_stem) = stem_families
-        .into_iter()
-        .find_map(|(stem, prefix)| file_name.strip_prefix(prefix).map(|suffix| (stem, suffix)))?;
+pub fn classify_backup_file(
+    database_name: &std::ffi::OsStr,
+    file_name: &std::ffi::OsStr,
+) -> Option<BackupKind> {
+    let (family_stem, suffix) = ["", "-wal", "-shm"].into_iter().find_map(|sidecar| {
+        let mut stem = database_name.to_os_string();
+        stem.push(sidecar);
+        let mut prefix = stem.clone();
+        prefix.push(".");
+        file_name
+            .as_encoded_bytes()
+            .strip_prefix(prefix.as_encoded_bytes())
+            .map(|suffix| (stem, suffix))
+    })?;
+    // Only the ASCII recovery suffix needs decoding. The configured basename
+    // stays byte-exact, including non-Unicode Unix filenames.
+    let after_stem = std::str::from_utf8(suffix).ok()?;
 
     // `archive-reconcile-` covers the bare, `-failed-*`, and `-restore-*`
     // variants in one check (they all share the prefix).
@@ -513,17 +507,15 @@ pub fn classify_backup_file(file_name: &str) -> Option<BackupKind> {
     // / `bak.<ts>` legacy variant. Using a bare `starts_with("bak")` would
     // false-positive future filenames like `backup-plan.txt` that happen to
     // share the prefix — match exact variants only.
-    let strict_bak = mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(
-        std::ffi::OsStr::new(family_stem),
-        std::ffi::OsStr::new(file_name),
-    )
-    .is_some_and(|candidate| {
-        matches!(
-            candidate.kind(),
-            mcp_agent_mail_core::disk::SqliteRecoveryCandidateKind::ProactiveBak
-                | mcp_agent_mail_core::disk::SqliteRecoveryCandidateKind::TimestampedBak
-        )
-    });
+    let strict_bak =
+        mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(&family_stem, file_name)
+            .is_some_and(|candidate| {
+                matches!(
+                    candidate.kind(),
+                    mcp_agent_mail_core::disk::SqliteRecoveryCandidateKind::ProactiveBak
+                        | mcp_agent_mail_core::disk::SqliteRecoveryCandidateKind::TimestampedBak
+                )
+            });
     if after_stem.starts_with("manual-backup-") || strict_bak {
         return Some(BackupKind::ManualBackup);
     }
@@ -539,10 +531,19 @@ pub fn classify_backup_file(file_name: &str) -> Option<BackupKind> {
 }
 
 /// Return the count and bytes of direct backup files eligible for rotation.
-/// Missing storage roots produce an empty inventory, matching rotation's
+///
+/// Backups live beside the resolved primary, even outside the archive root.
+/// Missing database parents produce an empty inventory, matching rotation's
 /// no-op behavior during first-run bootstrap.
-pub fn inspect_storage_backups(storage_root: &Path) -> std::io::Result<BackupInventory> {
-    let entries = match std::fs::read_dir(storage_root) {
+pub fn inspect_storage_backups(database_path: &Path) -> std::io::Result<BackupInventory> {
+    let Some(database_name) = database_path.file_name() else {
+        return Ok(BackupInventory::default());
+    };
+    let parent = database_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let entries = match std::fs::read_dir(parent) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(BackupInventory::default());
@@ -558,10 +559,7 @@ pub fn inspect_storage_backups(storage_root: &Path) -> std::io::Result<BackupInv
         if !metadata.file_type().is_file() {
             continue;
         }
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if classify_backup_file(&name).is_some() {
+        if classify_backup_file(database_name, &entry.file_name()).is_some() {
             inventory.artifact_count = inventory.artifact_count.saturating_add(1);
             inventory.resident_bytes = inventory.resident_bytes.saturating_add(metadata.len());
             inventory.artifacts.push(BackupInventoryArtifact {
@@ -634,7 +632,7 @@ pub fn retention_resident_stats(
         *slot = slot.saturating_add(artifact.bytes);
     }
 
-    let backup_inventory = inspect_storage_backups(storage_root)?;
+    let backup_inventory = inspect_storage_backups(database_path)?;
     let mut direct_backup_only_artifacts = 0_usize;
     let mut direct_backup_only_bytes = 0_u64;
     for artifact in &backup_inventory.artifacts {
@@ -1169,6 +1167,46 @@ mod tests {
         );
         assert_eq!(plan.prune.len(), 2);
         assert_eq!(plan.reclaimable_bytes, 110);
+    }
+
+    #[test]
+    fn retention_resident_stats_inventory_follows_external_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_root = dir.path().join("archive");
+        let database_dir = dir.path().join("database");
+        std::fs::create_dir(&storage_root).unwrap();
+        std::fs::create_dir(&database_dir).unwrap();
+        let database_path = database_dir.join("custom.db");
+        std::fs::write(&database_path, [0_u8; 7]).unwrap();
+        std::fs::write(
+            database_dir.join("custom.db.bak.20260101_000000"),
+            [0_u8; 11],
+        )
+        .unwrap();
+        std::fs::write(
+            database_dir.join("custom.db-wal.bak.20260101_000000"),
+            [0_u8; 13],
+        )
+        .unwrap();
+        std::fs::write(
+            database_dir.join("custom.db-shm.bak.20260101_000000"),
+            [0_u8; 17],
+        )
+        .unwrap();
+        std::fs::write(
+            database_dir.join("other.db.bak.20260101_000000"),
+            [0_u8; 19],
+        )
+        .unwrap();
+        std::fs::write(
+            storage_root.join("storage.sqlite3.bak.20260101_000000"),
+            [0_u8; 23],
+        )
+        .unwrap();
+        let stats = retention_resident_stats(&storage_root, &database_path, None).unwrap();
+        assert_eq!(stats.direct_backup_only_artifacts, 3);
+        assert_eq!(stats.resident_bytes, 41);
+        assert_eq!(stats.live_database_bytes, Some(7));
     }
 
     #[test]

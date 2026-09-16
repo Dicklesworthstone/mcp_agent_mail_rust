@@ -1,4 +1,4 @@
-//! Bounded retention for storage-root backup detritus.
+//! Bounded retention for backups of the configured database.
 //!
 //! Background: every SQLite corruption, reconstruction, or archive-reconcile
 //! cycle creates a dated backup file (e.g., `storage.sqlite3.corrupt-20260419_...`).
@@ -135,12 +135,15 @@ fn create_unique_quarantine_dir(parent: &Path, stem: &str) -> std::io::Result<Pa
     ))
 }
 
-/// Rotate backup files in `storage_root`, staging evictions for reclaim.
+/// Rotate backup files beside `database_path`, staging evictions for reclaim.
 ///
 /// Keeps `keep_per_kind` newest of each kind and stages the rest into
 /// `<storage_root>/doctor/reclaimable/rotation-<UTC ts>[-<n>]/` for operator
 /// reclaim. With the explicit `AM_BACKUP_ROTATION_DELETE` opt-in the evicted
 /// files are hard-deleted instead (the legacy behavior).
+/// An external database parent is inventoried in place; quarantine remains
+/// under the archive root. Cross-device staging leaves the backup untouched
+/// and reports it as kept, without a copy-and-delete fallback.
 ///
 /// Non-backup files (live DB, Codex DB, projects/, search_index/, .git/,
 /// etc.) are never touched. Rotation only applies to files classified as
@@ -152,22 +155,30 @@ fn create_unique_quarantine_dir(parent: &Path, stem: &str) -> std::io::Result<Pa
 /// failures don't mask themselves.
 pub fn rotate_storage_backups(
     storage_root: &Path,
+    database_path: &Path,
     keep_per_kind: usize,
 ) -> std::io::Result<RotateReport> {
     let keep = keep_per_kind.max(MIN_KEEP_PER_KIND);
     let delete_opted_in = rotation_delete_opted_in();
-    let snapshot_primary = storage_root.join("storage.sqlite3");
-    let snapshot_metadata = mcp_agent_mail_db::snapshot::snapshot_meta_path(&snapshot_primary);
+    let snapshot_primary = database_path;
+    let Some(database_name) = database_path.file_name() else {
+        return Ok(RotateReport::default());
+    };
+    let database_parent = database_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let snapshot_metadata = mcp_agent_mail_db::snapshot::snapshot_meta_path(snapshot_primary);
     let snapshot_authority_occupied = match fs::symlink_metadata(&snapshot_metadata) {
         Ok(_) => true,
         Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     };
     let pinned_verified_snapshot = snapshot_authority_occupied
-        .then(|| mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&snapshot_primary))
+        .then(|| mcp_agent_mail_db::snapshot::verified_snapshot_source_path(snapshot_primary))
         .flatten();
 
     let mut report = RotateReport::default();
-    let entries = match fs::read_dir(storage_root) {
+    let entries = match fs::read_dir(database_parent) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(report),
         Err(e) => return Err(e),
@@ -186,10 +197,7 @@ pub fn rotate_storage_backups(
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let Some(kind) = classify_backup_file(&name) else {
+        let Some(kind) = classify_backup_file(database_name, &entry.file_name()) else {
             continue;
         };
         // Single ownership: `storage.sqlite3.archive-reconcile-*` snapshots
@@ -232,8 +240,41 @@ pub fn rotate_storage_backups(
             report.per_kind.insert(kind.label(), summary);
             continue;
         }
-        // Sort descending by mtime — oldest tail will be evicted.
-        files.sort_by_key(|file| std::cmp::Reverse(file.1));
+        // Published backup generations outrank copy-preserved mtimes. Other
+        // debris uses mtime; raw paths make ties deterministic.
+        files.sort_by(|left, right| {
+            let candidate = |path: &Path| {
+                let name = path.file_name()?;
+                ["", "-wal", "-shm"].into_iter().find_map(|sidecar| {
+                    let mut stem = database_name.to_os_string();
+                    stem.push(sidecar);
+                    mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(&stem, name)
+                })
+            };
+            let left_candidate = candidate(&left.0);
+            let right_candidate = candidate(&right.0);
+            let generation =
+                |name: Option<mcp_agent_mail_core::disk::SqliteRecoveryCandidateName>, modified| {
+                    name.and_then(
+                        mcp_agent_mail_core::disk::SqliteRecoveryCandidateName::generation_micros,
+                    )
+                    .unwrap_or_else(|| {
+                        chrono::DateTime::<chrono::Utc>::from(modified).timestamp_micros()
+                    })
+                };
+            let order = generation(right_candidate, right.1)
+                .cmp(&generation(left_candidate, left.1))
+                .then_with(|| right_candidate.is_some().cmp(&left_candidate.is_some()));
+            let collision_order = match (left_candidate, right_candidate) {
+                (Some(left_name), Some(right_name)) => {
+                    left_name.cmp_newest_first(left.1, right_name, right.1)
+                }
+                _ => std::cmp::Ordering::Equal,
+            };
+            order
+                .then(collision_order)
+                .then_with(|| left.0.cmp(&right.0))
+        });
         let to_evict = files
             .iter()
             .enumerate()
@@ -362,6 +403,13 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    fn classify_backup_file(name: &str) -> Option<BackupKind> {
+        super::classify_backup_file(
+            std::ffi::OsStr::new("storage.sqlite3"),
+            std::ffi::OsStr::new(name),
+        )
+    }
+
     fn touch(path: &Path, size: usize) {
         let mut f = fs::File::create(path).unwrap();
         if size > 0 {
@@ -375,7 +423,7 @@ mod tests {
     fn rotate_with_delete_off(root: &Path, keep: usize) -> RotateReport {
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("AM_BACKUP_ROTATION_DELETE", "0")],
-            || rotate_storage_backups(root, keep).expect("rotate"),
+            || rotate_storage_backups(root, &root.join("storage.sqlite3"), keep).expect("rotate"),
         )
     }
 
@@ -567,7 +615,10 @@ mod tests {
     #[test]
     fn rotation_pins_the_metadata_authorized_backup_generation() {
         let tmp = TempDir::new().unwrap();
-        let primary = tmp.path().join("storage.sqlite3");
+        let archive = tmp.path().join("archive");
+        let database_dir = tmp.path().join("database");
+        fs::create_dir(&database_dir).unwrap();
+        let primary = database_dir.join("custom-mail.db");
         let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(primary.to_str().unwrap())
             .expect("open mailbox fixture");
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
@@ -579,14 +630,18 @@ mod tests {
         fs::copy(&primary, &exact).expect("copy verified exact backup");
         mcp_agent_mail_db::snapshot::record_snapshot_metadata(&primary, 42)
             .expect("record verified authority");
-        let pinned = tmp.path().join("storage.sqlite3.bak.20260101_000000");
+        let pinned = database_dir.join("custom-mail.db.bak.20260101_000000");
         fs::rename(&exact, &pinned).expect("rotate verified bytes");
         sleep(Duration::from_millis(5));
-        touch(&tmp.path().join("storage.sqlite3.bak.20260102_000000"), 13);
+        touch(&database_dir.join("custom-mail.db.bak.20260102_000000"), 13);
         sleep(Duration::from_millis(5));
-        touch(&tmp.path().join("storage.sqlite3.bak.20260103_000000"), 17);
+        touch(&database_dir.join("custom-mail.db.bak.20260103_000000"), 17);
 
-        let report = rotate_with_delete_off(tmp.path(), 1);
+        assert_eq!(inspect_storage_backups(&primary).unwrap().artifact_count, 3);
+        let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "0")],
+            || rotate_storage_backups(&archive, &primary, 1).unwrap(),
+        );
 
         assert!(
             pinned.is_file(),
@@ -598,6 +653,11 @@ mod tests {
         );
         assert_eq!(report.staged, 1);
         assert_eq!(report.kept, 2, "newest plus verified generation are kept");
+        assert_eq!(inspect_storage_backups(&primary).unwrap().artifact_count, 2);
+        assert_eq!(
+            quarantined_names(&archive),
+            ["custom-mail.db.bak.20260102_000000"]
+        );
         assert_eq!(
             mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).as_deref(),
             Some(pinned.as_path())
@@ -636,6 +696,86 @@ mod tests {
     }
 
     #[test]
+    fn rotation_prefers_logical_generation_over_copied_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let primary = tmp.path().join("custom.db");
+        let newest = tmp.path().join("custom.db.bak.20260103_000000");
+        let older = tmp.path().join("custom.db.bak.20260102_000000");
+        let collision = tmp.path().join("custom.db.bak.20260103_000000-01");
+        for (path, seconds) in [(&newest, 1), (&older, 3), (&collision, 2)] {
+            touch(path, 17);
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+                )
+                .unwrap();
+        }
+        let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "0")],
+            || rotate_storage_backups(tmp.path(), &primary, 1).unwrap(),
+        );
+        assert_eq!(report.staged, 2);
+        assert!(
+            collision.is_file(),
+            "latest logical generation and collision must survive"
+        );
+        assert!(!older.exists());
+        assert!(!newest.exists());
+    }
+
+    #[test]
+    fn rotation_breaks_equal_generation_ties_by_raw_path() {
+        let tmp = TempDir::new().unwrap();
+        let primary = tmp.path().join("custom.db");
+        let main = tmp.path().join("custom.db.bak.20260103_000000");
+        let wal = tmp.path().join("custom.db-wal.bak.20260103_000000");
+        touch(&main, 11);
+        touch(&wal, 13);
+        let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "0")],
+            || rotate_storage_backups(tmp.path(), &primary, 1).unwrap(),
+        );
+        assert_eq!(report.staged, 1);
+        assert!(
+            wal.is_file(),
+            "equal generations use ascending raw path order"
+        );
+        assert!(!main.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_matches_non_unicode_database_basename_without_aliasing() {
+        use std::os::unix::ffi::OsStringExt;
+        let tmp = TempDir::new().unwrap();
+        let name = std::ffi::OsString::from_vec(b"mail-\xff.db".to_vec());
+        let primary = tmp.path().join(&name);
+        let mut old_name = name.clone();
+        old_name.push(".bak.20260101_000000");
+        let mut new_name = name;
+        new_name.push(".bak.20260102_000000");
+        touch(&tmp.path().join(&old_name), 11);
+        touch(&tmp.path().join(&new_name), 13);
+        let alias = tmp.path().join("mail-�.db.bak.20260101_000000");
+        touch(&alias, 19);
+        assert_eq!(
+            inspect_storage_backups(&primary).unwrap().resident_bytes,
+            24
+        );
+        let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "0")],
+            || rotate_storage_backups(tmp.path(), &primary, 1).unwrap(),
+        );
+        assert_eq!(report.staged, 1);
+        assert!(tmp.path().join(new_name).is_file());
+        assert_eq!(fs::read(alias).unwrap(), vec![0; 19]);
+    }
+
+    #[test]
     fn rotate_storage_backups_does_not_remove_live_state() {
         let tmp = TempDir::new().unwrap();
         touch(&tmp.path().join("storage.sqlite3"), 1024);
@@ -643,7 +783,8 @@ mod tests {
         touch(&tmp.path().join("storage.sqlite3-shm"), 64);
         touch(&tmp.path().join("storage.codex.sqlite3"), 4096);
 
-        let report = rotate_storage_backups(tmp.path(), 3).expect("rotate");
+        let report = rotate_storage_backups(tmp.path(), &tmp.path().join("storage.sqlite3"), 3)
+            .expect("rotate");
         assert_eq!(report.evicted(), 0);
         assert!(tmp.path().join("storage.sqlite3").exists());
         assert!(tmp.path().join("storage.sqlite3-wal").exists());
@@ -682,7 +823,8 @@ mod tests {
     fn rotate_storage_backups_on_missing_root_is_noop() {
         let tmp = TempDir::new().unwrap();
         let missing = tmp.path().join("does-not-exist");
-        let report = rotate_storage_backups(&missing, 3).expect("rotate");
+        let report =
+            rotate_storage_backups(&missing, &missing.join("storage.sqlite3"), 3).expect("rotate");
         assert_eq!(report.evicted(), 0);
         assert_eq!(report.kept, 0);
     }
@@ -828,7 +970,10 @@ mod tests {
 
         let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("AM_BACKUP_ROTATION_DELETE", "1")],
-            || rotate_storage_backups(tmp.path(), 1).expect("rotate"),
+            || {
+                rotate_storage_backups(tmp.path(), &tmp.path().join("storage.sqlite3"), 1)
+                    .expect("rotate")
+            },
         );
 
         assert_eq!(report.deleted, 2, "opt-in restores hard-delete");
@@ -858,7 +1003,8 @@ mod tests {
             sleep(Duration::from_millis(5));
         }
 
-        let report = rotate_storage_backups(tmp.path(), 1).expect("rotate");
+        let report = rotate_storage_backups(tmp.path(), &tmp.path().join("storage.sqlite3"), 1)
+            .expect("rotate");
         assert_eq!(report.evicted(), 0);
         assert!(!report.per_kind.contains_key("archive_reconcile"));
         for i in 0..4 {
@@ -885,7 +1031,8 @@ mod tests {
         );
         touch(&tmp.path().join("unrelated.txt"), 600);
 
-        let inventory = inspect_storage_backups(tmp.path()).expect("inventory");
+        let inventory =
+            inspect_storage_backups(&tmp.path().join("storage.sqlite3")).expect("inventory");
         assert_eq!(inventory.artifact_count, 1);
         assert_eq!(inventory.resident_bytes, 400);
         assert_eq!(inventory.artifacts.len(), 1);
