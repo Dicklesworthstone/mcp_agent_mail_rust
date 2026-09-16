@@ -21426,7 +21426,7 @@ fn handle_migrate_with_database_url_locked(database_url: &str) -> CliResult<()> 
             // Legacy Python: `migrate` is an explicit schema-create command.
             ftui_runtime::ftui_println!("✓ Database schema created from model definitions!");
             ftui_runtime::ftui_println!(
-                "Note: To apply model changes, delete storage.sqlite3 and run this again."
+                "Keep the database and migration backup; run `am doctor check` if problems remain."
             );
             Ok(())
         }
@@ -50697,7 +50697,7 @@ http_headers = { Authorization = "Bearer secret" }
                 );
                 assert!(
                     out.contains(
-                        "Note: To apply model changes, delete storage.sqlite3 and run this again."
+                        "Keep the database and migration backup; run `am doctor check` if problems remain."
                     ),
                     "stdout: {out}"
                 );
