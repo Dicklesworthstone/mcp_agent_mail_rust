@@ -50,7 +50,18 @@ fn snapshot_app(width: u16, height: u16, screen_id: MailScreenId, name: &str) {
     use ftui_runtime::Model;
     use mcp_agent_mail_server::tui_app::{MailAppModel, MailMsg};
 
-    let config = Config::default();
+    let temp = tempfile::tempdir().expect("private app snapshot database");
+    let database = temp.path().join("snapshot.sqlite3");
+    let conn = mcp_agent_mail_db::DbConn::open_file(database.to_str().unwrap())
+        .expect("create real snapshot database");
+    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+        .expect("initialize healthy snapshot schema");
+    conn.close_sync().expect("close snapshot fixture writer");
+    let config = Config {
+        database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&database),
+        storage_root: temp.path().join("archive"),
+        ..Default::default()
+    };
     let state = TuiSharedState::new(&config);
     let mut model = MailAppModel::new(Arc::clone(&state));
 

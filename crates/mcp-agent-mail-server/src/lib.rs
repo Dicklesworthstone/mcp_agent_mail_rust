@@ -34087,6 +34087,12 @@ first body
 
     #[test]
     fn dispatch_compose_envelope_db_open_failure_pushes_console_log() {
+        let temp = tempfile::tempdir().expect("private fixture");
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"preserve parent blocker").unwrap();
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(
+            &blocked_parent.join("compose_fail.sqlite3"),
+        );
         let config = mcp_agent_mail_core::Config::default();
         let tui_state = tui_bridge::TuiSharedState::new(&config);
         let envelope = tui_compose::ComposeEnvelope {
@@ -34099,16 +34105,16 @@ first body
             importance: "normal".to_string(),
             thread_id: None,
         };
-        dispatch_compose_envelope(
-            "sqlite:///nonexistent/path/compose_fail.sqlite3",
-            &tui_state,
-            &envelope,
-        );
+        dispatch_compose_envelope(&database_url, &tui_state, &envelope);
         let logs = tui_state.console_log_since(0);
         assert!(
             logs.iter()
                 .any(|(_, msg)| msg.contains("could not open database")),
             "DB-open failure must surface to console log, got: {logs:?}"
+        );
+        assert_eq!(
+            std::fs::read(blocked_parent).unwrap(),
+            b"preserve parent blocker"
         );
     }
 

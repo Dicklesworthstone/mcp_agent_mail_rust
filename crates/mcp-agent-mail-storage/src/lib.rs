@@ -15562,9 +15562,37 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_file_lock_stale_cleanup_permission_denied_returns_false() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::process::CommandExt as _;
 
         let tmp = TempDir::new().unwrap();
+        if fs::metadata(tmp.path()).unwrap().uid() == 0 {
+            assert!(
+                std::env::var_os("AM_STORAGE_PERMISSION_TEST_CHILD").is_none(),
+                "permission child must actually drop root privileges"
+            );
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::test_file_lock_stale_cleanup_permission_denied_returns_false",
+                    "--nocapture",
+                ])
+                .uid(65534)
+                .gid(65534)
+                .env("AM_STORAGE_PERMISSION_TEST_CHILD", "1")
+                .env("TMPDIR", "/tmp")
+                .current_dir("/tmp")
+                .output()
+                .expect("run stale-lock denial without root DAC bypass");
+            assert!(
+                output.status.success(),
+                "unprivileged permission test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            return;
+        }
         let lock_dir = tmp.path().join("readonly");
         fs::create_dir_all(&lock_dir).unwrap();
         let lock_path = lock_dir.join("perm.lock");
@@ -15595,6 +15623,15 @@ mod tests {
         assert!(
             lock_path.exists(),
             "lock should remain when quarantine is denied"
+        );
+        assert_eq!(fs::read(&lock_path).unwrap(), b"locked");
+        assert_eq!(
+            fs::read_to_string(&meta_path).unwrap(),
+            stale_meta.to_string()
+        );
+        assert!(
+            lock.cleanup_if_stale().unwrap(),
+            "the same stale lock must quarantine once write access is restored"
         );
     }
 

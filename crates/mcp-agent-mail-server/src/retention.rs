@@ -1178,7 +1178,14 @@ mod tests {
 
     #[test]
     fn dir_size_nonexistent_returns_zero() {
-        assert_eq!(dir_size(Path::new("/nonexistent/path")), 0);
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        assert!(!missing.exists());
+        assert_eq!(dir_size(&missing), 0);
+        assert!(
+            !missing.exists(),
+            "measuring a missing directory must not create it"
+        );
     }
 
     #[test]

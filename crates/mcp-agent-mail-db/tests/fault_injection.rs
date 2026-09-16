@@ -1155,14 +1155,55 @@ fn checkpoint_read_from_corrupted_file_returns_serialization_error() {
     assert_eq!(result.unwrap_err().error_type(), "SERIALIZATION_ERROR");
 }
 
+// Unix mode-bit denial requires an unprivileged process. Windows directory
+// readonly attributes do not enforce this contract; those need ACL fixtures.
+#[cfg(unix)]
+fn run_permission_test_unprivileged(test_name: &str) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::process::CommandExt as _;
+
+    let probe = tempfile::tempdir().unwrap();
+    if std::fs::metadata(probe.path()).unwrap().uid() != 0 {
+        return false;
+    }
+    assert!(
+        std::env::var_os("AM_PERMISSION_TEST_CHILD").is_none(),
+        "permission child must actually drop root privileges"
+    );
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .uid(65534)
+        .gid(65534)
+        .env("AM_PERMISSION_TEST_CHILD", "1")
+        // The parent RCH runner's private TMPDIR belongs to root. The child
+        // creates its own mode-0700 fixture under the standard Unix temp root.
+        .env("TMPDIR", "/tmp")
+        .current_dir("/tmp")
+        .output()
+        .expect("run permission assertion without privileged DAC bypass");
+    assert!(
+        output.status.success(),
+        "unprivileged {test_name} failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    true
+}
+
+#[cfg(unix)]
 #[test]
 fn checkpoint_write_to_readonly_dir_returns_io_error() {
+    if run_permission_test_unprivileged("checkpoint_write_to_readonly_dir_returns_io_error") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let readonly_dir = tmp.path().join("readonly");
     std::fs::create_dir(&readonly_dir).unwrap();
 
-    // Make directory read-only
-    let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
+    // Preserve the original mode exactly for the writable control.
+    let original_perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
+    let mut perms = original_perms.clone();
     perms.set_readonly(true);
     std::fs::set_permissions(&readonly_dir, perms.clone()).unwrap();
 
@@ -1178,20 +1219,26 @@ fn checkpoint_write_to_readonly_dir_returns_io_error() {
     let result = cp.write_to(&readonly_dir);
 
     // Restore permissions for cleanup
-    perms.set_readonly(false);
-    std::fs::set_permissions(&readonly_dir, perms).unwrap();
+    std::fs::set_permissions(&readonly_dir, original_perms).unwrap();
 
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().error_type(), "IO_ERROR");
+    cp.write_to(&readonly_dir)
+        .expect("the same checkpoint succeeds after restoring write access");
 }
 
+#[cfg(unix)]
 #[test]
 fn ensure_dirs_on_readonly_root_returns_io_error() {
+    if run_permission_test_unprivileged("ensure_dirs_on_readonly_root_returns_io_error") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let readonly_root = tmp.path().join("readonly_root");
     std::fs::create_dir(&readonly_root).unwrap();
 
-    let mut perms = std::fs::metadata(&readonly_root).unwrap().permissions();
+    let original_perms = std::fs::metadata(&readonly_root).unwrap().permissions();
+    let mut perms = original_perms.clone();
     perms.set_readonly(true);
     std::fs::set_permissions(&readonly_root, perms.clone()).unwrap();
 
@@ -1199,10 +1246,13 @@ fn ensure_dirs_on_readonly_root_returns_io_error() {
     let result = layout.ensure_dirs(&test_scope(), &test_schema());
 
     // Restore permissions for cleanup
-    perms.set_readonly(false);
-    std::fs::set_permissions(&readonly_root, perms).unwrap();
+    std::fs::set_permissions(&readonly_root, original_perms).unwrap();
 
     assert!(result.is_err());
+    assert_eq!(result.unwrap_err().error_type(), "IO_ERROR");
+    layout
+        .ensure_dirs(&test_scope(), &test_schema())
+        .expect("the same layout succeeds after restoring write access");
 }
 
 #[test]
