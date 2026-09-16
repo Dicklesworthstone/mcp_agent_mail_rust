@@ -81,7 +81,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 |-------|---------|
 | `asupersync` (`=0.4.9`, crates.io) | Structured async runtime (channels, sync, regions, HTTP, testing) |
 | `fastmcp-rust` (`0.7.1`, immutable Git backport `c14d26b4`; imported as `fastmcp`) | MCP protocol implementation; full family pinned for legacy stdio version negotiation while retaining Asupersync 0.4.9 |
-| `sqlmodel` (`=0.4.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; the FrankenSQLite driver (`fsqlite =0.3.18`) is the runtime `DbConn` |
+| `sqlmodel` (`=0.4.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; the FrankenSQLite driver (`fsqlite =0.3.18`, Git revision `2633b38a26bde68db23172b12aa402ed698cc309`, tag `am-sql-compat-20260916`) is the runtime `DbConn`; the pin includes the Windows namespace identity fix |
 | `sqlmodel-sqlite` (`=0.4.0`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
 | `ftui` / `ftui-*` (`0.5.0`, FrankenTUI) | TUI rendering for operations console |
 | `frankensearch` (`0.4`, path dep `../frankensearch-rel-0332`, a gated clone at dist.yml's `FRANKENSEARCH_COMMIT`) | Search V3 engine; lexical (Tantivy) tier by default, semantic/rerank behind the `hybrid` feature. Never point this at a live checkout: the live tree already moved to asupersync 0.4.10, which fastmcp cannot follow yet |

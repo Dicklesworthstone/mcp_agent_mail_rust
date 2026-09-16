@@ -36,10 +36,15 @@ Recent releases; the earlier version history continues below.
 ## Unreleased
 
 Changes after the [v0.3.35 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.35),
-reviewed through 2026-09-15. These changes are not published release artifacts.
+reviewed through 2026-09-16. These changes are not published release artifacts.
 
 ### Fixed
 
+- **The pinned FrankenSQLite engine compiles on Windows.** Its namespace
+  generation probe now reads the synchronized file identity instead of comparing
+  the identity with its mutex. Native Windows namespace tests cover the fix;
+  the existing SQL and WAL compatibility changes remain in the dependency pin.
+  ([engine fix](https://github.com/Dicklesworthstone/frankensqlite/commit/2633b38a26bde68db23172b12aa402ed698cc309))
 - **Share snapshots preserve an occupied destination.** Publication now uses
   an atomic no-clobber operation, retains the private completed image when
   publication fails, and flushes the parent directory on Unix before reporting
