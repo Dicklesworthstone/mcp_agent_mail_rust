@@ -11862,12 +11862,9 @@ impl HttpState {
                     }),
                 ));
             }
-            let (_path, query_part) = split_path_query(&req.uri);
-            let observability_state =
-                tui_state_handle().unwrap_or_else(|| self.ws_state_fallback.clone());
-            let payload =
-                tui_ws_state::poll_payload(observability_state.as_ref(), query_part.as_deref());
-            return Some(self.json_response(req, 200, &payload));
+            // Snapshot collection can run a cold system-health filesystem/git
+            // sweep. Fall through to bounded mail dispatch instead of doing
+            // that synchronous work on an HTTP async worker (br-02zlk).
         }
 
         if path == "/mail/api/locks" || path == "/mail/api/locks/" {
@@ -11906,8 +11903,9 @@ impl HttpState {
         // happen here. It runs synchronous DB work (pool bootstrap, queries,
         // template render) and is routed through the bounded blocking-dispatch
         // pool in `handle_inner` (GH#184) so it can never occupy an async
-        // worker thread. The cheap `/mail/ws-*` + `/mail/api/locks` routes
-        // above stay inline.
+        // worker thread. `/mail/ws-state` uses that same pool; only its cheap
+        // method/upgrade rejection and `/mail/ws-input` stay inline, alongside
+        // `/mail/api/locks` above.
 
         // Static file serving from optional web/ SPA directory.
         // Only serve for GET requests on non-API paths (legacy Python: _is_api_path check).
@@ -11982,6 +11980,13 @@ impl HttpState {
             return rejection;
         }
         let (_path_part, query_part) = split_path_query(&req.uri);
+        if path == "/mail/ws-state" {
+            let observability_state =
+                tui_state_handle().unwrap_or_else(|| self.ws_state_fallback.clone());
+            let payload =
+                tui_ws_state::poll_payload(observability_state.as_ref(), query_part.as_deref());
+            return self.json_response(req, 200, &payload);
+        }
         let query_str = query_part.as_deref().unwrap_or("");
         let method_str = if matches!(req.method, Http1Method::Post) {
             "POST"
@@ -21854,6 +21859,64 @@ first body
             payload.get("locks").and_then(|v| v.as_array()).is_some(),
             "locks missing or not array: {payload}"
         );
+    }
+
+    #[test]
+    fn mail_ws_state_respects_dispatch_admission_without_blocking_liveness() {
+        const CHILD: &str = "AM_TEST_WS_STATE_DISPATCH_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Admission counters and the TUI singleton are process-global.
+            // Exercise the real handler in a fresh process instead of resetting
+            // shared state underneath other tests.
+            let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "tests::mail_ws_state_respects_dispatch_admission_without_blocking_liveness",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("run isolated dispatch regression");
+            assert!(status.success(), "isolated dispatch regression failed");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("private mailbox");
+        let config = mcp_agent_mail_core::Config {
+            storage_root: dir.path().join("archive"),
+            database_url: format!("sqlite:///{}", dir.path().join("mail.sqlite3").display()),
+            ..Default::default()
+        };
+        let state = Arc::new(build_state(config));
+        state
+            .self_ref
+            .set(Arc::downgrade(&state))
+            .expect("self reference");
+        let permits: Vec<_> = (0..MAX_CONCURRENT_DISPATCHES)
+            .map(|_| DispatchPermit::try_acquire().expect("fresh process admission slot"))
+            .collect();
+
+        let req = make_request(Http1Method::Get, "/mail/ws-state?system_health=1", &[]);
+        assert_eq!(block_on(state.handle(req)).status, 503);
+        let req = make_request(Http1Method::Get, "/health/liveness", &[]);
+        assert_eq!(block_on(state.handle(req)).status, 200);
+        let req = make_request(Http1Method::Post, "/mail/ws-state", &[]);
+        assert_eq!(block_on(state.handle(req)).status, 405);
+        let req = make_request(
+            Http1Method::Get,
+            "/mail/ws-state",
+            &[("upgrade", "websocket")],
+        );
+        assert_eq!(block_on(state.handle(req)).status, 501);
+
+        drop(permits);
+        let req = make_request(Http1Method::Get, "/mail/ws-state?limit=5", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("snapshot JSON");
+        assert_eq!(body["transport"], "http-poll");
+        assert_eq!(body["mode"], "snapshot");
+        assert!(body.get("atc").is_some());
     }
 
     #[test]

@@ -26,6 +26,11 @@ Recent releases; the earlier version history continues below.
 
 ## Unreleased
 
+- **Browser health polling no longer runs slow snapshot work on HTTP workers.**
+  `/mail/ws-state` now uses the existing bounded mail dispatch pool and request
+  timeout. Saturated dispatch returns HTTP 503 while liveness remains available;
+  snapshot payloads and method/WebSocket rejection behavior are unchanged.
+  (`br-02zlk`)
 - **Failed staged health probes retain a small private diagnostic report.**
   Doctor output includes the JSON report path after the temporary database
   copy is removed. Reports preserve the failure reason and its conclusive or

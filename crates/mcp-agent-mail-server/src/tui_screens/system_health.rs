@@ -902,8 +902,8 @@ fn boot_archive_preflight_remediation(snapshot: &BootArchivePreflightSnapshot) -
 /// Cached result of the expensive parts of the System Health payload: the
 /// env config read, the dismissal-file load, and the git ref-integrity sweep
 /// (which opens every archive repo and checks each ref against the odb).
-/// `/mail/ws-state?system_health=1` is polled inline on the async workers, so
-/// the sweep must never run more than once per configured
+/// `/mail/ws-state?system_health=1` runs on the bounded blocking-dispatch pool;
+/// the sweep must still never run more than once per configured
 /// `health_sweep_interval_seconds`.
 #[derive(Debug, Clone)]
 struct SystemHealthSweepCacheEntry {
