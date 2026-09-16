@@ -40,6 +40,18 @@ reviewed through 2026-09-16. These changes are not published release artifacts.
 
 ### Fixed
 
+- **Backup retention follows the configured database.** Custom database
+  names and locations now receive the same inventory, verified-snapshot
+  pinning, and rotation as the default mailbox. Timestamped backups use their
+  recorded generation instead of copied filesystem modification times;
+  quarantine remains under the archive root and failed cross-device moves
+  leave the source backup intact.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/05682121))
+- **Recovery rollback preserves collisions and flushes every restored parent.**
+  A newly occupied original path is left untouched while independent files
+  are restored. A failed directory flush no longer prevents the remaining
+  restored parents from being flushed; failures are reported together.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/9d46c65421e8ac5f8a04631d4e3a0d1a5e65effb))
 - **The pinned FrankenSQLite engine compiles on Windows.** Its namespace
   generation probe now reads the synchronized file identity instead of comparing
   the identity with its mutex. Native Windows namespace tests cover the fix;
