@@ -40457,34 +40457,34 @@ mod mail_server_cli_bridge_tests {
         PENDING_SEND_DISCARD_RECEIPT_SCHEMA_VERSION, PENDING_SEND_DISCARDED_STATUS,
         PENDING_SEND_SCHEMA_VERSION, PENDING_SEND_UNSENT_STATUS, PendingMailSendEnvelope,
         PendingSendArtifact, ServerToolCall, acquire_doctor_mailbox_activity_lock_for_sqlite_path,
-        acquire_doctor_mailbox_activity_lock_for_storage_root,
+        acquire_doctor_mailbox_activity_lock_for_storage_root, advertised_port_from_ownership,
         build_server_create_agent_identity_arguments, build_server_fetch_inbox_product_arguments,
         build_server_list_agents_arguments, build_server_macro_start_session_arguments,
         build_server_register_agent_arguments, build_server_reply_message_arguments,
         build_server_send_message_arguments, build_server_whois_arguments,
         classify_server_tool_call, coerce_tool_result_json, coerce_tool_result_json_or_error,
-        create_pending_send_artifact, ensure_message_in_project,
+        command_line_advertised_port, create_pending_send_artifact, ensure_message_in_project,
         fetch_inbox_server_rejection_allows_local_fallback, get_blocking_http_request,
         is_resource_busy_cli_error, load_pending_send_artifact, load_pending_send_receipt,
-        load_sender_identity_token, mail_server_rejection_allows_local_fallback,
-        mailbox_activity_lock_cli_error, normalize_cli_product_inbox_agent_name,
-        normalize_pending_send_discard_reason, parse_blocking_http_url,
-        parse_cli_fetch_inbox_product_limit, parse_cli_search_limit, pending_send_content_hash,
-        pending_send_discard_receipt_path, pending_send_failure_from_error,
-        pending_send_is_consumed, pending_send_queued_age_seconds, pending_send_receipt_path,
-        persist_sender_identity_token, persist_sender_identity_token_from_agent_payload,
-        post_jsonrpc_request_blocking_http, product_inbox_row_to_json,
-        reject_local_fallback_with_ownership_probe, reject_local_registration_when_gate,
-        resolve_mailbox_activity_sqlite_path, resolve_pending_send_discard_actor,
-        resolve_sender_token, server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
-        sort_product_inbox_items_desc, sqlite_doctor_sanity_with_health_probe,
-        validate_pending_send_artifact, validate_pending_send_discard_receipt,
-        validate_pending_send_receipt, write_pending_send_discard_receipt,
-        write_pending_send_receipt,
+        load_sender_identity_token, loopback_server_url_authority,
+        mail_server_rejection_allows_local_fallback, mailbox_activity_lock_cli_error,
+        normalize_cli_product_inbox_agent_name, normalize_pending_send_discard_reason,
+        parse_blocking_http_url, parse_cli_fetch_inbox_product_limit, parse_cli_search_limit,
+        pending_send_content_hash, pending_send_discard_receipt_path,
+        pending_send_failure_from_error, pending_send_is_consumed, pending_send_queued_age_seconds,
+        pending_send_receipt_path, persist_sender_identity_token,
+        persist_sender_identity_token_from_agent_payload, post_jsonrpc_request_blocking_http,
+        product_inbox_row_to_json, reject_local_fallback_with_ownership_probe,
+        reject_local_registration_when_gate, resolve_mailbox_activity_sqlite_path,
+        resolve_pending_send_discard_actor, resolve_sender_token, server_inbox_payload_to_cli_json,
+        server_message_payload_to_cli_json, server_url_with_port, sort_product_inbox_items_desc,
+        sqlite_doctor_sanity_with_health_probe, validate_pending_send_artifact,
+        validate_pending_send_discard_receipt, validate_pending_send_receipt,
+        write_pending_send_discard_receipt, write_pending_send_receipt,
     };
     use chrono::{DateTime, Utc};
     use mcp_agent_mail_core::config::Config;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn send_message_server_arguments_omit_absent_optional_fields() {
@@ -42214,6 +42214,184 @@ mod mail_server_cli_bridge_tests {
         assert!(message.contains("mail send could not be proxied"));
         assert!(message.contains("Refusing local SQLite fallback"));
         assert!(message.contains("another Agent Mail server owns the mailbox database"));
+    }
+
+    fn owned_mailbox_state(
+        commands: &[(&str, u32)],
+        storage_root: &Path,
+        sqlite_path: &Path,
+    ) -> mcp_agent_mail_db::pool::MailboxOwnershipState {
+        let processes = commands
+            .iter()
+            .map(
+                |(command, pid)| mcp_agent_mail_db::pool::MailboxOwnershipProcess {
+                    pid: *pid,
+                    command: Some((*command).to_string()),
+                    executable_path: Some("/usr/local/bin/am".to_string()),
+                    executable_deleted: false,
+                    holds_storage_root_lock: true,
+                    holds_sqlite_lock: true,
+                    holds_exclusive_lock: true,
+                    holds_database_file: false,
+                },
+            )
+            .collect();
+        mcp_agent_mail_db::pool::MailboxOwnershipState {
+            disposition: mcp_agent_mail_db::pool::MailboxOwnershipDisposition::ActiveOtherOwner,
+            storage_lock_path: storage_root
+                .join(".mailbox.activity.lock")
+                .display()
+                .to_string(),
+            sqlite_lock_path: format!("{}.activity.lock", sqlite_path.display()),
+            processes,
+            competing_pids: commands.iter().map(|(_, pid)| *pid).collect(),
+            readers: Vec::new(),
+            supervised_restart_required: false,
+            detail: "another Agent Mail server owns the mailbox database".to_string(),
+        }
+    }
+
+    #[test]
+    fn command_line_advertised_port_prefers_flag_over_env() {
+        assert_eq!(
+            command_line_advertised_port(
+                "/usr/local/bin/am serve-http --port 18765 --no-tui --no-auth"
+            ),
+            Some(18765)
+        );
+        assert_eq!(
+            command_line_advertised_port("am serve-http --port=9000"),
+            Some(9000)
+        );
+        assert_eq!(
+            command_line_advertised_port("env HTTP_PORT=18801 am serve-http --no-tui"),
+            Some(18801)
+        );
+        // Flag-over-env precedence matches the daemon's own config layering.
+        assert_eq!(
+            command_line_advertised_port("HTTP_PORT=1111 am serve-http --port 2222"),
+            Some(2222)
+        );
+        assert_eq!(command_line_advertised_port("am serve-stdio"), None);
+        assert_eq!(command_line_advertised_port("am serve-http --port 0"), None);
+        assert_eq!(command_line_advertised_port("am serve-http --port"), None);
+        // A `--port` token followed by another flag must not swallow it.
+        assert_eq!(
+            command_line_advertised_port("am serve-http --port --no-tui"),
+            None
+        );
+    }
+
+    #[test]
+    fn advertised_port_from_ownership_reads_owner_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ownership = owned_mailbox_state(
+            &[("/usr/local/bin/am serve-http --port 18765 --no-tui", 4242)],
+            dir.path(),
+            &dir.path().join("mailbox.sqlite3"),
+        );
+        assert_eq!(
+            advertised_port_from_ownership(&ownership, |_| None),
+            Some(18765)
+        );
+    }
+
+    #[test]
+    fn advertised_port_from_ownership_uses_environ_when_cmdline_has_no_port() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ownership = owned_mailbox_state(
+            &[("/usr/local/bin/am serve-http --no-tui", 4242)],
+            dir.path(),
+            &dir.path().join("mailbox.sqlite3"),
+        );
+        assert_eq!(
+            advertised_port_from_ownership(&ownership, |pid| (pid == 4242).then_some(18765)),
+            Some(18765)
+        );
+    }
+
+    #[test]
+    fn advertised_port_from_ownership_rejects_ambiguous_or_unowned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ambiguous = owned_mailbox_state(
+            &[
+                ("/a/am serve-http --port 18765", 100),
+                ("/b/am serve-http --port 18766", 101),
+            ],
+            dir.path(),
+            &dir.path().join("mailbox.sqlite3"),
+        );
+        assert_eq!(advertised_port_from_ownership(&ambiguous, |_| None), None);
+
+        let mut unowned = owned_mailbox_state(
+            &[("/a/am serve-http --port 18765", 100)],
+            dir.path(),
+            &dir.path().join("mailbox.sqlite3"),
+        );
+        unowned.disposition = mcp_agent_mail_db::pool::MailboxOwnershipDisposition::Unowned;
+        assert_eq!(advertised_port_from_ownership(&unowned, |_| None), None);
+    }
+
+    #[test]
+    fn server_url_port_rewrites_preserve_scheme_host_and_path() {
+        assert_eq!(
+            server_url_with_port("http://127.0.0.1:8765/mcp/", 18765),
+            Some("http://127.0.0.1:18765/mcp/".to_string())
+        );
+        assert_eq!(
+            server_url_with_port("http://[::1]:8765/mcp/", 9000),
+            Some("http://[::1]:9000/mcp/".to_string())
+        );
+        assert_eq!(
+            server_url_with_port("http://localhost:8765", 9000),
+            Some("http://localhost:9000".to_string())
+        );
+        assert_eq!(
+            loopback_server_url_authority("http://127.0.0.1:8765/mcp/"),
+            Some(("127.0.0.1", 8765))
+        );
+        assert_eq!(
+            loopback_server_url_authority("http://[::1]:8765/mcp/"),
+            Some(("::1", 8765))
+        );
+        // Remote hosts and port-less URLs never belong to the local owner.
+        assert_eq!(
+            loopback_server_url_authority("http://10.0.0.5:8765/mcp/"),
+            None
+        );
+        assert_eq!(loopback_server_url_authority("http://127.0.0.1/mcp/"), None);
+        assert_eq!(loopback_server_url_authority("not-a-url"), None);
+    }
+
+    #[test]
+    fn unavailable_server_fallback_error_names_owner_port() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mailbox.sqlite3");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("archive");
+
+        let error = reject_local_fallback_with_ownership_probe(
+            "mail send",
+            "http://127.0.0.1:8765/mcp/",
+            "transport failure calling server",
+            &database_url,
+            &storage_root,
+            |sqlite_path, root| {
+                owned_mailbox_state(
+                    &[(
+                        "/usr/local/bin/am serve-http --port 18765 --no-tui --no-auth",
+                        4242,
+                    )],
+                    root,
+                    sqlite_path,
+                )
+            },
+        )
+        .expect_err("owned mailbox should block local fallback");
+
+        let message = error.to_string();
+        assert!(message.contains("Refusing local SQLite fallback"));
+        assert!(message.contains("HTTP_PORT=18765"));
     }
 
     #[test]
@@ -86032,6 +86210,160 @@ async fn post_jsonrpc_request(
     payload: &serde_json::Value,
     timeout_seconds: u64,
 ) -> CliResult<serde_json::Value> {
+    match post_jsonrpc_request_once(server_url, bearer, payload, timeout_seconds).await {
+        Err(error) if server_tool_error_is_unavailable(&error) => {
+            // GH#323: the configured endpoint may be stale while a live daemon
+            // owns the mailbox on a different port. Prefer the port the lock
+            // owner advertises before giving up on the server path.
+            let Some(owner_url) = mailbox_owner_advertised_server_url(server_url) else {
+                return Err(error);
+            };
+            tracing::debug!(
+                %server_url,
+                %owner_url,
+                "configured endpoint unreachable; retrying the mailbox owner's advertised port"
+            );
+            post_jsonrpc_request_once(&owner_url, bearer, payload, timeout_seconds).await
+        }
+        result => result,
+    }
+}
+
+/// The HTTP port a daemon advertises on its command line: `--port 18765`,
+/// `--port=18765`, or an `HTTP_PORT=18765` argv token injected by a launcher
+/// wrapper. A `--port` flag wins over `HTTP_PORT`, matching the daemon's own
+/// flag-over-env precedence. Port `0` (ephemeral) is never advertised (GH#323).
+fn command_line_advertised_port(command: &str) -> Option<u16> {
+    let mut flag_port = None;
+    let mut env_port = None;
+    let mut tokens = command.split_whitespace().peekable();
+    while let Some(token) = tokens.next() {
+        if token == "--port" {
+            if let Some(next) = tokens.peek()
+                && let Ok(port) = next.parse::<u16>()
+            {
+                tokens.next();
+                flag_port = flag_port.or(Some(port));
+            }
+        } else if let Some(value) = token.strip_prefix("--port=") {
+            flag_port = flag_port.or_else(|| value.parse().ok());
+        } else if let Some(value) = token.strip_prefix("HTTP_PORT=") {
+            env_port = env_port.or_else(|| value.parse().ok());
+        }
+    }
+    flag_port.or(env_port).filter(|port| *port != 0)
+}
+
+/// Best-effort `HTTP_PORT` read from a live process's environment, covering
+/// daemons launched without an explicit `--port` flag. Linux `/proc` only;
+/// other platforms return `None` and rely on the command line (GH#323).
+#[cfg(target_os = "linux")]
+fn pid_environ_http_port(pid: u32) -> Option<u16> {
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    environ
+        .split(|&byte| byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .find_map(|entry| entry.strip_prefix("HTTP_PORT="))
+        .and_then(|value| value.parse().ok())
+        .filter(|port| *port != 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_environ_http_port(_pid: u32) -> Option<u16> {
+    None
+}
+
+/// The single HTTP port the mailbox's live owners advertise, when they all
+/// agree. Owners are the processes [`inspect_mailbox_ownership`] counts as
+/// `competing_pids`; readers never advertise a port. Conflicting or
+/// undiscoverable advertisements return `None` so callers keep the configured
+/// port instead of guessing (GH#323).
+fn advertised_port_from_ownership(
+    ownership: &mcp_agent_mail_db::pool::MailboxOwnershipState,
+    environ_port: impl Fn(u32) -> Option<u16>,
+) -> Option<u16> {
+    if !ownership.blocks_mutation() {
+        return None;
+    }
+    let mut ports = BTreeSet::new();
+    for pid in &ownership.competing_pids {
+        let command = ownership
+            .processes
+            .iter()
+            .find(|process| process.pid == *pid)
+            .and_then(|process| process.command.as_deref());
+        if let Some(port) = command
+            .and_then(command_line_advertised_port)
+            .or_else(|| environ_port(*pid))
+        {
+            ports.insert(port);
+        }
+    }
+    if ports.len() == 1 {
+        ports.into_iter().next()
+    } else {
+        None
+    }
+}
+
+/// `(host, port)` for a loopback `scheme://host:port/...` daemon URL. `None`
+/// for non-loopback hosts or URLs without an explicit port — only a loopback
+/// endpoint can belong to the local mailbox owner (GH#323).
+fn loopback_server_url_authority(server_url: &str) -> Option<(&str, u16)> {
+    let (_, rest) = server_url.split_once("://")?;
+    let authority = rest.split('/').next()?;
+    let (host, port_text) = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split_once("]:")?
+    } else {
+        authority.rsplit_once(':')?
+    };
+    let port = port_text.parse().ok()?;
+    matches!(host, "127.0.0.1" | "::1" | "localhost").then_some((host, port))
+}
+
+/// Rebuild `server_url` with `port`, preserving scheme, host, and path.
+fn server_url_with_port(server_url: &str, port: u16) -> Option<String> {
+    let (scheme, rest) = server_url.split_once("://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, ""),
+    };
+    let host = if authority.starts_with('[') {
+        &authority[..authority.find(']')? + 1]
+    } else {
+        authority.split(':').next()?
+    };
+    Some(format!("{scheme}://{host}:{port}{path}"))
+}
+
+/// The request URL rewritten to the port the mailbox's live owner actually
+/// advertises, or `None` when the mailbox is unowned, the owners advertise no
+/// unambiguous port, or the advertised port already matches the request
+/// (GH#323).
+fn mailbox_owner_advertised_server_url(server_url: &str) -> Option<String> {
+    let (_host, attempted_port) = loopback_server_url_authority(server_url)?;
+    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&database_url) {
+        return None;
+    }
+    let sqlite_path = resolve_mailbox_activity_sqlite_path(&database_url).ok()?;
+    let ownership = mcp_agent_mail_db::pool::inspect_mailbox_ownership(
+        &sqlite_path,
+        &Config::get().storage_root,
+    );
+    let advertised = advertised_port_from_ownership(&ownership, pid_environ_http_port)?;
+    if advertised == attempted_port {
+        return None;
+    }
+    server_url_with_port(server_url, advertised)
+}
+
+async fn post_jsonrpc_request_once(
+    server_url: &str,
+    bearer: Option<&str>,
+    payload: &serde_json::Value,
+    timeout_seconds: u64,
+) -> CliResult<serde_json::Value> {
     use asupersync::http::h1::Method;
     use asupersync::time::{timeout, wall_now};
     use std::time::Duration;
@@ -87027,9 +87359,21 @@ fn reject_local_fallback_with_ownership_probe(
         return Ok(());
     }
 
+    // GH#323: when the lock owner advertises a different HTTP port, name it —
+    // "retry with HTTP_PORT=<port>" is the fastest remediation for a CLI whose
+    // configured port drifted from the daemon's.
+    let port_hint = advertised_port_from_ownership(&ownership, pid_environ_http_port)
+        .map(|port| {
+            format!(
+                " The mailbox owner advertises HTTP port {port}; retry with \
+                 HTTP_PORT={port} to reach it."
+            )
+        })
+        .unwrap_or_default();
+
     Err(CliError::Other(format!(
         "{command_label} could not be proxied through the running Agent Mail daemon at \
-         {server_url}: {server_error}. Refusing local SQLite fallback because {}. \
+         {server_url}: {server_error}. Refusing local SQLite fallback because {}.{port_hint} \
          Check HTTP_HOST/HTTP_PORT/HTTP_PATH/HTTP_BEARER_TOKEN for the CLI, or restart \
          the daemon if its HTTP endpoint is wedged.",
         ownership.detail

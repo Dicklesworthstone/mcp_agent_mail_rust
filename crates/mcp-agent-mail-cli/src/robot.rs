@@ -22375,8 +22375,23 @@ mod tests {
     /// resources deterministically take the labelled local-process path
     /// instead of proxying whatever daemon is bound on 8765 (br-4myjj).
     fn with_unreachable_server<R>(f: impl FnOnce() -> R) -> R {
+        // GH#323: a dead HTTP_PORT alone is not "unreachable" on a host whose
+        // real mailbox is owned by a live daemon — the CLI now follows the
+        // lock owner's advertised port. Point DATABASE_URL/STORAGE_ROOT at a
+        // private tempdir so no owner is discoverable and the fallback branch
+        // stays deterministic.
+        let temp = tempfile::tempdir().expect("unreachable-server mailbox tempdir");
+        let database_url = format!(
+            "sqlite:///{}",
+            temp.path().join("mailbox.sqlite3").display()
+        );
+        let storage_root = temp.path().join("storage").to_string_lossy().into_owned();
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("HTTP_PORT", "47351")],
+            &[
+                ("HTTP_PORT", "47351"),
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root.as_str()),
+            ],
             f,
         )
     }
