@@ -28,8 +28,12 @@ e2e_log "am binary: $(command -v am 2>/dev/null || echo NOT_FOUND)"
 # Temp workspace
 WORK="$(e2e_mktemp "e2e_macros")"
 MACRO_DB="${WORK}/macros_test.sqlite3"
+export STORAGE_ROOT="${WORK}/mailbox"
+export DATABASE_URL="sqlite:////${MACRO_DB}"
+mkdir -p "$STORAGE_ROOT"
 
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-macros","version":"1.0"}}}'
+INITIALIZED_NOTIFICATION='{"jsonrpc":"2.0","method":"notifications/initialized"}'
 
 # Helper: write structured stdio request artifact(s) as JSON.
 write_stdio_request_artifact() {
@@ -109,6 +113,34 @@ out_file.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encodi
 PY
 }
 
+# Wait for an actual response before sending dependent requests or closing stdin.
+wait_stdio_response() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import json
+import pathlib
+import sys
+import time
+
+output = pathlib.Path(sys.argv[1])
+request = json.loads(sys.argv[2])
+if "id" not in request:
+    sys.exit(0)
+deadline = time.monotonic() + float(sys.argv[3])
+while time.monotonic() < deadline:
+    if output.exists():
+        for line in output.read_text().splitlines():
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if response.get("id") == request["id"] and ("result" in response or "error" in response):
+                sys.exit(0)
+    time.sleep(0.02)
+print("Timed out waiting for stdio response", file=sys.stderr)
+sys.exit(1)
+PY
+}
+
 # Helper: send multiple JSON-RPC requests in sequence to a single server session
 send_jsonrpc_session() {
     local db_path="$1"
@@ -140,22 +172,22 @@ send_jsonrpc_session() {
 
     sleep 0.3
 
+    local timeout_s=30
     {
         for req in "${requests[@]}"; do
             echo "$req"
-            sleep 0.3
+            wait_stdio_response "$response_raw_file" "$req" "$timeout_s" || break
         done
     } > "$fifo" &
     local write_pid=$!
 
-    local timeout_s=20
     local elapsed=0
     local timed_out=false
     while [ "$elapsed" -lt "$timeout_s" ]; do
         if ! kill -0 "$srv_pid" 2>/dev/null; then
             break
         fi
-        sleep 0.5
+        sleep 1
         elapsed=$((elapsed + 1))
     done
     if [ "$elapsed" -ge "$timeout_s" ] && kill -0 "$srv_pid" 2>/dev/null; then
@@ -238,9 +270,12 @@ for line in sys.stdin:
             if 'result' in d and d['result'].get('isError', False):
                 print('true')
                 sys.exit(0)
+            if 'result' in d:
+                print('false')
+                sys.exit(0)
     except (json.JSONDecodeError, KeyError, IndexError):
         pass
-print('false')
+print('true')  # A missing response cannot count as success.
 " 2>/dev/null
 }
 
@@ -251,6 +286,7 @@ e2e_case_banner "macro_start_session creates project + agent + fetches inbox"
 
 SESSION_REQS=(
     "$INIT_REQ"
+    "$INITIALIZED_NOTIFICATION"
     '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"macro_start_session","arguments":{"human_key":"/tmp/e2e_macro_project","program":"e2e-test","model":"test-model","task_description":"macro E2E testing","inbox_limit":5}}}'
 )
 
@@ -321,6 +357,7 @@ e2e_case_banner "macro_file_reservation_cycle reserves and releases files"
 # Register a named agent we can use (valid: Silver=adjective, Wolf=noun)
 SETUP_REQS=(
     "$INIT_REQ"
+    "$INITIALIZED_NOTIFICATION"
     '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"register_agent","arguments":{"project_key":"/tmp/e2e_macro_project","program":"e2e-test","model":"test","name":"SilverWolf"}}}'
     '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"macro_file_reservation_cycle","arguments":{"project_key":"/tmp/e2e_macro_project","agent_name":"SilverWolf","paths":["src/lib.rs","src/main.rs"],"reason":"macro cycle test","ttl_seconds":3600,"auto_release":false}}}'
 )
@@ -376,6 +413,7 @@ e2e_case_banner "macro_contact_handshake with auto-accept"
 # Use valid agent names: Gold=adjective, Hawk=noun
 HANDSHAKE_REQS=(
     "$INIT_REQ"
+    "$INITIALIZED_NOTIFICATION"
     '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"register_agent","arguments":{"project_key":"/tmp/e2e_macro_project","program":"e2e-test","model":"test","name":"GoldHawk"}}}'
     '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"macro_contact_handshake","arguments":{"project_key":"/tmp/e2e_macro_project","requester":"SilverWolf","target":"GoldHawk","auto_accept":true,"reason":"E2E macro test","welcome_subject":"Hello from macro test","welcome_body":"Testing macro_contact_handshake auto-accept flow."}}}'
 )
@@ -412,6 +450,7 @@ fi
 # Verify GoldHawk received the welcome message in their inbox
 INBOX_REQS=(
     "$INIT_REQ"
+    "$INITIALIZED_NOTIFICATION"
     '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"fetch_inbox","arguments":{"project_key":"/tmp/e2e_macro_project","agent_name":"GoldHawk","include_bodies":true,"limit":5}}}'
 )
 
@@ -454,6 +493,7 @@ e2e_case_banner "Build slots: acquire, renew, release lifecycle"
 export WORKTREES_ENABLED=true
 SLOT_REQS=(
     "$INIT_REQ"
+    "$INITIALIZED_NOTIFICATION"
     # Acquire a build slot
     '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"acquire_build_slot","arguments":{"project_key":"/tmp/e2e_macro_project","agent_name":"SilverWolf","slot":"cargo-build","ttl_seconds":300}}}'
     # Renew the slot
@@ -553,6 +593,7 @@ e2e_case_banner "Build slot conflict: second agent blocked"
 
 CONFLICT_REQS=(
     "$INIT_REQ"
+    "$INITIALIZED_NOTIFICATION"
     # SilverWolf acquires
     '{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"acquire_build_slot","arguments":{"project_key":"/tmp/e2e_macro_project","agent_name":"SilverWolf","slot":"test-build","ttl_seconds":300}}}'
     # GoldHawk tries to acquire same slot

@@ -28,6 +28,9 @@ e2e_ensure_binary "am" >/dev/null
 WORK="$(e2e_mktemp "e2e_guard")"
 REPO="${WORK}/repo"
 GUARD_DB="${WORK}/storage.sqlite3"
+export STORAGE_ROOT="${WORK}/mailbox"
+export DATABASE_URL="sqlite:////${WORK}/runtime.sqlite3"
+mkdir -p "$STORAGE_ROOT"
 mkdir -p "$REPO"
 
 e2e_init_git_repo "$REPO"
@@ -327,6 +330,12 @@ e2e_save_artifact "case5_release_output.txt" "$release_output"
 # ---------------------------------------------------------------------------
 e2e_case_banner "Rename scenario: stage rename; guard checks both old and new paths"
 
+# Commit the fixture before another agent reserves it. The installed guard
+# must remain enabled during setup and during the rename assertion.
+mkdir -p "$REPO/lib"
+echo "x" > "$REPO/lib/original_module.py"
+e2e_git_commit "$REPO" "add original module"
+
 # Create an active reservation matching ONLY the old path.
 cat > "${REPO}/file_reservations/res_rename.json" << EOJSON
 {
@@ -339,10 +348,7 @@ cat > "${REPO}/file_reservations/res_rename.json" << EOJSON
 }
 EOJSON
 
-# Create + commit the file, then stage a rename.
-mkdir -p "$REPO/lib"
-echo "x" > "$REPO/lib/original_module.py"
-e2e_git_commit "$REPO" "add original module"
+# Stage the rename after the reservation is active.
 git -C "$REPO" mv lib/original_module.py lib/renamed_module.py
 # Extract touched paths from staged rename (NUL-delimited parsing, includes old+new).
 rename_paths="$(
