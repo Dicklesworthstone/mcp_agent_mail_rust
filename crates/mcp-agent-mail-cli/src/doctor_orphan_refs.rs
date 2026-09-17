@@ -54,6 +54,7 @@ struct ActionRecord {
     ref_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     category: Option<RefCategory>,
