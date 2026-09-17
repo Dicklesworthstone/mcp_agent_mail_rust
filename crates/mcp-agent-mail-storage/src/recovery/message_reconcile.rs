@@ -63,7 +63,11 @@ pub fn reconcile_message_bundle(
         .ok_or_else(|| invalid("archive reconciliation requires the original created timestamp"))?;
     chrono::DateTime::parse_from_rfc3339(created)
         .map_err(|_| invalid("archive reconciliation refuses an invalid created timestamp"))?;
-    if entry.message.get("from").and_then(serde_json::Value::as_str) != Some(entry.sender)
+    if entry
+        .message
+        .get("from")
+        .and_then(serde_json::Value::as_str)
+        != Some(entry.sender)
         || entry
             .message
             .get("project_slug")
@@ -75,7 +79,9 @@ pub fn reconcile_message_bundle(
         ));
     }
     if entry.body_md.len() > MAX_MESSAGE_ARTIFACT_BYTES {
-        return Err(invalid("archive reconciliation message byte budget exceeded"));
+        return Err(invalid(
+            "archive reconciliation message byte budget exceeded",
+        ));
     }
     if entry.recipients.len() > MAX_RECIPIENTS {
         return Err(invalid("archive reconciliation recipient budget exceeded"));
@@ -119,7 +125,9 @@ pub fn reconcile_message_bundle(
     }
     let full = crate::render_message_bundle_content(entry.message, entry.body_md)?;
     if full.len() > MAX_MESSAGE_ARTIFACT_BYTES {
-        return Err(invalid("archive reconciliation message byte budget exceeded"));
+        return Err(invalid(
+            "archive reconciliation message byte budget exceeded",
+        ));
     }
     let inbox = crate::render_message_bundle_content(
         &crate::redact_message_bcc_for_inbox(entry.message),
@@ -136,7 +144,9 @@ pub fn reconcile_message_bundle(
         })
         .ok_or_else(|| invalid("archive reconciliation bundle size overflow"))?;
     if bytes > MAX_BUNDLE_BYTES {
-        return Err(invalid("archive reconciliation bundle byte budget exceeded"));
+        return Err(invalid(
+            "archive reconciliation bundle byte budget exceeded",
+        ));
     }
     let (paths, _, _) =
         crate::message_paths_for_bundle(archive, entry.message, entry.sender, &recipients)?;
@@ -346,8 +356,8 @@ pub fn read_surviving_message(path: &Path) -> crate::Result<Option<(serde_json::
     if bytes.len() > MAX_MESSAGE_ARTIFACT_BYTES {
         return Err(invalid("archive recovery source grew past its byte bound"));
     }
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| invalid("archive recovery source is not UTF-8"))?;
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| invalid("archive recovery source is not UTF-8"))?;
     let (frontmatter, body) = text
         .strip_prefix("---json\n")
         .and_then(|text| text.split_once("\n---\n\n"))
@@ -406,7 +416,8 @@ mod tests {
     #[test]
     fn repair_materializes_and_commits_exact_copies_without_redelivery() {
         let (_dir, config, archive, message, recipients) = fixture();
-        let first = reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap();
+        let first =
+            reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap();
         assert_eq!(first.files_created, 4);
         assert!(first.git_commit_needed);
         let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
@@ -427,7 +438,8 @@ mod tests {
         }
         let repo = Repository::open(&archive.repo_root).unwrap();
         let before = repo.head().unwrap().target().unwrap();
-        let second = reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap();
+        let second =
+            reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap();
         assert_eq!(second, ReconcileResult::default());
         assert_eq!(repo.head().unwrap().target().unwrap(), before);
     }
@@ -520,7 +532,9 @@ mod tests {
                 "{key}"
             );
         }
-        assert!(reconcile_message_bundle(&archive, &config, entry(&message, &recipients[..1])).is_err());
+        assert!(
+            reconcile_message_bundle(&archive, &config, entry(&message, &recipients[..1])).is_err()
+        );
     }
 
     #[test]
@@ -533,11 +547,22 @@ mod tests {
         // require deleting or corrupting any previously valid evidence.
         let mut tree_bytes = b"100644 message.md\0".to_vec();
         tree_bytes.extend_from_slice(oid.as_bytes());
-        let tree_id = repo.odb().unwrap().write(ObjectType::Tree, &tree_bytes).unwrap();
+        let tree_id = repo
+            .odb()
+            .unwrap()
+            .write(ObjectType::Tree, &tree_bytes)
+            .unwrap();
         let tree = repo.find_tree(tree_id).unwrap();
         let signature = git2::Signature::now("reconcile-test", "reconcile@local").unwrap();
-        repo.commit(Some("HEAD"), &signature, &signature, "incomplete object graph", &tree, &[])
-            .unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "incomplete object graph",
+            &tree,
+            &[],
+        )
+        .unwrap();
         let paths = vec!["message.md".to_string()];
         assert!(!head_contains(&repo, &paths, &[oid]).unwrap());
         assert_eq!(repo.blob(bytes).unwrap(), oid);

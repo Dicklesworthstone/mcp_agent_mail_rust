@@ -92,15 +92,18 @@ fn source_error(error: impl std::fmt::Display) -> String {
 }
 
 fn validate_pool_binding(pool: &DbPool, config: &Config) -> Result<(), String> {
-    let selected = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url)
-        .ok_or_else(|| "message reconciliation requires a file-backed source".to_string())?;
+    let selected =
+        mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url)
+            .ok_or_else(|| "message reconciliation requires a file-backed source".to_string())?;
     let selected = std::fs::canonicalize(selected).map_err(|error| error.to_string())?;
     let source = std::fs::canonicalize(pool.sqlite_path()).map_err(|error| error.to_string())?;
     if source != selected {
         return Err("message reconciliation pool is not the configured live database".to_string());
     }
-    let pool_root = std::fs::canonicalize(pool.storage_root()).map_err(|error| error.to_string())?;
-    let configured_root = std::fs::canonicalize(&config.storage_root).map_err(|error| error.to_string())?;
+    let pool_root =
+        std::fs::canonicalize(pool.storage_root()).map_err(|error| error.to_string())?;
+    let configured_root =
+        std::fs::canonicalize(&config.storage_root).map_err(|error| error.to_string())?;
     if pool_root != configured_root {
         return Err("message reconciliation pool and archive roots do not match".to_string());
     }
@@ -121,10 +124,14 @@ fn select_ids(
         };
     }
     let conn = outcome(block_on(pool.acquire(cx)))?;
-    let mode = conn.query_sync("PRAGMA query_only", &[]).map_err(source_error)?;
-    let query_only = mode.first()
+    let mode = conn
+        .query_sync("PRAGMA query_only", &[])
+        .map_err(source_error)?;
+    let query_only = mode
+        .first()
         .ok_or_else(|| "source query-only mode was not reported".to_string())?
-        .get_as::<i64>(0).map_err(source_error)?;
+        .get_as::<i64>(0)
+        .map_err(source_error)?;
     if query_only != 0 {
         return Err("query-only snapshots cannot authorize message archive repair".to_string());
     }
@@ -216,7 +223,9 @@ fn prepare_message(cx: &Cx, pool: &DbPool, id: i64) -> Result<PreparedMessage, S
         )
         .map_err(source_error)?;
     if rows.len() != 1 {
-        return Err("message missing, oversized, or lacking an unambiguous project/sender".to_string());
+        return Err(
+            "message missing, oversized, or lacking an unambiguous project/sender".to_string(),
+        );
     }
     let row = &rows[0];
     let text = |name| row.get_named::<String>(name).map_err(source_error);
@@ -245,8 +254,11 @@ fn prepare_message(cx: &Cx, pool: &DbPool, id: i64) -> Result<PreparedMessage, S
             .and_then(Value::as_array)
             .ok_or_else(|| format!("message recipient metadata lacks {kind} array"))?
         {
-            let name = name.as_str().ok_or_else(|| "non-string message recipient".to_string())?;
-            crate::validate_archive_component("recipient", name).map_err(|error| error.to_string())?;
+            let name = name
+                .as_str()
+                .ok_or_else(|| "non-string message recipient".to_string())?;
+            crate::validate_archive_component("recipient", name)
+                .map_err(|error| error.to_string())?;
             recipients.push(name.to_string());
             if recipients.len() > super::MAX_RECIPIENTS {
                 return Err("message recipient budget exceeded".to_string());
@@ -276,7 +288,12 @@ fn prepare_message(cx: &Cx, pool: &DbPool, id: i64) -> Result<PreparedMessage, S
     });
     let payload_bytes = body.len().saturating_add(message.to_string().len());
     Ok(PreparedMessage {
-        message, body, sender, project_slug, recipients, payload_bytes,
+        message,
+        body,
+        sender,
+        project_slug,
+        recipients,
+        payload_bytes,
     })
 }
 
@@ -286,41 +303,67 @@ fn validate_surviving_message(
     body: &str,
 ) -> Result<(), String> {
     if body != expected.body {
-        return Err("surviving archive body conflicts with the live message; preserved".to_string());
+        return Err(
+            "surviving archive body conflicts with the live message; preserved".to_string(),
+        );
     }
     for key in [
-        "id", "from", "subject", "project", "project_slug", "importance", "ack_required", "attachments",
+        "id",
+        "from",
+        "subject",
+        "project",
+        "project_slug",
+        "importance",
+        "ack_required",
+        "attachments",
     ] {
         if observed.get(key) != expected.message.get(key) {
-            return Err(format!("surviving archive {key} conflicts with live message; preserved"));
+            return Err(format!(
+                "surviving archive {key} conflicts with live message; preserved"
+            ));
         }
     }
     for key in ["topic", "thread_id"] {
         if observed.get(key).unwrap_or(&Value::Null) != &expected.message[key] {
-            return Err(format!("surviving archive {key} conflicts with live message; preserved"));
+            return Err(format!(
+                "surviving archive {key} conflicts with live message; preserved"
+            ));
         }
     }
     let timestamp = |value: &Value| {
-        value.get("created").and_then(Value::as_str)
+        value
+            .get("created")
+            .and_then(Value::as_str)
             .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
             .map(|time| time.timestamp_micros())
     };
     if timestamp(observed).is_none() || timestamp(observed) != timestamp(&expected.message) {
-        return Err("surviving archive creation timestamp conflicts with live message; preserved".to_string());
+        return Err(
+            "surviving archive creation timestamp conflicts with live message; preserved"
+                .to_string(),
+        );
     }
     for kind in ["to", "cc", "bcc"] {
         let names = |value: &Value| -> Option<Vec<String>> {
-            let mut names = value.get(kind)?.as_array()?.iter()
-                .map(|name| name.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()?;
+            let mut names = value
+                .get(kind)?
+                .as_array()?
+                .iter()
+                .map(|name| name.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()?;
             names.sort_unstable();
             Some(names)
         };
         if names(observed).is_none() || names(observed) != names(&expected.message) {
-            return Err(format!("surviving archive {kind} routing conflicts with live message; preserved"));
+            return Err(format!(
+                "surviving archive {kind} routing conflicts with live message; preserved"
+            ));
         }
     }
     if let Some(parent) = observed.get("reply_to")
-        && parent.as_i64().is_none_or(|parent| parent <= 0 || Some(parent) == observed["id"].as_i64())
+        && parent
+            .as_i64()
+            .is_none_or(|parent| parent <= 0 || Some(parent) == observed["id"].as_i64())
     {
         return Err("surviving archive reply parent is invalid; preserved".to_string());
     }
@@ -347,18 +390,31 @@ fn restore_inbox_metadata(
     Ok(message)
 }
 
-fn reconcile_prepared(config: &Config, prepared: &PreparedMessage) -> Result<ReconcileResult, String> {
-    let archive = crate::ensure_archive(config, &prepared.project_slug).map_err(|error| error.to_string())?;
+fn reconcile_prepared(
+    config: &Config,
+    prepared: &PreparedMessage,
+) -> Result<ReconcileResult, String> {
+    let archive =
+        crate::ensure_archive(config, &prepared.project_slug).map_err(|error| error.to_string())?;
     let paths = crate::message_paths_for_bundle(
-        &archive, &prepared.message, &prepared.sender, &prepared.recipients,
-    ).map_err(|error| error.to_string())?.0;
+        &archive,
+        &prepared.message,
+        &prepared.sender,
+        &prepared.recipients,
+    )
+    .map_err(|error| error.to_string())?
+    .0;
     let mut surviving = None;
     for path in [&paths.canonical, &paths.outbox] {
-        if let Some((message, body)) = read_surviving_message(path).map_err(|error| error.to_string())? {
+        if let Some((message, body)) =
+            read_surviving_message(path).map_err(|error| error.to_string())?
+        {
             validate_surviving_message(prepared, &message, &body)?;
             if let Some(previous) = &surviving {
                 if previous != &message {
-                    return Err("canonical and outbox metadata disagree; both preserved".to_string());
+                    return Err(
+                        "canonical and outbox metadata disagree; both preserved".to_string()
+                    );
                 }
             } else {
                 surviving = Some(message);
@@ -386,7 +442,9 @@ fn reconcile_prepared(config: &Config, prepared: &PreparedMessage) -> Result<Rec
                 let message = restore_inbox_metadata(prepared, message, &body)?;
                 if let Some(previous) = &surviving {
                     if previous != &message {
-                        return Err("surviving inbox metadata disagree; all copies preserved".to_string());
+                        return Err(
+                            "surviving inbox metadata disagree; all copies preserved".to_string()
+                        );
                     }
                 } else {
                     surviving = Some(message);
@@ -413,7 +471,8 @@ fn reconcile_prepared(config: &Config, prepared: &PreparedMessage) -> Result<Rec
             recipients: &prepared.recipients,
             extra_paths: &[],
         },
-    ).map_err(|error| error.to_string())
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn read_committed_message(
@@ -422,33 +481,51 @@ fn read_committed_message(
 ) -> Result<Option<(Value, String)>, String> {
     let repo = git2::Repository::open(
         crate::archive_repo_root_checked(archive).map_err(|error| error.to_string())?,
-    ).map_err(|error| error.to_string())?;
+    )
+    .map_err(|error| error.to_string())?;
     let head = match repo.head() {
         Ok(head) => head,
-        Err(error) if matches!(error.code(), git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound) => return Ok(None),
+        Err(error)
+            if matches!(
+                error.code(),
+                git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound
+            ) =>
+        {
+            return Ok(None);
+        }
         Err(error) => return Err(error.to_string()),
     };
-    let relative = crate::rel_path_cached(&archive.canonical_repo_root, path).map_err(|error| error.to_string())?;
+    let relative = crate::rel_path_cached(&archive.canonical_repo_root, path)
+        .map_err(|error| error.to_string())?;
     let tree = head.peel_to_tree().map_err(|error| error.to_string())?;
     let entry = match tree.get_path(std::path::Path::new(&relative)) {
         Ok(entry) => entry,
         Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),
     };
-    if entry.kind() != Some(git2::ObjectType::Blob) || !matches!(entry.filemode(), 0o100644 | 0o100755) {
+    if entry.kind() != Some(git2::ObjectType::Blob)
+        || !matches!(entry.filemode(), 0o100644 | 0o100755)
+    {
         return Err("committed message is not a regular-file blob".to_string());
     }
     let odb = repo.odb().map_err(|error| error.to_string())?;
-    let (size, kind) = odb.read_header(entry.id()).map_err(|error| error.to_string())?;
+    let (size, kind) = odb
+        .read_header(entry.id())
+        .map_err(|error| error.to_string())?;
     if kind != git2::ObjectType::Blob || size > super::MAX_MESSAGE_ARTIFACT_BYTES {
         return Err("committed message exceeds the archive recovery byte bound".to_string());
     }
-    let blob = repo.find_blob(entry.id()).map_err(|error| error.to_string())?;
-    let text = std::str::from_utf8(blob.content()).map_err(|_| "committed message is not UTF-8".to_string())?;
-    let (frontmatter, body) = text.strip_prefix("---json\n")
+    let blob = repo
+        .find_blob(entry.id())
+        .map_err(|error| error.to_string())?;
+    let text = std::str::from_utf8(blob.content())
+        .map_err(|_| "committed message is not UTF-8".to_string())?;
+    let (frontmatter, body) = text
+        .strip_prefix("---json\n")
         .and_then(|text| text.split_once("\n---\n\n"))
         .ok_or_else(|| "committed message has invalid canonical frontmatter".to_string())?;
-    let message = serde_json::from_str(frontmatter).map_err(|_| "committed message has invalid JSON".to_string())?;
+    let message = serde_json::from_str(frontmatter)
+        .map_err(|_| "committed message has invalid JSON".to_string())?;
     Ok(Some((message, body.to_string())))
 }
 
@@ -478,7 +555,9 @@ pub fn reconcile_message_batch(
         return Ok(report);
     }
     if corruption_circuit_breaker().is_tripped() {
-        return Err("message reconciliation refused: source corruption breaker is open".to_string());
+        return Err(
+            "message reconciliation refused: source corruption breaker is open".to_string(),
+        );
     }
     validate_pool_binding(pool, config)?;
     let cutoff = mcp_agent_mail_db::now_micros().saturating_sub(NORMAL_ARCHIVE_GRACE_US);
@@ -505,7 +584,9 @@ pub fn reconcile_message_batch(
         let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
         let result = match prepare_message(cx, pool, id) {
             Ok(prepared) => {
-                if prepared.payload_bytes > MAX_BATCH_PAYLOAD_BYTES.saturating_sub(report.payload_bytes) {
+                if prepared.payload_bytes
+                    > MAX_BATCH_PAYLOAD_BYTES.saturating_sub(report.payload_bytes)
+                {
                     report.budget_exhausted = true;
                     break;
                 }
@@ -551,8 +632,12 @@ mod tests {
             "importance": "normal", "ack_required": false, "attachments": [],
         });
         PreparedMessage {
-            message, body: "body\n".into(), sender: "BlueLake".into(), project_slug: "project".into(),
-            recipients: vec!["GreenStone".into(), "RedFox".into()], payload_bytes: 512,
+            message,
+            body: "body\n".into(),
+            sender: "BlueLake".into(),
+            project_slug: "project".into(),
+            recipients: vec!["GreenStone".into(), "RedFox".into()],
+            payload_bytes: 512,
         }
     }
 
@@ -565,8 +650,14 @@ mod tests {
         for raw in ["false", "0", "off", "no", "", "typo"] {
             assert!(!parse_enabled(Some(raw)));
         }
-        let config = Config { database_url: "sqlite:///:memory:".into(), ..Config::default() };
-        assert!(!enabled(&config), "ephemeral mailboxes do not start archive maintenance");
+        let config = Config {
+            database_url: "sqlite:///:memory:".into(),
+            ..Config::default()
+        };
+        assert!(
+            !enabled(&config),
+            "ephemeral mailboxes do not start archive maintenance"
+        );
     }
 
     #[test]
@@ -577,12 +668,20 @@ mod tests {
         message["future_metadata"] = json!({"opaque": true});
         validate_surviving_message(&original, &message, &original.body).unwrap();
         for (key, value) in [
-            ("id", json!(10)), ("from", json!("RedFox")), ("to", json!(["RedFox"])),
-            ("bcc", json!([])), ("project", json!("/other")), ("reply_to", json!(9)), ("created", json!("invalid")),
+            ("id", json!(10)),
+            ("from", json!("RedFox")),
+            ("to", json!(["RedFox"])),
+            ("bcc", json!([])),
+            ("project", json!("/other")),
+            ("reply_to", json!(9)),
+            ("created", json!("invalid")),
         ] {
             let mut changed = message.clone();
             changed[key] = value;
-            assert!(validate_surviving_message(&original, &changed, &original.body).is_err(), "{key}");
+            assert!(
+                validate_surviving_message(&original, &changed, &original.body).is_err(),
+                "{key}"
+            );
         }
         assert!(validate_surviving_message(&original, &message, "different body").is_err());
         assert_eq!(message["reply_to"], 7);
@@ -591,14 +690,22 @@ mod tests {
     #[test]
     fn unarchived_thread_is_deferred_instead_of_inventing_its_parent() {
         let temp = tempfile::tempdir().unwrap();
-        let config = Config { storage_root: temp.path().to_path_buf(), ..Config::default() };
+        let config = Config {
+            storage_root: temp.path().to_path_buf(),
+            ..Config::default()
+        };
         let original = prepared();
         let error = reconcile_prepared(&config, &original).unwrap_err();
         assert!(error.contains("reply metadata cannot be inferred"));
         let archive = crate::ensure_archive(&config, "project").unwrap();
         let paths = crate::message_paths_for_bundle(
-            &archive, &original.message, &original.sender, &original.recipients,
-        ).unwrap().0;
+            &archive,
+            &original.message,
+            &original.sender,
+            &original.recipients,
+        )
+        .unwrap()
+        .0;
         assert!(!paths.canonical.exists());
     }
 
@@ -612,8 +719,13 @@ mod tests {
         let original = prepared();
         let archive = crate::ensure_archive(&config, "project").unwrap();
         let paths = crate::message_paths_for_bundle(
-            &archive, &original.message, &original.sender, &original.recipients,
-        ).unwrap().0;
+            &archive,
+            &original.message,
+            &original.sender,
+            &original.recipients,
+        )
+        .unwrap()
+        .0;
         let mut full = original.message.clone();
         full["reply_to"] = json!(7);
         full["future_metadata"] = json!({"opaque": ["keep", 42]});
@@ -638,7 +750,10 @@ mod tests {
         }
         let repo = git2::Repository::open(&archive.repo_root).unwrap();
         let before = repo.head().unwrap().target().unwrap();
-        assert_eq!(reconcile_prepared(&config, &original).unwrap(), ReconcileResult::default());
+        assert_eq!(
+            reconcile_prepared(&config, &original).unwrap(),
+            ReconcileResult::default()
+        );
         assert_eq!(repo.head().unwrap().target().unwrap(), before);
     }
 
@@ -652,8 +767,13 @@ mod tests {
         let original = prepared();
         let archive = crate::ensure_archive(&config, "project").unwrap();
         let paths = crate::message_paths_for_bundle(
-            &archive, &original.message, &original.sender, &original.recipients,
-        ).unwrap().0;
+            &archive,
+            &original.message,
+            &original.sender,
+            &original.recipients,
+        )
+        .unwrap()
+        .0;
         let mut originals = Vec::new();
         for (index, path) in paths.inbox.iter().enumerate() {
             let mut message = crate::redact_message_bcc_for_inbox(&original.message);
@@ -700,19 +820,24 @@ mod tests {
         ] {
             let mut message = redacted.clone();
             message[key] = value;
-            assert!(restore_inbox_metadata(&original, message, &original.body).is_err(), "{key}");
+            assert!(
+                restore_inbox_metadata(&original, message, &original.body).is_err(),
+                "{key}"
+            );
         }
         assert!(restore_inbox_metadata(&original, redacted, "different body").is_err());
     }
 
     #[test]
     fn real_file_backed_projection_repairs_without_modifying_mailbox_rows() {
-        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|| {
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let temp = tempfile::tempdir().unwrap();
             let db_path = temp.path().join("mail.sqlite3");
             let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&db_path);
             let pool_config = mcp_agent_mail_db::DbPoolConfig {
-                database_url: database_url.clone(), min_connections: 1, max_connections: 1,
+                database_url: database_url.clone(),
+                min_connections: 1,
+                max_connections: 1,
                 ..Default::default()
             };
             let pool = mcp_agent_mail_db::create_pool(&pool_config).unwrap();
@@ -723,15 +848,34 @@ mod tests {
                 VALUES(101, 101, 'BlueLake', 'test', 'test', '', 1, 1), (102, 101, 'GreenStone', 'test', 'test', '', 1, 1)").unwrap();
             conn.execute_raw("INSERT INTO messages(id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
                 VALUES(901, 101, 101, 'handoff', 'body', 'normal', 0, 1000000, '{\"to\":[\"GreenStone\"],\"cc\":[],\"bcc\":[]}', '[]')").unwrap();
-            conn.execute_raw("INSERT INTO message_recipients(message_id, agent_id, kind) VALUES(901, 102, 'to')").unwrap();
-            let before = conn.query_sync("SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 901", &[]).unwrap();
+            conn.execute_raw(
+                "INSERT INTO message_recipients(message_id, agent_id, kind) VALUES(901, 102, 'to')",
+            )
+            .unwrap();
+            let before = conn
+                .query_sync(
+                    "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 901",
+                    &[],
+                )
+                .unwrap();
             assert_eq!(before[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
             assert_eq!(before[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
             drop(conn);
-            let config = Config { storage_root: pool.storage_root().to_path_buf(), database_url, ..Config::default() };
+            let config = Config {
+                storage_root: pool.storage_root().to_path_buf(),
+                database_url,
+                ..Config::default()
+            };
             let stop = AtomicBool::new(false);
             let readonly = DbPool::new_query_only(&pool_config).unwrap();
-            let rejected = reconcile_message_batch(&cx, &readonly, &config, &mut ReconcileCursor::default(), &stop).unwrap_err();
+            let rejected = reconcile_message_batch(
+                &cx,
+                &readonly,
+                &config,
+                &mut ReconcileCursor::default(),
+                &stop,
+            )
+            .unwrap_err();
             assert!(rejected.contains("query-only snapshots"), "{rejected}");
             drop(readonly);
             let mut cursor = ReconcileCursor::default();
@@ -740,14 +884,28 @@ mod tests {
             assert_eq!(report.repaired, 1);
             assert_eq!(report.files_created, 3);
             assert_eq!(report.deferred, 0);
-            let again = reconcile_message_batch(&cx, &pool, &config, &mut ReconcileCursor::default(), &stop).unwrap();
+            let again = reconcile_message_batch(
+                &cx,
+                &pool,
+                &config,
+                &mut ReconcileCursor::default(),
+                &stop,
+            )
+            .unwrap();
             assert_eq!(again.repaired, 0);
             assert_eq!(again.unchanged, 1);
             let conn = outcome(block_on(pool.acquire(&cx))).unwrap();
-            let after = conn.query_sync("SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 901", &[]).unwrap();
+            let after = conn
+                .query_sync(
+                    "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 901",
+                    &[],
+                )
+                .unwrap();
             assert_eq!(after[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
             assert_eq!(after[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
-            let rows = conn.query_sync("SELECT body_md FROM messages WHERE id = 901", &[]).unwrap();
+            let rows = conn
+                .query_sync("SELECT body_md FROM messages WHERE id = 901", &[])
+                .unwrap();
             assert_eq!(rows[0].get_named::<String>("body_md").unwrap(), "body");
             drop(conn);
             stop.store(true, Ordering::Release);
@@ -758,8 +916,15 @@ mod tests {
             std::fs::write(&other, b"preserve other database bytes").unwrap();
             let mut mismatched = config.clone();
             mismatched.database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&other);
-            assert!(validate_pool_binding(&pool, &mismatched).unwrap_err().contains("not the configured live database"));
-            assert_eq!(std::fs::read(&other).unwrap(), b"preserve other database bytes");
+            assert!(
+                validate_pool_binding(&pool, &mismatched)
+                    .unwrap_err()
+                    .contains("not the configured live database")
+            );
+            assert_eq!(
+                std::fs::read(&other).unwrap(),
+                b"preserve other database bytes"
+            );
         });
     }
 }

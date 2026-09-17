@@ -1238,7 +1238,10 @@ mod tests {
         assert!(!message_retention_needs_db(&config));
         let selected = retention_pool_config(&config);
         assert_eq!(selected.database_url, config.database_url);
-        assert_eq!(selected.storage_root.as_deref(), Some(config.storage_root.as_path()));
+        assert_eq!(
+            selected.storage_root.as_deref(),
+            Some(config.storage_root.as_path())
+        );
         assert_eq!(selected.max_connections, 1);
         assert!(!selected.run_migrations);
     }
@@ -1246,14 +1249,20 @@ mod tests {
     #[test]
     fn repair_polling_does_not_accelerate_reporting_or_pruning() {
         let interval = Duration::from_secs(3600);
-        assert_eq!(maintenance_poll_interval(interval, true), Duration::from_secs(60));
+        assert_eq!(
+            maintenance_poll_interval(interval, true),
+            Duration::from_secs(60)
+        );
         assert_eq!(maintenance_poll_interval(interval, false), interval);
         assert!(report_is_due(None, interval));
         for seconds in [0, 60, 3599] {
             assert!(!report_is_due(Some(Duration::from_secs(seconds)), interval));
         }
         assert!(report_is_due(Some(interval), interval));
-        assert!(report_is_due(Some(interval + Duration::from_secs(1)), interval));
+        assert!(report_is_due(
+            Some(interval + Duration::from_secs(1)),
+            interval
+        ));
     }
 
     #[test]

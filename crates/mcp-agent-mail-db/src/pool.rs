@@ -3361,8 +3361,7 @@ impl DbPool {
             .acquire_timeout(config.acquire_timeout_ms)
             .max_lifetime(config.max_lifetime_ms)
             // Legacy Python favors responsiveness; validate on checkout.
-            .test_on_checkout(true)
-            .test_on_return(false);
+            .test_on_checkout(true);
 
         let pool = Arc::new(Pool::new(pool_config));
         let journal_size_limit_state =

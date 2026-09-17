@@ -694,7 +694,11 @@ mod tests {
     #[test]
     fn test_cache_key_preserves_boolean_operator_case() {
         let filter = SearchFilter::default();
-        for mode in [SearchMode::Lexical, SearchMode::Semantic, SearchMode::Hybrid] {
+        for mode in [
+            SearchMode::Lexical,
+            SearchMode::Semantic,
+            SearchMode::Hybrid,
+        ] {
             for (left, right) in [
                 ("alpha OR beta", "alpha or beta"),
                 ("alpha AND beta", "alpha and beta"),

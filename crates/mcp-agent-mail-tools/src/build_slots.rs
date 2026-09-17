@@ -230,9 +230,9 @@ fn try_lock_slot(slot_path: &Path, create: bool) -> std::io::Result<Option<std::
 
 fn slot_io_error(error: std::io::Error) -> McpError {
     let contended = error.kind() == std::io::ErrorKind::WouldBlock
-        || error.raw_os_error().is_some_and(|code| {
-            Some(code) == fs2::lock_contended_error().raw_os_error()
-        });
+        || error
+            .raw_os_error()
+            .is_some_and(|code| Some(code) == fs2::lock_contended_error().raw_os_error());
     if contended {
         return legacy_tool_error(
             "BUILD_SLOT_BUSY",
@@ -244,7 +244,9 @@ fn slot_io_error(error: std::io::Error) -> McpError {
     if error.kind() == std::io::ErrorKind::InvalidData {
         return legacy_tool_error(
             "BUILD_SLOT_STATE_INVALID",
-            format!("Cannot safely read build-slot state: {error}. Repair the affected lease file before retrying."),
+            format!(
+                "Cannot safely read build-slot state: {error}. Repair the affected lease file before retrying."
+            ),
             false,
             serde_json::json!({ "operation": "read_build_slot_leases" }),
         );
@@ -533,8 +535,8 @@ pub async fn release_build_slot(
     let branch = compute_branch(&project.human_key);
     let project_root = project_archive_root(config, &project.slug);
     let slot_path = slot_dir(&project_root, &slot);
-    let response = release_slot_lease(&slot_path, &agent_name, branch.as_deref())
-        .map_err(slot_io_error)?;
+    let response =
+        release_slot_lease(&slot_path, &agent_name, branch.as_deref()).map_err(slot_io_error)?;
     serde_json::to_string(&response)
         .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
 }
@@ -1026,7 +1028,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = try_lock_slot(dir.path(), true).unwrap().unwrap();
         let error = try_lock_slot(dir.path(), true).unwrap_err();
-        assert_eq!(error.raw_os_error(), fs2::lock_contended_error().raw_os_error());
+        assert_eq!(
+            error.raw_os_error(),
+            fs2::lock_contended_error().raw_os_error()
+        );
         drop(first);
         let second = try_lock_slot(dir.path(), true).unwrap().unwrap();
         assert!(dir.path().join(".slot.lock").is_file());
@@ -1045,8 +1050,16 @@ mod tests {
     fn missing_slot_renew_and_release_do_not_create_directories() {
         let dir = tempfile::tempdir().unwrap();
         let slot = dir.path().join("absent");
-        assert!(!renew_slot_lease(&slot, "BlueLake", None, 600).unwrap().renewed);
-        assert!(!release_slot_lease(&slot, "BlueLake", None).unwrap().released);
+        assert!(
+            !renew_slot_lease(&slot, "BlueLake", None, 600)
+                .unwrap()
+                .renewed
+        );
+        assert!(
+            !release_slot_lease(&slot, "BlueLake", None)
+                .unwrap()
+                .released
+        );
         assert!(!slot.exists());
     }
 
@@ -1065,41 +1078,65 @@ mod tests {
         assert!(!lease_path_for_holder(dir.path(), "GreenPeak", None).exists());
 
         drop(lock);
-        assert!(renew_slot_lease(dir.path(), "BlueLake", None, 600).unwrap().renewed);
-        assert!(release_slot_lease(dir.path(), "BlueLake", None).unwrap().released);
+        assert!(
+            renew_slot_lease(dir.path(), "BlueLake", None, 600)
+                .unwrap()
+                .renewed
+        );
+        assert!(
+            release_slot_lease(dir.path(), "BlueLake", None)
+                .unwrap()
+                .released
+        );
     }
 
     #[test]
     fn acquired_holder_is_visible_to_next_advisory_acquisition() {
         let dir = tempfile::tempdir().unwrap();
-        let first = acquire_slot_lease(dir.path(), "slot-a", "BlueLake", None, 3600, true)
-            .unwrap();
+        let first = acquire_slot_lease(dir.path(), "slot-a", "BlueLake", None, 3600, true).unwrap();
         assert!(first.conflicts.is_empty());
-        let second = acquire_slot_lease(dir.path(), "slot-a", "GreenPeak", None, 3600, true)
-            .unwrap();
+        let second =
+            acquire_slot_lease(dir.path(), "slot-a", "GreenPeak", None, 3600, true).unwrap();
         assert_eq!(second.conflicts.len(), 1);
         assert_eq!(second.conflicts[0].agent, "BlueLake");
         assert_eq!(second.granted.agent, "GreenPeak");
-        assert_eq!(read_active_leases(dir.path(), chrono::Utc::now()).unwrap().len(), 2);
+        assert_eq!(
+            read_active_leases(dir.path(), chrono::Utc::now())
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
     fn renewal_after_release_does_not_resurrect_lease() {
         let dir = tempfile::tempdir().unwrap();
         acquire_slot_lease(
-            dir.path(), "slot-a", "BlueLake", Some("main".to_string()), 3600, true,
+            dir.path(),
+            "slot-a",
+            "BlueLake",
+            Some("main".to_string()),
+            3600,
+            true,
         )
         .unwrap();
         let released = release_slot_lease(dir.path(), "BlueLake", Some("feature")).unwrap();
         assert!(released.released);
-        assert!(!renew_slot_lease(dir.path(), "BlueLake", Some("feature"), 600).unwrap().renewed);
+        assert!(
+            !renew_slot_lease(dir.path(), "BlueLake", Some("feature"), 600)
+                .unwrap()
+                .renewed
+        );
         let repeated = release_slot_lease(dir.path(), "BlueLake", Some("feature")).unwrap();
         assert_eq!(repeated.released_at, released.released_at);
         let current: BuildSlotLease = serde_json::from_str(
             &std::fs::read_to_string(lease_path_for_holder(dir.path(), "BlueLake", None)).unwrap(),
         )
         .unwrap();
-        assert_eq!(current.released_ts.as_deref(), Some(released.released_at.as_str()));
+        assert_eq!(
+            current.released_ts.as_deref(),
+            Some(released.released_at.as_str())
+        );
     }
 
     #[test]
@@ -1107,8 +1144,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let corrupt = dir.path().join("existing.json");
         std::fs::write(&corrupt, "{ incomplete").unwrap();
-        let error = acquire_slot_lease(dir.path(), "slot-a", "BlueLake", None, 3600, true)
-            .unwrap_err();
+        let error =
+            acquire_slot_lease(dir.path(), "slot-a", "BlueLake", None, 3600, true).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(!lease_path_for_holder(dir.path(), "BlueLake", None).exists());
         assert_eq!(std::fs::read_to_string(&corrupt).unwrap(), "{ incomplete");

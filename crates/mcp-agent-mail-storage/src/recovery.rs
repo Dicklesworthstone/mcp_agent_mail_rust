@@ -531,7 +531,10 @@ mod tests {
             prune_missing_ref(tmp.path(), &finding, false).unwrap(),
             PruneRefOutcome::Changed
         );
-        assert_eq!(repo.find_reference(&finding.ref_name).unwrap().target(), Some(head));
+        assert_eq!(
+            repo.find_reference(&finding.ref_name).unwrap().target(),
+            Some(head)
+        );
     }
 
     #[test]
@@ -545,7 +548,10 @@ mod tests {
             prune_missing_ref(tmp.path(), &finding, false).unwrap(),
             PruneRefOutcome::Changed
         );
-        assert_eq!(repo.find_reference(&finding.ref_name).unwrap().target(), Some(changed));
+        assert_eq!(
+            repo.find_reference(&finding.ref_name).unwrap().target(),
+            Some(changed)
+        );
     }
 
     #[test]
@@ -555,12 +561,18 @@ mod tests {
         let bytes = b"object restored after detection";
         let oid = Oid::hash_object(ObjectType::Blob, bytes).unwrap();
         let finding = write_orphan(&repo, "refs/temp/restored", oid);
-        assert_eq!(repo.odb().unwrap().write(ObjectType::Blob, bytes).unwrap(), oid);
+        assert_eq!(
+            repo.odb().unwrap().write(ObjectType::Blob, bytes).unwrap(),
+            oid
+        );
         assert_eq!(
             prune_missing_ref(tmp.path(), &finding, false).unwrap(),
             PruneRefOutcome::TargetPresent
         );
-        assert_eq!(repo.find_reference(&finding.ref_name).unwrap().target(), Some(oid));
+        assert_eq!(
+            repo.find_reference(&finding.ref_name).unwrap().target(),
+            Some(oid)
+        );
     }
 
     #[test]

@@ -345,7 +345,9 @@ fn scan_one_project(
                     project: project_display.clone(),
                     ref_name: Some(finding.ref_name.clone()),
                     target_sha: Some(finding.target_sha.clone()),
-                    reason: Some(format!("finding no longer authorizes deletion: {outcome:?}")),
+                    reason: Some(format!(
+                        "finding no longer authorizes deletion: {outcome:?}"
+                    )),
                     category: Some(finding.category),
                 });
             }
@@ -828,7 +830,12 @@ mod tests {
         let report = scan_one_project(&path, &config, true, false);
 
         assert!(project_has_errors(&report));
-        assert!(report.actions.iter().any(|action| action.op == "backup_failed"));
+        assert!(
+            report
+                .actions
+                .iter()
+                .any(|action| action.op == "backup_failed")
+        );
         assert_eq!(report.apply_result.as_ref().unwrap().pruned, 0);
         assert_eq!(report.apply_result.as_ref().unwrap().errors, 1);
         assert_eq!(fs::read(&orphan).unwrap(), before);
@@ -849,8 +856,18 @@ mod tests {
         assert!(project_has_errors(&report));
         assert!(report.backup_path.as_ref().unwrap().is_file());
         assert_eq!(report.apply_result.as_ref().unwrap().pruned, 0);
-        assert!(report.actions.iter().any(|action| action.op == "prune_failed"));
-        assert!(!report.actions.iter().any(|action| action.op == "repacked_refs"));
+        assert!(
+            report
+                .actions
+                .iter()
+                .any(|action| action.op == "prune_failed")
+        );
+        assert!(
+            !report
+                .actions
+                .iter()
+                .any(|action| action.op == "repacked_refs")
+        );
         assert_eq!(fs::read(&orphan).unwrap(), before);
     }
 
@@ -864,7 +881,12 @@ mod tests {
 
         assert!(!project_has_errors(&report));
         assert_eq!(report.summary.findings, 1);
-        assert!(report.actions.iter().any(|action| action.op == "would_prune"));
+        assert!(
+            report
+                .actions
+                .iter()
+                .any(|action| action.op == "would_prune")
+        );
         assert_eq!(fs::read(&orphan).unwrap(), before);
         assert!(!config.storage_root.exists());
     }

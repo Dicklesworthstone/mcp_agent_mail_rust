@@ -984,7 +984,10 @@ mod tests {
         );
         assert_eq!(ContactPolicyKind::parse("Open"), ContactPolicyKind::Open);
         assert_eq!(ContactPolicyKind::parse("AUTO"), ContactPolicyKind::Auto);
-        assert_eq!(ContactPolicyKind::parse("unknown"), ContactPolicyKind::BlockAll);
+        assert_eq!(
+            ContactPolicyKind::parse("unknown"),
+            ContactPolicyKind::BlockAll
+        );
     }
 
     // ── SQL clause generation ─────────────────────────────────────
@@ -1386,7 +1389,10 @@ mod tests {
     fn missing_policy_preserves_independently_authorized_access() {
         let result = make_message_result(42, 1, "BlueLake", 20);
         let sender = viewer_ctx(20, 1);
-        assert_eq!(evaluate_scope(&result, &sender).reason, ScopeReason::IsSender);
+        assert_eq!(
+            evaluate_scope(&result, &sender).reason,
+            ScopeReason::IsSender
+        );
 
         let mut recipient = viewer_ctx(10, 99);
         recipient.recipient_map.push(RecipientEntry {
@@ -1443,7 +1449,10 @@ mod tests {
         assert_eq!(audit.denied_count, 1);
         assert_eq!(audit.redacted_count, 0);
         assert_eq!(audit.entries.len(), 1);
-        assert_eq!(audit.entries[0].reason, ScopeReason::SenderPolicyUnavailable);
+        assert_eq!(
+            audit.entries[0].reason,
+            ScopeReason::SenderPolicyUnavailable
+        );
         let encoded = serde_json::to_value(&audit.entries[0]).expect("serialize denial");
         assert_eq!(encoded["reason"], "sender_policy_unavailable");
         assert!(encoded.get("body").is_none());

@@ -1051,8 +1051,16 @@ mod tests {
         assert!(outcome.pruned_refs.is_empty());
         assert!(outcome.after_refs.is_empty());
         assert!(!outcome.actions.iter().any(|action| action == "repack_refs"));
-        assert!(outcome.actions.iter().any(|action| action.starts_with("skip_ref:")));
-        assert_eq!(repo.find_reference("refs/stash").unwrap().target(), Some(healthy));
+        assert!(
+            outcome
+                .actions
+                .iter()
+                .any(|action| action.starts_with("skip_ref:"))
+        );
+        assert_eq!(
+            repo.find_reference("refs/stash").unwrap().target(),
+            Some(healthy)
+        );
     }
 
     #[test]
@@ -1067,7 +1075,10 @@ mod tests {
         assert!(outcome.pruned_refs.is_empty());
         assert_eq!(outcome.after_refs, vec!["refs/stash".to_string()]);
         assert!(!outcome.actions.iter().any(|action| action == "repack_refs"));
-        assert_eq!(fs::read_to_string(repo.path().join("refs/stash")).unwrap(), changed);
+        assert_eq!(
+            fs::read_to_string(repo.path().join("refs/stash")).unwrap(),
+            changed
+        );
     }
 
     #[test]
