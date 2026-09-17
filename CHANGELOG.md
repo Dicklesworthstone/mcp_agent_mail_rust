@@ -26,6 +26,10 @@ Recent releases; the earlier version history continues below.
 
 ## Unreleased
 
+- **Source builds pin FrankenSearch directly to an immutable git revision.**
+  Cargo no longer reads a mutable sibling checkout, so updating that checkout
+  cannot break this workspace. Package versions and features are unchanged;
+  manual builds no longer require FrankenSearch or fast_cmaes siblings. (#325)
 - **CLI commands discover a mailbox daemon's nondefault port.** Mail, inbox,
   registration and other proxy commands use verified listener hints for the
   mailbox's sole exclusive owner when no endpoint was explicitly configured.

@@ -137,21 +137,16 @@ socketpair = { version = "=0.19.8", default-features = false }
 # those currently include FastEmbed, which pulls hf-hub/reqwest/hyper/tokio.
 # Downstream crates opt into the exact no-Tokio subfeatures they need.
 #
-# 2026-09-01: the sibling is a GATED CLONE at the v0.3.32 release pin
-# (dist.yml `FRANKENSEARCH_COMMIT` = 3bbfd8c6), not the live `../frankensearch`
-# checkout. The live tree moved to asupersync 0.4.10 (`Cx::is_cancelled` in
-# frankensearch-quill, commit 29d88ae6) while fastmcp — even 0.8.1 — still
-# pins asupersync =0.4.9, so building against the live sibling stopped
-# compiling for every agent on the host. dist.yml, Dockerfile, and
-# install.sh --from-source check the pinned commit out under the same name.
-# Cleanup trigger: fastmcp publishes a release on asupersync >=0.4.10 (then
-# retarget the live sibling or adopt registry frankensearch), or frankensearch
-# ships a tagged release that this workspace can pin from crates.io.
-frankensearch = { version = "0.4.0", path = "../frankensearch-rel-0332/frankensearch", default-features = false, features = ["lexical-tantivy"] }
-frankensearch-core = { version = "0.2.2", path = "../frankensearch-rel-0332/crates/frankensearch-core" }
-frankensearch-embed = { version = "0.2.2", path = "../frankensearch-rel-0332/crates/frankensearch-embed", default-features = false }
-frankensearch-index = { version = "0.2.2", path = "../frankensearch-rel-0332/crates/frankensearch-index" }
-frankensearch-fusion = { version = "0.2.2", path = "../frankensearch-rel-0332/crates/frankensearch-fusion" }
+# Pin Cargo's source itself: a sibling clone can drift even when its directory
+# is named after a release (GH325). Keep this revision aligned with dist.yml's
+# FRANKENSEARCH_COMMIT and the container/source-installer provenance record.
+# Newer FrankenSearch requires asupersync >=0.4.10 while fastmcp pins =0.4.9;
+# changing the source mechanism must not silently upgrade that runtime graph.
+frankensearch = { version = "0.4.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3bbfd8c664062f8304e7a790c51794671f9214dc", default-features = false, features = ["lexical-tantivy"] }
+frankensearch-core = { version = "0.2.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3bbfd8c664062f8304e7a790c51794671f9214dc" }
+frankensearch-embed = { version = "0.2.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3bbfd8c664062f8304e7a790c51794671f9214dc", default-features = false }
+frankensearch-index = { version = "0.2.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3bbfd8c664062f8304e7a790c51794671f9214dc" }
+frankensearch-fusion = { version = "0.2.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3bbfd8c664062f8304e7a790c51794671f9214dc" }
 
 # Two-tier search dependencies (legacy, being replaced by frankensearch)
 half = "2"

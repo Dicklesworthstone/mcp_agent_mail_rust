@@ -84,7 +84,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `sqlmodel` (`=0.4.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; the FrankenSQLite driver (`fsqlite =0.3.18`, Git revision `2633b38a26bde68db23172b12aa402ed698cc309`, tag `am-sql-compat-20260916`) is the runtime `DbConn`; the pin includes the Windows namespace identity fix |
 | `sqlmodel-sqlite` (`=0.4.0`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
 | `ftui` / `ftui-*` (`0.5.0`, FrankenTUI) | TUI rendering for operations console |
-| `frankensearch` (`0.4`, path dep `../frankensearch-rel-0332`, a gated clone at dist.yml's `FRANKENSEARCH_COMMIT`) | Search V3 engine; lexical (Tantivy) tier by default, semantic/rerank behind the `hybrid` feature. Never point this at a live checkout: the live tree already moved to asupersync 0.4.10, which fastmcp cannot follow yet |
+| `frankensearch` (`0.4`, git revision `3bbfd8c664062f8304e7a790c51794671f9214dc`, aligned with dist.yml's `FRANKENSEARCH_COMMIT`) | Search V3 engine; lexical (Tantivy) tier by default, semantic/rerank behind the `hybrid` feature. Cargo uses the immutable revision directly; no sibling checkout is required. Never switch to a floating branch: newer source requires asupersync 0.4.10, which fastmcp cannot follow yet |
 | `beads_rust` (`=0.5.4`) | Issue tracking integration |
 | `franken-agent-detection` (`0.2.2`) | Installed coding-agent detection for setup/doctor |
 | `serde` + `serde_json` | JSON serialization for MCP protocol |

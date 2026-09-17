@@ -2051,6 +2051,7 @@ dependencies = [
 [[package]]
 name = "frankensearch"
 version = "0.4.0"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=3bbfd8c664062f8304e7a790c51794671f9214dc#3bbfd8c664062f8304e7a790c51794671f9214dc"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -2066,6 +2067,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-core"
 version = "0.2.2"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=3bbfd8c664062f8304e7a790c51794671f9214dc#3bbfd8c664062f8304e7a790c51794671f9214dc"
 dependencies = [
  "asupersync",
  "compact_str 0.10.0",
@@ -2081,6 +2083,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-embed"
 version = "0.2.2"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=3bbfd8c664062f8304e7a790c51794671f9214dc#3bbfd8c664062f8304e7a790c51794671f9214dc"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -2097,6 +2100,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-fusion"
 version = "0.2.2"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=3bbfd8c664062f8304e7a790c51794671f9214dc#3bbfd8c664062f8304e7a790c51794671f9214dc"
 dependencies = [
  "ahash",
  "asupersync",
@@ -2116,6 +2120,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-index"
 version = "0.2.2"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=3bbfd8c664062f8304e7a790c51794671f9214dc#3bbfd8c664062f8304e7a790c51794671f9214dc"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -2137,6 +2142,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-lexical"
 version = "0.2.2"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=3bbfd8c664062f8304e7a790c51794671f9214dc#3bbfd8c664062f8304e7a790c51794671f9214dc"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -2150,6 +2156,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-quill"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=3bbfd8c664062f8304e7a790c51794671f9214dc#3bbfd8c664062f8304e7a790c51794671f9214dc"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2173,6 +2180,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-rerank"
 version = "0.2.3"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=3bbfd8c664062f8304e7a790c51794671f9214dc#3bbfd8c664062f8304e7a790c51794671f9214dc"
 dependencies = [
  "asupersync",
  "frankensearch-core",
