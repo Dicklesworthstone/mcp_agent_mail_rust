@@ -327,6 +327,26 @@ fn validate_surviving_message(
     Ok(())
 }
 
+/// Inbox copies retain reply/extension metadata but deliberately redact BCC.
+/// Restore only that redacted field from the live DB, then apply every normal
+/// identity/body/routing check. Never trust an inbox to supply private routing.
+fn restore_inbox_metadata(
+    prepared: &PreparedMessage,
+    mut message: Value,
+    body: &str,
+) -> Result<Value, String> {
+    if !message
+        .get("bcc")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        return Err("surviving inbox has invalid BCC redaction; preserved".to_string());
+    }
+    message["bcc"] = prepared.message["bcc"].clone();
+    validate_surviving_message(prepared, &message, body)?;
+    Ok(message)
+}
+
 fn reconcile_prepared(config: &Config, prepared: &PreparedMessage) -> Result<ReconcileResult, String> {
     let archive = crate::ensure_archive(config, &prepared.project_slug).map_err(|error| error.to_string())?;
     let paths = crate::message_paths_for_bundle(
@@ -352,6 +372,25 @@ fn reconcile_prepared(config: &Config, prepared: &PreparedMessage) -> Result<Rec
                 validate_surviving_message(prepared, &message, &body)?;
                 surviving = Some(message);
                 break;
+            }
+        }
+    }
+    // A crash can remove both full copies before Git commits them while
+    // leaving an inbox intact. It still carries the exact reply parent and
+    // extension fields; BCC comes exclusively from the authoritative DB row.
+    if surviving.is_none() {
+        for path in &paths.inbox {
+            if let Some((message, body)) =
+                read_surviving_message(path).map_err(|error| error.to_string())?
+            {
+                let message = restore_inbox_metadata(prepared, message, &body)?;
+                if let Some(previous) = &surviving {
+                    if previous != &message {
+                        return Err("surviving inbox metadata disagree; all copies preserved".to_string());
+                    }
+                } else {
+                    surviving = Some(message);
+                }
             }
         }
     }
@@ -561,6 +600,109 @@ mod tests {
             &archive, &original.message, &original.sender, &original.recipients,
         ).unwrap().0;
         assert!(!paths.canonical.exists());
+    }
+
+    #[test]
+    fn inbox_only_reply_recovery_preserves_parent_extensions_and_bcc_privacy() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            storage_root: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        let original = prepared();
+        let archive = crate::ensure_archive(&config, "project").unwrap();
+        let paths = crate::message_paths_for_bundle(
+            &archive, &original.message, &original.sender, &original.recipients,
+        ).unwrap().0;
+        let mut full = original.message.clone();
+        full["reply_to"] = json!(7);
+        full["future_metadata"] = json!({"opaque": ["keep", 42]});
+        let redacted = crate::redact_message_bcc_for_inbox(&full);
+        let bytes = crate::render_message_bundle_content(&redacted, &original.body).unwrap();
+        crate::ensure_parent_dir(&paths.inbox[0]).unwrap();
+        std::fs::write(&paths.inbox[0], bytes.as_bytes()).unwrap();
+
+        let repaired = reconcile_prepared(&config, &original).unwrap();
+        assert_eq!(repaired.files_created, 3);
+        assert!(repaired.git_commit_needed);
+        for path in [&paths.canonical, &paths.outbox] {
+            let (message, body) = read_surviving_message(path).unwrap().unwrap();
+            assert_eq!(message, full);
+            assert_eq!(body, original.body);
+        }
+        for path in &paths.inbox {
+            assert_eq!(std::fs::read(path).unwrap(), bytes.as_bytes());
+            let (message, _) = read_surviving_message(path).unwrap().unwrap();
+            assert_eq!(message["bcc"], json!([]));
+            assert_eq!(message["reply_to"], 7);
+        }
+        let repo = git2::Repository::open(&archive.repo_root).unwrap();
+        let before = repo.head().unwrap().target().unwrap();
+        assert_eq!(reconcile_prepared(&config, &original).unwrap(), ReconcileResult::default());
+        assert_eq!(repo.head().unwrap().target().unwrap(), before);
+    }
+
+    #[test]
+    fn conflicting_inbox_reply_parents_preserve_all_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            storage_root: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        let original = prepared();
+        let archive = crate::ensure_archive(&config, "project").unwrap();
+        let paths = crate::message_paths_for_bundle(
+            &archive, &original.message, &original.sender, &original.recipients,
+        ).unwrap().0;
+        let mut originals = Vec::new();
+        for (index, path) in paths.inbox.iter().enumerate() {
+            let mut message = crate::redact_message_bcc_for_inbox(&original.message);
+            message["reply_to"] = json!(7 + index);
+            let bytes = crate::render_message_bundle_content(&message, &original.body).unwrap();
+            crate::ensure_parent_dir(path).unwrap();
+            std::fs::write(path, bytes.as_bytes()).unwrap();
+            originals.push(bytes);
+        }
+        let error = reconcile_prepared(&config, &original).unwrap_err();
+        assert!(error.contains("inbox metadata disagree"), "{error}");
+        assert!(!paths.canonical.exists());
+        assert!(!paths.outbox.exists());
+        for (path, bytes) in paths.inbox.iter().zip(originals) {
+            assert_eq!(std::fs::read(path).unwrap(), bytes.as_bytes());
+        }
+    }
+
+    #[test]
+    fn inbox_recovery_refuses_private_routing_and_malformed_redaction() {
+        let original = prepared();
+        let redacted = crate::redact_message_bcc_for_inbox(&original.message);
+        for bcc in [json!(["RedFox"]), json!(null), json!("RedFox")] {
+            let mut message = redacted.clone();
+            message["bcc"] = bcc;
+            let error = restore_inbox_metadata(&original, message, &original.body).unwrap_err();
+            assert!(error.contains("BCC redaction"), "{error}");
+        }
+        let mut missing = redacted;
+        missing.as_object_mut().unwrap().remove("bcc");
+        assert!(restore_inbox_metadata(&original, missing, &original.body).is_err());
+    }
+
+    #[test]
+    fn inbox_recovery_still_requires_live_identity_body_and_visible_routing() {
+        let original = prepared();
+        let redacted = crate::redact_message_bcc_for_inbox(&original.message);
+        for (key, value) in [
+            ("id", json!(10)),
+            ("project_slug", json!("other-project")),
+            ("to", json!(["RedFox"])),
+            ("cc", json!(["RedFox"])),
+            ("reply_to", json!(9)),
+        ] {
+            let mut message = redacted.clone();
+            message[key] = value;
+            assert!(restore_inbox_metadata(&original, message, &original.body).is_err(), "{key}");
+        }
+        assert!(restore_inbox_metadata(&original, redacted, "different body").is_err());
     }
 
     #[test]
