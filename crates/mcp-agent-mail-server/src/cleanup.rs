@@ -1004,7 +1004,7 @@ fn write_cleanup_artifacts(
                 "reason": row.reason,
                 "created_ts": mcp_agent_mail_db::micros_to_iso(row.created_ts),
                 "expires_ts": mcp_agent_mail_db::micros_to_iso(row.expires_ts),
-                "released_ts": mcp_agent_mail_db::micros_to_iso(row.released_ts),
+                "released_ts": mcp_agent_mail_db::micros_to_iso(released_ts),
             }));
         }
     }
@@ -1615,6 +1615,7 @@ mod tests {
             .status()
             .expect("git config user.name should run");
         assert!(status.success(), "git config user.name should succeed");
+
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(repo)
