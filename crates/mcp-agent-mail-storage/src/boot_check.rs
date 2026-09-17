@@ -4,7 +4,8 @@
 //! checks whether they open cleanly, and reuses the git-2.51 recovery detector
 //! for missing-ref findings. `AutoRepair` is intentionally narrower than the
 //! detector: it writes a backup first, then prunes only refs already classified
-//! by the recovery layer as safe-to-prune.
+//! by the recovery layer as safe-to-prune. Every deletion revalidates the
+//! original target under the Git ref lock; a stale scan cannot delete a repair.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,9 @@ use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::recovery::{PrunableRef, RefCategory, detect_missing_refs};
+use crate::recovery::{
+    PrunableRef, PruneRefOutcome, RefCategory, detect_missing_refs, prune_missing_ref,
+};
 
 const TARGET: &str = "mcp_agent_mail::boot_check";
 const CALLER: &str = "startup.boot_check";
@@ -537,21 +540,34 @@ fn auto_repair_missing_refs(
 
     let canonical = canonicalize_repo(&candidate.path)
         .ok_or_else(|| format!("canonicalize repo {}", candidate.path.display()))?;
-    let _flock = RepoFlock::acquire(&canonical)
+    let flock = RepoFlock::acquire(&canonical)
         .map_err(|error| format!("acquire repo lock {}: {error}", canonical.display()))?;
+    if !flock.is_real() {
+        return Err("auto repair refused: repository lock is not held (phantom lock)".to_string());
+    }
 
     let backup_path = write_ref_backup(root, candidate, refs)?;
     actions.push(format!("backup_refs:{}", backup_path.display()));
 
     let mut pruned_refs = Vec::new();
     for finding in safe_refs {
-        prune_ref(&candidate.path, &finding.ref_name)?;
-        actions.push(format!("prune_ref:{}", finding.ref_name));
-        pruned_refs.push(finding.ref_name.clone());
+        match prune_missing_ref(&candidate.path, finding, false)
+            .map_err(|error| format!("revalidate/prune {}: {error}", finding.ref_name))?
+        {
+            PruneRefOutcome::Pruned => {
+                actions.push(format!("prune_ref:{}", finding.ref_name));
+                pruned_refs.push(finding.ref_name.clone());
+            }
+            outcome => {
+                actions.push(format!("skip_ref:{}:{outcome:?}", finding.ref_name));
+            }
+        }
     }
 
-    repack_refs(root, candidate)?;
-    actions.push("repack_refs".to_string());
+    if !pruned_refs.is_empty() {
+        repack_refs(root, candidate)?;
+        actions.push("repack_refs".to_string());
+    }
 
     let after = detect_missing_refs(&candidate.path)
         .map_err(|error| format!("post-repair missing-ref scan failed: {error}"))?;
@@ -610,18 +626,6 @@ fn write_ref_backup(
     fs::write(&backup_path, text.as_bytes())
         .map_err(|error| format!("write backup {}: {error}", backup_path.display()))?;
     Ok(backup_path)
-}
-
-fn prune_ref(repo_path: &Path, ref_name: &str) -> Result<(), String> {
-    let repo =
-        Repository::open(repo_path).map_err(|error| format!("open repo for pruning: {error}"))?;
-    let mut reference = repo
-        .find_reference(ref_name)
-        .map_err(|error| format!("find reference {ref_name}: {error}"))?;
-    reference
-        .delete()
-        .map_err(|error| format!("delete reference {ref_name}: {error}"))?;
-    Ok(())
 }
 
 fn repack_refs(root: &Path, candidate: &ArchiveRepoCandidate) -> Result<(), String> {
@@ -1016,5 +1020,93 @@ mod tests {
         assert_eq!(report.total_projects, 1);
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].kind, BootCheckFindingKind::RepoBroken);
+    }
+
+    fn stale_stash_fixture(tmp: &TempDir) -> (Repository, ArchiveRepoCandidate, Vec<PrunableRef>) {
+        let repo = init_repo_with_commit(tmp.path());
+        fs::write(
+            repo.path().join("refs/stash"),
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n",
+        )
+        .unwrap();
+        let refs = detect_missing_refs(tmp.path()).unwrap();
+        assert_eq!(refs.len(), 1);
+        let candidate = ArchiveRepoCandidate {
+            project: ARCHIVE_ROOT_LABEL.to_string(),
+            path: tmp.path().to_path_buf(),
+        };
+        (repo, candidate, refs)
+    }
+
+    #[test]
+    fn auto_repair_preserves_a_healthy_ref_from_a_stale_scan() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, candidate, refs) = stale_stash_fixture(&tmp);
+        let healthy = repo.head().unwrap().target().unwrap();
+        repo.reference("refs/stash", healthy, true, "concurrent repair")
+            .unwrap();
+
+        let outcome = auto_repair_missing_refs(tmp.path(), &candidate, &refs).unwrap();
+
+        assert!(outcome.pruned_refs.is_empty());
+        assert!(outcome.after_refs.is_empty());
+        assert!(!outcome.actions.iter().any(|action| action == "repack_refs"));
+        assert!(outcome.actions.iter().any(|action| action.starts_with("skip_ref:")));
+        assert_eq!(repo.find_reference("refs/stash").unwrap().target(), Some(healthy));
+    }
+
+    #[test]
+    fn auto_repair_preserves_a_different_missing_target_from_a_stale_scan() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, candidate, refs) = stale_stash_fixture(&tmp);
+        let changed = "cafebabecafebabecafebabecafebabecafebabe\n";
+        fs::write(repo.path().join("refs/stash"), changed).unwrap();
+
+        let outcome = auto_repair_missing_refs(tmp.path(), &candidate, &refs).unwrap();
+
+        assert!(outcome.pruned_refs.is_empty());
+        assert_eq!(outcome.after_refs, vec!["refs/stash".to_string()]);
+        assert!(!outcome.actions.iter().any(|action| action == "repack_refs"));
+        assert_eq!(fs::read_to_string(repo.path().join("refs/stash")).unwrap(), changed);
+    }
+
+    #[test]
+    fn auto_repair_refuses_repo_lock_failure_before_backing_up_or_pruning() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, candidate, refs) = stale_stash_fixture(&tmp);
+        let sentinel = mcp_agent_mail_core::git_lock::sentinel_path(tmp.path()).unwrap();
+        fs::create_dir(sentinel).unwrap();
+        let before = fs::read(repo.path().join("refs/stash")).unwrap();
+
+        assert!(auto_repair_missing_refs(tmp.path(), &candidate, &refs).is_err());
+
+        assert_eq!(fs::read(repo.path().join("refs/stash")).unwrap(), before);
+        assert!(backup_files(tmp.path(), ARCHIVE_ROOT_LABEL).is_empty());
+    }
+
+    #[test]
+    fn auto_repair_refuses_a_git_writer_holding_the_ref_lock() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, candidate, refs) = stale_stash_fixture(&tmp);
+        let mut writer = repo.transaction().unwrap();
+        writer.lock_ref("refs/stash").unwrap();
+        let before = fs::read(repo.path().join("refs/stash")).unwrap();
+
+        assert!(auto_repair_missing_refs(tmp.path(), &candidate, &refs).is_err());
+
+        assert_eq!(fs::read(repo.path().join("refs/stash")).unwrap(), before);
+        assert!(!backup_files(tmp.path(), ARCHIVE_ROOT_LABEL).is_empty());
+    }
+
+    #[test]
+    fn auto_repair_backup_failure_leaves_refs_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, candidate, refs) = stale_stash_fixture(&tmp);
+        fs::write(tmp.path().join("backups"), b"not a directory").unwrap();
+        let before = fs::read(repo.path().join("refs/stash")).unwrap();
+
+        assert!(auto_repair_missing_refs(tmp.path(), &candidate, &refs).is_err());
+
+        assert_eq!(fs::read(repo.path().join("refs/stash")).unwrap(), before);
     }
 }
