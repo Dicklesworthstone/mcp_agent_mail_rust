@@ -19,7 +19,9 @@
 //!   directory; older ones are moved into `retired/` rather than
 //!   deleted.
 //! - **Per-repo flock** held for the full detect+prune+repack
-//!   sequence to prevent interleaving with concurrent committers.
+//!   sequence. Apply refuses phantom locks as well as acquisition errors.
+//! - **Git ref locks** cover target revalidation and deletion, including
+//!   writers that do not participate in the cooperative flock protocol.
 //!
 //! # Output
 //!
@@ -34,7 +36,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mcp_agent_mail_core::config::Config;
 use mcp_agent_mail_core::git_lock::{RepoFlock, canonicalize_repo};
 use mcp_agent_mail_storage::recovery::{
-    DetectionSummary, PrunableRef, RefCategory, detect_missing_refs,
+    DetectionSummary, PrunableRef, PruneRefOutcome, RefCategory, detect_missing_refs,
+    prune_missing_ref,
 };
 
 use crate::output::CliOutputFormat;
@@ -149,13 +152,33 @@ pub fn run(
         }
     }
 
-    if apply && report.projects.iter().any(|p| p.error.is_some()) {
+    if report.projects.iter().any(project_has_errors) {
         return Err(CliError::Other(
             "fix-orphan-refs encountered errors; see report above".to_string(),
         ));
     }
 
     Ok(())
+}
+
+fn project_has_errors(report: &ProjectReport) -> bool {
+    report.error.is_some()
+        || report
+            .apply_result
+            .as_ref()
+            .is_some_and(|result| result.errors > 0)
+}
+
+fn failed_project_report(project: String, error: String) -> ProjectReport {
+    ProjectReport {
+        project,
+        scanned_refs: None,
+        actions: Vec::new(),
+        summary: DetectionSummary::default(),
+        apply_result: None,
+        backup_path: None,
+        error: Some(error),
+    }
 }
 
 fn scan_one_project(
@@ -173,41 +196,38 @@ fn scan_one_project(
         "fix_orphan_refs_started"
     );
 
-    // Acquire per-repo flock for the full detect-prune sequence. This
-    // protects against an operator running a git commit in the same
-    // repo concurrently with our prune — we'd rather wait than
-    // interleave.
-    let canonical = canonicalize_repo(project_path);
-    let _flock = canonical
-        .as_ref()
-        .and_then(|c| match RepoFlock::acquire(c) {
-            Ok(f) => Some(f),
-            Err(e) => {
-                tracing::error!(
-                    target: "mcp_agent_mail::doctor::fix_orphan_refs",
-                    project = %project_display,
-                    err = %e,
-                    "flock_acquire_failed"
-                );
-                // Proceed without flock — the caller will see any damage
-                // we cause in the error column.
-                None
-            }
-        });
+    // Apply requires actual ownership, not an optional/phantom lock. The
+    // per-ref transaction below additionally excludes ordinary Git writers.
+    let Some(canonical) = canonicalize_repo(project_path) else {
+        return failed_project_report(
+            project_display,
+            "cannot canonicalize repository for locking".to_string(),
+        );
+    };
+    let _flock = match RepoFlock::acquire(&canonical) {
+        Ok(lock) if !apply || lock.is_real() => lock,
+        Ok(_) => {
+            return failed_project_report(
+                project_display,
+                "apply refused: repository lock is not held (phantom lock)".to_string(),
+            );
+        }
+        Err(error) => {
+            return failed_project_report(
+                project_display,
+                format!("repository lock acquisition failed: {error}"),
+            );
+        }
+    };
 
     // Detect.
     let findings = match detect_missing_refs(project_path) {
         Ok(f) => f,
         Err(e) => {
-            return ProjectReport {
-                project: project_display,
-                scanned_refs: None,
-                actions: Vec::new(),
-                summary: DetectionSummary::default(),
-                apply_result: None,
-                backup_path: None,
-                error: Some(format!("detect_missing_refs failed: {e}")),
-            };
+            return failed_project_report(
+                project_display,
+                format!("detect_missing_refs failed: {e}"),
+            );
         }
     };
 
@@ -300,8 +320,8 @@ fn scan_one_project(
             });
             continue;
         }
-        match prune_ref(project_path, &finding.ref_name) {
-            Ok(()) => {
+        match prune_missing_ref(project_path, finding, force) {
+            Ok(PruneRefOutcome::Pruned) => {
                 apply_summary.pruned += 1;
                 actions.push(ActionRecord {
                     op: "pruned",
@@ -319,6 +339,16 @@ fn scan_one_project(
                     "ref_pruned"
                 );
             }
+            Ok(outcome) => {
+                actions.push(ActionRecord {
+                    op: "prune_skipped",
+                    project: project_display.clone(),
+                    ref_name: Some(finding.ref_name.clone()),
+                    target_sha: Some(finding.target_sha.clone()),
+                    reason: Some(format!("finding no longer authorizes deletion: {outcome:?}")),
+                    category: Some(finding.category),
+                });
+            }
             Err(e) => {
                 apply_summary.errors += 1;
                 actions.push(ActionRecord {
@@ -333,7 +363,7 @@ fn scan_one_project(
         }
     }
 
-    if apply && backup_path.is_some() {
+    if apply && apply_summary.pruned > 0 {
         // br-8ujfs.6.4 (F4): regenerate packed-refs after a successful
         // prune so the remaining refs are consolidated. Writes a
         // backup of packed-refs (if present) in the same backup dir
@@ -404,15 +434,6 @@ fn count_refs(project_path: &Path) -> Option<usize> {
     let repo = git2::Repository::open(project_path).ok()?;
     let refs = repo.references().ok()?;
     Some(refs.flatten().count())
-}
-
-fn prune_ref(project_path: &Path, ref_name: &str) -> Result<(), String> {
-    let repo = git2::Repository::open(project_path).map_err(|e| format!("open repo: {e}"))?;
-    let mut r = repo
-        .find_reference(ref_name)
-        .map_err(|e| format!("find_reference({ref_name}): {e}"))?;
-    r.delete().map_err(|e| format!("delete({ref_name}): {e}"))?;
-    Ok(())
 }
 
 fn write_ref_backup(
@@ -765,5 +786,99 @@ mod tests {
         let next = unique_retired_backup_path(&retired_dir, Path::new("/tmp/123.txt"));
 
         assert_eq!(next, retired_dir.join("123.txt.retired-1"));
+    }
+
+    fn orphan_fixture(temp: &TempDir) -> (PathBuf, Config, PathBuf) {
+        let path = temp.path().join("repo");
+        let repo = git2::Repository::init(&path).unwrap();
+        let orphan = repo.path().join("refs/temp/orphan");
+        fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+        fs::write(&orphan, b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n").unwrap();
+        let config = Config {
+            storage_root: temp.path().join("storage"),
+            ..Config::default()
+        };
+        (path, config, orphan)
+    }
+
+    #[test]
+    fn apply_lock_failure_does_not_prune_or_create_a_backup() {
+        let temp = TempDir::new().unwrap();
+        let (path, config, orphan) = orphan_fixture(&temp);
+        let sentinel = mcp_agent_mail_core::git_lock::sentinel_path(&path).unwrap();
+        fs::create_dir(&sentinel).unwrap();
+        let before = fs::read(&orphan).unwrap();
+
+        let report = scan_one_project(&path, &config, true, false);
+
+        assert!(project_has_errors(&report));
+        assert!(report.apply_result.is_none());
+        assert!(report.actions.is_empty());
+        assert_eq!(fs::read(&orphan).unwrap(), before);
+        assert!(!config.storage_root.exists());
+    }
+
+    #[test]
+    fn backup_failure_is_an_error_and_never_authorizes_pruning() {
+        let temp = TempDir::new().unwrap();
+        let (path, config, orphan) = orphan_fixture(&temp);
+        fs::write(&config.storage_root, b"not a directory").unwrap();
+        let before = fs::read(&orphan).unwrap();
+
+        let report = scan_one_project(&path, &config, true, false);
+
+        assert!(project_has_errors(&report));
+        assert!(report.actions.iter().any(|action| action.op == "backup_failed"));
+        assert_eq!(report.apply_result.as_ref().unwrap().pruned, 0);
+        assert_eq!(report.apply_result.as_ref().unwrap().errors, 1);
+        assert_eq!(fs::read(&orphan).unwrap(), before);
+        assert!(report.backup_path.is_none());
+    }
+
+    #[test]
+    fn git_ref_lock_failure_is_reported_without_repacking() {
+        let temp = TempDir::new().unwrap();
+        let (path, config, orphan) = orphan_fixture(&temp);
+        let repo = git2::Repository::open(&path).unwrap();
+        let mut writer = repo.transaction().unwrap();
+        writer.lock_ref("refs/temp/orphan").unwrap();
+        let before = fs::read(&orphan).unwrap();
+
+        let report = scan_one_project(&path, &config, true, false);
+
+        assert!(project_has_errors(&report));
+        assert!(report.backup_path.as_ref().unwrap().is_file());
+        assert_eq!(report.apply_result.as_ref().unwrap().pruned, 0);
+        assert!(report.actions.iter().any(|action| action.op == "prune_failed"));
+        assert!(!report.actions.iter().any(|action| action.op == "repacked_refs"));
+        assert_eq!(fs::read(&orphan).unwrap(), before);
+    }
+
+    #[test]
+    fn dry_run_preserves_orphan_refs_and_does_not_create_backups() {
+        let temp = TempDir::new().unwrap();
+        let (path, config, orphan) = orphan_fixture(&temp);
+        let before = fs::read(&orphan).unwrap();
+
+        let report = scan_one_project(&path, &config, false, false);
+
+        assert!(!project_has_errors(&report));
+        assert_eq!(report.summary.findings, 1);
+        assert!(report.actions.iter().any(|action| action.op == "would_prune"));
+        assert_eq!(fs::read(&orphan).unwrap(), before);
+        assert!(!config.storage_root.exists());
+    }
+
+    #[test]
+    fn failed_dry_run_is_not_a_successful_health_report() {
+        let temp = TempDir::new().unwrap();
+        let config = Config {
+            storage_root: temp.path().join("storage"),
+            ..Config::default()
+        };
+        let report = scan_one_project(&temp.path().join("missing-repo"), &config, false, false);
+        assert!(project_has_errors(&report));
+        assert!(report.scanned_refs.is_none());
+        assert!(!config.storage_root.exists());
     }
 }
