@@ -11,16 +11,20 @@
 //!   writer crashed mid-update.
 //! - Future: [`prune_orphan_refs`] (F3) and [`repack_refs`] (F4) will
 //!   live here once the F3/F4 beads land.
+//! - [`message_reconcile`] (br-8j6cb): restore missing message artifacts
+//!   without overwriting conflicting evidence or delivering mail again.
 //!
-//! # Non-goals
+//! # Ref-detection non-goals
 //!
-//! - We NEVER touch the working tree. All operations are pure ref /
-//!   ODB introspection.
+//! - Ref detection NEVER touches the working tree. Its operations are pure
+//!   ref / ODB introspection; message reconciliation is a separate write API.
 //! - We NEVER delete objects. If a ref points to a missing object we
 //!   delete the REF; the (missing) object is already gone.
-//! - We NEVER auto-repair. Detection is strictly read-only; the
+//! - Ref detection NEVER auto-repairs. Detection is strictly read-only; the
 //!   caller (Track F's `am doctor fix-orphan-refs` command) decides
 //!   when to prune.
+
+pub mod message_reconcile;
 
 use std::path::Path;
 

@@ -31,6 +31,8 @@ mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
 mcp-agent-mail-db = { path = "../mcp-agent-mail-db", default-features = false }
 fastmcp-core.workspace = true
 mime_guess = "2.0"
+# Reconciliation publishes private, fsynced candidates without replacing evidence.
+tempfile = "3"
 
 [features]
 default = ["mcp-agent-mail-db/default"]
@@ -42,7 +44,6 @@ portable = ["mcp-agent-mail-db/portable"]
 # the capability-security gate intact. See mcp-agent-mail-db/Cargo.toml.
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion.workspace = true
-tempfile = "3"
 toml.workspace = true
 
 [[bench]]

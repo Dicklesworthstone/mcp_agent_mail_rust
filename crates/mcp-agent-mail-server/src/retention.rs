@@ -15,6 +15,14 @@
 //! the knob is off, the phase stays report-only and logs what WOULD be pruned
 //! at the `retention_max_age_days` horizon.
 //!
+//! br-8j6cb adds non-destructive message archive healing on this same worker.
+//! File-backed mailboxes enable it by default; set
+//! `AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED=false` to disable it. Bounded recent
+//! catch-up and rotating history passes run at most once per minute, without
+//! accelerating the configured reporting/pruning cadence. Repair never sends
+//! another message or changes read/ack state. Its per-pass result is not a
+//! whole-mailbox or attachment-durability certificate.
+//!
 //! The worker runs on a dedicated OS thread with `std::thread::sleep` between
 //! iterations, matching the pattern in `cleanup.rs` and `ack_ttl.rs`.
 
@@ -27,10 +35,14 @@ use mcp_agent_mail_db::{
     DbPool, DbPoolConfig, create_pool, now_micros,
     queries::{MessagePruneReport, count_prunable_messages, prune_settled_messages},
 };
+use mcp_agent_mail_storage::recovery::message_reconcile::database::{
+    self as message_archive_reconcile, ReconcileCursor,
+};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 /// Maximum messages removed per delete transaction (GH#273). Bounded so a
@@ -53,14 +65,30 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
-/// Start the retention/quota report worker (if enabled).
+const fn maintenance_worker_enabled(config: &Config, repair_enabled: bool) -> bool {
+    config.retention_report_enabled
+        || config.quota_enabled
+        || config.messages_retention_days > 0
+        || repair_enabled
+}
+
+fn maintenance_poll_interval(report_interval: Duration, repair_enabled: bool) -> Duration {
+    if repair_enabled {
+        report_interval.min(Duration::from_secs(60))
+    } else {
+        report_interval
+    }
+}
+
+fn report_is_due(elapsed: Option<Duration>, interval: Duration) -> bool {
+    elapsed.is_none_or(|elapsed| elapsed >= interval)
+}
+
+/// Start the retention/quota/message-reconciliation worker when needed.
 ///
 /// Must be called at most once. Subsequent calls are no-ops.
 pub fn start(config: &Config) {
-    if !config.retention_report_enabled
-        && !config.quota_enabled
-        && config.messages_retention_days == 0
-    {
+    if !maintenance_worker_enabled(config, message_archive_reconcile::enabled(config)) {
         return;
     }
 
@@ -110,44 +138,41 @@ pub fn shutdown() {
     }
 }
 
-/// Whether this configuration needs a DB pool in the retention worker: either
-/// real message pruning (GH#273) or the report-only would-prune counter.
+/// Whether retention needs a DB pool: either real message pruning (GH#273)
+/// or the report-only would-prune counter. Archive repair is independent.
 const fn message_retention_needs_db(config: &Config) -> bool {
     config.messages_retention_days > 0
         || (config.retention_report_enabled && config.retention_max_age_days > 0)
 }
 
-fn retention_loop(config: &Config) {
-    let interval = std::time::Duration::from_secs(config.retention_report_interval_seconds.max(60));
-    let startup_delay = interval.min(std::time::Duration::from_secs(10));
+fn retention_pool_config(config: &Config) -> DbPoolConfig {
+    let mut pool_config = DbPoolConfig::from_env();
+    pool_config.database_url.clone_from(&config.database_url);
+    // Never rediscover an ambient archive root after the server has resolved
+    // its mailbox. Reconciliation verifies this exact source/root binding.
+    pool_config.storage_root = Some(config.storage_root.clone());
+    pool_config.min_connections = 1;
+    pool_config.max_connections = 1;
+    pool_config.warmup_connections = 0;
+    // Startup already ran readiness_check with migrations before workers.
+    pool_config.run_migrations = false;
+    pool_config
+}
 
-    // GH#273: the message retention phase reads/writes the live DB. Pool
-    // creation failure downgrades to filesystem-only reporting (never crash
-    // the server over a worker-side pool).
-    let pool: Option<DbPool> = if message_retention_needs_db(config) {
-        let mut pool_config = DbPoolConfig::from_env();
-        pool_config.database_url.clone_from(&config.database_url);
-        pool_config.min_connections = 1;
-        pool_config.max_connections = 1;
-        pool_config.warmup_connections = 0;
-        // Startup already ran readiness_check with migrations before workers.
-        pool_config.run_migrations = false;
-        match create_pool(&pool_config) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "retention worker: failed to create DB pool; message retention phase disabled this run"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+fn retention_loop(config: &Config) {
+    let interval = Duration::from_secs(config.retention_report_interval_seconds.max(60));
+    let repair_enabled = message_archive_reconcile::enabled(config);
+    let poll_interval = maintenance_poll_interval(interval, repair_enabled);
+    let startup_delay = poll_interval.min(Duration::from_secs(10));
+    let needs_db = message_retention_needs_db(config) || repair_enabled;
+    let mut pool: Option<DbPool> = None;
+    let mut cursor = ReconcileCursor::default();
+    let mut last_report: Option<Instant> = None;
 
     info!(
         interval_secs = interval.as_secs(),
+        poll_interval_secs = poll_interval.as_secs(),
+        archive_reconcile_enabled = repair_enabled,
         retention_enabled = config.retention_report_enabled,
         quota_enabled = config.quota_enabled,
         messages_retention_days = config.messages_retention_days,
@@ -155,7 +180,7 @@ fn retention_loop(config: &Config) {
         "retention/quota report worker started"
     );
 
-    if startup_delay > std::time::Duration::ZERO {
+    if startup_delay > Duration::ZERO {
         info!(
             startup_delay_secs = startup_delay.as_secs(),
             "retention/quota worker startup delay engaged"
@@ -171,34 +196,101 @@ fn retention_loop(config: &Config) {
             return;
         }
 
-        // The filesystem walk only serves the report/quota surfaces; skip it
-        // when the worker is running solely for message retention (GH#273).
-        if config.retention_report_enabled || config.quota_enabled {
-            match run_retention_cycle(config) {
-                Ok(report) => {
-                    info!(
-                        target: "maintenance",
-                        event = "retention_quota_report",
-                        projects_scanned = report.projects_scanned,
-                        total_attachment_bytes = report.total_attachment_bytes,
-                        total_inbox_count = report.total_inbox_count,
-                        warnings = report.warnings,
-                        "retention/quota report completed"
+        // Retry admission on a later tick instead of permanently disabling
+        // healing after a transient startup failure or a retired pool.
+        if needs_db && pool.is_none() {
+            match create_pool(&retention_pool_config(config)) {
+                Ok(created) => pool = Some(created),
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "maintenance DB pool unavailable; retrying on the next scheduled cycle"
                     );
-                }
-                Err(e) => {
-                    warn!(error = %e, "retention/quota report cycle failed");
                 }
             }
         }
 
-        // GH#273: message retention phase (prune when the knob is on,
-        // would-prune report when it is off).
-        if let Some(pool) = pool.as_ref() {
-            run_message_retention_phase(config, pool);
+        if repair_enabled {
+            let mut retire_pool = false;
+            if let Some(live_pool) = pool.as_ref() {
+                let cx = worker_cx();
+                match message_archive_reconcile::reconcile_message_batch(
+                    &cx,
+                    live_pool,
+                    config,
+                    &mut cursor,
+                    &SHUTDOWN,
+                ) {
+                    Ok(report) => {
+                        if report.scanned > 0 || report.interrupted {
+                            info!(
+                                target: "maintenance",
+                                event = "message_archive_reconcile",
+                                scanned = report.scanned,
+                                unchanged = report.unchanged,
+                                repaired = report.repaired,
+                                files_created = report.files_created,
+                                deferred = report.deferred,
+                                payload_bytes = report.payload_bytes,
+                                interrupted = report.interrupted,
+                                budget_exhausted = report.budget_exhausted,
+                                "bounded message archive reconciliation pass completed"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "maintenance",
+                            event = "message_archive_reconcile_source_unavailable",
+                            error = %error,
+                            "message archive reconciliation refused; preserving source and retrying next cycle"
+                        );
+                        retire_pool = true;
+                    }
+                }
+            }
+            if retire_pool {
+                // A verified recovery may have replaced the live generation.
+                // Reacquire through ordinary pool admission on the next tick.
+                pool = None;
+            }
         }
 
-        if sleep_with_shutdown(interval) {
+        if SHUTDOWN.load(Ordering::Acquire) {
+            return;
+        }
+
+        // Archive catch-up does not turn a long-interval filesystem inventory
+        // or destructive retention sweep into a once-per-minute operation.
+        if report_is_due(last_report.map(|last| last.elapsed()), interval) {
+            if config.retention_report_enabled || config.quota_enabled {
+                match run_retention_cycle(config) {
+                    Ok(report) => {
+                        info!(
+                            target: "maintenance",
+                            event = "retention_quota_report",
+                            projects_scanned = report.projects_scanned,
+                            total_attachment_bytes = report.total_attachment_bytes,
+                            total_inbox_count = report.total_inbox_count,
+                            warnings = report.warnings,
+                            "retention/quota report completed"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "retention/quota report cycle failed");
+                    }
+                }
+            }
+
+            // GH#273: keep the explicitly opted-in retention behavior separate
+            // from the non-destructive, per-message archive repair result.
+            if let Some(pool) = pool.as_ref() {
+                run_message_retention_phase(config, pool);
+            }
+            last_report = Some(Instant::now());
+        }
+
+        if sleep_with_shutdown(poll_interval) {
             return;
         }
     }
@@ -1139,6 +1231,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn archive_repair_starts_without_enabling_destructive_retention() {
+        let config = Config::default();
+        assert!(maintenance_worker_enabled(&config, true));
+        assert!(!maintenance_worker_enabled(&config, false));
+        assert!(!message_retention_needs_db(&config));
+        let selected = retention_pool_config(&config);
+        assert_eq!(selected.database_url, config.database_url);
+        assert_eq!(selected.storage_root.as_deref(), Some(config.storage_root.as_path()));
+        assert_eq!(selected.max_connections, 1);
+        assert!(!selected.run_migrations);
+    }
+
+    #[test]
+    fn repair_polling_does_not_accelerate_reporting_or_pruning() {
+        let interval = Duration::from_secs(3600);
+        assert_eq!(maintenance_poll_interval(interval, true), Duration::from_secs(60));
+        assert_eq!(maintenance_poll_interval(interval, false), interval);
+        assert!(report_is_due(None, interval));
+        for seconds in [0, 60, 3599] {
+            assert!(!report_is_due(Some(Duration::from_secs(seconds)), interval));
+        }
+        assert!(report_is_due(Some(interval), interval));
+        assert!(report_is_due(Some(interval + Duration::from_secs(1)), interval));
+    }
+
+    #[test]
     fn should_ignore_exact_match() {
         let patterns = vec!["demo".to_string(), "test*".to_string()];
         assert!(should_ignore("demo", &patterns));
@@ -1262,7 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_disabled_by_default() {
+    fn destructive_retention_disabled_by_default() {
         let config = Config::from_env();
         assert!(!config.retention_report_enabled);
         assert!(!config.quota_enabled);
