@@ -26,6 +26,15 @@ Recent releases; the earlier version history continues below.
 
 ## Unreleased
 
+- **Mailbox dependencies move to FrankenSQLite 0.4.4.** SQLModel 0.5.0,
+  Asupersync 0.5.0, FastMCP 0.10.0 and FrankenSearch 0.6.0 move together so
+  database and reranker contexts remain compatible. FastMCP stays pinned to
+  the upstream negotiation repair, preserving newer clients' initialization
+  proposals. Embedded Beads retains its separate patched 0.3.18 engine.
+  The 0.4.4 engine revision carries forward prepared-DML binding and stored
+  CREATE-prefix fixes omitted from the published release. Migration tracking
+  gains SQLModel's checksum column while preserving existing records.
+  Upgrade qualification is tracked in `UPGRADE_LOG.md` and `br-5lgwn`.
 - **Source builds pin FrankenSearch directly to an immutable git revision.**
   Cargo no longer reads a mutable sibling checkout, so updating that checkout
   cannot break this workspace. Package versions and features are unchanged;

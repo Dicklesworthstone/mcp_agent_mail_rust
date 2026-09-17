@@ -79,12 +79,12 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 | Crate | Purpose |
 |-------|---------|
-| `asupersync` (`=0.4.9`, crates.io) | Structured async runtime (channels, sync, regions, HTTP, testing) |
-| `fastmcp-rust` (`0.7.1`, immutable Git backport `c14d26b4`; imported as `fastmcp`) | MCP protocol implementation; full family pinned for legacy stdio version negotiation while retaining Asupersync 0.4.9 |
-| `sqlmodel` (`=0.4.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; the FrankenSQLite driver (`fsqlite =0.3.18`, Git revision `2633b38a26bde68db23172b12aa402ed698cc309`, tag `am-sql-compat-20260916`) is the runtime `DbConn`; the pin includes the Windows namespace identity fix |
-| `sqlmodel-sqlite` (`=0.4.0`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
+| `asupersync` (`=0.5.0`, crates.io) | Structured async runtime (channels, sync, regions, HTTP, testing) |
+| `fastmcp-rust` (`0.10.0`, immutable Git revision `1c2e5e4b`; imported as `fastmcp`) | MCP protocol implementation; full family pinned to preserve legacy stdio version negotiation on Asupersync 0.5 |
+| `sqlmodel` (`=0.5.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; FrankenSQLite `=0.4.4` is the runtime `DbConn`, pinned to `4b1ffc77` to retain SQL binding and schema-prefix repairs omitted from the release. Embedded Beads still uses a separate patched 0.3.18 engine |
+| `sqlmodel-sqlite` (`=0.5.0`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
 | `ftui` / `ftui-*` (`0.5.0`, FrankenTUI) | TUI rendering for operations console |
-| `frankensearch` (`0.4`, git revision `3bbfd8c664062f8304e7a790c51794671f9214dc`, aligned with dist.yml's `FRANKENSEARCH_COMMIT`) | Search V3 engine; lexical (Tantivy) tier by default, semantic/rerank behind the `hybrid` feature. Cargo uses the immutable revision directly; no sibling checkout is required. Never switch to a floating branch: newer source requires asupersync 0.4.10, which fastmcp cannot follow yet |
+| `frankensearch` (`0.6`, git revision `dd093fb230404ab08be2ed6f27776ed6c4796485`, aligned with dist.yml's `FRANKENSEARCH_COMMIT`) | Search V3 engine; lexical (Tantivy) tier by default, semantic/rerank behind the `hybrid` feature. Cargo uses the immutable revision directly; no sibling checkout is required. Its reranker shares the Asupersync 0.5 caller context |
 | `beads_rust` (`=0.5.4`) | Issue tracking integration |
 | `franken-agent-detection` (`0.2.2`) | Installed coding-agent detection for setup/doctor |
 | `serde` + `serde_json` | JSON serialization for MCP protocol |

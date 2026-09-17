@@ -11,10 +11,10 @@ statements below; v0.3.36 is published and this work targets unreleased main.
   `/data/projects/am-release-20260912/library-inventory-20260917.json`.
 - Migration requires SQLModel 0.5.0 and Asupersync 0.5.0. FastMCP 0.10.0
   provides the matching runtime; its breaking HTTP/context changes require
-  real transport regression coverage. Existing Beads and FrankenSearch
-  dependencies still use Asupersync 0.4 and must be assessed explicitly.
+  real transport regression coverage. FrankenSearch now follows the 0.5
+  runtime; embedded Beads retains its separate 0.4 runtime graph.
 - Validation is pending. No compatibility or release claim is made yet.
-- The mailbox dependency edges now resolve registry `fsqlite`/`fsqlite-types`
+- The mailbox dependency edges resolve patched `fsqlite`/`fsqlite-types`
   0.4.4, SQLModel 0.5.0 and Asupersync 0.5.0. Embedded Beads 0.5.4 still
   requires its separate 0.3.18 engine; its qualified git patches remain.
 - FastMCP registry 0.10.0 predates GH321 proposal negotiation. Preserve that
@@ -28,6 +28,63 @@ statements below; v0.3.36 is published and this work targets unreleased main.
   upstream 0.23.45 fixes it. This update is queued after the runtime gate.
 - First RCH check failed before compilation with SSH exit 255. A second
   worker is compiling; both logs are retained under the artifact directory.
+- The initial remote compiler result exposed two migration errors: removed
+  SQLModel `test_on_return` builder and a shared reranker `Cx` type crossing
+  Asupersync 0.4/0.5. Removed the obsolete pool setting; moved FrankenSearch
+  to immutable `dd093fb230404ab08be2ed6f27776ed6c4796485` (facade 0.6.0,
+  component crates 0.3.0, rerank 0.4.0). Required dependency floors also move
+  tokenizers to 0.23.2, wide to 1.7.1, and registry Tantivy to 0.26.2.
+  Container and source-installer provenance pins follow the same revision.
+  The pinned direct Tantivy 0.27 dependency is preserved.
+- The second admitted workspace/all-target check compiled the production
+  workspace, then failed on a pre-existing storage test closure taking zero
+  arguments instead of the helper's path argument. Corrected the closure to
+  `|_|`; a fresh all-target check is still required. Subsequent database
+  runtime results and their repairs are recorded below.
+- Manually corrected existing formatting drift in ten source files without
+  changing behavior. `cargo fmt --check` and `git diff --check` now pass.
+- Static UBS comparison of the pool migration found no new diagnostic messages;
+  the existing baseline is not clean (52 critical and 4255 warning findings).
+- Further research: dirs 7 changes Windows `preference_dir` to roaming data;
+  this project does not call that function. The update remains queued for its
+  own test gate, alongside the remaining inventoried libraries.
+- Compatibility risk found before qualification: exact 0.4.4 omits the former
+  `c76b22ec557344bf173f61e8f63580670d99ee62` CREATE TABLE schema-normalization
+  and prepared UPDATE/DELETE parameter-numbering fixes. The older WAL repair
+  `dedf3e1be376b9b8bd90e458912aa9b226b86bf9` is retained. These are source
+  findings, not executed failures; the existing recipient timestamp invariant
+  regression and canonical ALTER TABLE test must determine whether the new
+  engine needs the narrow SQL compatibility patch carried forward.
+- First real database run completed compilation on `vmi1152480` at 16:16 UTC:
+  28 passed, one failed, six skipped; fail-fast left 3234 unrun. SQLModel 0.5
+  reads a `checksum` column missing from our migration ledger. Added an
+  idempotent ledger-column upgrade, preserved historical empty checksums,
+  recorded checksums for new migrations, and rejected drift before pending
+  SQL or the completed-ledger fast path. Added real canonical SQLite tests;
+  focused remote validation is running in `044-schema-and-bind-runtime.log`.
+- Focused rerun at 16:26 UTC passed the original checksum failure and both new
+  checksum tests. The recipient invariant reproduced the missing engine fix:
+  UPDATE returned zero affected rows instead of one. Carried the original
+  `c76b22` patch unchanged onto exact 0.4.4 as
+  `4b1ffc77cc5c2ed6745cc37955c3a7789e178a47`, published only on the candidate
+  branch `am-sql-044-candidate-20260917` for reproducible remote testing.
+  The 20 mailbox engine packages now use that immutable 0.4.4 revision; Beads'
+  older graph remains separate. No crate release or main-branch push occurred.
+  Added an application-level FrankenSQLite/canonical ALTER/reopen regression.
+  Patched validation completed at 17:13 UTC in `044-patched-sql-runtime.log`:
+  all five selected tests passed remotely (3251 skipped), remote exit 0.
+  This includes checksum preservation/drift, the original ATC failure,
+  prepared binding, and runtime CREATE/canonical ALTER/runtime reopen.
+  Broader database coverage is running in `044-patched-db-broad-corrected.log`.
+  The first broader invocation named a nonexistent search integration target;
+  it ran no tests. Corrected it to `search_v3_conformance` and retained the log.
+- The corrected broad gate completed at 17:28 UTC: **3271 passed, 7 skipped**,
+  strict RCH remote exit 0. Database library, schema migrations, stateful
+  invariants and Search V3 conformance all passed on the patched 0.4.4 graph.
+- Advanced rustls 0.23.43 to 0.23.45, the upstream fix for
+  `RUSTSEC-2026-0285`; this lock update changed only rustls. Server HTTP/JWT/
+  transport tests are running remotely in `044-rustls-transport.log`;
+  refreshed audit output is `044-audit-rustls.json`.
 
 ## September 16, 2026 — release qualification update
 

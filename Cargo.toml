@@ -34,8 +34,7 @@ fastmcp-transport = "0.10.0"
 fastmcp-protocol = "0.10.0"
 
 # br-5lgwn: the mailbox engine, SQLModel and FastMCP share Asupersync 0.5.
-# The embedded Beads library and pinned search dependency retain their older
-# private runtime graph until their separate migrations are qualified.
+# The embedded Beads library retains its older private runtime graph.
 asupersync = { version = "=0.5.0", features = ["tls-webpki-roots"] }
 fsqlite = "=0.4.4"
 fsqlite-types = "=0.4.4"
@@ -117,7 +116,8 @@ jsonwebtoken = { version = "11.0.0", default-features = false, features = ["aws_
 fs2 = "0.4"
 walkdir = "2"
 # Tantivy 0.26.1 pins lru 0.16.x, which is affected by RUSTSEC-2026-0253.
-# Use the same immutable 0.27 commit as frankensearch; it carries lru 0.18.2.
+# The direct index uses this immutable 0.27 commit with lru 0.18.2;
+# FrankenSearch still has its separate registry Tantivy dependency.
 tantivy = { git = "https://github.com/quickwit-oss/tantivy", rev = "1f32c1a8af0eb9d68bd3f5576caf20941364b657" }
 indexmap = "2"
 nix = "0.31.3"
@@ -137,13 +137,13 @@ socketpair = { version = "=0.19.8", default-features = false }
 # Pin Cargo's source itself: a sibling clone can drift even when its directory
 # is named after a release (GH325). Keep this revision aligned with dist.yml's
 # FRANKENSEARCH_COMMIT and the container/source-installer provenance record.
-# Newer FrankenSearch requires asupersync >=0.4.10 while fastmcp pins =0.4.9;
-# changing the source mechanism must not silently upgrade that runtime graph.
-frankensearch = { version = "0.4.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3bbfd8c664062f8304e7a790c51794671f9214dc", default-features = false, features = ["lexical-tantivy"] }
-frankensearch-core = { version = "0.2.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3bbfd8c664062f8304e7a790c51794671f9214dc" }
-frankensearch-embed = { version = "0.2.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3bbfd8c664062f8304e7a790c51794671f9214dc", default-features = false }
-frankensearch-index = { version = "0.2.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3bbfd8c664062f8304e7a790c51794671f9214dc" }
-frankensearch-fusion = { version = "0.2.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3bbfd8c664062f8304e7a790c51794671f9214dc" }
+# The reranker consumes the caller's Cx, so its runtime must move together
+# with SQLModel and FastMCP to Asupersync 0.5.
+frankensearch = { version = "0.6.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "dd093fb230404ab08be2ed6f27776ed6c4796485", default-features = false, features = ["lexical-tantivy"] }
+frankensearch-core = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "dd093fb230404ab08be2ed6f27776ed6c4796485" }
+frankensearch-embed = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "dd093fb230404ab08be2ed6f27776ed6c4796485", default-features = false }
+frankensearch-index = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "dd093fb230404ab08be2ed6f27776ed6c4796485" }
+frankensearch-fusion = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "dd093fb230404ab08be2ed6f27776ed6c4796485" }
 
 # Two-tier search dependencies (legacy, being replaced by frankensearch)
 half = "2"
@@ -206,7 +206,7 @@ fastmcp-client = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", re
 fastmcp-derive = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1c2e5e4b61a839ebcc430e7bacbc94d4d3205102" }
 # Beads 0.5.4 still embeds the 0.3 engine. Preserve its qualified WAL,
 # read-only snapshot, DDL, prepared binding and Windows identity fixes.
-# The mailbox itself resolves the published 0.4.4 family, not these patches.
+# The mailbox uses the separate 0.4.4 compatibility revision below.
 fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-ast = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-btree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
@@ -227,9 +227,32 @@ fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", re
 fsqlite-vdbe = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-vfs = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
+# v0.4.4 omitted c76b22's prepared-DML binding and CREATE-prefix repairs.
+# Preserve the reproduced recipient UPDATE fix on the exact release base.
+# Package aliases let Beads retain its independently versioned 0.3 family.
+fsqlite-044 = { package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-ast-044 = { package = "fsqlite-ast", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-btree-044 = { package = "fsqlite-btree", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-core-044 = { package = "fsqlite-core", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-error-044 = { package = "fsqlite-error", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-ext-fts5-044 = { package = "fsqlite-ext-fts5", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-ext-icu-044 = { package = "fsqlite-ext-icu", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-ext-json-044 = { package = "fsqlite-ext-json", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-ext-misc-044 = { package = "fsqlite-ext-misc", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-ext-rtree-044 = { package = "fsqlite-ext-rtree", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-func-044 = { package = "fsqlite-func", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-mvcc-044 = { package = "fsqlite-mvcc", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-observability-044 = { package = "fsqlite-observability", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-pager-044 = { package = "fsqlite-pager", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-parser-044 = { package = "fsqlite-parser", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-planner-044 = { package = "fsqlite-planner", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-types-044 = { package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-vdbe-044 = { package = "fsqlite-vdbe", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-vfs-044 = { package = "fsqlite-vfs", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
+fsqlite-wal-044 = { package = "fsqlite-wal", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4b1ffc77cc5c2ed6745cc37955c3a7789e178a47" }
 # The mailbox runtime uses registry Asupersync 0.5.0, SQLModel 0.5.0,
-# FrankenSQLite 0.4.4 and pinned FastMCP 0.10.0. Only Beads' older engine graph
-# uses the immutable patches above. No mutable sibling checkout is required.
+# patched FrankenSQLite 0.4.4 and pinned FastMCP 0.10.0.
+# No mutable sibling checkout is required.
 #
 # beads_rust =0.5.4 is published and resolves from crates.io. Do not patch it
 # to a mutable sibling: even an unused patch adds that checkout to remote

@@ -20,9 +20,8 @@
 #                repo does not publish yet (default: main).
 #   FRANKENSEARCH_COMMIT
 #                Immutable frankensearch revision this workspace builds
-#                against. It is NOT a floating sibling: the live frankensearch
-#                tree already moved to an asupersync the rest of the workspace
-#                cannot follow, so its default here must stay identical to
+#                against. Cargo and container builds must use the same
+#                reviewed source, so its default here must stay identical to
 #                `FRANKENSEARCH_COMMIT` in .github/workflows/dist.yml
 #                (tests/docs_drift_ci.rs pins the two together).
 #
@@ -81,7 +80,7 @@ ARG AM_REF=main
 ARG SIBLING_REF=main
 ARG SIBLING_FALLBACK_REF=main
 # Keep in lock-step with FRANKENSEARCH_COMMIT in .github/workflows/dist.yml.
-ARG FRANKENSEARCH_COMMIT=3bbfd8c664062f8304e7a790c51794671f9214dc
+ARG FRANKENSEARCH_COMMIT=dd093fb230404ab08be2ed6f27776ed6c4796485
 
 # Clone the sibling checkouts that /Cargo.toml still resolves through a `path`,
 # so they're cached separately from the project source layer.
