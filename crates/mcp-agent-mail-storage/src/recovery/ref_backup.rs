@@ -119,7 +119,9 @@ fn publish(destination: &Path, bytes: &[u8]) -> crate::Result<()> {
         return Err(invalid("recovery backup destination has no filename"));
     }
     if crate::path_existing_prefix_has_symlink(destination)? {
-        return Err(invalid("recovery backup destination has a symlinked authority"));
+        return Err(invalid(
+            "recovery backup destination has a symlinked authority",
+        ));
     }
     let parent = destination
         .parent()
@@ -149,7 +151,9 @@ fn publish(destination: &Path, bytes: &[u8]) -> crate::Result<()> {
     }
     std::fs::create_dir_all(parent)?;
     if crate::path_existing_prefix_has_symlink(destination)? {
-        return Err(invalid("recovery backup authority changed before publication"));
+        return Err(invalid(
+            "recovery backup authority changed before publication",
+        ));
     }
 
     let mut staged = tempfile::Builder::new()
@@ -172,7 +176,10 @@ fn publish(destination: &Path, bytes: &[u8]) -> crate::Result<()> {
             drop(file);
             Err(std::io::Error::new(
                 kind,
-                format!("backup publication refused; candidate retained at {}", path.display()),
+                format!(
+                    "backup publication refused; candidate retained at {}",
+                    path.display()
+                ),
             )
             .into())
         }

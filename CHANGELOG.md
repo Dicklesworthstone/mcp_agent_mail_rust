@@ -35,6 +35,9 @@ Recent releases; the earlier version history continues below.
   CREATE-prefix fixes omitted from the published release. Migration tracking
   gains SQLModel's checksum column while preserving existing records.
   Upgrade qualification is tracked in `UPGRADE_LOG.md` and `br-5lgwn`.
+- **Update rustls to 0.23.45**, addressing `RUSTSEC-2026-0285` in the
+  previous 0.23.43 dependency. Transport regression validation is tracked
+  with the dependency upgrade above.
 - **Source builds pin FrankenSearch directly to an immutable git revision.**
   Cargo no longer reads a mutable sibling checkout, so updating that checkout
   cannot break this workspace. Package versions and features are unchanged;

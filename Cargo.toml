@@ -90,7 +90,7 @@ web-time = "1.1.0"
 comrak = { version = "0.55.0", default-features = false }
 include_dir = "0.7.4"
 minijinja = "2.15.1"
-ammonia = "4.1.2"
+ammonia = "4.2.0"
 regex = "1"
 unicode-normalization = "0.1"
 same-file = "1"

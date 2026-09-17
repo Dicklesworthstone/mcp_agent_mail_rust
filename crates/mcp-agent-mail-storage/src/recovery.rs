@@ -234,9 +234,7 @@ pub fn detect_missing_refs(repo_path: &Path) -> Result<Vec<PrunableRef>, git2::E
                     "recovery_ref_target_readable"
                 );
             }
-            Err(error)
-                if error.code() == ErrorCode::NotFound && reference.target().is_some() =>
-            {
+            Err(error) if error.code() == ErrorCode::NotFound && reference.target().is_some() => {
                 let category = ref_category(&name);
                 out.push(PrunableRef {
                     ref_name: name.clone(),

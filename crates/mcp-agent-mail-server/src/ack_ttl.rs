@@ -321,11 +321,11 @@ fn escalate(
 
     // An unresolved or cross-project identity never authorizes a wildcard
     // reservation over every agent's inbox. Retry after metadata is available.
-    let recipient =
-        match block_on(async { queries::get_agent_by_id(cx, pool, row.agent_id).await }) {
-            Outcome::Ok(agent) => agent,
-            other => return Err(format!("failed to resolve escalation recipient: {other:?}")),
-        };
+    let recipient = match block_on(async { queries::get_agent_by_id(cx, pool, row.agent_id).await })
+    {
+        Outcome::Ok(agent) => agent,
+        other => return Err(format!("failed to resolve escalation recipient: {other:?}")),
+    };
     if recipient.id != Some(row.agent_id) || recipient.project_id != row.project_id {
         return Err("ACK escalation recipient does not belong to the message project".to_string());
     }
@@ -355,7 +355,11 @@ fn escalate(
             .await
         }) {
             Outcome::Ok(agent) => agent,
-            other => return Err(format!("failed to resolve custom escalation holder: {other:?}")),
+            other => {
+                return Err(format!(
+                    "failed to resolve custom escalation holder: {other:?}"
+                ));
+            }
         };
         if holder.project_id != row.project_id {
             return Err("ACK escalation holder belongs to another project".to_string());
@@ -381,7 +385,11 @@ fn escalate(
                 && reservation.reason == "ack-overdue"
                 && (reservation.exclusive != 0) == config.ack_escalation_claim_exclusive
         }),
-        other => return Err(format!("failed to check existing escalation claims: {other:?}")),
+        other => {
+            return Err(format!(
+                "failed to check existing escalation claims: {other:?}"
+            ));
+        }
     };
     if has_existing {
         return Ok(());
@@ -1153,7 +1161,19 @@ mod tests {
         for name in ["BlueBear", "OpsEscalation", "legacy_agent-1"] {
             assert!(validate_escalation_agent_name(name).is_ok(), "{name}");
         }
-        for name in ["", ".", "..", "*", "../BlueBear", "a/b", "a\\b", "a?", "a[b]", "a{b,c}", "a\n"] {
+        for name in [
+            "",
+            ".",
+            "..",
+            "*",
+            "../BlueBear",
+            "a/b",
+            "a\\b",
+            "a?",
+            "a[b]",
+            "a{b,c}",
+            "a\n",
+        ] {
             assert!(validate_escalation_agent_name(name).is_err(), "{name:?}");
         }
     }
@@ -1169,7 +1189,10 @@ mod tests {
         let mut state = HashSet::new();
 
         for _ in 0..2 {
-            assert_eq!(run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(), (1, 1));
+            assert_eq!(
+                run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(),
+                (1, 1)
+            );
         }
         assert!(state.contains(&OverdueAckKey {
             message_id: unacked.message_id,
@@ -1181,12 +1204,18 @@ mod tests {
             Outcome::Ok(rows) => rows,
             other => panic!("list claims before retry: {other:?}"),
         };
-        assert!(before.is_empty(), "failed escalation must not change holders");
+        assert!(
+            before.is_empty(),
+            "failed escalation must not change holders"
+        );
 
         config.ack_escalation_claim_holder_name.clear();
         // Keep the same warning-dedupe state: the failed row was already seen.
         for _ in 0..2 {
-            assert_eq!(run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(), (1, 1));
+            assert_eq!(
+                run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(),
+                (1, 1)
+            );
         }
         let after = match block_on(async {
             queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
@@ -1211,12 +1240,23 @@ mod tests {
         run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap();
 
         match block_on(async {
-            queries::release_reservations(&cx, &pool, unacked.project_id, unacked.agent_id, None, None).await
+            queries::release_reservations(
+                &cx,
+                &pool,
+                unacked.project_id,
+                unacked.agent_id,
+                None,
+                None,
+            )
+            .await
         }) {
             Outcome::Ok(rows) => assert_eq!(rows.len(), 1),
             other => panic!("release first claim: {other:?}"),
         }
-        assert_eq!(run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(), (1, 1));
+        assert_eq!(
+            run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(),
+            (1, 1)
+        );
         let claims = match block_on(async {
             queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
         }) {
@@ -1224,7 +1264,13 @@ mod tests {
             other => panic!("list renewed claims: {other:?}"),
         };
         assert_eq!(claims.len(), 2);
-        assert_eq!(claims.iter().filter(|claim| claim.released_ts.is_none()).count(), 1);
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|claim| claim.released_ts.is_none())
+                .count(),
+            1
+        );
 
         match block_on(async {
             queries::acknowledge_message(&cx, &pool, unacked.agent_id, unacked.message_id).await
@@ -1233,12 +1279,23 @@ mod tests {
             other => panic!("acknowledge: {other:?}"),
         }
         match block_on(async {
-            queries::release_reservations(&cx, &pool, unacked.project_id, unacked.agent_id, None, None).await
+            queries::release_reservations(
+                &cx,
+                &pool,
+                unacked.project_id,
+                unacked.agent_id,
+                None,
+                None,
+            )
+            .await
         }) {
             Outcome::Ok(rows) => assert_eq!(rows.len(), 1),
             other => panic!("release second claim: {other:?}"),
         }
-        assert_eq!(run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(), (0, 0));
+        assert_eq!(
+            run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(),
+            (0, 0)
+        );
         assert!(state.is_empty());
         let active = match block_on(async {
             queries::list_file_reservations(&cx, &pool, unacked.project_id, true).await
@@ -1246,7 +1303,10 @@ mod tests {
             Outcome::Ok(rows) => rows,
             other => panic!("list post-ACK claims: {other:?}"),
         };
-        assert!(active.is_empty(), "acknowledged messages must not reacquire claims");
+        assert!(
+            active.is_empty(),
+            "acknowledged messages must not reacquire claims"
+        );
     }
 
     #[test]

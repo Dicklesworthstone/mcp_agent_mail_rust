@@ -470,9 +470,19 @@ fn repack_refs(project_path: &Path, config: &Config) -> Result<(), String> {
         .join("packed-refs");
     let has_packed_refs = match fs::symlink_metadata(&packed_refs) {
         Ok(metadata) if metadata.is_file() => true,
-        Ok(_) => return Err(format!("packed-refs is not a regular file: {}", packed_refs.display())),
+        Ok(_) => {
+            return Err(format!(
+                "packed-refs is not a regular file: {}",
+                packed_refs.display()
+            ));
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(format!("inspect packed-refs {}: {error}", packed_refs.display())),
+        Err(error) => {
+            return Err(format!(
+                "inspect packed-refs {}: {error}",
+                packed_refs.display()
+            ));
+        }
     };
     if has_packed_refs {
         let slug = project_slug(project_path);
@@ -940,7 +950,12 @@ mod tests {
 
         assert!(project_has_errors(&report));
         assert_eq!(report.apply_result.as_ref().unwrap().pruned, 0);
-        assert!(report.actions.iter().any(|action| action.op == "backup_failed"));
+        assert!(
+            report
+                .actions
+                .iter()
+                .any(|action| action.op == "backup_failed")
+        );
         assert_eq!(fs::read(orphan).unwrap(), before);
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }

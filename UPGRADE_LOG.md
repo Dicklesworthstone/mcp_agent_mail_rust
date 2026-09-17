@@ -85,6 +85,65 @@ statements below; v0.3.36 is published and this work targets unreleased main.
   `RUSTSEC-2026-0285`; this lock update changed only rustls. Server HTTP/JWT/
   transport tests are running remotely in `044-rustls-transport.log`;
   refreshed audit output is `044-audit-rustls.json`.
+- The refreshed audit exits 0 with zero vulnerabilities; existing `paste`
+  unmaintained and `lru` unsound warnings remain, without suppression.
+- Concurrent commits `944ffa74`, `bc7b0103` and `4694074d` captured the
+  candidate source and dependency edits while validation continued. They
+  do not imply completed transport or full-workspace qualification.
+- Beads 0.6.0 research confirms its Asupersync 0.4.10 pin and separate
+  FrankenSQLite 0.3.18 graph. This application's five call sites use only
+  configuration directory discovery/redirect APIs. The optional FastMCP
+  dependency and dev-only TOML pin are not enabled by this consumer;
+  resolution and focused tests remain pending.
+- The older all-target workspace check passed remotely on hz3 at 17:36 UTC,
+  exit 0 (`044-check-hz3-refreshed.log`). It predates the checksum/engine
+  repairs and rustls update, so a current-source check is running separately
+  in `044-check-patched-current.log`.
+- That current-source attempt stalled in source transfer before Cargo started.
+  Retry is `044-check-patched-retry.log`; no local fallback was used.
+- The retry passed at 18:29 UTC: current-source workspace/all-target check,
+  strict RCH remote exit 0. Strict workspace/all-target Clippy is running
+  separately in `044-clippy-patched.log`.
+- Initial Clippy admission reported a missing runtime without executing.
+  Native rustup confirmed the installed Clippy component; refreshed RCH's
+  live capability cache and retried as `044-clippy-refreshed.log`.
+- The refreshed and explicitly pinned attempts still refused. Diagnostic
+  `044-clippy-diagnose.json` reports a missing component despite the live
+  inventory containing it. The same diagnostic admits ovh-a, so Clippy is
+  now submitted there as `044-clippy-ovh.log`; no admission override used.
+- Rustls transport gate completed 18:51 UTC: **149 passed**, 4572 skipped,
+  strict RCH remote exit 0. Its snapshot predates concurrent merge
+  `29d6edc5` (17:32 UTC); the successful 18:29 compiler check and active
+  Clippy include that merge. The next server gate repeats transport coverage
+  on merged source alongside the sanitizer update.
+- Ammonia 4.1.4 → 4.2.0: reviewed upstream release changes (HTML5ever 0.40,
+  CSS parser 0.38, MSRV 1.85, additive introspection APIs). Updated the
+  manifest floor and resolved lockfile; Markdown/XSS and transport tests
+  will qualify this dependency before the next update.
+- Ammonia's warmed worker refused an unrelated skillranker scratchpad alias
+  during hard preflight; a live probe confirmed the issue. Left foreign
+  state untouched and moved to hz3. Cancelled the first hz3 job during
+  source sync after noticing its missing isolation runner; created a new
+  private runner and resubmitted as `044-ammonia-isolated.log`.
+- hz3 then reported missing cargo-nextest before any tests. Provisioned the
+  same nextest 0.9.143 executable used by the passing remote gate into the
+  private tool directory; source/copy SHA-256 both
+  `d97959a56feb7a1297576c1b47d9aaf7b5badd6be596e695ed203fa4490884ea`.
+  Its version command succeeds. Retried as `044-ammonia-provisioned.log`.
+- Strict workspace/all-target Clippy completed on ovh-a at 18:57 UTC,
+  remote exit 0 with `-D warnings` (`044-clippy-ovh.log`). This includes
+  merged source `29d6edc5` and rustls 0.23.45, but predates Ammonia 4.2.0.
+- Rustix remains 1.1.4: the preserved FastMCP revision's workspace manifest
+  requires `=1.1.4`, preventing selection of the semver-compatible 1.1.5.
+  Do not alter the qualified upstream git revision merely to loosen its pin.
+- A fresh formatting check found layout drift in six files introduced by
+  merge `29d6edc5`. Corrected the layout manually, preserving behavior;
+  workspace `cargo fmt --check` and `git diff --check` pass at 19:07 UTC.
+  These formatting edits postdate the active Ammonia snapshot and will be
+  included in subsequent final checks.
+- Audit of the Ammonia candidate lockfile exits 0 with zero vulnerabilities
+  (`044-audit-ammonia.json`); the same existing `paste` unmaintained and
+  `lru` unsound warnings remain. This does not substitute for runtime tests.
 
 ## September 16, 2026 — release qualification update
 

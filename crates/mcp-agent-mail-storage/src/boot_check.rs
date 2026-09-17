@@ -598,8 +598,12 @@ fn write_ref_backup(
         .join("refs")
         .join(safe_backup_project_name(&candidate.project))
         .join(format!("{ts}.txt"));
-    ref_backup::write_snapshot(&candidate.path, &backup_path, refs)
-        .map_err(|error| format!("write complete ref backup {}: {error}", backup_path.display()))?;
+    ref_backup::write_snapshot(&candidate.path, &backup_path, refs).map_err(|error| {
+        format!(
+            "write complete ref backup {}: {error}",
+            backup_path.display()
+        )
+    })?;
     Ok(backup_path)
 }
 
@@ -612,9 +616,19 @@ fn repack_refs(root: &Path, candidate: &ArchiveRepoCandidate) -> Result<(), Stri
         .join("packed-refs");
     let has_packed_refs = match fs::symlink_metadata(&packed_refs) {
         Ok(metadata) if metadata.is_file() => true,
-        Ok(_) => return Err(format!("packed-refs is not a regular file: {}", packed_refs.display())),
+        Ok(_) => {
+            return Err(format!(
+                "packed-refs is not a regular file: {}",
+                packed_refs.display()
+            ));
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(format!("inspect packed-refs {}: {error}", packed_refs.display())),
+        Err(error) => {
+            return Err(format!(
+                "inspect packed-refs {}: {error}",
+                packed_refs.display()
+            ));
+        }
     };
     if has_packed_refs {
         let ts = SystemTime::now()
@@ -887,12 +901,14 @@ mod tests {
 
         let backups = backup_files(tmp.path(), ARCHIVE_ROOT_LABEL);
         assert!(
-            backups.iter().any(|path| std::fs::read_to_string(path).is_ok_and(|text| {
-                text.contains("orphan  refs/stash")
-                    && text.contains("symref  HEAD  refs/heads/")
-                    && text.contains(&format!("ref  refs/stash  {fake}\n"))
-                    && text.ends_with("# END agent-mail ref backup\n")
-            })),
+            backups
+                .iter()
+                .any(|path| std::fs::read_to_string(path).is_ok_and(|text| {
+                    text.contains("orphan  refs/stash")
+                        && text.contains("symref  HEAD  refs/heads/")
+                        && text.contains(&format!("ref  refs/stash  {fake}\n"))
+                        && text.ends_with("# END agent-mail ref backup\n")
+                })),
             "expected complete pre-repair ref backup in {backups:?}"
         );
     }
@@ -1118,7 +1134,11 @@ mod tests {
         fs::write(&object, b"not a zlib object").unwrap();
         let before = fs::read(repo.path().join("refs/stash")).unwrap();
 
-        for mode in [BootCheckMode::Warn, BootCheckMode::Abort, BootCheckMode::AutoRepair] {
+        for mode in [
+            BootCheckMode::Warn,
+            BootCheckMode::Abort,
+            BootCheckMode::AutoRepair,
+        ] {
             let report = preflight_archive_integrity(tmp.path(), mode);
             assert!(report.has_findings());
             assert_eq!(report.findings[0].kind, BootCheckFindingKind::RepoBroken);

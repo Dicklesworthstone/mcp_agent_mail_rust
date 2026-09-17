@@ -685,7 +685,11 @@ mod tests {
                 let held_before_drop = current_thread_holds_promotion_barrier();
                 drop(guard);
                 done_tx
-                    .send((outcome, held_before_drop, current_thread_holds_promotion_barrier()))
+                    .send((
+                        outcome,
+                        held_before_drop,
+                        current_thread_holds_promotion_barrier(),
+                    ))
                     .unwrap();
             });
             let observed = done_rx.recv_timeout(Duration::from_secs(2));
@@ -694,10 +698,19 @@ mod tests {
             // can join its worker instead of leaving an orphan blocked forever.
             drop(owner);
             queued.join().expect("queued recovery");
-            let (outcome, held_before_drop, held_after_drop) = observed.expect("bounded queue wait");
-            assert_eq!(outcome, DrainOutcome::TimedOut { remaining_writers: 0 });
+            let (outcome, held_before_drop, held_after_drop) =
+                observed.expect("bounded queue wait");
+            assert_eq!(
+                outcome,
+                DrainOutcome::TimedOut {
+                    remaining_writers: 0
+                }
+            );
             assert!(!held_before_drop && !held_after_drop);
-            assert!(owner_still_active, "a timed-out waiter released the owner's barrier");
+            assert!(
+                owner_still_active,
+                "a timed-out waiter released the owner's barrier"
+            );
         }
     }
 
@@ -721,7 +734,12 @@ mod tests {
         let _ = release_tx.send(());
         let owner_released = owner.join().expect("foreign owner");
         assert!(owner_released.is_ok());
-        assert_eq!(outcome, DrainOutcome::TimedOut { remaining_writers: 0 });
+        assert_eq!(
+            outcome,
+            DrainOutcome::TimedOut {
+                remaining_writers: 0
+            }
+        );
         assert!(!falsely_owned);
 
         let fresh = try_acquire_promotion_barrier_if_idle().expect("fresh owner");
@@ -745,7 +763,9 @@ mod tests {
         let queued = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
             let (guard, outcome) = acquire_promotion_barrier_draining(Duration::from_secs(5));
-            acquired_tx.send((outcome, current_thread_holds_promotion_barrier())).unwrap();
+            acquired_tx
+                .send((outcome, current_thread_holds_promotion_barrier()))
+                .unwrap();
             let released = release_rx.recv_timeout(Duration::from_secs(5));
             drop(guard);
             released
@@ -756,8 +776,14 @@ mod tests {
         let acquired = acquired_rx.recv_timeout(Duration::from_secs(2));
         let held_by_successor = barrier().state.lock().unwrap().promotion_active;
         let _ = release_tx.send(());
-        queued.join().expect("queued recovery").expect("release successor");
-        assert_eq!(before_release, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        queued
+            .join()
+            .expect("queued recovery")
+            .expect("release successor");
+        assert_eq!(
+            before_release,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
         assert_eq!(acquired.unwrap(), (DrainOutcome::Idle, true));
         assert!(held_by_successor);
         assert!(!barrier().state.lock().unwrap().promotion_active);
@@ -775,7 +801,12 @@ mod tests {
 
         let writer = begin_write_activity();
         let (timed_out, outcome) = acquire_promotion_barrier_draining(Duration::ZERO);
-        assert_eq!(outcome, DrainOutcome::TimedOut { remaining_writers: 1 });
+        assert_eq!(
+            outcome,
+            DrainOutcome::TimedOut {
+                remaining_writers: 1
+            }
+        );
         assert!(current_thread_holds_promotion_barrier());
         assert!(barrier().state.lock().unwrap().promotion_active);
         drop(timed_out);
@@ -797,9 +828,10 @@ mod tests {
         drop(second);
         assert!(current_thread_holds_promotion_barrier());
         assert!(barrier().state.lock().unwrap().promotion_active);
-        let foreign_denied = std::thread::spawn(|| try_acquire_promotion_barrier_if_idle().is_none())
-            .join()
-            .expect("foreign acquisition");
+        let foreign_denied =
+            std::thread::spawn(|| try_acquire_promotion_barrier_if_idle().is_none())
+                .join()
+                .expect("foreign acquisition");
         assert!(foreign_denied, "a live nested lease lost exclusion");
         drop(third);
         assert!(!current_thread_holds_promotion_barrier());
@@ -822,7 +854,9 @@ mod tests {
         assert!(!current_thread_holds_promotion_barrier());
         assert!(!barrier().state.lock().unwrap().promotion_active);
         assert!(try_acquire_promotion_barrier_if_idle().is_none());
-        std::thread::spawn(move || drop(writer)).join().expect("migrated writer");
+        std::thread::spawn(move || drop(writer))
+            .join()
+            .expect("migrated writer");
         assert_eq!(active_writer_count(), 0);
         assert!(try_acquire_promotion_barrier_if_idle().is_some());
     }
