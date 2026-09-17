@@ -56,19 +56,23 @@ pub struct ReconcileReport {
     pub budget_exhausted: bool,
 }
 
-/// Default-on non-destructive message repair, independently switchable from
-/// opt-in destructive message retention. Invalid overrides fail disabled.
+/// Default-on non-destructive repair for file-backed mailboxes, independently
+/// switchable from destructive retention. Invalid overrides fail disabled.
 #[must_use]
-pub fn enabled() -> bool {
-    parse_enabled(
-        mcp_agent_mail_core::config::process_env_value("AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED")
-            .as_deref(),
-    )
+pub fn enabled(config: &Config) -> bool {
+    mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url).is_some()
+        && parse_enabled(
+            mcp_agent_mail_core::config::process_env_value("AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED")
+                .as_deref(),
+        )
 }
 
 fn parse_enabled(raw: Option<&str>) -> bool {
     raw.is_none_or(|raw| {
-        matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
     })
 }
 
@@ -87,6 +91,22 @@ fn source_error(error: impl std::fmt::Display) -> String {
     format!("message reconciliation source query failed: {error}")
 }
 
+fn validate_pool_binding(pool: &DbPool, config: &Config) -> Result<(), String> {
+    let selected = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url)
+        .ok_or_else(|| "message reconciliation requires a file-backed source".to_string())?;
+    let selected = std::fs::canonicalize(selected).map_err(|error| error.to_string())?;
+    let source = std::fs::canonicalize(pool.sqlite_path()).map_err(|error| error.to_string())?;
+    if source != selected {
+        return Err("message reconciliation pool is not the configured live database".to_string());
+    }
+    let pool_root = std::fs::canonicalize(pool.storage_root()).map_err(|error| error.to_string())?;
+    let configured_root = std::fs::canonicalize(&config.storage_root).map_err(|error| error.to_string())?;
+    if pool_root != configured_root {
+        return Err("message reconciliation pool and archive roots do not match".to_string());
+    }
+    Ok(())
+}
+
 fn select_ids(
     cx: &Cx,
     pool: &DbPool,
@@ -95,13 +115,27 @@ fn select_ids(
 ) -> Result<Vec<(i64, bool)>, String> {
     let identity = pool.sqlite_identity_key();
     if identity != cursor.source_identity {
-        *cursor = ReconcileCursor { source_identity: identity, ..Default::default() };
+        *cursor = ReconcileCursor {
+            source_identity: identity,
+            ..Default::default()
+        };
     }
     let conn = outcome(block_on(pool.acquire(cx)))?;
-    let rows = conn.query_sync("SELECT COALESCE(MAX(id), 0) AS max_id FROM messages", &[])
+    let mode = conn.query_sync("PRAGMA query_only", &[]).map_err(source_error)?;
+    let query_only = mode.first()
+        .ok_or_else(|| "source query-only mode was not reported".to_string())?
+        .get_as::<i64>(0).map_err(source_error)?;
+    if query_only != 0 {
+        return Err("query-only snapshots cannot authorize message archive repair".to_string());
+    }
+    let rows = conn
+        .query_sync("SELECT COALESCE(MAX(id), 0) AS max_id FROM messages", &[])
         .map_err(source_error)?;
-    let max_id = rows.first().ok_or_else(|| "message ID aggregate returned no row".to_string())?
-        .get_named::<i64>("max_id").map_err(source_error)?;
+    let max_id = rows
+        .first()
+        .ok_or_else(|| "message ID aggregate returned no row".to_string())?
+        .get_named::<i64>("max_id")
+        .map_err(source_error)?;
     if cursor.tail_after.is_some_and(|after| after > max_id) {
         cursor.tail_after = None;
         cursor.backfill_ceiling = None;
@@ -116,21 +150,29 @@ fn select_ids(
             "SELECT id FROM messages WHERE created_ts <= ? ORDER BY id DESC LIMIT ?",
             &[cutoff.into(), IDS_PER_LANE.into()],
         )
-    }.map_err(source_error)?.into_iter().map(|row| {
-        row.get_named::<i64>("id").map_err(source_error)
-    }).collect::<Result<Vec<_>, _>>()?;
-    // Advance the tail in ascending ID order even on its initial recent slice.
+    }
+    .map_err(source_error)?
+    .into_iter()
+    .map(|row| row.get_named::<i64>("id").map_err(source_error))
+    .collect::<Result<Vec<_>, _>>()?;
     tail.sort_unstable();
-    let history = conn.query_sync(
-        "SELECT id FROM messages WHERE id > 0 AND id <= ? AND created_ts <= ? ORDER BY id DESC LIMIT ?",
-        &[cursor.backfill_ceiling.unwrap_or(max_id).into(), cutoff.into(), IDS_PER_LANE.into()],
-    ).map_err(source_error)?.into_iter().map(|row| {
-        row.get_named::<i64>("id").map_err(source_error)
-    }).collect::<Result<Vec<_>, _>>()?;
+    let history = conn
+        .query_sync(
+            "SELECT id FROM messages WHERE id > 0 AND id <= ? AND created_ts <= ? ORDER BY id DESC LIMIT ?",
+            &[
+                cursor.backfill_ceiling.unwrap_or(max_id).into(),
+                cutoff.into(),
+                IDS_PER_LANE.into(),
+            ],
+        )
+        .map_err(source_error)?
+        .into_iter()
+        .map(|row| row.get_named::<i64>("id").map_err(source_error))
+        .collect::<Result<Vec<_>, _>>()?;
     if history.is_empty() {
         cursor.backfill_ceiling = None;
     }
-    // Interleave the lanes so a per-pass repair/byte budget cannot starve one.
+    // Interleave so a per-pass repair/byte budget cannot starve either lane.
     let mut selected = Vec::with_capacity(tail.len() + history.len());
     for index in 0..tail.len().max(history.len()) {
         if let Some(id) = tail.get(index) {
@@ -152,25 +194,27 @@ struct PreparedMessage {
     payload_bytes: usize,
 }
 
-/// One joined SELECT binds message, project and sender to the same observation.
-/// The size predicate runs before the application materializes any payload.
+/// One joined SELECT binds message, project and sender to one observation.
+/// The size predicate bounds the payload returned to this application.
 fn prepare_message(cx: &Cx, pool: &DbPool, id: i64) -> Result<PreparedMessage, String> {
     let conn = outcome(block_on(pool.acquire(cx)))?;
-    let rows = conn.query_sync(
-        "SELECT m.id, m.subject, m.body_md, m.thread_id, m.topic, m.importance, \
-         m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
-         p.slug AS project_slug, p.human_key AS project_key, a.name AS sender \
-         FROM messages m JOIN projects p ON p.id = m.project_id \
-         JOIN agents a ON a.id = m.sender_id AND a.project_id = m.project_id \
-         WHERE m.id = ? AND \
-         length(CAST(m.body_md AS BLOB)) + length(CAST(m.subject AS BLOB)) + \
-         length(CAST(m.recipients_json AS BLOB)) + length(CAST(m.attachments AS BLOB)) + \
-         length(CAST(m.importance AS BLOB)) + length(CAST(p.slug AS BLOB)) + \
-         length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
-         COALESCE(length(CAST(m.thread_id AS BLOB)), 0) + \
-         COALESCE(length(CAST(m.topic AS BLOB)), 0) <= ?",
-        &[id.into(), MAX_DB_PAYLOAD_BYTES.into()],
-    ).map_err(source_error)?;
+    let rows = conn
+        .query_sync(
+            "SELECT m.id, m.subject, m.body_md, m.thread_id, m.topic, m.importance, \
+             m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
+             p.slug AS project_slug, p.human_key AS project_key, a.name AS sender \
+             FROM messages m JOIN projects p ON p.id = m.project_id \
+             JOIN agents a ON a.id = m.sender_id AND a.project_id = m.project_id \
+             WHERE m.id = ? AND \
+             length(CAST(m.body_md AS BLOB)) + length(CAST(m.subject AS BLOB)) + \
+             length(CAST(m.recipients_json AS BLOB)) + length(CAST(m.attachments AS BLOB)) + \
+             length(CAST(m.importance AS BLOB)) + length(CAST(p.slug AS BLOB)) + \
+             length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
+             COALESCE(length(CAST(m.thread_id AS BLOB)), 0) + \
+             COALESCE(length(CAST(m.topic AS BLOB)), 0) <= ?",
+            &[id.into(), MAX_DB_PAYLOAD_BYTES.into()],
+        )
+        .map_err(source_error)?;
     if rows.len() != 1 {
         return Err("message missing, oversized, or lacking an unambiguous project/sender".to_string());
     }
@@ -196,7 +240,9 @@ fn prepare_message(cx: &Cx, pool: &DbPool, id: i64) -> Result<PreparedMessage, S
     }
     let mut recipients = Vec::new();
     for kind in ["to", "cc", "bcc"] {
-        for name in routing.get(kind).and_then(Value::as_array)
+        for name in routing
+            .get(kind)
+            .and_then(Value::as_array)
             .ok_or_else(|| format!("message recipient metadata lacks {kind} array"))?
         {
             let name = name.as_str().ok_or_else(|| "non-string message recipient".to_string())?;
@@ -229,7 +275,9 @@ fn prepare_message(cx: &Cx, pool: &DbPool, id: i64) -> Result<PreparedMessage, S
         "attachments": attachments,
     });
     let payload_bytes = body.len().saturating_add(message.to_string().len());
-    Ok(PreparedMessage { message, body, sender, project_slug, recipients, payload_bytes })
+    Ok(PreparedMessage {
+        message, body, sender, project_slug, recipients, payload_bytes,
+    })
 }
 
 fn validate_surviving_message(
@@ -240,7 +288,9 @@ fn validate_surviving_message(
     if body != expected.body {
         return Err("surviving archive body conflicts with the live message; preserved".to_string());
     }
-    for key in ["id", "from", "subject", "project", "project_slug", "importance", "ack_required", "attachments"] {
+    for key in [
+        "id", "from", "subject", "project", "project_slug", "importance", "ack_required", "attachments",
+    ] {
         if observed.get(key) != expected.message.get(key) {
             return Err(format!("surviving archive {key} conflicts with live message; preserved"));
         }
@@ -277,10 +327,7 @@ fn validate_surviving_message(
     Ok(())
 }
 
-fn reconcile_prepared(
-    config: &Config,
-    prepared: &PreparedMessage,
-) -> Result<ReconcileResult, String> {
+fn reconcile_prepared(config: &Config, prepared: &PreparedMessage) -> Result<ReconcileResult, String> {
     let archive = crate::ensure_archive(config, &prepared.project_slug).map_err(|error| error.to_string())?;
     let paths = crate::message_paths_for_bundle(
         &archive, &prepared.message, &prepared.sender, &prepared.recipients,
@@ -317,13 +364,17 @@ fn reconcile_prepared(
             return Err("threaded message has no surviving authoritative bundle; reply metadata cannot be inferred".to_string());
         }
     };
-    reconcile_message_bundle(&archive, config, MessageBundleBatchEntry {
-        message: &message,
-        body_md: &prepared.body,
-        sender: &prepared.sender,
-        recipients: &prepared.recipients,
-        extra_paths: &[],
-    }).map_err(|error| error.to_string())
+    reconcile_message_bundle(
+        &archive,
+        config,
+        MessageBundleBatchEntry {
+            message: &message,
+            body_md: &prepared.body,
+            sender: &prepared.sender,
+            recipients: &prepared.recipients,
+            extra_paths: &[],
+        },
+    ).map_err(|error| error.to_string())
 }
 
 fn read_committed_message(
@@ -366,15 +417,15 @@ fn read_committed_message(
 ///
 /// Recent catch-up and rotating history each select at most 16 IDs. At most
 /// four repairs and 16 MiB of projected payload are handled per pass. These
-/// are work/memory bounds, not a hard deadline on filesystem or libgit2 calls.
-/// Normal archive writes receive a 30-second grace window. No row, receipt,
-/// delivery, notification or thread digest is mutated. A failed message is
-/// reported and revisited by backfill, not retried in a tight loop.
+/// are application work/memory bounds, not deadlines on SQL, filesystem or
+/// libgit2 calls. Normal archive writes receive a 30-second grace window.
+/// No row, receipt, delivery, notification or thread digest is mutated. Failed
+/// messages are reported and revisited by backfill, not retried in a tight loop.
 ///
 /// # Errors
 ///
-/// Refuses source acquisition/query errors or an open corruption breaker.
-/// Individual ambiguous/conflicting/oversized artifacts count as deferred.
+/// Refuses mismatched/readonly sources, source acquisition/query errors, or an
+/// open corruption breaker. Ambiguous/conflicting/oversized artifacts defer.
 pub fn reconcile_message_batch(
     cx: &Cx,
     pool: &DbPool,
@@ -390,13 +441,7 @@ pub fn reconcile_message_batch(
     if corruption_circuit_breaker().is_tripped() {
         return Err("message reconciliation refused: source corruption breaker is open".to_string());
     }
-    // A published query-only snapshot must never become repair authority for
-    // another live mailbox. Bind the caller's root to the pool's frozen root.
-    let pool_root = std::fs::canonicalize(pool.storage_root()).map_err(|error| error.to_string())?;
-    let configured_root = std::fs::canonicalize(&config.storage_root).map_err(|error| error.to_string())?;
-    if pool_root != configured_root {
-        return Err("message reconciliation pool and archive roots do not match".to_string());
-    }
+    validate_pool_binding(pool, config)?;
     let cutoff = mcp_agent_mail_db::now_micros().saturating_sub(NORMAL_ARCHIVE_GRACE_US);
     let selected = select_ids(cx, pool, cursor, cutoff)?;
     let mut seen = HashSet::new();
@@ -417,7 +462,7 @@ pub fn reconcile_message_batch(
             continue;
         }
         // Freeze recovery promotion through source observation and archive
-        // publication. Drop each SQL connection before any filesystem/Git work.
+        // publication. Drop each SQL connection before filesystem/Git work.
         let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
         let result = match prepare_message(cx, pool, id) {
             Ok(prepared) => {
@@ -466,15 +511,23 @@ mod tests {
             "thread_id": "thread", "topic": null, "project": "/project", "project_slug": "project",
             "importance": "normal", "ack_required": false, "attachments": [],
         });
-        PreparedMessage { message, body: "body\n".into(), sender: "BlueLake".into(), project_slug: "project".into(),
-            recipients: vec!["GreenStone".into(), "RedFox".into()], payload_bytes: 512 }
+        PreparedMessage {
+            message, body: "body\n".into(), sender: "BlueLake".into(), project_slug: "project".into(),
+            recipients: vec!["GreenStone".into(), "RedFox".into()], payload_bytes: 512,
+        }
     }
 
     #[test]
     fn enable_override_is_explicit_and_invalid_values_fail_disabled() {
         assert!(parse_enabled(None));
-        for raw in ["true", " 1 ", "YES", "on"] { assert!(parse_enabled(Some(raw))); }
-        for raw in ["false", "0", "off", "no", "", "typo"] { assert!(!parse_enabled(Some(raw))); }
+        for raw in ["true", " 1 ", "YES", "on"] {
+            assert!(parse_enabled(Some(raw)));
+        }
+        for raw in ["false", "0", "off", "no", "", "typo"] {
+            assert!(!parse_enabled(Some(raw)));
+        }
+        let config = Config { database_url: "sqlite:///:memory:".into(), ..Config::default() };
+        assert!(!enabled(&config), "ephemeral mailboxes do not start archive maintenance");
     }
 
     #[test]
@@ -484,8 +537,10 @@ mod tests {
         message["reply_to"] = json!(7);
         message["future_metadata"] = json!({"opaque": true});
         validate_surviving_message(&original, &message, &original.body).unwrap();
-        for (key, value) in [("id", json!(10)), ("from", json!("RedFox")), ("to", json!(["RedFox"])),
-            ("bcc", json!([])), ("project", json!("/other")), ("reply_to", json!(9)), ("created", json!("invalid"))] {
+        for (key, value) in [
+            ("id", json!(10)), ("from", json!("RedFox")), ("to", json!(["RedFox"])),
+            ("bcc", json!([])), ("project", json!("/other")), ("reply_to", json!(9)), ("created", json!("invalid")),
+        ] {
             let mut changed = message.clone();
             changed[key] = value;
             assert!(validate_surviving_message(&original, &changed, &original.body).is_err(), "{key}");
@@ -502,7 +557,9 @@ mod tests {
         let error = reconcile_prepared(&config, &original).unwrap_err();
         assert!(error.contains("reply metadata cannot be inferred"));
         let archive = crate::ensure_archive(&config, "project").unwrap();
-        let paths = crate::message_paths_for_bundle(&archive, &original.message, &original.sender, &original.recipients).unwrap().0;
+        let paths = crate::message_paths_for_bundle(
+            &archive, &original.message, &original.sender, &original.recipients,
+        ).unwrap().0;
         assert!(!paths.canonical.exists());
     }
 
@@ -512,10 +569,11 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let db_path = temp.path().join("mail.sqlite3");
             let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&db_path);
-            let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig {
+            let pool_config = mcp_agent_mail_db::DbPoolConfig {
                 database_url: database_url.clone(), min_connections: 1, max_connections: 1,
                 ..Default::default()
-            }).unwrap();
+            };
+            let pool = mcp_agent_mail_db::create_pool(&pool_config).unwrap();
             let cx = Cx::for_testing();
             let conn = outcome(block_on(pool.acquire(&cx))).unwrap();
             conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(101, 'project', '/project', 1)").unwrap();
@@ -529,8 +587,12 @@ mod tests {
             assert_eq!(before[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
             drop(conn);
             let config = Config { storage_root: pool.storage_root().to_path_buf(), database_url, ..Config::default() };
-            let mut cursor = ReconcileCursor::default();
             let stop = AtomicBool::new(false);
+            let readonly = DbPool::new_query_only(&pool_config).unwrap();
+            let rejected = reconcile_message_batch(&cx, &readonly, &config, &mut ReconcileCursor::default(), &stop).unwrap_err();
+            assert!(rejected.contains("query-only snapshots"), "{rejected}");
+            drop(readonly);
+            let mut cursor = ReconcileCursor::default();
             let report = reconcile_message_batch(&cx, &pool, &config, &mut cursor, &stop).unwrap();
             assert_eq!(report.scanned, 1);
             assert_eq!(report.repaired, 1);
@@ -545,6 +607,17 @@ mod tests {
             assert_eq!(after[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
             let rows = conn.query_sync("SELECT body_md FROM messages WHERE id = 901", &[]).unwrap();
             assert_eq!(rows[0].get_named::<String>("body_md").unwrap(), "body");
+            drop(conn);
+            stop.store(true, Ordering::Release);
+            let stopped = reconcile_message_batch(&cx, &pool, &config, &mut cursor, &stop).unwrap();
+            assert!(stopped.interrupted);
+            assert_eq!(stopped.scanned, 0);
+            let other = temp.path().join("not-the-live-db.sqlite3");
+            std::fs::write(&other, b"preserve other database bytes").unwrap();
+            let mut mismatched = config.clone();
+            mismatched.database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&other);
+            assert!(validate_pool_binding(&pool, &mismatched).unwrap_err().contains("not the configured live database"));
+            assert_eq!(std::fs::read(&other).unwrap(), b"preserve other database bytes");
         });
     }
 }
