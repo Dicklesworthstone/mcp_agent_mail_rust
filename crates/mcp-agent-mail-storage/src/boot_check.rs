@@ -20,7 +20,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::recovery::{
-    PrunableRef, PruneRefOutcome, RefCategory, detect_missing_refs, prune_missing_ref,
+    PrunableRef, PruneRefOutcome, RefCategory, detect_missing_refs, prune_missing_ref, ref_backup,
 };
 
 const TARGET: &str = "mcp_agent_mail::boot_check";
@@ -593,57 +593,39 @@ fn write_ref_backup(
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_micros());
-    let backup_dir = root
+    let backup_path = root
         .join("backups")
         .join("refs")
-        .join(safe_backup_project_name(&candidate.project));
-    fs::create_dir_all(&backup_dir)
-        .map_err(|error| format!("create backup dir {}: {error}", backup_dir.display()))?;
-    let backup_path = backup_dir.join(format!("{ts}.txt"));
-    let mut text = String::new();
-    text.push_str(&format!("# boot-check auto-repair backup {ts}\n"));
-    text.push_str(&format!("# project: {}\n", candidate.project));
-    text.push_str(&format!("# repo: {}\n", candidate.path.display()));
-    text.push_str("# format: <status> <ref_name> <target_sha> <category> <reason>\n");
-    if let Ok(repo) = Repository::open(&candidate.path) {
-        text.push_str("#\n# ALL refs at backup time:\n");
-        if let Ok(references) = repo.references() {
-            for reference in references.flatten() {
-                if let (Ok(name), Some(target)) = (reference.name(), reference.target()) {
-                    text.push_str(&format!("ref  {name}  {target}\n"));
-                }
-            }
-        }
-        text.push_str("#\n");
-    }
-    text.push_str("# ORPHAN findings:\n");
-    for finding in refs {
-        text.push_str(&format!(
-            "orphan  {}  {}  {:?}  {}\n",
-            finding.ref_name, finding.target_sha, finding.category, finding.reason,
-        ));
-    }
-    fs::write(&backup_path, text.as_bytes())
-        .map_err(|error| format!("write backup {}: {error}", backup_path.display()))?;
+        .join(safe_backup_project_name(&candidate.project))
+        .join(format!("{ts}.txt"));
+    ref_backup::write_snapshot(&candidate.path, &backup_path, refs)
+        .map_err(|error| format!("write complete ref backup {}: {error}", backup_path.display()))?;
     Ok(backup_path)
 }
 
 fn repack_refs(root: &Path, candidate: &ArchiveRepoCandidate) -> Result<(), String> {
-    let admin_dir = mcp_agent_mail_core::git_lock::admin_dir_for(&candidate.path)
-        .ok_or_else(|| format!("resolve git admin dir for {}", candidate.path.display()))?;
-    let packed_refs = admin_dir.join("packed-refs");
-    if packed_refs.is_file() {
+    // Linked worktrees share packed-refs in the common Git directory, not in
+    // their individual worktree admin directories.
+    let packed_refs = Repository::open(&candidate.path)
+        .map_err(|error| format!("open repository for packed-refs backup: {error}"))?
+        .commondir()
+        .join("packed-refs");
+    let has_packed_refs = match fs::symlink_metadata(&packed_refs) {
+        Ok(metadata) if metadata.is_file() => true,
+        Ok(_) => return Err(format!("packed-refs is not a regular file: {}", packed_refs.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(format!("inspect packed-refs {}: {error}", packed_refs.display())),
+    };
+    if has_packed_refs {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_micros());
-        let backup_dir = root
+        let backup_path = root
             .join("backups")
             .join("refs")
-            .join(safe_backup_project_name(&candidate.project));
-        fs::create_dir_all(&backup_dir)
-            .map_err(|error| format!("create packed-refs backup dir: {error}"))?;
-        let backup_path = backup_dir.join(format!("{ts}-packed-refs.txt"));
-        fs::copy(&packed_refs, &backup_path).map_err(|error| {
+            .join(safe_backup_project_name(&candidate.project))
+            .join(format!("{ts}-packed-refs.txt"));
+        ref_backup::copy_file(&packed_refs, &backup_path).map_err(|error| {
             format!(
                 "copy packed-refs backup {} -> {}: {error}",
                 packed_refs.display(),
@@ -905,9 +887,13 @@ mod tests {
 
         let backups = backup_files(tmp.path(), ARCHIVE_ROOT_LABEL);
         assert!(
-            backups.iter().any(|path| std::fs::read_to_string(path)
-                .is_ok_and(|text| text.contains("orphan  refs/stash"))),
-            "expected refs/stash backup in {backups:?}"
+            backups.iter().any(|path| std::fs::read_to_string(path).is_ok_and(|text| {
+                text.contains("orphan  refs/stash")
+                    && text.contains("symref  HEAD  refs/heads/")
+                    && text.contains(&format!("ref  refs/stash  {fake}\n"))
+                    && text.ends_with("# END agent-mail ref backup\n")
+            })),
+            "expected complete pre-repair ref backup in {backups:?}"
         );
     }
 
@@ -1119,5 +1105,58 @@ mod tests {
         assert!(auto_repair_missing_refs(tmp.path(), &candidate, &refs).is_err());
 
         assert_eq!(fs::read(repo.path().join("refs/stash")).unwrap(), before);
+    }
+
+    #[test]
+    fn preflight_corrupt_object_is_never_healthy_or_auto_pruned() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, _, refs) = stale_stash_fixture(&tmp);
+        let oid = &refs[0].target_sha;
+        let directory = repo.path().join("objects").join(&oid[..2]);
+        fs::create_dir_all(&directory).unwrap();
+        let object = directory.join(&oid[2..]);
+        fs::write(&object, b"not a zlib object").unwrap();
+        let before = fs::read(repo.path().join("refs/stash")).unwrap();
+
+        for mode in [BootCheckMode::Warn, BootCheckMode::Abort, BootCheckMode::AutoRepair] {
+            let report = preflight_archive_integrity(tmp.path(), mode);
+            assert!(report.has_findings());
+            assert_eq!(report.findings[0].kind, BootCheckFindingKind::RepoBroken);
+            assert_eq!(report.auto_repaired_count, 0);
+            assert_eq!(report.should_abort(), mode == BootCheckMode::Abort);
+        }
+        assert_eq!(fs::read(repo.path().join("refs/stash")).unwrap(), before);
+        assert_eq!(fs::read(object).unwrap(), b"not a zlib object");
+        assert!(backup_files(tmp.path(), ARCHIVE_ROOT_LABEL).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_repair_refuses_symlinked_backup_authority_before_pruning() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let (repo, candidate, refs) = stale_stash_fixture(&tmp);
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("backups")).unwrap();
+        let before = fs::read(repo.path().join("refs/stash")).unwrap();
+
+        assert!(auto_repair_missing_refs(tmp.path(), &candidate, &refs).is_err());
+        assert_eq!(fs::read(repo.path().join("refs/stash")).unwrap(), before);
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn repack_refuses_nonregular_packed_refs_without_touching_them() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        let packed = repo.commondir().join("packed-refs");
+        fs::create_dir(&packed).unwrap();
+        let candidate = ArchiveRepoCandidate {
+            project: ARCHIVE_ROOT_LABEL.to_string(),
+            path: tmp.path().to_path_buf(),
+        };
+
+        assert!(repack_refs(tmp.path(), &candidate).is_err());
+        assert!(packed.is_dir());
+        assert!(backup_files(tmp.path(), ARCHIVE_ROOT_LABEL).is_empty());
     }
 }

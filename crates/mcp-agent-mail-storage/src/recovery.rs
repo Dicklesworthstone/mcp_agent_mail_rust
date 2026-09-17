@@ -25,6 +25,7 @@
 //!   when to prune.
 
 pub mod message_reconcile;
+pub mod ref_backup;
 
 use std::path::Path;
 
@@ -37,8 +38,8 @@ pub struct PrunableRef {
     /// Full ref name, e.g. `refs/stash`, `refs/heads/foo`.
     pub ref_name: String,
 
-    /// The object id the ref was pointing at (peeled through tag
-    /// chains if applicable).
+    /// The original direct target OID, not a peeled tag-chain target.
+    /// Locked pruning compares this exact identity before removing the ref.
     pub target_sha: String,
 
     /// Short human-readable reason, included in the action log.
@@ -174,18 +175,12 @@ pub fn prune_missing_ref(
     Ok(PruneRefOutcome::Pruned)
 }
 
-/// Detect refs whose target objects are missing from the repo's ODB.
+/// Detect direct refs whose target objects are missing from the repo's ODB.
 ///
-/// This is the libgit2-native replacement for the original plan to
-/// shell out `git fsck --unreachable --no-reflogs` and parse stderr.
-/// Reason for the switch (per bead F2 revision v2):
-///
-/// - git 2.51.0 itself can segfault during fsck under load — using
-///   the binary we're trying to survive is a bad plan.
-/// - fsck output format varies between git versions; parsing is
-///   brittle.
-/// - libgit2 exposes `odb.exists()` and the full ref database; the
-///   check is trivial and faster than fsck anyway.
+/// This uses libgit2 rather than invoking `git fsck`. A missing direct target
+/// is a finding; an unreadable reference/object or an unresolved symbolic/tag
+/// chain is an error. Callers must not mistake an incomplete scan for a clean
+/// repository or use its partial findings to authorize destructive recovery.
 ///
 /// # Arguments
 ///
@@ -193,87 +188,77 @@ pub fn prune_missing_ref(
 ///
 /// # Returns
 ///
-/// Vector of [`PrunableRef`] entries, one per ref with a missing
-/// target. Empty vector means the repo's ref integrity is intact.
+/// One [`PrunableRef`] per confirmed missing direct target. Each finding keeps
+/// the original ref OID for mutation-time revalidation. An empty result means
+/// that all enumerated refs resolved, their object headers were readable, and
+/// any annotated tags peeled successfully. This is not a complete audit of
+/// commit/tree reachability, object contents, or pseudorefs such as HEAD.
 ///
 /// # Errors
 ///
-/// Returns `git2::Error` if the repo cannot be opened, or if the
-/// references iterator fails. ODB lookups that fail are logged but
-/// do not abort — we want to list as many findings as we can.
+/// Returns an error if the repo, ref iterator, ref name, symbolic resolution,
+/// object header, or tag chain cannot be read reliably. Only an ODB
+/// `ErrorCode::NotFound` for a direct ref produces a prunable finding.
 pub fn detect_missing_refs(repo_path: &Path) -> Result<Vec<PrunableRef>, git2::Error> {
     let repo = Repository::open(repo_path)?;
     let odb = repo.odb()?;
     let mut out = Vec::new();
 
-    let references = repo.references()?;
-    for r in references {
-        let reference = match r {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    target: "mcp_agent_mail::storage::recovery",
-                    err = %e,
-                    "recovery_reference_iter_error"
-                );
-                continue;
-            }
-        };
-        let name = reference.name().unwrap_or("<invalid-utf8>").to_string();
+    for reference in repo.references()? {
+        // Never silently drop an iterator error or manufacture a ref name.
+        let reference = reference?;
+        let name = reference.name()?.to_string();
+        let resolved = reference.resolve().map_err(|error| {
+            git2::Error::from_str(&format!("cannot resolve reference {name}: {error}"))
+        })?;
+        let oid = resolved.target().ok_or_else(|| {
+            git2::Error::from_str(&format!("reference {name} has no resolved direct target"))
+        })?;
 
-        // Peel through tag chains to get the final ODB object we care
-        // about. If the reference is direct, `target()` gives the oid;
-        // if it's a tag object chain, `peel()` resolves to the final
-        // commit/tree/blob.
-        let (peeled_oid, peel_reason): (Option<Oid>, &'static str) =
-            if let Ok(obj) = reference.peel(ObjectType::Any) {
-                (Some(obj.id()), "peeled")
-            } else if let Some(target) = reference.target() {
-                (Some(target), "direct-target")
-            } else if let Ok(Some(sym)) = reference.symbolic_target() {
-                // Symbolic ref that points to something; peel through
-                // one level. If the pointed-to ref doesn't exist we
-                // handle that as its own finding (the direct ref).
-                tracing::debug!(
+        match odb.read_header(oid) {
+            Ok((_, kind)) => {
+                // A readable tag object is not sufficient: its target chain
+                // can still be missing or corrupt. Do not fall back to the
+                // tag's own OID after a failed peel and call the ref healthy.
+                if kind == ObjectType::Tag {
+                    resolved.peel(ObjectType::Any).map_err(|error| {
+                        git2::Error::from_str(&format!(
+                            "cannot validate tag chain for {name}: {error}"
+                        ))
+                    })?;
+                }
+                tracing::trace!(
                     target: "mcp_agent_mail::storage::recovery",
                     ref = %name,
-                    symbolic_target = %sym,
-                    "recovery_ref_symbolic_deferred_to_direct_check"
+                    oid = %oid,
+                    "recovery_ref_target_readable"
                 );
-                continue;
-            } else {
-                (None, "no-target")
-            };
-
-        let Some(oid) = peeled_oid else {
-            continue;
-        };
-
-        if odb.exists(oid) {
-            tracing::trace!(
-                target: "mcp_agent_mail::storage::recovery",
-                ref = %name,
-                oid = %oid,
-                via = peel_reason,
-                "recovery_ref_intact"
-            );
-        } else {
-            let category = ref_category(&name);
-            let finding = PrunableRef {
-                ref_name: name.clone(),
-                target_sha: oid.to_string(),
-                reason: format!("object {oid} missing from ODB (via {peel_reason})"),
-                category,
-            };
-            tracing::info!(
-                target: "mcp_agent_mail::storage::recovery",
-                ref = %name,
-                oid = %oid,
-                via = peel_reason,
-                category = ?category,
-                "recovery_ref_missing_object"
-            );
-            out.push(finding);
+            }
+            Err(error)
+                if error.code() == ErrorCode::NotFound && reference.target().is_some() =>
+            {
+                let category = ref_category(&name);
+                out.push(PrunableRef {
+                    ref_name: name.clone(),
+                    target_sha: oid.to_string(),
+                    reason: format!("object {oid} missing from ODB (via direct-target)"),
+                    category,
+                });
+                tracing::info!(
+                    target: "mcp_agent_mail::storage::recovery",
+                    ref = %name,
+                    oid = %oid,
+                    category = ?category,
+                    "recovery_ref_missing_object"
+                );
+            }
+            Err(error) => {
+                // Includes symbolic aliases resolving to missing objects.
+                // An alias is not authority to prune its target or itself.
+                return Err(git2::Error::from_str(&format!(
+                    "cannot validate target {oid} for reference {name}: {error}"
+                )));
+            }
         }
     }
 
@@ -421,9 +406,9 @@ mod tests {
     #[test]
     fn ref_category_refs_stash_is_leaf_not_prefix() {
         // `refs/stash` is a SINGLE ref (git stores multiple stashes as a
-        // reflog on that tip). Anything that merely starts with "refs/stash"
-        // — say `refs/stashy/*` from a user's ad-hoc naming — must NOT
-        // inherit the SafeToPrune category.
+        // reflog on a single ref tip, not as a namespace), so it's matched
+        // exactly rather than via starts_with — otherwise `refs/stashy/*`
+        // would also match, which is wrong.
         assert_eq!(ref_category("refs/stash"), RefCategory::SafeToPrune);
         assert_eq!(ref_category("refs/stashy/foo"), RefCategory::AskUser);
         assert_eq!(ref_category("refs/stash-backup"), RefCategory::AskUser);
@@ -645,5 +630,145 @@ mod tests {
             repo.find_reference(&finding.ref_name).unwrap().target(),
             Some(missing_oid())
         );
+    }
+
+    #[test]
+    fn detection_rejects_corrupt_object_headers_without_changing_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        let finding = write_orphan(&repo, "refs/temp/corrupt-scan", missing_oid());
+        let oid = finding.target_sha.as_str();
+        let dir = repo.path().join("objects").join(&oid[..2]);
+        std::fs::create_dir_all(&dir).unwrap();
+        let object_path = dir.join(&oid[2..]);
+        std::fs::write(&object_path, b"not a zlib object").unwrap();
+
+        assert!(detect_missing_refs(tmp.path()).is_err());
+        assert_eq!(std::fs::read(&object_path).unwrap(), b"not a zlib object");
+        assert_eq!(
+            repo.find_reference(&finding.ref_name).unwrap().target(),
+            Some(missing_oid())
+        );
+    }
+
+    #[test]
+    fn detection_rejects_a_dangling_symbolic_ref() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        let path = repo.path().join("refs/heads/alias");
+        let bytes = b"ref: refs/heads/nonexistent\n";
+        std::fs::write(&path, bytes).unwrap();
+
+        assert!(detect_missing_refs(tmp.path()).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn detection_rejects_a_symbolic_ref_cycle() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        std::fs::write(
+            repo.path().join("refs/heads/alias-a"),
+            b"ref: refs/heads/alias-b\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("refs/heads/alias-b"),
+            b"ref: refs/heads/alias-a\n",
+        )
+        .unwrap();
+
+        assert!(detect_missing_refs(tmp.path()).is_err());
+        assert!(repo.find_reference("refs/heads/alias-a").is_ok());
+        assert!(repo.find_reference("refs/heads/alias-b").is_ok());
+    }
+
+    #[test]
+    fn detection_does_not_turn_an_alias_into_prune_authority() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        let finding = write_orphan(&repo, "refs/temp/direct", missing_oid());
+        std::fs::write(
+            repo.path().join("refs/temp/alias"),
+            b"ref: refs/temp/direct\n",
+        )
+        .unwrap();
+
+        assert!(detect_missing_refs(tmp.path()).is_err());
+        assert_eq!(
+            repo.find_reference(&finding.ref_name).unwrap().target(),
+            Some(missing_oid())
+        );
+    }
+
+    #[test]
+    fn detection_rejects_an_existing_tag_with_a_missing_target() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        let text = format!(
+            "object {}\ntype commit\ntag broken\ntagger Test <test@local> 1700000000 +0000\n\nbroken target\n",
+            missing_oid()
+        );
+        let tag_oid = repo
+            .odb()
+            .unwrap()
+            .write(ObjectType::Tag, text.as_bytes())
+            .unwrap();
+        let finding = write_orphan(&repo, "refs/temp/broken-tag", tag_oid);
+
+        assert!(detect_missing_refs(tmp.path()).is_err());
+        assert_eq!(
+            repo.find_reference(&finding.ref_name).unwrap().target(),
+            Some(tag_oid)
+        );
+        assert_eq!(
+            prune_missing_ref(tmp.path(), &finding, false).unwrap(),
+            PruneRefOutcome::TargetPresent
+        );
+    }
+
+    #[test]
+    fn detection_accepts_valid_symbolic_refs_and_tag_chains() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        let head = repo.head().unwrap();
+        let commit = head.peel_to_commit().unwrap();
+        let signature = Signature::now("tag-test", "tag@local").unwrap();
+        let tag_oid = repo
+            .tag("healthy", commit.as_object(), &signature, "healthy", false)
+            .unwrap();
+        let tag = repo.find_object(tag_oid, Some(ObjectType::Tag)).unwrap();
+        repo.tag("nested", &tag, &signature, "nested", false)
+            .unwrap();
+        std::fs::write(
+            repo.path().join("refs/heads/alias"),
+            format!("ref: {}\n", head.name().unwrap()),
+        )
+        .unwrap();
+
+        assert!(detect_missing_refs(tmp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn detection_accepts_an_empty_unborn_repository() {
+        let tmp = TempDir::new().unwrap();
+        let _repo = Repository::init(tmp.path()).unwrap();
+        assert!(detect_missing_refs(tmp.path()).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detection_refuses_non_utf8_names_instead_of_inventing_a_prunable_name() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        let name = std::ffi::OsString::from_vec(b"invalid-\xff".to_vec());
+        let path = repo.path().join("refs/heads").join(name);
+        let before = format!("{}\n", missing_oid());
+        std::fs::write(&path, &before).unwrap();
+
+        assert!(detect_missing_refs(tmp.path()).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before);
     }
 }

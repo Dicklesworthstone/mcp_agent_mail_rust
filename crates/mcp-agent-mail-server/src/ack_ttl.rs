@@ -5,6 +5,11 @@
 //! - Log warnings for overdue acks
 //! - Optionally escalate via file reservations
 //!
+//! Warning suppression is separate from escalation reconciliation: active
+//! claims are checked again on later scans, including after an earlier error.
+//! Attempts are coalesced per recipient/month within each scan, and lookup
+//! failures never authorize a broader inbox pattern or a different holder.
+//!
 //! The worker runs on a dedicated OS thread with `std::thread::sleep` between
 //! iterations, matching the pattern in `cleanup.rs`.
 
@@ -218,6 +223,7 @@ fn run_ack_ttl_cycle_with_state(
     let scanned = rows.len();
     let mut overdue = 0usize;
     let mut currently_overdue: HashSet<OverdueAckKey> = HashSet::with_capacity(rows.len());
+    let mut attempted_escalations = HashSet::new();
 
     for row in &rows {
         let key = OverdueAckKey {
@@ -227,33 +233,69 @@ fn run_ack_ttl_cycle_with_state(
         currently_overdue.insert(key);
         overdue = overdue.saturating_add(1);
 
-        // Suppress duplicate log/escalation spam for rows that remain overdue
-        // across consecutive scan intervals.
-        if previously_overdue.contains(&key) {
-            continue;
+        // Suppress repeated warnings, not recovery attempts. A previous scan
+        // seeing this row proves neither that escalation succeeded nor that its
+        // reservation is still active after expiry or explicit release.
+        if !previously_overdue.contains(&key) {
+            let age_seconds = now.saturating_sub(row.created_ts) / 1_000_000;
+            warn!(
+                event = "ack_overdue",
+                message_id = row.message_id,
+                project_id = row.project_id,
+                agent_id = row.agent_id,
+                age_s = age_seconds,
+                ttl_s = config.ack_ttl_seconds,
+                "ACK overdue"
+            );
         }
 
-        let age_seconds = now.saturating_sub(row.created_ts) / 1_000_000;
-
-        // Log the overdue warning (matches legacy structlog + rich panel).
-        warn!(
-            event = "ack_overdue",
-            message_id = row.message_id,
-            project_id = row.project_id,
-            agent_id = row.agent_id,
-            age_s = age_seconds,
-            ttl_s = config.ack_ttl_seconds,
-            "ACK overdue"
-        );
-
-        // Escalation (best-effort, never crash).
-        if config.ack_escalation_enabled {
-            let _ = escalate(config, pool, &cx, row, now);
+        // Several messages can share the same monthly inbox claim. Attempt
+        // that claim once per cycle even on failure, so one broken recipient
+        // cannot consume a retry per message. The next scan retries naturally;
+        // the durable active-reservation check prevents duplicate grants.
+        if config.ack_escalation_enabled
+            && attempted_escalations.insert((
+                row.project_id,
+                row.agent_id,
+                inbox_month_path(row.created_ts),
+            ))
+            && let Err(error) = escalate(config, pool, &cx, row, now)
+        {
+            warn!(
+                event = "ack_escalation_deferred",
+                message_id = row.message_id,
+                project_id = row.project_id,
+                agent_id = row.agent_id,
+                error = %error,
+                "ACK escalation failed; will retry on a later overdue scan"
+            );
         }
     }
 
     *previously_overdue = currently_overdue;
     Ok((scanned, overdue))
+}
+
+fn inbox_month_path(created_ts: i64) -> String {
+    let ts_secs = created_ts / 1_000_000;
+    let dt = chrono::DateTime::from_timestamp(ts_secs, 0)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+    dt.format("%Y/%m").to_string()
+}
+
+/// Escalation paths must contain one literal agent component, never a glob
+/// supplied by a failed lookup or malformed stored/configured identity.
+fn validate_escalation_agent_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || matches!(name, "." | "..")
+        || name.chars().any(|character| {
+            character.is_control()
+                || matches!(character, '/' | '\\' | '*' | '?' | '[' | ']' | '{' | '}')
+        })
+    {
+        return Err("ACK escalation requires a literal, nonempty agent path component".to_string());
+    }
+    Ok(())
 }
 
 /// Escalate an overdue ACK via the configured escalation mode.
@@ -277,34 +319,30 @@ fn escalate(
             other => return Err(format!("failed to fetch project: {other:?}")),
         };
 
-    // Build the inbox path pattern from the created_ts timestamp.
-    let ts_secs = row.created_ts / 1_000_000;
-    let dt = chrono::DateTime::from_timestamp(ts_secs, 0)
-        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
-    let y_dir = dt.format("%Y").to_string();
-    let m_dir = dt.format("%m").to_string();
-
-    // Resolve recipient name.
-    let recipient_name =
+    // An unresolved or cross-project identity never authorizes a wildcard
+    // reservation over every agent's inbox. Retry after metadata is available.
+    let recipient =
         match block_on(async { queries::get_agent_by_id(cx, pool, row.agent_id).await }) {
-            Outcome::Ok(agent) => agent.name,
-            _ => "*".to_string(),
+            Outcome::Ok(agent) => agent,
+            other => return Err(format!("failed to resolve escalation recipient: {other:?}")),
         };
+    if recipient.id != Some(row.agent_id) || recipient.project_id != row.project_id {
+        return Err("ACK escalation recipient does not belong to the message project".to_string());
+    }
+    validate_escalation_agent_name(&recipient.name)?;
+    let recipient_name = recipient.name;
+    let month_path = inbox_month_path(row.created_ts);
+    let pattern = format!("agents/{recipient_name}/inbox/{month_path}/*.md");
 
-    let pattern = if recipient_name == "*" {
-        format!("agents/*/inbox/{y_dir}/{m_dir}/*.md")
-    } else {
-        format!("agents/{recipient_name}/inbox/{y_dir}/{m_dir}/*.md")
-    };
-
-    // Determine holder agent.
+    // Determine holder agent. An explicit custom holder is an identity
+    // requirement, not permission to silently fall back to the recipient.
     let holder_name_cfg = &config.ack_escalation_claim_holder_name;
     let (holder_agent_id, holder_agent_name) = if holder_name_cfg.is_empty() {
         // Use the recipient agent as the holder.
         (row.agent_id, recipient_name)
     } else {
-        // Look up or create the custom holder agent.
-        match block_on(async {
+        validate_escalation_agent_name(holder_name_cfg)?;
+        let holder = match block_on(async {
             queries::insert_system_agent(
                 cx,
                 pool,
@@ -316,9 +354,18 @@ fn escalate(
             )
             .await
         }) {
-            Outcome::Ok(agent) => (agent.id.unwrap_or(row.agent_id), agent.name),
-            _ => (row.agent_id, recipient_name), // Fallback to recipient.
+            Outcome::Ok(agent) => agent,
+            other => return Err(format!("failed to resolve custom escalation holder: {other:?}")),
+        };
+        if holder.project_id != row.project_id {
+            return Err("ACK escalation holder belongs to another project".to_string());
         }
+        validate_escalation_agent_name(&holder.name)?;
+        let holder_id = holder
+            .id
+            .filter(|id| *id > 0)
+            .ok_or_else(|| "ACK escalation holder has no valid database identity".to_string())?;
+        (holder_id, holder.name)
     };
 
     // Create the file reservation.
@@ -334,7 +381,7 @@ fn escalate(
                 && reservation.reason == "ack-overdue"
                 && (reservation.exclusive != 0) == config.ack_escalation_claim_exclusive
         }),
-        _ => false,
+        other => return Err(format!("failed to check existing escalation claims: {other:?}")),
     };
     if has_existing {
         return Ok(());
@@ -442,16 +489,14 @@ mod tests {
 
     #[test]
     fn inbox_path_pattern_format() {
-        // Verify the path pattern matches legacy format.
+        // Verify the path pattern matches legacy format for resolved agents.
         let name = "GreenCastle";
         let y = "2026";
         let m = "02";
         let pattern = format!("agents/{name}/inbox/{y}/{m}/*.md");
         assert_eq!(pattern, "agents/GreenCastle/inbox/2026/02/*.md");
-
-        // Wildcard pattern for unknown agents.
-        let pattern_wild = format!("agents/*/inbox/{y}/{m}/*.md");
-        assert_eq!(pattern_wild, "agents/*/inbox/2026/02/*.md");
+        assert!(validate_escalation_agent_name(name).is_ok());
+        assert!(validate_escalation_agent_name("*").is_err());
     }
 
     #[test]
@@ -1101,5 +1146,164 @@ mod tests {
             (110_000_000..=130_000_000).contains(&ttl_us),
             "reservation TTL should be close to configured 120 seconds, got {ttl_us}us"
         );
+    }
+
+    #[test]
+    fn escalation_scope_requires_literal_agent_components() {
+        for name in ["BlueBear", "OpsEscalation", "legacy_agent-1"] {
+            assert!(validate_escalation_agent_name(name).is_ok(), "{name}");
+        }
+        for name in ["", ".", "..", "*", "../BlueBear", "a/b", "a\\b", "a?", "a[b]", "a{b,c}", "a\n"] {
+            assert!(validate_escalation_agent_name(name).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn stateful_escalation_retries_after_a_failed_attempt() {
+        let (tmp, pool, cx, unacked) = seed_unacked_message();
+        let mut config = test_config(&tmp);
+        config.ack_ttl_seconds = 0;
+        config.ack_escalation_enabled = true;
+        config.ack_escalation_mode = "file_reservation".to_string();
+        config.ack_escalation_claim_holder_name = "../invalid-holder".to_string();
+        let mut state = HashSet::new();
+
+        for _ in 0..2 {
+            assert_eq!(run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(), (1, 1));
+        }
+        assert!(state.contains(&OverdueAckKey {
+            message_id: unacked.message_id,
+            agent_id: unacked.agent_id,
+        }));
+        let before = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list claims before retry: {other:?}"),
+        };
+        assert!(before.is_empty(), "failed escalation must not change holders");
+
+        config.ack_escalation_claim_holder_name.clear();
+        // Keep the same warning-dedupe state: the failed row was already seen.
+        for _ in 0..2 {
+            assert_eq!(run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(), (1, 1));
+        }
+        let after = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list claims after retry: {other:?}"),
+        };
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].agent_id, unacked.agent_id);
+        assert!(after[0].path_pattern.starts_with("agents/BlueBear/inbox/"));
+    }
+
+    #[test]
+    fn stateful_cycle_reacquires_a_released_claim_and_stops_after_ack() {
+        let (tmp, pool, cx, unacked) = seed_unacked_message();
+        let mut config = test_config(&tmp);
+        config.ack_ttl_seconds = 0;
+        config.ack_escalation_enabled = true;
+        config.ack_escalation_mode = "file_reservation".to_string();
+        config.ack_escalation_claim_holder_name.clear();
+        let mut state = HashSet::new();
+        run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap();
+
+        match block_on(async {
+            queries::release_reservations(&cx, &pool, unacked.project_id, unacked.agent_id, None, None).await
+        }) {
+            Outcome::Ok(rows) => assert_eq!(rows.len(), 1),
+            other => panic!("release first claim: {other:?}"),
+        }
+        assert_eq!(run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(), (1, 1));
+        let claims = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list renewed claims: {other:?}"),
+        };
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims.iter().filter(|claim| claim.released_ts.is_none()).count(), 1);
+
+        match block_on(async {
+            queries::acknowledge_message(&cx, &pool, unacked.agent_id, unacked.message_id).await
+        }) {
+            Outcome::Ok(_) => {}
+            other => panic!("acknowledge: {other:?}"),
+        }
+        match block_on(async {
+            queries::release_reservations(&cx, &pool, unacked.project_id, unacked.agent_id, None, None).await
+        }) {
+            Outcome::Ok(rows) => assert_eq!(rows.len(), 1),
+            other => panic!("release second claim: {other:?}"),
+        }
+        assert_eq!(run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(), (0, 0));
+        assert!(state.is_empty());
+        let active = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, true).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list post-ACK claims: {other:?}"),
+        };
+        assert!(active.is_empty(), "acknowledged messages must not reacquire claims");
+    }
+
+    #[test]
+    fn escalation_missing_recipient_never_reserves_all_inboxes() {
+        let (tmp, pool, cx, mut unacked) = seed_unacked_message();
+        let mut config = test_config(&tmp);
+        config.ack_escalation_mode = "file_reservation".to_string();
+        config.ack_escalation_claim_holder_name = "OpsEscalation".to_string();
+        unacked.agent_id = i64::MAX;
+        assert!(escalate(&config, &pool, &cx, &unacked, now_micros()).is_err());
+        let claims = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list claims: {other:?}"),
+        };
+        assert!(claims.is_empty());
+        assert!(!config.storage_root.exists());
+    }
+
+    #[test]
+    fn escalation_rejects_a_recipient_from_another_project() {
+        let (tmp, pool, cx, mut unacked) = seed_unacked_message();
+        let other_root = tmp.path().join("other_project");
+        std::fs::create_dir_all(&other_root).unwrap();
+        let other = ensure_ephemeral_test_project(&cx, &pool, &other_root.to_string_lossy());
+        unacked.project_id = other.id.unwrap();
+        let mut config = test_config(&tmp);
+        config.ack_escalation_mode = "file_reservation".to_string();
+        config.ack_escalation_claim_holder_name = "OpsEscalation".to_string();
+        assert!(escalate(&config, &pool, &cx, &unacked, now_micros()).is_err());
+        let claims = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list cross-project claims: {other:?}"),
+        };
+        assert!(claims.is_empty());
+        assert!(!config.storage_root.exists());
+    }
+
+    #[test]
+    fn escalation_invalid_custom_holder_does_not_fall_back_to_recipient() {
+        let (tmp, pool, cx, unacked) = seed_unacked_message();
+        let mut config = test_config(&tmp);
+        config.ack_escalation_mode = "file_reservation".to_string();
+        for holder in ["*", "../outside", "Ops[AB]", "Ops/Other"] {
+            config.ack_escalation_claim_holder_name = holder.to_string();
+            assert!(escalate(&config, &pool, &cx, &unacked, now_micros()).is_err());
+        }
+        let claims = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list fallback claims: {other:?}"),
+        };
+        assert!(claims.is_empty());
+        assert!(!config.storage_root.exists());
     }
 }

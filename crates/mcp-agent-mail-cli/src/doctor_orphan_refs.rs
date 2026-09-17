@@ -37,7 +37,7 @@ use mcp_agent_mail_core::config::Config;
 use mcp_agent_mail_core::git_lock::{RepoFlock, canonicalize_repo};
 use mcp_agent_mail_storage::recovery::{
     DetectionSummary, PrunableRef, PruneRefOutcome, RefCategory, detect_missing_refs,
-    prune_missing_ref,
+    prune_missing_ref, ref_backup,
 };
 
 use crate::output::CliOutputFormat;
@@ -444,64 +444,49 @@ fn write_ref_backup(
     findings: &[PrunableRef],
 ) -> Result<PathBuf, String> {
     let slug = project_slug(project_path);
-    // Microsecond resolution so two --apply runs in the same second
-    // don't clobber each other's backups. Microseconds is ~10x more
-    // precision than filesystem mtime typically reports, which is
-    // plenty for sort ordering.
+    // Time names order backups; no-clobber publication, not clock precision,
+    // prevents concurrent attempts from replacing previously saved evidence.
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or(0);
-    let dir = config.storage_root.join("backups").join("refs").join(&slug);
-    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-    let file = dir.join(format!("{ts}.txt"));
-    let mut text = String::new();
-    text.push_str(&format!("# fix-orphan-refs backup — {}\n", ts));
-    text.push_str(&format!("# project: {}\n", project_path.display()));
-    text.push_str("# format: <status> <ref_name> <target_sha> <category> <reason>\n");
-    // Also dump ALL refs via libgit2 so a full restore is possible
-    // from the backup alone.
-    if let Ok(repo) = git2::Repository::open(project_path) {
-        text.push_str("#\n# ALL refs at backup time:\n");
-        if let Ok(references) = repo.references() {
-            for r in references.flatten() {
-                if let (Ok(name), Some(target)) = (r.name(), r.target()) {
-                    text.push_str(&format!("ref  {name}  {target}\n"));
-                }
-            }
-        }
-        text.push_str("#\n");
-    }
-    text.push_str("# ORPHAN findings (to be pruned):\n");
-    for f in findings {
-        text.push_str(&format!(
-            "orphan  {}  {}  {:?}  {}\n",
-            f.ref_name, f.target_sha, f.category, f.reason,
-        ));
-    }
-    fs::write(&file, text.as_bytes()).map_err(|e| format!("write backup: {e}"))?;
+        .map_or(0, |duration| duration.as_micros());
+    let file = config
+        .storage_root
+        .join("backups")
+        .join("refs")
+        .join(&slug)
+        .join(format!("{ts}.txt"));
+    ref_backup::write_snapshot(project_path, &file, findings)
+        .map_err(|error| format!("write complete ref backup {}: {error}", file.display()))?;
     Ok(file)
 }
 
 /// Repack refs via `git pack-refs --all --prune` after a successful
 /// prune run. br-8ujfs.6.4 (F4).
 fn repack_refs(project_path: &Path, config: &Config) -> Result<(), String> {
-    // Backup packed-refs (if it exists) BEFORE running pack-refs.
-    let admin_dir = mcp_agent_mail_core::git_lock::admin_dir_for(project_path)
-        .ok_or_else(|| "admin dir unresolvable".to_string())?;
-    let packed_refs = admin_dir.join("packed-refs");
-    if packed_refs.is_file() {
+    // Linked worktrees keep packed-refs in the shared common Git directory.
+    let packed_refs = git2::Repository::open(project_path)
+        .map_err(|error| format!("open repository for packed-refs backup: {error}"))?
+        .commondir()
+        .join("packed-refs");
+    let has_packed_refs = match fs::symlink_metadata(&packed_refs) {
+        Ok(metadata) if metadata.is_file() => true,
+        Ok(_) => return Err(format!("packed-refs is not a regular file: {}", packed_refs.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(format!("inspect packed-refs {}: {error}", packed_refs.display())),
+    };
+    if has_packed_refs {
         let slug = project_slug(project_path);
-        // Microsecond resolution — see write_ref_backup for rationale.
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
-        let dir = config.storage_root.join("backups").join("refs").join(&slug);
-        fs::create_dir_all(&dir).map_err(|e| format!("mkdir backup dir: {e}"))?;
-        let backup_file = dir.join(format!("{ts}-packed-refs.txt"));
-        fs::copy(&packed_refs, &backup_file)
-            .map_err(|e| format!("copy packed-refs backup: {e}"))?;
+            .map_or(0, |duration| duration.as_micros());
+        let backup_file = config
+            .storage_root
+            .join("backups")
+            .join("refs")
+            .join(&slug)
+            .join(format!("{ts}-packed-refs.txt"));
+        ref_backup::copy_file(&packed_refs, &backup_file)
+            .map_err(|error| format!("copy packed-refs backup: {error}"))?;
         tracing::info!(
             target: "mcp_agent_mail::doctor::fix_orphan_refs",
             src = %packed_refs.display(),
@@ -901,6 +886,75 @@ mod tests {
         let report = scan_one_project(&temp.path().join("missing-repo"), &config, false, false);
         assert!(project_has_errors(&report));
         assert!(report.scanned_refs.is_none());
+        assert!(!config.storage_root.exists());
+    }
+
+    #[test]
+    fn successful_apply_keeps_a_complete_pre_repair_snapshot() {
+        let temp = TempDir::new().unwrap();
+        let (path, config, orphan) = orphan_fixture(&temp);
+        let report = scan_one_project(&path, &config, true, false);
+        assert!(!project_has_errors(&report));
+        assert_eq!(report.apply_result.as_ref().unwrap().pruned, 1);
+        assert!(!orphan.exists());
+        let text = fs::read_to_string(report.backup_path.as_ref().unwrap()).unwrap();
+        assert!(text.contains("symref  HEAD  refs/heads/"));
+        assert!(text.contains("ref  refs/temp/orphan  deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n"));
+        assert!(text.contains("orphan  refs/temp/orphan"));
+        assert!(text.ends_with("# END agent-mail ref backup\n"));
+    }
+
+    #[test]
+    fn corrupt_object_fails_both_dry_run_and_apply_without_pruning() {
+        let temp = TempDir::new().unwrap();
+        let (path, config, orphan) = orphan_fixture(&temp);
+        let repo = git2::Repository::open(&path).unwrap();
+        let oid = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let directory = repo.path().join("objects").join(&oid[..2]);
+        fs::create_dir_all(&directory).unwrap();
+        let object = directory.join(&oid[2..]);
+        fs::write(&object, b"not a zlib object").unwrap();
+        let before = fs::read(&orphan).unwrap();
+
+        for apply in [false, true] {
+            let report = scan_one_project(&path, &config, apply, false);
+            assert!(project_has_errors(&report));
+            assert!(report.apply_result.is_none());
+            assert!(report.backup_path.is_none());
+        }
+        assert_eq!(fs::read(&orphan).unwrap(), before);
+        assert_eq!(fs::read(object).unwrap(), b"not a zlib object");
+        assert!(!config.storage_root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_backup_root_never_authorizes_doctor_pruning() {
+        let temp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let (path, config, orphan) = orphan_fixture(&temp);
+        std::os::unix::fs::symlink(outside.path(), &config.storage_root).unwrap();
+        let before = fs::read(&orphan).unwrap();
+
+        let report = scan_one_project(&path, &config, true, false);
+
+        assert!(project_has_errors(&report));
+        assert_eq!(report.apply_result.as_ref().unwrap().pruned, 0);
+        assert!(report.actions.iter().any(|action| action.op == "backup_failed"));
+        assert_eq!(fs::read(orphan).unwrap(), before);
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn doctor_repack_refuses_nonregular_packed_refs() {
+        let temp = TempDir::new().unwrap();
+        let (path, config, _) = orphan_fixture(&temp);
+        let repo = git2::Repository::open(&path).unwrap();
+        let packed = repo.commondir().join("packed-refs");
+        fs::create_dir(&packed).unwrap();
+
+        assert!(repack_refs(&path, &config).is_err());
+        assert!(packed.is_dir());
         assert!(!config.storage_root.exists());
     }
 }
