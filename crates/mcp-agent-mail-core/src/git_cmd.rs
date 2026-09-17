@@ -992,7 +992,7 @@ mod tests {
             1024,
         ));
         assert_eq!(output.status.code(), Some(7));
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout, b"");
         assert_eq!(output.stderr, b"problem");
     }
 
