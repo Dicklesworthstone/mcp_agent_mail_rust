@@ -215,14 +215,11 @@ impl<'a> GitCmd<'a> {
         let mtx = if skip_mutex {
             None
         } else {
-            canonical
-                .as_ref()
-                .map(|c| GitRepoLocks::global().lock_for(c))
+            canonical.as_ref().map(|c| GitRepoLocks::global().lock_for(c))
         };
-        let _mtx_guard = mtx.as_ref().map(|arc| {
-            arc.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        });
+        let _mtx_guard = mtx
+            .as_ref()
+            .map(|arc| arc.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
 
         // Flock layer.
         let _flock = if skip_flock {
@@ -621,8 +618,10 @@ fn drain_pipe(
                     "GIT_OUTPUT_LIMIT: combined stdout/stderr exceeded AM_GIT_MAX_OUTPUT_BYTES",
                 ));
             }
+            // Geometric growth avoids a reallocation/copy for every 8 KiB
+            // chunk. Captured bytes still obey the shared exact limit.
             output
-                .try_reserve_exact(length)
+                .try_reserve(length)
                 .map_err(|error| io::Error::other(format!("git capture allocation failed: {error}")))?;
             output.extend_from_slice(&buffer[..length]);
             *remaining -= length;
@@ -670,6 +669,12 @@ fn capture_pipes(
             && stderr.is_none()
         {
             return match classify_exit(exited) {
+                GitRunOutcome::Finished(_) if !input.is_empty() => {
+                    GitRunOutcome::Error(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "git exited before all supplied stdin could be written",
+                    ))
+                }
                 GitRunOutcome::Finished(_) => GitRunOutcome::Finished(Output {
                     status: exited,
                     stdout: stdout_bytes,
@@ -779,12 +784,8 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> GitRunOutcome {
         }
     };
 
-    let stdout_bytes = stdout_handle
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
-    let stderr_bytes = stderr_handle
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
+    let stdout_bytes = stdout_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr_bytes = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
     match classify_exit(status) {
         GitRunOutcome::Finished(_) => GitRunOutcome::Finished(Output {
             status,
@@ -828,10 +829,7 @@ mod tests {
         let res = GitCmd::new(&repo).arg("nonexistent-subcommand-xyz").run();
         assert!(res.is_ok(), "nonzero exit should NOT be Err: {res:?}");
         let o = res.unwrap();
-        assert!(
-            !o.status.success(),
-            "expected nonzero exit from unknown subcmd"
-        );
+        assert!(!o.status.success(), "expected nonzero exit from unknown subcmd");
     }
 
     #[cfg(unix)]
@@ -856,15 +854,16 @@ mod tests {
         let output = finished(run_piped_command(
             shell(
                 "dd if=/dev/zero bs=65536 count=16 2>/dev/null; \
-                 dd if=/dev/zero bs=65536 count=16 2>/dev/null >&2; cat",
+                 dd if=/dev/zero bs=65536 count=16 >&2 2>/dev/null; cat",
             ),
             Some(&input),
             Duration::from_secs(10),
             4 * 1024 * 1024,
         ));
         assert!(output.status.success());
-        assert_eq!(&output.stdout[..1024 * 1024], vec![0; 1024 * 1024]);
-        assert_eq!(&output.stdout[1024 * 1024..], input);
+        assert_eq!(output.stdout.len(), 3 * 1024 * 1024);
+        assert!(output.stdout[..1024 * 1024].iter().all(|byte| *byte == 0));
+        assert_eq!(&output.stdout[1024 * 1024..], input.as_slice());
         assert_eq!(output.stderr, vec![0; 1024 * 1024]);
     }
 
@@ -910,6 +909,41 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(child.0.try_wait().unwrap().unwrap().success());
         drop(retained_writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_exit_cannot_hide_unwritten_stdin() {
+        let (retained_reader, stdin) = nonblocking_parent_pipe(true).unwrap();
+        let (stdout, stdout_writer) = nonblocking_parent_pipe(false).unwrap();
+        let (stderr, stderr_writer) = nonblocking_parent_pipe(false).unwrap();
+        drop(stdout_writer);
+        drop(stderr_writer);
+        let mut child = ReapedGitChild(
+            shell("exit 0")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        assert!(child.0.wait().unwrap().success());
+        // A descendant may keep stdin's read end open after the actual Git
+        // child exits. The successful status must not certify a partial feed.
+        let outcome = capture_pipes(
+            &mut child.0,
+            Some(stdin),
+            &vec![b'x'; 1024 * 1024],
+            stdout,
+            stderr,
+            Duration::from_secs(5),
+            1024,
+        );
+        assert!(matches!(
+            outcome,
+            GitRunOutcome::Error(error) if error.kind() == io::ErrorKind::BrokenPipe
+        ));
+        drop(retained_reader);
     }
 
     #[cfg(unix)]
