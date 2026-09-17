@@ -144,6 +144,13 @@ statements below; v0.3.36 is published and this work targets unreleased main.
 - Audit of the Ammonia candidate lockfile exits 0 with zero vulnerabilities
   (`044-audit-ammonia.json`); the same existing `paste` unmaintained and
   `lru` unsound warnings remain. This does not substitute for runtime tests.
+- Prepared an isolated doctor/WAL runner on ovh-a, but RCH refused the
+  separate CLI gate before execution because that worker now has critical
+  memory pressure (`044-doctor-merged.log`, RCH-I002). No local fallback
+  or pressure override. The already-admitted Ammonia gate continues on hz3.
+- Concurrent commit `f0bc676c` captured the Ammonia candidate and manual
+  formatting corrections while its tests were still compiling. The commit
+  is not a completed qualification result; the runtime gate remains open.
 
 ## September 16, 2026 — release qualification update
 
