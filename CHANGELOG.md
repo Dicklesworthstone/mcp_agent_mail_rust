@@ -38,6 +38,9 @@ Recent releases; the earlier version history continues below.
 - **Update rustls to 0.23.45**, addressing `RUSTSEC-2026-0285` in the
   previous 0.23.43 dependency. Transport regression validation is tracked
   with the dependency upgrade above.
+- **Update HTML sanitization to Ammonia 4.2.0**, including its HTML5ever
+  0.40 and CSS parser 0.38 dependencies. Existing Markdown, XSS rejection,
+  transport, and ACK-TTL regressions pass with the updated sanitizer.
 - **Source builds pin FrankenSearch directly to an immutable git revision.**
   Cargo no longer reads a mutable sibling checkout, so updating that checkout
   cannot break this workspace. Package versions and features are unchanged;

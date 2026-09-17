@@ -112,7 +112,7 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 loom = "0.7"
 proptest = "1"
-jsonwebtoken = { version = "11.0.0", default-features = false, features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs"] }
 fs2 = "0.4"
 walkdir = "2"
 # Tantivy 0.26.1 pins lru 0.16.x, which is affected by RUSTSEC-2026-0253.

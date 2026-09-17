@@ -151,6 +151,26 @@ statements below; v0.3.36 is published and this work targets unreleased main.
 - Concurrent commit `f0bc676c` captured the Ammonia candidate and manual
   formatting corrections while its tests were still compiling. The commit
   is not a completed qualification result; the runtime gate remains open.
+- Ammonia qualification completed at 21:08 UTC: **297 passed, 4430 skipped**,
+  strict RCH remote exit 0 (`044-ammonia-provisioned.log`). Includes Markdown
+  sanitization/XSS, HTTP/JWT/transport, and merged ACK-TTL regressions. The
+  cold build took 127 minutes; tests took 122 seconds. Ammonia 4.2.0 retained.
+- Next: jsonwebtoken 11.0.0 → 11.1.0. Upstream adds an opt-in insecure
+  claims decoder; this project continues using verified decoding. Run the
+  existing authentication acceptance/rejection regressions after resolution.
+- JWT resolution changes only jsonwebtoken. First runtime submission refused
+  because hz3 now has zero slots (`044-jwt-runtime.log`, RCH-I003). A fresh
+  vmi1152480 probe reports its former foreign-alias blocker repaired and
+  `projects_root_ok: true`; submitted the warm-cache test there instead
+  (`044-jwt-warm-worker.log`). No fleet configuration changes by this task.
+- The recovered worker is rebuilding broadly in its current Cargo artifact
+  layout despite the earlier target directory. JWT tests have not executed
+  yet; session 60291 is active. Do not interpret the resolved lockfile as
+  a passing JWT update or a completed general library refresh.
+- Resumed the pending doctor/WAL library regressions on hz3 after it regained
+  one admissible slot at 22:27 UTC (`044-doctor-hz3.log`, session 71926).
+  This runs independently of the JWT gate on vmi1152480; no shared-worker
+  build contention or additional dependency update was introduced.
 
 ## September 16, 2026 — release qualification update
 
