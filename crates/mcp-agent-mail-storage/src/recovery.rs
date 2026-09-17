@@ -9,8 +9,8 @@
 //!   repo and identify ones whose target object is missing from the
 //!   object database. These are "orphan" refs left behind when a
 //!   writer crashed mid-update.
-//! - Future: [`prune_orphan_refs`] (F3) and [`repack_refs`] (F4) will
-//!   live here once the F3/F4 beads land.
+//! - [`prune_missing_ref`] (F3): revalidate a finding under the Git ref
+//!   lock before pruning; callers retain backup and repository-lock ownership.
 //! - [`message_reconcile`] (br-8j6cb): restore missing message artifacts
 //!   without overwriting conflicting evidence or delivering mail again.
 //!
@@ -28,7 +28,7 @@ pub mod message_reconcile;
 
 use std::path::Path;
 
-use git2::{ObjectType, Oid, Repository};
+use git2::{ErrorCode, ObjectType, Oid, Repository};
 
 /// A ref that cannot be followed because its target object is missing
 /// from the repository's object database.
@@ -100,6 +100,78 @@ pub fn ref_category(ref_name: &str) -> RefCategory {
     }
 
     RefCategory::AskUser
+}
+
+/// Result of revalidating an orphan finding at the mutation boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneRefOutcome {
+    /// The same direct ref still named a missing object and was removed.
+    Pruned,
+    /// Another operation already removed the ref.
+    AlreadyAbsent,
+    /// The ref now has another target or is symbolic. It was not changed.
+    Changed,
+    /// The original object is now available. Its ref was not changed.
+    TargetPresent,
+}
+
+/// Prune only the exact, still-missing direct ref described by a finding.
+///
+/// The caller must obtain its repository coordination lock and successfully
+/// write its recovery backup before calling this mutation API. That flock
+/// does not serialize ordinary Git clients: a Git ref transaction holds the
+/// actual ref lock from revalidation through deletion. Never trust a finding's
+/// cached category or delete a ref merely because its name appeared in a scan.
+///
+/// A changed, symbolic, restored, or already-absent ref is a successful skip,
+/// not a deletion. Only `ErrorCode::NotFound` from the ODB proves absence;
+/// corruption and I/O errors must not authorize destructive recovery.
+///
+/// # Errors
+///
+/// Returns an error for protected refs (even with `force`), an unapproved
+/// namespace, malformed OIDs, lock failures, or uncertain repository state.
+/// No working-tree files or objects are deleted.
+pub fn prune_missing_ref(
+    repo_path: &Path,
+    finding: &PrunableRef,
+    force: bool,
+) -> Result<PruneRefOutcome, git2::Error> {
+    match ref_category(&finding.ref_name) {
+        RefCategory::Protected => {
+            return Err(git2::Error::from_str("refusing to prune a protected ref"));
+        }
+        RefCategory::AskUser if !force => {
+            return Err(git2::Error::from_str(
+                "refusing to prune an unknown namespace without force",
+            ));
+        }
+        RefCategory::SafeToPrune | RefCategory::AskUser => {}
+    }
+    let expected = Oid::from_str(&finding.target_sha)?;
+    let repo = Repository::open(repo_path)?;
+    let mut transaction = repo.transaction()?;
+    transaction.lock_ref(&finding.ref_name)?;
+
+    let reference = match repo.find_reference(&finding.ref_name) {
+        Ok(reference) => reference,
+        Err(error) if error.code() == ErrorCode::NotFound => {
+            return Ok(PruneRefOutcome::AlreadyAbsent);
+        }
+        Err(error) => return Err(error),
+    };
+    if reference.target() != Some(expected) {
+        return Ok(PruneRefOutcome::Changed);
+    }
+    match repo.odb()?.read_header(expected) {
+        Ok(_) => return Ok(PruneRefOutcome::TargetPresent),
+        Err(error) if error.code() == ErrorCode::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    transaction.remove(&finding.ref_name)?;
+    transaction.commit()?;
+    Ok(PruneRefOutcome::Pruned)
 }
 
 /// Detect refs whose target objects are missing from the repo's ODB.
@@ -410,5 +482,156 @@ mod tests {
         assert_eq!(summary.by_category.safe_to_prune, 1);
         assert_eq!(summary.by_category.ask_user, 1);
         assert_eq!(summary.by_category.protected, 0);
+    }
+
+    fn write_orphan(repo: &Repository, name: &str, oid: Oid) -> PrunableRef {
+        let path = repo.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("{oid}\n")).unwrap();
+        PrunableRef {
+            ref_name: name.to_string(),
+            target_sha: oid.to_string(),
+            reason: "test missing object".to_string(),
+            category: ref_category(name),
+        }
+    }
+
+    fn missing_oid() -> Oid {
+        Oid::from_str("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap()
+    }
+
+    #[test]
+    fn guarded_prune_removes_only_the_same_missing_ref() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        let head = repo.head().unwrap().target().unwrap();
+        let finding = write_orphan(&repo, "refs/temp/orphan", missing_oid());
+        assert_eq!(
+            prune_missing_ref(tmp.path(), &finding, false).unwrap(),
+            PruneRefOutcome::Pruned
+        );
+        assert!(repo.find_reference(&finding.ref_name).is_err());
+        assert_eq!(repo.head().unwrap().target(), Some(head));
+        assert_eq!(std::fs::read(tmp.path().join("a.txt")).unwrap(), b"hello\n");
+        assert_eq!(
+            prune_missing_ref(tmp.path(), &finding, false).unwrap(),
+            PruneRefOutcome::AlreadyAbsent
+        );
+    }
+
+    #[test]
+    fn guarded_prune_preserves_a_ref_repaired_after_detection() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        let finding = write_orphan(&repo, "refs/temp/repaired", missing_oid());
+        let head = repo.head().unwrap().target().unwrap();
+        repo.reference(&finding.ref_name, head, true, "concurrent repair")
+            .unwrap();
+        assert_eq!(
+            prune_missing_ref(tmp.path(), &finding, false).unwrap(),
+            PruneRefOutcome::Changed
+        );
+        assert_eq!(repo.find_reference(&finding.ref_name).unwrap().target(), Some(head));
+    }
+
+    #[test]
+    fn guarded_prune_preserves_a_different_missing_target() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        let finding = write_orphan(&repo, "refs/temp/changed", missing_oid());
+        let changed = Oid::from_str("cafebabecafebabecafebabecafebabecafebabe").unwrap();
+        write_orphan(&repo, &finding.ref_name, changed);
+        assert_eq!(
+            prune_missing_ref(tmp.path(), &finding, false).unwrap(),
+            PruneRefOutcome::Changed
+        );
+        assert_eq!(repo.find_reference(&finding.ref_name).unwrap().target(), Some(changed));
+    }
+
+    #[test]
+    fn guarded_prune_preserves_an_object_restored_under_the_same_oid() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        let bytes = b"object restored after detection";
+        let oid = Oid::hash_object(ObjectType::Blob, bytes).unwrap();
+        let finding = write_orphan(&repo, "refs/temp/restored", oid);
+        assert_eq!(repo.odb().unwrap().write(ObjectType::Blob, bytes).unwrap(), oid);
+        assert_eq!(
+            prune_missing_ref(tmp.path(), &finding, false).unwrap(),
+            PruneRefOutcome::TargetPresent
+        );
+        assert_eq!(repo.find_reference(&finding.ref_name).unwrap().target(), Some(oid));
+    }
+
+    #[test]
+    fn guarded_prune_preserves_a_ref_changed_to_symbolic() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        let finding = write_orphan(&repo, "refs/temp/symbolic", missing_oid());
+        std::fs::write(
+            repo.path().join(&finding.ref_name),
+            "ref: refs/heads/not-created\n",
+        )
+        .unwrap();
+        assert_eq!(
+            prune_missing_ref(tmp.path(), &finding, false).unwrap(),
+            PruneRefOutcome::Changed
+        );
+        assert_eq!(
+            repo.find_reference(&finding.ref_name)
+                .unwrap()
+                .symbolic_target()
+                .unwrap(),
+            Some("refs/heads/not-created")
+        );
+    }
+
+    #[test]
+    fn guarded_prune_reclassifies_names_instead_of_trusting_findings() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        for name in ["refs/heads/main", "refs/remotes/origin/main"] {
+            let mut finding = write_orphan(&repo, name, missing_oid());
+            finding.category = RefCategory::SafeToPrune;
+            assert!(prune_missing_ref(tmp.path(), &finding, true).is_err());
+            assert!(repo.find_reference(name).is_ok());
+        }
+        let mut finding = write_orphan(&repo, "refs/heads/recovery-topic", missing_oid());
+        finding.category = RefCategory::SafeToPrune;
+        assert!(prune_missing_ref(tmp.path(), &finding, false).is_err());
+        assert_eq!(
+            prune_missing_ref(tmp.path(), &finding, true).unwrap(),
+            PruneRefOutcome::Pruned
+        );
+    }
+
+    #[test]
+    fn guarded_prune_refuses_a_busy_git_ref_lock() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        let finding = write_orphan(&repo, "refs/temp/locked", missing_oid());
+        let mut writer = repo.transaction().unwrap();
+        writer.lock_ref(&finding.ref_name).unwrap();
+        assert!(prune_missing_ref(tmp.path(), &finding, false).is_err());
+        assert_eq!(
+            repo.find_reference(&finding.ref_name).unwrap().target(),
+            Some(missing_oid())
+        );
+    }
+
+    #[test]
+    fn guarded_prune_refuses_a_corrupt_object_instead_of_treating_it_as_missing() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        let finding = write_orphan(&repo, "refs/temp/corrupt", missing_oid());
+        let oid = finding.target_sha.as_str();
+        let dir = repo.path().join("objects").join(&oid[..2]);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&oid[2..]), b"not a zlib object").unwrap();
+        assert!(prune_missing_ref(tmp.path(), &finding, false).is_err());
+        assert_eq!(
+            repo.find_reference(&finding.ref_name).unwrap().target(),
+            Some(missing_oid())
+        );
     }
 }
