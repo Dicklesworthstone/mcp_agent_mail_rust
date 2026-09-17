@@ -2921,21 +2921,36 @@ async fn migration_set_is_complete<C: Connection>(
     let Some(_latest_id) = expected.last().map(|m| m.id.clone()) else {
         return Outcome::Ok(true);
     };
-    let sql = format!("SELECT id FROM {MIGRATIONS_TABLE_NAME}");
-    let applied_ids = match conn.query(cx, &sql, &[]).await {
+    let sql = format!("SELECT id, checksum FROM {MIGRATIONS_TABLE_NAME}");
+    let applied = match conn.query(cx, &sql, &[]).await {
         Outcome::Ok(rows) => rows
             .into_iter()
-            .filter_map(|row| row.get_named::<String>("id").ok())
-            .collect::<std::collections::HashSet<_>>(),
+            .filter_map(|row| {
+                Some((
+                    row.get_named::<String>("id").ok()?,
+                    row.get_named::<String>("checksum").ok()?,
+                ))
+            })
+            .collect::<std::collections::HashMap<_, _>>(),
         Outcome::Err(err) => return Outcome::Err(err),
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
-    Outcome::Ok(
-        expected
-            .iter()
-            .all(|migration| applied_ids.contains(&migration.id)),
-    )
+    let mut complete = true;
+    for migration in expected {
+        let Some(recorded) = applied.get(&migration.id) else {
+            complete = false;
+            continue;
+        };
+        let current = migration.checksum();
+        if !recorded.is_empty() && *recorded != current {
+            return Outcome::Err(SqlError::Custom(format!(
+                "migration {} changed after application: recorded checksum {recorded}, current {current}",
+                migration.id
+            )));
+        }
+    }
+    Outcome::Ok(complete)
 }
 
 async fn read_user_version<C: Connection>(cx: &Cx, conn: &C) -> Outcome<i64, SqlError> {
@@ -3368,6 +3383,16 @@ async fn run_specific_migrations<C: Connection>(
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
     let mut applied = Vec::new();
+    for (id, migration_status) in &status {
+        if let MigrationStatus::Drifted {
+            recorded, current, ..
+        } = migration_status
+        {
+            return Outcome::Err(SqlError::Custom(format!(
+                "migration {id} changed after application: recorded checksum {recorded}, current {current}"
+            )));
+        }
+    }
     for (id, migration_status) in status {
         if migration_status != MigrationStatus::Pending {
             continue;
@@ -3965,7 +3990,7 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
     migration: &Migration,
 ) -> Outcome<(), SqlError> {
     let record_sql = format!(
-        "INSERT OR IGNORE INTO {MIGRATIONS_TABLE_NAME} (id, description, applied_at) VALUES ($1, $2, $3)"
+        "INSERT OR IGNORE INTO {MIGRATIONS_TABLE_NAME} (id, description, applied_at, checksum) VALUES ($1, $2, $3, $4)"
     );
     let mut retries = 0usize;
     loop {
@@ -4150,6 +4175,7 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
             Value::Text(migration.id.clone()),
             Value::Text(migration.description.clone()),
             Value::BigInt(now),
+            Value::Text(migration.checksum()),
         ];
         match conn.execute(cx, &record_sql, &record_params).await {
             Outcome::Ok(_) => {}
@@ -4205,10 +4231,32 @@ pub async fn init_migrations_table<C: Connection>(cx: &Cx, conn: &C) -> Outcome<
         "CREATE TABLE IF NOT EXISTS {MIGRATIONS_TABLE_NAME} (
             id TEXT PRIMARY KEY,
             description TEXT NOT NULL,
-            applied_at INTEGER NOT NULL
+            applied_at INTEGER NOT NULL,
+            checksum TEXT NOT NULL DEFAULT ''
         )"
     );
-    execute_migration_ddl_with_lock_retry(cx, conn, &sql, "init migrations table").await
+    match execute_migration_ddl_with_lock_retry(cx, conn, &sql, "init migrations table").await {
+        Outcome::Ok(()) => {}
+        other => return other,
+    }
+    let columns = match table_column_names(cx, conn, MIGRATIONS_TABLE_NAME).await {
+        Outcome::Ok(columns) => columns,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    if columns.contains("checksum") {
+        return Outcome::Ok(());
+    }
+    // Existing installations predate SQLModel's checksum column. Preserve
+    // their records as unverifiable (empty), never invent historical hashes.
+    let alter =
+        format!("ALTER TABLE {MIGRATIONS_TABLE_NAME} ADD COLUMN checksum TEXT NOT NULL DEFAULT ''");
+    match execute_migration_ddl_with_lock_retry(cx, conn, &alter, "add migration checksums").await {
+        // Another initializer may have added the column after our probe.
+        Outcome::Err(err) if is_duplicate_column_error(&err) => Outcome::Ok(()),
+        other => other,
+    }
 }
 
 pub async fn migration_status<C: Connection>(
@@ -4478,6 +4526,108 @@ mod tests {
             .build()
             .expect("build runtime");
         rt.block_on(f(cx))
+    }
+
+    #[test]
+    fn migration_checksums_upgrade_legacy_table_without_rewriting_history() {
+        let conn = crate::CanonicalDbConn::open_memory().expect("open canonical database");
+        conn.execute_raw(&format!(
+            "CREATE TABLE {MIGRATIONS_TABLE_NAME} (id TEXT PRIMARY KEY, description TEXT NOT NULL, applied_at INTEGER NOT NULL); \
+             INSERT INTO {MIGRATIONS_TABLE_NAME} VALUES ('legacy', 'original description', 123)"
+        ))
+        .expect("seed legacy tracking table");
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                for _ in 0..2 {
+                    init_migrations_table(&cx, conn)
+                        .await
+                        .into_result()
+                        .expect("initialize checksums idempotently");
+                }
+                let legacy = Migration::new("legacy", "current description", "SELECT 1", "");
+                assert!(
+                    migration_set_is_complete(&cx, conn, &[legacy])
+                        .await
+                        .into_result()
+                        .unwrap()
+                );
+            }
+        });
+        let rows = conn
+            .query_sync(&format!("SELECT * FROM {MIGRATIONS_TABLE_NAME}"), &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<String>("checksum").unwrap(), "");
+        assert_eq!(rows[0].get_named::<i64>("applied_at").unwrap(), 123);
+        assert_eq!(
+            rows[0].get_named::<String>("description").unwrap(),
+            "original description"
+        );
+    }
+
+    #[test]
+    fn migration_checksums_record_and_reject_drift_before_pending_work() {
+        let conn = crate::CanonicalDbConn::open_memory().expect("open canonical database");
+        block_on(|cx| async move {
+            init_migrations_table(&cx, &conn)
+                .await
+                .into_result()
+                .unwrap();
+            let original = Migration::new(
+                "original",
+                "create table",
+                "CREATE TABLE witness(id INT)",
+                "",
+            );
+            run_specific_migrations(&cx, &conn, vec![original.clone()])
+                .await
+                .into_result()
+                .unwrap();
+            let rows = conn
+                .query_sync(
+                    &format!("SELECT checksum FROM {MIGRATIONS_TABLE_NAME}"),
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(
+                rows[0].get_named::<String>("checksum").unwrap(),
+                original.checksum()
+            );
+            assert!(
+                migration_set_is_complete(&cx, &conn, std::slice::from_ref(&original))
+                    .await
+                    .into_result()
+                    .unwrap()
+            );
+            let changed =
+                Migration::new("original", "changed", "CREATE TABLE witness(other INT)", "");
+            assert!(
+                migration_set_is_complete(&cx, &conn, std::slice::from_ref(&changed))
+                    .await
+                    .into_result()
+                    .is_err()
+            );
+            let pending = Migration::new(
+                "pending",
+                "must not run",
+                "CREATE TABLE forbidden(id INT)",
+                "",
+            );
+            let error = run_specific_migrations(&cx, &conn, vec![pending, changed])
+                .await
+                .into_result()
+                .expect_err("reject changed migration before any pending SQL");
+            assert!(error.to_string().contains("changed after application"));
+            assert!(
+                conn.query_sync(
+                    "SELECT name FROM sqlite_master WHERE name = 'forbidden'",
+                    &[]
+                )
+                .unwrap()
+                .is_empty()
+            );
+        });
     }
 
     fn insert_inbox_stats_test_project(conn: &DbConn) {

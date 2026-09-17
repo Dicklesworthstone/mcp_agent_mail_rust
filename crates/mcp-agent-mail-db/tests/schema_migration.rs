@@ -2223,6 +2223,41 @@ fn frankenconnection_autoincrement_write() {
     }
 }
 
+/// Persisted runtime CREATE text must remain usable by canonical recovery DDL.
+#[test]
+fn franken_created_schema_accepts_canonical_add_column() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("canonical_add_column.db");
+    let path = path.to_string_lossy().into_owned();
+    let conn = SqliteConnection::open_file(&path).expect("open runtime database");
+    conn.execute_raw(
+        "CREATE TABLE IF NOT EXISTS witness(id INTEGER PRIMARY KEY, value INTEGER); \
+         INSERT INTO witness VALUES(1, 42)",
+    )
+    .expect("create runtime schema");
+    drop(conn);
+    let canonical = mcp_agent_mail_db::CanonicalDbConn::open_file(&path)
+        .expect("open canonical database after runtime close");
+    canonical
+        .execute_raw("ALTER TABLE witness ADD COLUMN topic TEXT DEFAULT 'kept'")
+        .expect("canonical ALTER must accept persisted CREATE text");
+    let rows = canonical
+        .query_sync("SELECT value, topic FROM witness WHERE id = 1", &[])
+        .expect("read canonical altered table");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get_named::<i64>("value").unwrap(), 42);
+    assert_eq!(rows[0].get_named::<String>("topic").unwrap(), "kept");
+    let integrity = canonical.query_sync("PRAGMA integrity_check", &[]).unwrap();
+    assert_eq!(integrity[0].get_as::<String>(0).unwrap(), "ok");
+    drop(canonical);
+    let reopened = SqliteConnection::open_file(&path).expect("reopen runtime database");
+    let rows = reopened
+        .query_sync("SELECT value, topic FROM witness WHERE id = 1", &[])
+        .expect("runtime must read canonical schema alteration");
+    assert_eq!(rows[0].get_named::<i64>("value").unwrap(), 42);
+    assert_eq!(rows[0].get_named::<String>("topic").unwrap(), "kept");
+}
+
 /// Does `FrankenConnection` corrupt with a read-only query?
 #[test]
 fn frankenconnection_read_only_no_corruption() {
