@@ -322,7 +322,11 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
             )
         };
 
-        let full_due = full_check_due(config, full_every, last_full_attempt);
+        // A quick pass cannot release a corruption refusal. Recheck the
+        // actual mailbox in full on this cycle instead of waiting up to the
+        // normal full-check interval (or forever when that schedule is off).
+        let full_due = full_check_due(config, full_every, last_full_attempt)
+            || mcp_agent_mail_db::corruption_circuit_breaker().is_tripped();
         run_integrity_followups(
             quick_cycle_passed,
             full_due,
@@ -413,6 +417,14 @@ fn run_quick_cycle(
     match pool.run_periodic_integrity_check() {
         Ok(_) => {
             standing_defects.clear("quick_check");
+            if mcp_agent_mail_db::corruption_circuit_breaker().is_tripped() {
+                // Continue to the full recovery probe, but do not checkpoint,
+                // refresh backups, or reconcile the still-suspect live store.
+                tracing::debug!(
+                    "integrity guard: quick check passed; full verification required before releasing corruption refusal"
+                );
+                return true;
+            }
             if take_deferred_proactive_backup() {
                 tracing::debug!(
                     "integrity guard: deferred proactive backup during startup quick cycle"
@@ -464,6 +476,7 @@ fn run_full_cycle(
     last_recovery_attempt: &mut Option<Instant>,
     standing_defects: &mut StandingDefectLog,
 ) -> bool {
+    let recovery_check = mcp_agent_mail_db::corruption_circuit_breaker().begin_recovery_check();
     match pool.run_full_integrity_check() {
         Ok(_) => {
             standing_defects.clear("integrity_check");
@@ -474,18 +487,41 @@ fn run_full_cycle(
             // through their index btrees on the same full-check cadence.
             // Runs BEFORE the verified-snapshot capture so a desynced DB is
             // never recorded as last-known-healthy.
-            if let Some(mismatch) = run_index_table_cross_count(sqlite_path) {
-                handle_integrity_error_with_log(
-                    "index_table_cross_count",
-                    &mismatch,
-                    sqlite_path,
-                    storage_root,
-                    last_recovery_attempt,
-                    standing_defects,
+            match run_index_table_cross_count(sqlite_path) {
+                Ok(None) => {}
+                Ok(Some(mismatch)) => {
+                    handle_integrity_error_with_log(
+                        "index_table_cross_count",
+                        &mismatch,
+                        sqlite_path,
+                        storage_root,
+                        last_recovery_attempt,
+                        standing_defects,
+                    );
+                    return false;
+                }
+                Err(error) => {
+                    // Unavailable evidence is not proof of corruption, but it
+                    // also cannot authorize recovery, snapshots, or maintenance.
+                    handle_integrity_error_with_log(
+                        "index_table_cross_count_probe",
+                        &error,
+                        sqlite_path,
+                        storage_root,
+                        last_recovery_attempt,
+                        standing_defects,
+                    );
+                    return false;
+                }
+            }
+            standing_defects.clear("index_table_cross_count_probe");
+            standing_defects.clear("index_table_cross_count");
+            if !recovery_check.reset_if_unchanged() {
+                tracing::warn!(
+                    "integrity guard: newer corruption invalidated full-check evidence; retaining write refusal and skipping maintenance"
                 );
                 return false;
             }
-            standing_defects.clear("index_table_cross_count");
             // Bead K2: a passing full check means the DB is verifiably clean —
             // capture a last-known-healthy verified snapshot (best-effort; the
             // call re-verifies and records metrics, and never fails the cycle).
@@ -563,53 +599,32 @@ fn open_index_table_cross_count_connection(
 
 /// Run the GH#214 index-vs-table cross-count against a read-only connection.
 ///
-/// Returns the first mismatch rendered as a corruption-classifiable message,
-/// or `None` when every probed table agrees with its indexes (or the probe
-/// itself could not run — probe failures are logged and are NOT corruption
-/// evidence). Honest scope: this catches the desync class only; a mutually
+/// Returns `Ok(Some(message))` for a mismatch, `Ok(None)` after a completed
+/// comparison with no mismatch, and `Err` for unavailable evidence. Probe
+/// failures are not automatically corruption, but must not authorize recovery.
+/// Honest scope: this catches the desync class only; a mutually
 /// consistent database missing acknowledged rows (the GH#213 Windows silent
 /// class) is invisible to any server-side arithmetic.
-fn run_index_table_cross_count(sqlite_path: &Path) -> Option<String> {
-    let conn = match open_index_table_cross_count_connection(sqlite_path) {
-        Ok(conn) => conn,
-        Err(err) => {
-            tracing::debug!(
-                error = %err,
-                "integrity guard: cross-count read-only open failed; skipping this cycle"
-            );
-            return None;
-        }
-    };
+fn run_index_table_cross_count(sqlite_path: &Path) -> Result<Option<String>, String> {
+    let conn = open_index_table_cross_count_connection(sqlite_path)
+        .map_err(|error| format!("cross-count read-only open failed: {error}"))?;
     let result = mcp_agent_mail_db::integrity::index_table_cross_count(&conn, CROSS_COUNT_TABLES);
     // This is a true read-only observer. Its ordinary Drop path preserves the
     // live WAL/namespace family; the writable close helper may checkpoint it.
     drop(conn);
-    match result {
-        Ok(mismatches) => {
-            if mismatches.is_empty() {
-                return None;
-            }
-            for mismatch in &mismatches {
-                tracing::error!(
-                    table = %mismatch.table,
-                    index = %mismatch.index,
-                    table_rows = mismatch.table_rows,
-                    index_rows = mismatch.index_rows,
-                    "integrity guard: index/table cross-count desync (GH#214)"
-                );
-            }
-            mismatches
-                .first()
-                .map(mcp_agent_mail_db::integrity::CrossCountMismatch::as_corruption_message)
-        }
-        Err(err) => {
-            tracing::debug!(
-                error = %err,
-                "integrity guard: cross-count probe failed; skipping this cycle"
-            );
-            None
-        }
+    let mismatches = result.map_err(|error| format!("cross-count probe failed: {error}"))?;
+    for mismatch in &mismatches {
+        tracing::error!(
+            table = %mismatch.table,
+            index = %mismatch.index,
+            table_rows = mismatch.table_rows,
+            index_rows = mismatch.index_rows,
+            "integrity guard: index/table cross-count desync (GH#214)"
+        );
     }
+    Ok(mismatches
+        .first()
+        .map(mcp_agent_mail_db::integrity::CrossCountMismatch::as_corruption_message))
 }
 
 /// Whether a maintenance task with cadence `interval_secs` is due, given when
@@ -1060,7 +1075,9 @@ mod tests {
         mcp_agent_mail_db::close_db_conn(conn, "cross-count test");
 
         assert!(
-            run_index_table_cross_count(&path).is_none(),
+            run_index_table_cross_count(&path)
+                .expect("healthy cross-count probe must complete")
+                .is_none(),
             "healthy database must not report a cross-count desync"
         );
     }
@@ -1109,7 +1126,9 @@ mod tests {
         drop(observer);
 
         assert!(
-            run_index_table_cross_count(&path).is_none(),
+            run_index_table_cross_count(&path)
+                .expect("healthy WAL cross-count probe must complete")
+                .is_none(),
             "healthy cross-count fixture must not report desync"
         );
         assert_eq!(
@@ -1125,13 +1144,13 @@ mod tests {
     }
 
     #[test]
-    fn cross_count_missing_file_reports_none() {
+    fn cross_count_missing_file_reports_unavailable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("never-created.sqlite3");
-        assert!(
-            run_index_table_cross_count(&path).is_none(),
-            "an unopenable database is a probe failure, not corruption evidence"
-        );
+        let error = run_index_table_cross_count(&path)
+            .expect_err("an unopenable database must not become a completed clean probe");
+        assert!(error.contains("cross-count read-only open failed"));
+        assert!(!path.exists(), "the failed observer must not create a database");
     }
 
     #[test]
@@ -1250,8 +1269,8 @@ mod tests {
                 "unexpected cross-count refusal for {breaker_kind}: {error}"
             );
             assert!(
-                run_index_table_cross_count(&path).is_none(),
-                "the aggregate must degrade rather than inspect a refused family"
+                run_index_table_cross_count(&path).is_err(),
+                "the aggregate must report unavailable evidence for a refused family"
             );
             assert_eq!(
                 snapshot_namespace(dir.path()),
