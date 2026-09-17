@@ -11,9 +11,9 @@
 //! This is deliberately distinct from the auto-recovering, time-reset
 //! per-subsystem breakers in [`crate::retry`] (which are for transient
 //! contention, classed `RESOURCE_BUSY`). Corruption must NOT auto-recover on a
-//! timer; it clears only when the database is verified healthy again (a clean
-//! integrity check calls [`reset_corruption_circuit_breaker`]) or the process
-//! restarts.
+//! timer. Automatic recovery requires the live-mailbox owner's full check
+//! and an unchanged corruption epoch. Quick checks and diagnostic copies do
+//! not release writes. Explicit operator reset or process restart is separate.
 //!
 //! ## Scope: writes only, server only
 //!
@@ -155,8 +155,23 @@ impl CorruptionCircuitBreaker {
         )))
     }
 
-    /// Clear the breaker. Called by a clean integrity check (self-heal) and
-    /// available to operators/tests. The lifetime observation count is retained.
+    /// Capture the corruption observations that precede a recovery check.
+    ///
+    /// The live-mailbox owner must obtain this token BEFORE its full integrity
+    /// probe and complete it only after that probe and its required follow-up
+    /// checks pass. Quick checks, diagnostic copies, and decoded result rows
+    /// alone cannot authorize recovery. Any newer corruption observation
+    /// invalidates the token, even while the breaker is already open.
+    pub fn begin_recovery_check(&self) -> CorruptionRecoveryCheck<'_> {
+        CorruptionRecoveryCheck {
+            breaker: self,
+            observed_trip_count: self.lock_state().trip_count,
+        }
+    }
+
+    /// Explicit operator/test reset. Automatic recovery must instead use
+    /// [`Self::begin_recovery_check`] so stale evidence cannot reopen writes.
+    /// The lifetime observation count is retained.
     pub fn reset(&self) {
         let mut state = self.lock_state();
         state.detail = None;
@@ -178,6 +193,39 @@ impl CorruptionCircuitBreaker {
     }
 }
 
+/// Single-use evidence token tied to the breaker that issued it.
+///
+/// Dropping the token does nothing: a failed, cancelled, or abandoned check
+/// never clears the breaker. The token intentionally is neither `Copy` nor
+/// `Clone`, and its private fields prevent callers from fabricating an epoch.
+#[derive(Debug)]
+#[must_use = "complete only after a successful full check of the live mailbox"]
+pub struct CorruptionRecoveryCheck<'a> {
+    breaker: &'a CorruptionCircuitBreaker,
+    observed_trip_count: u64,
+}
+
+impl CorruptionRecoveryCheck<'_> {
+    /// Clear this breaker's evidence only if no corruption has been observed
+    /// since the token was issued. The caller is responsible for establishing
+    /// a successful full check of the live mailbox before calling this method.
+    ///
+    /// Returns false when the evidence is stale. A saturated lifetime counter
+    /// also refuses automatic recovery: equality can no longer prove that no
+    /// newer observation occurred. Explicit operator reset remains available.
+    #[must_use]
+    pub fn reset_if_unchanged(self) -> bool {
+        let mut state = self.breaker.lock_state();
+        if state.trip_count == u64::MAX || state.trip_count != self.observed_trip_count {
+            return false;
+        }
+        state.detail = None;
+        self.breaker.tripped.store(false, Ordering::Release);
+        drop(state);
+        true
+    }
+}
+
 /// Serializable snapshot for health/robot surfaces.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CorruptionBreakerSnapshot {
@@ -196,8 +244,9 @@ pub fn corruption_circuit_breaker() -> &'static CorruptionCircuitBreaker {
     BREAKER.get_or_init(CorruptionCircuitBreaker::default)
 }
 
-/// Clear the process-global corruption circuit breaker (called when an
-/// integrity check passes, and available to operators).
+/// Explicitly clear the process-global corruption circuit breaker.
+/// Automatic recovery must use a token from `begin_recovery_check` and
+/// complete it only after full verification of the live mailbox.
 pub fn reset_corruption_circuit_breaker() {
     corruption_circuit_breaker().reset();
 }
@@ -207,6 +256,109 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn verified_recovery_preserves_lifetime_observations() {
+        let breaker = CorruptionCircuitBreaker::default();
+        breaker.trip(DbErrorClass::MainDbBtreeCorruption, "original damage");
+        assert!(breaker.begin_recovery_check().reset_if_unchanged());
+        assert!(!breaker.is_tripped());
+        assert!(breaker.refusal_error().is_none());
+        assert_eq!(breaker.trip_count(), 1);
+    }
+
+    #[test]
+    fn recovery_cannot_clear_an_observation_after_the_probe_started() {
+        let breaker = CorruptionCircuitBreaker::default();
+        let check = breaker.begin_recovery_check();
+        breaker.trip(DbErrorClass::MainDbBtreeCorruption, "new damage");
+        assert!(!check.reset_if_unchanged());
+        assert!(breaker.is_tripped());
+        assert!(
+            breaker
+                .refusal_error()
+                .unwrap()
+                .to_string()
+                .contains("new damage")
+        );
+    }
+
+    #[test]
+    fn repeated_damage_invalidates_an_open_epoch_recovery() {
+        let breaker = CorruptionCircuitBreaker::default();
+        breaker.trip(DbErrorClass::MainDbBtreeCorruption, "first damage");
+        let check = breaker.begin_recovery_check();
+        breaker.trip(DbErrorClass::WalSidecarCorruption, "later damage");
+        assert!(!check.reset_if_unchanged());
+        assert!(breaker.is_tripped());
+        assert_eq!(breaker.trip_count(), 2);
+        assert!(
+            breaker
+                .refusal_error()
+                .unwrap()
+                .to_string()
+                .contains("first damage")
+        );
+    }
+
+    #[test]
+    fn recovery_cannot_clear_a_reset_and_retrip_epoch() {
+        let breaker = CorruptionCircuitBreaker::default();
+        breaker.trip(DbErrorClass::MainDbBtreeCorruption, "old damage");
+        let check = breaker.begin_recovery_check();
+        breaker.reset();
+        breaker.trip(DbErrorClass::WalSidecarCorruption, "new epoch");
+        assert!(!check.reset_if_unchanged());
+        assert_eq!(
+            breaker.snapshot().class.as_deref(),
+            Some("wal_sidecar_corruption")
+        );
+    }
+
+    #[test]
+    fn abandoning_recovery_does_not_release_writes() {
+        let breaker = CorruptionCircuitBreaker::default();
+        breaker.trip(DbErrorClass::MainDbBtreeCorruption, "unrepaired damage");
+        {
+            let _check = breaker.begin_recovery_check();
+        }
+        assert!(breaker.is_tripped());
+        assert_eq!(breaker.trip_count(), 1);
+    }
+
+    #[test]
+    fn saturated_observation_counter_refuses_automatic_recovery() {
+        let breaker = CorruptionCircuitBreaker::default();
+        breaker.trip(DbErrorClass::MainDbBtreeCorruption, "damage");
+        breaker.lock_state().trip_count = u64::MAX;
+        let check = breaker.begin_recovery_check();
+        breaker.trip(DbErrorClass::MainDbBtreeCorruption, "untrackable newer damage");
+        assert!(!check.reset_if_unchanged());
+        assert!(breaker.is_tripped());
+    }
+
+    #[test]
+    fn concurrent_corruption_invalidates_an_in_flight_full_probe() {
+        let breaker = CorruptionCircuitBreaker::default();
+        breaker.trip(DbErrorClass::MainDbBtreeCorruption, "original damage");
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (finish_tx, finish_rx) = mpsc::channel();
+            let breaker_ref = &breaker;
+            let worker = scope.spawn(move || {
+                let check = breaker_ref.begin_recovery_check();
+                started_tx.send(()).unwrap();
+                finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                check.reset_if_unchanged()
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            breaker.trip(DbErrorClass::WalSidecarCorruption, "concurrent damage");
+            finish_tx.send(()).unwrap();
+            assert!(!worker.join().unwrap());
+        });
+        assert!(breaker.is_tripped());
+        assert_eq!(breaker.trip_count(), 2);
+    }
 
     #[test]
     fn trips_refuses_and_resets() {

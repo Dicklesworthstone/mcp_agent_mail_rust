@@ -716,17 +716,25 @@ pub fn extract_check_details(rows: &[Row], kind: CheckKind) -> Vec<String> {
 
     let mut details: Vec<String> = rows
         .iter()
-        .filter_map(|row| {
-            if let Some(Value::Text(text)) = row.get_by_name(primary_column) {
-                Some(text.clone())
-            } else if let Some(Value::Text(text)) = row.get_by_name("integrity_check") {
-                Some(text.clone())
-            } else if let Some(Value::Text(text)) = row.get_by_name("quick_check") {
-                Some(text.clone())
-            } else if let Some(Value::Text(text)) = row.values().next() {
-                Some(text.clone())
-            } else {
-                None
+        .enumerate()
+        .map(|(index, row)| {
+            // A present but non-text authoritative column is invalid evidence;
+            // do not replace it with an unrelated text column or silently drop
+            // the row. Otherwise `[ok, NULL]` would become a healthy verdict.
+            let value = row
+                .get_by_name(primary_column)
+                .or_else(|| row.get_by_name("integrity_check"))
+                .or_else(|| row.get_by_name("quick_check"))
+                .or_else(|| row.values().next());
+            match value {
+                Some(Value::Text(text)) if !text.trim().is_empty() => text.clone(),
+                Some(Value::Text(_)) => {
+                    format!("{kind} row {} contained empty check output", index + 1)
+                }
+                _ => format!(
+                    "{kind} row {} had no extractable text check value",
+                    index + 1
+                ),
             }
         })
         // GH#247: some drivers return the ENTIRE check output as one
@@ -953,10 +961,11 @@ pub fn evaluate_check_rows(
         // since-last-ok counter so `failures_since_last_ok` reflects current
         // state (0), while `failures_total` stays as the lifetime trend tally.
         s.failures_since_last_ok.store(0, Ordering::Relaxed);
-        // K3 (br-bvq1x.11.3): a clean integrity check means the database is
-        // healthy again, so clear the corruption circuit breaker (self-heal
-        // after `am doctor repair`/`reconstruct`) and let writes resume.
-        crate::corruption_circuit_breaker().reset();
+        // Decoded rows carry neither mailbox identity nor the corruption
+        // epoch at probe start. In particular, a quick check or a successful
+        // recovery-copy diagnostic must not reopen writes to the live store.
+        // The live-mailbox guard authorizes recovery after a full check via
+        // begin_recovery_check()/reset_if_unchanged().
     } else {
         s.failures_total.fetch_add(1, Ordering::Relaxed);
         s.failures_since_last_ok.fetch_add(1, Ordering::Relaxed);
@@ -1119,8 +1128,10 @@ impl CrossCountMismatch {
 ///   coverage belongs to per-row point lookups);
 /// - partial indexes (`CREATE INDEX ... WHERE ...` legitimately holds fewer
 ///   entries than the table);
-/// - indexes whose forced probe errors (engine probe limitations are not
-///   corruption evidence; the error is reported via `tracing` only).
+///
+/// A failed forced probe is unavailable evidence, not corruption by itself.
+/// It returns an error rather than a successful empty mismatch list, so the
+/// recovery guard cannot mistake incomplete coverage for a verified pass.
 ///
 /// Honest scope note: this catches the loud desync class (index and table
 /// btrees disagree). It cannot see the GH#213 Windows silent-loss class,
@@ -1142,6 +1153,100 @@ pub fn index_table_cross_count(
     result
 }
 
+/// Missing, mistyped, or multiple count rows are unavailable evidence, not
+/// an empty table/index. Returning an error preserves that distinction all
+/// the way to the live-mailbox recovery gate.
+fn cross_count_value(rows: &[Row], context: &str) -> DbResult<i64> {
+    let [row] = rows else {
+        return Err(DbError::Sqlite(format!(
+            "cross-count {context}: expected one count row, received {}",
+            rows.len()
+        )));
+    };
+    let count = row.get_named::<i64>("c").map_err(|error| {
+        DbError::Sqlite(format!("cross-count {context}: invalid count value: {error}"))
+    })?;
+    if count < 0 {
+        return Err(DbError::Sqlite(format!(
+            "cross-count {context}: negative count {count}"
+        )));
+    }
+    Ok(count)
+}
+
+fn quote_cross_count_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+/// Detect the partial-index WHERE keyword without confusing it with text in
+/// identifiers, literals, or comments. Schema DDL is engine-owned, but an
+/// unreadable/unterminated definition still cannot authorize a skipped probe.
+fn cross_count_index_is_partial(sql: &str) -> DbResult<bool> {
+    if sql.trim().is_empty() {
+        return Err(DbError::Sqlite("cross-count index DDL is empty".to_string()));
+    }
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut partial = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' | b'[' => {
+                let opening = bytes[i];
+                let closing = if opening == b'[' { b']' } else { opening };
+                i += 1;
+                loop {
+                    if i == bytes.len() {
+                        return Err(DbError::Sqlite(
+                            "cross-count index DDL contains unterminated quoting".to_string(),
+                        ));
+                    }
+                    if bytes[i] == closing {
+                        i += 1;
+                        if opening != b'[' && bytes.get(i) == Some(&closing) {
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                i += 2;
+                while i < bytes.len() && !matches!(bytes[i], b'\n' | b'\r') {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && &bytes[i..i + 2] != b"*/" {
+                    i += 1;
+                }
+                if i + 1 >= bytes.len() {
+                    return Err(DbError::Sqlite(
+                        "cross-count index DDL contains an unterminated comment".to_string(),
+                    ));
+                }
+                i += 2;
+            }
+            byte if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte >= 0x80 => {
+                let start = i;
+                i += 1;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric()
+                        || matches!(bytes[i], b'_' | b'$')
+                        || bytes[i] >= 0x80)
+                {
+                    i += 1;
+                }
+                partial |= bytes[start..i].eq_ignore_ascii_case(b"where");
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(partial)
+}
+
 fn index_table_cross_count_snapshot(
     conn: &impl crate::pool::SyncQuery,
     tables: &[&str],
@@ -1154,25 +1259,19 @@ fn index_table_cross_count_snapshot(
                 &[Value::Text((*table).to_string())],
             )
             .map_err(|error| DbError::Sqlite(format!("cross-count table probe failed: {error}")))?;
-        let exists: i64 = exists_rows
-            .first()
-            .and_then(|row| row.get_named("c").ok())
-            .unwrap_or(0);
+        let exists = cross_count_value(&exists_rows, &format!("catalog lookup for {table}"))?;
         if exists == 0 {
             continue;
         }
 
-        let table_sql = format!("SELECT count(*) AS c FROM \"{table}\" NOT INDEXED");
-        let table_rows: i64 = conn
-            .query_sync(&table_sql, &[])
-            .map_err(|error| {
-                DbError::Sqlite(format!(
-                    "cross-count NOT INDEXED scan of {table} failed: {error}"
-                ))
-            })?
-            .first()
-            .and_then(|row| row.get_named("c").ok())
-            .unwrap_or(0);
+        let quoted_table = quote_cross_count_identifier(table);
+        let table_sql = format!("SELECT count(*) AS c FROM {quoted_table} NOT INDEXED");
+        let table_count_rows = conn.query_sync(&table_sql, &[]).map_err(|error| {
+            DbError::Sqlite(format!(
+                "cross-count NOT INDEXED scan of {table} failed: {error}"
+            ))
+        })?;
+        let table_rows = cross_count_value(&table_count_rows, &format!("table scan of {table}"))?;
 
         let index_rows = conn
             .query_sync(
@@ -1181,42 +1280,40 @@ fn index_table_cross_count_snapshot(
             )
             .map_err(|error| DbError::Sqlite(format!("cross-count index list failed: {error}")))?;
         for row in &index_rows {
-            let Ok(index) = row.get_named::<String>("name") else {
-                continue;
-            };
+            let index = row.get_named::<String>("name").map_err(|error| {
+                DbError::Sqlite(format!(
+                    "cross-count index name for {table} is unreadable: {error}"
+                ))
+            })?;
             if index.starts_with("sqlite_autoindex_") {
                 continue;
             }
             // Partial indexes legitimately hold fewer entries than the table.
-            let create_sql = row.get_named::<String>("sql").unwrap_or_default();
-            if create_sql.to_ascii_uppercase().contains("WHERE") {
+            // Match a SQL keyword, not names such as `idx_somewhere`, quoted
+            // identifiers, string literals, or comments containing WHERE.
+            let create_sql = row.get_named::<String>("sql").map_err(|error| {
+                DbError::Sqlite(format!("cross-count DDL for {index} is unreadable: {error}"))
+            })?;
+            if cross_count_index_is_partial(&create_sql)? {
                 continue;
             }
-            let forced_sql =
-                format!("SELECT count(*) AS c FROM \"{table}\" INDEXED BY \"{index}\" WHERE 1");
-            match conn.query_sync(&forced_sql, &[]) {
-                Ok(rows) => {
-                    let forced: i64 = rows
-                        .first()
-                        .and_then(|row| row.get_named("c").ok())
-                        .unwrap_or(0);
-                    if forced != table_rows {
-                        mismatches.push(CrossCountMismatch {
-                            table: (*table).to_string(),
-                            index,
-                            table_rows,
-                            index_rows: forced,
-                        });
-                    }
-                }
-                Err(error) => {
-                    tracing::debug!(
-                        table,
-                        index,
-                        %error,
-                        "cross-count forced-index probe failed; skipping index (probe limitation, not corruption evidence)"
-                    );
-                }
+            let quoted_index = quote_cross_count_identifier(&index);
+            let forced_sql = format!(
+                "SELECT count(*) AS c FROM {quoted_table} INDEXED BY {quoted_index} WHERE 1"
+            );
+            let rows = conn.query_sync(&forced_sql, &[]).map_err(|error| {
+                DbError::Sqlite(format!(
+                    "cross-count forced-index scan of {table}/{index} failed: {error}"
+                ))
+            })?;
+            let forced = cross_count_value(&rows, &format!("index scan of {table}/{index}"))?;
+            if forced != table_rows {
+                mismatches.push(CrossCountMismatch {
+                    table: (*table).to_string(),
+                    index,
+                    table_rows,
+                    index_rows: forced,
+                });
             }
         }
     }
@@ -1227,6 +1324,65 @@ fn index_table_cross_count_snapshot(
 mod tests {
     use super::*;
     use std::sync::{LazyLock, Mutex};
+
+    #[test]
+    fn mixed_ok_and_nontext_integrity_rows_fail_closed() {
+        for invalid in [Value::Null, Value::BigInt(0)] {
+            let rows = vec![
+                Row::new(
+                    vec!["integrity_check".to_string()],
+                    vec![Value::Text("ok".to_string())],
+                ),
+                Row::new(vec!["integrity_check".to_string()], vec![invalid]),
+            ];
+            let details = extract_check_details(&rows, CheckKind::Full);
+            assert_eq!(details.len(), 2);
+            assert!(!details_indicate_ok(&details));
+            assert!(details[1].contains("row 2"));
+        }
+    }
+
+    #[test]
+    fn mixed_ok_and_blank_integrity_rows_fail_closed() {
+        for blank in ["", " ", "\n\r\t"] {
+            let rows = vec![
+                Row::new(
+                    vec!["quick_check".to_string()],
+                    vec![Value::Text("ok".to_string())],
+                ),
+                Row::new(
+                    vec!["quick_check".to_string()],
+                    vec![Value::Text(blank.to_string())],
+                ),
+            ];
+            let details = extract_check_details(&rows, CheckKind::Quick);
+            assert_eq!(details.len(), 2);
+            assert!(!details_indicate_ok(&details));
+        }
+    }
+
+    #[test]
+    fn invalid_named_verdict_is_not_replaced_by_unrelated_ok_text() {
+        let rows = vec![Row::new(
+            vec!["other".to_string(), "integrity_check".to_string()],
+            vec![Value::Text("ok".to_string()), Value::Null],
+        )];
+        let details = extract_check_details(&rows, CheckKind::Full);
+        assert!(!details_indicate_ok(&details));
+        assert!(details[0].contains("no extractable text"));
+    }
+
+    #[test]
+    fn unnamed_text_verdict_remains_supported() {
+        let rows = vec![Row::new(
+            vec!["driver_result".to_string()],
+            vec![Value::Text("ok".to_string())],
+        )];
+        assert!(details_indicate_ok(&extract_check_details(
+            &rows,
+            CheckKind::Full
+        )));
+    }
 
     // GH#286: typed classification of integrity-check detail rows.
     #[test]
@@ -1286,6 +1442,68 @@ mod tests {
         assert_eq!(c.index_errors, 2);
         assert_eq!(c.leaked_pages, 1);
         assert_eq!(c.structural_errors, 0);
+    }
+
+    #[test]
+    fn cross_count_rejects_missing_or_invalid_count_evidence() {
+        assert!(cross_count_value(&[], "empty result").is_err());
+        assert!(cross_count_value(&[Row::new(vec![], vec![])], "missing column").is_err());
+        for value in [Value::Null, Value::Text("ok".to_string()), Value::BigInt(-1)] {
+            let rows = vec![Row::new(vec!["c".to_string()], vec![value])];
+            assert!(cross_count_value(&rows, "invalid value").is_err());
+        }
+        let count_row = || Row::new(vec!["c".to_string()], vec![Value::BigInt(0)]);
+        assert!(cross_count_value(&[count_row(), count_row()], "multiple rows").is_err());
+        assert_eq!(cross_count_value(&[count_row()], "empty table").unwrap(), 0);
+    }
+
+    #[test]
+    fn cross_count_quotes_embedded_identifier_quotes() {
+        assert_eq!(quote_cross_count_identifier("ordinary"), "\"ordinary\"");
+        assert_eq!(quote_cross_count_identifier("odd\"name"), "\"odd\"\"name\"");
+    }
+
+    #[test]
+    fn cross_count_partial_detection_ignores_names_literals_and_comments() {
+        for sql in [
+            "CREATE INDEX idx_somewhere ON t(x)",
+            "CREATE INDEX where_suffix ON t(x)",
+            "CREATE INDEX i ON t(\"WHERE\")",
+            "CREATE INDEX i ON t([where])",
+            "CREATE INDEX i ON t(`where`)",
+            "CREATE INDEX i ON t((x || 'WHERE'))",
+            "CREATE INDEX i ON t((x || 'it''s WHERE'))",
+            "CREATE INDEX \"odd\"\"where\" ON t(x)",
+            "CREATE INDEX i ON t(x) /* WHERE x > 1 */",
+            "CREATE INDEX i ON t(x) -- WHERE x > 1\n",
+        ] {
+            assert!(!cross_count_index_is_partial(sql).unwrap(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn cross_count_partial_detection_recognizes_real_predicates() {
+        for sql in [
+            "CREATE INDEX i ON t(x) WHERE x > 1",
+            "CREATE INDEX i ON t(x)\nwhere x IS NOT NULL",
+            "CREATE INDEX i ON t(x) /* comment */ WHERE x = 1",
+            "CREATE INDEX i ON t(x) WHERE/* comment */x = 1",
+        ] {
+            assert!(cross_count_index_is_partial(sql).unwrap(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn cross_count_partial_detection_rejects_unreadable_ddl() {
+        for sql in [
+            "",
+            " ",
+            "CREATE INDEX \"unfinished",
+            "CREATE INDEX i ON t([x)",
+            "CREATE INDEX i ON t(x) /* unfinished",
+        ] {
+            assert!(cross_count_index_is_partial(sql).is_err(), "{sql:?}");
+        }
     }
 
     static TEST_STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -1732,7 +1950,6 @@ mod tests {
             .expect("insert");
         conn.execute_raw("INSERT INTO test (id, name) VALUES (2, 'beta')")
             .expect("insert");
-
         let qr = quick_check(&conn).expect("quick_check");
         assert!(qr.ok);
         let ir = incremental_check(&conn).expect("incremental_check");
@@ -2367,6 +2584,103 @@ mod tests {
     fn cross_count_franken_releases_snapshot_after_query_error() {
         cross_count_releases_snapshot_after_query_error(
             &DbConn::open_memory().expect("runtime error fixture"),
+        );
+    }
+
+    /// Every call still reaches the real engine. Only the forced-index SQL
+    /// is changed to an invalid statement to exercise actual probe failure.
+    struct CrossCountForcedIndexFailure<'a, C>(&'a C);
+
+    impl<C: crate::pool::SyncQuery> crate::pool::SyncQuery for CrossCountForcedIndexFailure<'_, C> {
+        fn query_sync(
+            &self,
+            sql: &str,
+            params: &[Value],
+        ) -> Result<Vec<Row>, sqlmodel_core::Error> {
+            if sql.contains("INDEXED BY") {
+                self.0
+                    .query_sync("SELECT missing FROM absent_forced_index_fixture", &[])
+            } else {
+                self.0.query_sync(sql, params)
+            }
+        }
+
+        fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+            self.0.execute_raw(sql)
+        }
+    }
+
+    fn assert_failed_forced_index_probe_is_inconclusive(conn: &impl crate::pool::SyncQuery) {
+        conn.execute_raw("CREATE TABLE cc_force_error (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("create table");
+        conn.execute_raw("CREATE INDEX idx_cc_force_error ON cc_force_error(name)")
+            .expect("create index");
+        let error = index_table_cross_count(&CrossCountForcedIndexFailure(conn), &["cc_force_error"])
+            .expect_err("a failed forced scan cannot certify agreement");
+        assert!(error.to_string().contains("forced-index scan"));
+        conn.execute_raw("BEGIN")
+            .expect("failed forced probe must release its read savepoint");
+        conn.execute_raw("ROLLBACK").expect("finish caller transaction");
+    }
+
+    #[test]
+    fn canonical_failed_forced_index_probe_is_not_a_clean_cross_count() {
+        assert_failed_forced_index_probe_is_inconclusive(
+            &crate::CanonicalDbConn::open_memory().expect("canonical fixture"),
+        );
+    }
+
+    #[test]
+    fn franken_failed_forced_index_probe_is_not_a_clean_cross_count() {
+        assert_failed_forced_index_probe_is_inconclusive(
+            &DbConn::open_memory().expect("runtime fixture"),
+        );
+    }
+
+    #[test]
+    fn canonical_cross_count_checks_full_indexes_named_somewhere() {
+        let conn = crate::CanonicalDbConn::open_memory().expect("canonical fixture");
+        conn.execute_raw(
+            "CREATE TABLE cc_keyword (id INTEGER PRIMARY KEY, name TEXT); \
+             CREATE INDEX idx_somewhere ON cc_keyword(name); \
+             INSERT INTO cc_keyword (name) VALUES ('first'), ('second'); \
+             CREATE TABLE cc_keyword_empty (id INTEGER PRIMARY KEY, name TEXT); \
+             CREATE INDEX idx_keyword_empty ON cc_keyword_empty(name);",
+        )
+        .expect("create real btrees");
+        conn.execute_raw(
+            "PRAGMA writable_schema=ON; \
+             UPDATE sqlite_master SET rootpage=( \
+                 SELECT rootpage FROM sqlite_master WHERE name='idx_keyword_empty' \
+             ) WHERE name='idx_somewhere'; \
+             PRAGMA writable_schema=OFF; \
+             PRAGMA schema_version=101;",
+        )
+        .expect("redirect only the private fixture index to an empty btree");
+        assert_eq!(
+            index_table_cross_count(&conn, &["cc_keyword"]).expect("real cross count"),
+            vec![CrossCountMismatch {
+                table: "cc_keyword".to_string(),
+                index: "idx_somewhere".to_string(),
+                table_rows: 2,
+                index_rows: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn canonical_cross_count_accepts_quoted_table_and_index_names() {
+        let conn = crate::CanonicalDbConn::open_memory().expect("canonical fixture");
+        conn.execute_raw(
+            r#"CREATE TABLE "mail""box" (id INTEGER PRIMARY KEY, body TEXT);
+               CREATE INDEX "idx""body" ON "mail""box"(body);
+               INSERT INTO "mail""box" (body) VALUES ('first'), ('second');"#,
+        )
+        .expect("create quoted identifiers");
+        assert!(
+            index_table_cross_count(&conn, &["mail\"box"])
+                .expect("quoted identifier cross count")
+                .is_empty()
         );
     }
 
