@@ -258,6 +258,8 @@ impl CacheConfig {
 /// Bounded LRU cache for search query results.
 ///
 /// Thread-safe via `RwLock` with interior mutability for metrics.
+/// Epoch transitions and entry access share the entries lock: a search begun
+/// before invalidation cannot insert into, or read from, a later generation.
 pub struct QueryCache<T> {
     config: CacheConfig,
     entries: RwLock<HashMap<QueryCacheKey, CacheEntry<T>>>,
@@ -290,15 +292,17 @@ impl<T: Clone> QueryCache<T> {
             return None;
         }
 
-        // Check epoch first (quick rejection)
+        let mut entries = self.entries.write().ok()?;
+        // Check while holding the same lock used by epoch transitions. A
+        // pre-lock check alone can pass and then wait across invalidation.
         if key.index_epoch != self.current_epoch.load(Ordering::Acquire) {
+            drop(entries);
             self.update_metrics(|metrics| {
                 metrics.misses += 1;
             });
             return None;
         }
 
-        let mut entries = self.entries.write().ok()?;
         let Some(entry) = entries.get_mut(key) else {
             // Key not found - miss
             drop(entries); // Release write lock before acquiring metrics lock
@@ -312,7 +316,8 @@ impl<T: Clone> QueryCache<T> {
         if entry.is_expired(self.config.ttl) {
             entries.remove(key);
             let current_entries = entries.len();
-            drop(entries);
+            // Publish the size before unlocking so a concurrent insertion or
+            // invalidation cannot have its newer count overwritten here.
             self.update_metrics(|metrics| {
                 metrics.misses += 1;
                 metrics.evictions_ttl += 1;
@@ -336,14 +341,15 @@ impl<T: Clone> QueryCache<T> {
             return;
         }
 
-        // Don't cache if epoch mismatch
-        if key.index_epoch != self.current_epoch.load(Ordering::Acquire) {
-            return;
-        }
-
         let Ok(mut entries) = self.entries.write() else {
             return;
         };
+
+        // Revalidate the query's generation inside the critical section,
+        // before it can evict a fresh entry or repopulate an invalidated cache.
+        if key.index_epoch != self.current_epoch.load(Ordering::Acquire) {
+            return;
+        }
 
         // Evict if at capacity
         if entries.len() >= self.config.max_entries && !entries.contains_key(&key) {
@@ -385,17 +391,7 @@ impl<T: Clone> QueryCache<T> {
     ///
     /// This is called when the index is updated, making all cached results stale.
     pub fn invalidate_all(&self) {
-        self.current_epoch.fetch_add(1, Ordering::Release);
-
-        if let Ok(mut entries) = self.entries.write() {
-            let count = entries.len();
-            entries.clear();
-
-            if let Ok(mut metrics) = self.metrics.write() {
-                metrics.evictions_epoch += count as u64;
-                metrics.current_entries = 0;
-            }
-        }
+        self.bump_epoch();
     }
 
     /// Get the current index epoch.
@@ -404,9 +400,27 @@ impl<T: Clone> QueryCache<T> {
         self.current_epoch.load(Ordering::Acquire)
     }
 
-    /// Bump the epoch (used when index is updated).
+    /// Advance the generation and reclaim all entries from the old generation.
+    ///
+    /// The transition is atomic with respect to `get` and `put`. Reclaiming
+    /// unreachable entries also prevents an epoch-only bump from retaining old
+    /// response bodies until TTL expiry or evicting useful new-generation data.
     pub fn bump_epoch(&self) -> u64 {
-        self.current_epoch.fetch_add(1, Ordering::Release) + 1
+        let mut entries = self
+            .entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next_epoch = self
+            .current_epoch
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let count = entries.len();
+        entries.clear();
+        self.update_metrics(|metrics| {
+            metrics.evictions_epoch += count as u64;
+            metrics.current_entries = 0;
+        });
+        next_epoch
     }
 
     /// Get cache metrics snapshot.
@@ -1027,6 +1041,82 @@ mod tests {
         cache.put(stale_key, 42);
         let metrics = cache.metrics();
         assert_eq!(metrics.inserts, 0, "stale epoch put should be rejected");
+    }
+
+    #[test]
+    fn test_bump_epoch_reclaims_old_response_bodies() {
+        let cache = QueryCache::with_defaults();
+        let response = Arc::new(vec![1_i64, 2, 3]);
+        let old_key = QueryCacheKey::without_filter("old", SearchMode::Hybrid, 0, 0, 10);
+        cache.put(old_key.clone(), Arc::clone(&response));
+        assert_eq!(Arc::strong_count(&response), 2);
+
+        assert_eq!(cache.bump_epoch(), 1);
+        assert_eq!(Arc::strong_count(&response), 1);
+        assert_eq!(cache.metrics().current_entries, 0);
+        assert_eq!(cache.metrics().evictions_epoch, 1);
+        assert!(cache.get(&old_key).is_none());
+    }
+
+    #[test]
+    fn test_stale_completion_cannot_evict_current_generation() {
+        let cache = QueryCache::new(CacheConfig {
+            max_entries: 1,
+            ..CacheConfig::default()
+        });
+        let old_key = QueryCacheKey::without_filter("old", SearchMode::Hybrid, 0, 0, 10);
+        cache.bump_epoch();
+        let new_key = QueryCacheKey::without_filter("new", SearchMode::Hybrid, 1, 0, 10);
+        cache.put(new_key.clone(), 7_i64);
+        cache.put(old_key.clone(), 99);
+
+        assert_eq!(cache.get(&new_key), Some(7));
+        assert_eq!(cache.get(&old_key), None);
+        assert_eq!(cache.metrics().inserts, 1);
+        assert_eq!(cache.metrics().evictions_capacity, 0);
+    }
+
+    #[test]
+    fn test_concurrent_epoch_transitions_and_queries_preserve_generation() {
+        let cache = QueryCache::new(CacheConfig {
+            max_entries: 8,
+            ..CacheConfig::default()
+        });
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let cache = &cache;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for iteration in 0..250 {
+                        if worker % 2 == 0 {
+                            cache.bump_epoch();
+                        } else {
+                            let epoch = cache.current_epoch();
+                            let key = QueryCacheKey::without_filter(
+                                &format!("worker-{worker}-{iteration}"),
+                                SearchMode::Hybrid,
+                                epoch,
+                                0,
+                                10,
+                            );
+                            cache.put(key.clone(), epoch);
+                            if let Some(value) = cache.get(&key) {
+                                assert_eq!(value, epoch);
+                            }
+                        }
+                        let entries = cache.entries.read().unwrap();
+                        let epoch = cache.current_epoch();
+                        assert!(entries.keys().all(|key| key.index_epoch == epoch));
+                        assert!(entries.len() <= 8);
+                    }
+                });
+            }
+        });
+        assert_eq!(cache.current_epoch(), 500);
+        cache.invalidate_all();
+        assert_eq!(cache.metrics().current_entries, 0);
     }
 
     // ── Hit rate calculation ──────────────────────────────────────
