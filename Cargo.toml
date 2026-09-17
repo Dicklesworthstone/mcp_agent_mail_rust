@@ -27,30 +27,27 @@ authors = ["Jeff Emanuel"]
 
 [workspace.dependencies]
 # Required internal dependencies (local projects)
-fastmcp = { version = "0.7.1", package = "fastmcp-rust" }
-fastmcp-core = "0.7.1"
-fastmcp-server = "0.7.1"
-fastmcp-transport = "0.7.1"
-fastmcp-protocol = "0.7.1"
+fastmcp = { version = "0.10.0", package = "fastmcp-rust" }
+fastmcp-core = "0.10.0"
+fastmcp-server = "0.10.0"
+fastmcp-transport = "0.10.0"
+fastmcp-protocol = "0.10.0"
 
-# br-ba1ui: exact pins keep the shared Asupersync type universe coherent.
-# 2026-08-24: =0.4.9, lockstep with fastmcp 0.7.1 (which pins =0.4.9),
-# sqlmodel 0.4.0 (^0.4.9), and the fsqlite 0.3.18 registry baseline (bumped
-# on 2026-09-07; the full fsqlite family moves in lockstep).
-# 0.4.9 is additive on the v0.4.3 public compatibility floor (RuntimeHandle
-# request-Cx / blocking-pool APIs, SQLite cancel correctness, owned-OTLP).
-asupersync = { version = "=0.4.9", features = ["tls-webpki-roots"] }
-fsqlite = "=0.3.18"
-fsqlite-types = "=0.3.18"
+# br-5lgwn: the mailbox engine, SQLModel and FastMCP share Asupersync 0.5.
+# The embedded Beads library and pinned search dependency retain their older
+# private runtime graph until their separate migrations are qualified.
+asupersync = { version = "=0.5.0", features = ["tls-webpki-roots"] }
+fsqlite = "=0.4.4"
+fsqlite-types = "=0.4.4"
 
-sqlmodel = "=0.4.0"
-sqlmodel-core = "=0.4.0"
-sqlmodel-query = "=0.4.0"
-sqlmodel-schema = "=0.4.0"
-sqlmodel-session = "=0.4.0"
-sqlmodel-pool = "=0.4.0"
-sqlmodel-frankensqlite = "=0.4.0"
-sqlmodel-sqlite = "=0.4.0"
+sqlmodel = "=0.5.0"
+sqlmodel-core = "=0.5.0"
+sqlmodel-query = "=0.5.0"
+sqlmodel-schema = "=0.5.0"
+sqlmodel-session = "=0.5.0"
+sqlmodel-pool = "=0.5.0"
+sqlmodel-frankensqlite = "=0.5.0"
+sqlmodel-sqlite = "=0.5.0"
 
 ftui = "0.5.0"
 ftui-runtime = { version = "0.5.0" }
@@ -197,19 +194,19 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
-# Negotiate legacy stdio initialize proposals before pinning the protocol era.
-# Keep the 0.7.1 family together on this qualified Asupersync 0.4.9 backport.
-fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "c14d26b49f132625f4141b72669b157467b9aac2" }
-fastmcp-core = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "c14d26b49f132625f4141b72669b157467b9aac2" }
-fastmcp-server = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "c14d26b49f132625f4141b72669b157467b9aac2" }
-fastmcp-transport = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "c14d26b49f132625f4141b72669b157467b9aac2" }
-fastmcp-protocol = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "c14d26b49f132625f4141b72669b157467b9aac2" }
-fastmcp-console = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "c14d26b49f132625f4141b72669b157467b9aac2" }
-fastmcp-client = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "c14d26b49f132625f4141b72669b157467b9aac2" }
-fastmcp-derive = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "c14d26b49f132625f4141b72669b157467b9aac2" }
-# Immutable WAL, read-only snapshot, DDL and prepared binding fixes. Keep the engine family
-# together; this revision retains asupersync 0.4.9 compatibility and GH411,
-# and fixes the Windows namespace identity probe (am-sql-compat-20260916).
+# Preserve GH321 proposal negotiation on FastMCP's Asupersync 0.5 line;
+# registry 0.10.0 predates this fix. Keep all framework crates together.
+fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1c2e5e4b61a839ebcc430e7bacbc94d4d3205102" }
+fastmcp-core = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1c2e5e4b61a839ebcc430e7bacbc94d4d3205102" }
+fastmcp-server = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1c2e5e4b61a839ebcc430e7bacbc94d4d3205102" }
+fastmcp-transport = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1c2e5e4b61a839ebcc430e7bacbc94d4d3205102" }
+fastmcp-protocol = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1c2e5e4b61a839ebcc430e7bacbc94d4d3205102" }
+fastmcp-console = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1c2e5e4b61a839ebcc430e7bacbc94d4d3205102" }
+fastmcp-client = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1c2e5e4b61a839ebcc430e7bacbc94d4d3205102" }
+fastmcp-derive = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1c2e5e4b61a839ebcc430e7bacbc94d4d3205102" }
+# Beads 0.5.4 still embeds the 0.3 engine. Preserve its qualified WAL,
+# read-only snapshot, DDL, prepared binding and Windows identity fixes.
+# The mailbox itself resolves the published 0.4.4 family, not these patches.
 fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-ast = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-btree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
@@ -230,16 +227,9 @@ fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", re
 fsqlite-vdbe = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-vfs = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-# 2026-08-22 registry adoption (asupersync =0.4.9 universe):
-# - asupersync resolves from crates.io (=0.4.9; fastmcp 0.7.1 pins =0.4.9).
-# - fsqlite's 20 members use the immutable public revision above until its
-#   WAL ownership repairs are available in a qualified registry release.
-#   No mutable sibling checkout is required to build this project.
-# - sqlmodel family resolves from crates.io (=0.4.0, published 2026-08-21,
-#   accepting asupersync ^0.4.9 + fsqlite ^0.3.7) — the ../sqlmodel-rel-0327
-#   cleanup trigger fired, so those eight patch lines are gone too.
-# - fastmcp 0.7.1 uses the immutable negotiation backport above until a
-#   qualified registry release carries the repair on Asupersync 0.4.9.
+# The mailbox runtime uses registry Asupersync 0.5.0, SQLModel 0.5.0,
+# FrankenSQLite 0.4.4 and pinned FastMCP 0.10.0. Only Beads' older engine graph
+# uses the immutable patches above. No mutable sibling checkout is required.
 #
 # beads_rust =0.5.4 is published and resolves from crates.io. Do not patch it
 # to a mutable sibling: even an unused patch adds that checkout to remote
@@ -247,9 +237,7 @@ fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev 
 # ftui 0.5.0, franken-agent-detection 0.2.2, and tru 0.2.3 resolve from
 # crates.io. Their former path patches made builds depend on whatever state
 # each machine's sibling checkout happened to be in.
-# rich_rust resolves from the registry (0.2.3) as of 2026-08-20 —
-# fastmcp-console 0.7.1 pins =0.2.3 and registry 0.2.3 carries the
-# time ^0.3.54 req, so the 0.2.2 gated-clone patch is gone.
+# rich_rust resolves from the registry; no local console patch is required.
 
 # --- rch OOM mitigation (2026-07-23) ---------------------------------------
 # The 31k-line mcp-agent-mail-server crate needs ~7-10GB/rustc and OOM-kills the

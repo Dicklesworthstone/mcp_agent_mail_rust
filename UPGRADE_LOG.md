@@ -1,5 +1,34 @@
 # Dependency Upgrade Log
 
+## September 17, 2026 — FrankenSQLite 0.4.4 migration (in progress)
+
+Tracked by `br-5lgwn`. This section supersedes historical current-status
+statements below; v0.3.36 is published and this work targets unreleased main.
+
+- Verified the published `fsqlite` 0.4.4 dependency metadata and tag commit
+  `9d3d98778a372aba95d76d05c5c974ac0238c96a`.
+- Inventoried 95 direct registry dependencies; receipt:
+  `/data/projects/am-release-20260912/library-inventory-20260917.json`.
+- Migration requires SQLModel 0.5.0 and Asupersync 0.5.0. FastMCP 0.10.0
+  provides the matching runtime; its breaking HTTP/context changes require
+  real transport regression coverage. Existing Beads and FrankenSearch
+  dependencies still use Asupersync 0.4 and must be assessed explicitly.
+- Validation is pending. No compatibility or release claim is made yet.
+- The mailbox dependency edges now resolve registry `fsqlite`/`fsqlite-types`
+  0.4.4, SQLModel 0.5.0 and Asupersync 0.5.0. Embedded Beads 0.5.4 still
+  requires its separate 0.3.18 engine; its qualified git patches remain.
+- FastMCP registry 0.10.0 predates GH321 proposal negotiation. Preserve that
+  behavior using the matching 0.10.0 family at immutable upstream revision
+  `1c2e5e4b61a839ebcc430e7bacbc94d4d3205102`, which includes the repair.
+- Independent source review confirms the Windows namespace identity repair
+  remains in 0.4.4. The new `.fsqlite-shm` mapping is not called by ordinary
+  `Connection::open`/SQLModel workers; recovery inventory must be reviewed
+  again when upstream connects that mapping to the public connection path.
+- Initial audit finds pre-existing `RUSTSEC-2026-0285` in rustls 0.23.43;
+  upstream 0.23.45 fixes it. This update is queued after the runtime gate.
+- First RCH check failed before compilation with SSH exit 255. A second
+  worker is compiling; both logs are retained under the artifact directory.
+
 ## September 16, 2026 — release qualification update
 
 Version remains 0.3.35; the next application release is not published. This
