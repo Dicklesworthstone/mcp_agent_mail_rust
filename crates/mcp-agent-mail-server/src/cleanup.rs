@@ -402,15 +402,16 @@ fn detect_and_release_stale(
             .copied()
             .unwrap_or_else(|| {
                 let computed = match block_on(async {
-                    queries::get_agent_by_id(cx, pool, res.agent_id).await
+                    // Cleanup may revoke a live claim. A process-local cached
+                    // profile cannot establish inactivity after another writer
+                    // refreshed the heartbeat or enabled reaper exemption.
+                    queries::get_agent_by_id_fresh(cx, pool, res.agent_id).await
                 }) {
                     Outcome::Ok(agent) => {
-                        // Reaper-exempt agents are never classified as inactive.
-                        if agent.reaper_exempt != 0 {
-                            false
-                        } else {
-                            now.saturating_sub(agent.last_active_ts) > inactivity_us
-                        }
+                        agent.id == Some(res.agent_id)
+                            && agent.project_id == project_id
+                            && agent.reaper_exempt == 0
+                            && now.saturating_sub(agent.last_active_ts) > inactivity_us
                     }
                     _ => false, // Skip stale classification when agent lookup fails.
                 };
@@ -426,13 +427,26 @@ fn detect_and_release_stale(
             .get(&res.agent_id)
             .copied()
             .unwrap_or_else(|| {
-                let last_mail = match block_on(async {
+                let computed = match block_on(async {
                     get_agent_last_mail_activity(cx, pool, res.agent_id, project_id).await
                 }) {
-                    Outcome::Ok(ts) => ts,
-                    _ => None,
+                    Outcome::Ok(last_mail) => {
+                        last_mail.is_some_and(|ts| now.saturating_sub(ts) <= grace_us)
+                    }
+                    other => {
+                        // Unavailable evidence is not a negative activity
+                        // signal. Keep this agent's claims for this cycle and
+                        // retry the read on the next cycle, including after
+                        // cancellation or a database worker panic.
+                        warn!(
+                            project_id,
+                            agent_id = res.agent_id,
+                            outcome = ?other,
+                            "cleanup: mail activity unavailable; preserving reservations"
+                        );
+                        true
+                    }
                 };
-                let computed = last_mail.is_some_and(|ts| now.saturating_sub(ts) <= grace_us);
                 recent_mail_cache.insert(res.agent_id, computed);
                 computed
             });
@@ -504,13 +518,26 @@ fn stale_cleanup_workspace(cx: &Cx, pool: &DbPool, project_id: i64) -> Result<Pa
                     "project {project_id} has no workspace path; refusing stale cleanup without filesystem evidence"
                 ));
             }
-            if !workspace.exists() {
+            if !workspace.is_absolute() || project.id != Some(project_id) {
                 return Err(format!(
-                    "project {project_id} workspace does not exist: {}",
-                    workspace.display()
+                    "project {project_id} has an invalid workspace identity; refusing stale cleanup"
                 ));
             }
-            Ok(workspace)
+            match workspace.metadata() {
+                Ok(metadata) if metadata.is_dir() => Ok(workspace),
+                Ok(_) => Err(format!(
+                    "project {project_id} workspace is not a directory: {}",
+                    workspace.display()
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+                    "project {project_id} workspace does not exist: {}",
+                    workspace.display()
+                )),
+                Err(error) => Err(format!(
+                    "project {project_id} workspace cannot be inspected at {}: {error}",
+                    workspace.display()
+                )),
+            }
         }
         Outcome::Err(err) => Err(format!(
             "project lookup failed for stale cleanup on project {project_id}: {err}"
@@ -977,7 +1004,7 @@ fn write_cleanup_artifacts(
                 "reason": row.reason,
                 "created_ts": mcp_agent_mail_db::micros_to_iso(row.created_ts),
                 "expires_ts": mcp_agent_mail_db::micros_to_iso(row.expires_ts),
-                "released_ts": mcp_agent_mail_db::micros_to_iso(released_ts),
+                "released_ts": mcp_agent_mail_db::micros_to_iso(row.released_ts),
             }));
         }
     }
@@ -1813,5 +1840,143 @@ mod tests {
                 .expect_err("active reservation should not fabricate a release timestamp")
                 .contains("requires released_ts")
         );
+    }
+
+    fn stale_cleanup_test_config(tmp: &tempfile::TempDir) -> Config {
+        Config {
+            storage_root: tmp.path().join("storage"),
+            file_reservation_inactivity_seconds: 0,
+            file_reservation_activity_grace_seconds: 0,
+            ..Config::default()
+        }
+    }
+
+    fn assert_reservation_unreleased(pool: &DbPool, cx: &Cx, project_id: i64, id: i64) {
+        let rows = match block_on(queries::list_file_reservations(cx, pool, project_id, false)) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("read reservation state: {other:?}"),
+        };
+        let row = rows.iter().find(|row| row.id == Some(id)).expect("claim retained");
+        assert!(row.released_ts.is_none(), "uncertain activity must preserve claim {id}");
+    }
+
+    #[test]
+    fn stale_cleanup_retries_mail_evidence_instead_of_releasing_on_read_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, cx, project_id, agent_id, reservation_id, _, _) = seed_active_reservation(&tmp);
+        let config = stale_cleanup_test_config(&tmp);
+        let mut cache = CleanupProbeCache::default();
+        let conn = match block_on(pool.acquire(&cx)) {
+            Outcome::Ok(conn) => conn,
+            other => panic!("acquire fixture connection: {other:?}"),
+        };
+        // Preserve the table and its data while making the actual mail query
+        // unavailable. No mocked outcome and no mutation of an operator DB.
+        conn.execute_sync("ALTER TABLE messages RENAME TO cleanup_saved_messages", &[])
+            .expect("hide mail evidence in fixture");
+        drop(conn);
+        assert!(matches!(
+            block_on(get_agent_last_mail_activity(&cx, &pool, agent_id, project_id)),
+            Outcome::Err(_)
+        ));
+
+        for _ in 0..2 {
+            assert!(
+                detect_and_release_stale(&config, &pool, &cx, project_id, &mut cache)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_reservation_unreleased(&pool, &cx, project_id, reservation_id);
+        }
+
+        let conn = match block_on(pool.acquire(&cx)) {
+            Outcome::Ok(conn) => conn,
+            other => panic!("reacquire fixture connection: {other:?}"),
+        };
+        conn.execute_sync("ALTER TABLE cleanup_saved_messages RENAME TO messages", &[])
+            .expect("restore mail evidence");
+        drop(conn);
+        assert_eq!(
+            detect_and_release_stale(&config, &pool, &cx, project_id, &mut cache).unwrap(),
+            vec![reservation_id],
+            "a later successful inactivity check must still release a stale claim"
+        );
+    }
+
+    #[test]
+    fn stale_cleanup_observes_heartbeat_updates_outside_the_read_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, cx, project_id, agent_id, reservation_id, _, _) = seed_active_reservation(&tmp);
+        assert!(matches!(
+            block_on(queries::get_agent_by_id(&cx, &pool, agent_id)),
+            Outcome::Ok(_)
+        ));
+        let conn = match block_on(pool.acquire(&cx)) {
+            Outcome::Ok(conn) => conn,
+            other => panic!("acquire fixture connection: {other:?}"),
+        };
+        conn.execute_sync(
+            "UPDATE agents SET last_active_ts = ? WHERE id = ?",
+            &[
+                mcp_agent_mail_db::sqlmodel::Value::BigInt(now_micros() + 86_400_000_000),
+                mcp_agent_mail_db::sqlmodel::Value::BigInt(agent_id),
+            ],
+        )
+        .expect("refresh heartbeat without process-local invalidation");
+        drop(conn);
+
+        let mut cache = CleanupProbeCache::default();
+        let config = stale_cleanup_test_config(&tmp);
+        assert!(
+            detect_and_release_stale(&config, &pool, &cx, project_id, &mut cache)
+                .unwrap()
+                .is_empty()
+        );
+        assert_reservation_unreleased(&pool, &cx, project_id, reservation_id);
+    }
+
+    #[test]
+    fn stale_cleanup_observes_new_reaper_exemption_outside_the_read_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, cx, project_id, agent_id, reservation_id, _, _) = seed_active_reservation(&tmp);
+        assert!(matches!(
+            block_on(queries::get_agent_by_id(&cx, &pool, agent_id)),
+            Outcome::Ok(_)
+        ));
+        let conn = match block_on(pool.acquire(&cx)) {
+            Outcome::Ok(conn) => conn,
+            other => panic!("acquire fixture connection: {other:?}"),
+        };
+        conn.execute_sync(
+            "UPDATE agents SET reaper_exempt = 1, last_active_ts = 0 WHERE id = ?",
+            &[mcp_agent_mail_db::sqlmodel::Value::BigInt(agent_id)],
+        )
+        .expect("protect dormant agent without process-local invalidation");
+        drop(conn);
+
+        let mut cache = CleanupProbeCache::default();
+        let config = stale_cleanup_test_config(&tmp);
+        assert!(
+            detect_and_release_stale(&config, &pool, &cx, project_id, &mut cache)
+                .unwrap()
+                .is_empty()
+        );
+        assert_reservation_unreleased(&pool, &cx, project_id, reservation_id);
+    }
+
+    #[test]
+    fn stale_cleanup_refuses_a_workspace_replaced_by_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, cx, project_id, _, reservation_id, human_key, _) = seed_active_reservation(&tmp);
+        std::fs::rename(&human_key, tmp.path().join("saved-workspace")).unwrap();
+        std::fs::write(&human_key, b"not a workspace directory").unwrap();
+        let mut cache = CleanupProbeCache::default();
+        let config = stale_cleanup_test_config(&tmp);
+
+        let error = detect_and_release_stale(&config, &pool, &cx, project_id, &mut cache)
+            .expect_err("a file is not evidence about the reserved workspace paths");
+        assert!(error.contains("not a directory"));
+        assert_reservation_unreleased(&pool, &cx, project_id, reservation_id);
+        assert_eq!(std::fs::read(human_key).unwrap(), b"not a workspace directory");
     }
 }
