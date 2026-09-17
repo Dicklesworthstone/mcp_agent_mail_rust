@@ -90,6 +90,8 @@ impl CorruptionCircuitBreaker {
                     tripped_at_us: now_micros_u64(),
                 });
                 self.tripped.store(true, Ordering::Release);
+                // Publish the flag before unlocking so reset cannot interleave.
+                drop(state);
                 true
             } else {
                 false
@@ -159,6 +161,8 @@ impl CorruptionCircuitBreaker {
         let mut state = self.lock_state();
         state.detail = None;
         self.tripped.store(false, Ordering::Release);
+        // Keep clearing evidence and publishing the closed flag serialized.
+        drop(state);
     }
 
     /// Robot/health-facing snapshot of one coherent breaker state.
@@ -219,7 +223,10 @@ mod tests {
         let refusal = b.refusal_error().expect("open breaker must refuse writes");
         // The refusal must re-classify as corruption (keywords preserved) and
         // carry degraded-mode guidance — never a generic/scary raw error.
-        assert!(refusal.is_corruption(), "refusal must be a corruption class");
+        assert!(
+            refusal.is_corruption(),
+            "refusal must be a corruption class"
+        );
         assert!(refusal.classification().blocks_edits);
         let text = refusal.to_string();
         assert!(text.contains("am doctor repair"));
@@ -295,7 +302,10 @@ mod tests {
             // This interleaving used to leave the new open flag paired with
             // the old delayed trip's class/message/timestamp.
             b.reset();
-            b.trip(DbErrorClass::WalSidecarCorruption, "new wal sidecar corrupt");
+            b.trip(
+                DbErrorClass::WalSidecarCorruption,
+                "new wal sidecar corrupt",
+            );
             release_tx.send(()).expect("resume first trip");
             delayed.join().expect("delayed trip completed");
         });
@@ -345,14 +355,21 @@ mod tests {
         assert!(b.state.is_poisoned());
         let refusal = b.refusal_error().expect("poison cannot reopen writes");
         assert!(refusal.to_string().contains("original wal sidecar corrupt"));
-        assert_eq!(b.snapshot().class.as_deref(), Some("wal_sidecar_corruption"));
+        assert_eq!(
+            b.snapshot().class.as_deref(),
+            Some("wal_sidecar_corruption")
+        );
         b.reset();
         assert!(b.refusal_error().is_none());
         b.trip(
             DbErrorClass::MainDbBtreeCorruption,
             "database disk image is malformed",
         );
-        assert!(b.refusal_error().expect("retrip after poison").is_corruption());
+        assert!(
+            b.refusal_error()
+                .expect("retrip after poison")
+                .is_corruption()
+        );
     }
 
     #[test]

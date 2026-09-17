@@ -215,11 +215,14 @@ impl<'a> GitCmd<'a> {
         let mtx = if skip_mutex {
             None
         } else {
-            canonical.as_ref().map(|c| GitRepoLocks::global().lock_for(c))
+            canonical
+                .as_ref()
+                .map(|c| GitRepoLocks::global().lock_for(c))
         };
-        let _mtx_guard = mtx
-            .as_ref()
-            .map(|arc| arc.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let _mtx_guard = mtx.as_ref().map(|arc| {
+            arc.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
 
         // Flock layer.
         let _flock = if skip_flock {
@@ -620,9 +623,9 @@ fn drain_pipe(
             }
             // Geometric growth avoids a reallocation/copy for every 8 KiB
             // chunk. Captured bytes still obey the shared exact limit.
-            output
-                .try_reserve(length)
-                .map_err(|error| io::Error::other(format!("git capture allocation failed: {error}")))?;
+            output.try_reserve(length).map_err(|error| {
+                io::Error::other(format!("git capture allocation failed: {error}"))
+            })?;
             output.extend_from_slice(&buffer[..length]);
             *remaining -= length;
             Ok(true)
@@ -784,8 +787,12 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> GitRunOutcome {
         }
     };
 
-    let stdout_bytes = stdout_handle.and_then(|h| h.join().ok()).unwrap_or_default();
-    let stderr_bytes = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stdout_bytes = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stderr_bytes = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
     match classify_exit(status) {
         GitRunOutcome::Finished(_) => GitRunOutcome::Finished(Output {
             status,
@@ -829,7 +836,10 @@ mod tests {
         let res = GitCmd::new(&repo).arg("nonexistent-subcommand-xyz").run();
         assert!(res.is_ok(), "nonzero exit should NOT be Err: {res:?}");
         let o = res.unwrap();
-        assert!(!o.status.success(), "expected nonzero exit from unknown subcmd");
+        assert!(
+            !o.status.success(),
+            "expected nonzero exit from unknown subcmd"
+        );
     }
 
     #[cfg(unix)]
