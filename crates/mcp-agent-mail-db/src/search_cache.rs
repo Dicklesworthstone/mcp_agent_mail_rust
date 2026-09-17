@@ -29,14 +29,18 @@ pub const DEFAULT_CACHE_TTL_SECONDS: u64 = 300;
 /// Deterministic cache key for hybrid search queries.
 ///
 /// The key incorporates all factors that affect search results:
-/// - Query text (normalized)
+/// - Query text (outer whitespace trimmed, case and syntax preserved)
 /// - Search mode (lexical/semantic/hybrid/auto)
 /// - Active filters (sender, project, date range, importance)
 /// - Index epoch (invalidated on index updates)
 /// - Pagination parameters (offset, limit)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QueryCacheKey {
-    /// Normalized query text (lowercased, trimmed).
+    /// Query text with outer whitespace trimmed, but otherwise unchanged.
+    ///
+    /// Case folding is not a valid query normalization: boolean operators,
+    /// quoted values and case-sensitive embedding inputs can change meaning.
+    /// Only the active query engine may decide which inputs are equivalent.
     pub query_normalized: String,
     /// Search mode.
     pub mode: SearchMode,
@@ -62,7 +66,7 @@ impl QueryCacheKey {
         limit: usize,
     ) -> Self {
         Self {
-            query_normalized: query.trim().to_lowercase(),
+            query_normalized: query.trim().to_owned(),
             mode,
             filter_hash: hash_filter(filter),
             index_epoch,
@@ -81,7 +85,7 @@ impl QueryCacheKey {
         limit: usize,
     ) -> Self {
         Self {
-            query_normalized: query.trim().to_lowercase(),
+            query_normalized: query.trim().to_owned(),
             mode,
             filter_hash: 0,
             index_epoch,
@@ -680,10 +684,78 @@ mod tests {
     fn test_cache_key_normalization() {
         let filter = SearchFilter::default();
         let key1 = QueryCacheKey::new("  Hello World  ", SearchMode::Hybrid, &filter, 1, 0, 10);
-        let key2 = QueryCacheKey::new("hello world", SearchMode::Hybrid, &filter, 1, 0, 10);
+        let key2 = QueryCacheKey::new("Hello World", SearchMode::Hybrid, &filter, 1, 0, 10);
 
         assert_eq!(key1.query_normalized, key2.query_normalized);
         assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_cache_key_preserves_boolean_operator_case() {
+        let filter = SearchFilter::default();
+        for mode in [SearchMode::Lexical, SearchMode::Semantic, SearchMode::Hybrid] {
+            for (left, right) in [
+                ("alpha OR beta", "alpha or beta"),
+                ("alpha AND beta", "alpha and beta"),
+                ("alpha NOT beta", "alpha not beta"),
+            ] {
+                assert_ne!(
+                    QueryCacheKey::new(left, mode, &filter, 0, 0, 10),
+                    QueryCacheKey::new(right, mode, &filter, 0, 0, 10),
+                    "the cache must not rewrite query grammar for {mode:?}"
+                );
+                assert_ne!(
+                    QueryCacheKey::without_filter(left, mode, 0, 0, 10),
+                    QueryCacheKey::without_filter(right, mode, 0, 0, 10)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cache_key_preserves_quoted_and_unicode_input() {
+        let filter = SearchFilter::default();
+        for (left, right) in [
+            (r#"thread:"Build-A""#, r#"thread:"build-a""#),
+            (r#""Case Sensitive""#, r#""case sensitive""#),
+            ("\u{212a}", "K"),
+            ("\u{130}", "i\u{307}"),
+        ] {
+            let left_key = QueryCacheKey::new(left, SearchMode::Hybrid, &filter, 0, 0, 10);
+            let right_key = QueryCacheKey::new(right, SearchMode::Hybrid, &filter, 0, 0, 10);
+            assert_eq!(left_key.query_normalized, left);
+            assert_eq!(right_key.query_normalized, right);
+            assert_ne!(left_key, right_key);
+        }
+    }
+
+    #[test]
+    fn test_cache_case_variants_do_not_replay_another_response() {
+        let cache: QueryCache<Vec<i64>> = QueryCache::with_defaults();
+        let operator =
+            QueryCacheKey::without_filter("alpha OR beta", SearchMode::Lexical, 0, 0, 10);
+        let literal = QueryCacheKey::without_filter("alpha or beta", SearchMode::Lexical, 0, 0, 10);
+
+        cache.put(operator.clone(), vec![1, 2]);
+        assert_eq!(cache.get(&literal), None);
+        cache.put(literal.clone(), vec![3]);
+        assert_eq!(cache.get(&operator), Some(vec![1, 2]));
+        assert_eq!(cache.get(&literal), Some(vec![3]));
+    }
+
+    #[test]
+    fn test_unfiltered_cache_key_trims_only_outer_whitespace() {
+        let key =
+            QueryCacheKey::without_filter(" \nAlpha OR  Beta\t ", SearchMode::Lexical, 0, 0, 10);
+        assert_eq!(key.query_normalized, "Alpha OR  Beta");
+        assert_eq!(
+            key,
+            QueryCacheKey::without_filter("Alpha OR  Beta", SearchMode::Lexical, 0, 0, 10)
+        );
+        assert_ne!(
+            key,
+            QueryCacheKey::without_filter("Alpha OR Beta", SearchMode::Lexical, 0, 0, 10)
+        );
     }
 
     #[test]
