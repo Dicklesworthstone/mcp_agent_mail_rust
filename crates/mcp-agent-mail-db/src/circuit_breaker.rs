@@ -169,10 +169,7 @@ impl CorruptionCircuitBreaker {
             tripped: state.detail.is_some(),
             trip_count: state.trip_count,
             tripped_at_us: state.detail.as_ref().map_or(0, |d| d.tripped_at_us),
-            class: state
-                .detail
-                .as_ref()
-                .map(|d| d.class.as_str().to_string()),
+            class: state.detail.as_ref().map(|d| d.class.as_str().to_string()),
         }
     }
 }
@@ -222,10 +219,7 @@ mod tests {
         let refusal = b.refusal_error().expect("open breaker must refuse writes");
         // The refusal must re-classify as corruption (keywords preserved) and
         // carry degraded-mode guidance — never a generic/scary raw error.
-        assert!(
-            refusal.is_corruption(),
-            "refusal must be a corruption class"
-        );
+        assert!(refusal.is_corruption(), "refusal must be a corruption class");
         assert!(refusal.classification().blocks_edits);
         let text = refusal.to_string();
         assert!(text.contains("am doctor repair"));
@@ -326,7 +320,10 @@ mod tests {
         assert_eq!(closed.tripped_at_us, 0);
         assert_eq!(closed.trip_count, 1);
 
-        b.trip(DbErrorClass::MainDbBtreeCorruption, "database disk image is malformed");
+        b.trip(
+            DbErrorClass::MainDbBtreeCorruption,
+            "database disk image is malformed",
+        );
         let reopened = b.snapshot();
         assert!(reopened.tripped);
         assert_eq!(reopened.trip_count, 2);
@@ -336,7 +333,10 @@ mod tests {
     #[test]
     fn poisoned_state_preserves_refusal_evidence() {
         let b = CorruptionCircuitBreaker::default();
-        b.trip(DbErrorClass::WalSidecarCorruption, "original wal sidecar corrupt");
+        b.trip(
+            DbErrorClass::WalSidecarCorruption,
+            "original wal sidecar corrupt",
+        );
         let interrupted = std::panic::catch_unwind(|| {
             let _guard = b.state.lock().expect("initial state lock");
             panic!("simulate an interrupted state observer");
@@ -348,7 +348,10 @@ mod tests {
         assert_eq!(b.snapshot().class.as_deref(), Some("wal_sidecar_corruption"));
         b.reset();
         assert!(b.refusal_error().is_none());
-        b.trip(DbErrorClass::MainDbBtreeCorruption, "database disk image is malformed");
+        b.trip(
+            DbErrorClass::MainDbBtreeCorruption,
+            "database disk image is malformed",
+        );
         assert!(b.refusal_error().expect("retrip after poison").is_corruption());
     }
 
@@ -359,6 +362,37 @@ mod tests {
         b.trip(DbErrorClass::WalSidecarCorruption, "wal sidecar corrupt");
         assert_eq!(b.trip_count(), u64::MAX);
         assert!(b.is_tripped());
+    }
+
+    #[test]
+    fn concurrent_transition_snapshots_never_mix_open_and_closed_evidence() {
+        const ROUNDS: u64 = 512;
+        let b = CorruptionCircuitBreaker::default();
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                start.wait();
+                for _ in 0..ROUNDS {
+                    b.trip(DbErrorClass::WalSidecarCorruption, "wal sidecar corrupt");
+                    std::thread::yield_now();
+                    b.reset();
+                    std::thread::yield_now();
+                }
+            });
+            start.wait();
+            for _ in 0..ROUNDS * 2 {
+                let snapshot = b.snapshot();
+                assert_eq!(snapshot.tripped, snapshot.class.is_some());
+                assert!(snapshot.trip_count <= ROUNDS);
+                if !snapshot.tripped {
+                    assert_eq!(snapshot.tripped_at_us, 0);
+                }
+                std::thread::yield_now();
+            }
+            writer.join().expect("transition writer completed");
+        });
+        assert!(!b.is_tripped());
+        assert_eq!(b.trip_count(), ROUNDS);
     }
 
     #[test]
