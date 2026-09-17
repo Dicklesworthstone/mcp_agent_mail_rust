@@ -39,7 +39,9 @@ pub struct ScopeContext {
     pub viewer_project_ids: Vec<i64>,
 
     /// Sender contact policies, keyed by `(project_id, agent_id)`.
-    /// Pre-fetched so the scope filter doesn't need DB access.
+    /// Pre-fetched so the scope filter doesn't need DB access. A missing entry
+    /// does not grant access: only an explicit policy can authorize a viewer
+    /// who is not the sender, a recipient, or an approved contact.
     #[serde(default)]
     pub sender_policies: Vec<SenderPolicy>,
 
@@ -82,14 +84,18 @@ pub enum ContactPolicyKind {
 }
 
 impl ContactPolicyKind {
-    /// Parse from string (case-insensitive). Defaults to `Auto` for unknown values.
+    /// Parse a known policy case-insensitively. Unknown values fail closed.
+    ///
+    /// `Auto` is an explicit permissive policy, not a substitute for invalid or
+    /// missing authorization data. SQL scope filtering also rejects unknown
+    /// policies rather than treating them as `auto`.
     #[must_use]
     pub fn parse(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "open" => Self::Open,
+            "auto" => Self::Auto,
             "contacts_only" => Self::ContactsOnly,
-            "block_all" => Self::BlockAll,
-            _ => Self::Auto,
+            _ => Self::BlockAll,
         }
     }
 
@@ -145,6 +151,8 @@ pub enum ScopeReason {
     ContactsOnlyDenied,
     /// Sender policy blocks all inbound visibility.
     BlockAllDenied,
+    /// Sender identity or its policy was not available for authorization.
+    SenderPolicyUnavailable,
     /// Viewer is not in the same project and has no cross-project link.
     CrossProjectDenied,
     /// Operator/admin mode — full access.
@@ -166,6 +174,9 @@ impl ScopeReason {
                 "The sender restricts visibility to approved contacts only."
             }
             Self::BlockAllDenied => "The sender blocks all inbound visibility.",
+            Self::SenderPolicyUnavailable => {
+                "The sender's visibility policy could not be established."
+            }
             Self::CrossProjectDenied => {
                 "This message is from a different project you don't have access to."
             }
@@ -339,8 +350,16 @@ pub fn evaluate_scope(result: &SearchResult, ctx: &ScopeContext) -> ScopeDecisio
         };
     }
 
-    // Fall back to sender's contact policy.
-    let sender_policy = lookup_sender_policy(result, ctx);
+    // Only an explicit sender policy can grant this remaining access path.
+    // A missing prefetch entry (or orphaned sender) is not evidence of Auto.
+    // This matches SQL's NULL/unknown-policy rejection and keeps degraded
+    // metadata reads from broadening visibility.
+    let Some(sender_policy) = lookup_sender_policy(result, ctx) else {
+        return ScopeDecision {
+            verdict: ScopeVerdict::Deny,
+            reason: ScopeReason::SenderPolicyUnavailable,
+        };
+    };
     match sender_policy {
         ContactPolicyKind::Open => ScopeDecision {
             verdict: ScopeVerdict::Allow,
@@ -398,17 +417,15 @@ fn has_approved_contact(
 }
 
 /// Look up the sender's contact policy from the pre-fetched cache.
-fn lookup_sender_policy(result: &SearchResult, ctx: &ScopeContext) -> ContactPolicyKind {
-    let sender_project_id = result.project_id.unwrap_or(0);
-    if let Some(sender_id) = result.from_agent_id {
-        for sp in &ctx.sender_policies {
-            if sp.project_id == sender_project_id && sp.agent_id == sender_id {
-                return sp.policy;
-            }
-        }
-    }
-    // Default: auto (permissive fallback).
-    ContactPolicyKind::Auto
+///
+/// Do not synthesize a permissive policy when identity or policy data is absent.
+fn lookup_sender_policy(result: &SearchResult, ctx: &ScopeContext) -> Option<ContactPolicyKind> {
+    let sender_project_id = result.project_id?;
+    let sender_id = result.from_agent_id?;
+    ctx.sender_policies
+        .iter()
+        .find(|sp| sp.project_id == sender_project_id && sp.agent_id == sender_id)
+        .map(|sp| sp.policy)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -738,10 +755,10 @@ mod tests {
             message_id: 42,
             agent_ids: vec![99], // different agent
         });
-        // No approved contacts, default policy = auto → Allow
+        // Neither an approved contact nor an explicit policy grants access.
         let decision = evaluate_scope(&result, &ctx);
-        assert_eq!(decision.verdict, ScopeVerdict::Allow);
-        assert_eq!(decision.reason, ScopeReason::AutoPolicy);
+        assert_eq!(decision.verdict, ScopeVerdict::Deny);
+        assert_eq!(decision.reason, ScopeReason::SenderPolicyUnavailable);
     }
 
     // ── Contact policy checks ─────────────────────────────────────
@@ -913,7 +930,12 @@ mod tests {
             make_message_result(2, 99, "RedFox", 30), // cross-project
             make_agent_result(3),                     // non-message
         ];
-        let ctx = viewer_ctx(10, 1);
+        let mut ctx = viewer_ctx(10, 1);
+        ctx.sender_policies.push(SenderPolicy {
+            project_id: 1,
+            agent_id: 20,
+            policy: ContactPolicyKind::Auto,
+        });
         let policy = RedactionPolicy::default();
         let (visible, audit) = apply_scope(results, &ctx, &policy);
 
@@ -961,7 +983,8 @@ mod tests {
             ContactPolicyKind::BlockAll
         );
         assert_eq!(ContactPolicyKind::parse("Open"), ContactPolicyKind::Open);
-        assert_eq!(ContactPolicyKind::parse("unknown"), ContactPolicyKind::Auto);
+        assert_eq!(ContactPolicyKind::parse("AUTO"), ContactPolicyKind::Auto);
+        assert_eq!(ContactPolicyKind::parse("unknown"), ContactPolicyKind::BlockAll);
     }
 
     // ── SQL clause generation ─────────────────────────────────────
@@ -1024,6 +1047,7 @@ mod tests {
             ScopeReason::AutoPolicy,
             ScopeReason::ContactsOnlyDenied,
             ScopeReason::BlockAllDenied,
+            ScopeReason::SenderPolicyUnavailable,
             ScopeReason::CrossProjectDenied,
             ScopeReason::OperatorMode,
             ScopeReason::NonMessageEntity,
@@ -1043,7 +1067,12 @@ mod tests {
             make_message_result(3, 99, "GreenLake", 40), // denied (cross-project)
             make_agent_result(4),                        // allowed (non-message)
         ];
-        let ctx = viewer_ctx(10, 1);
+        let mut ctx = viewer_ctx(10, 1);
+        ctx.sender_policies.push(SenderPolicy {
+            project_id: 1,
+            agent_id: 20,
+            policy: ContactPolicyKind::Auto,
+        });
         let policy = RedactionPolicy::default();
         let (_, audit) = apply_scope(results, &ctx, &policy);
 
@@ -1260,13 +1289,17 @@ mod tests {
         assert_eq!(decision.reason, ScopeReason::CrossProjectDenied);
     }
 
-    // ── Auto policy allows when no other policy matches ──────────
+    // ── Explicit Auto policy remains permissive ──────────────────
 
     #[test]
-    fn auto_policy_default_allows() {
-        // No sender_policies → falls back to Auto → Allow
+    fn explicit_auto_policy_allows() {
         let result = make_message_result(1, 1, "BlueLake", 20);
-        let ctx = viewer_ctx(10, 1);
+        let mut ctx = viewer_ctx(10, 1);
+        ctx.sender_policies.push(SenderPolicy {
+            project_id: 1,
+            agent_id: 20,
+            policy: ContactPolicyKind::Auto,
+        });
         let decision = evaluate_scope(&result, &ctx);
         assert_eq!(decision.verdict, ScopeVerdict::Allow);
         assert_eq!(decision.reason, ScopeReason::AutoPolicy);
@@ -1299,5 +1332,120 @@ mod tests {
         assert!(clause.starts_with('('));
         assert!(clause.ends_with(')'));
         assert!(clause.contains(" OR "));
+    }
+
+    // ── Missing or invalid authorization data must not grant access ──
+
+    #[test]
+    fn missing_sender_policy_denies_message_and_thread() {
+        let ctx = viewer_ctx(10, 1);
+        for kind in [DocKind::Message, DocKind::Thread] {
+            let mut result = make_message_result(1, 1, "BlueLake", 20);
+            result.doc_kind = kind;
+            let decision = evaluate_scope(&result, &ctx);
+            assert_eq!(decision.verdict, ScopeVerdict::Deny);
+            assert_eq!(decision.reason, ScopeReason::SenderPolicyUnavailable);
+        }
+    }
+
+    #[test]
+    fn sender_policy_lookup_requires_both_identity_components() {
+        let mut ctx = viewer_ctx(10, 1);
+        ctx.sender_policies = vec![
+            SenderPolicy {
+                project_id: 2,
+                agent_id: 20,
+                policy: ContactPolicyKind::Open,
+            },
+            SenderPolicy {
+                project_id: 1,
+                agent_id: 30,
+                policy: ContactPolicyKind::Auto,
+            },
+        ];
+        let mut result = make_message_result(1, 1, "BlueLake", 20);
+        assert_eq!(lookup_sender_policy(&result, &ctx), None);
+        assert_eq!(evaluate_scope(&result, &ctx).verdict, ScopeVerdict::Deny);
+
+        ctx.sender_policies.push(SenderPolicy {
+            project_id: 1,
+            agent_id: 20,
+            policy: ContactPolicyKind::Open,
+        });
+        result.from_agent_id = None;
+        assert_eq!(lookup_sender_policy(&result, &ctx), None);
+        assert_eq!(evaluate_scope(&result, &ctx).verdict, ScopeVerdict::Deny);
+
+        result.from_agent_id = Some(20);
+        result.project_id = None;
+        assert_eq!(lookup_sender_policy(&result, &ctx), None);
+        assert_eq!(evaluate_scope(&result, &ctx).verdict, ScopeVerdict::Deny);
+    }
+
+    #[test]
+    fn missing_policy_preserves_independently_authorized_access() {
+        let result = make_message_result(42, 1, "BlueLake", 20);
+        let sender = viewer_ctx(20, 1);
+        assert_eq!(evaluate_scope(&result, &sender).reason, ScopeReason::IsSender);
+
+        let mut recipient = viewer_ctx(10, 99);
+        recipient.recipient_map.push(RecipientEntry {
+            message_id: 42,
+            agent_ids: vec![10],
+        });
+        let decision = evaluate_scope(&result, &recipient);
+        assert_eq!(decision.verdict, ScopeVerdict::Allow);
+        assert_eq!(decision.reason, ScopeReason::IsRecipient);
+
+        let mut contact = viewer_ctx(10, 99);
+        contact.approved_contacts.push((1, 20));
+        let decision = evaluate_scope(&result, &contact);
+        assert_eq!(decision.verdict, ScopeVerdict::Allow);
+        assert_eq!(decision.reason, ScopeReason::ApprovedContact);
+        assert_eq!(
+            evaluate_scope(&result, &operator_ctx()).verdict,
+            ScopeVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn unknown_contact_policies_fail_closed() {
+        for raw in ["", "unknown", "autp", "open ", " auto", "open\0", "*"] {
+            let policy = ContactPolicyKind::parse(raw);
+            assert_eq!(policy, ContactPolicyKind::BlockAll, "policy {raw:?}");
+            let mut ctx = viewer_ctx(10, 1);
+            ctx.sender_policies.push(SenderPolicy {
+                project_id: 1,
+                agent_id: 20,
+                policy,
+            });
+            let result = make_message_result(1, 1, "BlueLake", 20);
+            assert_eq!(evaluate_scope(&result, &ctx).verdict, ScopeVerdict::Deny);
+        }
+    }
+
+    #[test]
+    fn missing_policy_batch_excludes_payload_and_records_denial() {
+        let results = vec![
+            make_message_result(1, 1, "BlueLake", 20),
+            make_message_result(2, 1, "RedFox", 30),
+        ];
+        let mut ctx = viewer_ctx(10, 1);
+        ctx.recipient_map.push(RecipientEntry {
+            message_id: 2,
+            agent_ids: vec![10],
+        });
+        let (visible, audit) = apply_scope(results, &ctx, &RedactionPolicy::default());
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].result.id, 2);
+        assert_eq!(audit.total_before, 2);
+        assert_eq!(audit.visible_count, 1);
+        assert_eq!(audit.denied_count, 1);
+        assert_eq!(audit.redacted_count, 0);
+        assert_eq!(audit.entries.len(), 1);
+        assert_eq!(audit.entries[0].reason, ScopeReason::SenderPolicyUnavailable);
+        let encoded = serde_json::to_value(&audit.entries[0]).expect("serialize denial");
+        assert_eq!(encoded["reason"], "sender_policy_unavailable");
+        assert!(encoded.get("body").is_none());
     }
 }
