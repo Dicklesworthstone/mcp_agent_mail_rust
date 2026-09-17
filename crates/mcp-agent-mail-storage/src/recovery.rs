@@ -25,6 +25,7 @@
 //!   when to prune.
 
 pub mod message_reconcile;
+pub mod ref_backup;
 
 use std::path::Path;
 
