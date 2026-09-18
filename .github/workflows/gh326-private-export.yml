@@ -2,6 +2,8 @@ name: GH326 private export integration
 
 # Applies only the two fixed, reviewed patches. It never opens a PR, force
 # pushes, edits another source file, or substitutes a skipped native test.
+# Publication retry: the original 6166f116 push had no Actions run recorded.
+# Retry through the Contents API without relaxing validation or changing patches.
 on:
   push:
     branches: [main]
