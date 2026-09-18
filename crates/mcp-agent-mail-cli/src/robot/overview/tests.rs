@@ -90,7 +90,7 @@ fn linear_overview_preserves_strict_time_boundaries_and_null_semantics() {
     let (rows, work) = build_at(&conn, now).expect("overview at boundary");
     assert_eq!(rows.len(), 1);
     assert_eq!((rows[0].unread, rows[0].urgent, rows[0].ack_overdue, rows[0].reservations), (5, 3, 2, 1));
-    assert_eq!(work.queries, 5);
+    assert_eq!(work.queries, 7);
     assert_eq!(work.rows, [1, 0, 4, 6, 1]);
 }
 
@@ -250,7 +250,13 @@ fn linear_overview_work_is_bounded_by_input_rows_not_project_times_recipients() 
         let (_dir, conn) = fixture(false, false);
         seed_scale(&conn, projects, 10);
         let (rows, work) = build_at(&conn, mcp_agent_mail_db::now_micros()).expect("overview");
-        assert_eq!(work.queries, 5);
+        let pages = |count: usize| count / OVERVIEW_PAGE_ROWS + 1;
+        let recipient_batches = (projects * 20).div_ceil(OVERVIEW_PAGE_ROWS);
+        assert_eq!(work.queries,
+            2 * pages(projects) + pages(projects * 10) + pages(projects * 20)
+                + 1 + recipient_batches);
+        assert!(work.peak_query_rows <= OVERVIEW_PAGE_ROWS);
+        assert!(work.peak_message_keys <= OVERVIEW_PAGE_ROWS);
         assert_eq!(work.rows, [projects, projects, projects * 10, projects * 20, 0]);
         assert_eq!(rows.len(), projects);
         for row in rows {
@@ -296,3 +302,5 @@ fn benchmark_linear_overview_against_current_main() {
         assert!(linear < reference, "linear scan must improve the native reference on this fixture");
     }
 }
+
+mod bounded;
