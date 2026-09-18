@@ -50,11 +50,12 @@ NEW_DISPATCH = '''            let Some(mut effect) = pending_effects.pop_front()
                 continue;
             };
             pending_effect_keys.remove(&cooldown_key);
+            let prepared_row = pending_experience_rows.remove(&cooldown_key);
             // GH258: this point is after deduplication, eviction, and cooldown
             // suppression, and inside ATC_OPERATOR_ACTION_CAPACITY. Never create
             // orphan Planned rows for proposals that cannot be dispatched.
             if effect.experience_id.is_none() {
-''' + indent(APPEND, "    ") + '''            }
+''' + indent(APPEND.replace("append_atc_experience_for_effect(pool, &effect)", "append_atc_experience_for_effect_prepared(pool, &effect, prepared_row)"), "    ") + '''            }
             let status = execute_atc_effect('''
 
 
@@ -77,13 +78,13 @@ def loop_region(source: str) -> tuple[int, int, str]:
 def check(source: str) -> None:
     _, _, region = loop_region(source)
     admission, dispatch = region.split(MIDDLE, 1)
-    if "append_atc_experience_for_effect(" in admission:
+    if "append_atc_experience_for_effect" in admission:
         raise ValueError("GH258 remains: persistence occurs before admission/deduplication")
-    if dispatch.count("append_atc_experience_for_effect(") != 1:
+    if dispatch.count("append_atc_experience_for_effect_prepared(") != 1:
         raise ValueError("expected exactly one dispatch-side experience append")
     cooldown = dispatch.index("if throttled {")
     dequeue = dispatch.index("let Some(mut effect) = pending_effects.pop_front()")
-    append = dispatch.index("append_atc_experience_for_effect(")
+    append = dispatch.index("append_atc_experience_for_effect_prepared(")
     execute = dispatch.index("let status = execute_atc_effect(")
     if not cooldown < dequeue < append < execute:
         raise ValueError("experience append is not after cooldown and before execution")
@@ -93,6 +94,12 @@ def check(source: str) -> None:
         raise ValueError("eviction capture must skip intentionally unpersisted effects")
     if "effect.experience_id.is_some()" not in dispatch[cooldown:dequeue]:
         raise ValueError("cooldown capture must skip intentionally unpersisted effects")
+    if "build_atc_experience_row(&effect)" not in admission:
+        raise ValueError("queued effects must retain decision-time evidence in memory")
+    if "pending_experience_rows.remove(&cooldown_key)" not in dispatch:
+        raise ValueError("queued decision evidence must be consumed on dispatch")
+    if "prepared_row.unwrap_or_else(|| build_atc_experience_row(effect))" not in source:
+        raise ValueError("append helper must use captured decision evidence")
 
 
 def transform(source: str) -> str:
@@ -119,7 +126,57 @@ def transform(source: str) -> str:
         "// Throttled outcomes still perform durable work, so they must\n                // count against the per-tick action budget.",
         "// Suppressed outcomes still count against the action budget,\n                // even when they intentionally have no durable experience.",
     )
-    result = source[:start] + region + source[end:]
+    region = replace_once(region, "pending_effect_keys.insert(effect_key)", "pending_effect_keys.insert(effect_key.clone())", "retained semantic key")
+    region = replace_once(
+        region, "                        pending_effect_keys.remove(&dropped_key);",
+        "                        pending_effect_keys.remove(&dropped_key);\n                        let _ = pending_experience_rows.remove(&dropped_key);",
+        "evicted evidence cleanup",
+    )
+    region = replace_once(
+        region, "                pending_effect_keys.remove(&cooldown_key);",
+        "                pending_effect_keys.remove(&cooldown_key);\n                let _ = pending_experience_rows.remove(&cooldown_key);",
+        "throttled evidence cleanup",
+    )
+    region = replace_once(
+        region, "                pending_effects.push_back(effect);",
+        "                // Preserve decision-time evidence before the bounded ledger can evict it.\n"
+        "                // This derives an in-memory row; it does not acquire a DB connection.\n"
+        "                if durable_writes_enabled && effect.experience_id.is_none() {\n"
+        "                    pending_experience_rows.insert(effect_key, build_atc_experience_row(&effect));\n"
+        "                }\n"
+        "                pending_effects.push_back(effect);",
+        "queued decision evidence",
+    )
+    prefix = source[:start]
+    prefix = replace_once(
+        prefix, "    let mut pending_effect_keys: HashSet<String> = HashSet::new();",
+        "    let mut pending_effect_keys: HashSet<String> = HashSet::new();\n"
+        "    let mut pending_experience_rows: HashMap<String, Result<ExperienceRow, String>> = HashMap::new();",
+        "bounded evidence cache",
+    )
+    result = prefix + region + source[end:]
+    signature = (
+        "fn append_atc_experience_for_effect(\n"
+        "    pool: &mcp_agent_mail_db::DbPool,\n"
+        "    effect: &atc::AtcEffectPlan,\n"
+        ") -> Result<ExperienceRow, String> {\n"
+    )
+    replacement_signature = (
+        "#[allow(dead_code)] // Retain the immediate-append entry point for existing callers/tests.\n"
+        + signature
+        + "    append_atc_experience_for_effect_prepared(pool, effect, None)\n}\n\n"
+        "fn append_atc_experience_for_effect_prepared(\n"
+        "    pool: &mcp_agent_mail_db::DbPool,\n"
+        "    effect: &atc::AtcEffectPlan,\n"
+        "    prepared_row: Option<Result<ExperienceRow, String>>,\n"
+        ") -> Result<ExperienceRow, String> {\n"
+    )
+    result = replace_once(result, signature, replacement_signature, "prepared-row append helper")
+    result = replace_once(
+        result, "    let row = match build_atc_experience_row(effect) {",
+        "    let row = match prepared_row.unwrap_or_else(|| build_atc_experience_row(effect)) {",
+        "decision snapshot consumption",
+    )
     check(result)
     return result
 
@@ -139,16 +196,27 @@ struct Semantics { cooldown_key: String, cooldown_micros: i64, family: String }
 #[derive(Clone, Debug)]
 struct Effect { experience_id: Option<u64>, semantics: Semantics }
 #[derive(Default)]
-struct Pool { appends: Cell<usize>, captures: Cell<usize>, missing: Cell<usize>, fail: bool }
-struct Experience { experience_id: u64 }
+struct Pool { appends: Cell<usize>, captures: Cell<usize>, missing: Cell<usize>, generations: Cell<u64>, fail: bool }
+struct Experience { experience_id: u64, generation: u64 }
+type ExperienceRow = Experience;
+thread_local! { static GENERATION: Cell<u64> = const { Cell::new(1) }; }
+fn build_atc_experience_row(_: &Effect) -> Result<ExperienceRow, String> {
+    Ok(Experience { experience_id: 0, generation: GENERATION.with(Cell::get) })
+}
 #[derive(Clone, Copy)]
 struct Mode;
 impl Mode { fn as_str(self) -> &'static str { "live" } }
 fn atc_effect_semantic_key(effect: &Effect) -> String { effect.semantics.cooldown_key.clone() }
-fn append_atc_experience_for_effect(pool: &Pool, _: &Effect) -> Result<Experience, &'static str> {
+fn append_atc_experience_for_effect(pool: &Pool, effect: &Effect) -> Result<Experience, &'static str> {
+    append_atc_experience_for_effect_prepared(pool, effect, None)
+}
+fn append_atc_experience_for_effect_prepared(pool: &Pool, effect: &Effect, prepared: Option<Result<ExperienceRow, String>>) -> Result<Experience, &'static str> {
+    let mut row = prepared.unwrap_or_else(|| build_atc_experience_row(effect)).map_err(|_| "derive failure")?;
     pool.appends.set(pool.appends.get() + 1);
+    pool.generations.set(pool.generations.get() + row.generation);
     if pool.fail { return Err("injected append failure"); }
-    Ok(Experience { experience_id: pool.appends.get() as u64 })
+    row.experience_id = pool.appends.get() as u64;
+    Ok(row)
 }
 fn capture_atc_execution_result(pool: &Pool, id: Option<u64>, _: &str, _: &str, _: i64) {
     if id.is_some() { pool.captures.set(pool.captures.get() + 1); }
@@ -175,8 +243,9 @@ fn effect(index: usize) -> Effect {
         family: "liveness_probe".into(),
     } }
 }
-struct ResultCounts { appends: usize, captures: usize, missing: usize, executions: Vec<Option<u64>>, pending: usize, processed: usize, visible: Vec<String> }
+struct ResultCounts { appends: usize, captures: usize, missing: usize, generations: u64, pending_rows: usize, executions: Vec<Option<u64>>, pending: usize, processed: usize, visible: Vec<String> }
 fn run(new_effects: Vec<Effect>, mut last_action_by_key: HashMap<String, i64>, durable_writes_enabled: bool, fail: bool) -> ResultCounts {
+    GENERATION.with(|g| g.set(1));
     let pool = Pool { fail, ..Pool::default() };
     let atc_db_pool = Some(pool);
     let now_micros: i64 = 10_000_000;
@@ -185,13 +254,14 @@ fn run(new_effects: Vec<Effect>, mut last_action_by_key: HashMap<String, i64>, d
     let mut executor_registered_projects = Vec::new();
     let mut pending_effects: VecDeque<Effect> = VecDeque::new();
     let mut pending_effect_keys: HashSet<String> = HashSet::new();
+    let mut pending_experience_rows: HashMap<String, Result<ExperienceRow, String>> = HashMap::new();
     let mut recent_executions = VecDeque::new();
     let mut recent_actions = VecDeque::new();
     let mut visible_actions = Vec::new();
 '''
 HARNESS_SUFFIX = r'''
     let pool = atc_db_pool.unwrap();
-    ResultCounts { appends: pool.appends.get(), captures: pool.captures.get(), missing: pool.missing.get(), executions: executor_registered_projects, pending: pending_effects.len(), processed: processed_this_tick, visible: visible_actions }
+    ResultCounts { appends: pool.appends.get(), captures: pool.captures.get(), missing: pool.missing.get(), generations: pool.generations.get(), pending_rows: pending_experience_rows.len(), executions: executor_registered_projects, pending: pending_effects.len(), processed: processed_this_tick, visible: visible_actions }
 }
 #[test]
 fn burst_940_agents_persists_only_64_dispatches() {
@@ -202,6 +272,7 @@ fn burst_940_agents_persists_only_64_dispatches() {
     assert_eq!(r.executions.len(), 64);
     assert!(r.executions.iter().all(Option::is_some));
     assert_eq!(r.pending, 448);
+    assert_eq!(r.pending_rows, 448, "evicted/dispatched evidence must not leak");
     assert!(r.visible.iter().any(|s| s == ATC_QUEUE_BACKPRESSURE_STATUS));
 }
 #[test]
@@ -211,6 +282,7 @@ fn ten_thousand_duplicate_proposals_persist_once() {
     assert_eq!(r.captures, 1);
     assert_eq!(r.executions.len(), 1);
     assert_eq!(r.pending, 0);
+    assert_eq!(r.pending_rows, 0);
 }
 #[test]
 fn cooled_down_burst_does_not_write_or_report_missing_experiences() {
@@ -221,6 +293,7 @@ fn cooled_down_burst_does_not_write_or_report_missing_experiences() {
     assert!(r.executions.is_empty());
     assert_eq!(r.processed, 64, "throttled effects must consume the processing budget");
     assert_eq!(r.pending, 448);
+    assert_eq!(r.pending_rows, 448, "throttled evidence must not leak");
 }
 #[test]
 fn disabled_write_gate_is_preserved() {
@@ -245,6 +318,11 @@ fn existing_experience_is_not_appended_again() {
     assert_eq!(r.captures, 1);
 }
 #[test]
+fn dispatch_retains_decision_time_evidence_after_ledger_changes() {
+    let r = run((0..940).map(effect).collect(), HashMap::new(), true, false);
+    assert_eq!(r.generations, r.appends as u64, "must append generation-1 evidence, not derive generation-2 evidence at dispatch");
+}
+#[test]
 fn empty_tick_is_write_free() {
     let r = run(Vec::new(), HashMap::new(), true, false);
     assert_eq!((r.appends, r.captures, r.missing), (0, 0, 0));
@@ -256,6 +334,8 @@ fn empty_tick_is_write_free() {
 def harness(source: str) -> str:
     # These are the production Rust statements, not a Python model of the queue.
     _, _, region = loop_region(source)
+    # Change the decision source after admission to catch late re-derivation.
+    region = replace_once(region, MIDDLE, "        GENERATION.with(|g| g.set(2));\n" + MIDDLE, "regression evidence-change boundary")
     return HARNESS_PREFIX + region + HARNESS_SUFFIX
 
 
