@@ -225,6 +225,27 @@ statements below; v0.3.36 is published and this work targets unreleased main.
   does not match these integer keys. This is a bounded source assessment,
   not an advisory suppression or a claim that the dependency is patched.
   The direct pinned Tantivy and engine crates use fixed lru 0.18.2.
+- Queued a conditional IndexMap follow-up for the actual cache golden,
+  conformance fixture loader and storage coalescer tests. It waits for the
+  primary gate's terminal RCH success, stops on failure/refusal/deadline,
+  and keeps remote-only execution (`044-indexmap-consumers.log`). This
+  supplements indirect serialization coverage; neither run has passed yet.
+- IndexMap qualification completed: **275 tests passed** (3019 skipped)
+  at 15:15 UTC, followed by **54 direct-consumer/storage tests passed**
+  (3665 skipped) at 15:16 UTC September 18. Both strict RCH runs exited 0;
+  receipts are `044-indexmap-runtime.log` and `044-indexmap-consumers.log`.
+  These supersede the pending status above; final workspace/platform gates
+  remain separate. The lockfile change was already captured by shared
+  commit `4c56a97a`; no duplicate implementation commit is needed.
+- SmallVec 1.15.2 → 1.16.1 resolved alone. Reviewed upstream 1.16 changes
+  (push implementation, debugger metadata and warning fixes), and the real
+  messaging/contact/reservation consumers. A bounded sequential campaign
+  will test this candidate, then update/test toml_edit 0.25.15 and tru 0.2.4
+  individually. Those patch releases were researched in advance; no API
+  migration is required by their release notes. Each stage requires the
+  preceding strict remote tests to pass and fresh exclusive file leases.
+  Unexpected package changes, merge conflicts or any failed command stop
+  the sequence for review. No source-code rewriting or publication occurs.
 
 ## September 16, 2026 — release qualification update
 
