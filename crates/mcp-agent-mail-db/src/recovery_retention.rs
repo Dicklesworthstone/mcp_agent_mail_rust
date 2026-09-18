@@ -675,42 +675,50 @@ pub fn retention_resident_stats(
 /// Outcome of [`consolidate_debris`].
 #[derive(Debug, Clone, Default)]
 pub struct ReclaimOutcome {
+    /// Moves whose source and destination parent-directory syncs completed.
     pub moved: usize,
     pub moved_bytes: u64,
-    /// `(path, error_message)` for artifacts that could not be moved.
+    /// `(source_path, error_message)` for incomplete operations. If a rename
+    /// completed but a subsequent directory sync failed, the message names
+    /// the retained destination explicitly. Such evidence must not be retried
+    /// or described as still present at the source.
     pub failures: Vec<(PathBuf, String)>,
 }
 
 /// Consolidate (MOVE — never delete) the planned debris into `dest_dir`.
 ///
-/// Per RULE 1 and the forensic-bundle manifest's no-automatic-deletion
-/// contract, this never removes data; it relocates each artifact under one
-/// operator-reclaimable directory so disk is freed only by an explicit later
-/// `rm` the operator chooses to run. The destination directory is claimed with
-/// `create_dir`, never reused, so concurrent reclaim passes cannot overwrite
-/// one another's evidence. Same-filesystem renames are atomic and cheap.
+/// Each move uses atomic no-replace publication, including when the source is
+/// an entire forensic directory. Existing and raced destination entries are
+/// never replaced. A bounded collision budget leaves the source in place on
+/// exhaustion. Completed moves are counted only after both parent-directory
+/// syncs succeed; a sync failure preserves the moved evidence and reports its
+/// actual destination instead of attempting a destructive rollback.
+///
+/// New directories are private at creation on Unix. This is not a claim of
+/// full ancestor anchoring: callers must still supply a trusted storage-root
+/// namespace. Non-Unix platforms fail closed until directory durability has
+/// a supported implementation; an empty plan remains a side-effect-free no-op.
 pub fn consolidate_debris(plan: &ReclaimPlan, dest_dir: &Path) -> std::io::Result<ReclaimOutcome> {
     if plan.prune.is_empty() {
         return Ok(ReclaimOutcome::default());
+    }
+    if !cfg!(unix) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "durable recovery-debris consolidation is unsupported on this platform; sources retained",
+        ));
     }
     if let Some(parent) = dest_dir
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        std::fs::create_dir_all(parent)?;
+        create_private_reclaim_directory(parent, true)?;
     }
-    std::fs::create_dir(dest_dir)?;
+    create_private_reclaim_directory(dest_dir, false)?;
     let mut outcome = ReclaimOutcome::default();
     for art in &plan.prune {
-        let Some(name) = art.path.file_name() else {
-            outcome
-                .failures
-                .push((art.path.clone(), "artifact has no file name".to_string()));
-            continue;
-        };
-        let dest = unique_dest_path(dest_dir, name);
-        match std::fs::rename(&art.path, &dest) {
-            Ok(()) => {
+        match move_recovery_debris(&art.path, dest_dir) {
+            Ok(_) => {
                 outcome.moved += 1;
                 outcome.moved_bytes = outcome.moved_bytes.saturating_add(art.bytes);
             }
@@ -720,22 +728,130 @@ pub fn consolidate_debris(plan: &ReclaimPlan, dest_dir: &Path) -> std::io::Resul
     Ok(outcome)
 }
 
-/// Pick a destination path under `dest_dir` that does not collide with an
-/// existing entry (suffix `.1`, `.2`, ... on conflict).
-fn unique_dest_path(dest_dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
-    let candidate = dest_dir.join(name);
-    if !candidate.exists() {
-        return candidate;
+const MAX_RECLAIM_MOVE_ATTEMPTS: u32 = 128;
+
+fn create_private_reclaim_directory(path: &Path, recursive: bool) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(recursive);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
     }
-    for n in 1..u32::MAX {
-        let mut alt = name.to_os_string();
-        alt.push(format!(".{n}"));
-        let candidate = dest_dir.join(&alt);
-        if !candidate.exists() {
-            return candidate;
+    builder.create(path)
+}
+
+/// Open the directory itself without following a final-component symlink.
+/// Preflight sync support before any source can be moved. The retained file
+/// handle also prevents a later pathname substitution from redirecting the
+/// durability operation to a different directory.
+fn open_reclaim_sync_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags};
+        let fd = rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let directory = std::fs::File::from(fd);
+        directory.sync_all()?;
+        Ok(directory)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "recovery-debris directory sync is unsupported on this platform",
+        ))
+    }
+}
+
+fn sync_reclaim_move_parents(
+    source_parent: &std::fs::File,
+    destination_parent: &std::fs::File,
+) -> std::io::Result<()> {
+    // Attempt BOTH syncs even if one fails. Never undo a published move.
+    let destination_result = destination_parent.sync_all();
+    let source_result = source_parent.sync_all();
+    destination_result.and(source_result)
+}
+
+fn move_recovery_debris(source: &Path, destination_dir: &Path) -> std::io::Result<PathBuf> {
+    move_recovery_debris_with(
+        source,
+        destination_dir,
+        crate::pool::rename_noreplace_preserving_source,
+        sync_reclaim_move_parents,
+    )
+}
+
+fn move_recovery_debris_with<R, S>(
+    source: &Path,
+    destination_dir: &Path,
+    mut rename: R,
+    mut sync: S,
+) -> std::io::Result<PathBuf>
+where
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+    S: FnMut(&std::fs::File, &std::fs::File) -> std::io::Result<()>,
+{
+    let name = source.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "artifact has no file name")
+    })?;
+    let metadata = std::fs::symlink_metadata(source)?;
+    if !(metadata.file_type().is_file() || metadata.file_type().is_dir()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "recovery artifact is not a regular file or real directory",
+        ));
+    }
+    let source_parent_path = source
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let source_parent = open_reclaim_sync_directory(source_parent_path)?;
+    let destination_parent = open_reclaim_sync_directory(destination_dir)?;
+    // Persist the newly claimed quarantine directory's own directory entry
+    // as well as the entries that will be placed inside it.
+    let quarantine_parent_path = destination_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let _quarantine_parent = open_reclaim_sync_directory(quarantine_parent_path)?;
+    for suffix in 0..MAX_RECLAIM_MOVE_ATTEMPTS {
+        let mut leaf = name.to_os_string();
+        if suffix != 0 {
+            leaf.push(format!(".{suffix}"));
+        }
+        let destination = destination_dir.join(leaf);
+        match rename(source, &destination) {
+            Ok(()) => {
+                sync(&source_parent, &destination_parent).map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "artifact moved to {}; directory durability is unconfirmed: {error}; evidence retained at destination, do not retry or roll back this move",
+                            destination.display()
+                        ),
+                    )
+                })?;
+                return Ok(destination);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
         }
     }
-    dest_dir.join(name)
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "reclaim collision budget exhausted for {} under {}; source retained",
+            source.display(),
+            destination_dir.display()
+        ),
+    ))
 }
 
 /// Recursive on-disk byte total for a directory, without following symlinks
@@ -1300,6 +1416,7 @@ mod tests {
         assert_eq!(stats.reclaimable_bytes, 0, "no policy → no reclaim probe");
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerates_startup_precheckpoint_snapshots_as_sidecar_snapshots() {
         let dir = tempfile::tempdir().unwrap();
@@ -1359,6 +1476,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_and_consolidate_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -1448,6 +1566,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn consolidate_refuses_to_reuse_an_existing_destination() {
         let dir = tempfile::tempdir().unwrap();
@@ -1474,5 +1593,159 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&source).unwrap(), b"new evidence");
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"prior evidence");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_directory_collision_preserves_both_forensic_bundles() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("bundle");
+        let dest = root.path().join("quarantine");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(source.join("evidence"), b"source bundle").unwrap();
+        let mut attempts = 0;
+        let moved = move_recovery_debris_with(
+            &source,
+            &dest,
+            |from, to| {
+                attempts += 1;
+                if attempts == 1 {
+                    std::fs::create_dir(to).unwrap();
+                    std::fs::write(to.join("evidence"), b"raced bundle").unwrap();
+                }
+                crate::pool::rename_noreplace_preserving_source(from, to)
+            },
+            sync_reclaim_move_parents,
+        )
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(moved, dest.join("bundle.1"));
+        assert_eq!(std::fs::read(moved.join("evidence")).unwrap(), b"source bundle");
+        assert_eq!(std::fs::read(dest.join("bundle/evidence")).unwrap(), b"raced bundle");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_preserves_dangling_destination_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("evidence");
+        let dest = root.path().join("quarantine");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(&source, b"source").unwrap();
+        std::os::unix::fs::symlink("absent", dest.join("evidence")).unwrap();
+        let moved = move_recovery_debris(&source, &dest).unwrap();
+        assert_eq!(moved, dest.join("evidence.1"));
+        assert_eq!(std::fs::read_link(dest.join("evidence")).unwrap(), Path::new("absent"));
+        assert_eq!(std::fs::read(moved).unwrap(), b"source");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_sync_failure_reports_the_retained_destination_without_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("evidence");
+        let dest = root.path().join("quarantine");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(&source, b"source evidence").unwrap();
+        let mut renames = 0;
+        let error = move_recovery_debris_with(
+            &source,
+            &dest,
+            |from, to| {
+                renames += 1;
+                crate::pool::rename_noreplace_preserving_source(from, to)
+            },
+            |_, _| Err(std::io::Error::other("injected directory sync failure")),
+        )
+        .unwrap_err();
+        assert_eq!(renames, 1);
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(dest.join("evidence")).unwrap(), b"source evidence");
+        let message = error.to_string();
+        assert!(message.contains(&dest.join("evidence").display().to_string()));
+        assert!(message.contains("durability is unconfirmed"));
+        assert!(message.contains("do not retry or roll back"));
+        assert_eq!(std::fs::read_dir(dest).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_exhaustion_preserves_source_and_all_destinations() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("evidence");
+        let dest = root.path().join("quarantine");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(&source, b"source").unwrap();
+        for suffix in 0..MAX_RECLAIM_MOVE_ATTEMPTS {
+            let name = if suffix == 0 {
+                "evidence".to_string()
+            } else {
+                format!("evidence.{suffix}")
+            };
+            std::fs::write(dest.join(name), b"existing").unwrap();
+        }
+        let error = move_recovery_debris(&source, &dest).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(source).unwrap(), b"source");
+        for entry in std::fs::read_dir(dest).unwrap() {
+            assert_eq!(std::fs::read(entry.unwrap().path()).unwrap(), b"existing");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_rejects_symlink_sources_and_destination_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let source = root.path().join("evidence");
+        let dest = root.path().join("quarantine");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(&target, b"unrelated").unwrap();
+        std::os::unix::fs::symlink(&target, &source).unwrap();
+        assert!(move_recovery_debris(&source, &dest).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"unrelated");
+        assert!(std::fs::symlink_metadata(source).unwrap().file_type().is_symlink());
+        let linked_dest = root.path().join("linked-quarantine");
+        std::os::unix::fs::symlink(&dest, &linked_dest).unwrap();
+        assert!(move_recovery_debris(&target, &linked_dest).is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"unrelated");
+        assert_eq!(std::fs::read_dir(dest).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_directories_are_private_when_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("doctor/reclaimable/run");
+        create_private_reclaim_directory(&dest, true).unwrap();
+        for path in [root.path().join("doctor"), root.path().join("doctor/reclaimable"), dest] {
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn reclaim_without_supported_directory_sync_refuses_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("evidence");
+        std::fs::write(&source, b"source").unwrap();
+        let plan = ReclaimPlan {
+            prune: vec![DebrisArtifact {
+                path: source.clone(),
+                bytes: 6,
+                modified_us: 1,
+                category: DebrisCategory::CorruptQuarantine,
+            }],
+            ..ReclaimPlan::default()
+        };
+        let dest = root.path().join("quarantine");
+        let error = consolidate_debris(&plan, &dest).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(std::fs::read(source).unwrap(), b"source");
+        assert!(!dest.exists());
+        assert_eq!(consolidate_debris(&ReclaimPlan::default(), &dest).unwrap().moved, 0);
+        assert!(!dest.exists());
     }
 }
