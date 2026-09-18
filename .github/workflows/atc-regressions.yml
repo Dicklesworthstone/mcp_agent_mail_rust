@@ -5,9 +5,12 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/atc-regressions.yml'
-      - 'scripts/atc_dispatch_persistence.py'
       - 'crates/mcp-agent-mail-server/src/atc*.rs'
       - 'crates/mcp-agent-mail-server/src/lib.rs'
+      - 'crates/mcp-agent-mail-server/tests/*atc*'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
   workflow_dispatch:
 
 permissions:
@@ -15,15 +18,12 @@ permissions:
 
 concurrency:
   group: atc-regressions-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   atc:
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    permissions:
-      contents: write
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -33,66 +33,25 @@ jobs:
       HTTP_PORT: '1'
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install repository-pinned compiler
         shell: bash
         run: |
           set -euo pipefail
           toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
-          rustup toolchain install "$toolchain" --profile minimal --component rustfmt
+          rustup toolchain install "$toolchain" --profile minimal
           rustc --version
+      - name: Run dependency-free native notification regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --edition=2024 --test crates/mcp-agent-mail-server/src/atc_delivery.rs -o /tmp/atc-delivery-tests
+          /tmp/atc-delivery-tests --nocapture
       - uses: Swatinem/rust-cache@v2
-      - name: Reproduce old write amplification before patching
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! python3 scripts/atc_dispatch_persistence.py check; then
-            python3 scripts/atc_dispatch_persistence.py test --expect-failure
-          fi
-      - name: Apply exact-context source patch and run regressions
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 scripts/atc_dispatch_persistence.py apply
-          python3 scripts/atc_dispatch_persistence.py check
-          python3 scripts/atc_dispatch_persistence.py test
-          python3 scripts/atc_dispatch_persistence.py harness > /tmp/atc_dispatch_regressions.rs
-          git diff -- crates/mcp-agent-mail-server/src/lib.rs > /tmp/atc_dispatch_persistence.patch
-      - name: Format changed Rust source
-        run: |
-          rustfmt --edition 2024 --config skip_children=true crates/mcp-agent-mail-server/src/lib.rs
-          python3 scripts/atc_dispatch_persistence.py check
-          python3 scripts/atc_dispatch_persistence.py test
       - name: Compile server targets
         run: cargo check --locked -p mcp-agent-mail-server --all-targets
-      - name: Run server ATC tests
+      - name: Run server ATC tests including the admission boundary
         run: cargo test --locked -p mcp-agent-mail-server --lib atc -- --nocapture
-      - name: Preserve regression evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: atc-regression-evidence-${{ github.sha }}
-          path: |
-            /tmp/atc_dispatch_regressions.rs
-            /tmp/atc_dispatch_persistence.patch
-            crates/mcp-agent-mail-server/src/lib.rs
-          retention-days: 3
-          if-no-files-found: error
-      - name: Commit validated source directly to main
-        shell: bash
-        run: |
-          set -euo pipefail
-          target=crates/mcp-agent-mail-server/src/lib.rs
-          if git diff --quiet -- "$target"; then
-            echo 'Source fix is already integrated.'
-            exit 0
-          fi
-          changed=$(git diff --name-only)
-          test "$changed" = "$target"
-          # Do not overwrite or silently rebase a concurrently updated main.
-          remote_head=$(git ls-remote origin refs/heads/main | cut -f1)
-          test "$remote_head" = "$GITHUB_SHA"
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- "$target"
-          git commit -m 'fix(atc): persist experiences only for budgeted dispatches (GH258)'
-          git push origin HEAD:main
+      - name: Verify validation did not rewrite production sources
+        run: git diff --exit-code
