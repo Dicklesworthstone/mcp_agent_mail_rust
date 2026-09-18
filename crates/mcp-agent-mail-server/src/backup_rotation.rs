@@ -29,6 +29,7 @@ use tracing::{debug, info, warn};
 /// `AM_BACKUP_KEEP_COUNT`. Floor of 1 (keep the most recent no matter what).
 const DEFAULT_KEEP_PER_KIND: usize = 3;
 const MIN_KEEP_PER_KIND: usize = 1;
+const MAX_QUARANTINE_LEAF_ATTEMPTS: u32 = 128;
 
 // Lifted to the db crate (GH#210) so the MCP `health_check` retention block
 // (tools crate, which cannot depend on this crate) and `am doctor health`
@@ -106,9 +107,8 @@ pub fn rotation_delete_opted_in() -> bool {
 ///
 /// Rotation can run concurrently in two cold-starting processes. A shared
 /// second-resolution directory would let both processes target the same file
-/// name, and `rename` is allowed to replace an existing destination on Unix.
-/// Claiming the directory with `create_dir` keeps each pass isolated and makes
-/// the later moves non-overwriting among cooperative rotation processes.
+/// name. Claiming the directory with `create_dir` isolates cooperative passes;
+/// atomic no-replace leaf moves additionally protect against raced entries.
 fn create_unique_quarantine_dir(parent: &Path, stem: &str) -> std::io::Result<PathBuf> {
     fs::create_dir_all(parent)?;
 
@@ -131,6 +131,61 @@ fn create_unique_quarantine_dir(parent: &Path, stem: &str) -> std::io::Result<Pa
         format!(
             "no unique rotation quarantine directory available under {}",
             parent.display()
+        ),
+    ))
+}
+
+/// Move one backup without ever replacing an occupied quarantine leaf.
+/// Unsupported atomic moves and cross-device moves fail without copying or
+/// unlinking source evidence. Directory ownership is not a substitute for
+/// this primitive: another process can populate a claimed directory later.
+fn stage_backup_noreplace(source: &Path, directory: &Path) -> std::io::Result<PathBuf> {
+    stage_backup_noreplace_with(
+        source,
+        directory,
+        mcp_agent_mail_db::pool::rename_noreplace_preserving_source,
+    )
+}
+
+fn stage_backup_noreplace_with<F>(
+    source: &Path,
+    directory: &Path,
+    mut rename: F,
+) -> std::io::Result<PathBuf>
+where
+    F: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    let name = source.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "backup has no file name")
+    })?;
+    // The inventory can be stale by the time rotation reaches this entry.
+    // Never deliberately stage a symlink, directory, or other non-file.
+    if !fs::symlink_metadata(source)?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "rotation source is no longer a regular backup file",
+        ));
+    }
+    for suffix in 0..MAX_QUARANTINE_LEAF_ATTEMPTS {
+        let mut leaf = name.to_os_string();
+        if suffix != 0 {
+            leaf.push(format!(".{suffix}"));
+        }
+        let destination = directory.join(leaf);
+        // No exists() preflight: even dangling symlinks occupy a name, and
+        // only the atomic operation can exclude a concurrent publication.
+        match rename(source, &destination) {
+            Ok(()) => return Ok(destination),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "quarantine collision budget exhausted for {} under {}; source retained",
+            source.display(),
+            directory.display()
         ),
     ))
 }
@@ -336,10 +391,6 @@ pub fn rotate_storage_backups(
                     }
                 }
             }
-            let file_name = path.file_name().map_or_else(
-                || std::ffi::OsString::from("unnamed-backup"),
-                std::ffi::OsStr::to_os_string,
-            );
             let Some(directory) = quarantine_dir.as_ref() else {
                 warn!(
                     path = %path.display(),
@@ -348,23 +399,19 @@ pub fn rotate_storage_backups(
                 summary.kept += 1;
                 continue;
             };
-            let dest = directory.join(file_name);
-            match fs::rename(path, &dest) {
-                Ok(()) => {
+            match stage_backup_noreplace(path, directory) {
+                Ok(dest) => {
                     debug!(kind = kind.label(), path = %path.display(), dest = %dest.display(), size, "staged rotated backup into quarantine");
                     summary.staged += 1;
                     summary.bytes_staged = summary.bytes_staged.saturating_add(*size);
                 }
                 Err(err) => {
-                    // A cross-device rename can't succeed; a copy+remove
-                    // fallback would still be a delete, so it stays behind
-                    // the same explicit opt-in (which hard-deletes above
-                    // anyway). Without the opt-in, leave the file in place
-                    // and say so.
+                    // A cross-device or unsupported atomic move cannot
+                    // safely fall back to copy+remove. Preserve the source.
                     warn!(
                         kind = kind.label(),
                         path = %path.display(),
-                        dest = %dest.display(),
+                        directory = %directory.display(),
                         %err,
                         "failed to stage rotated backup into quarantine; keeping in place"
                     );
@@ -1041,5 +1088,111 @@ mod tests {
                 .path
                 .ends_with("storage.sqlite3.archive-reconcile-20260419_120000_000")
         );
+    }
+
+    #[test]
+    fn staging_preserves_a_destination_created_at_the_move_boundary() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("backup");
+        let directory = root.path().join("quarantine");
+        fs::create_dir(&directory).unwrap();
+        fs::write(&source, b"source evidence").unwrap();
+        let mut attempts = 0;
+        let staged = stage_backup_noreplace_with(&source, &directory, |from, to| {
+            attempts += 1;
+            if attempts == 1 {
+                fs::write(to, b"concurrent evidence").unwrap();
+            }
+            mcp_agent_mail_db::pool::rename_noreplace_preserving_source(from, to)
+        })
+        .expect("retry the actual OS collision");
+        assert_eq!(attempts, 2);
+        assert_eq!(staged, directory.join("backup.1"));
+        assert_eq!(fs::read(directory.join("backup")).unwrap(), b"concurrent evidence");
+        assert_eq!(fs::read(staged).unwrap(), b"source evidence");
+        assert!(!source.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_preserves_dangling_destination_symlink() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("backup");
+        let directory = root.path().join("quarantine");
+        fs::create_dir(&directory).unwrap();
+        fs::write(&source, b"source evidence").unwrap();
+        let occupied = directory.join("backup");
+        std::os::unix::fs::symlink("absent-target", &occupied).unwrap();
+        let staged = stage_backup_noreplace(&source, &directory).unwrap();
+        assert_eq!(staged, directory.join("backup.1"));
+        assert!(fs::symlink_metadata(&occupied).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_link(occupied).unwrap(), Path::new("absent-target"));
+        assert_eq!(fs::read(staged).unwrap(), b"source evidence");
+    }
+
+    #[test]
+    fn staging_collision_budget_exhaustion_preserves_all_evidence() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("backup");
+        let directory = root.path().join("quarantine");
+        fs::create_dir(&directory).unwrap();
+        fs::write(&source, b"source evidence").unwrap();
+        for suffix in 0..MAX_QUARANTINE_LEAF_ATTEMPTS {
+            let leaf = if suffix == 0 { "backup".to_string() } else { format!("backup.{suffix}") };
+            fs::write(directory.join(leaf), b"retained evidence").unwrap();
+        }
+        let error = stage_backup_noreplace(&source, &directory).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(error.to_string().contains("collision budget exhausted"));
+        assert_eq!(fs::read(source).unwrap(), b"source evidence");
+        let entries: Vec<_> = fs::read_dir(&directory).unwrap().collect();
+        assert_eq!(entries.len(), MAX_QUARANTINE_LEAF_ATTEMPTS as usize);
+        for entry in entries {
+            assert_eq!(fs::read(entry.unwrap().path()).unwrap(), b"retained evidence");
+        }
+    }
+
+    #[test]
+    fn staging_missing_destination_does_not_copy_or_remove_source() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("backup");
+        fs::write(&source, b"source evidence").unwrap();
+        assert!(stage_backup_noreplace(&source, &root.path().join("absent")).is_err());
+        assert_eq!(fs::read(source).unwrap(), b"source evidence");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_rejects_a_source_replaced_by_a_symlink() {
+        let root = TempDir::new().unwrap();
+        let directory = root.path().join("quarantine");
+        fs::create_dir(&directory).unwrap();
+        let target = root.path().join("target");
+        let source = root.path().join("backup");
+        fs::write(&target, b"unrelated evidence").unwrap();
+        std::os::unix::fs::symlink(&target, &source).unwrap();
+        assert!(stage_backup_noreplace(&source, &directory).is_err());
+        assert!(fs::symlink_metadata(source).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(target).unwrap(), b"unrelated evidence");
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_collision_suffix_preserves_raw_filename_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = TempDir::new().unwrap();
+        let directory = root.path().join("quarantine");
+        fs::create_dir(&directory).unwrap();
+        let name = std::ffi::OsString::from_vec(b"backup-\xff".to_vec());
+        let source = root.path().join(&name);
+        fs::write(&source, b"source").unwrap();
+        fs::write(directory.join(&name), b"existing").unwrap();
+        let staged = stage_backup_noreplace(&source, &directory).unwrap();
+        let mut suffixed = name.clone();
+        suffixed.push(".1");
+        assert_eq!(staged, directory.join(suffixed));
+        assert_eq!(fs::read(directory.join(name)).unwrap(), b"existing");
+        assert_eq!(fs::read(staged).unwrap(), b"source");
     }
 }
