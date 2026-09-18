@@ -1,0 +1,53 @@
+name: ATC regressions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/atc-regressions.yml'
+      - 'crates/mcp-agent-mail-server/src/atc*.rs'
+      - 'crates/mcp-agent-mail-server/src/lib.rs'
+      - 'crates/mcp-agent-mail-server/tests/*atc*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: atc-regressions-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  atc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preserve exact ATC sources for regression diagnosis
+        uses: actions/upload-artifact@v4
+        with:
+          name: atc-regression-sources-${{ github.sha }}
+          path: |
+            crates/mcp-agent-mail-server/src/atc*.rs
+            crates/mcp-agent-mail-server/src/lib.rs
+            crates/mcp-agent-mail-server/Cargo.toml
+            Cargo.toml
+            Cargo.lock
+            rust-toolchain.toml
+          retention-days: 3
+          if-no-files-found: error
+      - name: Clone sibling dependencies
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: ATC unit regressions
+        run: cargo test -p mcp-agent-mail-server --lib atc -- --nocapture
+        env:
+          DATABASE_URL: sqlite:///tmp/atc-regressions.sqlite3
+          STORAGE_ROOT: /tmp/atc-regressions-storage
+          HTTP_PORT: '1'
