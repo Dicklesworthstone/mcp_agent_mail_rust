@@ -209,6 +209,11 @@ statements below; v0.3.36 is published and this work targets unreleased main.
   exit 0 at 09:28 UTC September 18 (`044-clap-runtime.log`). This qualifies
   the dependency on its captured source; subsequent recovery/ATC merges
   still require final current-source gates.
+- IndexMap 2.14.0 → 2.14.2 resolves without other dependency changes.
+  Reviewed upstream macro-hygiene/const-initialization changes and the direct
+  conformance fixture maps plus DB serialization consumers. DB tracking,
+  cache, ordering, serialization and search-conformance tests are running
+  strictly remotely (`044-indexmap-runtime.log`); no result yet.
 
 ## September 16, 2026 — release qualification update
 
