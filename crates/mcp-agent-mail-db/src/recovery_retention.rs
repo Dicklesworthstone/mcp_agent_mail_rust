@@ -22,6 +22,16 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+#[cfg(unix)]
+#[path = "recovery_retention_namespace.rs"]
+mod namespace;
+
+#[cfg(all(test, unix))]
+use namespace::{
+    MAX_RECLAIM_MOVE_ATTEMPTS, create_private_reclaim_directory, move_recovery_debris,
+    move_recovery_debris_with, rename_reclaim_entry, sync_reclaim_move_parents,
+};
+
 /// Which kind of recovery debris an artifact is. Retention is applied
 /// independently per category so a burst of one kind cannot evict the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -444,7 +454,7 @@ pub fn is_stale_artifact_name(name: &str) -> bool {
 //
 // This lived in `mcp-agent-mail-server::backup_rotation` and was lifted here
 // so BOTH `am doctor health` (CLI) and the MCP `health_check` retention block
-// (tools crate, which cannot depend on the server crate) consume one
+// (tools crate, which cannot depend on this crate) consume one
 // classifier. The server re-exports these for its rotation machinery.
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -715,183 +725,66 @@ pub fn retention_resident_stats(
 /// Outcome of [`consolidate_debris`].
 #[derive(Debug, Clone, Default)]
 pub struct ReclaimOutcome {
-    /// Moves whose source and destination parent-directory syncs completed.
+    /// Moves whose source/destination identity checks and directory syncs completed.
     pub moved: usize,
     pub moved_bytes: u64,
-    /// `(source_path, error_message)` for incomplete operations. If a rename
-    /// completed but a subsequent directory sync failed, the message names
-    /// the retained destination explicitly. Such evidence must not be retried
-    /// or described as still present at the source.
+    /// `(source_path, error_message)` for incomplete operations. A completed
+    /// rename followed by a sync or namespace-validation failure reports the
+    /// requested destination and preserves evidence in the retained directory.
+    /// Its pathname may have changed; never blindly retry or roll back it.
     pub failures: Vec<(PathBuf, String)>,
 }
 
 /// Consolidate (MOVE — never delete) the planned debris into `dest_dir`.
 ///
-/// Each move uses atomic no-replace publication, including when the source is
-/// an entire forensic directory. Existing and raced destination entries are
-/// never replaced. A bounded collision budget leaves the source in place on
-/// exhaustion. Completed moves are counted only after both parent-directory
-/// syncs succeed; a sync failure preserves the moved evidence and reports its
-/// actual destination instead of attempting a destructive rollback.
+/// Retain one newly claimed quarantine directory for the entire batch. Walk
+/// source and destination ancestors without following user-controlled symlinks,
+/// create new components privately, and sync their entries before moving data.
+/// Each atomic no-replace move uses retained parent handles, not a fresh pathname
+/// lookup. A replaced parent cannot redirect the rename into its replacement.
 ///
-/// New directories are private at creation on Unix. This is not a claim of
-/// full ancestor anchoring: callers must still supply a trusted storage-root
-/// namespace. Non-Unix platforms fail closed until directory durability has
-/// a supported implementation; an empty plan remains a side-effect-free no-op.
+/// A completed rename is counted only after both participating directories are
+/// synced and the source/destination identities revalidate. Post-move failures
+/// preserve evidence and report uncertainty without retrying or rolling back.
+/// Non-Unix platforms retain the existing fail-closed contract; an empty plan
+/// remains a side-effect-free no-op.
 pub fn consolidate_debris(plan: &ReclaimPlan, dest_dir: &Path) -> std::io::Result<ReclaimOutcome> {
     if plan.prune.is_empty() {
         return Ok(ReclaimOutcome::default());
     }
-    if !cfg!(unix) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "durable recovery-debris consolidation is unsupported on this platform; sources retained",
-        ));
-    }
-    if let Some(parent) = dest_dir
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        create_private_reclaim_directory(parent, true)?;
-    }
-    create_private_reclaim_directory(dest_dir, false)?;
-    let mut outcome = ReclaimOutcome::default();
-    for art in &plan.prune {
-        match move_recovery_debris(&art.path, dest_dir) {
-            Ok(_) => {
-                outcome.moved += 1;
-                outcome.moved_bytes = outcome.moved_bytes.saturating_add(art.bytes);
-            }
-            Err(err) => outcome.failures.push((art.path.clone(), err.to_string())),
-        }
-    }
-    Ok(outcome)
-}
-
-const MAX_RECLAIM_MOVE_ATTEMPTS: u32 = 128;
-
-fn create_private_reclaim_directory(path: &Path, recursive: bool) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(recursive);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path)
-}
-
-/// Open the directory itself without following a final-component symlink.
-/// Preflight sync support before any source can be moved. The retained file
-/// handle also prevents a later pathname substitution from redirecting the
-/// durability operation to a different directory.
-fn open_reclaim_sync_directory(path: &Path) -> std::io::Result<std::fs::File> {
-    #[cfg(unix)]
-    {
-        use rustix::fs::{Mode, OFlags};
-        let fd = rustix::fs::open(
-            path,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(std::io::Error::from)?;
-        let directory = std::fs::File::from(fd);
-        directory.sync_all()?;
-        Ok(directory)
-    }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = dest_dir;
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "recovery-debris directory sync is unsupported on this platform",
+            "durable recovery-debris consolidation is unsupported on this platform; sources retained",
         ))
     }
-}
-
-fn sync_reclaim_move_parents(
-    source_parent: &std::fs::File,
-    destination_parent: &std::fs::File,
-) -> std::io::Result<()> {
-    // Attempt BOTH syncs even if one fails. Never undo a published move.
-    let destination_result = destination_parent.sync_all();
-    let source_result = source_parent.sync_all();
-    destination_result.and(source_result)
-}
-
-fn move_recovery_debris(source: &Path, destination_dir: &Path) -> std::io::Result<PathBuf> {
-    move_recovery_debris_with(
-        source,
-        destination_dir,
-        crate::pool::rename_noreplace_preserving_source,
-        sync_reclaim_move_parents,
-    )
-}
-
-fn move_recovery_debris_with<R, S>(
-    source: &Path,
-    destination_dir: &Path,
-    mut rename: R,
-    mut sync: S,
-) -> std::io::Result<PathBuf>
-where
-    R: FnMut(&Path, &Path) -> std::io::Result<()>,
-    S: FnMut(&std::fs::File, &std::fs::File) -> std::io::Result<()>,
-{
-    let name = source.file_name().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "artifact has no file name")
-    })?;
-    let metadata = std::fs::symlink_metadata(source)?;
-    if !(metadata.file_type().is_file() || metadata.file_type().is_dir()) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "recovery artifact is not a regular file or real directory",
-        ));
-    }
-    let source_parent_path = source
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let source_parent = open_reclaim_sync_directory(source_parent_path)?;
-    let destination_parent = open_reclaim_sync_directory(destination_dir)?;
-    // Persist the newly claimed quarantine directory's own directory entry
-    // as well as the entries that will be placed inside it.
-    let quarantine_parent_path = destination_dir
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let _quarantine_parent = open_reclaim_sync_directory(quarantine_parent_path)?;
-    for suffix in 0..MAX_RECLAIM_MOVE_ATTEMPTS {
-        let mut leaf = name.to_os_string();
-        if suffix != 0 {
-            leaf.push(format!(".{suffix}"));
-        }
-        let destination = destination_dir.join(leaf);
-        match rename(source, &destination) {
-            Ok(()) => {
-                sync(&source_parent, &destination_parent).map_err(|error| {
-                    std::io::Error::new(
-                        error.kind(),
-                        format!(
-                            "artifact moved to {}; directory durability is unconfirmed: {error}; evidence retained at destination, do not retry or roll back this move",
-                            destination.display()
-                        ),
-                    )
-                })?;
-                return Ok(destination);
+    #[cfg(unix)]
+    {
+        // Resolve every relative spelling against one captured working directory,
+        // rather than allowing a process-wide chdir to redirect a later artifact.
+        let cwd = std::env::current_dir()?;
+        let absolute = |path: &Path| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
+        };
+        let destination = namespace::claim_reclaim_directory(&absolute(dest_dir))?;
+        let mut outcome = ReclaimOutcome::default();
+        for art in &plan.prune {
+            match namespace::move_recovery_debris_into(&absolute(&art.path), &destination) {
+                Ok(_) => {
+                    outcome.moved += 1;
+                    outcome.moved_bytes = outcome.moved_bytes.saturating_add(art.bytes);
+                }
+                Err(error) => outcome.failures.push((art.path.clone(), error.to_string())),
+            }
         }
+        Ok(outcome)
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        format!(
-            "reclaim collision budget exhausted for {} under {}; source retained",
-            source.display(),
-            destination_dir.display()
-        ),
-    ))
 }
 
 /// Recursive on-disk byte total for a directory, without following symlinks
@@ -1648,13 +1541,13 @@ mod tests {
         let moved = move_recovery_debris_with(
             &source,
             &dest,
-            |from, to| {
+            |from_parent, from, to_parent, to| {
                 attempts += 1;
                 if attempts == 1 {
-                    std::fs::create_dir(to).unwrap();
-                    std::fs::write(to.join("evidence"), b"raced bundle").unwrap();
+                    std::fs::create_dir(dest.join(to)).unwrap();
+                    std::fs::write(dest.join(to).join("evidence"), b"raced bundle").unwrap();
                 }
-                crate::pool::rename_noreplace_preserving_source(from, to)
+                rename_reclaim_entry(from_parent, from, to_parent, to)
             },
             sync_reclaim_move_parents,
         )
@@ -1692,9 +1585,9 @@ mod tests {
         let error = move_recovery_debris_with(
             &source,
             &dest,
-            |from, to| {
+            |from_parent, from, to_parent, to| {
                 renames += 1;
-                crate::pool::rename_noreplace_preserving_source(from, to)
+                rename_reclaim_entry(from_parent, from, to_parent, to)
             },
             |_, _| Err(std::io::Error::other("injected directory sync failure")),
         )
@@ -1936,5 +1829,45 @@ mod tests {
         assert_eq!(debris[0].category, DebrisCategory::CorruptQuarantine);
         assert_eq!(std::fs::read(&primary).unwrap(), b"live state");
         assert_eq!(std::fs::read(alias).unwrap(), b"different mailbox");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn consolidate_rejects_an_aliased_source_without_losing_other_batch_artifacts() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let outside_artifact = outside.join("outside-evidence");
+        std::fs::write(&outside_artifact, b"outside evidence").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked-forensics")).unwrap();
+        let aliased = root.join("linked-forensics/outside-evidence");
+        let owned = root.join("owned-evidence");
+        std::fs::write(&owned, b"owned").unwrap();
+        let plan = ReclaimPlan {
+            prune: vec![
+                DebrisArtifact {
+                    path: aliased.clone(),
+                    bytes: 16,
+                    modified_us: 1,
+                    category: DebrisCategory::CorruptQuarantine,
+                },
+                DebrisArtifact {
+                    path: owned.clone(),
+                    bytes: 5,
+                    modified_us: 1,
+                    category: DebrisCategory::CorruptQuarantine,
+                },
+            ],
+            ..ReclaimPlan::default()
+        };
+        let destination = root.join("doctor/reclaimable/anchored-run");
+        let outcome = consolidate_debris(&plan, &destination).unwrap();
+        assert_eq!(outcome.moved, 1);
+        assert_eq!(outcome.moved_bytes, 5);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].0, aliased);
+        assert_eq!(std::fs::read(outside_artifact).unwrap(), b"outside evidence");
+        assert!(!owned.exists());
+        assert_eq!(std::fs::read(destination.join("owned-evidence")).unwrap(), b"owned");
+        assert_eq!(std::fs::read_dir(destination).unwrap().count(), 1);
     }
 }
