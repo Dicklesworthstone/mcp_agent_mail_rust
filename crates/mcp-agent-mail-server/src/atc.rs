@@ -4,12 +4,19 @@
 //! bounded evidence ledger. Routine probes and monitoring notices are passive:
 //! neither Live mode nor restarting grants permission to append mailbox rows.
 //! Only actionable notifications cross the delivery admission boundary.
+//! Population hydration yields between bounded slices before inference resumes.
 
 #[path = "atc_engine.rs"]
 mod engine;
+pub use engine::*;
 #[cfg(test)]
 pub(crate) use engine::GLOBAL_ATC_TEST_LOCK;
-pub use engine::*;
+
+#[path = "atc_population.rs"]
+mod population;
+pub use population::{
+    AtcPopulationHydrationStats, atc_population_hydration_stats, atc_sync_population_from_db,
+};
 
 #[path = "atc_delivery.rs"]
 mod delivery;
@@ -40,9 +47,7 @@ static DELIVERY: OnceLock<Mutex<DeliveryState>> = OnceLock::new();
 
 fn delivery_state() -> &'static Mutex<DeliveryState> {
     DELIVERY.get_or_init(|| {
-        Mutex::new(DeliveryState::new(
-            AtcConfig::default().probe_interval_micros,
-        ))
+        Mutex::new(DeliveryState::new(AtcConfig::default().probe_interval_micros))
     })
 }
 
@@ -53,15 +58,15 @@ fn reset_delivery(probe_interval_micros: i64) {
         DeliveryState::new(probe_interval_micros);
 }
 
-/// Initialize planning and its process-local delivery admission together.
+/// Initialize planning, hydration, and process-local delivery admission together.
 pub fn init_global_atc(config: &mcp_agent_mail_core::Config) {
-    engine::init_global_atc(config);
+    population::reset_with(|| engine::init_global_atc(config));
     reset_delivery(AtcEngine::config_from_env(config).probe_interval_micros);
 }
 
 #[cfg(test)]
 pub(crate) fn reset_global_atc_state_for_test(config: &mcp_agent_mail_core::Config) {
-    engine::reset_global_atc_state_for_test(config);
+    population::reset_with(|| engine::reset_global_atc_state_for_test(config));
     reset_delivery(AtcEngine::config_from_env(config).probe_interval_micros);
 }
 
@@ -76,11 +81,12 @@ pub fn atc_delivery_stats() -> AtcDeliveryStats {
         .stats()
 }
 
-/// Run the engine and admit actionable notifications before any executor I/O.
-/// Independent reservation mutations and their outcome notices are preserved.
+/// Advance bounded hydration or inference, then admit actionable notifications.
+/// Inference yields while a population refresh is incomplete; already-generated
+/// reservation mutations and their outcome notices retain their delivery policy.
 #[must_use]
 pub fn atc_tick_report(now_micros: i64) -> Option<AtcTickReport> {
-    let mut report = engine::atc_tick_report(now_micros)?;
+    let mut report = population::tick_report(now_micros)?;
     let mut state = delivery_state()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -129,7 +135,7 @@ pub fn atc_tick(now_micros: i64) -> Vec<AtcTickAction> {
     atc_tick_report(now_micros).map_or_else(Vec::new, |report| report.actions)
 }
 
-/// Keep the standalone snapshot's pending count consistent with the tick report.
+/// Keep the standalone snapshot consistent with admission and hydration progress.
 #[must_use]
 pub fn atc_summary() -> Option<AtcSummarySnapshot> {
     let mut summary = engine::atc_summary()?;
@@ -139,6 +145,8 @@ pub fn atc_summary() -> Option<AtcSummarySnapshot> {
     if state.last_tick_count == Some(summary.tick_count) {
         summary.kernel.pending_effects = state.last_effect_count;
     }
+    drop(state);
+    population::annotate_summary(&mut summary);
     Some(summary)
 }
 
@@ -277,28 +285,12 @@ mod admission_boundary_tests {
 
     #[test]
     fn only_recognized_notification_kind_and_family_pairs_are_gated() {
-        assert_eq!(
-            notification_class("probe_agent", "liveness_probe", false),
-            Some(NotificationClass::Probe)
-        );
+        assert_eq!(notification_class("probe_agent", "liveness_probe", false), Some(NotificationClass::Probe));
         for family in ["liveness_monitoring", "withheld_release_notice"] {
-            assert_eq!(
-                notification_class("send_advisory", family, false),
-                Some(NotificationClass::Liveness)
-            );
+            assert_eq!(notification_class("send_advisory", family, false), Some(NotificationClass::Liveness));
         }
-        assert_eq!(
-            notification_class("send_advisory", "deadlock_remediation", false),
-            Some(NotificationClass::Conflict)
-        );
-        assert_eq!(
-            notification_class(
-                "release_reservations_requested",
-                "liveness_monitoring",
-                false
-            ),
-            None
-        );
+        assert_eq!(notification_class("send_advisory", "deadlock_remediation", false), Some(NotificationClass::Conflict));
+        assert_eq!(notification_class("release_reservations_requested", "liveness_monitoring", false), None);
     }
 
     #[test]
@@ -312,14 +304,8 @@ mod admission_boundary_tests {
         let key = ActionKey::Advisory("BlueFox".into(), "released".into());
         retain_actions(&mut actions, &mut HashMap::from([(key, 1)]));
         assert_eq!(actions.len(), 2);
-        assert!(matches!(
-            actions[0],
-            AtcTickAction::ReleaseReservations { .. }
-        ));
-        assert!(matches!(
-            &actions[1],
-            AtcTickAction::SendAdvisory { message, .. } if message == "released"
-        ));
+        assert!(matches!(actions[0], AtcTickAction::ReleaseReservations { .. }));
+        assert!(matches!(&actions[1], AtcTickAction::SendAdvisory { message, .. } if message == "released"));
     }
 
     #[test]
