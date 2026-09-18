@@ -26,6 +26,9 @@ use std::time::UNIX_EPOCH;
 #[path = "recovery_retention_namespace.rs"]
 mod namespace;
 
+#[cfg(unix)]
+pub use namespace::{CompletedReclaimMove, ReclaimDirectory};
+
 #[cfg(all(test, unix))]
 use namespace::{
     MAX_RECLAIM_MOVE_ATTEMPTS, create_private_reclaim_directory, move_recovery_debris,
