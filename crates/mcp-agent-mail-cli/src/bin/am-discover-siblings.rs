@@ -59,8 +59,7 @@ fn main() {
     let args = Args::parse();
     mcp_agent_mail_core::diagnostics::init_process_start();
     match run(&args).and_then(|report| {
-        serde_json::to_string_pretty(&report)
-            .map_err(|error| CliError::Format(error.to_string()))
+        serde_json::to_string_pretty(&report).map_err(|error| CliError::Format(error.to_string()))
     }) {
         Ok(report) => println!("{report}"),
         Err(error) => {
@@ -94,8 +93,7 @@ mod tests {
     fn rejects_invalid_scope_and_unknown_arguments_before_database_access() {
         for invalid in ["0", "-1", "not-an-id"] {
             assert!(
-                Args::try_parse_from(["am-discover-siblings", "--project-id", invalid])
-                    .is_err()
+                Args::try_parse_from(["am-discover-siblings", "--project-id", invalid]).is_err()
             );
         }
         assert!(Args::try_parse_from(["am-discover-siblings", "--broadcast"]).is_err());

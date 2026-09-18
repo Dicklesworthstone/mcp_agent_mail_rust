@@ -529,9 +529,8 @@ fn run_full_cycle(
                 Ok(Some(mismatch)) => {
                     // This is positive corruption evidence, not an unavailable
                     // probe. Publish the same write refusal as a corrupt query.
-                    mcp_agent_mail_db::corruption_circuit_breaker().observe_error(
-                        &mcp_agent_mail_db::DbError::Sqlite(mismatch.clone()),
-                    );
+                    mcp_agent_mail_db::corruption_circuit_breaker()
+                        .observe_error(&mcp_agent_mail_db::DbError::Sqlite(mismatch.clone()));
                     handle_integrity_error_with_log(
                         "index_table_cross_count",
                         &mismatch,
@@ -1257,7 +1256,10 @@ mod tests {
         let error = run_index_table_cross_count(&path)
             .expect_err("an unopenable database must not become a completed clean probe");
         assert!(error.contains("cross-count read-only open failed"));
-        assert!(!path.exists(), "the failed observer must not create a database");
+        assert!(
+            !path.exists(),
+            "the failed observer must not create a database"
+        );
     }
 
     #[test]
@@ -1684,10 +1686,14 @@ mod tests {
     fn backup_dispatch_uses_one_shared_window_and_retries_pending_verified_work() {
         let now = Instant::now();
         let mut schedule = AutomaticBackupSchedule::default();
-        assert!(run_automatic_backup_with(&mut schedule, || now, |kind| {
-            assert_eq!(kind, BackupKind::Proactive);
-            Err("export failed; unique staging path one".to_string())
-        }));
+        assert!(run_automatic_backup_with(
+            &mut schedule,
+            || now,
+            |kind| {
+                assert_eq!(kind, BackupKind::Proactive);
+                Err("export failed; unique staging path one".to_string())
+            }
+        ));
         schedule.request_verified();
         assert!(run_automatic_backup_with(
             &mut schedule,
@@ -1772,8 +1778,15 @@ mod tests {
             details_indicate_ok(&extract_check_details(&rows, CheckKind::Full))
         };
         assert!(quick_passes());
-        assert!(index_table_cross_count(&conn, &["guard_mail"]).unwrap().is_empty());
-        assert!(!full_passes(), "the full probe must detect actual key-order damage");
+        assert!(
+            index_table_cross_count(&conn, &["guard_mail"])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !full_passes(),
+            "the full probe must detect actual key-order damage"
+        );
 
         let start = Instant::now();
         let mut gate = FullVerificationGate::default();
@@ -1804,7 +1817,10 @@ mod tests {
         assert_eq!(rows[0].get_named::<i64>("c").unwrap(), 0);
 
         conn.execute_raw("REINDEX idx_guard_mail").unwrap();
-        assert!(full_passes(), "the complete canonical scan must pass after repair");
+        assert!(
+            full_passes(),
+            "the complete canonical scan must pass after repair"
+        );
         assert!(run_integrity_followups(
             quick_passes(),
             false,

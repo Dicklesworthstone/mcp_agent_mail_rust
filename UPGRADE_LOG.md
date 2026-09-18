@@ -171,6 +171,49 @@ statements below; v0.3.36 is published and this work targets unreleased main.
   one admissible slot at 22:27 UTC (`044-doctor-hz3.log`, session 71926).
   This runs independently of the JWT gate on vmi1152480; no shared-worker
   build contention or additional dependency update was introduced.
+- JWT 11.1.0 passed **64 authentication tests**, 4663 skipped, strict RCH
+  exit 0 at 22:39 UTC September 17 (`044-jwt-warm-worker.log`).
+- Doctor/WAL gate passed **1225 tests**, 1616 skipped, strict RCH exit 0
+  at 01:37 UTC September 18 (`044-doctor-hz3.log`). These source snapshots
+  predate subsequent integrity/cache commits merged in `1e3dd21d`; final
+  current-source verification remains required.
+- Coordination recovery at 06:15 UTC September 18: the live Agent Mail
+  process had 2047 descriptors against soft limit 2048 (hard 1048576),
+  causing sidecar-open errors. Raised only PID 1685075's soft limit to 8192,
+  retaining its hard limit; inbox/reservations succeed again. No restart,
+  database repair or file mutation. This mitigates exhaustion, not its cause.
+- Next: Clap 4.6.6 → 4.6.7. Upstream adds an opt-in lazy-subcommand derive
+  attribute; no default behavior change requested. Qualify parser/help tests.
+- Clap and its builder/derive crates now resolve to 4.6.7. The strict remote
+  parser/help gate is running on hz3 (`044-clap-runtime.log`). Cargo also
+  reselected existing Windows dependency edges within their published ranges
+  (for example errno/tempfile allow `>=0.52, <0.62`, dirs-sys allows `>=0.59`).
+  These are resolver changes, not evidence that the previous edges were invalid;
+  Windows qualification remains required.
+- Descriptor accumulation is tracked separately by `br-8r6dl`: a subsequent
+  live-process sample found 2080 descriptors for the main database. Candidate
+  0.4.4 retains redundant opens while inode lock claims exist, a possible
+  explanation requiring reproduction. Never close these handles by force:
+  classic POSIX locks can be lost by closing another descriptor for that inode.
+- Current Clap-candidate audit returned exit 0 with zero vulnerabilities
+  (`044-audit-clap.json`); existing unmaintained/unsound warning categories
+  remain. New shared commits through `94edf0c3` introduced formatting drift
+  in twelve files. Manual formatting-only corrections restore a passing
+  workspace `cargo fmt --check` (`044-format-corrected.log`). No behavioral
+  qualification of those new recovery/ATC changes is implied.
+- Formatting-only commit `a09ff284` contains those twelve files. Compared
+  each corrected file byte-for-byte with rustfmt's stdout for its HEAD
+  baseline; all match. No formatter wrote source files. Released the exact
+  formatting leases; pending dependency/tracker/log changes stay separate.
+- Clap 4.6.7 passed **192 parser/help tests**, 2650 skipped, strict RCH
+  exit 0 at 09:28 UTC September 18 (`044-clap-runtime.log`). This qualifies
+  the dependency on its captured source; subsequent recovery/ATC merges
+  still require final current-source gates.
+- IndexMap 2.14.0 → 2.14.2 resolves without other dependency changes.
+  Reviewed upstream macro-hygiene/const-initialization changes and the direct
+  conformance fixture maps plus DB serialization consumers. DB tracking,
+  cache, ordering, serialization and search-conformance tests are running
+  strictly remotely (`044-indexmap-runtime.log`); no result yet.
 
 ## September 16, 2026 — release qualification update
 

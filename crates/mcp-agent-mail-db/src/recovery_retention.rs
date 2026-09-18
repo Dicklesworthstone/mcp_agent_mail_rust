@@ -1557,8 +1557,14 @@ mod tests {
         .unwrap();
         assert_eq!(attempts, 2);
         assert_eq!(moved, dest.join("bundle.1"));
-        assert_eq!(std::fs::read(moved.join("evidence")).unwrap(), b"source bundle");
-        assert_eq!(std::fs::read(dest.join("bundle/evidence")).unwrap(), b"raced bundle");
+        assert_eq!(
+            std::fs::read(moved.join("evidence")).unwrap(),
+            b"source bundle"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("bundle/evidence")).unwrap(),
+            b"raced bundle"
+        );
     }
 
     #[cfg(unix)]
@@ -1572,7 +1578,10 @@ mod tests {
         std::os::unix::fs::symlink("absent", dest.join("evidence")).unwrap();
         let moved = move_recovery_debris(&source, &dest).unwrap();
         assert_eq!(moved, dest.join("evidence.1"));
-        assert_eq!(std::fs::read_link(dest.join("evidence")).unwrap(), Path::new("absent"));
+        assert_eq!(
+            std::fs::read_link(dest.join("evidence")).unwrap(),
+            Path::new("absent")
+        );
         assert_eq!(std::fs::read(moved).unwrap(), b"source");
     }
 
@@ -1597,7 +1606,10 @@ mod tests {
         .unwrap_err();
         assert_eq!(renames, 1);
         assert!(!source.exists());
-        assert_eq!(std::fs::read(dest.join("evidence")).unwrap(), b"source evidence");
+        assert_eq!(
+            std::fs::read(dest.join("evidence")).unwrap(),
+            b"source evidence"
+        );
         let message = error.to_string();
         assert!(message.contains(&dest.join("evidence").display().to_string()));
         assert!(message.contains("durability is unconfirmed"));
@@ -1641,7 +1653,12 @@ mod tests {
         std::os::unix::fs::symlink(&target, &source).unwrap();
         assert!(move_recovery_debris(&source, &dest).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"unrelated");
-        assert!(std::fs::symlink_metadata(source).unwrap().file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(source)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         let linked_dest = root.path().join("linked-quarantine");
         std::os::unix::fs::symlink(&dest, &linked_dest).unwrap();
         assert!(move_recovery_debris(&target, &linked_dest).is_err());
@@ -1656,8 +1673,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dest = root.path().join("doctor/reclaimable/run");
         create_private_reclaim_directory(&dest, true).unwrap();
-        for path in [root.path().join("doctor"), root.path().join("doctor/reclaimable"), dest] {
-            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+        for path in [
+            root.path().join("doctor"),
+            root.path().join("doctor/reclaimable"),
+            dest,
+        ] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
+                0
+            );
         }
     }
 
@@ -1681,7 +1705,12 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
         assert_eq!(std::fs::read(source).unwrap(), b"source");
         assert!(!dest.exists());
-        assert_eq!(consolidate_debris(&ReclaimPlan::default(), &dest).unwrap().moved, 0);
+        assert_eq!(
+            consolidate_debris(&ReclaimPlan::default(), &dest)
+                .unwrap()
+                .moved,
+            0
+        );
         assert!(!dest.exists());
     }
 
@@ -1698,8 +1727,17 @@ mod tests {
             "mail.stale-live.db",
         ] {
             for suffix in [
-                "", "-wal", "-shm", "-journal", "-wal-cert", "-wal-cert-head",
-                "-fsqlite-ns-gate", "-fsqlite-ns-use", ".lock", ".bak", ".bak.meta.json",
+                "",
+                "-wal",
+                "-shm",
+                "-journal",
+                "-wal-cert",
+                "-wal-cert-head",
+                "-fsqlite-ns-gate",
+                "-fsqlite-ns-use",
+                ".lock",
+                ".bak",
+                ".bak.meta.json",
             ] {
                 let name = format!("{database}{suffix}");
                 assert_eq!(
@@ -1741,15 +1779,34 @@ mod tests {
     fn recovery_debris_classifies_known_companions_after_the_database_name() {
         use std::ffi::OsStr;
         for companion in [
-            "", "-wal", "-shm", "-journal", "-wal-cert", "-wal-cert-head",
-            "-fsqlite-ns-gate", "-fsqlite-ns-use", ".lock",
+            "",
+            "-wal",
+            "-shm",
+            "-journal",
+            "-wal-cert",
+            "-wal-cert-head",
+            "-fsqlite-ns-gate",
+            "-fsqlite-ns-use",
+            ".lock",
         ] {
             for (suffix, category) in [
                 ("corrupt-incident", DebrisCategory::CorruptQuarantine),
-                ("reconstruct-failed-incident", DebrisCategory::CorruptQuarantine),
-                ("archive-reconcile-incident", DebrisCategory::ArchiveReconcileBackup),
-                ("startup-precheckpoint-incident", DebrisCategory::SidecarSnapshot),
-                ("startup-quarantine-incident", DebrisCategory::SidecarSnapshot),
+                (
+                    "reconstruct-failed-incident",
+                    DebrisCategory::CorruptQuarantine,
+                ),
+                (
+                    "archive-reconcile-incident",
+                    DebrisCategory::ArchiveReconcileBackup,
+                ),
+                (
+                    "startup-precheckpoint-incident",
+                    DebrisCategory::SidecarSnapshot,
+                ),
+                (
+                    "startup-quarantine-incident",
+                    DebrisCategory::SidecarSnapshot,
+                ),
                 ("stale", DebrisCategory::StaleArtifact),
                 ("stale-incident", DebrisCategory::StaleArtifact),
                 ("stale.evidence", DebrisCategory::StaleArtifact),
@@ -1770,7 +1827,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reclaim_inventory_cannot_move_a_live_database_with_recovery_words() {
-        for database in ["mail.corrupt-live.db", "mail.archive-reconcile-live.db", "mail.stale"] {
+        for database in [
+            "mail.corrupt-live.db",
+            "mail.archive-reconcile-live.db",
+            "mail.stale",
+        ] {
             let root = tempfile::tempdir().unwrap().keep();
             let primary = root.join(database);
             let protected = [
@@ -1868,9 +1929,15 @@ mod tests {
         assert_eq!(outcome.moved_bytes, 5);
         assert_eq!(outcome.failures.len(), 1);
         assert_eq!(outcome.failures[0].0, aliased);
-        assert_eq!(std::fs::read(outside_artifact).unwrap(), b"outside evidence");
+        assert_eq!(
+            std::fs::read(outside_artifact).unwrap(),
+            b"outside evidence"
+        );
         assert!(!owned.exists());
-        assert_eq!(std::fs::read(destination.join("owned-evidence")).unwrap(), b"owned");
+        assert_eq!(
+            std::fs::read(destination.join("owned-evidence")).unwrap(),
+            b"owned"
+        );
         assert_eq!(std::fs::read_dir(destination).unwrap().count(), 1);
     }
 }

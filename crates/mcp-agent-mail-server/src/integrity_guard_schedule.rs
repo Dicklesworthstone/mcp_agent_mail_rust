@@ -136,12 +136,7 @@ impl AutomaticBackupSchedule {
         self.retry.failures
     }
 
-    pub(super) fn complete(
-        &mut self,
-        kind: BackupKind,
-        outcome: BackupCompletion,
-        now: Instant,
-    ) {
+    pub(super) fn complete(&mut self, kind: BackupKind, outcome: BackupCompletion, now: Instant) {
         match outcome {
             BackupCompletion::Published => {
                 self.retry.clear();
@@ -171,7 +166,10 @@ mod tests {
     #[test]
     fn initial_backup_is_proactive_and_immediately_eligible() {
         let schedule = AutomaticBackupSchedule::default();
-        assert_eq!(schedule.next_attempt(Instant::now()), Some(BackupKind::Proactive));
+        assert_eq!(
+            schedule.next_attempt(Instant::now()),
+            Some(BackupKind::Proactive)
+        );
         assert_eq!(schedule.consecutive_failures(), 0);
     }
 
@@ -182,8 +180,14 @@ mod tests {
         schedule.complete(BackupKind::Proactive, BackupCompletion::Failed, now);
         schedule.request_verified();
         assert_eq!(schedule.next_attempt(now), None);
-        assert_eq!(schedule.next_attempt(now + BACKUP_RETRY_INITIAL - Duration::from_nanos(1)), None);
-        assert_eq!(schedule.next_attempt(now + BACKUP_RETRY_INITIAL), Some(BackupKind::Verified));
+        assert_eq!(
+            schedule.next_attempt(now + BACKUP_RETRY_INITIAL - Duration::from_nanos(1)),
+            None
+        );
+        assert_eq!(
+            schedule.next_attempt(now + BACKUP_RETRY_INITIAL),
+            Some(BackupKind::Verified)
+        );
     }
 
     #[test]
@@ -212,7 +216,10 @@ mod tests {
         schedule.complete(BackupKind::Verified, BackupCompletion::Skipped, retry);
         assert_eq!(schedule.consecutive_failures(), 1);
         assert_eq!(schedule.next_attempt(retry), None);
-        assert_eq!(schedule.next_attempt(retry + BACKUP_RETRY_INITIAL), Some(BackupKind::Verified));
+        assert_eq!(
+            schedule.next_attempt(retry + BACKUP_RETRY_INITIAL),
+            Some(BackupKind::Verified)
+        );
     }
 
     #[test]
@@ -223,7 +230,10 @@ mod tests {
         schedule.complete(BackupKind::Verified, BackupCompletion::Skipped, now);
         assert_eq!(schedule.consecutive_failures(), 0);
         assert_eq!(schedule.next_attempt(now), None);
-        assert_eq!(schedule.next_attempt(now + BACKUP_RETRY_INITIAL), Some(BackupKind::Verified));
+        assert_eq!(
+            schedule.next_attempt(now + BACKUP_RETRY_INITIAL),
+            Some(BackupKind::Verified)
+        );
     }
 
     #[test]
@@ -232,9 +242,16 @@ mod tests {
         let mut schedule = AutomaticBackupSchedule::default();
         schedule.request_verified();
         schedule.complete(BackupKind::Verified, BackupCompletion::Failed, now);
-        schedule.complete(BackupKind::Verified, BackupCompletion::Published, now + BACKUP_RETRY_INITIAL);
+        schedule.complete(
+            BackupKind::Verified,
+            BackupCompletion::Published,
+            now + BACKUP_RETRY_INITIAL,
+        );
         assert_eq!(schedule.consecutive_failures(), 0);
-        assert_eq!(schedule.next_attempt(now + BACKUP_RETRY_INITIAL), Some(BackupKind::Proactive));
+        assert_eq!(
+            schedule.next_attempt(now + BACKUP_RETRY_INITIAL),
+            Some(BackupKind::Proactive)
+        );
     }
 
     #[test]
@@ -254,7 +271,10 @@ mod tests {
         schedule.complete(BackupKind::Proactive, BackupCompletion::Failed, now);
         assert_eq!(schedule.consecutive_failures(), u32::MAX);
         assert_eq!(schedule.retry_remaining(now), BACKUP_RETRY_MAX);
-        assert_eq!(schedule.next_attempt(now + BACKUP_RETRY_MAX), Some(BackupKind::Proactive));
+        assert_eq!(
+            schedule.next_attempt(now + BACKUP_RETRY_MAX),
+            Some(BackupKind::Proactive)
+        );
     }
 
     #[test]
@@ -283,7 +303,11 @@ mod tests {
         schedule.complete(BackupKind::Proactive, BackupCompletion::Failed, completed);
         assert_eq!(schedule.retry_remaining(started), BACKUP_RETRY_INITIAL);
         assert_eq!(schedule.next_attempt(completed), None);
-        assert!(schedule.next_attempt(completed + BACKUP_RETRY_INITIAL).is_some());
+        assert!(
+            schedule
+                .next_attempt(completed + BACKUP_RETRY_INITIAL)
+                .is_some()
+        );
     }
 
     #[test]
@@ -293,7 +317,10 @@ mod tests {
         gate.complete(now, false);
         assert!(gate.is_required());
         assert_eq!(gate.retry_remaining(now), FULL_RETRY_INITIAL);
-        assert_eq!(gate.retry_remaining(now + FULL_RETRY_INITIAL), Duration::ZERO);
+        assert_eq!(
+            gate.retry_remaining(now + FULL_RETRY_INITIAL),
+            Duration::ZERO
+        );
         assert!(gate.is_required(), "elapsed time is not healthy evidence");
         gate.complete(now + FULL_RETRY_INITIAL, true);
         assert!(!gate.is_required());
@@ -309,7 +336,10 @@ mod tests {
         }
         assert_eq!(gate.retry_remaining(now), FULL_RETRY_INITIAL);
         gate.complete(now + FULL_RETRY_INITIAL, false);
-        assert_eq!(gate.retry_remaining(now + FULL_RETRY_INITIAL), FULL_RETRY_INITIAL * 2);
+        assert_eq!(
+            gate.retry_remaining(now + FULL_RETRY_INITIAL),
+            FULL_RETRY_INITIAL * 2
+        );
         assert!(gate.is_required());
     }
 

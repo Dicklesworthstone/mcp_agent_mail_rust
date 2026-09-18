@@ -1857,8 +1857,14 @@ mod tests {
             Outcome::Ok(rows) => rows,
             other => panic!("read reservation state: {other:?}"),
         };
-        let row = rows.iter().find(|row| row.id == Some(id)).expect("claim retained");
-        assert!(row.released_ts.is_none(), "uncertain activity must preserve claim {id}");
+        let row = rows
+            .iter()
+            .find(|row| row.id == Some(id))
+            .expect("claim retained");
+        assert!(
+            row.released_ts.is_none(),
+            "uncertain activity must preserve claim {id}"
+        );
     }
 
     #[test]
@@ -1877,7 +1883,9 @@ mod tests {
             .expect("hide mail evidence in fixture");
         drop(conn);
         assert!(matches!(
-            block_on(get_agent_last_mail_activity(&cx, &pool, agent_id, project_id)),
+            block_on(get_agent_last_mail_activity(
+                &cx, &pool, agent_id, project_id
+            )),
             Outcome::Err(_)
         ));
 
@@ -1978,6 +1986,9 @@ mod tests {
             .expect_err("a file is not evidence about the reserved workspace paths");
         assert!(error.contains("not a directory"));
         assert_reservation_unreleased(&pool, &cx, project_id, reservation_id);
-        assert_eq!(std::fs::read(human_key).unwrap(), b"not a workspace directory");
+        assert_eq!(
+            std::fs::read(human_key).unwrap(),
+            b"not a workspace directory"
+        );
     }
 }
