@@ -1242,7 +1242,11 @@ mod tests {
         fs::write(&source, b"source evidence").unwrap();
         let inventoried = fs::symlink_metadata(&source).unwrap();
         for suffix in 0..MAX_QUARANTINE_LEAF_ATTEMPTS {
-            let leaf = if suffix == 0 { "backup".to_string() } else { format!("backup.{suffix}") };
+            let leaf = if suffix == 0 {
+                "backup".to_string()
+            } else {
+                format!("backup.{suffix}")
+            };
             fs::write(directory.path().join(leaf), b"retained evidence").unwrap();
         }
         let error = stage_backup_noreplace(&source, &directory, &inventoried).unwrap_err();
@@ -1252,7 +1256,10 @@ mod tests {
         let entries: Vec<_> = fs::read_dir(directory.path()).unwrap().collect();
         assert_eq!(entries.len(), MAX_QUARANTINE_LEAF_ATTEMPTS as usize);
         for entry in entries {
-            assert_eq!(fs::read(entry.unwrap().path()).unwrap(), b"retained evidence");
+            assert_eq!(
+                fs::read(entry.unwrap().path()).unwrap(),
+                b"retained evidence"
+            );
         }
     }
 
@@ -1281,7 +1288,12 @@ mod tests {
         std::os::unix::fs::symlink(&target, &source).unwrap();
         let inventoried = fs::symlink_metadata(&source).unwrap();
         assert!(stage_backup_noreplace(&source, &directory, &inventoried).is_err());
-        assert!(fs::symlink_metadata(source).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(source)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(fs::read(target).unwrap(), b"unrelated evidence");
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
     }

@@ -212,7 +212,10 @@ mod tests {
         let mut gate = NotificationAdmission::new(0);
         gate.begin_tick(200 * SECOND);
         for activity in [None, Some(0), Some(-1)] {
-            assert_eq!(gate.admit(probe("probe:p:a", activity), 200 * SECOND), Admission::NoActivity);
+            assert_eq!(
+                gate.admit(probe("probe:p:a", activity), 200 * SECOND),
+                Admission::NoActivity
+            );
         }
         assert_eq!(gate.stats().tracked_keys, 0);
         assert_eq!(gate.admit(probe("probe:p:a", Some(SECOND)), 200 * SECOND), Admission::Passive);
@@ -223,7 +226,10 @@ mod tests {
         let mut gate = NotificationAdmission::new(120 * SECOND);
         gate.begin_tick(100 * SECOND);
         for now in [0, SECOND, 120 * SECOND] {
-            assert_eq!(gate.admit(probe("probe:p:a", Some(SECOND)), now), Admission::RecentlyActive);
+            assert_eq!(
+                gate.admit(probe("probe:p:a", Some(SECOND)), now),
+                Admission::RecentlyActive
+            );
         }
         assert_eq!(gate.admit(probe("probe:p:a", Some(SECOND)), 121 * SECOND), Admission::Passive);
         assert_eq!(gate.stats().admitted, 0);
@@ -256,7 +262,10 @@ mod tests {
             for agent in 0..POPULATION {
                 let key = format!("deadlock:p:Agent{agent:04}");
                 if gate.admit(conflict(&key), now) == Admission::Admitted {
-                    assert!(delivered.insert(agent));
+                    assert!(
+                        delivered.insert(agent),
+                        "duplicate proposal escaped admission"
+                    );
                     batch += 1;
                 }
             }
@@ -290,11 +299,18 @@ mod tests {
     fn expired_conflict_cooldowns_free_capacity() {
         let mut gate = NotificationAdmission::with_limits(0, 16, 1);
         gate.begin_tick(SECOND);
-        assert_eq!(gate.admit(conflict("deadlock:p:a"), SECOND), Admission::Admitted);
+        assert_eq!(
+            gate.admit(conflict("deadlock:p:a"), SECOND),
+            Admission::Admitted
+        );
         gate.begin_tick(300 * SECOND);
-        assert_eq!(gate.admit(conflict("deadlock:p:a"), 300 * SECOND), Admission::Duplicate);
+        assert_eq!(
+            gate.admit(conflict("deadlock:p:a"), 300 * SECOND),
+            Admission::Duplicate
+        );
         gate.begin_tick(301 * SECOND);
         assert_eq!(gate.admit(conflict("deadlock:p:b"), 301 * SECOND), Admission::Admitted);
+        assert_eq!(gate.stats().tracked_keys, 1);
     }
 
     #[test]
@@ -311,7 +327,10 @@ mod tests {
     fn zero_cooldown_still_coalesces_the_current_tick() {
         let mut gate = NotificationAdmission::new(0);
         gate.begin_tick(SECOND);
-        let notice = || Notification { cooldown_micros: 0, ..conflict("deadlock:p:a") };
+        let notice = || Notification {
+            cooldown_micros: 0,
+            ..conflict("deadlock:p:a")
+        };
         assert_eq!(gate.admit(notice(), SECOND), Admission::Admitted);
         assert_eq!(gate.admit(notice(), SECOND), Admission::Duplicate);
     }
@@ -320,8 +339,14 @@ mod tests {
     fn clock_regression_does_not_rearm_a_cooldown() {
         let mut gate = NotificationAdmission::new(0);
         gate.begin_tick(100 * SECOND);
-        assert_eq!(gate.admit(conflict("deadlock:p:a"), 100 * SECOND), Admission::Admitted);
+        assert_eq!(
+            gate.admit(conflict("deadlock:p:a"), 100 * SECOND),
+            Admission::Admitted
+        );
         gate.begin_tick(SECOND);
-        assert_eq!(gate.admit(conflict("deadlock:p:a"), SECOND), Admission::Duplicate);
+        assert_eq!(
+            gate.admit(conflict("deadlock:p:a"), SECOND),
+            Admission::Duplicate
+        );
     }
 }

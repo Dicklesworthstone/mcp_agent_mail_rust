@@ -7,9 +7,9 @@
 
 #[path = "atc_engine.rs"]
 mod engine;
-pub use engine::*;
 #[cfg(test)]
 pub(crate) use engine::GLOBAL_ATC_TEST_LOCK;
+pub use engine::*;
 
 #[path = "atc_delivery.rs"]
 mod delivery;
@@ -40,7 +40,9 @@ static DELIVERY: OnceLock<Mutex<DeliveryState>> = OnceLock::new();
 
 fn delivery_state() -> &'static Mutex<DeliveryState> {
     DELIVERY.get_or_init(|| {
-        Mutex::new(DeliveryState::new(AtcConfig::default().probe_interval_micros))
+        Mutex::new(DeliveryState::new(
+            AtcConfig::default().probe_interval_micros,
+        ))
     })
 }
 
@@ -275,12 +277,28 @@ mod admission_boundary_tests {
 
     #[test]
     fn only_recognized_notification_kind_and_family_pairs_are_gated() {
-        assert_eq!(notification_class("probe_agent", "liveness_probe", false), Some(NotificationClass::Probe));
+        assert_eq!(
+            notification_class("probe_agent", "liveness_probe", false),
+            Some(NotificationClass::Probe)
+        );
         for family in ["liveness_monitoring", "withheld_release_notice"] {
-            assert_eq!(notification_class("send_advisory", family, false), Some(NotificationClass::Liveness));
+            assert_eq!(
+                notification_class("send_advisory", family, false),
+                Some(NotificationClass::Liveness)
+            );
         }
-        assert_eq!(notification_class("send_advisory", "deadlock_remediation", false), Some(NotificationClass::Conflict));
-        assert_eq!(notification_class("release_reservations_requested", "liveness_monitoring", false), None);
+        assert_eq!(
+            notification_class("send_advisory", "deadlock_remediation", false),
+            Some(NotificationClass::Conflict)
+        );
+        assert_eq!(
+            notification_class(
+                "release_reservations_requested",
+                "liveness_monitoring",
+                false
+            ),
+            None
+        );
     }
 
     #[test]
@@ -294,8 +312,14 @@ mod admission_boundary_tests {
         let key = ActionKey::Advisory("BlueFox".into(), "released".into());
         retain_actions(&mut actions, &mut HashMap::from([(key, 1)]));
         assert_eq!(actions.len(), 2);
-        assert!(matches!(actions[0], AtcTickAction::ReleaseReservations { .. }));
-        assert!(matches!(&actions[1], AtcTickAction::SendAdvisory { message, .. } if message == "released"));
+        assert!(matches!(
+            actions[0],
+            AtcTickAction::ReleaseReservations { .. }
+        ));
+        assert!(matches!(
+            &actions[1],
+            AtcTickAction::SendAdvisory { message, .. } if message == "released"
+        ));
     }
 
     #[test]
