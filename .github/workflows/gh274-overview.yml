@@ -1,42 +1,24 @@
-name: Validate and integrate GH274 overview
+name: Native overview candidate validation
 
 on:
-  push:
-    branches: [main]
-    paths: [.github/workflows/gh274-overview.yml]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  integrate:
+  overview:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Verify inspected source and apply exact patch
+        with:
+          persist-credentials: false
+      - name: Apply candidate wiring in the test checkout only
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           test "$(git hash-object crates/mcp-agent-mail-cli/src/robot.rs)" = f8ca6f74bb4621882b71ef8148a156752e5e9cb5
-          python3 - <<'PY'
-          import base64, json, os, pathlib, urllib.request
-          sha = '7e0ef6c92a0e655f7e74ad2b487e9ae793deffd1'
-          url = 'https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/git/blobs/' + sha
-          request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-          with urllib.request.urlopen(request, timeout=60) as response:
-              blob = json.load(response)
-          assert blob['sha'] == sha and blob['encoding'] == 'base64'
-          path = pathlib.Path('crates/mcp-agent-mail-cli/src/robot/overview.rs')
-          assert not path.exists(), 'do not overwrite a concurrently added module'
-          path.parent.mkdir(parents=True, exist_ok=True)
-          path.write_bytes(base64.b64decode(blob['content']))
-          PY
-          test "$(git hash-object crates/mcp-agent-mail-cli/src/robot/overview.rs)" = 7e0ef6c92a0e655f7e74ad2b487e9ae793deffd1
           cat > "$RUNNER_TEMP/gh274.patch" <<'PATCH'
           diff --git a/crates/mcp-agent-mail-cli/src/robot.rs b/crates/mcp-agent-mail-cli/src/robot.rs
           --- a/crates/mcp-agent-mail-cli/src/robot.rs
@@ -67,56 +49,21 @@ jobs:
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Format the new module
+      - name: Format the candidate module
         run: rustfmt --edition 2024 crates/mcp-agent-mail-cli/src/robot/overview.rs
       - name: Native correctness and work-bound regressions
-        run: cargo test -p mcp-agent-mail-cli --bin am robot::overview::tests -- --nocapture
+        run: cargo test --release -p mcp-agent-mail-cli --bin am robot::overview::tests -- --nocapture
       - name: Separate-process overview regressions
-        run: cargo test -p mcp-agent-mail-cli --test cli_robot_query_counts overview -- --nocapture
-      - name: Native live-build comparison (debug profile, moderate fixture)
+        run: cargo test --release -p mcp-agent-mail-cli --test cli_robot_query_counts overview -- --nocapture
+      - name: Native live-build comparison (50 projects, 2400 messages)
         env:
           AM_OVERVIEW_BENCH_MESSAGES_PER_PROJECT: '48'
           AM_OVERVIEW_BENCH_REQUIRE_SPEEDUP: '1'
-        run: cargo test -p mcp-agent-mail-cli --bin am benchmark_linear_overview_against_current_main -- --ignored --nocapture
-      - name: Replace bootstrap with read-only manual benchmark and commit
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > .github/workflows/gh274-overview.yml <<'WORKFLOW'
-          name: Native overview benchmark
-
-          on:
-            workflow_dispatch:
-
-          permissions:
-            contents: read
-
-          jobs:
-            overview:
-              runs-on: ubuntu-latest
-              timeout-minutes: 30
-              steps:
-                - uses: actions/checkout@v4
-                - name: Clone workspace sibling dependencies
-                  run: |
-                    git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
-                    git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-                    git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
-                - uses: dtolnay/rust-toolchain@stable
-                  with:
-                    components: rustfmt
-                - uses: Swatinem/rust-cache@v2
-                - name: Native correctness and work-bound regressions
-                  run: cargo test -p mcp-agent-mail-cli --bin am robot::overview::tests -- --nocapture
-                - name: Separate-process overview regressions
-                  run: cargo test -p mcp-agent-mail-cli --test cli_robot_query_counts overview -- --nocapture
-                - name: Native live-build benchmark
-                  run: cargo test --release -p mcp-agent-mail-cli --bin am benchmark_linear_overview_against_current_main -- --ignored --nocapture
-          WORKFLOW
-          git diff --check
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add crates/mcp-agent-mail-cli/src/robot.rs crates/mcp-agent-mail-cli/src/robot/overview.rs .github/workflows/gh274-overview.yml
-          git commit -m "perf(cli): bound overview collection with linear scans (GH#274)"
-          # A concurrent main update rejects this non-force push; never overwrite it.
-          git push origin HEAD:main
+        run: cargo test --release -p mcp-agent-mail-cli --bin am benchmark_linear_overview_against_current_main -- --ignored --nocapture
+      - name: Export validated wiring patch
+        run: git diff --binary -- crates/mcp-agent-mail-cli/src/robot.rs crates/mcp-agent-mail-cli/src/robot/overview.rs > gh274-validated.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gh274-native-validated-patch
+          path: gh274-validated.patch
+          if-no-files-found: error
