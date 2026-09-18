@@ -483,6 +483,24 @@ where
     true
 }
 
+/// Publish hard live-mailbox corruption before logging or retry throttling.
+///
+/// The pool has already reconciled its probe with the canonical second opinion.
+/// Observing raw probe rows here would incorrectly trip on accepted engine
+/// disagreements; observing formatted log messages would lose typed evidence.
+/// Keep the original result and the breaker's existing edit-blocking policy.
+/// Private backup diagnostics and unavailable cross-count probes do not enter
+/// this boundary. A successful probe alone never releases an existing refusal.
+fn observe_live_integrity_result<T>(
+    result: mcp_agent_mail_db::DbResult<T>,
+    breaker: &mcp_agent_mail_db::CorruptionCircuitBreaker,
+) -> mcp_agent_mail_db::DbResult<T> {
+    if let Err(error) = &result {
+        breaker.observe_error(error);
+    }
+    result
+}
+
 fn run_quick_cycle(
     pool: &DbPool,
     sqlite_path: &Path,
@@ -490,7 +508,10 @@ fn run_quick_cycle(
     last_recovery_attempt: &mut Option<Instant>,
     standing_defects: &mut StandingDefectLog,
 ) -> bool {
-    match pool.run_periodic_integrity_check() {
+    match observe_live_integrity_result(
+        pool.run_periodic_integrity_check(),
+        mcp_agent_mail_db::corruption_circuit_breaker(),
+    ) {
         Ok(_) => {
             standing_defects.clear("quick_check");
             // No backup, checkpoint, or reconciliation here. A due or failed
@@ -519,7 +540,10 @@ fn run_full_cycle(
     standing_defects: &mut StandingDefectLog,
 ) -> bool {
     let recovery_check = mcp_agent_mail_db::corruption_circuit_breaker().begin_recovery_check();
-    match pool.run_full_integrity_check() {
+    match observe_live_integrity_result(
+        pool.run_full_integrity_check(),
+        mcp_agent_mail_db::corruption_circuit_breaker(),
+    ) {
         Ok(_) => {
             standing_defects.clear("integrity_check");
             tracing::info!("integrity guard: periodic full integrity check passed");
@@ -1153,6 +1177,147 @@ fn handle_integrity_error_with_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hard_live_integrity_error() -> mcp_agent_mail_db::DbError {
+        mcp_agent_mail_db::DbError::IntegrityCorruption {
+            message: "live integrity probe rejected the mailbox".to_string(),
+            details: vec!["row 1 missing from index idx_agents_name".to_string()],
+        }
+    }
+
+    #[test]
+    fn live_integrity_failure_publishes_typed_write_refusal_before_reporting() {
+        let breaker = mcp_agent_mail_db::CorruptionCircuitBreaker::default();
+        let original = hard_live_integrity_error();
+        assert!(original.classification().blocks_edits);
+        let expected = original.to_string();
+        let error = observe_live_integrity_result::<()>(Err(original), &breaker).unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        assert!(matches!(error, mcp_agent_mail_db::DbError::IntegrityCorruption { .. }));
+        assert!(breaker.is_tripped());
+        assert_eq!(breaker.trip_count(), 1);
+        assert!(breaker.refusal_error().is_some());
+    }
+
+    #[test]
+    fn live_integrity_deferrals_do_not_trip_the_corruption_breaker() {
+        use mcp_agent_mail_db::DbError;
+        let breaker = mcp_agent_mail_db::CorruptionCircuitBreaker::default();
+        for error in [
+            DbError::ResourceBusy("database is locked".to_string()),
+            DbError::Pool("pool exhausted".to_string()),
+            DbError::Sqlite("integrity reconcile deferred under lock/busy contention: the canonical second-opinion probe could not run; the primary verdict is unconfirmed and will be re-probed on the next integrity cycle".to_string()),
+            DbError::Sqlite("integrity reconcile deferred under staged-copy-inconclusive contention: the canonical second-opinion probe could not run; the primary verdict is unconfirmed and will be re-probed on the next integrity cycle".to_string()),
+        ] {
+            let expected = error.to_string();
+            assert_eq!(
+                observe_live_integrity_result::<()>(Err(error), &breaker)
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+            assert!(!breaker.is_tripped());
+            assert!(breaker.refusal_error().is_none());
+        }
+        assert_eq!(breaker.trip_count(), 0);
+    }
+
+    #[test]
+    fn accepted_live_probe_neither_trips_nor_clears_existing_refusal() {
+        let breaker = mcp_agent_mail_db::CorruptionCircuitBreaker::default();
+        let accepted = || mcp_agent_mail_db::IntegrityCheckResult {
+            ok: true,
+            details: vec!["ok (canonical fallback)".to_string()],
+            duration_us: 7,
+            kind: mcp_agent_mail_db::CheckKind::Full,
+        };
+        let result = observe_live_integrity_result(Ok(accepted()), &breaker).unwrap();
+        assert_eq!(result.details, ["ok (canonical fallback)"]);
+        assert_eq!(result.duration_us, 7);
+        assert!(!breaker.is_tripped());
+        observe_live_integrity_result::<()>(Err(hard_live_integrity_error()), &breaker)
+            .unwrap_err();
+        let recovery = breaker.begin_recovery_check();
+        assert!(observe_live_integrity_result(Ok(accepted()), &breaker).unwrap().ok);
+        assert!(breaker.is_tripped(), "the remaining full-cycle checks still own recovery");
+        assert_eq!(breaker.trip_count(), 1);
+        assert!(recovery.reset_if_unchanged());
+        assert!(!breaker.is_tripped());
+    }
+
+    #[test]
+    fn repeated_live_failure_invalidates_recovery_even_when_repeat_logs_are_suppressed() {
+        let breaker = mcp_agent_mail_db::CorruptionCircuitBreaker::default();
+        let mut log = StandingDefectLog::default();
+        let first = observe_live_integrity_result::<()>(Err(hard_live_integrity_error()), &breaker)
+            .unwrap_err();
+        assert!(log.observe("integrity_check", &first.to_string()).is_some());
+        let recovery = breaker.begin_recovery_check();
+        let repeated = observe_live_integrity_result::<()>(Err(hard_live_integrity_error()), &breaker)
+            .unwrap_err();
+        assert!(log.observe("integrity_check", &repeated.to_string()).is_none());
+        assert_eq!(breaker.trip_count(), 2);
+        assert!(!recovery.reset_if_unchanged());
+        assert!(breaker.refusal_error().is_some());
+    }
+
+    #[test]
+    fn real_canonical_index_finding_reaches_write_breaker_without_mutating_rows() {
+        use mcp_agent_mail_db::integrity::{CheckKind, details_indicate_ok, extract_check_details};
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_memory().unwrap();
+        conn.execute_raw(
+            "CREATE TABLE live_probe_rows (id INTEGER PRIMARY KEY, body TEXT); \
+             INSERT INTO live_probe_rows(body) VALUES ('Zebra'), ('apple'); \
+             CREATE INDEX idx_live_probe ON live_probe_rows(body); \
+             PRAGMA writable_schema=ON; \
+             UPDATE sqlite_master SET sql= \
+                 'CREATE INDEX idx_live_probe ON live_probe_rows(body COLLATE NOCASE)' \
+                 WHERE name='idx_live_probe'; \
+             PRAGMA writable_schema=OFF; PRAGMA schema_version=100;",
+        ).unwrap();
+        let quick = conn.query_sync("PRAGMA quick_check", &[]).unwrap();
+        assert!(details_indicate_ok(&extract_check_details(&quick, CheckKind::Quick)));
+        let rows = conn.query_sync("PRAGMA integrity_check", &[]).unwrap();
+        let details = extract_check_details(&rows, CheckKind::Full);
+        assert!(!details_indicate_ok(&details));
+        assert!(details.iter().any(|detail| detail.contains("idx_live_probe")));
+        let breaker = mcp_agent_mail_db::CorruptionCircuitBreaker::default();
+        let finding = mcp_agent_mail_db::DbError::IntegrityCorruption {
+            message: "live integrity probe rejected the mailbox".to_string(),
+            details,
+        };
+        observe_live_integrity_result::<()>(Err(finding), &breaker).unwrap_err();
+        assert!(breaker.refusal_error().is_some());
+        // The observer only publishes refusal. Reads remain possible and it
+        // does not REINDEX, reconstruct, or write to the reported database.
+        let remaining = conn.query_sync(
+            "SELECT body FROM live_probe_rows NOT INDEXED ORDER BY id", &[],
+        ).unwrap();
+        assert_eq!(remaining[0].get_named::<String>("body").unwrap(), "Zebra");
+        assert_eq!(remaining[1].get_named::<String>("body").unwrap(), "apple");
+        assert!(!details_indicate_ok(&extract_check_details(
+            &conn.query_sync("PRAGMA integrity_check", &[]).unwrap(), CheckKind::Full,
+        )));
+    }
+
+    #[test]
+    fn real_probe_execution_error_is_not_reclassified_as_live_corruption() {
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_memory().unwrap();
+        conn.execute_raw("CREATE TABLE intact (id INTEGER PRIMARY KEY)").unwrap();
+        let error = conn.query_sync("SELECT unavailable_column FROM intact", &[]).unwrap_err();
+        let breaker = mcp_agent_mail_db::CorruptionCircuitBreaker::default();
+        let error = mcp_agent_mail_db::DbError::Sqlite(error.to_string());
+        let expected = error.to_string();
+        assert_eq!(
+            observe_live_integrity_result::<()>(Err(error), &breaker).unwrap_err().to_string(),
+            expected
+        );
+        assert!(!breaker.is_tripped());
+        assert!(breaker.refusal_error().is_none());
+        conn.execute_raw("INSERT INTO intact VALUES (1)").unwrap();
+        let rows = conn.query_sync("SELECT count(*) AS n FROM intact", &[]).unwrap();
+        assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 1);
+    }
 
     #[test]
     fn retained_staging_refuses_both_routes_without_discarding_verified_requests() {
