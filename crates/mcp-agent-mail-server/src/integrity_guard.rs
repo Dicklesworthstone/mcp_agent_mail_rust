@@ -12,6 +12,9 @@
 
 #[path = "integrity_guard_backup_budget.rs"]
 mod backup_budget;
+#[cfg(unix)]
+#[path = "integrity_guard_backup_journal.rs"]
+mod backup_journal;
 #[path = "integrity_guard_schedule.rs"]
 mod schedule;
 
@@ -625,6 +628,67 @@ where
     F: FnOnce(BackupKind) -> Result<bool, String>,
     C: Fn() -> Instant,
 {
+    #[cfg(unix)]
+    if primary.as_os_str() != ":memory:" {
+        let Some(requested) = schedule.next_attempt(clock()) else {
+            tracing::debug!(
+                retry_after_secs = schedule.retry_remaining(clock()).as_secs(),
+                "integrity guard: automatic backup deferred by process-local retry pacing"
+            );
+            return true;
+        };
+        // Keep the retained-stage budget and its parent-wide lease. Only an
+        // admitted exporter may acquire the mailbox journal, always in this
+        // lock order, and both leases remain held through producer completion.
+        let admitted = backup_budget::with_admission(primary, || {
+            let lease = match backup_journal::AutomaticBackupLease::try_begin(primary, requested) {
+                Ok(Some(lease)) => lease,
+                Ok(None) => {
+                    tracing::debug!(
+                        "integrity guard: automatic export deferred by durable backoff or an active exporter; health probes continue"
+                    );
+                    return Ok(true);
+                }
+                Err(error) => {
+                    // Journal IO is unavailable admission, not evidence that
+                    // the live mailbox is corrupt. Never start an unrecorded
+                    // export or weaken the existing full-verification gate.
+                    tracing::warn!(
+                        %error,
+                        "integrity guard: automatic backup journal admission unavailable; no export started; health probes continue"
+                    );
+                    return Ok(true);
+                }
+            };
+            if lease.kind() == BackupKind::Verified {
+                schedule.request_verified();
+            }
+            Ok(run_automatic_backup_with(schedule, &clock, |kind| {
+                let result = produce(kind);
+                let completion = match &result {
+                    Ok(true) => BackupCompletion::Published,
+                    Ok(false) => BackupCompletion::Skipped,
+                    Err(_) => BackupCompletion::Failed,
+                };
+                if let Err(error) = lease.finish(completion) {
+                    // A torn update retains the preceding synced intent.
+                    // Keep the producer's actual result, including a skipped
+                    // verified snapshot's requirement for fresh full evidence.
+                    tracing::warn!(
+                        %error,
+                        "integrity guard: automatic backup completion journal update failed; subsequent admission remains conservative"
+                    );
+                }
+                result
+            }))
+        });
+        return match admitted {
+            Ok(followups_allowed) => followups_allowed,
+            Err(error) => run_automatic_backup_with(schedule, clock, |_| Err(error)),
+        };
+    }
+    // Non-Unix platforms retain the existing admission path; memory-backed
+    // fixtures never create a journal or a control path on disk.
     run_automatic_backup_with(schedule, clock, |kind| {
         backup_budget::with_admission(primary, || produce(kind))
     })

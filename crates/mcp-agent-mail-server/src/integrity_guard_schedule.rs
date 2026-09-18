@@ -11,8 +11,8 @@
 
 use std::time::{Duration, Instant};
 
-const BACKUP_RETRY_INITIAL: Duration = Duration::from_secs(15 * 60);
-const BACKUP_RETRY_MAX: Duration = Duration::from_secs(6 * 60 * 60);
+pub(super) const BACKUP_RETRY_INITIAL: Duration = Duration::from_secs(15 * 60);
+pub(super) const BACKUP_RETRY_MAX: Duration = Duration::from_secs(6 * 60 * 60);
 const FULL_RETRY_INITIAL: Duration = Duration::from_secs(5 * 60);
 const FULL_RETRY_MAX: Duration = Duration::from_secs(60 * 60);
 
