@@ -23,6 +23,7 @@ struct DeliveryState {
     admission: NotificationAdmission,
     last_tick_count: Option<u64>,
     last_effect_count: usize,
+    last_notification_key: Option<String>,
 }
 
 impl DeliveryState {
@@ -31,6 +32,7 @@ impl DeliveryState {
             admission: NotificationAdmission::new(probe_interval_micros),
             last_tick_count: None,
             last_effect_count: 0,
+            last_notification_key: None,
         }
     }
 }
@@ -86,13 +88,21 @@ pub fn atc_tick_report(now_micros: i64) -> Option<AtcTickReport> {
     let before = state.admission.stats();
     state.admission.begin_tick(now_micros);
     let generated = report.effects.len();
-    admit_effects(
-        &mut report.effects,
-        &mut report.actions,
-        &mut state.admission,
-        now_micros,
-        engine::atc_agent_last_activity,
-    );
+    {
+        let DeliveryState {
+            admission,
+            last_notification_key,
+            ..
+        } = &mut *state;
+        admit_effects(
+            &mut report.effects,
+            &mut report.actions,
+            admission,
+            last_notification_key,
+            now_micros,
+            engine::atc_agent_last_activity,
+        );
+    }
     report.summary.kernel.pending_effects = report.effects.len();
     state.last_tick_count = Some(report.summary.tick_count);
     state.last_effect_count = report.effects.len();
@@ -197,52 +207,90 @@ fn admit_effects(
     effects: &mut Vec<AtcEffectPlan>,
     actions: &mut Vec<AtcTickAction>,
     admission: &mut NotificationAdmission,
+    last_notification_key: &mut Option<String>,
     now_micros: i64,
     mut last_activity: impl FnMut(&str) -> Option<i64>,
 ) {
+    // Rotate only admission priority, never execution order. A stable planner
+    // order plus recurring cooldowns otherwise lets the first agents consume
+    // every replenished budget before later agents get their first notice.
+    // Semantic keys survive changed decision IDs, reordered input and removal
+    // of the previous recipient. Critical effects do not enter this scheduler.
+    let mut candidates: Vec<_> = effects
+        .iter()
+        .enumerate()
+        .filter_map(|(index, effect)| {
+            notification_class(
+                &effect.kind,
+                &effect.semantics.family,
+                effect.semantics.high_risk_intervention,
+            )
+            .map(|class| (index, class))
+        })
+        .collect();
+    candidates.sort_unstable_by(|left, right| {
+        effects[left.0]
+            .semantics
+            .cooldown_key
+            .cmp(&effects[right.0].semantics.cooldown_key)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let start = last_notification_key.as_deref().map_or(0, |last| {
+        candidates.partition_point(|(index, _)| {
+            effects[*index].semantics.cooldown_key.as_str() <= last
+        })
+    });
+    let mut accepted = vec![true; effects.len()];
     let mut activity_by_agent = HashMap::new();
+    for &(index, class) in candidates[start..].iter().chain(&candidates[..start]) {
+        let effect = &effects[index];
+        // Conflict notices need no activity lookup. Liveness candidates share
+        // one lookup per agent, even when they have multiple families.
+        let activity = if class == NotificationClass::Conflict {
+            None
+        } else {
+            *activity_by_agent
+                .entry(effect.agent.clone())
+                .or_insert_with(|| last_activity(&effect.agent))
+        };
+        accepted[index] = admission.admit(
+            Notification {
+                key: &effect.semantics.cooldown_key,
+                class,
+                last_activity_micros: activity,
+                cooldown_micros: effect.semantics.cooldown_micros,
+            },
+            now_micros,
+        ) == Admission::Admitted;
+        if accepted[index] {
+            *last_notification_key = Some(effect.semantics.cooldown_key.clone());
+        }
+    }
+
     let mut suppressed = HashSet::new();
     let mut retained = HashMap::new();
+    let mut index = 0;
     effects.retain(|effect| {
-        let accepted = notification_class(
-            &effect.kind,
-            &effect.semantics.family,
-            effect.semantics.high_risk_intervention,
-        )
-        .is_none_or(|class| {
-            // Conflict notices need no activity lookup. Liveness candidates
-            // share one lookup per agent, even when they have multiple families.
-            let activity = if class == NotificationClass::Conflict {
-                None
-            } else {
-                *activity_by_agent
-                    .entry(effect.agent.clone())
-                    .or_insert_with(|| last_activity(&effect.agent))
-            };
-            admission.admit(
-                Notification {
-                    key: &effect.semantics.cooldown_key,
-                    class,
-                    last_activity_micros: activity,
-                    cooldown_micros: effect.semantics.cooldown_micros,
-                },
-                now_micros,
-            ) == Admission::Admitted
-        });
+        let keep = accepted[index];
+        index += 1;
         if let Some(key) = effect_action_key(effect) {
-            if accepted {
+            if keep {
                 *retained.entry(key).or_insert(0_usize) += 1;
             } else {
                 suppressed.insert(key);
             }
         }
-        accepted
+        keep
     });
     // Match the exact advisory body, not just its recipient: a suppressed
     // monitoring prompt must not hide the same agent's genuine release notice.
     // Counts also prevent the action-only API from replaying dropped duplicates.
     retain_actions(actions, &suppressed, &mut retained);
 }
+
+#[cfg(test)]
+#[path = "atc_admission_tests.rs"]
+mod fair_admission_tests;
 
 #[cfg(test)]
 mod admission_boundary_tests {
