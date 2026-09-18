@@ -10,6 +10,11 @@
 
 #![forbid(unsafe_code)]
 
+#[path = "integrity_guard_schedule.rs"]
+mod schedule;
+
+use schedule::{AutomaticBackupSchedule, BackupCompletion, BackupKind, FullVerificationGate};
+
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::disk::is_sqlite_memory_database_url;
 use mcp_agent_mail_db::{
@@ -181,8 +186,8 @@ pub fn note_startup_integrity_probe_completed() {
     SKIP_NEXT_QUICK_CYCLE.store(true, Ordering::Release);
 }
 
-/// Skip only the next proactive backup refresh while still performing the
-/// integrity guard's quick health check.
+/// Skip the next automatic backup refresh, including a due verified snapshot,
+/// while still performing the integrity guard's health checks.
 pub fn defer_next_proactive_backup() {
     SKIP_NEXT_PROACTIVE_BACKUP.store(true, Ordering::Release);
 }
@@ -286,6 +291,8 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
 
     let mut last_full_attempt: Option<Instant> = None;
     let mut last_recovery_attempt: Option<Instant> = None;
+    let mut verification_gate = FullVerificationGate::default();
+    let mut backup_schedule = AutomaticBackupSchedule::default();
     // GH#288: transition-aware defect logging (fingerprint + backoff).
     let mut standing_defects = StandingDefectLog::default();
     // Bead K4: seed the maintenance schedule at "now" so the first checkpoint /
@@ -306,6 +313,7 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
             return;
         }
 
+        let skipped_quick_cycle = skip_first_quick_cycle;
         let quick_cycle_passed = if skip_first_quick_cycle {
             skip_first_quick_cycle = false;
             tracing::debug!(
@@ -322,16 +330,19 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
             )
         };
 
-        // A quick pass cannot release a corruption refusal. Recheck the
-        // actual mailbox in full on this cycle instead of waiting up to the
-        // normal full-check interval (or forever when that schedule is off).
+        // Quick checks never discharge a failed full verification. Include
+        // failures observed elsewhere in this process, as well as the worker's
+        // own sticky gate (which also covers unavailable cross-count evidence).
         let full_due = full_check_due(config, full_every, last_full_attempt)
-            || mcp_agent_mail_db::corruption_circuit_breaker().is_tripped();
-        run_integrity_followups(
+            || mcp_agent_mail_db::corruption_circuit_breaker().is_tripped()
+            || mcp_agent_mail_db::integrity::integrity_metrics().last_full_check_outcome
+                == mcp_agent_mail_db::integrity::IntegrityCheckOutcome::Failed;
+        let probes_passed = run_integrity_followups(
             quick_cycle_passed,
             full_due,
+            &mut verification_gate,
+            Instant::now,
             || {
-                let attempted_at = Instant::now();
                 let passed = run_full_cycle(
                     &pool,
                     sqlite_path,
@@ -339,10 +350,40 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
                     &mut last_recovery_attempt,
                     &mut standing_defects,
                 );
-                last_full_attempt = Some(attempted_at);
+                last_full_attempt = Some(Instant::now());
                 passed
             },
-            || {
+            |full_completed| {
+                if full_completed {
+                    backup_schedule.request_verified();
+                }
+                if SHUTDOWN.load(Ordering::Acquire)
+                    || mcp_agent_mail_db::corruption_circuit_breaker().is_tripped()
+                {
+                    return false;
+                }
+                // Both backup entry points are now downstream of every due
+                // integrity check and share one retry budget. Prefer a pending
+                // verified snapshot instead of creating two copies this cycle.
+                if full_completed || !skipped_quick_cycle {
+                    if take_deferred_proactive_backup() {
+                        tracing::debug!("integrity guard: deferred automatic backup refresh");
+                    } else if !run_automatic_backup(&pool, &mut backup_schedule) {
+                        return false;
+                    }
+                }
+                if mcp_agent_mail_db::corruption_circuit_breaker().is_tripped()
+                    || mcp_agent_mail_db::integrity::integrity_metrics().last_full_check_outcome
+                        == mcp_agent_mail_db::integrity::IntegrityCheckOutcome::Failed
+                {
+                    return false;
+                }
+                run_archive_drift_cycle(sqlite_path, &storage_root, full_completed);
+                if SHUTDOWN.load(Ordering::Acquire)
+                    || mcp_agent_mail_db::corruption_circuit_breaker().is_tripped()
+                {
+                    return false;
+                }
                 // Bead K4: bounded SQLite maintenance (checkpoint / analyze /
                 // vacuum / journal_size_limit) on independent cadences, off
                 // the hot path. Never run it after a failed integrity verdict.
@@ -357,8 +398,14 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
                     &mut last_atc_retention,
                     &mut last_doctor_retention,
                 );
+                true
             },
         );
+        if !probes_passed {
+            tracing::debug!(
+                "integrity guard: full evidence remains required before mutating followups"
+            );
+        }
 
         // Sleep in short increments so shutdown reacts quickly.
         let mut remaining = quick_every;
@@ -374,36 +421,60 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
     }
 }
 
-/// Run the full-check and maintenance followups only after the integrity
-/// verdicts that authorize them.
-///
-/// Keeping this sequencing in one small seam makes it impossible for a quick
-/// breaker refusal to fall through into a second live-family open, checkpoint,
-/// ANALYZE, or VACUUM. When a due full check fails, maintenance is likewise
-/// skipped for this iteration.
-fn run_integrity_followups<F, M>(
+/// Run mutating followups only after all required integrity verdicts pass.
+/// A failed full cycle remains terminal on LATER quick cycles as well. Retry
+/// pacing never authorizes maintenance by itself. The clock is injected so
+/// repeated-cycle and slow-probe interleavings can be exercised without sleeps.
+fn run_integrity_followups<F, M, C>(
     quick_cycle_passed: bool,
     full_due: bool,
+    gate: &mut FullVerificationGate,
+    clock: C,
     run_full: F,
-    run_maintenance: M,
+    run_followups: M,
 ) -> bool
 where
     F: FnOnce() -> bool,
-    M: FnOnce(),
+    M: FnOnce(bool) -> bool,
+    C: Fn() -> Instant,
 {
     if !quick_cycle_passed {
+        gate.require();
         tracing::warn!(
             "integrity guard: skipping full check and database maintenance after failed quick cycle"
         );
         return false;
     }
-    if full_due && !run_full() {
-        tracing::warn!(
-            "integrity guard: skipping database maintenance after failed full integrity cycle"
-        );
+    if full_due {
+        gate.require();
+    }
+    let full_completed = if gate.is_required() {
+        let remaining = gate.retry_remaining(clock());
+        if !remaining.is_zero() {
+            tracing::debug!(
+                retry_after_secs = remaining.as_secs(),
+                "integrity guard: failed full verification remains blocking during retry backoff"
+            );
+            return false;
+        }
+        let passed = run_full();
+        gate.complete(clock(), passed);
+        if !passed {
+            tracing::warn!(
+                "integrity guard: skipping mutating followups until full integrity verification succeeds"
+            );
+            return false;
+        }
+        true
+    } else {
+        false
+    };
+    if !run_followups(full_completed) {
+        // A fresh corruption refusal or an inconclusive snapshot's own live
+        // verification can invalidate the evidence after the initial probes.
+        gate.require();
         return false;
     }
-    run_maintenance();
     true
 }
 
@@ -417,42 +488,8 @@ fn run_quick_cycle(
     match pool.run_periodic_integrity_check() {
         Ok(_) => {
             standing_defects.clear("quick_check");
-            if mcp_agent_mail_db::corruption_circuit_breaker().is_tripped() {
-                // Continue to the full recovery probe, but do not checkpoint,
-                // refresh backups, or reconcile the still-suspect live store.
-                tracing::debug!(
-                    "integrity guard: quick check passed; full verification required before releasing corruption refusal"
-                );
-                return true;
-            }
-            if take_deferred_proactive_backup() {
-                tracing::debug!(
-                    "integrity guard: deferred proactive backup during startup quick cycle"
-                );
-                return true;
-            }
-            if let Err(err) = pool.create_proactive_backup(Duration::from_secs(BACKUP_MAX_AGE_SECS))
-            {
-                tracing::warn!(error = %err, "integrity guard: proactive backup refresh failed");
-            }
-            // #219: a drift reconcile deferred at pool-bootstrap time
-            // (cooldown or write activity) is otherwise lost until the next
-            // promotion or restart — the per-path init gate latches. Retry
-            // here on the quick cadence; every standalone pacing gate
-            // (ownership, cooldown, write idleness) still applies inside,
-            // so under sustained write load this stays a cheap no-op and
-            // converges the first time the process goes write-quiet.
-            match mcp_agent_mail_db::pool::retry_archive_drift_reconcile(sqlite_path, storage_root)
-            {
-                Ok(true) => tracing::info!(
-                    "integrity guard: reconciled archive-ahead drift during quick cycle"
-                ),
-                Ok(false) => {}
-                Err(err) => tracing::debug!(
-                    error = %err,
-                    "integrity guard: archive drift reconcile attempt failed; will retry next cycle"
-                ),
-            }
+            // No backup, checkpoint, or reconciliation here. A due or failed
+            // full verification has not authorized those operations yet.
             true
         }
         Err(err) => {
@@ -490,6 +527,11 @@ fn run_full_cycle(
             match run_index_table_cross_count(sqlite_path) {
                 Ok(None) => {}
                 Ok(Some(mismatch)) => {
+                    // This is positive corruption evidence, not an unavailable
+                    // probe. Publish the same write refusal as a corrupt query.
+                    mcp_agent_mail_db::corruption_circuit_breaker().observe_error(
+                        &mcp_agent_mail_db::DbError::Sqlite(mismatch.clone()),
+                    );
                     handle_integrity_error_with_log(
                         "index_table_cross_count",
                         &mismatch,
@@ -522,41 +564,8 @@ fn run_full_cycle(
                 );
                 return false;
             }
-            // Bead K2: a passing full check means the DB is verifiably clean —
-            // capture a last-known-healthy verified snapshot (best-effort; the
-            // call re-verifies and records metrics, and never fails the cycle).
-            match pool.create_verified_snapshot() {
-                Ok(Some(meta)) => tracing::debug!(
-                    snapshot = %meta.snapshot_path,
-                    "integrity guard: recorded verified snapshot"
-                ),
-                Ok(None) => {}
-                Err(err) => tracing::warn!(
-                    error = %err,
-                    "integrity guard: verified snapshot capture failed"
-                ),
-            }
-            // Archive-ahead drift that first arises AFTER a clean bootstrap
-            // (another process crashed between archive append and DB write,
-            // manual/git archive edits, an external older-.bak restore) is
-            // never in the pending-deferral set, so the quick cycle's cheap
-            // gate short-circuits forever. The full cycle runs hourly and
-            // already does O(DB-size) work, so run the drift predicate here
-            // without the pending precondition; every standalone pacing gate
-            // (ownership, cooldown, write idleness) still applies inside.
-            match mcp_agent_mail_db::pool::reconcile_archive_drift_full_cycle(
-                sqlite_path,
-                storage_root,
-            ) {
-                Ok(true) => tracing::info!(
-                    "integrity guard: reconciled post-bootstrap archive-ahead drift during full cycle"
-                ),
-                Ok(false) => {}
-                Err(err) => tracing::warn!(
-                    error = %err,
-                    "integrity guard: full-cycle archive drift reconcile failed"
-                ),
-            }
+            // Backup publication and archive reconciliation happen only in
+            // the followup phase, after the sticky verification gate clears.
             true
         }
         Err(err) => {
@@ -570,6 +579,104 @@ fn run_full_cycle(
             );
             false
         }
+    }
+}
+
+/// Execute at most one eligible backup operation. This is the only automatic
+/// backup entry point in the guard; explicit operator calls remain unchanged.
+fn run_automatic_backup(pool: &DbPool, schedule: &mut AutomaticBackupSchedule) -> bool {
+    run_automatic_backup_with(schedule, Instant::now, |kind| match kind {
+        BackupKind::Proactive => pool
+            .create_proactive_backup(Duration::from_secs(BACKUP_MAX_AGE_SECS))
+            .map(|path| path.is_some())
+            .map_err(|error| error.to_string()),
+        BackupKind::Verified => pool
+            .create_verified_snapshot()
+            .map(|metadata| {
+                if let Some(meta) = &metadata {
+                    tracing::debug!(
+                        snapshot = %meta.snapshot_path,
+                        "integrity guard: recorded verified snapshot"
+                    );
+                }
+                metadata.is_some()
+            })
+            .map_err(|error| error.to_string()),
+    })
+}
+
+/// `Ok(true)` means an artifact was actually published, `Ok(false)` means the
+/// producer skipped it. A skipped verified snapshot cannot certify the live
+/// mailbox or clear failure history. Other backup failures remain best-effort
+/// and are not reclassified as live corruption merely because staging failed.
+fn run_automatic_backup_with<F, C>(
+    schedule: &mut AutomaticBackupSchedule,
+    clock: C,
+    produce: F,
+) -> bool
+where
+    F: FnOnce(BackupKind) -> Result<bool, String>,
+    C: Fn() -> Instant,
+{
+    let Some(kind) = schedule.next_attempt(clock()) else {
+        tracing::debug!(
+            retry_after_secs = schedule.retry_remaining(clock()).as_secs(),
+            consecutive_failures = schedule.consecutive_failures(),
+            "integrity guard: automatic backup deferred after incomplete prior attempt; health probes continue"
+        );
+        return true;
+    };
+    let result = produce(kind);
+    let completion = match &result {
+        Ok(true) => BackupCompletion::Published,
+        Ok(false) => BackupCompletion::Skipped,
+        Err(_) => BackupCompletion::Failed,
+    };
+    let completed_at = clock();
+    schedule.complete(kind, completion, completed_at);
+    match result {
+        Err(error) => tracing::warn!(
+            ?kind,
+            %error,
+            consecutive_failures = schedule.consecutive_failures(),
+            retry_after_secs = schedule.retry_remaining(completed_at).as_secs(),
+            "integrity guard: automatic backup failed; preserving evidence and backing off both backup routes"
+        ),
+        Ok(false) if kind == BackupKind::Verified => {
+            tracing::warn!(
+                retry_after_secs = schedule.retry_remaining(completed_at).as_secs(),
+                "integrity guard: verified snapshot was not published; retaining pending request and requiring fresh full evidence"
+            );
+            return false;
+        }
+        Ok(_) => {}
+    }
+    true
+}
+
+fn run_archive_drift_cycle(sqlite_path: &Path, storage_root: &Path, full_completed: bool) {
+    // The quick path retries only previously deferred work (#219). The full
+    // path additionally discovers drift arising after bootstrap. Neither may
+    // run before a required full verification has actually succeeded.
+    let result = if full_completed {
+        mcp_agent_mail_db::pool::reconcile_archive_drift_full_cycle(sqlite_path, storage_root)
+    } else {
+        mcp_agent_mail_db::pool::retry_archive_drift_reconcile(sqlite_path, storage_root)
+    };
+    match result {
+        Ok(true) => tracing::info!(
+            full_completed,
+            "integrity guard: reconciled archive-ahead drift after integrity verification"
+        ),
+        Ok(false) => {}
+        Err(error) if full_completed => tracing::warn!(
+            %error,
+            "integrity guard: full-cycle archive drift reconcile failed"
+        ),
+        Err(error) => tracing::debug!(
+            %error,
+            "integrity guard: archive drift reconcile attempt failed; will retry next eligible cycle"
+        ),
     }
 }
 
@@ -1372,18 +1479,25 @@ mod tests {
     fn failed_quick_cycle_skips_full_check_and_maintenance() {
         let full_calls = std::cell::Cell::new(0_u8);
         let maintenance_calls = std::cell::Cell::new(0_u8);
+        let mut gate = FullVerificationGate::default();
 
         let followed_up = run_integrity_followups(
             false,
             true,
+            &mut gate,
+            Instant::now,
             || {
                 full_calls.set(full_calls.get() + 1);
                 true
             },
-            || maintenance_calls.set(maintenance_calls.get() + 1),
+            |_| {
+                maintenance_calls.set(maintenance_calls.get() + 1);
+                true
+            },
         );
 
         assert!(!followed_up);
+        assert!(gate.is_required());
         assert_eq!(full_calls.get(), 0, "failed quick verdict must be terminal");
         assert_eq!(
             maintenance_calls.get(),
@@ -1396,18 +1510,25 @@ mod tests {
     fn failed_due_full_cycle_skips_maintenance() {
         let full_calls = std::cell::Cell::new(0_u8);
         let maintenance_calls = std::cell::Cell::new(0_u8);
+        let mut gate = FullVerificationGate::default();
 
         let followed_up = run_integrity_followups(
             true,
             true,
+            &mut gate,
+            Instant::now,
             || {
                 full_calls.set(full_calls.get() + 1);
                 false
             },
-            || maintenance_calls.set(maintenance_calls.get() + 1),
+            |_| {
+                maintenance_calls.set(maintenance_calls.get() + 1);
+                true
+            },
         );
 
         assert!(!followed_up);
+        assert!(gate.is_required());
         assert_eq!(
             full_calls.get(),
             1,
@@ -1424,15 +1545,22 @@ mod tests {
     fn passing_integrity_verdicts_run_only_due_followups() {
         let full_calls = std::cell::Cell::new(0_u8);
         let maintenance_calls = std::cell::Cell::new(0_u8);
+        let mut gate = FullVerificationGate::default();
 
         assert!(run_integrity_followups(
             true,
             false,
+            &mut gate,
+            Instant::now,
             || {
                 full_calls.set(full_calls.get() + 1);
                 true
             },
-            || maintenance_calls.set(maintenance_calls.get() + 1),
+            |full_completed| {
+                assert!(!full_completed);
+                maintenance_calls.set(maintenance_calls.get() + 1);
+                true
+            },
         ));
         assert_eq!(
             full_calls.get(),
@@ -1444,14 +1572,251 @@ mod tests {
         assert!(run_integrity_followups(
             true,
             true,
+            &mut gate,
+            Instant::now,
             || {
                 full_calls.set(full_calls.get() + 1);
                 true
             },
-            || maintenance_calls.set(maintenance_calls.get() + 1),
+            |full_completed| {
+                assert!(full_completed);
+                maintenance_calls.set(maintenance_calls.get() + 1);
+                true
+            },
         ));
         assert_eq!(full_calls.get(), 1);
         assert_eq!(maintenance_calls.get(), 2);
+    }
+
+    #[test]
+    fn failed_full_cycle_remains_blocking_on_later_quick_success() {
+        let start = Instant::now();
+        let mut gate = FullVerificationGate::default();
+        assert!(!run_integrity_followups(
+            true,
+            true,
+            &mut gate,
+            || start,
+            || false,
+            |_| panic!("failed full check must block all writes"),
+        ));
+        assert!(!run_integrity_followups(
+            true,
+            false,
+            &mut gate,
+            || start + Duration::from_secs(60),
+            || panic!("full retry must respect its delay"),
+            |_| panic!("a quick pass cannot erase the previous full failure"),
+        ));
+        assert!(gate.is_required());
+        let full_calls = std::cell::Cell::new(0);
+        assert!(run_integrity_followups(
+            true,
+            false,
+            &mut gate,
+            || start + Duration::from_secs(300),
+            || {
+                full_calls.set(full_calls.get() + 1);
+                true
+            },
+            |full_completed| {
+                assert!(full_completed);
+                true
+            },
+        ));
+        assert_eq!(full_calls.get(), 1);
+        assert!(!gate.is_required());
+    }
+
+    #[test]
+    fn failed_quick_cycle_requires_a_full_check_even_without_a_schedule() {
+        let now = Instant::now();
+        let mut gate = FullVerificationGate::default();
+        assert!(!run_integrity_followups(
+            false,
+            false,
+            &mut gate,
+            || now,
+            || panic!("quick failure is terminal for this cycle"),
+            |_| panic!("quick failure must block writes"),
+        ));
+        let verified = std::cell::Cell::new(false);
+        assert!(run_integrity_followups(
+            true,
+            false,
+            &mut gate,
+            || now,
+            || {
+                verified.set(true);
+                true
+            },
+            |full_completed| {
+                assert!(full_completed && verified.get());
+                true
+            },
+        ));
+    }
+
+    #[test]
+    fn followup_invalidation_requires_fresh_full_evidence_next_cycle() {
+        let now = Instant::now();
+        let mut gate = FullVerificationGate::default();
+        assert!(!run_integrity_followups(
+            true,
+            false,
+            &mut gate,
+            || now,
+            || panic!("initial full check was not due"),
+            |_| false,
+        ));
+        assert!(gate.is_required());
+        assert!(!run_integrity_followups(
+            true,
+            false,
+            &mut gate,
+            || now,
+            || false,
+            |_| panic!("invalidated evidence must not authorize writes"),
+        ));
+    }
+
+    #[test]
+    fn backup_dispatch_uses_one_shared_window_and_retries_pending_verified_work() {
+        let now = Instant::now();
+        let mut schedule = AutomaticBackupSchedule::default();
+        assert!(run_automatic_backup_with(&mut schedule, || now, |kind| {
+            assert_eq!(kind, BackupKind::Proactive);
+            Err("export failed; unique staging path one".to_string())
+        }));
+        schedule.request_verified();
+        assert!(run_automatic_backup_with(
+            &mut schedule,
+            || now + Duration::from_secs(300),
+            |_| panic!("verified route must not bypass proactive failure backoff"),
+        ));
+        assert!(!run_automatic_backup_with(
+            &mut schedule,
+            || now + Duration::from_secs(900),
+            |kind| {
+                assert_eq!(kind, BackupKind::Verified);
+                Ok(false)
+            },
+        ));
+        assert_eq!(schedule.consecutive_failures(), 1);
+        assert!(run_automatic_backup_with(
+            &mut schedule,
+            || now + Duration::from_secs(1800),
+            |kind| {
+                assert_eq!(kind, BackupKind::Verified);
+                Ok(true)
+            },
+        ));
+        assert_eq!(schedule.consecutive_failures(), 0);
+        assert_eq!(
+            schedule.next_attempt(now + Duration::from_secs(1800)),
+            Some(BackupKind::Proactive)
+        );
+    }
+
+    #[test]
+    fn automatic_backup_failure_delay_starts_after_the_producer_finishes() {
+        let started = Instant::now();
+        let clock = std::cell::Cell::new(started);
+        let mut schedule = AutomaticBackupSchedule::default();
+        assert!(run_automatic_backup_with(
+            &mut schedule,
+            || clock.get(),
+            |_| {
+                clock.set(started + Duration::from_secs(3600));
+                Err("slow failed export".to_string())
+            },
+        ));
+        assert!(schedule.next_attempt(clock.get()).is_none());
+        assert_eq!(
+            schedule.retry_remaining(clock.get()),
+            Duration::from_secs(900)
+        );
+    }
+
+    #[test]
+    fn real_collation_mismatch_blocks_followup_writes_until_reindex() {
+        use mcp_agent_mail_db::integrity::{
+            CheckKind, details_indicate_ok, extract_check_details, index_table_cross_count,
+        };
+
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_memory().unwrap();
+        conn.execute_raw(
+            "CREATE TABLE guard_mail (id INTEGER PRIMARY KEY, body TEXT); \
+             INSERT INTO guard_mail(body) VALUES ('Zebra'), ('apple'); \
+             CREATE INDEX idx_guard_mail ON guard_mail(body); \
+             CREATE TABLE guard_writes (id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+        // Only this owned in-memory fixture is altered. The existing index
+        // has BINARY key order; declaring NOCASE reproduces a real ordering
+        // disagreement without missing rows, orphan pages, or shared roots.
+        conn.execute_raw(
+            "PRAGMA writable_schema=ON; \
+             UPDATE sqlite_master SET sql= \
+                 'CREATE INDEX idx_guard_mail ON guard_mail(body COLLATE NOCASE)' \
+                 WHERE name='idx_guard_mail'; \
+             PRAGMA writable_schema=OFF; PRAGMA schema_version=100;",
+        )
+        .unwrap();
+        let quick_passes = || {
+            let rows = conn.query_sync("PRAGMA quick_check", &[]).unwrap();
+            details_indicate_ok(&extract_check_details(&rows, CheckKind::Quick))
+        };
+        let full_passes = || {
+            let rows = conn.query_sync("PRAGMA integrity_check", &[]).unwrap();
+            details_indicate_ok(&extract_check_details(&rows, CheckKind::Full))
+        };
+        assert!(quick_passes());
+        assert!(index_table_cross_count(&conn, &["guard_mail"]).unwrap().is_empty());
+        assert!(!full_passes(), "the full probe must detect actual key-order damage");
+
+        let start = Instant::now();
+        let mut gate = FullVerificationGate::default();
+        let mutating_followup = |_| {
+            conn.execute_raw("INSERT INTO guard_writes DEFAULT VALUES")
+                .unwrap();
+            true
+        };
+        assert!(!run_integrity_followups(
+            quick_passes(),
+            true,
+            &mut gate,
+            || start,
+            full_passes,
+            mutating_followup,
+        ));
+        assert!(!run_integrity_followups(
+            quick_passes(),
+            false,
+            &mut gate,
+            || start + Duration::from_secs(300),
+            full_passes,
+            mutating_followup,
+        ));
+        let rows = conn
+            .query_sync("SELECT count(*) AS c FROM guard_writes", &[])
+            .unwrap();
+        assert_eq!(rows[0].get_named::<i64>("c").unwrap(), 0);
+
+        conn.execute_raw("REINDEX idx_guard_mail").unwrap();
+        assert!(full_passes(), "the complete canonical scan must pass after repair");
+        assert!(run_integrity_followups(
+            quick_passes(),
+            false,
+            &mut gate,
+            || start + Duration::from_secs(900),
+            full_passes,
+            mutating_followup,
+        ));
+        let rows = conn
+            .query_sync("SELECT count(*) AS c FROM guard_writes", &[])
+            .unwrap();
+        assert_eq!(rows[0].get_named::<i64>("c").unwrap(), 1);
     }
 
     #[test]
