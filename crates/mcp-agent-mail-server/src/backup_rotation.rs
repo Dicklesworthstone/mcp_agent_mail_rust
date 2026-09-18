@@ -25,10 +25,16 @@ use std::time::SystemTime;
 
 use tracing::{debug, info, warn};
 
+#[cfg(unix)]
+use mcp_agent_mail_db::recovery_retention::{
+    CompletedReclaimMove, ReclaimDirectory as RotationQuarantine,
+};
+
 /// How many of each kind to keep when rotating. Override via
 /// `AM_BACKUP_KEEP_COUNT`. Floor of 1 (keep the most recent no matter what).
 const DEFAULT_KEEP_PER_KIND: usize = 3;
 const MIN_KEEP_PER_KIND: usize = 1;
+#[cfg(any(not(unix), test))]
 const MAX_QUARANTINE_LEAF_ATTEMPTS: u32 = 128;
 
 // Lifted to the db crate (GH#210) so the MCP `health_check` retention block
@@ -45,25 +51,57 @@ pub use mcp_agent_mail_db::recovery_retention::{
 /// "Staged" means moved into a `doctor/reclaimable/rotation-<ts>[-<n>]/`
 /// quarantine directory (the default); "deleted" means hard-removed, which
 /// only happens behind the explicit `AM_BACKUP_ROTATION_DELETE` opt-in.
-/// Staged bytes are *not* reclaimed disk — they still live in the storage
-/// root until an operator reclaims them — so the fields say what actually
-/// happened rather than claiming savings that didn't occur.
+/// Staged bytes are *not* reclaimed disk. On Unix, staging also requires the
+/// source-file and parent-directory syncs and identity checks to complete.
+/// A rename followed by failed sync or validation is separately unconfirmed:
+/// it is neither a successful stage nor an entry left at its source.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RotateReport {
+    /// Entries not moved or deleted by this pass, including refused operations.
     pub kept: usize,
     pub staged: usize,
     pub deleted: usize,
     pub bytes_staged: u64,
     pub bytes_deleted: u64,
+    pub unconfirmed_moves: usize,
+    pub bytes_unconfirmed_moves: u64,
+    pub failures: Vec<RotationFailure>,
     pub per_kind: BTreeMap<&'static str, RotateKindSummary>,
 }
 
 impl RotateReport {
-    /// Total files evicted from retention, regardless of whether they were
-    /// staged into quarantine or hard-deleted under the opt-in.
+    /// Confirmed completed evictions. Unconfirmed moves are reported separately
+    /// and must never be silently promoted into successful staging counts.
     #[must_use]
     pub const fn evicted(&self) -> usize {
         self.staged.saturating_add(self.deleted)
+    }
+}
+
+/// An incomplete operation, including whether the atomic rename took place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotationFailure {
+    pub source: PathBuf,
+    pub rename_completed: bool,
+    /// Requested spelling, not a guarantee that a concurrently renamed parent
+    /// can still be reached through this path. Never use it for blind rollback.
+    pub requested_destination: Option<PathBuf>,
+    pub error: String,
+}
+
+impl RotationFailure {
+    fn from_error(source: &Path, error: &std::io::Error) -> Self {
+        #[cfg(unix)]
+        let requested_destination = CompletedReclaimMove::from_io_error(error)
+            .map(|completed| completed.requested_destination().to_path_buf());
+        #[cfg(not(unix))]
+        let requested_destination: Option<PathBuf> = None;
+        Self {
+            source: source.to_path_buf(),
+            rename_completed: requested_destination.is_some(),
+            requested_destination,
+            error: error.to_string(),
+        }
     }
 }
 
@@ -74,6 +112,19 @@ pub struct RotateKindSummary {
     pub deleted: usize,
     pub bytes_staged: u64,
     pub bytes_deleted: u64,
+    pub unconfirmed_moves: usize,
+    pub bytes_unconfirmed_moves: u64,
+}
+
+impl RotateKindSummary {
+    fn record_failure(&mut self, failure: &RotationFailure, bytes: u64) {
+        if failure.rename_completed {
+            self.unconfirmed_moves = self.unconfirmed_moves.saturating_add(1);
+            self.bytes_unconfirmed_moves = self.bytes_unconfirmed_moves.saturating_add(bytes);
+        } else {
+            self.kept = self.kept.saturating_add(1);
+        }
+    }
 }
 
 /// Resolve the rotation "keep count" — honors `AM_BACKUP_KEEP_COUNT` env
@@ -103,15 +154,34 @@ pub fn rotation_delete_opted_in() -> bool {
     })
 }
 
-/// Create a quarantine directory owned exclusively by this rotation pass.
-///
-/// Rotation can run concurrently in two cold-starting processes. A shared
-/// second-resolution directory would let both processes target the same file
-/// name. Claiming the directory with `create_dir` isolates cooperative passes;
-/// atomic no-replace leaf moves additionally protect against raced entries.
-fn create_unique_quarantine_dir(parent: &Path, stem: &str) -> std::io::Result<PathBuf> {
-    fs::create_dir_all(parent)?;
+// Preserve the existing non-Unix move contract. The stronger descriptor and
+// directory-durability implementation is Unix-specific; no claim of equivalent
+// Windows namespace protection is made by the shared report shape.
+#[cfg(not(unix))]
+#[derive(Debug)]
+struct RotationQuarantine {
+    path: PathBuf,
+}
 
+#[cfg(not(unix))]
+impl RotationQuarantine {
+    fn claim(path: &Path) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::create_dir(path)?;
+        Ok(Self { path: path.to_path_buf() })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Claim a unique quarantine and keep its directory authority for the whole
+/// rotation. Unix creation walks ancestors without following user-controlled
+/// symlinks and persists every newly created directory entry privately.
+fn create_unique_quarantine_dir(parent: &Path, stem: &str) -> std::io::Result<RotationQuarantine> {
     for suffix in 0_u32..=u32::from(u16::MAX) {
         let directory_name = if suffix == 0 {
             stem.to_string()
@@ -119,8 +189,8 @@ fn create_unique_quarantine_dir(parent: &Path, stem: &str) -> std::io::Result<Pa
             format!("{stem}-{suffix}")
         };
         let candidate = parent.join(directory_name);
-        match fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
+        match RotationQuarantine::claim(&candidate) {
+            Ok(directory) => return Ok(directory),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(err) => return Err(err),
         }
@@ -135,59 +205,50 @@ fn create_unique_quarantine_dir(parent: &Path, stem: &str) -> std::io::Result<Pa
     ))
 }
 
-/// Move one backup without ever replacing an occupied quarantine leaf.
-/// Unsupported atomic moves and cross-device moves fail without copying or
-/// unlinking source evidence. Directory ownership is not a substitute for
-/// this primitive: another process can populate a claimed directory later.
-fn stage_backup_noreplace(source: &Path, directory: &Path) -> std::io::Result<PathBuf> {
-    stage_backup_noreplace_with(
-        source,
-        directory,
-        mcp_agent_mail_db::pool::rename_noreplace_preserving_source,
-    )
-}
-
-fn stage_backup_noreplace_with<F>(
+/// On Unix, stage the inventoried inode through retained directory handles.
+/// Unsupported or cross-device moves never use a copy-and-delete fallback.
+fn stage_backup_noreplace(
     source: &Path,
-    directory: &Path,
-    mut rename: F,
-) -> std::io::Result<PathBuf>
-where
-    F: FnMut(&Path, &Path) -> std::io::Result<()>,
-{
-    let name = source.file_name().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "backup has no file name")
-    })?;
-    // The inventory can be stale by the time rotation reaches this entry.
-    // Never deliberately stage a symlink, directory, or other non-file.
-    if !fs::symlink_metadata(source)?.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "rotation source is no longer a regular backup file",
-        ));
+    directory: &RotationQuarantine,
+    inventoried: &fs::Metadata,
+) -> std::io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        directory.stage_inventoried_file(source, inventoried)
     }
-    for suffix in 0..MAX_QUARANTINE_LEAF_ATTEMPTS {
-        let mut leaf = name.to_os_string();
-        if suffix != 0 {
-            leaf.push(format!(".{suffix}"));
+    #[cfg(not(unix))]
+    {
+        let _ = inventoried;
+        let name = source.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "backup has no file name")
+        })?;
+        if !fs::symlink_metadata(source)?.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "rotation source is no longer a regular backup file",
+            ));
         }
-        let destination = directory.join(leaf);
-        // No exists() preflight: even dangling symlinks occupy a name, and
-        // only the atomic operation can exclude a concurrent publication.
-        match rename(source, &destination) {
-            Ok(()) => return Ok(destination),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
+        for suffix in 0..MAX_QUARANTINE_LEAF_ATTEMPTS {
+            let mut leaf = name.to_os_string();
+            if suffix != 0 {
+                leaf.push(format!(".{suffix}"));
+            }
+            let destination = directory.path().join(leaf);
+            match mcp_agent_mail_db::pool::rename_noreplace_preserving_source(source, &destination) {
+                Ok(()) => return Ok(destination),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
         }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "quarantine collision budget exhausted for {} under {}; source retained",
+                source.display(),
+                directory.path().display()
+            ),
+        ))
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        format!(
-            "quarantine collision budget exhausted for {} under {}; source retained",
-            source.display(),
-            directory.display()
-        ),
-    ))
 }
 
 /// Rotate backup files beside `database_path`, staging evictions for reclaim.
@@ -197,25 +258,58 @@ where
 /// reclaim. With the explicit `AM_BACKUP_ROTATION_DELETE` opt-in the evicted
 /// files are hard-deleted instead (the legacy behavior).
 /// An external database parent is inventoried in place; quarantine remains
-/// under the archive root. Cross-device staging leaves the backup untouched
-/// and reports it as kept, without a copy-and-delete fallback.
+/// under the archive root. Cross-device staging reports a refusal without a
+/// copy-and-delete fallback.
 ///
 /// Non-backup files (live DB, Codex DB, projects/, search_index/, .git/,
 /// etc.) are never touched. Rotation only applies to files classified as
 /// backups. `storage.sqlite3.archive-reconcile-*` files are additionally
 /// excluded even though they classify as backups — see the comment inside.
 ///
-/// Returns a `RotateReport` with per-kind counts. Errors on individual
-/// stage/delete operations are logged and counted as `kept` so partial
-/// failures don't mask themselves.
+/// Unix staging verifies the original inventory, retains the claimed directory
+/// across the batch, and distinguishes a refused operation from a completed
+/// rename with unconfirmed durability. Both are recorded in `failures`.
+/// The explicit hard-delete lane and non-Unix staging retain their prior
+/// behavior; they do not inherit the Unix descriptor-bound guarantees.
 pub fn rotate_storage_backups(
     storage_root: &Path,
     database_path: &Path,
     keep_per_kind: usize,
 ) -> std::io::Result<RotateReport> {
+    rotate_storage_backups_with(storage_root, database_path, keep_per_kind, stage_backup_noreplace)
+}
+
+fn rotate_storage_backups_with<F>(
+    storage_root: &Path,
+    database_path: &Path,
+    keep_per_kind: usize,
+    mut stage: F,
+) -> std::io::Result<RotateReport>
+where
+    F: FnMut(&Path, &RotationQuarantine, &fs::Metadata) -> std::io::Result<PathBuf>,
+{
     let keep = keep_per_kind.max(MIN_KEEP_PER_KIND);
     let delete_opted_in = rotation_delete_opted_in();
-    let snapshot_primary = database_path;
+    if database_path.file_name().is_none() {
+        return Ok(RotateReport::default());
+    }
+    // One working-directory snapshot prevents a process-wide chdir from
+    // redirecting later inventory entries. Do not canonicalize away symlinks.
+    let cwd = if storage_root.is_relative() || database_path.is_relative() {
+        Some(std::env::current_dir()?)
+    } else {
+        None
+    };
+    let absolute = |path: &Path| {
+        if path.is_relative() {
+            cwd.as_ref().map_or_else(|| path.to_path_buf(), |cwd| cwd.join(path))
+        } else {
+            path.to_path_buf()
+        }
+    };
+    let storage_root = absolute(storage_root);
+    let database_path = absolute(database_path);
+    let snapshot_primary = database_path.as_path();
     let Some(database_name) = database_path.file_name() else {
         return Ok(RotateReport::default());
     };
@@ -239,19 +333,14 @@ pub fn rotate_storage_backups(
         Err(e) => return Err(e),
     };
 
-    // Group candidate files by kind so we can rotate each independently.
-    let mut by_kind: BTreeMap<BackupKind, Vec<(PathBuf, SystemTime, u64)>> = BTreeMap::new();
+    // Retain the inventory's metadata, not only its size. Staging must not
+    // silently adopt a different file subsequently placed at this pathname.
+    let mut by_kind: BTreeMap<BackupKind, Vec<(PathBuf, SystemTime, fs::Metadata)>> = BTreeMap::new();
     for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_file() {
-            // `DirEntry::metadata()` follows symlinks. Check the directory
-            // entry itself first so a backup-shaped symlink is never moved or
-            // accounted as though its target were an owned backup file.
+        let Ok(meta) = fs::symlink_metadata(entry.path()) else { continue };
+        if !meta.file_type().is_file() {
             continue;
         }
-        let Ok(meta) = entry.metadata() else { continue };
         let Some(kind) = classify_backup_file(database_name, &entry.file_name()) else {
             continue;
         };
@@ -268,7 +357,7 @@ pub fn rotate_storage_backups(
         by_kind
             .entry(kind)
             .or_default()
-            .push((entry.path(), mtime, meta.len()));
+            .push((entry.path(), mtime, meta));
     }
 
     // Quarantine directory for this rotation pass. Created lazily on the
@@ -351,7 +440,8 @@ pub fn rotate_storage_backups(
             kept: files.len().saturating_sub(to_evict.len()),
             ..Default::default()
         };
-        for (path, _mtime, size) in to_evict {
+        for (path, _mtime, metadata) in to_evict {
+            let size = metadata.len();
             if delete_opted_in {
                 // Legacy hard-delete behavior — only behind the explicit
                 // `AM_BACKUP_ROTATION_DELETE` opt-in.
@@ -359,7 +449,7 @@ pub fn rotate_storage_backups(
                     Ok(()) => {
                         debug!(kind = kind.label(), path = %path.display(), size, "deleted rotated backup (explicit opt-in)");
                         summary.deleted += 1;
-                        summary.bytes_deleted = summary.bytes_deleted.saturating_add(*size);
+                        summary.bytes_deleted = summary.bytes_deleted.saturating_add(size);
                     }
                     Err(err) => {
                         warn!(
@@ -368,15 +458,16 @@ pub fn rotate_storage_backups(
                             %err,
                             "failed to delete rotated backup; keeping in place"
                         );
-                        summary.kept += 1;
+                        let failure = RotationFailure::from_error(path, &err);
+                        summary.record_failure(&failure, size);
+                        report.failures.push(failure);
                     }
                 }
                 continue;
             }
 
-            // Default: quarantine instead of delete (RULE 1). Move the file
-            // into `doctor/reclaimable/rotation-<ts>[-<n>]/` so an operator (or a
-            // later explicit reclaim) decides when disk is actually freed.
+            // Default: quarantine instead of delete (RULE 1). Keep the same
+            // claimed directory handle across every kind and every artifact.
             if quarantine_dir.is_none() {
                 match create_unique_quarantine_dir(&quarantine_parent, &quarantine_stem) {
                     Ok(directory) => quarantine_dir = Some(directory),
@@ -384,38 +475,49 @@ pub fn rotate_storage_backups(
                         warn!(
                             parent = %quarantine_parent.display(),
                             %err,
-                            "failed to claim a unique rotation quarantine dir; leaving evicted backups in place"
+                            "failed to claim a rotation quarantine; no backup was moved"
                         );
-                        summary.kept += 1;
+                        let failure = RotationFailure::from_error(path, &err);
+                        summary.record_failure(&failure, size);
+                        report.failures.push(failure);
                         continue;
                     }
                 }
             }
             let Some(directory) = quarantine_dir.as_ref() else {
-                warn!(
-                    path = %path.display(),
-                    "rotation quarantine directory unexpectedly unavailable; keeping backup in place"
-                );
-                summary.kept += 1;
+                let error = std::io::Error::other("rotation quarantine directory unavailable");
+                let failure = RotationFailure::from_error(path, &error);
+                summary.record_failure(&failure, size);
+                report.failures.push(failure);
                 continue;
             };
-            match stage_backup_noreplace(path, directory) {
+            match stage(path, directory, metadata) {
                 Ok(dest) => {
                     debug!(kind = kind.label(), path = %path.display(), dest = %dest.display(), size, "staged rotated backup into quarantine");
                     summary.staged += 1;
-                    summary.bytes_staged = summary.bytes_staged.saturating_add(*size);
+                    summary.bytes_staged = summary.bytes_staged.saturating_add(size);
                 }
                 Err(err) => {
-                    // A cross-device or unsupported atomic move cannot
-                    // safely fall back to copy+remove. Preserve the source.
-                    warn!(
-                        kind = kind.label(),
-                        path = %path.display(),
-                        directory = %directory.display(),
-                        %err,
-                        "failed to stage rotated backup into quarantine; keeping in place"
-                    );
-                    summary.kept += 1;
+                    let failure = RotationFailure::from_error(path, &err);
+                    if failure.rename_completed {
+                        warn!(
+                            kind = kind.label(),
+                            path = %path.display(),
+                            requested_destination = ?failure.requested_destination,
+                            %err,
+                            "backup rename completed but durability or namespace is unconfirmed; evidence retained, no rollback or retry"
+                        );
+                    } else {
+                        warn!(
+                            kind = kind.label(),
+                            path = %path.display(),
+                            directory = %directory.path().display(),
+                            %err,
+                            "rotation refused to stage this backup; no move performed by this attempt"
+                        );
+                    }
+                    summary.record_failure(&failure, size);
+                    report.failures.push(failure);
                 }
             }
         }
@@ -425,16 +527,21 @@ pub fn rotate_storage_backups(
         report.deleted = report.deleted.saturating_add(summary.deleted);
         report.bytes_staged = report.bytes_staged.saturating_add(summary.bytes_staged);
         report.bytes_deleted = report.bytes_deleted.saturating_add(summary.bytes_deleted);
+        report.unconfirmed_moves = report.unconfirmed_moves.saturating_add(summary.unconfirmed_moves);
+        report.bytes_unconfirmed_moves = report.bytes_unconfirmed_moves
+            .saturating_add(summary.bytes_unconfirmed_moves);
         report.per_kind.insert(kind.label(), summary);
     }
 
-    if report.evicted() > 0 {
+    if report.evicted() > 0 || report.unconfirmed_moves > 0 {
         info!(
             staged = report.staged,
             deleted = report.deleted,
             kept = report.kept,
             bytes_staged = report.bytes_staged,
             bytes_deleted = report.bytes_deleted,
+            unconfirmed_moves = report.unconfirmed_moves,
+            bytes_unconfirmed_moves = report.bytes_unconfirmed_moves,
             "rotated storage backups"
         );
     }
@@ -644,6 +751,8 @@ mod tests {
         assert_eq!(report.kept, 3 + 2, "3 corrupts + 2 reconstructs kept");
         assert!(report.bytes_staged > 0);
         assert_eq!(report.bytes_deleted, 0);
+        assert_eq!(report.unconfirmed_moves, 0);
+        assert!(report.failures.is_empty());
 
         // Unrelated file intact.
         assert!(tmp.path().join("do-not-touch.txt").exists());
@@ -974,14 +1083,14 @@ mod tests {
         let parent = tmp.path().join("doctor").join("reclaimable");
 
         let first = create_unique_quarantine_dir(&parent, "rotation-fixed").unwrap();
-        touch(&first.join("storage.sqlite3.corrupt-same-name"), 17);
+        touch(&first.path().join("storage.sqlite3.corrupt-same-name"), 17);
         let second = create_unique_quarantine_dir(&parent, "rotation-fixed").unwrap();
 
-        assert_ne!(first, second);
-        assert_eq!(first.file_name().unwrap(), "rotation-fixed");
-        assert_eq!(second.file_name().unwrap(), "rotation-fixed-1");
+        assert_ne!(first.path(), second.path());
+        assert_eq!(first.path().file_name().unwrap(), "rotation-fixed");
+        assert_eq!(second.path().file_name().unwrap(), "rotation-fixed-1");
         assert_eq!(
-            fs::read(first.join("storage.sqlite3.corrupt-same-name")).unwrap(),
+            fs::read(first.path().join("storage.sqlite3.corrupt-same-name")).unwrap(),
             vec![0_u8; 17],
             "claiming a later rotation directory must not replace prior evidence"
         );
@@ -1091,27 +1200,19 @@ mod tests {
     }
 
     #[test]
-    fn staging_preserves_a_destination_created_at_the_move_boundary() {
+    fn staging_preserves_a_destination_created_after_quarantine_claim() {
         let root = TempDir::new().unwrap();
         let source = root.path().join("backup");
-        let directory = root.path().join("quarantine");
-        fs::create_dir(&directory).unwrap();
+        let directory = RotationQuarantine::claim(&root.path().join("quarantine")).unwrap();
         fs::write(&source, b"source evidence").unwrap();
-        let mut attempts = 0;
-        let staged = stage_backup_noreplace_with(&source, &directory, |from, to| {
-            attempts += 1;
-            if attempts == 1 {
-                fs::write(to, b"concurrent evidence").unwrap();
-            }
-            mcp_agent_mail_db::pool::rename_noreplace_preserving_source(from, to)
-        })
-        .expect("retry the actual OS collision");
-        assert_eq!(attempts, 2);
-        assert_eq!(staged, directory.join("backup.1"));
-        assert_eq!(
-            fs::read(directory.join("backup")).unwrap(),
-            b"concurrent evidence"
-        );
+        let inventoried = fs::symlink_metadata(&source).unwrap();
+        // The shared DB namespace tests additionally inject collisions at the
+        // rename callback itself. This uses the actual production stage API.
+        fs::write(directory.path().join("backup"), b"concurrent evidence").unwrap();
+        let staged = stage_backup_noreplace(&source, &directory, &inventoried)
+            .expect("retry the actual OS collision");
+        assert_eq!(staged, directory.path().join("backup.1"));
+        assert_eq!(fs::read(directory.path().join("backup")).unwrap(), b"concurrent evidence");
         assert_eq!(fs::read(staged).unwrap(), b"source evidence");
         assert!(!source.exists());
     }
@@ -1121,19 +1222,14 @@ mod tests {
     fn staging_preserves_dangling_destination_symlink() {
         let root = TempDir::new().unwrap();
         let source = root.path().join("backup");
-        let directory = root.path().join("quarantine");
-        fs::create_dir(&directory).unwrap();
+        let directory = RotationQuarantine::claim(&root.path().join("quarantine")).unwrap();
         fs::write(&source, b"source evidence").unwrap();
-        let occupied = directory.join("backup");
+        let inventoried = fs::symlink_metadata(&source).unwrap();
+        let occupied = directory.path().join("backup");
         std::os::unix::fs::symlink("absent-target", &occupied).unwrap();
-        let staged = stage_backup_noreplace(&source, &directory).unwrap();
-        assert_eq!(staged, directory.join("backup.1"));
-        assert!(
-            fs::symlink_metadata(&occupied)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
+        let staged = stage_backup_noreplace(&source, &directory, &inventoried).unwrap();
+        assert_eq!(staged, directory.path().join("backup.1"));
+        assert!(fs::symlink_metadata(&occupied).unwrap().file_type().is_symlink());
         assert_eq!(fs::read_link(occupied).unwrap(), Path::new("absent-target"));
         assert_eq!(fs::read(staged).unwrap(), b"source evidence");
     }
@@ -1142,22 +1238,22 @@ mod tests {
     fn staging_collision_budget_exhaustion_preserves_all_evidence() {
         let root = TempDir::new().unwrap();
         let source = root.path().join("backup");
-        let directory = root.path().join("quarantine");
-        fs::create_dir(&directory).unwrap();
+        let directory = RotationQuarantine::claim(&root.path().join("quarantine")).unwrap();
         fs::write(&source, b"source evidence").unwrap();
+        let inventoried = fs::symlink_metadata(&source).unwrap();
         for suffix in 0..MAX_QUARANTINE_LEAF_ATTEMPTS {
             let leaf = if suffix == 0 {
                 "backup".to_string()
             } else {
                 format!("backup.{suffix}")
             };
-            fs::write(directory.join(leaf), b"retained evidence").unwrap();
+            fs::write(directory.path().join(leaf), b"retained evidence").unwrap();
         }
-        let error = stage_backup_noreplace(&source, &directory).unwrap_err();
+        let error = stage_backup_noreplace(&source, &directory, &inventoried).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert!(error.to_string().contains("collision budget exhausted"));
         assert_eq!(fs::read(source).unwrap(), b"source evidence");
-        let entries: Vec<_> = fs::read_dir(&directory).unwrap().collect();
+        let entries: Vec<_> = fs::read_dir(directory.path()).unwrap().collect();
         assert_eq!(entries.len(), MAX_QUARANTINE_LEAF_ATTEMPTS as usize);
         for entry in entries {
             assert_eq!(
@@ -1172,21 +1268,26 @@ mod tests {
         let root = TempDir::new().unwrap();
         let source = root.path().join("backup");
         fs::write(&source, b"source evidence").unwrap();
-        assert!(stage_backup_noreplace(&source, &root.path().join("absent")).is_err());
+        let inventoried = fs::symlink_metadata(&source).unwrap();
+        let directory = RotationQuarantine::claim(&root.path().join("quarantine")).unwrap();
+        let retained = root.path().join("retained-quarantine");
+        fs::rename(directory.path(), &retained).unwrap();
+        assert!(stage_backup_noreplace(&source, &directory, &inventoried).is_err());
         assert_eq!(fs::read(source).unwrap(), b"source evidence");
+        assert_eq!(fs::read_dir(retained).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
     #[test]
     fn staging_rejects_a_source_replaced_by_a_symlink() {
         let root = TempDir::new().unwrap();
-        let directory = root.path().join("quarantine");
-        fs::create_dir(&directory).unwrap();
+        let directory = RotationQuarantine::claim(&root.path().join("quarantine")).unwrap();
         let target = root.path().join("target");
         let source = root.path().join("backup");
         fs::write(&target, b"unrelated evidence").unwrap();
         std::os::unix::fs::symlink(&target, &source).unwrap();
-        assert!(stage_backup_noreplace(&source, &directory).is_err());
+        let inventoried = fs::symlink_metadata(&source).unwrap();
+        assert!(stage_backup_noreplace(&source, &directory, &inventoried).is_err());
         assert!(
             fs::symlink_metadata(source)
                 .unwrap()
@@ -1194,7 +1295,7 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read(target).unwrap(), b"unrelated evidence");
-        assert_eq!(fs::read_dir(directory).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
@@ -1202,17 +1303,193 @@ mod tests {
     fn staging_collision_suffix_preserves_raw_filename_bytes() {
         use std::os::unix::ffi::OsStringExt;
         let root = TempDir::new().unwrap();
-        let directory = root.path().join("quarantine");
-        fs::create_dir(&directory).unwrap();
+        let directory = RotationQuarantine::claim(&root.path().join("quarantine")).unwrap();
         let name = std::ffi::OsString::from_vec(b"backup-\xff".to_vec());
         let source = root.path().join(&name);
         fs::write(&source, b"source").unwrap();
-        fs::write(directory.join(&name), b"existing").unwrap();
-        let staged = stage_backup_noreplace(&source, &directory).unwrap();
+        let inventoried = fs::symlink_metadata(&source).unwrap();
+        fs::write(directory.path().join(&name), b"existing").unwrap();
+        let staged = stage_backup_noreplace(&source, &directory, &inventoried).unwrap();
         let mut suffixed = name.clone();
         suffixed.push(".1");
-        assert_eq!(staged, directory.join(suffixed));
-        assert_eq!(fs::read(directory.join(name)).unwrap(), b"existing");
+        assert_eq!(staged, directory.path().join(suffixed));
+        assert_eq!(fs::read(directory.path().join(name)).unwrap(), b"existing");
         assert_eq!(fs::read(staged).unwrap(), b"source");
+    }
+
+    #[cfg(unix)]
+    fn ordered_backup_pair(root: &Path) -> (PathBuf, PathBuf) {
+        let old = root.join("storage.sqlite3.corrupt-old");
+        let new = root.join("storage.sqlite3.corrupt-new");
+        for (path, seconds) in [(&old, 1), (&new, 2)] {
+            fs::write(path, b"original").unwrap();
+            fs::File::options().write(true).open(path).unwrap().set_times(
+                fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+            ).unwrap();
+        }
+        (old, new)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_rejects_symlinked_quarantine_ancestors_without_touching_outside_files() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let (old, new) = ordered_backup_pair(root.path());
+        std::os::unix::fs::symlink(outside.path(), root.path().join("doctor")).unwrap();
+        let report = rotate_with_delete_off(root.path(), 1);
+        assert_eq!(report.kept, 2);
+        assert_eq!(report.staged, 0);
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.unconfirmed_moves, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert!(!report.failures[0].rename_completed);
+        assert_eq!(fs::read(old).unwrap(), b"original");
+        assert_eq!(fs::read(new).unwrap(), b"original");
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_rejects_same_size_same_mtime_replacement_after_inventory() {
+        let root = TempDir::new().unwrap();
+        let (old, new) = ordered_backup_pair(root.path());
+        let retained = root.path().join("retained-original");
+        let mut attempts = 0;
+        let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "0")],
+            || rotate_storage_backups_with(
+                root.path(), &root.path().join("storage.sqlite3"), 1,
+                |source, directory, metadata| {
+                    attempts += 1;
+                    assert_eq!(source, old);
+                    fs::rename(source, &retained).unwrap();
+                    fs::write(source, b"replaced").unwrap();
+                    fs::File::options().write(true).open(source).unwrap().set_times(
+                        fs::FileTimes::new().set_modified(metadata.modified().unwrap()),
+                    ).unwrap();
+                    stage_backup_noreplace(source, directory, metadata)
+                },
+            ).unwrap(),
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(report.kept, 2);
+        assert_eq!(report.staged, 0);
+        assert_eq!(report.unconfirmed_moves, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert!(!report.failures[0].rename_completed);
+        assert!(report.failures[0].requested_destination.is_none());
+        assert_eq!(fs::read(old).unwrap(), b"replaced");
+        assert_eq!(fs::read(retained).unwrap(), b"original");
+        assert_eq!(fs::read(new).unwrap(), b"original");
+        assert!(quarantined_names(root.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_refuses_a_backup_hardlinked_to_the_live_mailbox() {
+        let root = TempDir::new().unwrap();
+        let primary = root.path().join("storage.sqlite3");
+        fs::write(&primary, b"live mailbox state").unwrap();
+        let alias = root.path().join("storage.sqlite3.corrupt-old");
+        fs::hard_link(&primary, &alias).unwrap();
+        fs::File::options().write(true).open(&alias).unwrap().set_times(
+            fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+        ).unwrap();
+        let newest = root.path().join("storage.sqlite3.corrupt-new");
+        fs::write(&newest, b"newest backup").unwrap();
+        let report = rotate_with_delete_off(root.path(), 1);
+        assert_eq!(report.kept, 2);
+        assert_eq!(report.staged, 0);
+        assert_eq!(report.unconfirmed_moves, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert!(report.failures[0].error.contains("single-link"));
+        assert_eq!(fs::read(primary).unwrap(), b"live mailbox state");
+        assert_eq!(fs::read(alias).unwrap(), b"live mailbox state");
+        assert_eq!(fs::read(newest).unwrap(), b"newest backup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_retains_the_claimed_quarantine_across_dispatch() {
+        let root = TempDir::new().unwrap();
+        let (old, new) = ordered_backup_pair(root.path());
+        let retained = root.path().join("retained-quarantine");
+        let mut requested = None;
+        let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "0")],
+            || rotate_storage_backups_with(
+                root.path(), &root.path().join("storage.sqlite3"), 1,
+                |source, directory, metadata| {
+                    let replacement = directory.path().to_path_buf();
+                    fs::rename(&replacement, &retained).unwrap();
+                    fs::create_dir(&replacement).unwrap();
+                    fs::write(replacement.join(source.file_name().unwrap()), b"outside sentinel").unwrap();
+                    requested = Some(replacement);
+                    stage_backup_noreplace(source, directory, metadata)
+                },
+            ).unwrap(),
+        );
+        assert_eq!(report.kept, 2);
+        assert_eq!(report.staged, 0);
+        assert_eq!(report.unconfirmed_moves, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(fs::read(&old).unwrap(), b"original");
+        assert_eq!(fs::read(new).unwrap(), b"original");
+        assert_eq!(fs::read(requested.unwrap().join(old.file_name().unwrap())).unwrap(), b"outside sentinel");
+        assert_eq!(fs::read_dir(retained).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_creates_private_directories_and_preserves_existing_root_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TempDir::new().unwrap();
+        let (old, new) = ordered_backup_pair(root.path());
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let report = rotate_with_delete_off(root.path(), 1);
+        assert_eq!(report.staged, 1);
+        assert_eq!(report.bytes_staged, 8);
+        assert!(report.failures.is_empty());
+        assert_eq!(report.unconfirmed_moves, 0);
+        let doctor = root.path().join("doctor");
+        let reclaimable = doctor.join("reclaimable");
+        let quarantine = reclaimable.join(quarantine_dir_name(root.path()));
+        for directory in [&doctor, &reclaimable, &quarantine] {
+            assert_eq!(fs::metadata(directory).unwrap().permissions().mode() & 0o077, 0);
+        }
+        assert_eq!(fs::metadata(root.path()).unwrap().permissions().mode() & 0o777, 0o755);
+        assert!(!old.exists());
+        assert_eq!(fs::read(quarantine.join(old.file_name().unwrap())).unwrap(), b"original");
+        assert_eq!(fs::read(new).unwrap(), b"original");
+    }
+
+    #[test]
+    fn incomplete_move_accounting_never_claims_kept_or_successful_staging() {
+        let mut summary = RotateKindSummary::default();
+        let refused = RotationFailure::from_error(
+            Path::new("source"), &std::io::Error::other("refused before rename"),
+        );
+        assert!(!refused.rename_completed);
+        summary.record_failure(&refused, 7);
+        let completed = RotationFailure {
+            source: PathBuf::from("source"),
+            rename_completed: true,
+            requested_destination: Some(PathBuf::from("quarantine/source")),
+            error: "post-move validation failure".to_string(),
+        };
+        summary.record_failure(&completed, 11);
+        assert_eq!(summary.kept, 1);
+        assert_eq!(summary.staged, 0);
+        assert_eq!(summary.deleted, 0);
+        assert_eq!(summary.bytes_staged, 0);
+        assert_eq!(summary.unconfirmed_moves, 1);
+        assert_eq!(summary.bytes_unconfirmed_moves, 11);
+        let report = RotateReport {
+            unconfirmed_moves: 1,
+            bytes_unconfirmed_moves: 11,
+            ..RotateReport::default()
+        };
+        assert_eq!(report.evicted(), 0);
     }
 }
