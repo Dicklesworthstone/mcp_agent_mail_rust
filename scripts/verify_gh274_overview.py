@@ -93,7 +93,53 @@ class Work:
     peak_release_keys: int = 0
 
 
-def bounded(db, now=NOW, on_recipient_page=None):
+def quoted_identifier(name):
+    return '"' + name.replace('"', '""') + '"'
+
+
+def inventory_index(db, table):
+    for index in db.execute(f'PRAGMA index_list({quoted_identifier(table)})'):
+        if len(index) < 5 or index[4] != 0:
+            continue
+        columns = db.execute(f'PRAGMA index_info({quoted_identifier(index[1])})').fetchall()
+        if any(column[0] == 0 and column[2] == 'project_id' for column in columns):
+            return index[1]
+    return None
+
+
+def inventory_pages(db, select, table, query, indexed=True):
+    """Project-group seeks, falling back to the original ID-keyed scan."""
+    index = inventory_index(db, table) if indexed else None
+    after = None
+    while True:
+        params = () if after is None else (after,)
+        if index is None:
+            key = 'id'
+            condition = '' if after is None else ' AND id > ?'
+            sql = f'{select} WHERE (1 = 1){condition} ORDER BY id LIMIT {PAGE}'
+        else:
+            key = 'project_id'
+            condition = '' if after is None else 'WHERE project_id > ?'
+            sql = (f'{SQL["PROJECT_INVENTORY_SQL"]} {quoted_identifier(table)} '
+                   f'INDEXED BY {quoted_identifier(index)} {condition} '
+                   f'ORDER BY project_id LIMIT {PAGE}')
+        rows = query(sql, params)
+        previous = after
+        for row in rows:
+            value = row[key]
+            if (not isinstance(value, int)
+                    or (after is not None and value <= after)
+                    or (previous is not None and (value < previous if index else value <= previous))):
+                raise RuntimeError('non-progressing inventory cursor')
+            previous = value
+        if rows:
+            yield rows
+        if len(rows) < PAGE:
+            return
+        after = previous
+
+
+def bounded(db, now=NOW, on_recipient_page=None, on_inventory_page=None, indexed_inventory=True):
     work = Work()
     projects = {}
 
@@ -165,8 +211,11 @@ def bounded(db, now=NOW, on_recipient_page=None):
         for rows in pages(SQL['PROJECTS_SQL'], '1 = 1', 'id', 0):
             for row in rows:
                 project(row['id'])[0] = row['slug']
-        for name, slot in [('AGENTS_SQL', 1), ('MESSAGE_INVENTORY_SQL', 2)]:
-            for rows in pages(SQL[name], '1 = 1', 'id', slot):
+        for table, name, slot in [('agents', 'AGENTS_SQL', 1), ('messages', 'MESSAGE_INVENTORY_SQL', 2)]:
+            for rows in inventory_pages(db, SQL[name], table, query, indexed_inventory):
+                work.scan_rows[slot] += len(rows)
+                if on_inventory_page:
+                    on_inventory_page(table)
                 for row in rows:
                     project(row['project_id'])
         for rows in pages(SQL['RECIPIENTS_SQL'], PENDING, '_rowid_', 3):
@@ -374,12 +423,183 @@ class DifferentialTests(unittest.TestCase):
         self.assertIn('commands::handle_robot(args)', wrapper)
         self.assertNotIn('build_overview_with_snapshot_cache', wrapper)
         self.assertEqual(set(SQL), {'PROJECTS_SQL', 'AGENTS_SQL', 'MESSAGE_INVENTORY_SQL',
-                                   'MESSAGES_SQL', 'RECIPIENTS_SQL', 'RESERVATIONS_SQL', 'RELEASE_LOOKUP_SQL'})
+                                   'PROJECT_INVENTORY_SQL', 'MESSAGES_SQL', 'RECIPIENTS_SQL',
+                                   'RESERVATIONS_SQL', 'RELEASE_LOOKUP_SQL'})
         for sql in SQL.values():
             self.assertNotRegex(sql.upper(), r'\b(JOIN|GROUP BY|DISTINCT|OFFSET)\b')
         self.assertIn('SAVEPOINT robot_overview_read', SOURCE)
         self.assertIn('RELEASE robot_overview_read', SOURCE)
         self.assertIn('scan_reservation_pages(conn', SOURCE)
+        self.assertIn('scan_project_inventory(conn', SOURCE)
+
+
+def inventory_probe(db, indexed):
+    """Measure only message-project inventory, including index-schema probes.
+
+    Progress-handler counts are canonical SQLite VM instructions, not elapsed
+    time or work inside FrankenSQLite. No row materialization occurs here
+    outside the same bounded data pages used by the complete Python model.
+    """
+    stats = dict(data_queries=0, returned_rows=0, peak_rows=0, vm_instructions=0)
+    ids = set()
+    plans = set()
+
+    def progress():
+        stats['vm_instructions'] += 1
+        return 0
+
+    def query(sql, params):
+        cursor = db.execute(sql, params)
+        names = [entry[0] for entry in cursor.description]
+        rows = [dict(zip(names, row)) for row in cursor.fetchall()]
+        stats['data_queries'] += 1
+        stats['returned_rows'] += len(rows)
+        stats['peak_rows'] = max(stats['peak_rows'], len(rows))
+        if len(rows) > PAGE:
+            raise AssertionError('inventory page exceeded its budget')
+        # EXPLAIN is diagnostic only and excluded from the VM work metric.
+        db.set_progress_handler(None, 0)
+        plans.update(row[3] for row in db.execute('EXPLAIN QUERY PLAN ' + sql, params))
+        db.set_progress_handler(progress, 1)
+        return rows
+
+    db.set_progress_handler(progress, 1)
+    try:
+        for rows in inventory_pages(db, SQL['MESSAGE_INVENTORY_SQL'], 'messages', query, indexed):
+            ids.update(row['project_id'] for row in rows)
+    finally:
+        db.set_progress_handler(None, 0)
+    stats['plans'] = sorted(plans)
+    return ids, stats
+
+
+class InventoryTests(unittest.TestCase):
+    def test_inventory_work_stays_bounded_as_completed_history_grows(self):
+        evidence = []
+        for per_project in [1000, 10000]:
+            with closing(fixture()) as db:
+                projects = 33
+                db.executemany("INSERT INTO messages VALUES (?, ?, 'high', 1, 0)",
+                               ((i, i % projects) for i in range(projects * per_project)))
+                old_ids, old = inventory_probe(db, False)
+                new_ids, new = inventory_probe(db, True)
+                self.assertEqual(new_ids, old_ids)
+                self.assertEqual(new_ids, set(range(projects)))
+                self.assertEqual(new['returned_rows'], projects * PAGE)
+                self.assertEqual(new['data_queries'], projects + 1)
+                self.assertLessEqual(new['data_queries'], old['data_queries'])
+                self.assertLess(new['vm_instructions'], old['vm_instructions'])
+                self.assertTrue(all('COVERING INDEX' in plan for plan in new['plans']))
+                self.assertTrue(any('project_id>?' in plan for plan in new['plans']))
+                evidence.append(dict(projects=projects, messages=projects * per_project, old=old, new=new))
+        print(json.dumps({'engine': 'canonical SQLite', 'version': sqlite3.sqlite_version,
+                          'scope': 'message inventory only; index-schema reads included; EXPLAIN excluded; NOT native timing',
+                          'source_sha256': hashlib.sha256(SOURCE.encode()).hexdigest(),
+                          'project_inventory_evidence': evidence}, sort_keys=True))
+
+    def test_dense_small_projects_do_not_become_one_query_per_project(self):
+        with closing(fixture()) as db:
+            count = PAGE * 2 + 5
+            db.executemany("INSERT INTO messages VALUES (?, ?, 'normal', 0, 0)",
+                           ((i, count - i) for i in range(count)))
+            old_ids, old = inventory_probe(db, False)
+            new_ids, new = inventory_probe(db, True)
+            self.assertEqual(old_ids, new_ids)
+            self.assertEqual(new['data_queries'], old['data_queries'])
+            self.assertEqual(new['data_queries'], 3)
+            self.assertEqual(new['returned_rows'], count)
+
+    def test_partial_expression_and_nonleading_indexes_use_unfiltered_fallback(self):
+        for ddl in [None, 'CREATE INDEX alternative ON messages(project_id) WHERE project_id = 1',
+                    'CREATE INDEX alternative ON messages((project_id + 0))',
+                    'CREATE INDEX alternative ON messages(created_ts, project_id)']:
+            with self.subTest(ddl=ddl), closing(fixture()) as db:
+                db.execute('DROP INDEX idx_messages_project_created')
+                if ddl:
+                    db.execute(ddl)
+                db.executemany("INSERT INTO messages VALUES (?, ?, 'normal', 0, 0)",
+                               ((i, 1 if i % 2 else 999) for i in range(PAGE * 3)))
+                self.assertIsNone(inventory_index(db, 'messages'))
+                old_ids, old = inventory_probe(db, False)
+                new_ids, new = inventory_probe(db, True)
+                self.assertEqual(old_ids, new_ids)
+                self.assertEqual(new_ids, {1, 999})
+                self.assertEqual(new['data_queries'], old['data_queries'])
+                self.assertEqual(new['returned_rows'], old['returned_rows'])
+                self.assertEqual(bounded(db)[0], reference(db))
+
+    def test_quoted_descending_index_and_duplicate_extreme_page_tails(self):
+        with closing(fixture()) as db:
+            db.execute('DROP INDEX idx_messages_project_created')
+            db.execute('CREATE INDEX "project""history" ON messages(project_id DESC, created_ts)')
+            minimum, maximum = -(2**63), 2**63 - 1
+            ids = [minimum] * (PAGE - 1) + [0] * 2 + [maximum] * (PAGE + 1)
+            db.executemany("INSERT INTO messages VALUES (?, ?, 'normal', 0, 0)", enumerate(ids))
+            self.assertEqual(inventory_index(db, 'messages'), 'project"history')
+            found, work = inventory_probe(db, True)
+            self.assertEqual(found, {minimum, 0, maximum})
+            self.assertEqual(work['returned_rows'], PAGE * 2)
+            self.assertEqual(bounded(db)[0], reference(db))
+
+    def test_randomized_inventory_with_skew_and_partial_page_tails(self):
+        for seed in range(30):
+            with self.subTest(seed=seed), closing(fixture()) as db:
+                rng = random.Random(seed)
+                groups = [(pid, rng.randrange(0, PAGE * 4)) for pid in range(-4, 8)]
+                ids = [pid for pid, count in groups for _ in range(count)]
+                rng.shuffle(ids)
+                db.executemany("INSERT INTO messages VALUES (?, ?, 'normal', 0, 0)", enumerate(ids))
+                old_ids, old = inventory_probe(db, False)
+                new_ids, new = inventory_probe(db, True)
+                self.assertEqual(new_ids, old_ids)
+                self.assertLessEqual(new['returned_rows'], min(len(ids), len(new_ids) * PAGE))
+                self.assertLessEqual(new['data_queries'], old['data_queries'])
+
+    def test_live_wal_mutation_between_inventory_pages_is_snapshot_isolated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'inventory.sqlite3'
+            with closing(fixture()) as source, closing(sqlite3.connect(path)) as writer:
+                seed_scale(source, 3, PAGE * 2, pending=False)
+                source.backup(writer)
+                writer.execute('PRAGMA journal_mode=WAL')
+                expected = reference(writer)
+                changed = False
+
+                def mutate(table):
+                    nonlocal changed
+                    if table == 'messages' and not changed:
+                        writer.execute('UPDATE messages SET project_id=999 WHERE project_id=2')
+                        writer.execute("INSERT INTO messages VALUES (999999, -999, 'high', 1, 0)")
+                        writer.commit()
+                        changed = True
+
+                with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as reader:
+                    reader.execute('PRAGMA query_only=ON')
+                    self.assertEqual(bounded(reader, on_inventory_page=mutate)[0], expected)
+                    self.assertTrue(changed)
+                    self.assertEqual(bounded(reader)[0], reference(writer))
+                    self.assertNotEqual(bounded(reader)[0], expected)
+
+    def test_indexed_and_fallback_full_outputs_match_with_pending_and_finished_mail(self):
+        for pending in [False, True]:
+            with closing(fixture()) as db:
+                seed_scale(db, 7, PAGE * 2 + 1, pending=pending)
+                db.execute('INSERT INTO agents VALUES (999, 888)')
+                db.execute("INSERT INTO messages VALUES (999999, 777, 'normal', 0, 0)")
+                indexed, work = bounded(db)
+                old, old_work = bounded(db, indexed_inventory=False)
+                self.assertEqual(indexed, old)
+                self.assertEqual(indexed, reference(db))
+                self.assertLess(work.scan_rows[2], old_work.scan_rows[2])
+                self.assertEqual(work.scan_rows[3:], old_work.scan_rows[3:])
+                self.assertEqual(work.message_lookup_rows, old_work.message_lookup_rows)
+
+    def test_empty_inventory_has_no_phantom_project(self):
+        with closing(fixture()) as db:
+            ids, work = inventory_probe(db, True)
+            self.assertEqual(ids, set())
+            self.assertEqual(work['data_queries'], 1)
+            self.assertEqual(work['returned_rows'], 0)
 
 
 if __name__ == '__main__':
