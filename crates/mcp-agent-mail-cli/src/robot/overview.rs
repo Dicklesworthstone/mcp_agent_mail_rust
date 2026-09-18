@@ -4,14 +4,88 @@
 //! needed. Each table is read once; message/recipient correlation is a hash
 //! lookup, independent of the embedded SQL engine's join strategy.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use super::{
-    ACK_OVERDUE_THRESHOLD_US, CliError, DbConn, OverviewProject,
-    active_reservation_candidate_sql, has_file_reservation_release_ledger,
-    has_file_reservations_released_ts_column, micros_ago, release_ledger_index,
-};
+use super::{OutputFormat, OverviewProject, RobotEnvelope, format_output};
+use crate::CliError;
+use mcp_agent_mail_db::DbConn;
+use serde::Serialize;
 use sqlmodel_core::{Row, Value};
+
+// Same 30-minute, strictly-older-than boundary as inbox/status.
+const ACK_OVERDUE_THRESHOLD_US: i64 = 30 * 60 * 1_000_000;
+
+fn micros_ago(now: i64, delta: i64) -> i64 {
+    now.saturating_sub(delta)
+}
+
+fn has_column(conn: &DbConn, sql: &str, column: Option<&str>) -> Result<bool, CliError> {
+    let rows = conn.query_sync(sql, &[])
+        .map_err(|error| CliError::Other(format!("overview schema probe failed: {error}")))?;
+    Ok(match column {
+        None => !rows.is_empty(),
+        Some(column) => rows.iter().any(|row| {
+            row.get_named::<String>("name").ok().as_deref() == Some(column)
+        }),
+    })
+}
+
+fn has_file_reservation_release_ledger(conn: &DbConn) -> Result<bool, CliError> {
+    has_column(conn, "PRAGMA table_info(file_reservation_releases)", None)
+}
+
+fn has_file_reservations_released_ts_column(conn: &DbConn) -> Result<bool, CliError> {
+    has_column(conn, "PRAGMA table_info(file_reservations)", Some("released_ts"))
+}
+
+fn release_ledger_index(conn: &DbConn, present: bool) -> Result<HashSet<i64>, CliError> {
+    if !present {
+        return Ok(HashSet::new());
+    }
+    // Existence releases a reservation even when released_ts is NULL or zero.
+    conn.query_sync("SELECT reservation_id FROM file_reservation_releases", &[])
+        .map_err(|error| CliError::Other(format!("overview release ledger query failed: {error}")))?
+        .iter()
+        .map(|row| integer(row, "reservation_id"))
+        .collect()
+}
+
+fn active_reservation_candidate_sql(legacy: bool, alias: &str) -> String {
+    if legacy {
+        mcp_agent_mail_db::queries::active_reservation_candidate_predicate_for(alias)
+    } else {
+        "1 = 1".to_string()
+    }
+}
+
+pub(super) fn render(
+    projects: &[OverviewProject], counts: bool, format: OutputFormat,
+) -> Result<String, CliError> {
+    #[derive(Serialize)]
+    struct Full<'a> {
+        project_count: usize,
+        projects: &'a [OverviewProject],
+    }
+    #[derive(Serialize)]
+    struct Counts {
+        project_count: usize,
+        unread: usize,
+        urgent: usize,
+        ack_overdue: usize,
+    }
+    if counts {
+        let mut totals = Counts { project_count: projects.len(), unread: 0, urgent: 0, ack_overdue: 0 };
+        for project in projects {
+            totals.unread = totals.unread.saturating_add(project.unread);
+            totals.urgent = totals.urgent.saturating_add(project.urgent);
+            totals.ack_overdue = totals.ack_overdue.saturating_add(project.ack_overdue);
+        }
+        format_output(&RobotEnvelope::new("robot overview", format, totals), format)
+    } else {
+        format_output(&RobotEnvelope::new("robot overview", format,
+            Full { project_count: projects.len(), projects }), format)
+    }
+}
 
 const PROJECTS_SQL: &str = "SELECT id, slug FROM projects";
 const AGENTS_SQL: &str = "SELECT project_id FROM agents";
@@ -32,7 +106,7 @@ struct Message {
 }
 
 /// Work performed by the five data scans, excluding schema probes and the
-/// existing release-ledger loader. Tests use this instead of timing budgets.
+/// release-ledger scan. Counts returned rows, not SQLite VM steps. Tests avoid timing budgets.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ScanWork {
     queries: usize,
@@ -75,6 +149,20 @@ pub(super) fn build(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
 }
 
 fn build_at(conn: &DbConn, now_us: i64) -> Result<(Vec<OverviewProject>, ScanWork), CliError> {
+    // A savepoint works on query-only connections and nests inside a caller's
+    // transaction. It does not commit, roll back or acquire a write lock for it.
+    conn.execute_sync("SAVEPOINT robot_overview_read", &[])
+        .map_err(|error| CliError::Other(format!("overview snapshot begin failed: {error}")))?;
+    let result = collect_at(conn, now_us);
+    let release = conn.execute_sync("RELEASE robot_overview_read", &[]);
+    match (result, release) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(CliError::Other(format!("overview snapshot end failed: {error}"))),
+        (Ok(result), Ok(_)) => Ok(result),
+    }
+}
+
+fn collect_at(conn: &DbConn, now_us: i64) -> Result<(Vec<OverviewProject>, ScanWork), CliError> {
     let mut work = ScanWork::default();
     let mut projects = HashMap::new();
     for row in query(conn, PROJECTS_SQL, &[], &mut work, 0)? {
@@ -133,10 +221,10 @@ fn build_at(conn: &DbConn, now_us: i64) -> Result<(Vec<OverviewProject>, ScanWor
     }
     drop(messages);
 
-    // Preserve the already-fixed release-ledger path. Membership, not the
+    // Preserve the already-fixed release-ledger semantics. Membership, not the
     // ledger timestamp's nullability, determines whether a release exists.
-    let has_ledger = has_file_reservation_release_ledger(conn);
-    let legacy = has_file_reservations_released_ts_column(conn);
+    let has_ledger = has_file_reservation_release_ledger(conn)?;
+    let legacy = has_file_reservations_released_ts_column(conn)?;
     let ledger = release_ledger_index(conn, has_ledger)?;
     let predicate = active_reservation_candidate_sql(legacy, "fr");
     let reservation_sql = format!(
@@ -150,182 +238,17 @@ fn build_at(conn: &DbConn, now_us: i64) -> Result<(Vec<OverviewProject>, ScanWor
         &mut work,
         4,
     )? {
-        if !ledger.contains(integer(&row, "id")?) {
+        if !ledger.contains(&integer(&row, "id")?) {
             project(&mut projects, integer(&row, "project_id")?).reservations += 1;
         }
     }
 
-    let mut projects: Vec<_> = projects.into_values().collect();
-    projects.sort_by(|left, right| left.slug.cmp(&right.slug));
-    Ok((projects, work))
+    let mut projects: Vec<_> = projects.into_iter().collect();
+    projects.sort_by(|(left_id, left), (right_id, right)| {
+        left.slug.cmp(&right.slug).then(left_id.cmp(right_id))
+    });
+    Ok((projects.into_iter().map(|(_, row)| row).collect(), work))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Instant;
-
-    fn execute(conn: &DbConn, sql: &str) {
-        conn.execute_sync(sql, &[]).expect(sql);
-    }
-
-    fn fixture(legacy: bool, ledger: bool) -> (tempfile::TempDir, DbConn) {
-        let dir = tempfile::tempdir().expect("temporary directory");
-        let path = dir.path().join("overview.sqlite3");
-        let conn = DbConn::open_file(path.to_str().expect("UTF-8 path")).expect("open database");
-        execute(&conn, "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL)");
-        execute(&conn, "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL)");
-        execute(&conn, "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL,
-            importance TEXT, ack_required INTEGER, created_ts INTEGER)");
-        execute(&conn, "CREATE TABLE message_recipients (message_id INTEGER NOT NULL,
-            agent_id INTEGER NOT NULL, read_ts INTEGER, ack_ts INTEGER,
-            PRIMARY KEY (message_id, agent_id))");
-        let released_column = if legacy { ", released_ts INTEGER" } else { "" };
-        execute(&conn, &format!("CREATE TABLE file_reservations (id INTEGER PRIMARY KEY,
-            project_id INTEGER NOT NULL, created_ts INTEGER NOT NULL, expires_ts INTEGER NOT NULL
-            {released_column})"));
-        if ledger {
-            execute(&conn, "CREATE TABLE file_reservation_releases (
-                reservation_id INTEGER PRIMARY KEY, released_ts INTEGER)");
-        }
-        (dir, conn)
-    }
-
-    fn json(projects: &[OverviewProject]) -> serde_json::Value {
-        serde_json::to_value(projects).expect("serialize overview")
-    }
-
-    #[test]
-    fn linear_overview_matches_current_main_across_release_schemas() {
-        for legacy in [false, true] {
-            for ledger in [false, true] {
-                let (_dir, conn) = fixture(legacy, ledger);
-                let now = mcp_agent_mail_db::now_micros();
-                let old = now - ACK_OVERDUE_THRESHOLD_US - 60_000_000;
-                let future = now + 60_000_000;
-                execute(&conn, "INSERT INTO projects VALUES (1, 'alpha'), (2, 'empty')");
-                execute(&conn, "INSERT INTO agents VALUES (1, 77), (2, 77), (3, 1)");
-                execute(&conn, &format!("INSERT INTO messages VALUES
-                    (1, 1, 'urgent', 1, {old}), (2, 1, 'high', 0, {old}),
-                    (3, 1, 'normal', 1, {old}), (4, 88, 'urgent', 1, {old}),
-                    (5, 99, 'normal', 0, {old}), (6, 1, 'URGENT', 0, {old})"));
-                execute(&conn, "INSERT INTO message_recipients VALUES
-                    (1, 1, NULL, NULL), (1, 2, 0, NULL), (1, 3, NULL, 0),
-                    (2, 1, NULL, NULL), (3, 1, 0, NULL), (4, 1, NULL, NULL),
-                    (6, 1, NULL, NULL), (999, 1, NULL, NULL)");
-                execute(&conn, &format!("INSERT INTO file_reservations
-                    (id, project_id, created_ts, expires_ts) VALUES
-                    (1, 1, {old}, {future}), (2, 66, {old}, {future}),
-                    (3, 55, {old}, {old}), (4, 44, {old}, {future}),
-                    (5, 33, {old}, {future})"));
-                if ledger {
-                    execute(&conn, "INSERT INTO file_reservation_releases VALUES (4, NULL)");
-                }
-                if legacy {
-                    execute(&conn, &format!("UPDATE file_reservations SET released_ts = {now} WHERE id = 5"));
-                }
-                let actual = build(&conn).expect("linear overview");
-                let reference = super::super::build_overview_reference(&conn).expect("reference overview");
-                assert_eq!(json(&actual), json(&reference), "legacy={legacy} ledger={ledger}");
-                let alpha = actual.iter().find(|row| row.slug == "alpha").expect("alpha");
-                assert_eq!((alpha.unread, alpha.urgent, alpha.ack_overdue), (4, 3, 3));
-                assert!(actual.iter().any(|row| row.slug == "[unknown-project-99]"));
-                assert!(!actual.iter().any(|row| row.slug == "[unknown-project-55]"));
-                assert_eq!(actual.iter().any(|row| row.slug == "[unknown-project-44]"), !ledger);
-                assert_eq!(actual.iter().any(|row| row.slug == "[unknown-project-33]"), !legacy);
-            }
-        }
-    }
-
-    #[test]
-    fn linear_overview_preserves_strict_time_boundaries_and_null_semantics() {
-        let (_dir, conn) = fixture(false, true);
-        let now = 10 * ACK_OVERDUE_THRESHOLD_US;
-        let threshold = micros_ago(now, ACK_OVERDUE_THRESHOLD_US);
-        execute(&conn, "INSERT INTO projects VALUES (1, 'alpha')");
-        execute(&conn, &format!("INSERT INTO messages VALUES
-            (1, 1, 'high', 1, {}), (2, 1, 'urgent', 1, {threshold}),
-            (3, 1, 'normal', 1, {}), (4, 1, NULL, NULL, NULL)", threshold - 1, threshold + 1));
-        execute(&conn, "INSERT INTO message_recipients VALUES
-            (1, 1, NULL, NULL), (1, 2, 0, NULL), (1, 3, NULL, 0),
-            (1, 4, 0, 0), (2, 1, NULL, NULL), (3, 1, NULL, NULL), (4, 1, NULL, NULL)");
-        execute(&conn, &format!("INSERT INTO file_reservations VALUES
-            (1, 1, 0, {now}), (2, 1, 0, {}), (3, 1, 0, {})", now + 1, now - 1));
-        let (rows, work) = build_at(&conn, now).expect("overview at boundary");
-        assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].unread, rows[0].urgent, rows[0].ack_overdue, rows[0].reservations), (5, 3, 2, 1));
-        assert_eq!(work.queries, 5);
-        assert_eq!(work.rows, [1, 0, 4, 6, 1]);
-    }
-
-    fn seed_scale(conn: &DbConn, projects: usize, per_project: usize) {
-        let now = mcp_agent_mail_db::now_micros();
-        let old = now - ACK_OVERDUE_THRESHOLD_US - 60_000_000;
-        execute(conn, "BEGIN");
-        for p in 1..=projects {
-            execute(conn, &format!("INSERT INTO projects VALUES ({p}, 'project-{p:04}')"));
-            execute(conn, &format!("INSERT INTO agents VALUES ({p}, {p})"));
-            for m in 1..=per_project {
-                let id = (p - 1) * per_project + m;
-                execute(conn, &format!("INSERT INTO messages VALUES ({id}, {p}, 'high', 1, {old})"));
-                execute(conn, &format!("INSERT INTO message_recipients VALUES
-                    ({id}, 1, NULL, NULL), ({id}, 2, 0, NULL), ({id}, 3, 0, 0)"));
-                execute(conn, &format!("INSERT INTO file_reservations VALUES ({id}, {p}, {old}, {old})"));
-            }
-        }
-        execute(conn, "COMMIT");
-    }
-
-    #[test]
-    fn linear_overview_work_is_bounded_by_input_rows_not_project_times_recipients() {
-        for projects in [1, 10, 50] {
-            let (_dir, conn) = fixture(false, false);
-            seed_scale(&conn, projects, 10);
-            let (rows, work) = build_at(&conn, mcp_agent_mail_db::now_micros()).expect("overview");
-            assert_eq!(work.queries, 5);
-            assert_eq!(work.rows, [projects, projects, projects * 10, projects * 20, 0]);
-            assert_eq!(rows.len(), projects);
-            for row in rows {
-                assert_eq!((row.unread, row.urgent, row.ack_overdue, row.reservations), (10, 10, 20, 0));
-            }
-        }
-        for sql in [PROJECTS_SQL, AGENTS_SQL, MESSAGES_SQL, RECIPIENTS_SQL] {
-            assert!(!sql.contains("JOIN"));
-            assert!(!sql.contains("GROUP BY"));
-            assert!(!sql.contains("DISTINCT"));
-        }
-    }
-
-    #[test]
-    #[ignore = "native-engine benchmark; run explicitly in release mode with --nocapture"]
-    fn benchmark_linear_overview_against_current_main() {
-        let (_dir, conn) = fixture(false, false);
-        let per_project = std::env::var("AM_OVERVIEW_BENCH_MESSAGES_PER_PROJECT")
-            .map_or(480, |value| value.parse().expect("positive messages-per-project count"));
-        assert!(per_project > 0);
-        seed_scale(&conn, 50, per_project);
-        let baseline = super::super::build_overview_reference(&conn).expect("reference");
-        assert_eq!(json(&build(&conn).expect("linear")), json(&baseline));
-        let mut old = Vec::new();
-        let mut new = Vec::new();
-        for iteration in 0..6 {
-            // Alternate order to reduce filesystem/page-cache ordering bias.
-            for linear in [iteration % 2 == 0, iteration % 2 != 0] {
-                let start = Instant::now();
-                let result = if linear { build(&conn) } else { super::super::build_overview_reference(&conn) };
-                let elapsed = start.elapsed();
-                assert_eq!(json(&result.expect("benchmark result")), json(&baseline));
-                if linear { new.push(elapsed); } else { old.push(elapsed); }
-            }
-        }
-        old.sort_unstable();
-        new.sort_unstable();
-        let reference = old[old.len() / 2];
-        let linear = new[new.len() / 2];
-        eprintln!("native DbConn live-build benchmark (not CLI startup), 50 projects / {} messages / {} recipients / {} expired reservations: reference_median={reference:?}, linear_median={linear:?}, speedup={:.3}", 50 * per_project, 150 * per_project, 50 * per_project, reference.as_secs_f64() / linear.as_secs_f64());
-        // Opt-in benchmark gate, never a wall-clock assertion in regular tests.
-        if std::env::var("AM_OVERVIEW_BENCH_REQUIRE_SPEEDUP").as_deref() == Ok("1") {
-            assert!(linear < reference, "linear scan must improve the native reference on this fixture");
-        }
-    }
-}
+mod tests;

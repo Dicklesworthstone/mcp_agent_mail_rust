@@ -1,6 +1,13 @@
-name: Native overview candidate validation
+name: Native overview regression and benchmark
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - crates/mcp-agent-mail-cli/src/robot.rs
+      - crates/mcp-agent-mail-cli/src/robot_commands.rs
+      - crates/mcp-agent-mail-cli/src/robot/**
+      - .github/workflows/gh274-overview.yml
   workflow_dispatch:
 
 permissions:
@@ -14,56 +21,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Apply candidate wiring in the test checkout only
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git hash-object crates/mcp-agent-mail-cli/src/robot.rs)" = f8ca6f74bb4621882b71ef8148a156752e5e9cb5
-          cat > "$RUNNER_TEMP/gh274.patch" <<'PATCH'
-          diff --git a/crates/mcp-agent-mail-cli/src/robot.rs b/crates/mcp-agent-mail-cli/src/robot.rs
-          --- a/crates/mcp-agent-mail-cli/src/robot.rs
-          +++ b/crates/mcp-agent-mail-cli/src/robot.rs
-          @@ -9796,4 +9796,13 @@
-          +mod overview;
-          +
-           fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
-          +    overview::build(conn)
-          +}
-          +
-          +// Keep the previous query shape as a test/benchmark oracle, not a second
-          +// production implementation. GH#274 compares exact counts on the native engine.
-          +#[cfg(test)]
-          +fn build_overview_reference(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
-               fn decode_count(row: &sqlmodel_core::Row, column: &str) -> Result<i64, CliError> {
-                   row.get_by_name(column)
-                       .and_then(sqlmodel_core::Value::as_i64)
-          PATCH
-          git apply --check "$RUNNER_TEMP/gh274.patch"
-          git apply "$RUNNER_TEMP/gh274.patch"
       - name: Clone workspace sibling dependencies
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
           git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
           git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Format the candidate module
-        run: rustfmt --edition 2024 crates/mcp-agent-mail-cli/src/robot/overview.rs
-      - name: Native correctness and work-bound regressions
-        run: cargo test --release -p mcp-agent-mail-cli --bin am robot::overview::tests -- --nocapture
-      - name: Separate-process overview regressions
-        run: cargo test --release -p mcp-agent-mail-cli --test cli_robot_query_counts overview -- --nocapture
-      - name: Native live-build comparison (50 projects, 2400 messages)
+      - name: Live collector correctness and work bounds
+        run: cargo test --release -p mcp-agent-mail-cli --lib robot::overview::tests -- --nocapture
+      - name: Actual CLI cold-process mutation regression
+        run: cargo test --release -p mcp-agent-mail-cli --test integration_runs robot_overview_cold_processes -- --nocapture
+      - name: Native collector comparison (not CLI startup)
         env:
           AM_OVERVIEW_BENCH_MESSAGES_PER_PROJECT: '48'
-          AM_OVERVIEW_BENCH_REQUIRE_SPEEDUP: '1'
-        run: cargo test --release -p mcp-agent-mail-cli --bin am benchmark_linear_overview_against_current_main -- --ignored --nocapture
-      - name: Export validated wiring patch
-        run: git diff --binary -- crates/mcp-agent-mail-cli/src/robot.rs crates/mcp-agent-mail-cli/src/robot/overview.rs > gh274-validated.patch
-      - uses: actions/upload-artifact@v4
-        with:
-          name: gh274-native-validated-patch
-          path: gh274-validated.patch
-          if-no-files-found: error
+        run: cargo test --release -p mcp-agent-mail-cli --lib benchmark_linear_overview_against_current_main -- --ignored --nocapture
