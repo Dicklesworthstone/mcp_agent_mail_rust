@@ -1,0 +1,140 @@
+name: GH326 private export integration
+
+# Applies only the two fixed, reviewed patches. It never opens a PR, force
+# pushes, edits another source file, or substitutes a skipped native test.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'patches/gh326-private-export/**'
+      - '.github/workflows/gh326-private-export.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gh326-private-export-integration
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.repository == 'Dicklesworthstone/mcp_agent_mail_rust' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      candidate_blob: ${{ steps.candidate.outputs.blob }}
+      source_commit: ${{ steps.candidate.outputs.source_commit }}
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify exact source and patch identities; apply to the full checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          target=crates/mcp-agent-mail-db/src/pool.rs
+          test "$(git rev-parse "HEAD:$target")" = 7177a643c9de3ebec2ef446825dfe96b279a3b03
+          sha256sum --check <<'HASHES'
+          8bc57beccedc53d2eb4001ace59eb25e0f6eed5acbdc638c126c03b5a57fe5ad  patches/gh326-private-export/0001-normalize-and-preserve-private-backup-export.patch
+          cebad1ef6746d921a020ed53a94b83daa7fed16f3e15c375a3bef29415c3f4c5  patches/gh326-private-export/0002-native-export-and-failure-regressions.patch
+          HASHES
+          for patch in patches/gh326-private-export/000[12]-*.patch; do
+            git apply --index --check "$patch"
+            git apply --index "$patch"
+          done
+          test "$(git diff --cached --name-only)" = "$target"
+          git diff --cached --check
+          mkdir -p "$RUNNER_TEMP/gh326-evidence"
+          git diff --cached --binary > "$RUNNER_TEMP/gh326-evidence/reviewed-source.diff"
+      - name: Install the repository's pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal
+          rustc --version
+          cargo --version
+      - name: Check the database crate and all its targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked -p mcp-agent-mail-db --all-targets 2>&1 | tee "$RUNNER_TEMP/gh326-evidence/check.log"
+      - name: Require and execute all nineteen native staging regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-db --lib proactive_backup_export_tests -- --list 2>&1 | tee "$RUNNER_TEMP/gh326-evidence/test-list.log"
+          count=$(grep -c '^pool::proactive_backup_export_tests::.*: test$' "$RUNNER_TEMP/gh326-evidence/test-list.log")
+          test "$count" -eq 19
+          cargo test --locked -p mcp-agent-mail-db --lib proactive_backup_export_tests -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh326-evidence/tests.log"
+      - name: Exercise the public proactive-backup entry point
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-db --test nocase_backup_compat public_proactive_backup_publishes_a_strict_nocase_snapshot -- --exact 2>&1 | tee "$RUNNER_TEMP/gh326-evidence/public-backup.log"
+          grep -q '1 passed; 0 failed' "$RUNNER_TEMP/gh326-evidence/public-backup.log"
+      - name: Seal the tested candidate
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          target=crates/mcp-agent-mail-db/src/pool.rs
+          git diff --exit-code
+          test "$(git diff --cached --name-only)" = "$target"
+          echo "blob=$(git rev-parse ":$target")" >> "$GITHUB_OUTPUT"
+          echo "source_commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+      - name: Retain validation evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gh326-private-export-evidence
+          path: ${{ runner.temp }}/gh326-evidence/
+          if-no-files-found: ignore
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The write token exists only in this job. No project build/test code or
+    # scripts run here; the publisher applies only hash-bound source patches.
+    permissions:
+      contents: write
+    env:
+      EXPECTED_SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+      EXPECTED_CANDIDATE_BLOB: ${{ needs.validate.outputs.candidate_blob }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Publish the tested source directly to main, without overwriting concurrent work
+        shell: bash
+        run: |
+          set -euo pipefail
+          target=crates/mcp-agent-mail-db/src/pool.rs
+          # A concurrent commit changes the tested tree. Stop rather than
+          # silently rebasing untested dependency or source changes.
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_COMMIT"
+          test "$(git rev-parse "HEAD:$target")" = 7177a643c9de3ebec2ef446825dfe96b279a3b03
+          sha256sum --check <<'HASHES'
+          8bc57beccedc53d2eb4001ace59eb25e0f6eed5acbdc638c126c03b5a57fe5ad  patches/gh326-private-export/0001-normalize-and-preserve-private-backup-export.patch
+          cebad1ef6746d921a020ed53a94b83daa7fed16f3e15c375a3bef29415c3f4c5  patches/gh326-private-export/0002-native-export-and-failure-regressions.patch
+          HASHES
+          for patch in patches/gh326-private-export/000[12]-*.patch; do
+            git apply --index --check "$patch"
+            git apply --index "$patch"
+          done
+          test "$(git diff --cached --name-only)" = "$target"
+          test "$(git rev-parse ":$target")" = "$EXPECTED_CANDIDATE_BLOB"
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(recovery): normalize private NOCASE exports and preserve failed backup stages' -m "Apply the exact reviewed GH326 replacement series after database all-targets checking, all nineteen native staging regressions, and the public proactive-backup regression passed on $EXPECTED_SOURCE_COMMIT. Strict backup validation remains unchanged. No workspace-wide, macOS, Windows, rustfmt, or Clippy pass is claimed."
+          git push origin HEAD:refs/heads/main
+          printf 'Published source commit: %s\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"

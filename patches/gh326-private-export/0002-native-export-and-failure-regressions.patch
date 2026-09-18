@@ -1,0 +1,466 @@
+Subject: Cover normalization, complete staging, rollback and failure retention
+
+diff --git a/crates/mcp-agent-mail-db/src/pool.rs b/crates/mcp-agent-mail-db/src/pool.rs
+--- a/crates/mcp-agent-mail-db/src/pool.rs
++++ b/crates/mcp-agent-mail-db/src/pool.rs
+@@ -346,6 +346,460 @@
+     }
+ }
+ 
++#[cfg(test)]
++mod proactive_backup_export_tests {
++    use super::*;
++
++    const SCHEMA: &str = "
++        CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT);
++        CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT);
++        CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER,
++                               subject TEXT, body_md TEXT);
++        CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, kind TEXT);
++        INSERT INTO projects VALUES (1, 'fixture', '/fixture');";
++
++    fn fixture(
++        index: &str,
++        names: &[&str],
++        original_collation: &str,
++        declared_collation: &str,
++        partial: bool,
++    ) -> (PathBuf, crate::CanonicalDbConn) {
++        let root = tempfile::tempdir().expect("private retained fixture").keep();
++        let path = root.join("live-export.sqlite3");
++        let conn = crate::CanonicalDbConn::open_file(path.to_str().unwrap()).unwrap();
++        conn.execute_raw("PRAGMA journal_mode=DELETE").unwrap();
++        conn.execute_raw(SCHEMA).unwrap();
++        let quoted = index.replace('"', "\"\"");
++        let predicate = if partial { " WHERE name IS NOT NULL" } else { "" };
++        conn.execute_raw(&format!(
++            "CREATE UNIQUE INDEX \"{quoted}\" ON agents(project_id, name COLLATE \
++             {original_collation}){predicate}"
++        ))
++        .unwrap();
++        for (offset, name) in names.iter().enumerate() {
++            let id = offset + 1;
++            let escaped = name.replace('\'', "''");
++            conn.execute_raw(&format!("INSERT INTO agents VALUES ({id}, 1, '{escaped}')"))
++                .unwrap();
++        }
++        if original_collation != declared_collation {
++            // Change ONLY this private fixture's declaration, leaving the
++            // original real index pages in the old collation's order.
++            let literal = index.replace('\'', "''");
++            conn.execute_raw(&format!(
++                "PRAGMA writable_schema=ON; \
++                 UPDATE sqlite_master SET sql=replace(sql, 'COLLATE {original_collation}', \
++                 'COLLATE {declared_collation}') WHERE name='{literal}'; \
++                 PRAGMA writable_schema=OFF; PRAGMA schema_version=101;"
++            ))
++            .unwrap();
++        }
++        (path, conn)
++    }
++
++    fn full(conn: &crate::CanonicalDbConn) -> Vec<String> {
++        proactive_backup_export_check_details(conn, integrity::CheckKind::Full).unwrap()
++    }
++
++    fn agent_rows(conn: &crate::CanonicalDbConn) -> Vec<(i64, i64, Option<String>)> {
++        conn.query_sync("SELECT id, project_id, name FROM agents NOT INDEXED ORDER BY id", &[])
++            .unwrap()
++            .iter()
++            .map(|row| {
++                let name = match row.get_by_name("name") {
++                    Some(Value::Text(name)) => Some(name.clone()),
++                    Some(Value::Null) => None,
++                    value => panic!("unexpected fixture name: {value:?}"),
++                };
++                (row.get_named("id").unwrap(), row.get_named("project_id").unwrap(), name)
++            })
++            .collect()
++    }
++
++    #[test]
++    fn normalization_repairs_real_export_before_strict_backup_validation() {
++        let (path, conn) = fixture("idx_agents_project_name_nocase", &["Z", "["], "BINARY", "NOCASE", false);
++        let before_rows = agent_rows(&conn);
++        assert!(!integrity::details_indicate_ok(&full(&conn)));
++        assert!(integrity::details_indicate_ok(
++            &proactive_backup_export_check_details(&conn, integrity::CheckKind::Quick).unwrap()
++        ));
++        for sql in [
++            "SELECT count(*) AS n FROM agents NOT INDEXED",
++            "SELECT count(*) AS n FROM agents INDEXED BY idx_agents_project_name_nocase WHERE 1",
++        ] {
++            assert_eq!(conn.query_sync(sql, &[]).unwrap()[0].get_named::<i64>("n").unwrap(), 2);
++        }
++        let unrepaired = path.with_file_name("unrepaired.sqlite3");
++        conn.backup_to_path(unrepaired.to_str().unwrap()).unwrap();
++        assert!(!sqlite_recovery_candidate_passes_full_integrity_check(&unrepaired).unwrap());
++        assert_eq!(normalize_proactive_backup_export(&conn).unwrap(), 1);
++        assert_eq!(agent_rows(&conn), before_rows);
++        assert!(integrity::details_indicate_ok(&full(&conn)));
++        let snapshot = path.with_file_name("snapshot.sqlite3");
++        conn.backup_to_path(snapshot.to_str().unwrap()).unwrap();
++        drop(conn);
++        assert!(sqlite_recovery_candidate_passes_full_integrity_check(&snapshot).unwrap());
++        let reopened = open_immutable_canonical_sqlite(&snapshot).unwrap();
++        assert_eq!(agent_rows(&reopened), before_rows);
++    }
++
++    #[test]
++    fn healthy_private_export_is_not_rewritten() {
++        let (path, conn) = fixture("idx_healthy", &["Z", "["], "NOCASE", "NOCASE", false);
++        let before = std::fs::read(&path).unwrap();
++        assert_eq!(normalize_proactive_backup_export(&conn).unwrap(), 0);
++        assert_eq!(std::fs::read(path).unwrap(), before);
++    }
++
++    #[test]
++    fn real_duplicate_keys_roll_back_every_earlier_index_rebuild() {
++        let (path, conn) = fixture("idx_a", &["Z", "["], "BINARY", "NOCASE", false);
++        conn.execute_raw(
++            "CREATE TABLE duplicate_keys (name TEXT); \
++             CREATE UNIQUE INDEX idx_z ON duplicate_keys(name COLLATE BINARY); \
++             INSERT INTO duplicate_keys VALUES ('A'), ('a'); \
++             PRAGMA writable_schema=ON; \
++             UPDATE sqlite_master SET sql=replace(sql, 'COLLATE BINARY', 'COLLATE NOCASE') \
++                 WHERE name='idx_z'; \
++             PRAGMA writable_schema=OFF; PRAGMA schema_version=102;"
++        ).unwrap();
++        let before = std::fs::read(&path).unwrap();
++        let before_rows = agent_rows(&conn);
++        assert_eq!(proactive_backup_export_nocase_targets(&conn, &full(&conn)).unwrap(), ["idx_a", "idx_z"]);
++        let error = normalize_proactive_backup_export(&conn).unwrap_err();
++        assert!(error.to_string().contains("UNIQUE constraint failed"), "{error}");
++        assert_eq!(std::fs::read(path).unwrap(), before);
++        assert_eq!(agent_rows(&conn), before_rows);
++        assert!(full(&conn).iter().any(|detail| detail.contains("idx_a")));
++        let duplicates = conn.query_sync("SELECT name FROM duplicate_keys NOT INDEXED ORDER BY rowid", &[]).unwrap();
++        assert_eq!(duplicates[0].get_named::<String>("name").unwrap(), "A");
++        assert_eq!(duplicates[1].get_named::<String>("name").unwrap(), "a");
++        conn.execute_raw("BEGIN; ROLLBACK;").expect("failed normalization releases its transaction");
++    }
++
++    #[test]
++    fn normalization_quotes_complete_catalog_identifiers() {
++        let (_path, conn) = fixture("odd\" index; REINDEX main.agents; --", &["Z", "["], "BINARY", "NOCASE", false);
++        let before = agent_rows(&conn);
++        assert_eq!(normalize_proactive_backup_export(&conn).unwrap(), 1);
++        assert!(integrity::details_indicate_ok(&full(&conn)));
++        assert_eq!(agent_rows(&conn), before);
++    }
++
++    #[test]
++    fn normalization_preserves_partial_predicates_and_excluded_rows() {
++        let (_path, conn) = fixture("idx_partial", &["Z", "["], "BINARY", "NOCASE", true);
++        conn.execute_raw("INSERT INTO agents VALUES (3, 1, NULL)").unwrap();
++        let before = agent_rows(&conn);
++        let before_ddl = conn.query_sync("SELECT sql FROM sqlite_master WHERE name='idx_partial'", &[]).unwrap()[0]
++            .get_named::<String>("sql").unwrap();
++        assert_eq!(normalize_proactive_backup_export(&conn).unwrap(), 1);
++        assert_eq!(agent_rows(&conn), before);
++        let after_ddl = conn.query_sync("SELECT sql FROM sqlite_master WHERE name='idx_partial'", &[]).unwrap()[0]
++            .get_named::<String>("sql").unwrap();
++        assert_eq!(after_ddl, before_ddl);
++    }
++
++    #[test]
++    fn normalization_supports_nocase_unique_constraint_autoindexes() {
++        let (_path, conn) = fixture("idx_healthy", &["Z", "["], "NOCASE", "NOCASE", false);
++        conn.execute_raw(
++            "CREATE TABLE auto_table (name TEXT COLLATE BINARY UNIQUE); \
++             INSERT INTO auto_table VALUES ('Z'), ('['); \
++             PRAGMA writable_schema=ON; \
++             UPDATE sqlite_master SET sql=replace(sql, 'COLLATE BINARY', 'COLLATE NOCASE') \
++                 WHERE name='auto_table'; \
++             PRAGMA writable_schema=OFF; PRAGMA schema_version=104;"
++        ).unwrap();
++        assert_eq!(proactive_backup_export_nocase_targets(&conn, &full(&conn)).unwrap(), ["sqlite_autoindex_auto_table_1"]);
++        assert_eq!(normalize_proactive_backup_export(&conn).unwrap(), 1);
++        assert!(integrity::details_indicate_ok(&full(&conn)));
++        let rows = conn.query_sync("SELECT name FROM auto_table NOT INDEXED ORDER BY rowid", &[]).unwrap();
++        assert_eq!(rows[0].get_named::<String>("name").unwrap(), "Z");
++        assert_eq!(rows[1].get_named::<String>("name").unwrap(), "[");
++    }
++
++    #[test]
++    fn mixed_nonindex_damage_is_not_normalized() {
++        let (path, conn) = fixture("idx_order", &["Z", "["], "BINARY", "NOCASE", false);
++        conn.execute_raw(
++            "CREATE TABLE broken_constraint (value INTEGER CHECK(value > 0)); \
++             PRAGMA ignore_check_constraints=ON; \
++             INSERT INTO broken_constraint VALUES (-1); \
++             PRAGMA ignore_check_constraints=OFF;"
++        ).unwrap();
++        let before = std::fs::read(&path).unwrap();
++        assert!(full(&conn).iter().any(|detail| detail.contains("CHECK constraint failed")));
++        assert!(normalize_proactive_backup_export(&conn).is_err());
++        assert_eq!(std::fs::read(path).unwrap(), before);
++    }
++
++    #[test]
++    fn non_nocase_disagreements_are_not_repaired() {
++        let (path, conn) = fixture("idx_rtrim", &["a", "a "], "BINARY", "RTRIM", false);
++        let before = std::fs::read(&path).unwrap();
++        assert!(!integrity::details_indicate_ok(&full(&conn)));
++        assert!(normalize_proactive_backup_export(&conn).unwrap_err().to_string().contains("unsupported key collation"));
++        assert_eq!(std::fs::read(path).unwrap(), before);
++    }
++
++    #[test]
++    fn entry_count_loss_unknown_names_and_unavailable_output_cannot_authorize_rebuild() {
++        let (_path, conn) = fixture("idx_order", &["Z", "["], "BINARY", "NOCASE", false);
++        for details in [
++            vec![],
++            vec!["*** in database main ***"],
++            vec!["ok"],
++            vec!["wrong # of entries in index idx_order"],
++            vec!["row X missing from index idx_order"],
++            vec!["row 1 missing from index absent"],
++            vec!["row 1 missing from index idx_order", "Page 7: never used"],
++            vec!["row 1 missing from index idx_order", "integrity_check row 2 had no extractable text check value"],
++            vec!["database disk image is malformed: non-unique entry in index idx_order"],
++        ] {
++            let details: Vec<String> = details.into_iter().map(str::to_string).collect();
++            assert!(proactive_backup_export_nocase_targets(&conn, &details).is_err(), "{details:?}");
++        }
++    }
++
++    #[test]
++    fn existing_caller_transaction_is_refused_without_committing_or_rolling_it_back() {
++        let (path, conn) = fixture("idx_order", &["Z", "["], "BINARY", "NOCASE", false);
++        let before = std::fs::read(&path).unwrap();
++        conn.execute_raw("BEGIN").unwrap();
++        assert!(normalize_proactive_backup_export(&conn).is_err());
++        assert!(!integrity::details_indicate_ok(&full(&conn)));
++        conn.execute_raw("ROLLBACK").expect("caller still owns its transaction");
++        assert_eq!(std::fs::read(path).unwrap(), before);
++    }
++
++    #[test]
++    fn unknown_collation_probe_error_cannot_authorize_repair() {
++        let (path, conn) = fixture("idx_unknown", &["Z", "["], "BINARY", "UNAVAILABLE_COLLATION", false);
++        let before = std::fs::read(&path).unwrap();
++        assert!(normalize_proactive_backup_export(&conn).is_err());
++        assert_eq!(std::fs::read(path).unwrap(), before);
++    }
++
++    #[test]
++    fn actual_proactive_stage_keeps_the_live_source_and_existing_backup_untouched() {
++        let (path, conn) = fixture("idx_order", &["Z", "["], "NOCASE", "NOCASE", false);
++        drop(conn);
++        let before = std::fs::read(&path).unwrap();
++        let backup = path.with_file_name("published.bak");
++        std::fs::write(&backup, b"existing backup sentinel").unwrap();
++        let (directory, snapshot) = create_proactive_backup_stage(&path, &backup).unwrap();
++        let retained = directory.preserve();
++        assert!(snapshot.starts_with(&retained));
++        validate_proactive_backup_stage(&path, &snapshot).unwrap();
++        assert_eq!(std::fs::read(path).unwrap(), before);
++        assert_eq!(std::fs::read(backup).unwrap(), b"existing backup sentinel");
++    }
++
++    #[test]
++    fn actual_runtime_nocase_export_produces_a_strictly_valid_standalone_backup() {
++        let root = tempfile::tempdir().expect("retained native runtime fixture").keep();
++        let source = root.join("runtime.sqlite3");
++        let conn = DbConn::open_file(source.to_str().unwrap()).unwrap();
++        conn.execute_raw(SCHEMA).unwrap();
++        conn.execute_raw(
++            "CREATE UNIQUE INDEX idx_agents_project_name_nocase ON agents(project_id, name COLLATE NOCASE); \
++             INSERT INTO agents VALUES (1, 1, 'Z'), (2, 1, '['), (3, 1, 'codex_823_cache');"
++        ).unwrap();
++        crate::close_db_conn(conn, "GH326 runtime export fixture");
++        let (directory, snapshot) = create_proactive_backup_stage(&source, &source.with_extension("bak")).unwrap();
++        let retained = directory.preserve();
++        assert!(snapshot.starts_with(retained));
++        validate_proactive_backup_stage(&source, &snapshot).unwrap();
++        let verified = open_immutable_canonical_sqlite(&snapshot).unwrap();
++        assert_eq!(agent_rows(&verified), vec![
++            (1, 1, Some("Z".to_string())),
++            (2, 1, Some("[".to_string())),
++            (3, 1, Some("codex_823_cache".to_string())),
++        ]);
++    }
++
++    #[test]
++    fn composite_nocase_key_does_not_authorize_a_separate_rtrim_disagreement() {
++        let (path, conn) = fixture("idx_healthy", &["Z", "["], "NOCASE", "NOCASE", false);
++        conn.execute_raw(
++            "CREATE TABLE mixed_keys (prefix TEXT, suffix TEXT); \
++             CREATE UNIQUE INDEX idx_mixed ON mixed_keys( \
++                 prefix COLLATE NOCASE, suffix COLLATE BINARY); \
++             INSERT INTO mixed_keys VALUES ('x', 'a '), ('x', 'a' || char(9)); \
++             PRAGMA writable_schema=ON; \
++             UPDATE sqlite_master SET sql=replace(sql, 'suffix COLLATE BINARY', \
++                 'suffix COLLATE RTRIM') WHERE name='idx_mixed'; \
++             PRAGMA writable_schema=OFF; PRAGMA schema_version=201;"
++        ).unwrap();
++        let before = std::fs::read(&path).unwrap();
++        assert!(integrity::details_indicate_ok(
++            &proactive_backup_export_check_details(&conn, integrity::CheckKind::Quick).unwrap()
++        ));
++        assert!(!integrity::details_indicate_ok(&full(&conn)));
++        let error = normalize_proactive_backup_export(&conn).unwrap_err();
++        assert!(error.to_string().contains("unsupported key collation RTRIM"), "{error}");
++        assert_eq!(std::fs::read(path).unwrap(), before);
++        assert!(!integrity::details_indicate_ok(&full(&conn)));
++        conn.execute_raw("BEGIN; ROLLBACK;").unwrap();
++    }
++
++    #[test]
++    fn healthy_mixed_collation_export_remains_a_byte_identical_noop() {
++        let (path, conn) = fixture("idx_healthy", &["Z", "["], "NOCASE", "NOCASE", false);
++        conn.execute_raw(
++            "CREATE TABLE mixed_keys (prefix TEXT, suffix TEXT); \
++             CREATE INDEX idx_mixed ON mixed_keys(prefix COLLATE NOCASE, suffix COLLATE RTRIM); \
++             INSERT INTO mixed_keys VALUES ('x', 'a '), ('x', 'a' || char(9));"
++        ).unwrap();
++        let before = std::fs::read(&path).unwrap();
++        assert_eq!(normalize_proactive_backup_export(&conn).unwrap(), 0);
++        assert_eq!(std::fs::read(path).unwrap(), before);
++    }
++
++    fn expect_stage_failure(
++        result: DbResult<(CanonicalSnapshotTempDir, PathBuf)>,
++    ) -> DbError {
++        match result {
++            Err(error) => error,
++            Ok((directory, snapshot)) => {
++                let retained = directory.preserve();
++                panic!("unexpected successful snapshot {snapshot:?}; stage retained at {retained:?}");
++            }
++        }
++    }
++
++    fn retained_failed_stage(primary: &Path, error: &DbError) -> PathBuf {
++        let stages = std::fs::read_dir(primary.parent().unwrap())
++            .unwrap()
++            .map(Result::unwrap)
++            .filter(|entry| {
++                entry.file_type().unwrap().is_dir()
++                    && entry.file_name().to_string_lossy()
++                        .starts_with(".mcp-agent-mail-proactive-backup-")
++            })
++            .map(|entry| entry.path())
++            .collect::<Vec<_>>();
++        assert_eq!(stages.len(), 1, "failed attempt must retain its exact private stage: {error}");
++        assert!(error.to_string().contains(&stages[0].display().to_string()));
++        stages[0].clone()
++    }
++
++    #[test]
++    fn real_staging_normalizes_an_export_defect_before_capturing_a_publish_witness() {
++        let (source, conn) = fixture("idx_order", &["Z", "["], "NOCASE", "NOCASE", false);
++        let expected_rows = agent_rows(&conn);
++        let expected_ddl = conn.query_sync("SELECT sql FROM sqlite_master WHERE name='idx_order'", &[])
++            .unwrap()[0].get_named::<String>("sql").unwrap();
++        drop(conn);
++        let before = std::fs::read(&source).unwrap();
++        let backup = source.with_file_name("published.bak");
++        std::fs::write(&backup, b"previous published generation").unwrap();
++        let (directory, snapshot) = create_proactive_backup_stage_with(
++            &source, &backup, |export| {
++                // Reproduce the exporter's wrong physical key order ONLY in
++                // the just-created private file; leave its final DDL identical.
++                let private = crate::CanonicalDbConn::open_file(export.to_str().unwrap())
++                    .map_err(|error| DbError::Sqlite(error.to_string()))?;
++                private.execute_raw(
++                    "DROP INDEX idx_order; \
++                     CREATE UNIQUE INDEX \"idx_order\" ON agents(project_id, name COLLATE BINARY); \
++                     PRAGMA writable_schema=ON; \
++                     UPDATE sqlite_master SET sql=replace(sql, 'COLLATE BINARY', 'COLLATE NOCASE') \
++                         WHERE name='idx_order'; \
++                     PRAGMA writable_schema=OFF; PRAGMA schema_version=202;"
++                ).map_err(|error| DbError::Sqlite(error.to_string()))?;
++                assert!(!integrity::details_indicate_ok(&full(&private)));
++                Ok(())
++            },
++        ).unwrap();
++        let retained = directory.preserve();
++        assert!(snapshot.starts_with(retained));
++        // Exercise the production capture -> strict validation -> identity
++        // verification ordering. No normalizer runs after witness capture.
++        let witness = ProactiveBackupWitness::capture(&snapshot).unwrap();
++        validate_proactive_backup_stage(&source, &snapshot).unwrap();
++        witness.verify(&snapshot).unwrap();
++        let canonical = open_immutable_canonical_sqlite(&snapshot).unwrap();
++        assert_eq!(agent_rows(&canonical), expected_rows);
++        assert_eq!(canonical.query_sync("SELECT sql FROM sqlite_master WHERE name='idx_order'", &[])
++            .unwrap()[0].get_named::<String>("sql").unwrap(), expected_ddl);
++        assert_eq!(std::fs::read(source).unwrap(), before);
++        assert_eq!(std::fs::read(backup).unwrap(), b"previous published generation");
++    }
++
++    #[test]
++    fn real_staging_retains_a_duplicate_key_export_without_touching_prior_backup() {
++        let (source, conn) = fixture("idx_duplicate", &["A", "a"], "BINARY", "BINARY", false);
++        drop(conn);
++        let before = std::fs::read(&source).unwrap();
++        let backup = source.with_file_name("published.bak");
++        std::fs::write(&backup, b"previous published generation").unwrap();
++        let error = expect_stage_failure(create_proactive_backup_stage_with(
++            &source, &backup, |export| {
++                let private = crate::CanonicalDbConn::open_file(export.to_str().unwrap())
++                    .map_err(|error| DbError::Sqlite(error.to_string()))?;
++                private.execute_raw(
++                    "PRAGMA writable_schema=ON; \
++                     UPDATE sqlite_master SET sql=replace(sql, 'COLLATE BINARY', 'COLLATE NOCASE') \
++                         WHERE name='idx_duplicate'; \
++                     PRAGMA writable_schema=OFF; PRAGMA schema_version=203;"
++                ).map_err(|error| DbError::Sqlite(error.to_string()))
++            },
++        ));
++        assert!(error.to_string().contains("UNIQUE constraint failed"), "{error}");
++        let stage = retained_failed_stage(&source, &error);
++        assert!(!stage.join("snapshot.sqlite3").exists());
++        let retained = crate::CanonicalDbConn::open_file(stage.join("live-export.sqlite3").to_str().unwrap()).unwrap();
++        assert_eq!(agent_rows(&retained), vec![
++            (1, 1, Some("A".to_string())), (2, 1, Some("a".to_string())),
++        ]);
++        assert!(!integrity::details_indicate_ok(&full(&retained)));
++        assert_eq!(std::fs::read(source).unwrap(), before);
++        assert_eq!(std::fs::read(backup).unwrap(), b"previous published generation");
++    }
++
++    #[test]
++    fn real_staging_retains_a_healthy_export_when_backup_copy_cannot_open_its_target() {
++        let (source, conn) = fixture("idx_healthy", &["Z", "["], "NOCASE", "NOCASE", false);
++        drop(conn);
++        let before = std::fs::read(&source).unwrap();
++        let backup = source.with_file_name("published.bak");
++        std::fs::write(&backup, b"previous published generation").unwrap();
++        let error = expect_stage_failure(create_proactive_backup_stage_with(
++            &source, &backup, |export| {
++                // A real OS/SQLite open failure, not a substituted error result.
++                std::fs::create_dir(export.with_file_name("snapshot.sqlite3"))
++                    .map_err(|error| DbError::Sqlite(error.to_string()))
++            },
++        ));
++        assert!(error.to_string().contains("failed to materialize a standalone snapshot"), "{error}");
++        let stage = retained_failed_stage(&source, &error);
++        assert!(stage.join("snapshot.sqlite3").is_dir());
++        let retained = crate::CanonicalDbConn::open_file(stage.join("live-export.sqlite3").to_str().unwrap()).unwrap();
++        assert!(integrity::details_indicate_ok(&full(&retained)));
++        assert_eq!(agent_rows(&retained).len(), 2);
++        assert_eq!(std::fs::read(source).unwrap(), before);
++        assert_eq!(std::fs::read(backup).unwrap(), b"previous published generation");
++    }
++
++    #[test]
++    fn real_staging_source_open_failure_neither_creates_source_nor_erases_stage() {
++        let root = tempfile::tempdir().unwrap().keep();
++        let source = root.join("absent.sqlite3");
++        let backup = root.join("published.bak");
++        std::fs::write(&backup, b"previous published generation").unwrap();
++        let error = expect_stage_failure(create_proactive_backup_stage(&source, &backup));
++        let stage = retained_failed_stage(&source, &error);
++        assert!(stage.is_dir());
++        assert!(!source.exists());
++        assert!(!stage.join("snapshot.sqlite3").exists());
++        assert_eq!(std::fs::read(backup).unwrap(), b"previous published generation");
++    }
++}
++
+ fn stage_backup_restore_candidate(
+     backup_path: &Path,
+     primary_path: &Path,

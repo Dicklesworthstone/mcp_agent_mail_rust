@@ -1,0 +1,425 @@
+Subject: Normalize private NOCASE exports before backup publication; retain failed preparation
+
+diff --git a/crates/mcp-agent-mail-db/src/pool.rs b/crates/mcp-agent-mail-db/src/pool.rs
+--- a/crates/mcp-agent-mail-db/src/pool.rs
++++ b/crates/mcp-agent-mail-db/src/pool.rs
+@@ -4,10 +4,211 @@
+     )))
+ }
+ 
++/// Rebuild only canonical NOCASE indexes named by an export-order disagreement.
++///
++/// GH#326: the runtime's VACUUM INTO can emit NOCASE keys in an order that
++/// canonical SQLite rejects. Its online-backup API copies those index pages;
++/// it does not rebuild them. This helper is ONLY for the process-exclusive
++/// intermediate export, before backup publication or health-witness capture.
++/// Never call it on a live mailbox, published backup, or recovery authority.
++///
++/// A passing export is not rewritten. Otherwise every diagnostic must name
++/// a real NOCASE index and be an exact lookup/uniqueness complaint; structural
++/// damage, entry-count loss, unavailable evidence, and other collations fail
++/// closed. REINDEX enforces actual uniqueness, and a strict full check must
++/// pass before the transaction is committed. None of these private-copy probes
++/// update the process-wide live-mailbox integrity metrics or circuit breaker.
++fn normalize_proactive_backup_export(conn: &crate::CanonicalDbConn) -> DbResult<usize> {
++    // This fresh private-export connection must not already be in a caller
++    // transaction. BEGIN failing leaves any such transaction owned by its
++    // caller; a successful BEGIN makes the entire rebuild ours to roll back.
++    conn.execute_raw("BEGIN IMMEDIATE")
++        .map_err(|error| DbError::Sqlite(format!("private export verification start: {error}")))?;
++    let result = (|| {
++        let full = proactive_backup_export_check_details(conn, integrity::CheckKind::Full)?;
++        if integrity::details_indicate_ok(&full) {
++            return Ok(0);
++        }
++        let quick = proactive_backup_export_check_details(conn, integrity::CheckKind::Quick)?;
++        if !integrity::details_indicate_ok(&quick) {
++            return Err(DbError::Sqlite(format!(
++                "private export failed structural verification; refusing NOCASE normalization: {}",
++                integrity::summarize_check_details(&quick)
++            )));
++        }
++        let targets = proactive_backup_export_nocase_targets(conn, &full)?;
++        for index in &targets {
++            // Schema qualification avoids REINDEX's collation-name precedence.
++            // The entire catalog-confirmed identifier is quoted, never a token
++            // extracted into executable SQL from an arbitrary error substring.
++            let quoted = index.replace('"', "\"\"");
++            conn.execute_raw(&format!("REINDEX main.\"{quoted}\""))
++                .map_err(|error| {
++                    DbError::Sqlite(format!(
++                        "private export NOCASE rebuild failed for {index}: {error}"
++                    ))
++                })?;
++        }
++        let verified = proactive_backup_export_check_details(conn, integrity::CheckKind::Full)?;
++        if !integrity::details_indicate_ok(&verified) {
++            return Err(DbError::Sqlite(format!(
++                "private export remained invalid after NOCASE normalization: {}",
++                integrity::summarize_check_details(&verified)
++            )));
++        }
++        Ok(targets.len())
++    })();
++    match result {
++        Ok(rebuilt) => {
++            match conn.execute_raw("COMMIT") {
++                Ok(()) => Ok(rebuilt),
++                Err(error) => {
++                    let rollback = conn.execute_raw("ROLLBACK");
++                    Err(DbError::Sqlite(format!(
++                        "private export normalization commit failed: {error}; rollback={rollback:?}"
++                    )))
++                }
++            }
++        }
++        Err(error) => {
++            // A later index can fail UNIQUE enforcement after an earlier one
++            // rebuilt successfully. Roll back the WHOLE normalization, not
++            // just the last REINDEX. Preserve a rollback failure as well.
++            match conn.execute_raw("ROLLBACK") {
++                Ok(()) => Err(error),
++                Err(rollback) => Err(DbError::Sqlite(format!(
++                    "{error}; private export normalization rollback failed: {rollback}"
++                ))),
++            }
++        }
++    }
++}
++
++fn proactive_backup_export_check_details(
++    conn: &crate::CanonicalDbConn,
++    kind: integrity::CheckKind,
++) -> DbResult<Vec<String>> {
++    let rows = integrity::probe_check_rows(
++        |sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()),
++        kind,
++    )
++    .map_err(|error| DbError::Sqlite(format!("private export {kind} unavailable: {error}")))?;
++    Ok(integrity::extract_check_details(&rows, kind))
++}
++
++/// Exact canonical diagnostics only. In particular, an entry-count mismatch
++/// is not a collation-ordering disagreement and cannot authorize this repair.
++fn proactive_backup_export_index_complaint(detail: &str) -> Option<&str> {
++    let detail = detail.trim();
++    let name = if let Some(name) = detail.strip_prefix("non-unique entry in index ") {
++        name
++    } else {
++        let (row, name) = detail.strip_prefix("row ")?.split_once(" missing from index ")?;
++        if row.is_empty() || !row.bytes().all(|byte| byte.is_ascii_digit()) {
++            return None;
++        }
++        name
++    };
++    (!name.is_empty() && !name.chars().any(char::is_control)).then_some(name)
++}
++
++fn proactive_backup_export_nocase_targets(
++    conn: &crate::CanonicalDbConn,
++    details: &[String],
++) -> DbResult<Vec<String>> {
++    let mut targets = std::collections::BTreeSet::new();
++    for detail in details {
++        if detail.trim() == "*** in database main ***" {
++            continue;
++        }
++        let index = proactive_backup_export_index_complaint(detail).ok_or_else(|| {
++            DbError::Sqlite(format!(
++                "private export has damage outside the NOCASE ordering class: {}",
++                integrity::summarize_check_details(details)
++            ))
++        })?;
++        if !targets.insert(index.to_string()) {
++            continue;
++        }
++        let catalog = conn
++            .query_sync(
++                "SELECT name FROM main.sqlite_master WHERE type = 'index' AND name = ?",
++                &[Value::Text(index.to_string())],
++            )
++            .map_err(|error| DbError::Sqlite(format!("private export index lookup: {error}")))?;
++        if catalog.len() != 1
++            || catalog[0].get_named::<String>("name").ok().as_deref() != Some(index)
++        {
++            return Err(DbError::Sqlite(format!(
++                "private export complaint does not identify one catalog index: {index}"
++            )));
++        }
++        let quoted = index.replace('"', "\"\"");
++        let columns = conn
++            .query_sync(&format!("PRAGMA main.index_xinfo(\"{quoted}\")"), &[])
++            .map_err(|error| DbError::Sqlite(format!("private export index metadata: {error}")))?;
++        let mut has_nocase_key = false;
++        for column in &columns {
++            let key = column.get_named::<i64>("key").map_err(|error| {
++                DbError::Sqlite(format!("private export index key metadata: {error}"))
++            })?;
++            match key {
++                0 => {}
++                1 => {
++                    let collation = column.get_named::<String>("coll").map_err(|error| {
++                        DbError::Sqlite(format!("private export index collation: {error}"))
++                    })?;
++                    if collation.eq_ignore_ascii_case("NOCASE") {
++                        has_nocase_key = true;
++                    } else if !collation.eq_ignore_ascii_case("BINARY") {
++                        // REINDEX rebuilds the whole composite index. One
++                        // NOCASE column must not authorize repairing a separate
++                        // RTRIM/custom-collation defect in another key column.
++                        return Err(DbError::Sqlite(format!(
++                            "private export index {index} has unsupported key collation \
++                             {collation}; refusing NOCASE-only normalization"
++                        )));
++                    }
++                }
++                _ => {
++                    return Err(DbError::Sqlite(format!(
++                        "private export index {index} has invalid key metadata: {key}"
++                    )));
++                }
++            }
++        }
++        if !has_nocase_key {
++            return Err(DbError::Sqlite(format!(
++                "private export complaint names an index without a NOCASE key: {index}"
++            )));
++        }
++    }
++    if targets.is_empty() {
++        return Err(DbError::Sqlite(
++            "private export has no actionable NOCASE index evidence".to_string(),
++        ));
++    }
++    Ok(targets.into_iter().collect())
++}
++
+ fn create_proactive_backup_stage(
+     source: &Path,
+     backup_path: &Path,
+ ) -> DbResult<(CanonicalSnapshotTempDir, PathBuf)> {
++    create_proactive_backup_stage_with(source, backup_path, |_| Ok(()))
++}
++
++/// Keep the production export/copy/durability sequence shared with real-engine
++/// failure tests. The callback receives only this attempt's private export,
++/// after the guarded live-source reader has closed and before normalization.
++fn create_proactive_backup_stage_with<F>(
++    source: &Path,
++    backup_path: &Path,
++    after_export: F,
++) -> DbResult<(CanonicalSnapshotTempDir, PathBuf)>
++where
++    F: FnOnce(&Path) -> DbResult<()>,
++{
+     let stage_parent = backup_path
+         .parent()
+         .filter(|path| !path.as_os_str().is_empty())
+@@ -22,96 +223,127 @@
+             backup_path.display()
+         ))
+     })?;
+-    let live_export = staging_directory.path().join("live-export.sqlite3");
+-    let live_export_str = sqlite_path_as_utf8(&live_export).map_err(|error| {
+-        DbError::Sqlite(format!(
+-            "proactive backup private export path is not usable by FrankenSQLite: {error}"
+-        ))
+-    })?;
+-    // Engine-dispatching: a Franken-admitted source exports through the bound
+-    // FrankenSQLite opener; a source without a namespace pair (restored,
+-    // reconstructed, canonical-written) exports through canonical SQLite.
+-    // Either way the source pager is engine-enforced read-only and the
+-    // `VACUUM INTO` below writes only the private export.
+-    let source_conn =
+-        open_guarded_read_only_sqlite_file(source, "proactive backup live-source export")
++    // Every fallible operation after stage allocation belongs to this scope.
++    // Drop all SQLite/file handles before preserving a failed stage, including
++    // failures during export, opening, copying, and durability -- not just a
++    // normalization error. The caller's backup has not been rotated yet.
++    let staged = (|| -> DbResult<PathBuf> {
++        let live_export = staging_directory.path().join("live-export.sqlite3");
++        let live_export_str = sqlite_path_as_utf8(&live_export).map_err(|error| {
++            DbError::Sqlite(format!(
++                "proactive backup private export path is not usable by FrankenSQLite: {error}"
++            ))
++        })?;
++        // Engine-dispatching: a Franken-admitted source exports through the
++        // bound FrankenSQLite opener; an unadmitted canonical-written source
++        // exports through canonical SQLite. Both source pagers remain
++        // engine-enforced read-only while VACUUM INTO writes the private file.
++        let source_conn =
++            open_guarded_read_only_sqlite_file(source, "proactive backup live-source export")
++                .map_err(|error| {
++                    DbError::Sqlite(format!(
++                        "proactive backup failed to open live source {} through guarded read-only authority: {error}",
++                        source.display()
++                    ))
++                })?;
++        source_conn
++            .execute_raw("PRAGMA query_only = OFF;")
++            .map_err(|error| DbError::Sqlite(format!("proactive backup snapshot export: {error}")))?;
++        let live_export_literal = format!("'{}'", live_export_str.replace('\'', "''"));
++        source_conn
++            .execute_raw(&format!("VACUUM INTO {live_export_literal}"))
+             .map_err(|error| {
+                 DbError::Sqlite(format!(
+-                    "proactive backup failed to open live source {} through guarded read-only authority: {error}",
+-                    source.display()
++                    "proactive backup failed to materialize live source {} into private export {}: {error}",
++                    source.display(),
++                    live_export.display()
+                 ))
+             })?;
+-    source_conn
+-        .execute_raw("PRAGMA query_only = OFF;")
+-        .map_err(|error| DbError::Sqlite(format!("proactive backup snapshot export: {error}")))?;
+-    let live_export_literal = format!("'{}'", live_export_str.replace('\'', "''"));
+-    source_conn
+-        .execute_raw(&format!("VACUUM INTO {live_export_literal}"))
+-        .map_err(|error| {
+-            DbError::Sqlite(format!(
+-                "proactive backup failed to materialize live source {} into private export {}: {error}",
++        drop(source_conn);
++        after_export(&live_export)?;
++
++        // FrankenSQLite may leave private namespace records beside its export.
++        // Canonical SQLite operates ONLY on the process-exclusive intermediate
++        // and emits a standalone file for the existing strict publish validator.
++        let private_source = crate::CanonicalDbConn::open_file(live_export_str).map_err(|error| {
++            DbError::Sqlite(format!(
++                "proactive backup failed to open private export {} with canonical SQLite: {error}",
++                live_export.display()
++            ))
++        })?;
++        // GH#326: online backup copies physical index pages, not logical rows.
++        // Normalize before copying and before capturing the publication witness.
++        // Live data and existing published backup generations are never reindexed.
++        let rebuilt = normalize_proactive_backup_export(&private_source)?;
++        if rebuilt > 0 {
++            tracing::info!(
++                rebuilt,
++                export = %live_export.display(),
++                "normalized private export NOCASE indexes before proactive backup"
++            );
++        }
++        let staged_backup = staging_directory.path().join("snapshot.sqlite3");
++        let staged_str = sqlite_path_as_utf8(&staged_backup).map_err(|error| {
++            DbError::Sqlite(format!(
++                "proactive backup stage path is not usable by canonical SQLite: {error}"
++            ))
++        })?;
++        private_source.backup_to_path(staged_str).map_err(|error| {
++            DbError::Sqlite(format!(
++                "proactive backup failed to materialize a standalone snapshot from private export of {} at {}: {error}",
+                 source.display(),
+-                live_export.display()
+-            ))
+-        })?;
+-    drop(source_conn);
+-
+-    // FrankenSQLite may leave private namespace records beside VACUUM INTO
+-    // output. Canonical SQLite therefore reads only this process-exclusive
+-    // intermediate image and emits the standalone artifact that can be
+-    // published as the `.bak` generation.
+-    let private_source = crate::CanonicalDbConn::open_file(live_export_str).map_err(|error| {
+-        DbError::Sqlite(format!(
+-            "proactive backup failed to open private export {} with canonical SQLite: {error}",
+-            live_export.display()
+-        ))
+-    })?;
+-    let staged_backup = staging_directory.path().join("snapshot.sqlite3");
+-    let staged_str = sqlite_path_as_utf8(&staged_backup).map_err(|error| {
+-        DbError::Sqlite(format!(
+-            "proactive backup stage path is not usable by canonical SQLite: {error}"
+-        ))
+-    })?;
+-    private_source.backup_to_path(staged_str).map_err(|error| {
+-        DbError::Sqlite(format!(
+-            "proactive backup failed to materialize a standalone snapshot from private export of {} at {}: {error}",
+-            source.display(),
+-            staged_backup.display()
+-        ))
+-    })?;
+-    drop(private_source);
+-
+-    let staged_file = std::fs::OpenOptions::new()
+-        .read(true)
+-        .write(true)
+-        .open(&staged_backup)
+-        .map_err(|error| {
+-            DbError::Sqlite(format!(
+-                "proactive backup failed to open staged snapshot {} for durability: {error}",
+                 staged_backup.display()
+             ))
+         })?;
+-    mcp_agent_mail_core::disk::set_private_writable_file_permissions(&staged_file).map_err(
+-        |error| {
+-            DbError::Sqlite(format!(
+-                "proactive backup failed to secure staged snapshot {}: {error}",
++        drop(private_source);
++
++        let staged_file = std::fs::OpenOptions::new()
++            .read(true)
++            .write(true)
++            .open(&staged_backup)
++            .map_err(|error| {
++                DbError::Sqlite(format!(
++                    "proactive backup failed to open staged snapshot {} for durability: {error}",
++                    staged_backup.display()
++                ))
++            })?;
++        mcp_agent_mail_core::disk::set_private_writable_file_permissions(&staged_file).map_err(
++            |error| {
++                DbError::Sqlite(format!(
++                    "proactive backup failed to secure staged snapshot {}: {error}",
++                    staged_backup.display()
++                ))
++            },
++        )?;
++        staged_file.sync_all().map_err(|error| {
++            DbError::Sqlite(format!(
++                "proactive backup failed to sync staged snapshot {}: {error}",
+                 staged_backup.display()
+             ))
+-        },
+-    )?;
+-    staged_file.sync_all().map_err(|error| {
+-        DbError::Sqlite(format!(
+-            "proactive backup failed to sync staged snapshot {}: {error}",
+-            staged_backup.display()
+-        ))
+-    })?;
+-    sync_recovery_parent(&staged_backup).map_err(|error| {
+-        DbError::Sqlite(format!(
+-            "proactive backup failed to sync private stage directory {}: {error}",
+-            staging_directory.path().display()
+-        ))
+-    })?;
+-    Ok((staging_directory, staged_backup))
++        })?;
++        sync_recovery_parent(&staged_backup).map_err(|error| {
++            DbError::Sqlite(format!(
++                "proactive backup failed to sync private stage directory {}: {error}",
++                staging_directory.path().display()
++            ))
++        })?;
++        Ok(staged_backup)
++    })();
++    match staged {
++        Ok(staged_backup) => Ok((staging_directory, staged_backup)),
++        Err(error) => {
++            let preserved = staging_directory.preserve();
++            tracing::warn!(
++                path = %preserved.display(),
++                "preserved failed proactive-backup staging directory for inspection"
++            );
++            Err(DbError::Sqlite(format!(
++                "{error}; private export directory {} was preserved; \
++                 live source and existing backup are untouched",
++                preserved.display()
++            )))
++        }
++    }
+ }
+ 
+ fn stage_backup_restore_candidate(
