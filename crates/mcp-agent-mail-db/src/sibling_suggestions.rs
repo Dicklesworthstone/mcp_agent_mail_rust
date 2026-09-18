@@ -193,7 +193,10 @@ fn refresh_conn(
     pair_ids.extend(ids);
     let cutoff = now.saturating_sub(REFRESH_TTL_MICROS);
     let mut blocked = BTreeSet::new();
-    for row in conn.query_sync(&existing_sql, &pair_ids).map_err(db_error)? {
+    for row in conn
+        .query_sync(&existing_sql, &pair_ids)
+        .map_err(db_error)?
+    {
         let a: i64 = row.get_named("project_a_id").map_err(db_error)?;
         let b: i64 = row.get_named("project_b_id").map_err(db_error)?;
         let status: String = row.get_named("status").map_err(db_error)?;
@@ -471,12 +474,7 @@ fn rank_pair(a: &Project, b: &Project) -> Option<(f64, String)> {
         score = (score + 0.02).min(1.0);
         evidence.push("shared parent directory".to_string());
     }
-    (score >= MIN_SCORE).then(|| {
-        (
-            score,
-            format!("Local heuristic: {}", evidence.join("; ")),
-        )
-    })
+    (score >= MIN_SCORE).then(|| (score, format!("Local heuristic: {}", evidence.join("; "))))
 }
 
 #[cfg(test)]
@@ -575,10 +573,7 @@ mod tests {
                 persist_candidate(&conn, &candidate, now * 10, now * 9).unwrap(),
                 0
             );
-            assert_eq!(
-                refresh_conn(&cx, &conn, None, now * 10).unwrap().written,
-                0
-            );
+            assert_eq!(refresh_conn(&cx, &conn, None, now * 10).unwrap().written, 0);
             let rows = state(&conn);
             assert_eq!(rows[0].get_named::<String>("status").unwrap(), status);
             assert_eq!(rows[0].get_named::<i64>("evaluated_ts").unwrap(), now);
@@ -611,13 +606,14 @@ mod tests {
     fn cancelled_refresh_and_query_only_connection_do_not_persist() {
         let conn = fixture();
         let cx = Cx::for_testing();
-        cx.cancel_with(asupersync::types::CancelKind::User, Some("cancel discovery"));
+        cx.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel discovery"),
+        );
         assert!(refresh_conn(&cx, &conn, None, REFRESH_TTL_MICROS * 2).is_err());
         assert!(state(&conn).is_empty());
         conn.execute_raw("PRAGMA query_only=ON").unwrap();
-        assert!(
-            refresh_conn(&Cx::for_testing(), &conn, None, REFRESH_TTL_MICROS * 2).is_err()
-        );
+        assert!(refresh_conn(&Cx::for_testing(), &conn, None, REFRESH_TTL_MICROS * 2).is_err());
         assert!(state(&conn).is_empty());
     }
 
@@ -631,13 +627,8 @@ mod tests {
              (5, 'acme-docs', '/work/acme-docs', 1)",
         )
         .unwrap();
-        let summary = refresh_conn(
-            &Cx::for_testing(),
-            &conn,
-            Some(5),
-            REFRESH_TTL_MICROS * 2,
-        )
-        .unwrap();
+        let summary =
+            refresh_conn(&Cx::for_testing(), &conn, Some(5), REFRESH_TTL_MICROS * 2).unwrap();
         assert_eq!(summary.written, MAX_REFRESH_PAIRS);
         assert!(summary.candidates > MAX_REFRESH_PAIRS);
         for row in state(&conn) {
@@ -731,7 +722,9 @@ mod tests {
             0
         );
         assert_eq!(
-            state(&reopened)[0].get_named::<i64>("evaluated_ts").unwrap(),
+            state(&reopened)[0]
+                .get_named::<i64>("evaluated_ts")
+                .unwrap(),
             now
         );
         crate::close_db_conn(reopened, "sibling discovery persistence reopen");
@@ -752,13 +745,8 @@ mod tests {
              VALUES (300, 'acme-jobs', '/work/acme-jobs', 1)",
         )
         .unwrap();
-        let summary = refresh_conn(
-            &Cx::for_testing(),
-            &conn,
-            Some(1),
-            REFRESH_TTL_MICROS * 2,
-        )
-        .expect("old project remains explicitly addressable");
+        let summary = refresh_conn(&Cx::for_testing(), &conn, Some(1), REFRESH_TTL_MICROS * 2)
+            .expect("old project remains explicitly addressable");
         assert_eq!(summary.written, 1);
         assert_eq!(summary.suggestions[0].project_a_id, 1);
         assert_eq!(summary.suggestions[0].project_b_id, 300);
@@ -790,18 +778,17 @@ mod tests {
              VALUES (3, 2, 'GreenHill', 'test', 'test', 'acme inventory reconciliation dashboards', 1, 3)",
         )
         .unwrap();
-        let summary = refresh_conn(
-            &Cx::for_testing(),
-            &conn,
-            None,
-            REFRESH_TTL_MICROS * 2,
-        )
-        .unwrap();
+        let summary =
+            refresh_conn(&Cx::for_testing(), &conn, None, REFRESH_TTL_MICROS * 2).unwrap();
         assert_eq!(summary.written, 1);
         assert!(
             summary.suggestions[0].score >= crate::queries::PROJECT_SIBLING_MIN_SUGGESTION_SCORE
         );
-        assert!(summary.suggestions[0].rationale.contains("agent-task terms"));
+        assert!(
+            summary.suggestions[0]
+                .rationale
+                .contains("agent-task terms")
+        );
     }
 
     #[test]

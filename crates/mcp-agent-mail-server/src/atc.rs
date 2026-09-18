@@ -8,9 +8,9 @@
 
 #[path = "atc_engine.rs"]
 mod engine;
-pub use engine::*;
 #[cfg(test)]
 pub(crate) use engine::GLOBAL_ATC_TEST_LOCK;
+pub use engine::*;
 
 #[path = "atc_delivery.rs"]
 mod delivery;
@@ -39,7 +39,9 @@ static DELIVERY: OnceLock<Mutex<DeliveryState>> = OnceLock::new();
 
 fn delivery_state() -> &'static Mutex<DeliveryState> {
     DELIVERY.get_or_init(|| {
-        Mutex::new(DeliveryState::new(AtcConfig::default().probe_interval_micros))
+        Mutex::new(DeliveryState::new(
+            AtcConfig::default().probe_interval_micros,
+        ))
     })
 }
 
@@ -283,7 +285,11 @@ mod admission_boundary_tests {
             Some(NotificationClass::Conflict)
         );
         assert_eq!(
-            notification_class("release_reservations_requested", "liveness_monitoring", false),
+            notification_class(
+                "release_reservations_requested",
+                "liveness_monitoring",
+                false
+            ),
             None
         );
     }
@@ -312,7 +318,10 @@ mod admission_boundary_tests {
         ]);
         retain_actions(&mut actions, &suppressed, &mut HashMap::new());
         assert_eq!(actions.len(), 2);
-        assert!(matches!(actions[0], AtcTickAction::ReleaseReservations { .. }));
+        assert!(matches!(
+            actions[0],
+            AtcTickAction::ReleaseReservations { .. }
+        ));
         assert!(matches!(
             &actions[1],
             AtcTickAction::SendAdvisory { message, .. } if message == "released"

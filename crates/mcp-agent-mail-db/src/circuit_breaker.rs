@@ -332,7 +332,10 @@ mod tests {
         breaker.trip(DbErrorClass::MainDbBtreeCorruption, "damage");
         breaker.lock_state().trip_count = u64::MAX;
         let check = breaker.begin_recovery_check();
-        breaker.trip(DbErrorClass::MainDbBtreeCorruption, "untrackable newer damage");
+        breaker.trip(
+            DbErrorClass::MainDbBtreeCorruption,
+            "untrackable newer damage",
+        );
         assert!(!check.reset_if_unchanged());
         assert!(breaker.is_tripped());
     }

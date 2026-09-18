@@ -1108,7 +1108,10 @@ mod tests {
         .expect("retry the actual OS collision");
         assert_eq!(attempts, 2);
         assert_eq!(staged, directory.join("backup.1"));
-        assert_eq!(fs::read(directory.join("backup")).unwrap(), b"concurrent evidence");
+        assert_eq!(
+            fs::read(directory.join("backup")).unwrap(),
+            b"concurrent evidence"
+        );
         assert_eq!(fs::read(staged).unwrap(), b"source evidence");
         assert!(!source.exists());
     }
@@ -1125,7 +1128,12 @@ mod tests {
         std::os::unix::fs::symlink("absent-target", &occupied).unwrap();
         let staged = stage_backup_noreplace(&source, &directory).unwrap();
         assert_eq!(staged, directory.join("backup.1"));
-        assert!(fs::symlink_metadata(&occupied).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(&occupied)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(fs::read_link(occupied).unwrap(), Path::new("absent-target"));
         assert_eq!(fs::read(staged).unwrap(), b"source evidence");
     }
@@ -1138,7 +1146,11 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         fs::write(&source, b"source evidence").unwrap();
         for suffix in 0..MAX_QUARANTINE_LEAF_ATTEMPTS {
-            let leaf = if suffix == 0 { "backup".to_string() } else { format!("backup.{suffix}") };
+            let leaf = if suffix == 0 {
+                "backup".to_string()
+            } else {
+                format!("backup.{suffix}")
+            };
             fs::write(directory.join(leaf), b"retained evidence").unwrap();
         }
         let error = stage_backup_noreplace(&source, &directory).unwrap_err();
@@ -1148,7 +1160,10 @@ mod tests {
         let entries: Vec<_> = fs::read_dir(&directory).unwrap().collect();
         assert_eq!(entries.len(), MAX_QUARANTINE_LEAF_ATTEMPTS as usize);
         for entry in entries {
-            assert_eq!(fs::read(entry.unwrap().path()).unwrap(), b"retained evidence");
+            assert_eq!(
+                fs::read(entry.unwrap().path()).unwrap(),
+                b"retained evidence"
+            );
         }
     }
 
@@ -1172,7 +1187,12 @@ mod tests {
         fs::write(&target, b"unrelated evidence").unwrap();
         std::os::unix::fs::symlink(&target, &source).unwrap();
         assert!(stage_backup_noreplace(&source, &directory).is_err());
-        assert!(fs::symlink_metadata(source).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(source)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(fs::read(target).unwrap(), b"unrelated evidence");
         assert_eq!(fs::read_dir(directory).unwrap().count(), 0);
     }

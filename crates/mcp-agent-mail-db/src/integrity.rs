@@ -1164,7 +1164,9 @@ fn cross_count_value(rows: &[Row], context: &str) -> DbResult<i64> {
         )));
     };
     let count = row.get_named::<i64>("c").map_err(|error| {
-        DbError::Sqlite(format!("cross-count {context}: invalid count value: {error}"))
+        DbError::Sqlite(format!(
+            "cross-count {context}: invalid count value: {error}"
+        ))
     })?;
     if count < 0 {
         return Err(DbError::Sqlite(format!(
@@ -1183,7 +1185,9 @@ fn quote_cross_count_identifier(identifier: &str) -> String {
 /// unreadable/unterminated definition still cannot authorize a skipped probe.
 fn cross_count_index_is_partial(sql: &str) -> DbResult<bool> {
     if sql.trim().is_empty() {
-        return Err(DbError::Sqlite("cross-count index DDL is empty".to_string()));
+        return Err(DbError::Sqlite(
+            "cross-count index DDL is empty".to_string(),
+        ));
     }
     let bytes = sql.as_bytes();
     let mut i = 0;
@@ -1229,7 +1233,11 @@ fn cross_count_index_is_partial(sql: &str) -> DbResult<bool> {
                 }
                 i += 2;
             }
-            byte if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte >= 0x80 => {
+            byte if byte.is_ascii_alphanumeric()
+                || byte == b'_'
+                || byte == b'$'
+                || byte >= 0x80 =>
+            {
                 let start = i;
                 i += 1;
                 while i < bytes.len()
@@ -1292,7 +1300,9 @@ fn index_table_cross_count_snapshot(
             // Match a SQL keyword, not names such as `idx_somewhere`, quoted
             // identifiers, string literals, or comments containing WHERE.
             let create_sql = row.get_named::<String>("sql").map_err(|error| {
-                DbError::Sqlite(format!("cross-count DDL for {index} is unreadable: {error}"))
+                DbError::Sqlite(format!(
+                    "cross-count DDL for {index} is unreadable: {error}"
+                ))
             })?;
             if cross_count_index_is_partial(&create_sql)? {
                 continue;
@@ -1448,7 +1458,11 @@ mod tests {
     fn cross_count_rejects_missing_or_invalid_count_evidence() {
         assert!(cross_count_value(&[], "empty result").is_err());
         assert!(cross_count_value(&[Row::new(vec![], vec![])], "missing column").is_err());
-        for value in [Value::Null, Value::Text("ok".to_string()), Value::BigInt(-1)] {
+        for value in [
+            Value::Null,
+            Value::Text("ok".to_string()),
+            Value::BigInt(-1),
+        ] {
             let rows = vec![Row::new(vec!["c".to_string()], vec![value])];
             assert!(cross_count_value(&rows, "invalid value").is_err());
         }
@@ -2615,12 +2629,14 @@ mod tests {
             .expect("create table");
         conn.execute_raw("CREATE INDEX idx_cc_force_error ON cc_force_error(name)")
             .expect("create index");
-        let error = index_table_cross_count(&CrossCountForcedIndexFailure(conn), &["cc_force_error"])
-            .expect_err("a failed forced scan cannot certify agreement");
+        let error =
+            index_table_cross_count(&CrossCountForcedIndexFailure(conn), &["cc_force_error"])
+                .expect_err("a failed forced scan cannot certify agreement");
         assert!(error.to_string().contains("forced-index scan"));
         conn.execute_raw("BEGIN")
             .expect("failed forced probe must release its read savepoint");
-        conn.execute_raw("ROLLBACK").expect("finish caller transaction");
+        conn.execute_raw("ROLLBACK")
+            .expect("finish caller transaction");
     }
 
     #[test]

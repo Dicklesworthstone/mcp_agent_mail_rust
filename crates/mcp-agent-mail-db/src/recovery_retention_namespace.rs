@@ -36,9 +36,10 @@ fn absolute_spelling(path: &Path) -> io::Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    if absolute.components().any(|part| {
-        matches!(part, Component::ParentDir | Component::Prefix(_))
-    }) {
+    if absolute
+        .components()
+        .any(|part| matches!(part, Component::ParentDir | Component::Prefix(_)))
+    {
         return Err(invalid("reclaim paths must not contain parent traversal"));
     }
     Ok(absolute)
@@ -75,9 +76,8 @@ fn open_directory(path: &Path, create_missing: bool) -> io::Result<File> {
     let checked_path = system_alias_target(path);
     #[cfg(not(target_os = "macos"))]
     let checked_path = path;
-    let mut directory = File::from(
-        rustix::fs::open("/", DIRECTORY_FLAGS, Mode::empty()).map_err(io::Error::from)?,
-    );
+    let mut directory =
+        File::from(rustix::fs::open("/", DIRECTORY_FLAGS, Mode::empty()).map_err(io::Error::from)?);
     for component in checked_path.components() {
         let name = match component {
             Component::RootDir | Component::CurDir => continue,
@@ -130,8 +130,12 @@ fn validate_directory(path: &Path, retained: &File) -> io::Result<()> {
 /// An occupied final name is never reused, including a dangling symlink.
 pub(super) fn claim_reclaim_directory(path: &Path) -> io::Result<ReclaimDirectory> {
     let path = absolute_spelling(path)?;
-    let name = path.file_name().ok_or_else(|| invalid("quarantine has no leaf name"))?;
-    let parent_path = path.parent().ok_or_else(|| invalid("quarantine has no parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid("quarantine has no leaf name"))?;
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| invalid("quarantine has no parent"))?;
     let parent = open_directory(parent_path, true)?;
     validate_directory(parent_path, &parent)?;
     rustix::fs::mkdirat(&parent, name, Mode::RWXU).map_err(io::Error::from)?;
@@ -165,9 +169,14 @@ pub(super) fn rename_reclaim_entry(
     destination_name: &OsStr,
 ) -> io::Result<()> {
     #[cfg(any(
-        target_os = "android", target_os = "linux", target_os = "macos",
-        target_os = "ios", target_os = "tvos", target_os = "visionos",
-        target_os = "watchos", target_os = "redox",
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+        target_os = "redox",
     ))]
     {
         rustix::fs::renameat_with(
@@ -180,12 +189,22 @@ pub(super) fn rename_reclaim_entry(
         .map_err(io::Error::from)
     }
     #[cfg(not(any(
-        target_os = "android", target_os = "linux", target_os = "macos",
-        target_os = "ios", target_os = "tvos", target_os = "visionos",
-        target_os = "watchos", target_os = "redox",
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+        target_os = "redox",
     )))]
     {
-        let _ = (source_parent, source_name, destination_parent, destination_name);
+        let _ = (
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        );
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "descriptor-relative atomic no-replace rename is unavailable",
@@ -194,10 +213,12 @@ pub(super) fn rename_reclaim_entry(
 }
 
 fn validate_source_entry(parent: &File, name: &OsStr, expected: &Stat) -> io::Result<()> {
-    let current = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
-        .map_err(io::Error::from)?;
+    let current =
+        rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
     if !same_object(&current, expected) || current.st_size != expected.st_size {
-        return Err(invalid("reclaim source identity or size changed before publication"));
+        return Err(invalid(
+            "reclaim source identity or size changed before publication",
+        ));
     }
     Ok(())
 }
@@ -206,7 +227,12 @@ pub(super) fn move_recovery_debris_into(
     source: &Path,
     destination: &ReclaimDirectory,
 ) -> io::Result<PathBuf> {
-    move_into_with(source, destination, rename_reclaim_entry, sync_reclaim_move_parents)
+    move_into_with(
+        source,
+        destination,
+        rename_reclaim_entry,
+        sync_reclaim_move_parents,
+    )
 }
 
 fn move_into_with<R, S>(
@@ -220,8 +246,12 @@ where
     S: FnMut(&File, &File) -> io::Result<()>,
 {
     let source = absolute_spelling(source)?;
-    let name = source.file_name().ok_or_else(|| invalid("artifact has no file name"))?;
-    let source_parent_path = source.parent().ok_or_else(|| invalid("artifact has no parent"))?;
+    let name = source
+        .file_name()
+        .ok_or_else(|| invalid("artifact has no file name"))?;
+    let source_parent_path = source
+        .parent()
+        .ok_or_else(|| invalid("artifact has no parent"))?;
     let source_parent = open_directory(source_parent_path, false)?;
     validate_directory(&destination.path, &destination.file)?;
     let before = rustix::fs::statat(&source_parent, name, AtFlags::SYMLINK_NOFOLLOW)
@@ -230,7 +260,9 @@ where
         FileType::from_raw_mode(before.st_mode),
         FileType::RegularFile | FileType::Directory
     ) {
-        return Err(invalid("recovery artifact is not a regular file or real directory"));
+        return Err(invalid(
+            "recovery artifact is not a regular file or real directory",
+        ));
     }
     // Retain the object as well as its parent. NONBLOCK prevents a FIFO
     // substitution during the stat/open interval from hanging the operator.
@@ -245,7 +277,9 @@ where
     );
     let expected = rustix::fs::fstat(&source_file).map_err(io::Error::from)?;
     if !same_object(&before, &expected) || before.st_size != expected.st_size {
-        return Err(invalid("recovery artifact changed while acquiring its authority"));
+        return Err(invalid(
+            "recovery artifact changed while acquiring its authority",
+        ));
     }
     for suffix in 0..MAX_RECLAIM_MOVE_ATTEMPTS {
         let mut leaf = name.to_os_string();
@@ -278,7 +312,8 @@ where
                 if !failures.is_empty() {
                     return Err(io::Error::other(format!(
                         "artifact rename completed for requested destination {}; directory durability is unconfirmed or namespace validation failed: {}; evidence is retained in the opened destination directory, whose pathname may have changed; do not retry or roll back this move",
-                        requested_destination.display(), failures.join("; ")
+                        requested_destination.display(),
+                        failures.join("; ")
                     )));
                 }
                 return Ok(requested_destination);
@@ -289,7 +324,10 @@ where
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
-        format!("reclaim collision budget exhausted for {}; no move performed", source.display()),
+        format!(
+            "reclaim collision budget exhausted for {}; no move performed",
+            source.display()
+        ),
     ))
 }
 
@@ -297,7 +335,12 @@ where
 // explicit operation boundaries; no result or filesystem is simulated.
 #[cfg(test)]
 pub(super) fn move_recovery_debris(source: &Path, destination: &Path) -> io::Result<PathBuf> {
-    move_recovery_debris_with(source, destination, rename_reclaim_entry, sync_reclaim_move_parents)
+    move_recovery_debris_with(
+        source,
+        destination,
+        rename_reclaim_entry,
+        sync_reclaim_move_parents,
+    )
 }
 
 #[cfg(test)]
@@ -312,7 +355,10 @@ where
     S: FnMut(&File, &File) -> io::Result<()>,
 {
     let path = absolute_spelling(destination)?;
-    let directory = ReclaimDirectory { file: open_directory(&path, false)?, path };
+    let directory = ReclaimDirectory {
+        file: open_directory(&path, false)?,
+        path,
+    };
     move_into_with(source, &directory, rename, sync)
 }
 
@@ -340,7 +386,12 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("doctor")).unwrap();
         assert!(claim_reclaim_directory(&root.join("doctor/reclaimable/run")).is_err());
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
-        assert!(std::fs::symlink_metadata(root.join("doctor")).unwrap().file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(root.join("doctor"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -356,7 +407,10 @@ mod tests {
         std::fs::write(&source, b"source evidence").unwrap();
         assert!(move_recovery_debris_into(&source, &directory).is_err());
         assert_eq!(std::fs::read(source).unwrap(), b"source evidence");
-        assert_eq!(std::fs::read(requested.join("evidence")).unwrap(), b"replacement sentinel");
+        assert_eq!(
+            std::fs::read(requested.join("evidence")).unwrap(),
+            b"replacement sentinel"
+        );
         assert_eq!(std::fs::read_dir(retained).unwrap().count(), 0);
     }
 
@@ -380,10 +434,17 @@ mod tests {
                 rename_reclaim_entry(from_parent, from, to_parent, to)
             },
             sync_reclaim_move_parents,
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert_eq!(calls, 1);
-        assert_eq!(std::fs::read(requested.join("evidence")).unwrap(), b"replacement sentinel");
-        assert_eq!(std::fs::read(retained.join("evidence")).unwrap(), b"source evidence");
+        assert_eq!(
+            std::fs::read(requested.join("evidence")).unwrap(),
+            b"replacement sentinel"
+        );
+        assert_eq!(
+            std::fs::read(retained.join("evidence")).unwrap(),
+            b"source evidence"
+        );
         assert!(error.to_string().contains("pathname may have changed"));
         assert!(error.to_string().contains("do not retry or roll back"));
     }
@@ -407,9 +468,13 @@ mod tests {
                 rename_reclaim_entry(from_parent, from, to_parent, to)
             },
             sync_reclaim_move_parents,
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert_eq!(std::fs::read(&source).unwrap(), b"replacement sentinel");
-        assert_eq!(std::fs::read(directory.path.join("evidence")).unwrap(), b"original evidence");
+        assert_eq!(
+            std::fs::read(directory.path.join("evidence")).unwrap(),
+            b"original evidence"
+        );
         assert!(error.to_string().contains("source parent"));
     }
 
@@ -428,17 +493,24 @@ mod tests {
             |from_parent, from, to_parent, to| {
                 calls += 1;
                 let result = rename_reclaim_entry(from_parent, from, to_parent, to);
-                assert_eq!(result.as_ref().unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+                assert_eq!(
+                    result.as_ref().unwrap_err().kind(),
+                    io::ErrorKind::AlreadyExists
+                );
                 std::fs::rename(&source, &original).unwrap();
                 std::fs::write(&source, b"different replacement").unwrap();
                 result
             },
             sync_reclaim_move_parents,
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert_eq!(calls, 1);
         assert_eq!(std::fs::read(&source).unwrap(), b"different replacement");
         assert_eq!(std::fs::read(original).unwrap(), b"original");
-        assert_eq!(std::fs::read(directory.path.join("evidence")).unwrap(), b"occupied");
+        assert_eq!(
+            std::fs::read(directory.path.join("evidence")).unwrap(),
+            b"occupied"
+        );
         assert!(!directory.path.join("evidence.1").exists());
         assert!(error.to_string().contains("source identity"));
     }
@@ -456,9 +528,19 @@ mod tests {
         let root = fixture();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
         let directory = claim_reclaim_directory(&root.join("doctor/reclaimable/run")).unwrap();
-        for path in [root.join("doctor"), root.join("doctor/reclaimable"), directory.path] {
-            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+        for path in [
+            root.join("doctor"),
+            root.join("doctor/reclaimable"),
+            directory.path,
+        ] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
+                0
+            );
         }
-        assert_eq!(std::fs::metadata(root).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(
+            std::fs::metadata(root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
     }
 }
