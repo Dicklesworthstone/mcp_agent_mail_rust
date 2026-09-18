@@ -10,6 +10,11 @@
 
 #![forbid(unsafe_code)]
 
+#[path = "integrity_guard_backup_budget.rs"]
+mod backup_budget;
+#[cfg(unix)]
+#[path = "integrity_guard_backup_journal.rs"]
+mod backup_journal;
 #[path = "integrity_guard_schedule.rs"]
 mod schedule;
 
@@ -584,23 +589,108 @@ fn run_full_cycle(
 /// Execute at most one eligible backup operation. This is the only automatic
 /// backup entry point in the guard; explicit operator calls remain unchanged.
 fn run_automatic_backup(pool: &DbPool, schedule: &mut AutomaticBackupSchedule) -> bool {
-    run_automatic_backup_with(schedule, Instant::now, |kind| match kind {
-        BackupKind::Proactive => pool
-            .create_proactive_backup(Duration::from_secs(BACKUP_MAX_AGE_SECS))
-            .map(|path| path.is_some())
-            .map_err(|error| error.to_string()),
-        BackupKind::Verified => pool
-            .create_verified_snapshot()
-            .map(|metadata| {
-                if let Some(meta) = &metadata {
+    run_admitted_backup_with(
+        Path::new(pool.sqlite_path()),
+        schedule,
+        Instant::now,
+        |kind| match kind {
+            BackupKind::Proactive => pool
+                .create_proactive_backup(Duration::from_secs(BACKUP_MAX_AGE_SECS))
+                .map(|path| path.is_some())
+                .map_err(|error| error.to_string()),
+            BackupKind::Verified => pool
+                .create_verified_snapshot()
+                .map(|metadata| {
+                    if let Some(meta) = &metadata {
+                        tracing::debug!(
+                            snapshot = %meta.snapshot_path,
+                            "integrity guard: recorded verified snapshot"
+                        );
+                    }
+                    metadata.is_some()
+                })
+                .map_err(|error| error.to_string()),
+        },
+    )
+}
+
+/// Acquire filesystem admission only when retry timing permits an attempt.
+/// The same lease and retained-stage budget protect both producer routes. A
+/// refusal goes through ordinary incomplete-attempt pacing, preserves pending
+/// verified work, and is not reported as a live-database integrity failure.
+fn run_admitted_backup_with<F, C>(
+    primary: &Path,
+    schedule: &mut AutomaticBackupSchedule,
+    clock: C,
+    produce: F,
+) -> bool
+where
+    F: FnOnce(BackupKind) -> Result<bool, String>,
+    C: Fn() -> Instant,
+{
+    #[cfg(unix)]
+    if primary.as_os_str() != ":memory:" {
+        let Some(requested) = schedule.next_attempt(clock()) else {
+            tracing::debug!(
+                retry_after_secs = schedule.retry_remaining(clock()).as_secs(),
+                "integrity guard: automatic backup deferred by process-local retry pacing"
+            );
+            return true;
+        };
+        // Keep the retained-stage budget and its parent-wide lease. Only an
+        // admitted exporter may acquire the mailbox journal, always in this
+        // lock order, and both leases remain held through producer completion.
+        let admitted = backup_budget::with_admission(primary, || {
+            let lease = match backup_journal::AutomaticBackupLease::try_begin(primary, requested) {
+                Ok(Some(lease)) => lease,
+                Ok(None) => {
                     tracing::debug!(
-                        snapshot = %meta.snapshot_path,
-                        "integrity guard: recorded verified snapshot"
+                        "integrity guard: automatic export deferred by durable backoff or an active exporter; health probes continue"
+                    );
+                    return Ok(true);
+                }
+                Err(error) => {
+                    // Journal IO is unavailable admission, not evidence that
+                    // the live mailbox is corrupt. Never start an unrecorded
+                    // export or weaken the existing full-verification gate.
+                    tracing::warn!(
+                        %error,
+                        "integrity guard: automatic backup journal admission unavailable; no export started; health probes continue"
+                    );
+                    return Ok(true);
+                }
+            };
+            if lease.kind() == BackupKind::Verified {
+                schedule.request_verified();
+            }
+            Ok(run_automatic_backup_with(schedule, &clock, |kind| {
+                let result = produce(kind);
+                let completion = match &result {
+                    Ok(true) => BackupCompletion::Published,
+                    Ok(false) => BackupCompletion::Skipped,
+                    Err(_) => BackupCompletion::Failed,
+                };
+                if let Err(error) = lease.finish(completion) {
+                    // A torn update retains the preceding synced intent.
+                    // Keep the producer's actual result, including a skipped
+                    // verified snapshot's requirement for fresh full evidence.
+                    tracing::warn!(
+                        %error,
+                        "integrity guard: automatic backup completion journal update failed; subsequent admission remains conservative"
                     );
                 }
-                metadata.is_some()
-            })
-            .map_err(|error| error.to_string()),
+                result
+            }))
+        });
+        return match admitted {
+            Ok(followups_allowed) => followups_allowed,
+            Err(error) => run_automatic_backup_with(schedule, clock, |_| Err(error)),
+        };
+    }
+    // Non-Unix platforms retain the existing admission path; memory-backed
+    // fixtures never create a journal or a control path on disk.
+    run_automatic_backup_with(schedule, clock, |kind| {
+        backup_budget::with_admission(primary, || produce(kind))
     })
 }
 
@@ -1063,6 +1153,116 @@ fn handle_integrity_error_with_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_staging_refuses_both_routes_without_discarding_verified_requests() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("mail.sqlite3");
+        let backup = root.join("mail.sqlite3.bak");
+        std::fs::write(&primary, b"live mailbox").unwrap();
+        std::fs::write(&backup, b"verified backup").unwrap();
+        for ordinal in 0..3 {
+            let stage = root.join(format!(".mcp-agent-mail-proactive-backup-{ordinal:06}"));
+            std::fs::create_dir(&stage).unwrap();
+            std::fs::write(stage.join("snapshot.sqlite3"), b"retained evidence").unwrap();
+        }
+        let now = Instant::now();
+        for verified in [false, true] {
+            let mut schedule = AutomaticBackupSchedule::default();
+            if verified {
+                schedule.request_verified();
+            }
+            assert!(run_admitted_backup_with(
+                &primary,
+                &mut schedule,
+                || now,
+                |_| panic!("a saturated staging budget must block either producer"),
+            ));
+            assert_eq!(schedule.consecutive_failures(), 1);
+            assert_eq!(schedule.next_attempt(now), None);
+            assert_eq!(
+                schedule.next_attempt(now + Duration::from_secs(900)),
+                Some(if verified { BackupKind::Verified } else { BackupKind::Proactive }),
+                "admission refusal must preserve pending verified work"
+            );
+        }
+        assert_eq!(std::fs::read(primary).unwrap(), b"live mailbox");
+        assert_eq!(std::fs::read(backup).unwrap(), b"verified backup");
+        for ordinal in 0..3 {
+            let stage = root.join(format!(".mcp-agent-mail-proactive-backup-{ordinal:06}"));
+            assert_eq!(std::fs::read(stage.join("snapshot.sqlite3")).unwrap(), b"retained evidence");
+        }
+    }
+
+    #[test]
+    fn backup_retry_delay_skips_filesystem_admission_too() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let absent = root.join("absent.sqlite3");
+        let now = Instant::now();
+        let mut schedule = AutomaticBackupSchedule::default();
+        schedule.complete(BackupKind::Proactive, BackupCompletion::Failed, now);
+        assert!(run_admitted_backup_with(
+            &absent,
+            &mut schedule,
+            || now + Duration::from_secs(1),
+            |_| panic!("a paced operation must not enter admission or its producer"),
+        ));
+        assert_eq!(schedule.consecutive_failures(), 1);
+        assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn admitted_dispatch_holds_the_parent_lease_until_the_producer_returns() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("mail.sqlite3");
+        std::fs::write(&primary, b"live mailbox").unwrap();
+        let now = Instant::now();
+        let mut schedule = AutomaticBackupSchedule::default();
+        schedule.request_verified();
+        assert!(run_admitted_backup_with(
+            &primary,
+            &mut schedule,
+            || now,
+            |kind| {
+                assert_eq!(kind, BackupKind::Verified);
+                assert!(backup_budget::with_admission(&primary, || Ok(())).is_err());
+                Ok(true)
+            },
+        ));
+        assert!(backup_budget::with_admission(&primary, || Ok(())).is_ok());
+        assert_eq!(schedule.next_attempt(now), Some(BackupKind::Proactive));
+    }
+
+    #[test]
+    fn automatic_admission_allows_real_proactive_and_verified_publication() {
+        for verified in [false, true] {
+            let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+            let primary = root.join("mail.sqlite3");
+            let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(primary.to_str().unwrap())
+                .expect("create real canonical mailbox");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("initialize real mailbox schema");
+            conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[]).unwrap();
+            drop(conn);
+            let pool = mcp_agent_mail_db::create_pool(&DbPoolConfig {
+                database_url: format!("sqlite:///{}", primary.display()),
+                ..DbPoolConfig::default()
+            }).expect("create real backup pool");
+            let before = std::fs::read(&primary).unwrap();
+            let mut schedule = AutomaticBackupSchedule::default();
+            if verified {
+                schedule.request_verified();
+            }
+            assert!(run_automatic_backup(&pool, &mut schedule));
+            let backup = mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary);
+            assert!(backup.is_file(), "the real producer must publish, not merely return best-effort success");
+            assert!(mcp_agent_mail_db::pool::sqlite_recovery_candidate_passes_full_integrity_check(&backup)
+                .expect("independent strict canonical snapshot validation"));
+            assert_eq!(mcp_agent_mail_db::snapshot::snapshot_meta_path(&primary).is_file(), verified);
+            assert_eq!(std::fs::read(primary).unwrap(), before, "backup admission must not alter live bytes");
+            assert_eq!(schedule.consecutive_failures(), 0);
+        }
+    }
 
     // GH#288: fingerprint + backoff for standing integrity defects.
     #[test]
