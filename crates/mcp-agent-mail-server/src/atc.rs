@@ -9,6 +9,8 @@
 #[path = "atc_engine.rs"]
 mod engine;
 pub use engine::*;
+#[cfg(test)]
+pub(crate) use engine::GLOBAL_ATC_TEST_LOCK;
 
 #[path = "atc_delivery.rs"]
 mod delivery;
@@ -55,10 +57,9 @@ pub fn init_global_atc(config: &mcp_agent_mail_core::Config) {
 }
 
 #[cfg(test)]
-pub(crate) fn reset_global_atc_state_for_test(config: AtcConfig) {
-    let probe_interval_micros = config.probe_interval_micros;
+pub(crate) fn reset_global_atc_state_for_test(config: &mcp_agent_mail_core::Config) {
     engine::reset_global_atc_state_for_test(config);
-    reset_delivery(probe_interval_micros);
+    reset_delivery(AtcEngine::config_from_env(config).probe_interval_micros);
 }
 
 /// Delivery counters are in-memory only: suppressed mail must not generate
@@ -171,7 +172,7 @@ fn effect_action_key(effect: &AtcEffectPlan) -> Option<ActionKey> {
 fn retain_actions(
     actions: &mut Vec<AtcTickAction>,
     suppressed: &HashSet<ActionKey>,
-    retained: &HashSet<ActionKey>,
+    retained: &mut HashMap<ActionKey, usize>,
 ) {
     actions.retain(|action| {
         let key = match action {
@@ -181,7 +182,14 @@ fn retain_actions(
             }
             AtcTickAction::ReleaseReservations { .. } => return true,
         };
-        !suppressed.contains(&key) || retained.contains(&key)
+        if let Some(remaining) = retained.get_mut(&key) {
+            if *remaining == 0 {
+                return false;
+            }
+            *remaining -= 1;
+            return true;
+        }
+        !suppressed.contains(&key)
     });
 }
 
@@ -194,7 +202,7 @@ fn admit_effects(
 ) {
     let mut activity_by_agent = HashMap::new();
     let mut suppressed = HashSet::new();
-    let mut retained = HashSet::new();
+    let mut retained = HashMap::new();
     effects.retain(|effect| {
         let accepted = notification_class(
             &effect.kind,
@@ -223,7 +231,7 @@ fn admit_effects(
         });
         if let Some(key) = effect_action_key(effect) {
             if accepted {
-                retained.insert(key);
+                *retained.entry(key).or_insert(0_usize) += 1;
             } else {
                 suppressed.insert(key);
             }
@@ -232,7 +240,8 @@ fn admit_effects(
     });
     // Match the exact advisory body, not just its recipient: a suppressed
     // monitoring prompt must not hide the same agent's genuine release notice.
-    retain_actions(actions, &suppressed, &retained);
+    // Counts also prevent the action-only API from replaying dropped duplicates.
+    retain_actions(actions, &suppressed, &mut retained);
 }
 
 #[cfg(test)]
@@ -249,44 +258,149 @@ mod admission_boundary_tests {
             assert_eq!(notification_class(kind, family, false), None);
             assert_eq!(notification_class(kind, family, true), None);
         }
-        assert_eq!(notification_class("send_advisory", "liveness_monitoring", true), None);
+        assert_eq!(
+            notification_class("send_advisory", "liveness_monitoring", true),
+            None
+        );
     }
 
     #[test]
     fn only_recognized_notification_kind_and_family_pairs_are_gated() {
-        assert_eq!(notification_class("probe_agent", "liveness_probe", false), Some(NotificationClass::Probe));
-        assert_eq!(notification_class("send_advisory", "liveness_monitoring", false), Some(NotificationClass::Liveness));
-        assert_eq!(notification_class("send_advisory", "withheld_release_notice", false), Some(NotificationClass::Liveness));
-        assert_eq!(notification_class("send_advisory", "deadlock_remediation", false), Some(NotificationClass::Conflict));
-        assert_eq!(notification_class("release_reservations_requested", "liveness_monitoring", false), None);
+        assert_eq!(
+            notification_class("probe_agent", "liveness_probe", false),
+            Some(NotificationClass::Probe)
+        );
+        assert_eq!(
+            notification_class("send_advisory", "liveness_monitoring", false),
+            Some(NotificationClass::Liveness)
+        );
+        assert_eq!(
+            notification_class("send_advisory", "withheld_release_notice", false),
+            Some(NotificationClass::Liveness)
+        );
+        assert_eq!(
+            notification_class("send_advisory", "deadlock_remediation", false),
+            Some(NotificationClass::Conflict)
+        );
+        assert_eq!(
+            notification_class("release_reservations_requested", "liveness_monitoring", false),
+            None
+        );
     }
 
     #[test]
     fn suppressing_monitoring_preserves_release_and_its_exact_notice() {
         let mut actions = vec![
-            AtcTickAction::ProbeAgent { agent: "BlueFox".into() },
-            AtcTickAction::SendAdvisory { agent: "BlueFox".into(), message: "monitoring".into() },
-            AtcTickAction::ReleaseReservations { agent: "BlueFox".into() },
-            AtcTickAction::SendAdvisory { agent: "BlueFox".into(), message: "released".into() },
+            AtcTickAction::ProbeAgent {
+                agent: "BlueFox".into(),
+            },
+            AtcTickAction::SendAdvisory {
+                agent: "BlueFox".into(),
+                message: "monitoring".into(),
+            },
+            AtcTickAction::ReleaseReservations {
+                agent: "BlueFox".into(),
+            },
+            AtcTickAction::SendAdvisory {
+                agent: "BlueFox".into(),
+                message: "released".into(),
+            },
         ];
         let suppressed = HashSet::from([
             ActionKey::Probe("BlueFox".into()),
             ActionKey::Advisory("BlueFox".into(), "monitoring".into()),
         ]);
-        retain_actions(&mut actions, &suppressed, &HashSet::new());
+        retain_actions(&mut actions, &suppressed, &mut HashMap::new());
         assert_eq!(actions.len(), 2);
         assert!(matches!(actions[0], AtcTickAction::ReleaseReservations { .. }));
-        assert!(matches!(&actions[1], AtcTickAction::SendAdvisory { message, .. } if message == "released"));
+        assert!(matches!(
+            &actions[1],
+            AtcTickAction::SendAdvisory { message, .. } if message == "released"
+        ));
     }
 
     #[test]
-    fn an_identical_retained_action_wins_over_a_suppressed_duplicate() {
+    fn one_retained_effect_cannot_replay_multiple_identical_actions() {
         let key = ActionKey::Advisory("BlueFox".into(), "notice".into());
-        let mut actions = vec![AtcTickAction::SendAdvisory {
-            agent: "BlueFox".into(),
-            message: "notice".into(),
-        }];
-        retain_actions(&mut actions, &HashSet::from([key.clone()]), &HashSet::from([key]));
+        let mut actions = vec![
+            AtcTickAction::SendAdvisory {
+                agent: "BlueFox".into(),
+                message: "notice".into(),
+            };
+            10_000
+        ];
+        retain_actions(
+            &mut actions,
+            &HashSet::from([key.clone()]),
+            &mut HashMap::from([(key, 1)]),
+        );
         assert_eq!(actions.len(), 1);
+    }
+
+    #[test]
+    fn multiple_genuinely_retained_notices_preserve_their_multiplicity() {
+        let key = ActionKey::Advisory("BlueFox".into(), "notice".into());
+        let mut actions = vec![
+            AtcTickAction::SendAdvisory {
+                agent: "BlueFox".into(),
+                message: "notice".into(),
+            };
+            3
+        ];
+        retain_actions(
+            &mut actions,
+            &HashSet::from([key.clone()]),
+            &mut HashMap::from([(key, 2)]),
+        );
+        assert_eq!(actions.len(), 2);
+    }
+
+    #[test]
+    fn shared_global_reset_also_resets_notification_admission() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            atc_probe_interval_secs: 1,
+            ..mcp_agent_mail_core::Config::default()
+        };
+        reset_global_atc_state_for_test(&config);
+        {
+            let mut state = delivery_state()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.admission.begin_tick(200_000_000);
+            assert_eq!(
+                state.admission.admit(
+                    Notification {
+                        key: "liveness_probe:project:BlueFox",
+                        class: NotificationClass::Probe,
+                        last_activity_micros: Some(1_000_000),
+                        cooldown_micros: 1_000_000,
+                    },
+                    200_000_000,
+                ),
+                Admission::Admitted
+            );
+        }
+        assert_eq!(atc_delivery_stats().admitted, 1);
+        reset_global_atc_state_for_test(&config);
+        assert_eq!(atc_delivery_stats(), AtcDeliveryStats::default());
+    }
+
+    #[test]
+    fn disabled_public_tick_entrypoints_remain_inert() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: false,
+            ..mcp_agent_mail_core::Config::default()
+        };
+        reset_global_atc_state_for_test(&config);
+        assert!(atc_tick_report(200_000_000).is_none());
+        assert!(atc_tick(200_000_000).is_empty());
+        assert_eq!(atc_delivery_stats(), AtcDeliveryStats::default());
     }
 }
