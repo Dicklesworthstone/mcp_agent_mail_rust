@@ -1,24 +1,18 @@
-//! Bounded admission for best-effort ATC notifications, before persistence.
+//! Passive liveness observation and bounded admission for actionable ATC mail.
 //!
-//! A new decision ID is not a new reason to contact an agent. Liveness prompts
-//! are admitted once per family and observed-activity epoch; recurring conflict
-//! notices are admitted once per semantic cooldown. Neither a timer tick nor
-//! another copy of a population snapshot rearms an unanswered prompt.
+//! Routine liveness checks are NOT messages. A timer, restart, newer activity
+//! epoch, or explicit Live executor mode must not turn them into durable
+//! `messages`, `message_recipients`, contact requests, or archive work (GH264).
+//! The engine already receives attributed tool activity and retains its bounded
+//! decision ledger; unsent checks are not acknowledgments or delivery outcomes.
 //!
-//! This gate records admission, not successful delivery. Prompts are best-effort
-//! and are not retried within the same inactivity episode. It must never gate
-//! reservation mutations or notices reporting their outcome. No entry here is
-//! an acknowledgement, an activity observation, or evidence of agent death.
+//! Only actionable conflict notifications use this delivery budget/cache.
+//! Reservation mutations and their outcome notices bypass this optional-mail
+//! gate. The gate records admission, not successful delivery.
 
 use std::collections::HashMap;
 
-/// Keep routine notifications well below the operator's 64-action drain budget.
-/// The engine independently limits liveness reviews (including releases) to 8.
 pub(crate) const MAX_NOTIFICATIONS_PER_TICK: usize = 16;
-/// Three liveness families for a 4,096-agent population, plus conflict headroom.
-/// At capacity, fail closed for optional notifications rather than evicting an
-/// unanswered prompt and immediately sending it again. Critical effects bypass
-/// this cache entirely. Expired conflict cooldowns are reclaimed each tick.
 const MAX_NOTIFICATION_KEYS: usize = 16_384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,7 +24,10 @@ pub(crate) enum NotificationClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Admission {
+    /// An actionable notification may reach the durable executor.
     Admitted,
+    /// Observed only in memory; MUST NOT reach the mail/experience executor.
+    Passive,
     Duplicate,
     NoActivity,
     RecentlyActive,
@@ -38,10 +35,11 @@ pub(crate) enum Admission {
     Capacity,
 }
 
-/// Process-local counters. Suppression is deliberately not another DB event.
+/// Process-local counters. Passive checks never create replacement DB events.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AtcDeliveryStats {
     pub admitted: u64,
+    pub passive_liveness: u64,
     pub duplicate: u64,
     pub no_activity: u64,
     pub recently_active: u64,
@@ -50,14 +48,8 @@ pub struct AtcDeliveryStats {
     pub tracked_keys: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Entry {
-    Activity(i64),
-    Cooldown(i64),
-}
-
 pub(crate) struct Notification<'a> {
-    /// The planner's project-, agent-, and family-scoped semantic cooldown key.
+    /// Project-, agent-, and family-scoped semantic key for actionable mail.
     pub key: &'a str,
     pub class: NotificationClass,
     pub last_activity_micros: Option<i64>,
@@ -66,7 +58,7 @@ pub(crate) struct Notification<'a> {
 
 #[derive(Debug)]
 pub(crate) struct NotificationAdmission {
-    entries: HashMap<String, Entry>,
+    cooldowns: HashMap<String, i64>,
     limit: usize,
     key_limit: usize,
     remaining: usize,
@@ -85,7 +77,7 @@ impl NotificationAdmission {
 
     fn with_limits(min_probe_silence_micros: i64, limit: usize, key_limit: usize) -> Self {
         Self {
-            entries: HashMap::new(),
+            cooldowns: HashMap::new(),
             limit,
             key_limit,
             remaining: 0,
@@ -96,55 +88,40 @@ impl NotificationAdmission {
 
     pub(crate) fn begin_tick(&mut self, now_micros: i64) {
         self.remaining = self.limit;
-        // Never age out unanswered liveness entries: doing so rearms silent
-        // agents without new evidence. Conflict entries can safely expire.
-        self.entries.retain(|_, entry| match entry {
-            Entry::Activity(_) => true,
-            Entry::Cooldown(until) => *until > now_micros,
-        });
+        self.cooldowns.retain(|_, until| *until > now_micros);
     }
 
     pub(crate) fn admit(&mut self, notification: Notification<'_>, now_micros: i64) -> Admission {
-        let next_entry = match notification.class {
-            NotificationClass::Probe | NotificationClass::Liveness => {
-                let Some(activity) = notification.last_activity_micros.filter(|ts| *ts > 0) else {
-                    return self.record(Admission::NoActivity);
-                };
-                if notification.class == NotificationClass::Probe
-                    && (activity >= now_micros
-                        || now_micros.saturating_sub(activity) < self.min_probe_silence_micros)
-                {
-                    return self.record(Admission::RecentlyActive);
-                }
-                if let Some(Entry::Activity(previous)) = self.entries.get(notification.key)
-                    && activity <= *previous
-                {
-                    return self.record(Admission::Duplicate);
-                }
-                Entry::Activity(activity)
+        if matches!(notification.class, NotificationClass::Probe | NotificationClass::Liveness) {
+            let Some(activity) = notification.last_activity_micros.filter(|ts| *ts > 0) else {
+                return self.record(Admission::NoActivity);
+            };
+            if notification.class == NotificationClass::Probe
+                && (activity >= now_micros
+                    || now_micros.saturating_sub(activity) < self.min_probe_silence_micros)
+            {
+                return self.record(Admission::RecentlyActive);
             }
-            NotificationClass::Conflict => {
-                if let Some(Entry::Cooldown(until)) = self.entries.get(notification.key)
-                    && now_micros < *until
-                {
-                    return self.record(Admission::Duplicate);
-                }
-                // A zero/negative cooldown must still coalesce duplicates in
-                // the same tick, rather than filling the entire action budget.
-                Entry::Cooldown(now_micros.saturating_add(notification.cooldown_micros.max(1)))
-            }
-        };
+            // No admission entitlement, key allocation, cooldown, or budget is
+            // consumed. In particular, a fresh process/epoch still sends zero
+            // routine mail, and a large liveness roster cannot starve conflicts.
+            return self.record(Admission::Passive);
+        }
 
+        if self.cooldowns.get(notification.key).is_some_and(|until| now_micros < *until) {
+            return self.record(Admission::Duplicate);
+        }
         if self.remaining == 0 {
-            // Do not consume an activity epoch or cooldown. The planner can
-            // propose the still-relevant notification again on a later tick.
+            // A later proposal can retry; deferral consumes no cooldown.
             return self.record(Admission::Deferred);
         }
-        if !self.entries.contains_key(notification.key) && self.entries.len() >= self.key_limit {
+        if !self.cooldowns.contains_key(notification.key) && self.cooldowns.len() >= self.key_limit {
             return self.record(Admission::Capacity);
         }
-
-        self.entries.insert(notification.key.to_owned(), next_entry);
+        self.cooldowns.insert(
+            notification.key.to_owned(),
+            now_micros.saturating_add(notification.cooldown_micros.max(1)),
+        );
         self.remaining -= 1;
         self.record(Admission::Admitted)
     }
@@ -152,6 +129,7 @@ impl NotificationAdmission {
     fn record(&mut self, admission: Admission) -> Admission {
         let count = match admission {
             Admission::Admitted => &mut self.stats.admitted,
+            Admission::Passive => &mut self.stats.passive_liveness,
             Admission::Duplicate => &mut self.stats.duplicate,
             Admission::NoActivity => &mut self.stats.no_activity,
             Admission::RecentlyActive => &mut self.stats.recently_active,
@@ -163,10 +141,7 @@ impl NotificationAdmission {
     }
 
     pub(crate) fn stats(&self) -> AtcDeliveryStats {
-        AtcDeliveryStats {
-            tracked_keys: self.entries.len(),
-            ..self.stats
-        }
+        AtcDeliveryStats { tracked_keys: self.cooldowns.len(), ..self.stats }
     }
 }
 
@@ -196,51 +171,77 @@ mod tests {
     }
 
     #[test]
-    fn ten_thousand_ticks_do_not_rearm_an_unanswered_probe() {
+    fn ten_thousand_ticks_emit_no_unanswered_probe_mail() {
         let mut gate = NotificationAdmission::new(120 * SECOND);
         for tick in 0..10_000 {
             let now = (200 + tick * 120) * SECOND;
             gate.begin_tick(now);
-            let result = gate.admit(probe("probe:project:BlueFox", Some(SECOND)), now);
-            assert_eq!(result, if tick == 0 { Admission::Admitted } else { Admission::Duplicate });
+            assert_eq!(gate.admit(probe("probe:p:a", Some(SECOND)), now), Admission::Passive);
         }
-        assert_eq!(gate.stats().admitted, 1);
-        assert_eq!(gate.stats().duplicate, 9_999);
-        assert_eq!(gate.stats().tracked_keys, 1);
+        assert_eq!(gate.stats().admitted, 0);
+        assert_eq!(gate.stats().passive_liveness, 10_000);
+        assert_eq!(gate.stats().tracked_keys, 0);
     }
 
     #[test]
-    fn only_strictly_new_activity_rearms_a_prompt() {
+    fn new_activity_and_restarts_do_not_create_delivery_entitlements() {
+        for _restart in 0..100 {
+            let mut gate = NotificationAdmission::new(0);
+            gate.begin_tick(10 * SECOND);
+            for activity in [SECOND, 2 * SECOND, SECOND - 1] {
+                assert_eq!(gate.admit(probe("probe:p:a", Some(activity)), 10 * SECOND), Admission::Passive);
+            }
+            assert_eq!(gate.stats().admitted, 0);
+            assert_eq!(gate.stats().tracked_keys, 0);
+        }
+    }
+
+    #[test]
+    fn all_routine_liveness_families_are_observation_only() {
         let mut gate = NotificationAdmission::new(0);
         gate.begin_tick(10 * SECOND);
-        assert_eq!(gate.admit(probe("probe:p:a", Some(SECOND)), 10 * SECOND), Admission::Admitted);
-        for activity in [SECOND, SECOND - 1, 1] {
-            assert_eq!(gate.admit(probe("probe:p:a", Some(activity)), 10 * SECOND), Admission::Duplicate);
+        for key in ["liveness_monitoring:p:a", "withheld_release_notice:p:a"] {
+            let notice = Notification { class: NotificationClass::Liveness, ..probe(key, Some(SECOND)) };
+            assert_eq!(gate.admit(notice, 10 * SECOND), Admission::Passive);
         }
-        assert_eq!(gate.admit(probe("probe:p:a", Some(2 * SECOND)), 10 * SECOND), Admission::Admitted);
-        assert_eq!(gate.stats().tracked_keys, 1, "new epochs replace, not accumulate, entries");
+        assert_eq!(gate.stats().admitted, 0);
     }
 
     #[test]
-    fn never_observed_agents_do_not_receive_durable_probe_proposals() {
+    fn never_observed_agents_do_not_receive_probe_proposals() {
         let mut gate = NotificationAdmission::new(0);
         gate.begin_tick(200 * SECOND);
         for activity in [None, Some(0), Some(-1)] {
             assert_eq!(gate.admit(probe("probe:p:a", activity), 200 * SECOND), Admission::NoActivity);
         }
         assert_eq!(gate.stats().tracked_keys, 0);
-        assert_eq!(gate.admit(probe("probe:p:a", Some(SECOND)), 200 * SECOND), Admission::Admitted);
+        assert_eq!(gate.admit(probe("probe:p:a", Some(SECOND)), 200 * SECOND), Admission::Passive);
     }
 
     #[test]
-    fn active_or_future_dated_agents_do_not_consume_their_next_probe() {
+    fn active_or_future_dated_agents_are_not_counted_as_silent() {
         let mut gate = NotificationAdmission::new(120 * SECOND);
         gate.begin_tick(100 * SECOND);
         for now in [0, SECOND, 120 * SECOND] {
             assert_eq!(gate.admit(probe("probe:p:a", Some(SECOND)), now), Admission::RecentlyActive);
         }
+        assert_eq!(gate.admit(probe("probe:p:a", Some(SECOND)), 121 * SECOND), Admission::Passive);
+        assert_eq!(gate.stats().admitted, 0);
+    }
+
+    #[test]
+    fn passive_population_cannot_consume_conflict_capacity_or_budget() {
+        let mut gate = NotificationAdmission::with_limits(0, 1, 1);
+        gate.begin_tick(10 * SECOND);
+        for agent in 0..10_000 {
+            let key = format!("probe:p:Agent{agent}");
+            assert_eq!(gate.admit(probe(&key, Some(SECOND)), 10 * SECOND), Admission::Passive);
+        }
         assert_eq!(gate.stats().tracked_keys, 0);
-        assert_eq!(gate.admit(probe("probe:p:a", Some(SECOND)), 121 * SECOND), Admission::Admitted);
+        assert_eq!(gate.admit(conflict("deadlock:p:a"), 10 * SECOND), Admission::Admitted);
+        // Passive observations remain possible even after the mail budget is spent.
+        assert_eq!(gate.admit(probe("probe:p:late", Some(SECOND)), 10 * SECOND), Admission::Passive);
+        assert_eq!(gate.stats().admitted, 1);
     }
 
     #[test]
@@ -253,37 +254,35 @@ mod tests {
             gate.begin_tick(now);
             let mut batch = 0;
             for agent in 0..POPULATION {
-                let key = format!("deadlock:project:Agent{agent:04}");
+                let key = format!("deadlock:p:Agent{agent:04}");
                 if gate.admit(conflict(&key), now) == Admission::Admitted {
-                    assert!(delivered.insert(agent), "duplicate proposal escaped admission");
+                    assert!(delivered.insert(agent));
                     batch += 1;
                 }
             }
             assert!(batch <= MAX_NOTIFICATIONS_PER_TICK);
         }
         assert_eq!(delivered.len(), POPULATION);
-        assert_eq!(gate.stats().admitted, 940);
     }
 
     #[test]
-    fn deferred_notification_does_not_consume_epoch_or_cooldown() {
+    fn deferred_conflict_does_not_consume_cooldown() {
         let mut gate = NotificationAdmission::with_limits(0, 1, 10);
         gate.begin_tick(10 * SECOND);
         assert_eq!(gate.admit(conflict("deadlock:p:a"), 10 * SECOND), Admission::Admitted);
-        assert_eq!(gate.admit(probe("probe:p:b", Some(SECOND)), 10 * SECOND), Admission::Deferred);
+        assert_eq!(gate.admit(conflict("deadlock:p:b"), 10 * SECOND), Admission::Deferred);
         gate.begin_tick(11 * SECOND);
-        assert_eq!(gate.admit(probe("probe:p:b", Some(SECOND)), 11 * SECOND), Admission::Admitted);
+        assert_eq!(gate.admit(conflict("deadlock:p:b"), 11 * SECOND), Admission::Admitted);
     }
 
     #[test]
-    fn full_cache_does_not_evict_and_rearm_unanswered_agents() {
+    fn full_cache_preserves_existing_conflict_cooldowns() {
         let mut gate = NotificationAdmission::with_limits(0, 16, 1);
         gate.begin_tick(10 * SECOND);
-        assert_eq!(gate.admit(probe("probe:p:a", Some(SECOND)), 10 * SECOND), Admission::Admitted);
-        assert_eq!(gate.admit(probe("probe:p:b", Some(SECOND)), 10 * SECOND), Admission::Capacity);
+        assert_eq!(gate.admit(conflict("deadlock:p:a"), 10 * SECOND), Admission::Admitted);
+        assert_eq!(gate.admit(conflict("deadlock:p:b"), 10 * SECOND), Admission::Capacity);
         gate.begin_tick(20 * SECOND);
-        assert_eq!(gate.admit(probe("probe:p:a", Some(SECOND)), 20 * SECOND), Admission::Duplicate);
-        assert_eq!(gate.admit(probe("probe:p:a", Some(2 * SECOND)), 20 * SECOND), Admission::Admitted);
+        assert_eq!(gate.admit(conflict("deadlock:p:a"), 20 * SECOND), Admission::Duplicate);
         assert_eq!(gate.stats().tracked_keys, 1);
     }
 
@@ -296,17 +295,16 @@ mod tests {
         assert_eq!(gate.admit(conflict("deadlock:p:a"), 300 * SECOND), Admission::Duplicate);
         gate.begin_tick(301 * SECOND);
         assert_eq!(gate.admit(conflict("deadlock:p:b"), 301 * SECOND), Admission::Admitted);
-        assert_eq!(gate.stats().tracked_keys, 1);
     }
 
     #[test]
-    fn project_and_family_scopes_are_independent() {
+    fn conflict_project_scopes_are_independent() {
         let mut gate = NotificationAdmission::new(0);
         gate.begin_tick(10 * SECOND);
-        for key in ["probe:p1:a", "probe:p2:a", "monitoring:p1:a"] {
-            assert_eq!(gate.admit(probe(key, Some(SECOND)), 10 * SECOND), Admission::Admitted);
+        for key in ["deadlock:p1:a", "deadlock:p2:a"] {
+            assert_eq!(gate.admit(conflict(key), 10 * SECOND), Admission::Admitted);
         }
-        assert_eq!(gate.stats().admitted, 3);
+        assert_eq!(gate.stats().admitted, 2);
     }
 
     #[test]

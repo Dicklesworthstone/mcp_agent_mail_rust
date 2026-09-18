@@ -1,6 +1,7 @@
 //! Regressions through the actual report-admission boundary, not a model of it.
 
 use super::*;
+use std::collections::HashSet;
 
 const SECOND: i64 = 1_000_000;
 
@@ -168,8 +169,13 @@ fn liveness_families_share_one_activity_lookup_and_conflicts_need_none() {
         Some(SECOND)
     });
     assert_eq!(lookups, ["BlueFox"]);
-    assert_eq!(effects.len(), 4);
-    assert_eq!(actions.len(), 4);
+    assert_eq!(effects.len(), 2);
+    assert_eq!(actions.len(), 2);
+    assert_eq!(admission.stats().passive_liveness, 2);
+    assert_eq!(cursor.as_deref(), Some("deadlock_remediation:project:RedFox"));
+    assert!(effects.iter().all(|effect| {
+        matches!(effect.semantics.family.as_str(), "deadlock_remediation" | "release_notice")
+    }));
 }
 
 #[test]
