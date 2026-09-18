@@ -6,8 +6,9 @@
 //! an error, not permission to retry or to overwrite a replacement pathname.
 
 use std::ffi::OsStr;
-use std::fs::File;
+use std::fs::{File, Metadata};
 use std::io;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
@@ -19,10 +20,80 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NONBLOCK)
     .union(OFlags::CLOEXEC);
 
-pub(super) struct ReclaimDirectory {
+/// One newly claimed quarantine, retained across all moves in a batch.
+/// Dropping it closes the handle; it never removes the directory or evidence.
+#[derive(Debug)]
+pub struct ReclaimDirectory {
     file: File,
     path: PathBuf,
 }
+
+impl ReclaimDirectory {
+    /// Claim a fresh, private, directory-synced quarantine without following
+    /// user-controlled ancestor symlinks. An occupied leaf is never reused.
+    pub fn claim(path: &Path) -> io::Result<Self> {
+        claim_reclaim_directory(path)
+    }
+
+    /// Requested absolute spelling. A concurrent namespace change can make
+    /// this spelling stale; all moves also validate the retained authority.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Stage precisely the regular file selected by a prior inventory.
+    ///
+    /// Reject replacement, changed length/mtime, and hard-linked aliases before
+    /// moving. Sync the retained source file and both participating directories.
+    /// A post-move failure carries [`CompletedReclaimMove`] in the IO error;
+    /// callers must not report it as still at the source or retry it blindly.
+    pub fn stage_inventoried_file(&self, source: &Path, expected: &Metadata) -> io::Result<PathBuf> {
+        move_into_with(
+            source,
+            self,
+            Some(expected),
+            rename_reclaim_entry,
+            sync_reclaim_move_parents,
+        )
+    }
+}
+
+/// The namespace move completed, but subsequent validation or sync failed.
+///
+/// This is deliberately distinguishable from a refused move without parsing
+/// an English diagnostic. The destination spelling may no longer name the
+/// retained directory when another actor has renamed an ancestor.
+#[derive(Debug)]
+pub struct CompletedReclaimMove {
+    requested_destination: PathBuf,
+    failures: Vec<String>,
+}
+
+impl CompletedReclaimMove {
+    #[must_use]
+    pub fn from_io_error(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref::<Self>()
+    }
+
+    #[must_use]
+    pub fn requested_destination(&self) -> &Path {
+        &self.requested_destination
+    }
+}
+
+impl std::fmt::Display for CompletedReclaimMove {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "artifact rename completed for requested destination {}; directory durability is unconfirmed or namespace validation failed: {}; evidence is retained in the opened destination directory, whose pathname may have changed; do not retry or roll back this move",
+            self.requested_destination.display(),
+            self.failures.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for CompletedReclaimMove {}
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
@@ -202,16 +273,36 @@ fn validate_source_entry(parent: &File, name: &OsStr, expected: &Stat) -> io::Re
     Ok(())
 }
 
+fn validate_inventoried_file(file: &File, expected: &Metadata) -> io::Result<()> {
+    let current = file.metadata()?;
+    if !expected.file_type().is_file()
+        || !current.file_type().is_file()
+        || expected.nlink() != 1
+        || current.nlink() != 1
+        || expected.dev() != current.dev()
+        || expected.ino() != current.ino()
+        || expected.len() != current.len()
+        || expected.mtime() != current.mtime()
+        || expected.mtime_nsec() != current.mtime_nsec()
+    {
+        return Err(invalid(
+            "rotation source no longer matches its inventoried regular, single-link file",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn move_recovery_debris_into(
     source: &Path,
     destination: &ReclaimDirectory,
 ) -> io::Result<PathBuf> {
-    move_into_with(source, destination, rename_reclaim_entry, sync_reclaim_move_parents)
+    move_into_with(source, destination, None, rename_reclaim_entry, sync_reclaim_move_parents)
 }
 
 fn move_into_with<R, S>(
     source: &Path,
     destination: &ReclaimDirectory,
+    inventoried: Option<&Metadata>,
     mut rename: R,
     mut sync: S,
 ) -> io::Result<PathBuf>
@@ -247,6 +338,10 @@ where
     if !same_object(&before, &expected) || before.st_size != expected.st_size {
         return Err(invalid("recovery artifact changed while acquiring its authority"));
     }
+    if let Some(inventoried) = inventoried {
+        validate_inventoried_file(&source_file, inventoried)?;
+        source_file.sync_all()?;
+    }
     for suffix in 0..MAX_RECLAIM_MOVE_ATTEMPTS {
         let mut leaf = name.to_os_string();
         if suffix != 0 {
@@ -256,6 +351,9 @@ where
         validate_directory(source_parent_path, &source_parent)?;
         validate_directory(&destination.path, &destination.file)?;
         validate_source_entry(&source_parent, name, &expected)?;
+        if let Some(inventoried) = inventoried {
+            validate_inventoried_file(&source_file, inventoried)?;
+        }
         match rename(&source_parent, name, &destination.file, &leaf) {
             Ok(()) => {
                 // Always sync the directories that actually participated in
@@ -264,22 +362,26 @@ where
                 let source_bound = validate_directory(source_parent_path, &source_parent);
                 let destination_bound = validate_directory(&destination.path, &destination.file);
                 let moved_identity = validate_source_entry(&destination.file, &leaf, &expected);
+                let inventory_bound = inventoried.map_or(Ok(()), |metadata| {
+                    validate_inventoried_file(&source_file, metadata)
+                });
                 let mut failures = Vec::new();
                 for (phase, result) in [
                     ("parent sync", synced),
                     ("source parent", source_bound),
                     ("destination parent", destination_bound),
                     ("moved identity", moved_identity),
+                    ("inventory witness", inventory_bound),
                 ] {
                     if let Err(error) = result {
                         failures.push(format!("{phase}: {error}"));
                     }
                 }
                 if !failures.is_empty() {
-                    return Err(io::Error::other(format!(
-                        "artifact rename completed for requested destination {}; directory durability is unconfirmed or namespace validation failed: {}; evidence is retained in the opened destination directory, whose pathname may have changed; do not retry or roll back this move",
-                        requested_destination.display(), failures.join("; ")
-                    )));
+                    return Err(io::Error::other(CompletedReclaimMove {
+                        requested_destination,
+                        failures,
+                    }));
                 }
                 return Ok(requested_destination);
             }
@@ -313,7 +415,7 @@ where
 {
     let path = absolute_spelling(destination)?;
     let directory = ReclaimDirectory { file: open_directory(&path, false)?, path };
-    move_into_with(source, &directory, rename, sync)
+    move_into_with(source, &directory, None, rename, sync)
 }
 
 #[cfg(test)]
@@ -372,6 +474,7 @@ mod tests {
         let error = move_into_with(
             &source,
             &directory,
+            None,
             |from_parent, from, to_parent, to| {
                 calls += 1;
                 std::fs::rename(&requested, &retained).unwrap();
@@ -386,6 +489,10 @@ mod tests {
         assert_eq!(std::fs::read(retained.join("evidence")).unwrap(), b"source evidence");
         assert!(error.to_string().contains("pathname may have changed"));
         assert!(error.to_string().contains("do not retry or roll back"));
+        assert_eq!(
+            CompletedReclaimMove::from_io_error(&error).unwrap().requested_destination(),
+            requested.join("evidence")
+        );
     }
 
     #[test]
@@ -400,6 +507,7 @@ mod tests {
         let error = move_into_with(
             &source,
             &directory,
+            None,
             |from_parent, from, to_parent, to| {
                 std::fs::rename(&parent, &retained).unwrap();
                 std::fs::create_dir(&parent).unwrap();
@@ -425,6 +533,7 @@ mod tests {
         let error = move_into_with(
             &source,
             &directory,
+            None,
             |from_parent, from, to_parent, to| {
                 calls += 1;
                 let result = rename_reclaim_entry(from_parent, from, to_parent, to);
@@ -441,6 +550,7 @@ mod tests {
         assert_eq!(std::fs::read(directory.path.join("evidence")).unwrap(), b"occupied");
         assert!(!directory.path.join("evidence.1").exists());
         assert!(error.to_string().contains("source identity"));
+        assert!(CompletedReclaimMove::from_io_error(&error).is_none());
     }
 
     #[test]
@@ -460,5 +570,80 @@ mod tests {
             assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
         }
         assert_eq!(std::fs::metadata(root).unwrap().permissions().mode() & 0o777, 0o755);
+    }
+
+    #[test]
+    fn inventoried_file_stage_rejects_same_size_replacement() {
+        let root = fixture();
+        let source = root.join("backup");
+        std::fs::write(&source, b"original").unwrap();
+        let inventoried = std::fs::symlink_metadata(&source).unwrap();
+        std::fs::rename(&source, root.join("original")).unwrap();
+        std::fs::write(&source, b"replaced").unwrap();
+        let directory = ReclaimDirectory::claim(&root.join("quarantine")).unwrap();
+        let error = directory.stage_inventoried_file(&source, &inventoried).unwrap_err();
+        assert!(CompletedReclaimMove::from_io_error(&error).is_none());
+        assert_eq!(std::fs::read(source).unwrap(), b"replaced");
+        assert_eq!(std::fs::read(root.join("original")).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn inventoried_file_stage_rejects_changed_content_and_hardlink_alias() {
+        for hardlink in [false, true] {
+            let root = fixture();
+            let source = root.join("backup");
+            std::fs::write(&source, b"original").unwrap();
+            let inventoried = std::fs::symlink_metadata(&source).unwrap();
+            if hardlink {
+                std::fs::hard_link(&source, root.join("live-alias")).unwrap();
+            } else {
+                std::fs::write(&source, b"longer changed content").unwrap();
+            }
+            let before = std::fs::read(&source).unwrap();
+            let directory = ReclaimDirectory::claim(&root.join("quarantine")).unwrap();
+            assert!(directory.stage_inventoried_file(&source, &inventoried).is_err());
+            assert_eq!(std::fs::read(source).unwrap(), before);
+            if hardlink {
+                assert_eq!(std::fs::read(root.join("live-alias")).unwrap(), before);
+            }
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn inventoried_file_stage_reports_sync_failure_as_a_completed_move() {
+        let root = fixture();
+        let source = root.join("backup");
+        std::fs::write(&source, b"backup contents").unwrap();
+        let inventoried = std::fs::symlink_metadata(&source).unwrap();
+        let directory = ReclaimDirectory::claim(&root.join("quarantine")).unwrap();
+        let error = move_into_with(
+            &source,
+            &directory,
+            Some(&inventoried),
+            rename_reclaim_entry,
+            |_, _| Err(io::Error::other("injected post-move sync failure")),
+        ).unwrap_err();
+        let completed = CompletedReclaimMove::from_io_error(&error).unwrap();
+        assert_eq!(completed.requested_destination(), directory.path().join("backup"));
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(completed.requested_destination()).unwrap(), b"backup contents");
+    }
+
+    #[test]
+    fn inventoried_file_stage_preserves_collision_evidence_and_publishes_exact_file() {
+        let root = fixture();
+        let source = root.join("backup");
+        std::fs::write(&source, b"backup contents").unwrap();
+        let inventoried = std::fs::symlink_metadata(&source).unwrap();
+        let directory = ReclaimDirectory::claim(&root.join("quarantine")).unwrap();
+        std::fs::write(directory.path().join("backup"), b"prior evidence").unwrap();
+        let destination = directory.stage_inventoried_file(&source, &inventoried).unwrap();
+        assert_eq!(destination, directory.path().join("backup.1"));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"backup contents");
+        assert_eq!(std::fs::symlink_metadata(&destination).unwrap().ino(), inventoried.ino());
+        assert_eq!(std::fs::read(directory.path().join("backup")).unwrap(), b"prior evidence");
+        assert!(!source.exists());
     }
 }
