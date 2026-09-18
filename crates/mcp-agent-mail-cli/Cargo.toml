@@ -18,6 +18,11 @@ publish = false
 name = "am"
 path = "src/main.rs"
 
+# Explicit maintenance utility; does not add work to UI reads or registration.
+[[bin]]
+name = "am-discover-siblings"
+path = "src/bin/am-discover-siblings.rs"
+
 [dependencies]
 # GH#161: global allocator to bound long-running daemon RSS (glibc arena fragmentation).
 mimalloc = { workspace = true }

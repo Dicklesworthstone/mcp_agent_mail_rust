@@ -1,4 +1,4 @@
-//! Bounded, local sibling-project discovery for fresh Rust mailboxes.
+//! Explicit, bounded sibling-project discovery from live task metadata.
 //!
 //! Suggestions are hints for human review, not links or contact permissions.
 //! Ranking uses only project identity and bounded agent task descriptions; no
@@ -18,12 +18,22 @@ pub const MAX_REFRESH_PAIRS: usize = 3;
 pub const REFRESH_TTL_MICROS: i64 = 12 * 60 * 60 * 1_000_000;
 const MAX_PROJECTS: i64 = 256;
 const MAX_PROFILES: usize = 1024;
-const MIN_SCORE: f64 = 0.55;
+const MIN_SCORE: f64 = crate::queries::PROJECT_SIBLING_MIN_SUGGESTION_SCORE;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
 pub struct RefreshSummary {
     pub candidates: usize,
     pub written: usize,
+    pub suggestions: Vec<DiscoveredPair>,
+}
+
+/// One persisted review hint. Scores are heuristic ranks, not probabilities.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DiscoveredPair {
+    pub project_a_id: i64,
+    pub project_b_id: i64,
+    pub score: f64,
+    pub rationale: String,
 }
 
 #[derive(Debug)]
@@ -47,7 +57,7 @@ fn db_error(error: impl std::fmt::Display) -> DbError {
 }
 
 fn checkpoint(cx: &Cx, started: Instant) -> DbResult<()> {
-    if cx.is_cancel_requested() || started.elapsed() >= Duration::from_secs(2) {
+    if cx.checkpoint().is_err() || started.elapsed() >= Duration::from_secs(2) {
         return Err(DbError::ResourceBusy(
             "sibling discovery cancelled or exceeded its refresh budget".to_string(),
         ));
@@ -59,8 +69,9 @@ fn checkpoint(cx: &Cx, started: Instant) -> DbResult<()> {
 ///
 /// Read-only diagnostics and static exports must not call this entrypoint.
 /// `focus_project` includes that project even when it is outside the newest
-/// 256 projects; opening an older project's home can therefore discover its
-/// relationships too. A failed/cancelled refresh never advances a TTL.
+/// 256 projects. This is explicit maintenance, not a page-render hook or a
+/// replacement for the cheap creation-time seeding in `queries`.
+/// A failed/cancelled refresh never advances a TTL.
 /// Confirmed and dismissed decisions are retained until explicitly reset by
 /// the existing review API; background heuristics cannot reverse a decision.
 pub async fn refresh_project_sibling_suggestions(
@@ -68,9 +79,24 @@ pub async fn refresh_project_sibling_suggestions(
     pool: &DbPool,
     focus_project: Option<i64>,
 ) -> Outcome<RefreshSummary, DbError> {
+    if focus_project.is_some_and(|id| id <= 0) {
+        return Outcome::Err(DbError::invalid(
+            "project_id",
+            "expected a positive project id",
+        ));
+    }
+    if cx.checkpoint().is_err() {
+        return Outcome::Cancelled(
+            cx.cancel_reason()
+                .unwrap_or_else(|| asupersync::CancelReason::user("sibling discovery cancelled")),
+        );
+    }
     if let Some(error) = crate::corruption_circuit_breaker().refusal_error() {
         return Outcome::Err(error);
     }
+    // Hold the generation lease across identity reads and connection acquire,
+    // not just COMMIT: a promotion must not replace the file between them.
+    let _write_activity = crate::write_barrier::begin_write_activity();
     let conn = match pool.acquire(cx).await {
         Outcome::Ok(conn) => conn,
         Outcome::Err(error) => return Outcome::Err(DbError::Sqlite(error.to_string())),
@@ -125,6 +151,8 @@ fn refresh_conn(
             .map_err(db_error)?;
         if let Some(row) = rows.first() {
             projects.push(project_from_row(row)?);
+        } else {
+            return Err(DbError::not_found("Project", id.to_string()));
         }
     }
     if projects.len() < 2 {
@@ -142,6 +170,7 @@ fn refresh_conn(
     let profile_sql = format!(
         "SELECT project_id, substr(task_description, 1, 256) AS task \
          FROM agents WHERE project_id IN ({placeholders}) AND retired_at IS NULL \
+         AND NOT EXISTS (SELECT 1 FROM agent_deregistrations d WHERE d.agent_id = agents.id) \
          AND task_description <> '' ORDER BY last_active_ts DESC LIMIT {MAX_PROFILES}"
     );
     for row in conn.query_sync(&profile_sql, &ids).map_err(db_error)? {
@@ -206,21 +235,29 @@ fn refresh_conn(
     });
     let mut summary = RefreshSummary {
         candidates: candidates.len(),
-        written: 0,
+        ..RefreshSummary::default()
     };
     candidates.truncate(MAX_REFRESH_PAIRS);
     if candidates.is_empty() {
         return Ok(summary);
     }
     checkpoint(cx, started)?;
-    let _write_activity = crate::write_barrier::begin_write_activity();
     if let Some(error) = crate::corruption_circuit_breaker().refusal_error() {
         return Err(error);
     }
     let mut transaction = RefreshTransaction::begin(conn)?;
     for candidate in candidates {
         checkpoint(cx, started)?;
-        summary.written += persist_candidate(conn, &candidate, now, cutoff)?;
+        let written = persist_candidate(conn, &candidate, now, cutoff)?;
+        summary.written += written;
+        if written == 1 {
+            summary.suggestions.push(DiscoveredPair {
+                project_a_id: candidate.a.id,
+                project_b_id: candidate.b.id,
+                score: candidate.score,
+                rationale: candidate.rationale,
+            });
+        }
     }
     checkpoint(cx, started)?;
     transaction.commit()?;
@@ -236,6 +273,7 @@ fn persist_candidate(
     now: i64,
     cutoff: i64,
 ) -> DbResult<usize> {
+    let before = candidate_revision(conn, candidate)?;
     conn.execute_sync(
         "INSERT INTO project_sibling_suggestions \
          (project_a_id, project_b_id, score, status, rationale, created_ts, evaluated_ts) \
@@ -267,15 +305,52 @@ fn persist_candidate(
         ],
     )
     .map_err(db_error)?;
+    // The runtime driver can report zero through changes() after a real
+    // write. Read the row instead, under the caller's immediate transaction.
+    let after = candidate_revision(conn, candidate)?;
+    if after == before {
+        return Ok(0);
+    }
+    match after {
+        Some((id, evaluated, status, score, rationale))
+            if evaluated == now
+                && status == "suggested"
+                && score.to_bits() == candidate.score.to_bits()
+                && rationale.as_deref() == Some(candidate.rationale.as_str())
+                && before.as_ref().is_none_or(|previous| previous.0 == id) =>
+        {
+            Ok(1)
+        }
+        _ => Err(db_error(
+            "persisted sibling suggestion did not match the write witness",
+        )),
+    }
+}
+
+type CandidateRevision = (i64, i64, String, f64, Option<String>);
+
+fn candidate_revision(
+    conn: &DbConn,
+    candidate: &Candidate<'_>,
+) -> DbResult<Option<CandidateRevision>> {
     let rows = conn
-        .query_sync("SELECT changes() AS changed", &[])
+        .query_sync(
+            "SELECT id, evaluated_ts, status, score, rationale FROM project_sibling_suggestions \
+             WHERE project_a_id = ? AND project_b_id = ?",
+            &[Value::BigInt(candidate.a.id), Value::BigInt(candidate.b.id)],
+        )
         .map_err(db_error)?;
-    let changed: i64 = rows
-        .first()
-        .ok_or_else(|| db_error("missing change count"))?
-        .get_named("changed")
-        .map_err(db_error)?;
-    usize::try_from(changed).map_err(db_error)
+    match rows.as_slice() {
+        [] => Ok(None),
+        [row] => Ok(Some((
+            row.get_named("id").map_err(db_error)?,
+            row.get_named("evaluated_ts").map_err(db_error)?,
+            row.get_named("status").map_err(db_error)?,
+            row.get_named("score").map_err(db_error)?,
+            row.get_named("rationale").map_err(db_error)?,
+        ))),
+        _ => Err(db_error("multiple rows represent one sibling pair")),
+    }
 }
 
 struct RefreshTransaction<'a> {
@@ -364,25 +439,28 @@ fn rank_pair(a: &Project, b: &Project) -> Option<(f64, String)> {
     let mut evidence = Vec::new();
     if !shared.is_empty() {
         let union = a_names.union(&b_names).count();
-        score = 0.55 + 0.35 * shared.len() as f64 / union as f64;
+        score = 0.90 + 0.07 * shared.len() as f64 / union as f64;
         evidence.push(format!("shared project-name terms: {}", shared.join(", ")));
     }
     if !a_names.is_empty() && a_leaf.eq_ignore_ascii_case(b_leaf) {
-        score = score.max(0.95);
+        score = score.max(0.98);
         evidence.push("same repository directory name in distinct locations".to_string());
     }
     if a_path.len() >= 2
         && b_path.len() >= 2
         && (a_path.starts_with(&b_path) || b_path.starts_with(&a_path))
     {
-        score = score.max(0.8);
+        score = score.max(0.96);
         evidence.push("one project directory contains the other".to_string());
     }
     let task_shared: Vec<_> = a.task_tokens.intersection(&b.task_tokens).collect();
-    if task_shared.len() >= 2 {
+    if task_shared.len() >= 3 {
         let union = a.task_tokens.union(&b.task_tokens).count();
-        score = score.max(0.5 + 0.4 * task_shared.len() as f64 / union as f64);
-        evidence.push(format!("{} shared agent-task terms", task_shared.len()));
+        let overlap = task_shared.len() as f64 / union as f64;
+        if overlap >= 0.5 {
+            score = score.max(0.92 + 0.07 * overlap);
+            evidence.push(format!("{} shared agent-task terms", task_shared.len()));
+        }
     }
     // Merely living in /dp, /work, or the same user's home is not a relation.
     if score >= MIN_SCORE
@@ -390,7 +468,7 @@ fn rank_pair(a: &Project, b: &Project) -> Option<(f64, String)> {
         && b_path.len() >= 2
         && a_path[..a_path.len() - 1] == b_path[..b_path.len() - 1]
     {
-        score = (score + 0.05).min(1.0);
+        score = (score + 0.02).min(1.0);
         evidence.push("shared parent directory".to_string());
     }
     (score >= MIN_SCORE).then(|| {
@@ -657,5 +735,87 @@ mod tests {
             now
         );
         crate::close_db_conn(reopened, "sibling discovery persistence reopen");
+    }
+
+    #[test]
+    fn focused_project_outside_scan_window_is_still_discovered() {
+        let conn = fixture();
+        for id in 3..=260 {
+            conn.execute_raw(&format!(
+                "INSERT INTO projects(id, slug, human_key, created_at) \
+                 VALUES ({id}, 'unrelated-{id}', '/elsewhere/item{id}', 1)"
+            ))
+            .unwrap();
+        }
+        conn.execute_raw(
+            "INSERT INTO projects(id, slug, human_key, created_at) \
+             VALUES (300, 'acme-jobs', '/work/acme-jobs', 1)",
+        )
+        .unwrap();
+        let summary = refresh_conn(
+            &Cx::for_testing(),
+            &conn,
+            Some(1),
+            REFRESH_TTL_MICROS * 2,
+        )
+        .expect("old project remains explicitly addressable");
+        assert_eq!(summary.written, 1);
+        assert_eq!(summary.suggestions[0].project_a_id, 1);
+        assert_eq!(summary.suggestions[0].project_b_id, 300);
+    }
+
+    #[test]
+    fn active_task_metadata_discovers_differently_named_projects() {
+        let conn = fixture();
+        conn.execute_raw(
+            "UPDATE projects SET human_key = '/warehouse/dispatch', slug = 'dispatch' WHERE id = 1; \
+             UPDATE projects SET human_key = '/store/shopfront', slug = 'shopfront' WHERE id = 2; \
+             INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts) \
+             VALUES (1, 1, 'BlueLake', 'test', 'test', 'acme inventory reconciliation', 1, 1), \
+                    (2, 2, 'RedStone', 'test', 'test', 'acme inventory reconciliation dashboards', 1, 1); \
+             INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (2, 2)",
+        )
+        .unwrap();
+        assert_eq!(
+            refresh_conn(&Cx::for_testing(), &conn, None, REFRESH_TTL_MICROS * 2)
+                .unwrap()
+                .written,
+            0,
+            "deregistered profiles must not supply active task evidence"
+        );
+        // A new active agent supplies real task metadata. No suggestion row
+        // is seeded by the fixture; discovery must generate it from the DB.
+        conn.execute_raw(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts) \
+             VALUES (3, 2, 'GreenHill', 'test', 'test', 'acme inventory reconciliation dashboards', 1, 3)",
+        )
+        .unwrap();
+        let summary = refresh_conn(
+            &Cx::for_testing(),
+            &conn,
+            None,
+            REFRESH_TTL_MICROS * 2,
+        )
+        .unwrap();
+        assert_eq!(summary.written, 1);
+        assert!(
+            summary.suggestions[0].score >= crate::queries::PROJECT_SIBLING_MIN_SUGGESTION_SCORE
+        );
+        assert!(summary.suggestions[0].rationale.contains("agent-task terms"));
+    }
+
+    #[test]
+    fn missing_focused_project_is_not_an_empty_success() {
+        let conn = fixture();
+        assert!(matches!(
+            refresh_conn(
+                &Cx::for_testing(),
+                &conn,
+                Some(999_999),
+                REFRESH_TTL_MICROS * 2,
+            ),
+            Err(DbError::NotFound { .. })
+        ));
+        assert!(state(&conn).is_empty());
     }
 }
