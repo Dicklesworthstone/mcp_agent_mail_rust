@@ -56,7 +56,9 @@ struct HydrationState {
 }
 
 impl HydrationState {
-    const fn should_defer_refresh(&self) -> bool {
+    // Not `const fn`: `VecDeque::is_empty` is not callable in a const context
+    // (E0015), and marking this const breaks the build outright.
+    fn should_defer_refresh(&self) -> bool {
         self.active_refresh.is_some()
             || !self.pending.is_empty()
             // The final hydration slice deliberately yields before inference.
