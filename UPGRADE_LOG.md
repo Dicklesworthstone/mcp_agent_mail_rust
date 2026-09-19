@@ -308,6 +308,15 @@ statements below; v0.3.36 is published and this work targets unreleased main.
   byte comparator also continues past a shared NUL, unlike canonical SQLite.
   These are source/oracle findings pending application-level reproduction;
   neither an engine pin change nor issue closure has been made.
+- Prepared a narrow candidate in the isolated `fsqlite-044-research` clone:
+  registry lowercase/shared-NUL handling follows upstream `6ede4b51c`, and
+  the VDBE comparator now also stops at a shared NUL before comparing full
+  lengths. A real rusqlite differential regression checks both paths across
+  441 input pairs (ASCII punctuation, case, Unicode and embedded NULs).
+  Two-file formatting passes. Strict remote execution is compiling on ovh-a
+  (`044-nocase-engine-candidate.log`); this is not yet a qualified fix.
+  Application pins are unchanged, and actual export/backup validation is
+  still required after engine qualification.
 - Concurrent commits captured the ATC fix and corrected ambiguous empty-vector
   assertions in cleanup tests (`a27c2bda` merge). The first retry predates that
   cleanup correction. A bounded shell follow-up waits for that owned RCH

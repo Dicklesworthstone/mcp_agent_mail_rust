@@ -1230,16 +1230,27 @@ mod tests {
 
     #[test]
     fn emit_output_toon_format() {
-        let data = serde_json::json!({"items": [1, 2, 3]});
+        let data = serde_json::json!({
+            "items": [1, 2, 3],
+            "agent": "BlueLake",
+            "subjects": ["comma, colon: quote\"", "first line\nsecond line", "Äλ"],
+            "ack_required": true,
+            "thread_id": null,
+            "empty": []
+        });
         let output = with_capture(|| {
             emit_output(&data, CliOutputFormat::Toon, || {
                 panic!("table render should not be called");
             });
         });
-        // TOON output should be valid and different from JSON
-        assert!(!output.is_empty());
-        // TOON uses different formatting than pretty JSON
-        // Just verify it produces output without crashing
+        assert!(
+            serde_json::from_str::<serde_json::Value>(output.trim()).is_err(),
+            "requested TOON must not silently fall back to JSON: {output}"
+        );
+        let decoded = toon::toon_to_json(output.trim()).expect("CLI emits valid TOON");
+        let decoded: serde_json::Value =
+            serde_json::from_str(&decoded).expect("decoded TOON is valid JSON");
+        assert_eq!(decoded, data, "CLI TOON output must preserve every value");
     }
 
     #[test]
