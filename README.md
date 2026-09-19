@@ -330,6 +330,11 @@ installed binary always matches the freshly-built artifact regardless of
 
 Requires Rust nightly (see `rust-toolchain.toml`). On current `main`, Cargo fetches [FrankenSearch](https://github.com/Dicklesworthstone/frankensearch) at the full git revision recorded in `Cargo.toml` and `Cargo.lock`, aligned with `FRANKENSEARCH_COMMIT` in `.github/workflows/dist.yml`. A manual build needs no FrankenSearch, fast_cmaes, or Beads sibling checkout. Use `cargo build --locked` to retain the checked-in dependency graph. Earlier release tags may still require the gated `../frankensearch-rel-0332` and `../fast_cmaes` checkouts; `install.sh --from-source` provisions their recorded revisions. The installer and container recipes retain those additional checkouts for provenance compatibility, while current Cargo builds consume the pinned git source. The mailbox uses FrankenSQLite 0.4.4 through SQLModel 0.5.0 on Asupersync 0.5.0, with an immutable engine revision retaining SQL binding and schema-prefix fixes omitted from the release. FastMCP 0.10.0 remains pinned to an immutable revision preserving protocol negotiation. Registry `beads_rust =0.5.4` retains its separate, patched FrankenSQLite 0.3.18 dependency.
 
+The current engine pin also includes NOCASE consistency, `INSERT ... SELECT`
+UPSERT parameter binding, and Linux retained-descriptor fixes. See
+[`UPGRADE_LOG.md`](UPGRADE_LOG.md) for qualification results and remaining
+release gates; these changes are not part of the published v0.3.36 binaries.
+
 ### Platforms
 
 | Platform | Architecture | Binary |

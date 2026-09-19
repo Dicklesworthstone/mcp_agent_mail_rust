@@ -5,6 +5,24 @@
 Tracked by `br-5lgwn`. This section supersedes historical current-status
 statements below; v0.3.36 is published and this work targets unreleased main.
 
+September 19 TOON update: `tru` 0.2.4 replaces 0.2.3 after review of the
+published package and upstream maintenance notes. Default features remain
+empty; no optional asynchronous runtime is enabled. The targeted resolution
+adds only `tru` 0.2.4 and removes its predecessor plus 58 obsolete/duplicate
+packages, reducing the graph from 880 to 822 packages. Its build metadata now
+shares the existing `vergen-gix` 10 stack. The remaining semantic edge changes
+select already-present Windows bindings and `gix-imara-diff`'s hashbrown;
+native Windows qualification remains required. The corrected old-version
+baseline passed all 95 selected tests at 18:20 UTC; the 95-test new-version
+runtime gate is running on the same worker. No new-version TOON runtime
+pass is claimed yet. Workspace/all-target compilation and strict Clippy
+passed on the new graph (`044-tru-024-{check,clippy}.log`); the isolated
+format check also passed after correcting the test assertion's wrapping
+(`044-tru-024-fmt-corrected.log`). Details: `044-tru-024-{metadata,resolution}.log` and
+`044-tru-024-semantic-edge-review.json`. The refreshed audit reports zero
+vulnerabilities; existing `paste` unmaintained and `lru` unsound advisories
+remain visible in `044-tru-024-audit.json`.
+
 Parallel reliability work (`br-8r6dl`, September 19): a real 0.4.4 VFS
 regression reproduced descriptor growth from 1 to 65 after 64 reopen/close
 cycles while preserving foreign-process lock exclusion. An isolated Linux
@@ -60,19 +78,31 @@ workspace/all-target check passed on ovh-a at 16:51 UTC (strict RCH exit 0,
 population integration test. Its bounded-hydration loop was extracted into
 a helper without changing any assertion, and the full workspace/all-target
 Clippy rerun passed at 16:55 UTC (`044-runtime-pin-app-clippy-helper.log`).
-Formatting and the final post-extraction workspace check pass; the real ATC
-integration target still needs re-execution. The older-pin TOON baseline
-continues independently on vmi1152480. The
+Formatting and the final post-extraction workspace check pass. All six real
+ATC integration tests passed at 17:55 UTC on the quiet worker, including
+940-agent bounded hydration and liveness behavior (strict RCH exit 0,
+`044-atc-helper-runtime-quiet.log`). The archive was built on hz3 and verified
+byte-identical before execution; SHA-256
+`7fa44c7f37141ca0fc2d11a1c3d3b367c651a42fb4ae304f069d2bc3333ee1d4`.
+The older-pin TOON baseline
+completed with twelve passes, one failure and 82 unrun tests. Its new
+round-trip assertion incorrectly distinguished JSON integers from the
+decoder's documented `f64` number representation. The corrected test
+requires the exact integer array on the wire and compares decoded values
+with explicit floating-point expectations for those three numbers, retaining
+all other field and no-JSON-fallback assertions. A fresh 95-test baseline
+on the current engine pin and unchanged `tru` 0.2.3 is running; the original
+failure is retained in `044-toon-baseline-runtime.log`. The
 focused sibling-discovery gate passed on hz3 with four normally admitted
 compiler slots, reusing the interrupted one-slot build's cache. The initial
 attempt exited 143 without a test verdict; its log is retained.
 
 The earlier application workspace/all-target check passed at 07:59 UTC. Strict
 Clippy then found a missing semicolon in ATC hydration; the manual fix is
-committed as `fd7a8f5b`. Fresh Clippy admission on hz3 is currently refused
+committed as `fd7a8f5b`. Fresh Clippy admission on hz3 was initially refused
 because its Rust inventory probe cannot acquire its cache lock. These are
-pre-compilation refusals, not compiler failures or passes. The independent
-TOON/output baseline is running remotely on vmi1152480.
+pre-compilation refusals, not compiler failures or passes; the later
+successful ovh-a compiler gates above supersede these attempts.
 
 - Verified the published `fsqlite` 0.4.4 dependency metadata and tag commit
   `9d3d98778a372aba95d76d05c5c974ac0238c96a`.

@@ -102,10 +102,15 @@ release readiness.
   ([GH #326](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/326))
 - **Installer cleanup preserves the original exit status.** The EXIT handler
   disables ERR-trap re-entry, avoiding a second generic error reported at line 1,
-  and successful completion explicitly exits zero. Tests preserve both success
-  and deliberate failure exit codes, including on macOS Bash 3.2. The full
-  successful-install failure reported in #327 is still being investigated.
+  and successful completion explicitly exits zero. An explicit completion marker
+  prevents Bash 3.2 from masking fatal unset-variable errors. Expected GNU/BSD
+  `stat` fallbacks and Git discovery probes no longer emit spurious ERR diagnostics
+  on macOS. Full signed v0.3.36 installs pass through both file and stdin entry
+  points on Linux and native macOS Bash 3.2; 22 exit controls preserve required
+  client-setup failures. The reporter-specific environment in #327 remains under
+  investigation.
   ([repair](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/9686e9b47c797d15c742585470f47e3bdb739488),
+  [native-shell hardening](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/4d181f8a),
   [GH #327](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/327))
 - **`am robot overview` is much cheaper at multi-project scale.** Per-project counting
   no longer issues a query loop: recipient counts come from one grouped query, a single
