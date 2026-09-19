@@ -335,6 +335,27 @@ statements below; v0.3.36 is published and this work targets unreleased main.
   `044-nocase-final-runtime.log`). Source hashes are retained in the sequence
   log. The workspace compiler check is now running, followed by Clippy.
   Application export/backup tests have not yet qualified this candidate.
+- Engine workspace/all-target check and strict Clippy completed successfully
+  at 06:03 and 06:16 UTC September 19, respectively, with matching source
+  hashes and strict RCH exit 0. Committed the repair as
+  `dbcc7adb5d2491504af4c07a38a58378522f5a07`, published the isolated
+  `am-nocase-044-20260919` branch, and pinned all 20 runtime engine crates
+  to that revision. No upstream main branch, tag or crate release changed.
+- The application baseline reproduced GH326: public proactive backup rejected
+  its staged native export during strict canonical health checks (1 passed,
+  1 failed, 2 unrun at 06:16 UTC). The fixed-pin rerun uses `--no-fail-fast`
+  and is active in `044-gh326-nocase-fixed-runtime.log`.
+- The merged TOML/ATC/backup-admission gate passed 244/244 at 06:27 UTC.
+  Its subsequent compiler command was refused before compilation because RCH
+  estimated 16 cores on a 10-slot worker. A fresh application sequence uses
+  explicit `-j1`: workspace check, strict Clippy, then CLI TOON/output tests
+  (`044-nocase-app-*.log`). No local fallback was used.
+- Cargo's targeted engine resolution also changed 16 dependency references
+  within existing package versions, including Windows bindings, tempfile's
+  getrandom reference and prost-derive's itertools reference. The initial
+  assertion expecting only engine source changes correctly failed; detailed
+  review is retained in `044-nocase-resolution-review.txt`. These resolver
+  choices remain subject to the application and native-platform gates.
 - Concurrent commits captured the ATC fix and corrected ambiguous empty-vector
   assertions in cleanup tests (`a27c2bda` merge). The first retry predates that
   cleanup correction. A bounded shell follow-up waits for that owned RCH
