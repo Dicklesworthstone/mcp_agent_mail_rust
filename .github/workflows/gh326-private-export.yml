@@ -2,8 +2,8 @@ name: GH326 private export integration
 
 # Applies only the two fixed, reviewed patches. It never opens a PR, force
 # pushes, edits another source file, or substitutes a skipped native test.
-# Publication retry from 42ea093: no recent Actions run was recorded.
-# Retry through the Contents API without relaxing validation or changing patches.
+# The owner-only issue command provides an explicit invocation route when
+# connector-created pushes do not start Actions. Comment text is never executed.
 on:
   push:
     branches: [main]
@@ -11,6 +11,8 @@ on:
       - 'patches/gh326-private-export/**'
       - '.github/workflows/gh326-private-export.yml'
   workflow_dispatch:
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: read
@@ -21,7 +23,14 @@ concurrency:
 
 jobs:
   validate:
-    if: github.repository == 'Dicklesworthstone/mcp_agent_mail_rust' && github.ref == 'refs/heads/main'
+    if: >-
+      github.repository == 'Dicklesworthstone/mcp_agent_mail_rust' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name != 'issue_comment' ||
+       (github.actor == 'Dicklesworthstone' &&
+        github.event.issue.number == 326 &&
+        !github.event.issue.pull_request &&
+        github.event.comment.body == '/apply-gh326-private-export'))
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
@@ -115,7 +124,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 1
-      - name: Publish the tested source directly to main, without overwriting concurrent work
+      - name: Publish the tested source directly to main and its mirror
         shell: bash
         run: |
           set -euo pipefail
@@ -138,5 +147,5 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git commit -m 'fix(recovery): normalize private NOCASE exports and preserve failed backup stages' -m "Apply the exact reviewed GH326 replacement series after database all-targets checking, all nineteen native staging regressions, and the public proactive-backup regression passed on $EXPECTED_SOURCE_COMMIT. Strict backup validation remains unchanged. No workspace-wide, macOS, Windows, rustfmt, or Clippy pass is claimed."
-          git push origin HEAD:refs/heads/main
+          git push --atomic origin HEAD:refs/heads/main HEAD:refs/heads/master
           printf 'Published source commit: %s\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"

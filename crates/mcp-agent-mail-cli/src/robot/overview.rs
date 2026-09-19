@@ -1,8 +1,9 @@
 //! Bounded cold overview collection without SQL joins (GH#274).
 //!
 //! Keyset pages bound the Rust row buffers independently of mailbox size.
-//! Correlate pending recipient pages with indexed message-ID lookups, and
-//! consult the release ledger only for the current active-reservation page.
+//! Separate unread recipients from overdue acknowledgement candidates when
+//! the schema supports indexed counts, and consult the release ledger only
+//! for the current active-reservation page.
 //! Inventory seeks past already-discovered project groups through a suitable
 //! index, rather than returning every historical message and agent row.
 //! The returned project list necessarily remains proportional to projects.
@@ -14,6 +15,8 @@ use crate::CliError;
 use mcp_agent_mail_db::DbConn;
 use serde::Serialize;
 use sqlmodel_core::{Row, Value};
+
+mod sparse_recipients;
 
 const ACK_OVERDUE_THRESHOLD_US: i64 = 30 * 60 * 1_000_000;
 // Below the conservative SQLite limit of 999 bindings, including the time
@@ -125,12 +128,17 @@ struct Message {
 /// release lookups are counted separately. Peaks measure Rust result buffers,
 /// not the embedded engine's internal memory or VM work.
 /// Inventory slots count returned keys, not the history skipped by index seeks.
+/// `ack_message_rows` and `ack_count_rows` cover the separate indexed ack pass;
+/// the latter counts grouped result rows, not the recipients represented by them.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ScanWork {
     queries: usize,
     rows: [usize; 5],
     message_lookup_rows: usize,
     release_lookup_rows: usize,
+    recipient_sample_rows: usize,
+    ack_message_rows: usize,
+    ack_count_rows: usize,
     peak_query_rows: usize,
     peak_message_keys: usize,
     peak_release_keys: usize,
@@ -218,6 +226,14 @@ fn quoted_identifier(name: &str) -> String {
 /// fallback schemas may lack it. Missing or inconclusive index metadata uses
 /// the original ID scan; an actual database read failure still propagates.
 fn project_inventory_index(conn: &DbConn, table: &str) -> Result<Option<String>, CliError> {
+    full_index_with_prefix(conn, table, &["project_id"])
+}
+
+fn full_index_with_prefix(
+    conn: &DbConn,
+    table: &str,
+    prefix: &[&str],
+) -> Result<Option<String>, CliError> {
     let indexes = conn.query_sync(
         &format!("PRAGMA index_list({})", quoted_identifier(table)), &[],
     ).map_err(|error| CliError::Other(format!("overview index inventory failed: {error}")))?;
@@ -229,9 +245,12 @@ fn project_inventory_index(conn: &DbConn, table: &str) -> Result<Option<String>,
         let columns = conn.query_sync(
             &format!("PRAGMA index_info({})", quoted_identifier(&name)), &[],
         ).map_err(|error| CliError::Other(format!("overview index columns failed: {error}")))?;
-        if columns.iter().any(|column| {
-            column.get_by_name("seqno").and_then(Value::as_i64) == Some(0)
-                && column.get_named::<String>("name").ok().as_deref() == Some("project_id")
+        if prefix.iter().enumerate().all(|(position, expected)| {
+            let Ok(position) = i64::try_from(position) else { return false };
+            columns.iter().any(|column| {
+                column.get_by_name("seqno").and_then(Value::as_i64) == Some(position)
+                    && column.get_named::<String>("name").ok().as_deref() == Some(*expected)
+            })
         }) {
             return Ok(Some(name));
         }
@@ -424,45 +443,9 @@ fn collect_at(conn: &DbConn, now_us: i64) -> Result<(Vec<OverviewProject>, ScanW
         scan_project_inventory(conn, &mut work, table, select, slot, &mut projects)?;
     }
 
-    scan_pages(conn, &mut work, Scan {
-        select: RECIPIENTS_SQL, predicate: RECIPIENT_FILTER,
-        key: "_rowid_", params: &[], slot: 3,
-    }, |rows, work| {
-        let mut ids: Vec<_> = rows.iter().filter_map(|row| {
-            row.get_by_name("message_id").and_then(Value::as_i64)
-        }).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        let message_rows = lookup_ids(conn, MESSAGES_SQL, "id",
-            &[Value::BigInt(micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US))], &ids, work)?;
-        work.message_lookup_rows += message_rows.len();
-        let mut messages = HashMap::with_capacity(message_rows.len());
-        for row in message_rows {
-            messages.insert(integer(&row, "id")?, Message {
-                project_id: integer(&row, "project_id")?,
-                urgent: integer(&row, "urgent")? != 0,
-                overdue: integer(&row, "overdue")? != 0,
-            });
-        }
-        work.peak_message_keys = work.peak_message_keys.max(messages.len());
-        for row in rows {
-            // Match the original INNER JOIN: dangling recipients contribute
-            // nothing. Read-but-unacknowledged mail still counts as overdue.
-            let Some(message) = row.get_by_name("message_id")
-                .and_then(Value::as_i64).and_then(|id| messages.get(&id)) else {
-                continue;
-            };
-            let counts = project(&mut projects, message.project_id);
-            if integer(row, "unread")? != 0 {
-                counts.unread += 1;
-                counts.urgent += usize::from(message.urgent);
-            }
-            if message.overdue && integer(row, "unacked")? != 0 {
-                counts.ack_overdue += 1;
-            }
-        }
-        Ok(())
-    })?;
+    if !sparse_recipients::try_collect(conn, now_us, &mut projects, &mut work)? {
+        collect_recipients_scan(conn, now_us, &mut projects, &mut work)?;
+    }
 
     let has_ledger = has_file_reservation_release_ledger(conn)?;
     let legacy = has_file_reservations_released_ts_column(conn)?;
@@ -493,6 +476,55 @@ fn collect_at(conn: &DbConn, now_us: i64) -> Result<(Vec<OverviewProject>, ScanW
         left.slug.cmp(&right.slug).then(left_id.cmp(right_id))
     });
     Ok((projects.into_iter().map(|(_, row)| row).collect(), work))
+}
+
+/// Read-only fallback for schemas without the acknowledgement indexes.
+/// Kept separately so native benchmarks can compare the actual implementations.
+fn collect_recipients_scan(
+    conn: &DbConn,
+    now_us: i64,
+    projects: &mut HashMap<i64, OverviewProject>,
+    work: &mut ScanWork,
+) -> Result<(), CliError> {
+    scan_pages(conn, work, Scan {
+        select: RECIPIENTS_SQL, predicate: RECIPIENT_FILTER,
+        key: "_rowid_", params: &[], slot: 3,
+    }, |rows, work| {
+        let mut ids: Vec<_> = rows.iter().filter_map(|row| {
+            row.get_by_name("message_id").and_then(Value::as_i64)
+        }).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let message_rows = lookup_ids(conn, MESSAGES_SQL, "id",
+            &[Value::BigInt(micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US))], &ids, work)?;
+        work.message_lookup_rows += message_rows.len();
+        let mut messages = HashMap::with_capacity(message_rows.len());
+        for row in message_rows {
+            messages.insert(integer(&row, "id")?, Message {
+                project_id: integer(&row, "project_id")?,
+                urgent: integer(&row, "urgent")? != 0,
+                overdue: integer(&row, "overdue")? != 0,
+            });
+        }
+        work.peak_message_keys = work.peak_message_keys.max(messages.len());
+        for row in rows {
+            // Match the original INNER JOIN: dangling recipients contribute
+            // nothing. Read-but-unacknowledged mail still counts as overdue.
+            let Some(message) = row.get_by_name("message_id")
+                .and_then(Value::as_i64).and_then(|id| messages.get(&id)) else {
+                continue;
+            };
+            let counts = project(projects, message.project_id);
+            if integer(row, "unread")? != 0 {
+                counts.unread += 1;
+                counts.urgent += usize::from(message.urgent);
+            }
+            if message.overdue && integer(row, "unacked")? != 0 {
+                counts.ack_overdue += 1;
+            }
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
