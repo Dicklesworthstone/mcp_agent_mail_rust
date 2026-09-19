@@ -60034,6 +60034,93 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn doctor_read_only_strategy_matches_checkpointed_committed_wal() {
+        let writer_dir = tempfile::tempdir().expect("writer directory");
+        let hot_dir = tempfile::tempdir().expect("hot family directory");
+        let settled_dir = tempfile::tempdir().expect("checkpointed family directory");
+        let stale_dir = tempfile::tempdir().expect("main-only control directory");
+        let writer_path = writer_dir.path().join("storage.sqlite3");
+        let hot_path = hot_dir.path().join("storage.sqlite3");
+        let settled_path = settled_dir.path().join("storage.sqlite3");
+        let stale_path = stale_dir.path().join("storage.sqlite3");
+        seed_project_only_db(&writer_path, "wal-strategy", "/wal-strategy");
+        {
+            let writer =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(writer_path.display().to_string())
+                    .expect("open private canonical writer");
+            writer
+                .execute_raw(
+                    "PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0; \
+                     ALTER TABLE agents RENAME TO agents_before_wal; \
+                     PRAGMA wal_checkpoint(TRUNCATE);",
+                )
+                .expect("checkpoint a deliberately incomplete schema");
+            writer
+                .execute_raw(
+                    "ALTER TABLE agents_before_wal RENAME TO agents; \
+                     INSERT INTO projects (id, slug, human_key, created_at) \
+                     VALUES (2, 'wal-only', '/wal-only', 0);",
+                )
+                .expect("commit the schema repair and a row only in WAL");
+            for suffix in ["", "-wal"] {
+                std::fs::copy(
+                    sqlite_sidecar_path(&writer_path, suffix),
+                    sqlite_sidecar_path(&hot_path, suffix),
+                )
+                .expect("retain the committed family without checkpointing");
+            }
+        }
+        std::fs::copy(&writer_path, &settled_path).expect("copy the checkpointed equivalent");
+        std::fs::copy(&hot_path, &stale_path).expect("copy main-only negative control");
+        let stale = mcp_agent_mail_db::CanonicalDbConn::open_file(stale_path.display().to_string())
+            .expect("open independent main-only control");
+        assert!(
+            doctor_required_tables_canonical(&stale)
+                .expect("inspect stale schema")
+                .iter()
+                .any(|name| name == "agents"),
+            "ignoring WAL must lose a table required by the strategy"
+        );
+        let stale_rows = stale
+            .query_sync("SELECT COUNT(*) AS count FROM projects", &[])
+            .expect("read main-only row control");
+        assert_eq!(stale_rows[0].get_named::<i64>("count").expect("count"), 1);
+        assert!(
+            std::fs::metadata(sqlite_sidecar_path(&hot_path, "-wal"))
+                .expect("committed WAL exists")
+                .len()
+                > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES
+        );
+
+        for path in [&hot_path, &settled_path] {
+            let root = path.parent().expect("fixture directory");
+            let before = sqlite_family_bytes_for_cli_open_test(path);
+            let names_before = directory_entry_names_for_cli_open_test(root);
+            let url = format!("sqlite:///{}", path.display());
+            let opened = open_db_for_doctor_check_read_only_with_context(&url)
+                .expect("open diagnostic family");
+            let rows = opened
+                .conn
+                .query_sync("SELECT COUNT(*) AS count FROM projects", &[])
+                .expect("read committed rows");
+            assert_eq!(rows[0].get_named::<i64>("count").expect("count"), 2);
+            drop(opened);
+            for strategy in [
+                doctor_database_fix_strategy_read_only(&url, root),
+                doctor_database_fix_strategy_for_fix(true, &url, root),
+            ] {
+                let strategy = strategy.expect("read-only strategy");
+                assert!(
+                    matches!(strategy, DoctorDatabaseFixStrategy::None(_)),
+                    "committed WAL and its checkpointed equivalent must both be healthy: {strategy:?}"
+                );
+            }
+            assert_eq!(sqlite_family_bytes_for_cli_open_test(path), before);
+            assert_eq!(directory_entry_names_for_cli_open_test(root), names_before);
+        }
+    }
+
+    #[test]
     fn doctor_attempt_index_only_reindex_declines_non_index_corruption() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("malformed.sqlite3");
