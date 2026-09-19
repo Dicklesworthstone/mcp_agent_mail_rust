@@ -81,7 +81,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 |-------|---------|
 | `asupersync` (`=0.5.0`, crates.io) | Structured async runtime (channels, sync, regions, HTTP, testing) |
 | `fastmcp-rust` (`0.10.0`, immutable Git revision `1c2e5e4b`; imported as `fastmcp`) | MCP protocol implementation; full family pinned to preserve legacy stdio version negotiation on Asupersync 0.5 |
-| `sqlmodel` (`=0.5.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; FrankenSQLite `=0.4.4` is the runtime `DbConn`, pinned to `4b1ffc77` to retain SQL binding and schema-prefix repairs omitted from the release. Embedded Beads still uses a separate patched 0.3.18 engine |
+| `sqlmodel` (`=0.5.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; FrankenSQLite `=0.4.4` is the runtime `DbConn`, pinned to `db458bfba780e79d099d9f8986da5a1f7b360901` for SQL binding, schema-prefix, NOCASE, INSERT SELECT UPSERT, and Linux descriptor-retention repairs. Embedded Beads still uses a separate patched 0.3.18 engine |
 | `sqlmodel-sqlite` (`=0.5.0`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
 | `ftui` / `ftui-*` (`0.5.0`, FrankenTUI) | TUI rendering for operations console |
 | `frankensearch` (`0.6`, git revision `dd093fb230404ab08be2ed6f27776ed6c4796485`, aligned with dist.yml's `FRANKENSEARCH_COMMIT`) | Search V3 engine; lexical (Tantivy) tier by default, semantic/rerank behind the `hybrid` feature. Cargo uses the immutable revision directly; no sibling checkout is required. Its reranker shares the Asupersync 0.5 caller context |

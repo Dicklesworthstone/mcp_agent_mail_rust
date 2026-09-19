@@ -6,8 +6,8 @@ Versions marked **[Release]** have published [GitHub Releases](https://github.co
 
 Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_PLAN.md), and per-release sign-off packets should start from [docs/RELEASE_READINESS_TEMPLATE.md](docs/RELEASE_READINESS_TEMPLATE.md).
 
-The latest review covers [v0.3.35 → v0.3.36](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.35...v0.3.36)
-and the installer correction on `main`. Entries use git diffs, tag targets,
+Scope window: [v0.3.35 → v0.3.36](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.35...v0.3.36)
+and the [unreleased changes on `main`](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.36...main). Entries use git diffs, tag targets,
 GitHub publication metadata, Beads records, and executed release receipts.
 Publication dates are UTC; post-tag installer changes are identified separately.
 
@@ -26,6 +26,10 @@ Recent releases; the earlier version history continues below.
 
 ## Unreleased
 
+These changes are not a published release. Dependency upgrades and the full
+release validation remain in progress; selected passing tests do not establish
+release readiness.
+
 - **Mailbox dependencies move to FrankenSQLite 0.4.4.** SQLModel 0.5.0,
   Asupersync 0.5.0, FastMCP 0.10.0 and FrankenSearch 0.6.0 move together so
   database and reranker contexts remain compatible. FastMCP stays pinned to
@@ -35,6 +39,19 @@ Recent releases; the earlier version history continues below.
   CREATE-prefix fixes omitted from the published release. Migration tracking
   gains SQLModel's checksum column while preserving existing records.
   Upgrade qualification is tracked in `UPGRADE_LOG.md` and `br-5lgwn`.
+- **Preserve parameters when replaying `INSERT ... SELECT` with UPSERT.**
+  The pinned engine resolves original UPSERT and RETURNING bindings before
+  replaying materialized rows, including attached-database targets. This
+  repairs the out-of-range binding error exposed by sibling-discovery
+  persistence. Six SQLite differential tests and all twelve application
+  sibling-discovery regressions pass; broader release validation remains open.
+  ([engine repair](https://github.com/Dicklesworthstone/frankensqlite/commit/24ae22dafad39b8e0333f7e4c1719efa55813d2b))
+- **Bound retained database descriptors on Linux.** Repeated opens reuse an
+  existing lock-domain descriptor after inode and access checks. Regression
+  tests verify the descriptor bound, foreign-process lock exclusion, permission
+  revocation, replacement paths and exclusive creation. Other operating
+  systems retain their existing descriptor implementation.
+  ([engine repair](https://github.com/Dicklesworthstone/frankensqlite/commit/db458bfba780e79d099d9f8986da5a1f7b360901))
 - **Update rustls to 0.23.45**, addressing `RUSTSEC-2026-0285` in the
   previous 0.23.43 dependency. Transport regression validation is tracked
   with the dependency upgrade above.
@@ -69,16 +86,32 @@ Recent releases; the earlier version history continues below.
   files, while rejecting unexpected paths, duplicate entries, missing binaries,
   and links. This correction follows the v0.3.36 tag: use the documented
   installer URL on `main`, not the installer script frozen at that tag.
-- **Proactive backups stop aborting on collated-index false positives, and can no
-  longer fill the disk.** With `INTEGRITY_CHECK_ON_STARTUP=true`, a live mailbox that
+- **Proactive exports use SQLite-compatible NOCASE ordering; automatic backup
+  staging and retries are bounded.** With `INTEGRITY_CHECK_ON_STARTUP=true`, a live mailbox that
   passes canonical `integrity_check` could still fail `create_proactive_backup` every
   quick cycle, because the exported copy writes `COLLATE NOCASE` indexes in the primary
   engine's key order and canonical SQLite reads that ordering as corruption. Each failed
-  cycle also preserved a ~24 MB staging directory with no sweeper. Staging is now
+  cycle also preserved a ~24 MB staging directory with no sweeper. The pinned
+  [engine repair](https://github.com/Dicklesworthstone/frankensqlite/commit/dbcc7adb5d2491504af4c07a38a58378522f5a07)
+  corrects ASCII case folding, punctuation ordering and embedded-NUL comparisons;
+  canonical full-integrity validation remains strict. Four real export and
+  public-backup regressions pass with this pin. Staging is now
   admission-controlled and descriptor-bound, retry admission persists across restarts,
   rotation can no longer overwrite quarantine evidence, and reclaim never touches a live
   database whose name carries a recovery marker.
   ([GH #326](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/326))
+- **Installer cleanup preserves the original exit status.** The EXIT handler
+  disables ERR-trap re-entry, avoiding a second generic error reported at line 1,
+  and successful completion explicitly exits zero. An explicit completion marker
+  prevents Bash 3.2 from masking fatal unset-variable errors. Expected GNU/BSD
+  `stat` fallbacks and Git discovery probes no longer emit spurious ERR diagnostics
+  on macOS. Full signed v0.3.36 installs pass through both file and stdin entry
+  points on Linux and native macOS Bash 3.2; 22 exit controls preserve required
+  client-setup failures. The reporter-specific environment in #327 remains under
+  investigation.
+  ([repair](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/9686e9b47c797d15c742585470f47e3bdb739488),
+  [native-shell hardening](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/4d181f8a),
+  [GH #327](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/327))
 - **`am robot overview` is much cheaper at multi-project scale.** Per-project counting
   no longer issues a query loop: recipient counts come from one grouped query, a single
   reservation candidate scan supplies both counts and orphan-project visibility, and

@@ -1247,10 +1247,20 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(output.trim()).is_err(),
             "requested TOON must not silently fall back to JSON: {output}"
         );
+        assert!(
+            output.lines().any(|line| line == "items[3]: 1,2,3"),
+            "TOON must preserve the integer array on the wire: {output}"
+        );
         let decoded = toon::toon_to_json(output.trim()).expect("CLI emits valid TOON");
         let decoded: serde_json::Value =
             serde_json::from_str(&decoded).expect("decoded TOON is valid JSON");
-        assert_eq!(decoded, data, "CLI TOON output must preserve every value");
+        // The decoder models all numbers as f64; serde_json distinguishes 1 from 1.0.
+        let mut expected = data;
+        expected["items"] = serde_json::json!([1.0, 2.0, 3.0]);
+        assert_eq!(
+            decoded, expected,
+            "CLI TOON output must preserve every value"
+        );
     }
 
     #[test]
