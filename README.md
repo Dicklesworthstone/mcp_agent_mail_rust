@@ -1783,7 +1783,7 @@ need to do anything.
 ## Limitations
 
 - **Rust nightly required.** Uses Rust 2024 edition features that require the nightly compiler.
-- **Local search dependency.** A manual source build expects `../frankensearch-rel-0332` and its `../fast_cmaes` workspace sibling when running workspace-wide Cargo metadata. Match the immutable revisions in the checked-out release workflow; `install.sh --from-source` fetches those pins automatically. The remaining dependencies, including `beads_rust` and `franken-agent-detection`, resolve from crates.io.
+- **Pinned Git dependencies.** Current `main` fetches FrankenSearch, FastMCP, and patched FrankenSQLite from immutable Git revisions. Source builds require access to those repositories as well as crates.io; use `cargo build --locked`. Earlier release tags may require sibling checkouts; `install.sh --from-source` provisions their recorded revisions.
 - **Single-machine coordination.** Designed for agents running on the same machine or accessing the same filesystem. Not a distributed system.
 - **Advisory, not enforced.** File reservations are advisory. Agents can bypass the pre-commit guard with `--no-verify`.
 - **No built-in authentication federation.** JWT support exists, but there's no centralized auth service. Each server manages its own tokens.

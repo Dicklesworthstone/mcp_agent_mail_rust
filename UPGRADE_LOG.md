@@ -270,6 +270,29 @@ statements below; v0.3.36 is published and this work targets unreleased main.
   with host I/O full-pressure avg10 at 57.25%. Read-only evidence is retained
   in `044-smallvec-repeat-io-observation.txt`. This explains an observed
   storage wait in this run, not the earlier unobserved timeout.
+- Full SmallVec repeat completed at 01:56 UTC September 19: **317 passed,
+  658 skipped**, strict RCH exit 0 in `044-smallvec-runtime-repeat.log`.
+  Both slow persistence tests recovered with unchanged timeout limits.
+  This qualifies the selected consumers; the original failed run is retained.
+- Updated only `toml_edit` 0.25.13 → 0.25.15 (spec-1.1.0). Upstream patch
+  releases reduce parser/render allocations; no API migration is needed.
+  Lock diff contains only its version/checksum. The strict remote CLI gate
+  includes TOML/config tests and both complete startup-timeout/legacy-launcher
+  fixer modules, covering comment preservation and malformed-input handling.
+  Result pending in `044-toml-edit-runtime.log`. TOON remains unchanged.
+- Current candidate audit reports zero vulnerabilities, retaining existing
+  unmaintained/unsound warnings (`044-audit-toml-edit.json`). Latest workspace
+  formatting check found drift in 19 files introduced by intervening merges.
+  Manual corrections are complete: all 19 files byte-match read-only rustfmt
+  output from their HEAD originals, and workspace `cargo fmt --check` passes
+  (`044-format-smallvec-final.log`). No behavior changes were made.
+  The README limitation now agrees with the actual immutable Git dependency
+  graph instead of requiring obsolete sibling checkouts on current main.
+- A fresh read-only `cargo update --dry-run --verbose` preview identifies 77
+  compatible package selections, including transitive changes beyond the
+  direct-library inventory (`044-remaining-update-preview.log`). It changed
+  no lockfile entries. Those candidates still require research and consumer
+  validation; they have not been applied as a batch.
 
 ## September 16, 2026 — release qualification update
 
