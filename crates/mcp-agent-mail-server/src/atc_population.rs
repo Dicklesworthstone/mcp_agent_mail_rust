@@ -11,7 +11,7 @@
 use super::engine::{self, AtcPopulationSyncStats, AtcSummarySnapshot, AtcTickReport};
 use mcp_agent_mail_db::models::AtcPopulationAgentRow;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Mutex, OnceLock, TryLockError};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 /// A count bound as well as a cooperative elapsed-time bound. The latter cannot
@@ -31,10 +31,12 @@ pub struct AtcPopulationHydrationStats {
     pub last_slice_agents: usize,
     pub deferred_refreshes: u64,
     pub snapshot_started_at_micros: i64,
-    /// Errors returned by population refreshes since the last engine reset.
+    /// Failed or interrupted population refreshes since the last engine reset.
     pub refresh_failures: u64,
     /// Inference is suspended until a subsequent refresh succeeds.
     pub refresh_failed: bool,
+    /// A population read is running without holding the hydration mutex.
+    pub refresh_in_flight: bool,
 }
 
 #[derive(Default)]
@@ -47,6 +49,10 @@ struct HydrationState {
     snapshot_stats: AtcPopulationSyncStats,
     progress: AtcPopulationHydrationStats,
     resume_pending: bool,
+    // Identity, not a wrapping generation counter: a reset may start another
+    // read while an old one is still returning. The old lease keeps its Arc
+    // alive, so an allocator cannot reuse that identity for the new read.
+    active_refresh: Option<Arc<()>>,
 }
 
 impl HydrationState {
@@ -149,7 +155,9 @@ impl HydrationState {
     }
 
     fn annotate(&self, summary: &mut AtcSummarySnapshot, now_micros: i64) {
-        if self.progress.refresh_failed {
+        if self.active_refresh.is_some() {
+            annotate_incomplete_summary(summary, None, "population_refresh_in_progress");
+        } else if self.progress.refresh_failed {
             // No immediate inference deadline: only a successful population
             // refresh can clear this gate. Repeated ticks cannot repair a DB
             // failure and must not turn it into a busy retry loop.
@@ -183,7 +191,39 @@ fn hydration() -> &'static Mutex<HydrationState> {
     HYDRATION.get_or_init(|| Mutex::new(HydrationState::default()))
 }
 
+/// A query owns no engine/hydration lock. This lease only permits its result to
+/// enter the epoch that admitted it; dropping an interrupted query fails closed.
+struct PopulationRefresh {
+    token: Arc<()>,
+}
+
+impl PopulationRefresh {
+    fn start(state: &mut HydrationState) -> Self {
+        let token = Arc::new(());
+        state.active_refresh = Some(Arc::clone(&token));
+        state.progress.refresh_in_flight = true;
+        Self { token }
+    }
+
+    fn is_current(&self, state: &HydrationState) -> bool {
+        state.active_refresh.as_ref().is_some_and(|token| Arc::ptr_eq(token, &self.token))
+    }
+}
+
+impl Drop for PopulationRefresh {
+    fn drop(&mut self) {
+        let mut state = hydration().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_current(&state) {
+            state.active_refresh = None;
+            state.progress.refresh_in_flight = false;
+            state.progress.refresh_failed = true;
+            state.progress.refresh_failures = state.progress.refresh_failures.saturating_add(1);
+        }
+    }
+}
+
 /// Serialize reset with refresh/tick so an old snapshot cannot seed a new engine.
+/// In-flight database reads do not delay reset; their leases are invalidated.
 pub(super) fn reset_with(reset_engine: impl FnOnce()) {
     let mut state = hydration().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     reset_engine();
@@ -206,12 +246,8 @@ pub fn atc_population_hydration_stats() -> AtcPopulationHydrationStats {
 pub fn atc_sync_population_from_db(
     pool: &mcp_agent_mail_db::DbPool,
 ) -> Result<AtcPopulationSyncStats, String> {
-    let mut state = hydration().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !engine::atc_enabled() {
-        return Ok(AtcPopulationSyncStats::default());
-    }
     let now = mcp_agent_mail_core::timestamps::now_micros();
-    let sync_stats = state.refresh_with(now, || {
+    sync_population_with(now, || {
         let recency_micros = i64::try_from(mcp_agent_mail_core::config::atc_population_recency_secs())
             .unwrap_or(i64::MAX)
             .saturating_mul(1_000_000);
@@ -228,9 +264,48 @@ pub fn atc_sync_population_from_db(
             asupersync::Outcome::Cancelled(reason) => Err(format!("cancelled: {reason:?}")),
             asupersync::Outcome::Panicked(payload) => Err(format!("panicked: {}", payload.message())),
         }
-    })?;
-    state.drain_slice();
-    Ok(sync_stats)
+    })
+}
+
+fn sync_population_with(
+    now_micros: i64,
+    load: impl FnOnce() -> Result<Vec<AtcPopulationAgentRow>, String>,
+) -> Result<AtcPopulationSyncStats, String> {
+    let refresh = {
+        let mut state = hydration().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !engine::atc_enabled() {
+            return Ok(AtcPopulationSyncStats::default());
+        }
+        if state.active_refresh.is_some() || !state.pending.is_empty() {
+            state.progress.deferred_refreshes = state.progress.deferred_refreshes.saturating_add(1);
+            if state.active_refresh.is_none() {
+                state.drain_slice();
+            }
+            return Ok(state.snapshot_stats);
+        }
+        PopulationRefresh::start(&mut state)
+    };
+
+    // The DB may wait on a connection or an I/O operation. Never make summary,
+    // progress, tick or reset callers join that wait through the hydration lock.
+    // Inference remains passive while the query owns the refresh lease.
+    let loaded = load();
+
+    let mut state = hydration().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !refresh.is_current(&state) {
+        return Err("population refresh discarded after ATC reset".to_string());
+    }
+    // Only the already-loaded result crosses this short critical section.
+    let result = state.refresh_with(now_micros, || loaded);
+    state.active_refresh = None;
+    state.progress.refresh_in_flight = false;
+    if result.is_ok() {
+        state.drain_slice();
+    }
+    // `state` was declared after `refresh`, so it is dropped before the lease.
+    // On an unwind during installation, the lease recovers the poisoned lock
+    // and leaves the epoch failed rather than stranding a single-flight token.
+    result
 }
 
 pub(super) fn tick_report(now_micros: i64) -> Option<AtcTickReport> {
@@ -241,7 +316,7 @@ pub(super) fn tick_report(now_micros: i64) -> Option<AtcTickReport> {
         return None;
     }
     let started = Instant::now();
-    if state.progress.refresh_failed {
+    if state.active_refresh.is_some() || state.progress.refresh_failed {
         state.progress.last_slice_agents = 0;
         return partial_report(&state, now_micros, started);
     }
@@ -437,6 +512,167 @@ mod tests {
         state.refresh_with(30, || Ok(rows(1))).unwrap();
         assert!(!state.progress.refresh_failed);
         assert_eq!(state.progress.unchanged_agents, 1);
+    }
+
+    #[test]
+    fn population_read_releases_hydration_lock_but_keeps_public_ticks_passive() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+        super::super::reset_global_atc_state_for_test(&config);
+        let sync_stats = sync_population_with(10, || {
+            {
+                let state = hydration().try_lock().expect("DB read held hydration lock");
+                assert!(state.progress.refresh_in_flight);
+                assert!(state.active_refresh.is_some());
+            }
+            let report = super::super::atc_tick_report(2_000_000).unwrap();
+            assert_eq!(report.summary.tick_count, 0);
+            assert_eq!(report.actions.len(), 0);
+            assert_eq!(report.effects.len(), 0);
+            assert_eq!(report.summary.kernel.next_due_micros, None);
+            assert_eq!(
+                report.summary.policy.fallback_reason.as_deref(),
+                Some("population_refresh_in_progress"),
+            );
+            assert!(atc_population_hydration_stats().refresh_in_flight);
+            assert_eq!(
+                super::super::atc_summary().unwrap().policy.fallback_reason.as_deref(),
+                Some("population_refresh_in_progress"),
+            );
+            Ok(rows(1))
+        }).unwrap();
+        assert_eq!(sync_stats.agents, 1);
+        let progress = atc_population_hydration_stats();
+        assert!(!progress.refresh_in_flight);
+        assert!(!progress.refresh_failed);
+        assert_eq!(progress.applied_agents, 1);
+        super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn concurrent_refresh_defers_without_waiting_for_or_repeating_the_query() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+        super::super::reset_global_atc_state_for_test(&config);
+        let (send, receive) = std::sync::mpsc::channel();
+        let mut worker = None;
+        let mut completed_during_load = None;
+        let result = sync_population_with(10, || {
+            worker = Some(std::thread::spawn(move || {
+                let deferred = sync_population_with(20, || panic!("duplicate population query"));
+                let _ = send.send(deferred);
+            }));
+            completed_during_load = receive.recv_timeout(Duration::from_secs(5)).ok();
+            // Finish the first read before asserting or joining. Reintroducing
+            // the old long-held mutex fails this test without stranding a thread.
+            Ok(rows(1))
+        });
+        worker.unwrap().join().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(completed_during_load, Some(Ok(AtcPopulationSyncStats::default())));
+        assert_eq!(atc_population_hydration_stats().deferred_refreshes, 1);
+        assert_eq!(atc_population_hydration_stats().applied_agents, 1);
+        super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn reset_during_read_rejects_late_rows_without_touching_the_new_epoch() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+        super::super::reset_global_atc_state_for_test(&config);
+        let old = sync_population_with(10, || {
+            super::super::reset_global_atc_state_for_test(&config);
+            sync_population_with(20, || {
+                let mut fresh = rows(1);
+                fresh[0].name = "FreshEpochAgent".into();
+                Ok(fresh)
+            }).unwrap();
+            Ok(rows(65))
+        });
+        assert_eq!(old.unwrap_err(), "population refresh discarded after ATC reset");
+        let progress = atc_population_hydration_stats();
+        assert_eq!(progress.snapshot_started_at_micros, 20);
+        assert_eq!(progress.snapshot_agents, 1);
+        assert_eq!(progress.applied_agents, 1);
+        assert_eq!(progress.refresh_failures, 0);
+        assert!(!progress.refresh_failed);
+        assert!(!progress.refresh_in_flight);
+        assert_eq!(engine::atc_agent_last_activity("FreshEpochAgent"), Some(1_000_000));
+        assert_eq!(engine::atc_agent_last_activity("HydratedAgent0000"), None);
+        super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn late_query_error_cannot_poison_a_successful_post_reset_refresh() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+        super::super::reset_global_atc_state_for_test(&config);
+        let old = sync_population_with(10, || {
+            super::super::reset_global_atc_state_for_test(&config);
+            sync_population_with(20, || Ok(rows(1))).unwrap();
+            Err("failure belongs to the previous epoch".to_string())
+        });
+        assert!(old.is_err());
+        let progress = atc_population_hydration_stats();
+        assert_eq!(progress.snapshot_started_at_micros, 20);
+        assert_eq!(progress.refresh_failures, 0);
+        assert!(!progress.refresh_failed);
+        assert!(!progress.refresh_in_flight);
+        assert_eq!(super::super::atc_tick_report(2_000_000).unwrap().summary.tick_count, 1);
+        super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn panicking_query_releases_single_flight_lease_and_allows_a_fresh_read() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+        super::super::reset_global_atc_state_for_test(&config);
+        let interrupted = std::panic::catch_unwind(|| {
+            let _ = sync_population_with(10, || panic!("interrupted population query"));
+        });
+        assert!(interrupted.is_err());
+        let progress = atc_population_hydration_stats();
+        assert!(!progress.refresh_in_flight);
+        assert!(progress.refresh_failed);
+        assert_eq!(progress.refresh_failures, 1);
+        assert_eq!(super::super::atc_tick_report(2_000_000).unwrap().summary.tick_count, 0);
+        sync_population_with(20, || Ok(rows(1))).unwrap();
+        assert!(!atc_population_hydration_stats().refresh_failed);
+        assert_eq!(atc_population_hydration_stats().applied_agents, 1);
+        super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn dropping_an_old_lease_does_not_cancel_a_newer_query() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+        super::super::reset_global_atc_state_for_test(&config);
+        let old = PopulationRefresh::start(&mut hydration().lock().unwrap());
+        super::super::reset_global_atc_state_for_test(&config);
+        let fresh = PopulationRefresh::start(&mut hydration().lock().unwrap());
+        drop(old);
+        {
+            let state = hydration().lock().unwrap();
+            assert!(fresh.is_current(&state));
+            assert!(state.progress.refresh_in_flight);
+            assert_eq!(state.progress.refresh_failures, 0);
+        }
+        drop(fresh);
+        assert!(!atc_population_hydration_stats().refresh_in_flight);
+        assert_eq!(atc_population_hydration_stats().refresh_failures, 1);
+        super::super::reset_global_atc_state_for_test(&config);
     }
 
     #[test]
