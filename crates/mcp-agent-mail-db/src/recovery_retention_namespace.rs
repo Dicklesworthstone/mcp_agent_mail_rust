@@ -48,7 +48,11 @@ impl ReclaimDirectory {
     /// moving. Sync the retained source file and both participating directories.
     /// A post-move failure carries [`CompletedReclaimMove`] in the IO error;
     /// callers must not report it as still at the source or retry it blindly.
-    pub fn stage_inventoried_file(&self, source: &Path, expected: &Metadata) -> io::Result<PathBuf> {
+    pub fn stage_inventoried_file(
+        &self,
+        source: &Path,
+        expected: &Metadata,
+    ) -> io::Result<PathBuf> {
         move_into_with(
             source,
             self,
@@ -317,7 +321,13 @@ pub(super) fn move_recovery_debris_into(
     source: &Path,
     destination: &ReclaimDirectory,
 ) -> io::Result<PathBuf> {
-    move_into_with(source, destination, None, rename_reclaim_entry, sync_reclaim_move_parents)
+    move_into_with(
+        source,
+        destination,
+        None,
+        rename_reclaim_entry,
+        sync_reclaim_move_parents,
+    )
 }
 
 fn move_into_with<R, S>(
@@ -451,7 +461,10 @@ where
     S: FnMut(&File, &File) -> io::Result<()>,
 {
     let path = absolute_spelling(destination)?;
-    let directory = ReclaimDirectory { file: open_directory(&path, false)?, path };
+    let directory = ReclaimDirectory {
+        file: open_directory(&path, false)?,
+        path,
+    };
     move_into_with(source, &directory, None, rename, sync)
 }
 
@@ -542,7 +555,9 @@ mod tests {
         assert!(error.to_string().contains("pathname may have changed"));
         assert!(error.to_string().contains("do not retry or roll back"));
         assert_eq!(
-            CompletedReclaimMove::from_io_error(&error).unwrap().requested_destination(),
+            CompletedReclaimMove::from_io_error(&error)
+                .unwrap()
+                .requested_destination(),
             requested.join("evidence")
         );
     }
@@ -654,7 +669,9 @@ mod tests {
         std::fs::rename(&source, root.join("original")).unwrap();
         std::fs::write(&source, b"replaced").unwrap();
         let directory = ReclaimDirectory::claim(&root.join("quarantine")).unwrap();
-        let error = directory.stage_inventoried_file(&source, &inventoried).unwrap_err();
+        let error = directory
+            .stage_inventoried_file(&source, &inventoried)
+            .unwrap_err();
         assert!(CompletedReclaimMove::from_io_error(&error).is_none());
         assert_eq!(std::fs::read(source).unwrap(), b"replaced");
         assert_eq!(std::fs::read(root.join("original")).unwrap(), b"original");
@@ -675,7 +692,11 @@ mod tests {
             }
             let before = std::fs::read(&source).unwrap();
             let directory = ReclaimDirectory::claim(&root.join("quarantine")).unwrap();
-            assert!(directory.stage_inventoried_file(&source, &inventoried).is_err());
+            assert!(
+                directory
+                    .stage_inventoried_file(&source, &inventoried)
+                    .is_err()
+            );
             assert_eq!(std::fs::read(source).unwrap(), before);
             if hardlink {
                 assert_eq!(std::fs::read(root.join("live-alias")).unwrap(), before);
@@ -697,11 +718,18 @@ mod tests {
             Some(&inventoried),
             rename_reclaim_entry,
             |_, _| Err(io::Error::other("injected post-move sync failure")),
-        ).unwrap_err();
+        )
+        .unwrap_err();
         let completed = CompletedReclaimMove::from_io_error(&error).unwrap();
-        assert_eq!(completed.requested_destination(), directory.path().join("backup"));
+        assert_eq!(
+            completed.requested_destination(),
+            directory.path().join("backup")
+        );
         assert!(!source.exists());
-        assert_eq!(std::fs::read(completed.requested_destination()).unwrap(), b"backup contents");
+        assert_eq!(
+            std::fs::read(completed.requested_destination()).unwrap(),
+            b"backup contents"
+        );
     }
 
     #[test]
@@ -712,11 +740,19 @@ mod tests {
         let inventoried = std::fs::symlink_metadata(&source).unwrap();
         let directory = ReclaimDirectory::claim(&root.join("quarantine")).unwrap();
         std::fs::write(directory.path().join("backup"), b"prior evidence").unwrap();
-        let destination = directory.stage_inventoried_file(&source, &inventoried).unwrap();
+        let destination = directory
+            .stage_inventoried_file(&source, &inventoried)
+            .unwrap();
         assert_eq!(destination, directory.path().join("backup.1"));
         assert_eq!(std::fs::read(&destination).unwrap(), b"backup contents");
-        assert_eq!(std::fs::symlink_metadata(&destination).unwrap().ino(), inventoried.ino());
-        assert_eq!(std::fs::read(directory.path().join("backup")).unwrap(), b"prior evidence");
+        assert_eq!(
+            std::fs::symlink_metadata(&destination).unwrap().ino(),
+            inventoried.ino()
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("backup")).unwrap(),
+            b"prior evidence"
+        );
         assert!(!source.exists());
     }
 }

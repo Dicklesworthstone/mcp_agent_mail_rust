@@ -10,7 +10,7 @@
 //! writes retain the preceding admitted intent. Both invalid slots fail closed
 //! for automatic backup admission only; this is not evidence of live corruption.
 
-use super::schedule::{BackupCompletion, BackupKind, BACKUP_RETRY_INITIAL, BACKUP_RETRY_MAX};
+use super::schedule::{BACKUP_RETRY_INITIAL, BACKUP_RETRY_MAX, BackupCompletion, BackupKind};
 use sha2::{Digest as _, Sha256};
 use std::ffi::OsString;
 use std::fs::File;
@@ -45,7 +45,8 @@ struct State {
 impl State {
     fn remaining(self, now: u64) -> u64 {
         // A reversed wall clock is never permission to retry immediately.
-        self.delay_secs.saturating_sub(now.saturating_sub(self.recorded_at))
+        self.delay_secs
+            .saturating_sub(now.saturating_sub(self.recorded_at))
     }
 
     fn encode(self) -> [u8; SLOT_BYTES] {
@@ -105,13 +106,21 @@ fn unix_seconds() -> io::Result<u64> {
 /// user-controlled directory or leaf symlink while opening the journal.
 fn open_parent(sqlite_path: &Path) -> io::Result<File> {
     if !sqlite_path.is_absolute() {
-        return Err(invalid("automatic backup journal requires an absolute mailbox path"));
+        return Err(invalid(
+            "automatic backup journal requires an absolute mailbox path",
+        ));
     }
-    let parent = sqlite_path.parent().ok_or_else(|| invalid("mailbox has no parent"))?;
+    let parent = sqlite_path
+        .parent()
+        .ok_or_else(|| invalid("mailbox has no parent"))?;
     #[cfg(target_os = "macos")]
     let physical_parent = {
         let mut physical = parent.to_path_buf();
-        for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp"), ("/etc", "/private/etc")] {
+        for (alias, target) in [
+            ("/var", "/private/var"),
+            ("/tmp", "/private/tmp"),
+            ("/etc", "/private/etc"),
+        ] {
             let alias = Path::new(alias);
             if let Ok(tail) = parent.strip_prefix(alias)
                 && mcp_agent_mail_core::disk::is_trusted_system_directory_alias(alias)
@@ -130,9 +139,7 @@ fn open_parent(sqlite_path: &Path) -> io::Result<File> {
         match component {
             Component::RootDir | Component::CurDir => {}
             Component::Normal(name) => {
-                directory = File::from(openat(
-                    &directory, name, DIRECTORY_FLAGS, Mode::empty(),
-                )?);
+                directory = File::from(openat(&directory, name, DIRECTORY_FLAGS, Mode::empty())?);
             }
             Component::ParentDir | Component::Prefix(_) => {
                 return Err(invalid("automatic backup journal refuses parent traversal"));
@@ -141,11 +148,15 @@ fn open_parent(sqlite_path: &Path) -> io::Result<File> {
     }
     let source = fstatat(
         &directory,
-        sqlite_path.file_name().ok_or_else(|| invalid("mailbox has no filename"))?,
+        sqlite_path
+            .file_name()
+            .ok_or_else(|| invalid("mailbox has no filename"))?,
         AtFlags::AT_SYMLINK_NOFOLLOW,
     )?;
     if source.st_mode & SFlag::S_IFMT.bits() != SFlag::S_IFREG.bits() {
-        return Err(invalid("automatic backup journal requires a regular mailbox file"));
+        return Err(invalid(
+            "automatic backup journal requires a regular mailbox file",
+        ));
     }
     Ok(directory)
 }
@@ -167,14 +178,25 @@ impl AutomaticBackupLease {
         Self::try_begin_at(sqlite_path, requested, unix_seconds()?)
     }
 
-    fn try_begin_at(sqlite_path: &Path, requested: BackupKind, now: u64) -> io::Result<Option<Self>> {
+    fn try_begin_at(
+        sqlite_path: &Path,
+        requested: BackupKind,
+        now: u64,
+    ) -> io::Result<Option<Self>> {
         let parent = open_parent(sqlite_path)?;
-        let mut leaf = sqlite_path.file_name().ok_or_else(|| invalid("mailbox has no filename"))?.to_os_string();
+        let mut leaf = sqlite_path
+            .file_name()
+            .ok_or_else(|| invalid("mailbox has no filename"))?
+            .to_os_string();
         leaf.push(".automatic-backup-state");
         let file = File::from(openat(
             &parent,
             leaf.as_os_str(),
-            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            OFlag::O_RDWR
+                | OFlag::O_CREAT
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_NONBLOCK
+                | OFlag::O_CLOEXEC,
             Mode::S_IRUSR | Mode::S_IWUSR,
         )?);
         match fs2::FileExt::try_lock_exclusive(&file) {
@@ -202,7 +224,11 @@ impl AutomaticBackupLease {
             }
             return Ok(None);
         }
-        lease.kind = if lease.state.verified_pending { BackupKind::Verified } else { requested };
+        lease.kind = if lease.state.verified_pending {
+            BackupKind::Verified
+        } else {
+            requested
+        };
         lease.previous_failures = lease.state.failures;
         lease.previous_delay = lease.state.delay_secs;
         lease.state.failures = lease.state.failures.saturating_add(1);
@@ -242,11 +268,12 @@ impl AutomaticBackupLease {
             }
             BackupCompletion::Skipped => {
                 self.state.failures = self.previous_failures;
-                self.state.delay_secs = if self.kind == BackupKind::Verified || self.previous_failures > 0 {
-                    self.previous_delay.max(BACKUP_RETRY_INITIAL.as_secs())
-                } else {
-                    0
-                };
+                self.state.delay_secs =
+                    if self.kind == BackupKind::Verified || self.previous_failures > 0 {
+                        self.previous_delay.max(BACKUP_RETRY_INITIAL.as_secs())
+                    } else {
+                        0
+                    };
             }
         }
         self.state.in_flight = false;
@@ -257,7 +284,11 @@ impl AutomaticBackupLease {
     #[allow(clippy::unnecessary_cast)] // stat field widths differ across Unix targets.
     fn validate_entry(&self) -> io::Result<()> {
         let opened = self.file.metadata()?;
-        let named = fstatat(&self.parent, self.leaf.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW)?;
+        let named = fstatat(
+            &self.parent,
+            self.leaf.as_os_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )?;
         if !opened.is_file()
             || opened.nlink() != 1
             || opened.mode() & 0o077 != 0
@@ -268,7 +299,9 @@ impl AutomaticBackupLease {
             || opened.dev() != named.st_dev as u64
             || opened.ino() != named.st_ino as u64
         {
-            return Err(invalid("automatic backup journal is not a private, exclusive, unchanged regular file"));
+            return Err(invalid(
+                "automatic backup journal is not a private, exclusive, unchanged regular file",
+            ));
         }
         Ok(())
     }
@@ -288,7 +321,9 @@ impl AutomaticBackupLease {
         let (slots, _) = bytes.as_chunks::<SLOT_BYTES>();
         for slot in slots {
             if slot.starts_with(b"AMBACK") && &slot[..8] != MAGIC {
-                return Err(invalid("automatic backup journal uses an unsupported version"));
+                return Err(invalid(
+                    "automatic backup journal uses an unsupported version",
+                ));
             }
         }
         let first = State::decode(&bytes[..SLOT_BYTES]);
@@ -296,23 +331,32 @@ impl AutomaticBackupLease {
         if first.is_some_and(|state| state.sequence % 2 != 0)
             || second.is_some_and(|state| state.sequence % 2 != 1)
         {
-            return Err(invalid("automatic backup journal has misplaced generations"));
+            return Err(invalid(
+                "automatic backup journal has misplaced generations",
+            ));
         }
         match (first, second) {
             (Some(a), Some(b)) => {
                 if a.sequence.abs_diff(b.sequence) != 1 {
-                    return Err(invalid("automatic backup journal has ambiguous generations"));
+                    return Err(invalid(
+                        "automatic backup journal has ambiguous generations",
+                    ));
                 }
                 Ok(if a.sequence > b.sequence { a } else { b })
             }
             (Some(state), None) | (None, Some(state)) => Ok(state),
-            (None, None) => Err(invalid("automatic backup journal has no intact supported record; inspect it before retrying automatic exports")),
+            (None, None) => Err(invalid(
+                "automatic backup journal has no intact supported record; inspect it before retrying automatic exports",
+            )),
         }
     }
 
     fn persist(&mut self) -> io::Result<()> {
         self.validate_entry()?;
-        self.state.sequence = self.state.sequence.checked_add(1)
+        self.state.sequence = self
+            .state
+            .sequence
+            .checked_add(1)
             .ok_or_else(|| invalid("automatic backup journal generation exhausted"))?;
         let offset = (self.state.sequence % 2) * SLOT_BYTES as u64;
         self.file.seek(SeekFrom::Start(offset))?;
@@ -356,12 +400,21 @@ mod tests {
     fn lock_is_held_past_cooldown_until_the_export_finishes() {
         let (_directory, database) = fixture();
         let lease = begin(&database, BackupKind::Proactive, NOW);
-        assert!(AutomaticBackupLease::try_begin_at(
-            &database, BackupKind::Verified, NOW + BACKUP_RETRY_MAX.as_secs() * 2,
-        ).unwrap().is_none());
+        assert!(
+            AutomaticBackupLease::try_begin_at(
+                &database,
+                BackupKind::Verified,
+                NOW + BACKUP_RETRY_MAX.as_secs() * 2,
+            )
+            .unwrap()
+            .is_none()
+        );
         lease.finish_at(BackupCompletion::Published, NOW).unwrap();
-        assert!(AutomaticBackupLease::try_begin_at(&database, BackupKind::Proactive, NOW)
-            .unwrap().is_some());
+        assert!(
+            AutomaticBackupLease::try_begin_at(&database, BackupKind::Proactive, NOW)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -373,9 +426,16 @@ mod tests {
                 &database, BackupKind::Proactive, NOW + elapsed,
             ).unwrap().is_none(), "restart at {elapsed}s bypassed admission");
         }
-        let lease = begin(&database, BackupKind::Proactive, NOW + BACKUP_RETRY_MAX.as_secs());
+        let lease = begin(
+            &database,
+            BackupKind::Proactive,
+            NOW + BACKUP_RETRY_MAX.as_secs(),
+        );
         assert_eq!(lease.state.failures, 2);
-        assert_eq!(fs::metadata(journal_path(&database)).unwrap().len(), JOURNAL_BYTES as u64);
+        assert_eq!(
+            fs::metadata(journal_path(&database)).unwrap().len(),
+            JOURNAL_BYTES as u64
+        );
         assert_eq!(fs::read(&database).unwrap(), b"untouched mailbox sentinel");
     }
 
@@ -384,11 +444,22 @@ mod tests {
         let (_directory, database) = fixture();
         let completed = NOW + 3600;
         begin(&database, BackupKind::Proactive, NOW)
-            .finish_at(BackupCompletion::Failed, completed).unwrap();
-        assert!(AutomaticBackupLease::try_begin_at(
-            &database, BackupKind::Proactive, completed + BACKUP_RETRY_INITIAL.as_secs() - 1,
-        ).unwrap().is_none());
-        let retry = begin(&database, BackupKind::Proactive, completed + BACKUP_RETRY_INITIAL.as_secs());
+            .finish_at(BackupCompletion::Failed, completed)
+            .unwrap();
+        assert!(
+            AutomaticBackupLease::try_begin_at(
+                &database,
+                BackupKind::Proactive,
+                completed + BACKUP_RETRY_INITIAL.as_secs() - 1,
+            )
+            .unwrap()
+            .is_none()
+        );
+        let retry = begin(
+            &database,
+            BackupKind::Proactive,
+            completed + BACKUP_RETRY_INITIAL.as_secs(),
+        );
         assert_eq!(retry.state.failures, 2);
     }
 
@@ -396,16 +467,32 @@ mod tests {
     fn verified_request_during_backoff_is_retained_without_sliding_deadline() {
         let (_directory, database) = fixture();
         begin(&database, BackupKind::Proactive, NOW)
-            .finish_at(BackupCompletion::Failed, NOW).unwrap();
+            .finish_at(BackupCompletion::Failed, NOW)
+            .unwrap();
         for elapsed in [100, 300, 600] {
-            assert!(AutomaticBackupLease::try_begin_at(
-                &database, BackupKind::Verified, NOW + elapsed,
-            ).unwrap().is_none());
+            assert!(
+                AutomaticBackupLease::try_begin_at(&database, BackupKind::Verified, NOW + elapsed,)
+                    .unwrap()
+                    .is_none()
+            );
         }
-        let retry = begin(&database, BackupKind::Proactive, NOW + BACKUP_RETRY_INITIAL.as_secs());
+        let retry = begin(
+            &database,
+            BackupKind::Proactive,
+            NOW + BACKUP_RETRY_INITIAL.as_secs(),
+        );
         assert_eq!(retry.kind(), BackupKind::Verified);
-        retry.finish_at(BackupCompletion::Published, NOW + BACKUP_RETRY_INITIAL.as_secs()).unwrap();
-        let next = begin(&database, BackupKind::Proactive, NOW + BACKUP_RETRY_INITIAL.as_secs());
+        retry
+            .finish_at(
+                BackupCompletion::Published,
+                NOW + BACKUP_RETRY_INITIAL.as_secs(),
+            )
+            .unwrap();
+        let next = begin(
+            &database,
+            BackupKind::Proactive,
+            NOW + BACKUP_RETRY_INITIAL.as_secs(),
+        );
         assert_eq!(next.kind(), BackupKind::Proactive);
         assert_eq!(next.previous_failures, 0);
     }
@@ -414,10 +501,18 @@ mod tests {
     fn verified_skip_preserves_request_and_previous_failure_count() {
         let (_directory, database) = fixture();
         begin(&database, BackupKind::Verified, NOW)
-            .finish_at(BackupCompletion::Skipped, NOW).unwrap();
-        assert!(AutomaticBackupLease::try_begin_at(&database, BackupKind::Proactive, NOW)
-            .unwrap().is_none());
-        let retry = begin(&database, BackupKind::Proactive, NOW + BACKUP_RETRY_INITIAL.as_secs());
+            .finish_at(BackupCompletion::Skipped, NOW)
+            .unwrap();
+        assert!(
+            AutomaticBackupLease::try_begin_at(&database, BackupKind::Proactive, NOW)
+                .unwrap()
+                .is_none()
+        );
+        let retry = begin(
+            &database,
+            BackupKind::Proactive,
+            NOW + BACKUP_RETRY_INITIAL.as_secs(),
+        );
         assert_eq!(retry.kind(), BackupKind::Verified);
         assert_eq!(retry.previous_failures, 0);
     }
@@ -426,7 +521,8 @@ mod tests {
     fn normal_proactive_skip_is_not_a_failure() {
         let (_directory, database) = fixture();
         begin(&database, BackupKind::Proactive, NOW)
-            .finish_at(BackupCompletion::Skipped, NOW).unwrap();
+            .finish_at(BackupCompletion::Skipped, NOW)
+            .unwrap();
         let next = begin(&database, BackupKind::Proactive, NOW);
         assert_eq!(next.previous_failures, 0);
     }
@@ -437,14 +533,23 @@ mod tests {
         let mut attempts = Vec::new();
         for minute in (0_u64..24 * 60).step_by(5) {
             if let Some(lease) = AutomaticBackupLease::try_begin_at(
-                &database, BackupKind::Verified, NOW + minute * 60,
-            ).unwrap() {
+                &database,
+                BackupKind::Verified,
+                NOW + minute * 60,
+            )
+            .unwrap()
+            {
                 attempts.push(minute);
-                lease.finish_at(BackupCompletion::Failed, NOW + minute * 60).unwrap();
+                lease
+                    .finish_at(BackupCompletion::Failed, NOW + minute * 60)
+                    .unwrap();
             }
         }
         assert_eq!(attempts, [0, 15, 45, 105, 225, 465, 825, 1185]);
-        assert_eq!(fs::metadata(journal_path(&database)).unwrap().len(), JOURNAL_BYTES as u64);
+        assert_eq!(
+            fs::metadata(journal_path(&database)).unwrap().len(),
+            JOURNAL_BYTES as u64
+        );
     }
 
     #[test]
@@ -453,8 +558,12 @@ mod tests {
         let mut attempts = Vec::new();
         for minute in (0_u64..24 * 60).step_by(5) {
             if let Some(lease) = AutomaticBackupLease::try_begin_at(
-                &database, BackupKind::Proactive, NOW + minute * 60,
-            ).unwrap() {
+                &database,
+                BackupKind::Proactive,
+                NOW + minute * 60,
+            )
+            .unwrap()
+            {
                 attempts.push(minute);
                 drop(lease); // No completion record: same durable state as a kill.
             }
@@ -466,8 +575,11 @@ mod tests {
     fn backwards_clock_cannot_clear_admission() {
         let (_directory, database) = fixture();
         drop(begin(&database, BackupKind::Proactive, NOW));
-        assert!(AutomaticBackupLease::try_begin_at(&database, BackupKind::Proactive, NOW - 3600)
-            .unwrap().is_none());
+        assert!(
+            AutomaticBackupLease::try_begin_at(&database, BackupKind::Proactive, NOW - 3600)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -476,13 +588,19 @@ mod tests {
         let lease = begin(&database, BackupKind::Proactive, NOW);
         assert_eq!(lease.state.sequence, 1);
         drop(lease);
-        let mut file = OpenOptions::new().write(true).open(journal_path(&database)).unwrap();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(journal_path(&database))
+            .unwrap();
         // Slot zero is the NEXT completion slot, not the admitted intent slot.
         file.write_all(b"interrupted completion").unwrap();
         file.sync_all().unwrap();
         drop(file);
-        assert!(AutomaticBackupLease::try_begin_at(&database, BackupKind::Proactive, NOW + 300)
-            .unwrap().is_none());
+        assert!(
+            AutomaticBackupLease::try_begin_at(&database, BackupKind::Proactive, NOW + 300)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -490,8 +608,11 @@ mod tests {
         let (_directory, database) = fixture();
         for bytes in [b"not a journal".to_vec(), vec![0_u8; JOURNAL_BYTES + 1]] {
             fs::write(journal_path(&database), &bytes).unwrap();
-            fs::set_permissions(journal_path(&database), fs::Permissions::from_mode(0o600)).unwrap();
-            assert!(AutomaticBackupLease::try_begin_at(&database, BackupKind::Proactive, NOW).is_err());
+            fs::set_permissions(journal_path(&database), fs::Permissions::from_mode(0o600))
+                .unwrap();
+            assert!(
+                AutomaticBackupLease::try_begin_at(&database, BackupKind::Proactive, NOW).is_err()
+            );
             assert_eq!(fs::read(journal_path(&database)).unwrap(), bytes);
         }
         assert_eq!(fs::read(&database).unwrap(), b"untouched mailbox sentinel");
@@ -519,9 +640,14 @@ mod tests {
         let (directory, database) = fixture();
         let alias = directory.path().join("alias");
         symlink(directory.path(), &alias).unwrap();
-        assert!(AutomaticBackupLease::try_begin_at(
-            &alias.join("storage.sqlite3"), BackupKind::Proactive, NOW,
-        ).is_err());
+        assert!(
+            AutomaticBackupLease::try_begin_at(
+                &alias.join("storage.sqlite3"),
+                BackupKind::Proactive,
+                NOW,
+            )
+            .is_err()
+        );
         assert!(!journal_path(&database).exists());
     }
 
@@ -529,10 +655,17 @@ mod tests {
     fn replacement_entry_is_never_overwritten_on_completion() {
         let (directory, database) = fixture();
         let lease = begin(&database, BackupKind::Proactive, NOW);
-        fs::rename(journal_path(&database), directory.path().join("retained-intent")).unwrap();
+        fs::rename(
+            journal_path(&database),
+            directory.path().join("retained-intent"),
+        )
+        .unwrap();
         fs::write(journal_path(&database), b"replacement evidence").unwrap();
         assert!(lease.finish_at(BackupCompletion::Published, NOW).is_err());
-        assert_eq!(fs::read(journal_path(&database)).unwrap(), b"replacement evidence");
+        assert_eq!(
+            fs::read(journal_path(&database)).unwrap(),
+            b"replacement evidence"
+        );
     }
 
     #[test]
@@ -543,18 +676,30 @@ mod tests {
         fs::write(&other, b"other mailbox").unwrap();
         let lease = begin(&other, BackupKind::Proactive, NOW);
         assert_eq!(lease.previous_failures, 0);
-        assert_eq!(fs::metadata(journal_path(&other)).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(journal_path(&other)).unwrap().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
     fn records_check_version_checksum_and_bounded_delay() {
-        let state = State { sequence: 1, failures: 1, in_flight: true,
-            delay_secs: BACKUP_RETRY_MAX.as_secs(), recorded_at: NOW, ..State::default() };
+        let state = State {
+            sequence: 1,
+            failures: 1,
+            in_flight: true,
+            delay_secs: BACKUP_RETRY_MAX.as_secs(),
+            recorded_at: NOW,
+            ..State::default()
+        };
         assert_eq!(State::decode(&state.encode()), Some(state));
         let mut damaged = state.encode();
         damaged[24] ^= 1;
         assert!(State::decode(&damaged).is_none());
-        let future = State { delay_secs: BACKUP_RETRY_MAX.as_secs() + 1, ..state };
+        let future = State {
+            delay_secs: BACKUP_RETRY_MAX.as_secs() + 1,
+            ..state
+        };
         assert!(State::decode(&future.encode()).is_none());
         let mut unknown = state.encode();
         unknown[..8].copy_from_slice(b"AMBACK99");
@@ -568,23 +713,41 @@ mod tests {
         let (_directory, database) = fixture();
         for expected in ["admitted", "deferred"] {
             let output = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "integrity_guard::backup_journal::tests::durable_backup_child_process_probe", "--nocapture"])
+                .args([
+                    "--exact",
+                    "integrity_guard::backup_journal::tests::durable_backup_child_process_probe",
+                    "--nocapture",
+                ])
                 .env("AM_BACKUP_JOURNAL_TEST_PATH", &database)
                 .env("AM_BACKUP_JOURNAL_TEST_EXPECTED", expected)
-                .output().unwrap();
-            assert!(output.status.success(), "child: {}", String::from_utf8_lossy(&output.stderr));
-            assert!(String::from_utf8_lossy(&output.stderr).contains("GH326_CHILD_PROBE_EXECUTED"),
-                "child test filter matched no test");
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("GH326_CHILD_PROBE_EXECUTED"),
+                "child test filter matched no test"
+            );
         }
     }
 
     #[test]
     fn durable_backup_child_process_probe() {
-        let Some(path) = std::env::var_os("AM_BACKUP_JOURNAL_TEST_PATH") else { return; };
+        let Some(path) = std::env::var_os("AM_BACKUP_JOURNAL_TEST_PATH") else {
+            return;
+        };
         let expected = std::env::var("AM_BACKUP_JOURNAL_TEST_EXPECTED").unwrap();
-        let lease = AutomaticBackupLease::try_begin_at(Path::new(&path), BackupKind::Proactive, NOW).unwrap();
+        let lease =
+            AutomaticBackupLease::try_begin_at(Path::new(&path), BackupKind::Proactive, NOW)
+                .unwrap();
         match expected.as_str() {
-            "admitted" => lease.expect("first process admitted").finish_at(BackupCompletion::Failed, NOW).unwrap(),
+            "admitted" => lease
+                .expect("first process admitted")
+                .finish_at(BackupCompletion::Failed, NOW)
+                .unwrap(),
             "deferred" => assert!(lease.is_none(), "fresh process bypassed durable failure"),
             _ => panic!("invalid fixture expectation"),
         }

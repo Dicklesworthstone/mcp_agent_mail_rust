@@ -84,9 +84,16 @@ fn recurring_conflicts_cannot_starve_the_tail_of_a_stable_population() {
             })
             .collect();
         let mut actions = actions(&effects);
-        admit_effects(&mut effects, &mut actions, &mut admission, &mut cursor, now, |_| {
-            panic!("conflict admission must not consult liveness");
-        });
+        admit_effects(
+            &mut effects,
+            &mut actions,
+            &mut admission,
+            &mut cursor,
+            now,
+            |_| {
+                panic!("conflict admission must not consult liveness");
+            },
+        );
         assert!(effects.len() <= delivery::MAX_NOTIFICATIONS_PER_TICK);
         assert_eq!(actions.len(), effects.len());
         for effect in effects {
@@ -107,11 +114,27 @@ fn cursor_survives_reordering_and_removal_without_reordering_effects() {
         .map(|agent| effect(&format!("Agent{agent:04}"), "deadlock_remediation"))
         .collect();
     let mut actions = actions(&effects);
-    admit_effects(&mut effects, &mut actions, &mut admission, &mut cursor, 200 * SECOND, |_| None);
+    admit_effects(
+        &mut effects,
+        &mut actions,
+        &mut admission,
+        &mut cursor,
+        200 * SECOND,
+        |_| None,
+    );
     let actual: Vec<_> = effects.iter().map(|effect| effect.agent.clone()).collect();
-    let expected: Vec<_> = (20..36).rev().map(|agent| format!("Agent{agent:04}")).collect();
-    assert_eq!(actual, expected, "admission order must not leak into execution order");
-    assert_eq!(cursor.as_deref(), Some("deadlock_remediation:project:Agent0035"));
+    let expected: Vec<_> = (20..36)
+        .rev()
+        .map(|agent| format!("Agent{agent:04}"))
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "admission order must not leak into execution order"
+    );
+    assert_eq!(
+        cursor.as_deref(),
+        Some("deadlock_remediation:project:Agent0035")
+    );
     assert_eq!(actions.len(), expected.len());
 }
 
@@ -125,7 +148,14 @@ fn exhausted_admission_preserves_mutations_outcome_notices_and_unknown_effects_i
         .map(|agent| effect(&format!("Fill{agent:04}"), "deadlock_remediation"))
         .collect();
     let mut fill_actions = actions(&fill);
-    admit_effects(&mut fill, &mut fill_actions, &mut admission, &mut cursor, now, |_| None);
+    admit_effects(
+        &mut fill,
+        &mut fill_actions,
+        &mut admission,
+        &mut cursor,
+        now,
+        |_| None,
+    );
     let previous_cursor = cursor.clone();
 
     let mut release = effect("BlueFox", "reservation_release");
@@ -140,14 +170,38 @@ fn exhausted_admission_preserves_mutations_outcome_notices_and_unknown_effects_i
         unknown,
         effect("BlueFox", "liveness_monitoring"),
     ];
-    let expected: Vec<_> = [0, 2, 3].into_iter().map(|i| effects[i].effect_id.clone()).collect();
+    let expected: Vec<_> = [0, 2, 3]
+        .into_iter()
+        .map(|i| effects[i].effect_id.clone())
+        .collect();
     let mut actions = actions(&effects);
-    admit_effects(&mut effects, &mut actions, &mut admission, &mut cursor, now, |_| Some(SECOND));
-    assert_eq!(effects.iter().map(|effect| effect.effect_id.clone()).collect::<Vec<_>>(), expected);
+    admit_effects(
+        &mut effects,
+        &mut actions,
+        &mut admission,
+        &mut cursor,
+        now,
+        |_| Some(SECOND),
+    );
+    assert_eq!(
+        effects
+            .iter()
+            .map(|effect| effect.effect_id.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
     assert_eq!(actions.len(), 2);
-    assert!(matches!(actions[0], AtcTickAction::ReleaseReservations { .. }));
-    assert!(matches!(&actions[1], AtcTickAction::SendAdvisory { message, .. } if message == "release_notice:BlueFox"));
-    assert_eq!(cursor, previous_cursor, "bypassed effects do not consume scheduling priority");
+    assert!(matches!(
+        actions[0],
+        AtcTickAction::ReleaseReservations { .. }
+    ));
+    assert!(
+        matches!(&actions[1], AtcTickAction::SendAdvisory { message, .. } if message == "release_notice:BlueFox")
+    );
+    assert_eq!(
+        cursor, previous_cursor,
+        "bypassed effects do not consume scheduling priority"
+    );
 }
 
 #[test]
@@ -164,17 +218,30 @@ fn liveness_families_share_one_activity_lookup_and_conflicts_need_none() {
     ];
     let mut actions = actions(&effects);
     let mut lookups = Vec::new();
-    admit_effects(&mut effects, &mut actions, &mut admission, &mut cursor, now, |agent| {
-        lookups.push(agent.to_owned());
-        Some(SECOND)
-    });
+    admit_effects(
+        &mut effects,
+        &mut actions,
+        &mut admission,
+        &mut cursor,
+        now,
+        |agent| {
+            lookups.push(agent.to_owned());
+            Some(SECOND)
+        },
+    );
     assert_eq!(lookups, ["BlueFox"]);
     assert_eq!(effects.len(), 2);
     assert_eq!(actions.len(), 2);
     assert_eq!(admission.stats().passive_liveness, 2);
-    assert_eq!(cursor.as_deref(), Some("deadlock_remediation:project:RedFox"));
+    assert_eq!(
+        cursor.as_deref(),
+        Some("deadlock_remediation:project:RedFox")
+    );
     assert!(effects.iter().all(|effect| {
-        matches!(effect.semantics.family.as_str(), "deadlock_remediation" | "release_notice")
+        matches!(
+            effect.semantics.family.as_str(),
+            "deadlock_remediation" | "release_notice"
+        )
     }));
 }
 
@@ -186,11 +253,21 @@ fn duplicate_effects_keep_exact_action_multiplicity_after_cursor_wrap() {
     admission.begin_tick(now);
     let mut effects = vec![effect("BlueFox", "deadlock_remediation"); 3];
     let mut actions = actions(&effects);
-    admit_effects(&mut effects, &mut actions, &mut admission, &mut cursor, now, |_| None);
+    admit_effects(
+        &mut effects,
+        &mut actions,
+        &mut admission,
+        &mut cursor,
+        now,
+        |_| None,
+    );
     assert_eq!(effects.len(), 1);
     assert_eq!(actions.len(), 1);
     assert_eq!(admission.stats().duplicate, 2);
-    assert_eq!(cursor.as_deref(), Some("deadlock_remediation:project:BlueFox"));
+    assert_eq!(
+        cursor.as_deref(),
+        Some("deadlock_remediation:project:BlueFox")
+    );
 }
 
 #[test]
@@ -202,7 +279,14 @@ fn empty_and_unobserved_batches_do_not_advance_the_fairness_cursor() {
     admission.begin_tick(now);
     for mut effects in [Vec::new(), vec![effect("RedFox", "liveness_probe")]] {
         let mut actions = actions(&effects);
-        admit_effects(&mut effects, &mut actions, &mut admission, &mut cursor, now, |_| None);
+        admit_effects(
+            &mut effects,
+            &mut actions,
+            &mut admission,
+            &mut cursor,
+            now,
+            |_| None,
+        );
         assert!(effects.is_empty());
         assert!(actions.is_empty());
         assert_eq!(cursor, expected);
@@ -220,9 +304,16 @@ fn high_risk_notification_shaped_effects_bypass_the_scheduler() {
     critical.semantics.high_risk_intervention = true;
     let mut effects = vec![critical];
     let mut actions = actions(&effects);
-    admit_effects(&mut effects, &mut actions, &mut admission, &mut cursor, 200 * SECOND, |_| {
-        panic!("critical effect must not consult notification activity");
-    });
+    admit_effects(
+        &mut effects,
+        &mut actions,
+        &mut admission,
+        &mut cursor,
+        200 * SECOND,
+        |_| {
+            panic!("critical effect must not consult notification activity");
+        },
+    );
     assert_eq!(effects.len(), 1);
     assert_eq!(actions.len(), 1);
     assert!(cursor.is_none());

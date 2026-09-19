@@ -15,7 +15,9 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), crate::CliError> {
     let RobotSubcommand::Overview { counts } = &args.command else {
         return commands::handle_robot(args);
     };
-    let requested = args.format.or_else(|| args.json.then_some(OutputFormat::Json));
+    let requested = args
+        .format
+        .or_else(|| args.json.then_some(OutputFormat::Json));
     if requested == Some(OutputFormat::Markdown) {
         // Keep the existing unsupported-format error and validate before any IO.
         return commands::handle_robot(args);

@@ -170,7 +170,9 @@ impl RotationQuarantine {
             fs::create_dir_all(parent)?;
         }
         fs::create_dir(path)?;
-        Ok(Self { path: path.to_path_buf() })
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
     }
 
     fn path(&self) -> &Path {
@@ -234,7 +236,8 @@ fn stage_backup_noreplace(
                 leaf.push(format!(".{suffix}"));
             }
             let destination = directory.path().join(leaf);
-            match mcp_agent_mail_db::pool::rename_noreplace_preserving_source(source, &destination) {
+            match mcp_agent_mail_db::pool::rename_noreplace_preserving_source(source, &destination)
+            {
                 Ok(()) => return Ok(destination),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error),
@@ -276,7 +279,12 @@ pub fn rotate_storage_backups(
     database_path: &Path,
     keep_per_kind: usize,
 ) -> std::io::Result<RotateReport> {
-    rotate_storage_backups_with(storage_root, database_path, keep_per_kind, stage_backup_noreplace)
+    rotate_storage_backups_with(
+        storage_root,
+        database_path,
+        keep_per_kind,
+        stage_backup_noreplace,
+    )
 }
 
 fn rotate_storage_backups_with<F>(
@@ -302,7 +310,8 @@ where
     };
     let absolute = |path: &Path| {
         if path.is_relative() {
-            cwd.as_ref().map_or_else(|| path.to_path_buf(), |cwd| cwd.join(path))
+            cwd.as_ref()
+                .map_or_else(|| path.to_path_buf(), |cwd| cwd.join(path))
         } else {
             path.to_path_buf()
         }
@@ -335,9 +344,12 @@ where
 
     // Retain the inventory's metadata, not only its size. Staging must not
     // silently adopt a different file subsequently placed at this pathname.
-    let mut by_kind: BTreeMap<BackupKind, Vec<(PathBuf, SystemTime, fs::Metadata)>> = BTreeMap::new();
+    let mut by_kind: BTreeMap<BackupKind, Vec<(PathBuf, SystemTime, fs::Metadata)>> =
+        BTreeMap::new();
     for entry in entries.flatten() {
-        let Ok(meta) = fs::symlink_metadata(entry.path()) else { continue };
+        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
         if !meta.file_type().is_file() {
             continue;
         }
@@ -527,8 +539,11 @@ where
         report.deleted = report.deleted.saturating_add(summary.deleted);
         report.bytes_staged = report.bytes_staged.saturating_add(summary.bytes_staged);
         report.bytes_deleted = report.bytes_deleted.saturating_add(summary.bytes_deleted);
-        report.unconfirmed_moves = report.unconfirmed_moves.saturating_add(summary.unconfirmed_moves);
-        report.bytes_unconfirmed_moves = report.bytes_unconfirmed_moves
+        report.unconfirmed_moves = report
+            .unconfirmed_moves
+            .saturating_add(summary.unconfirmed_moves);
+        report.bytes_unconfirmed_moves = report
+            .bytes_unconfirmed_moves
             .saturating_add(summary.bytes_unconfirmed_moves);
         report.per_kind.insert(kind.label(), summary);
     }
@@ -1212,7 +1227,10 @@ mod tests {
         let staged = stage_backup_noreplace(&source, &directory, &inventoried)
             .expect("retry the actual OS collision");
         assert_eq!(staged, directory.path().join("backup.1"));
-        assert_eq!(fs::read(directory.path().join("backup")).unwrap(), b"concurrent evidence");
+        assert_eq!(
+            fs::read(directory.path().join("backup")).unwrap(),
+            b"concurrent evidence"
+        );
         assert_eq!(fs::read(staged).unwrap(), b"source evidence");
         assert!(!source.exists());
     }
@@ -1229,7 +1247,12 @@ mod tests {
         std::os::unix::fs::symlink("absent-target", &occupied).unwrap();
         let staged = stage_backup_noreplace(&source, &directory, &inventoried).unwrap();
         assert_eq!(staged, directory.path().join("backup.1"));
-        assert!(fs::symlink_metadata(&occupied).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(&occupied)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(fs::read_link(occupied).unwrap(), Path::new("absent-target"));
         assert_eq!(fs::read(staged).unwrap(), b"source evidence");
     }
@@ -1323,9 +1346,15 @@ mod tests {
         let new = root.join("storage.sqlite3.corrupt-new");
         for (path, seconds) in [(&old, 1), (&new, 2)] {
             fs::write(path, b"original").unwrap();
-            fs::File::options().write(true).open(path).unwrap().set_times(
-                fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
-            ).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+                )
+                .unwrap();
         }
         (old, new)
     }
@@ -1358,19 +1387,29 @@ mod tests {
         let mut attempts = 0;
         let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("AM_BACKUP_ROTATION_DELETE", "0")],
-            || rotate_storage_backups_with(
-                root.path(), &root.path().join("storage.sqlite3"), 1,
-                |source, directory, metadata| {
-                    attempts += 1;
-                    assert_eq!(source, old);
-                    fs::rename(source, &retained).unwrap();
-                    fs::write(source, b"replaced").unwrap();
-                    fs::File::options().write(true).open(source).unwrap().set_times(
-                        fs::FileTimes::new().set_modified(metadata.modified().unwrap()),
-                    ).unwrap();
-                    stage_backup_noreplace(source, directory, metadata)
-                },
-            ).unwrap(),
+            || {
+                rotate_storage_backups_with(
+                    root.path(),
+                    &root.path().join("storage.sqlite3"),
+                    1,
+                    |source, directory, metadata| {
+                        attempts += 1;
+                        assert_eq!(source, old);
+                        fs::rename(source, &retained).unwrap();
+                        fs::write(source, b"replaced").unwrap();
+                        fs::File::options()
+                            .write(true)
+                            .open(source)
+                            .unwrap()
+                            .set_times(
+                                fs::FileTimes::new().set_modified(metadata.modified().unwrap()),
+                            )
+                            .unwrap();
+                        stage_backup_noreplace(source, directory, metadata)
+                    },
+                )
+                .unwrap()
+            },
         );
         assert_eq!(attempts, 1);
         assert_eq!(report.kept, 2);
@@ -1393,9 +1432,14 @@ mod tests {
         fs::write(&primary, b"live mailbox state").unwrap();
         let alias = root.path().join("storage.sqlite3.corrupt-old");
         fs::hard_link(&primary, &alias).unwrap();
-        fs::File::options().write(true).open(&alias).unwrap().set_times(
-            fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
-        ).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&alias)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            )
+            .unwrap();
         let newest = root.path().join("storage.sqlite3.corrupt-new");
         fs::write(&newest, b"newest backup").unwrap();
         let report = rotate_with_delete_off(root.path(), 1);
@@ -1418,17 +1462,26 @@ mod tests {
         let mut requested = None;
         let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("AM_BACKUP_ROTATION_DELETE", "0")],
-            || rotate_storage_backups_with(
-                root.path(), &root.path().join("storage.sqlite3"), 1,
-                |source, directory, metadata| {
-                    let replacement = directory.path().to_path_buf();
-                    fs::rename(&replacement, &retained).unwrap();
-                    fs::create_dir(&replacement).unwrap();
-                    fs::write(replacement.join(source.file_name().unwrap()), b"outside sentinel").unwrap();
-                    requested = Some(replacement);
-                    stage_backup_noreplace(source, directory, metadata)
-                },
-            ).unwrap(),
+            || {
+                rotate_storage_backups_with(
+                    root.path(),
+                    &root.path().join("storage.sqlite3"),
+                    1,
+                    |source, directory, metadata| {
+                        let replacement = directory.path().to_path_buf();
+                        fs::rename(&replacement, &retained).unwrap();
+                        fs::create_dir(&replacement).unwrap();
+                        fs::write(
+                            replacement.join(source.file_name().unwrap()),
+                            b"outside sentinel",
+                        )
+                        .unwrap();
+                        requested = Some(replacement);
+                        stage_backup_noreplace(source, directory, metadata)
+                    },
+                )
+                .unwrap()
+            },
         );
         assert_eq!(report.kept, 2);
         assert_eq!(report.staged, 0);
@@ -1436,7 +1489,10 @@ mod tests {
         assert_eq!(report.failures.len(), 1);
         assert_eq!(fs::read(&old).unwrap(), b"original");
         assert_eq!(fs::read(new).unwrap(), b"original");
-        assert_eq!(fs::read(requested.unwrap().join(old.file_name().unwrap())).unwrap(), b"outside sentinel");
+        assert_eq!(
+            fs::read(requested.unwrap().join(old.file_name().unwrap())).unwrap(),
+            b"outside sentinel"
+        );
         assert_eq!(fs::read_dir(retained).unwrap().count(), 0);
     }
 
@@ -1456,11 +1512,20 @@ mod tests {
         let reclaimable = doctor.join("reclaimable");
         let quarantine = reclaimable.join(quarantine_dir_name(root.path()));
         for directory in [&doctor, &reclaimable, &quarantine] {
-            assert_eq!(fs::metadata(directory).unwrap().permissions().mode() & 0o077, 0);
+            assert_eq!(
+                fs::metadata(directory).unwrap().permissions().mode() & 0o077,
+                0
+            );
         }
-        assert_eq!(fs::metadata(root.path()).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(
+            fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
         assert!(!old.exists());
-        assert_eq!(fs::read(quarantine.join(old.file_name().unwrap())).unwrap(), b"original");
+        assert_eq!(
+            fs::read(quarantine.join(old.file_name().unwrap())).unwrap(),
+            b"original"
+        );
         assert_eq!(fs::read(new).unwrap(), b"original");
     }
 
@@ -1468,7 +1533,8 @@ mod tests {
     fn incomplete_move_accounting_never_claims_kept_or_successful_staging() {
         let mut summary = RotateKindSummary::default();
         let refused = RotationFailure::from_error(
-            Path::new("source"), &std::io::Error::other("refused before rename"),
+            Path::new("source"),
+            &std::io::Error::other("refused before rename"),
         );
         assert!(!refused.rename_completed);
         summary.record_failure(&refused, 7);

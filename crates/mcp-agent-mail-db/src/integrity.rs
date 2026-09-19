@@ -2694,8 +2694,7 @@ mod tests {
         )
         .expect("create quoted identifiers");
         assert_eq!(
-            index_table_cross_count(&conn, &["mail\"box"])
-                .expect("quoted identifier cross count"),
+            index_table_cross_count(&conn, &["mail\"box"]).expect("quoted identifier cross count"),
             Vec::new()
         );
     }

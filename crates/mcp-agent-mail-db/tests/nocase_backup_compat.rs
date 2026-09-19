@@ -41,7 +41,9 @@ fn seed_native_mailbox(root: &Path) -> PathBuf {
     let primary = root.join("mailbox.sqlite3");
     let writer = DbConn::open_file(primary.to_str().expect("fixture UTF-8"))
         .expect("open real runtime writer");
-    writer.execute_raw(MAILBOX_SCHEMA).expect("seed native mailbox");
+    writer
+        .execute_raw(MAILBOX_SCHEMA)
+        .expect("seed native mailbox");
     mcp_agent_mail_db::close_db_conn(writer, "GH326 native mailbox fixture");
     primary
 }
@@ -51,11 +53,16 @@ fn sql_compare(conn: &impl SyncQuery, left: &str, right: &str) -> i64 {
         .query_sync(
             "SELECT CASE WHEN ?1 COLLATE NOCASE < ?2 THEN -1 \
              WHEN ?1 COLLATE NOCASE > ?2 THEN 1 ELSE 0 END AS ordering",
-            &[Value::Text(left.to_string()), Value::Text(right.to_string())],
+            &[
+                Value::Text(left.to_string()),
+                Value::Text(right.to_string()),
+            ],
         )
         .expect("execute real NOCASE comparison");
     assert_eq!(rows.len(), 1);
-    rows[0].get_named::<i64>("ordering").expect("comparison result")
+    rows[0]
+        .get_named::<i64>("ordering")
+        .expect("comparison result")
 }
 
 fn agent_rows(conn: &impl SyncQuery) -> Vec<(i64, String)> {
@@ -96,8 +103,14 @@ fn assert_strict_snapshot(path: &Path) {
     let bodies = conn
         .query_sync("SELECT subject, body_md FROM messages WHERE id = 1", &[])
         .expect("read retained message");
-    assert_eq!(bodies[0].get_named::<String>("subject").unwrap(), "retained subject");
-    assert_eq!(bodies[0].get_named::<String>("body_md").unwrap(), "retained body");
+    assert_eq!(
+        bodies[0].get_named::<String>("subject").unwrap(),
+        "retained subject"
+    );
+    assert_eq!(
+        bodies[0].get_named::<String>("body_md").unwrap(),
+        "retained body"
+    );
 }
 
 #[test]
@@ -105,9 +118,28 @@ fn runtime_nocase_sql_matches_canonical_boundaries() {
     let runtime = DbConn::open_memory().expect("runtime comparison fixture");
     let canonical = CanonicalDbConn::open_memory().expect("canonical comparison oracle");
     let values = [
-        "", "A", "a", "Z", "z", "[", "\\", "]", "^", "_", "`", "{",
-        "codex_823_cache", "CODEX_823_CACHE", "Ä", "ä", "\0", "A\0x",
-        "a\0y", "a\0longer", "a\0", "a",
+        "",
+        "A",
+        "a",
+        "Z",
+        "z",
+        "[",
+        "\\",
+        "]",
+        "^",
+        "_",
+        "`",
+        "{",
+        "codex_823_cache",
+        "CODEX_823_CACHE",
+        "Ä",
+        "ä",
+        "\0",
+        "A\0x",
+        "a\0y",
+        "a\0longer",
+        "a\0",
+        "a",
     ];
     for left in values {
         for right in values {
@@ -131,12 +163,20 @@ fn runtime_vacuum_into_has_canonical_nocase_index_order() {
         "GH326 native export test",
     )
     .expect("open guarded runtime source");
-    reader.execute_raw("PRAGMA query_only = OFF").expect("enable private export");
+    reader
+        .execute_raw("PRAGMA query_only = OFF")
+        .expect("enable private export");
     let literal = export.to_str().expect("export UTF-8").replace('\'', "''");
-    reader.execute_raw(&format!("VACUUM INTO '{literal}'")).expect("native export");
+    reader
+        .execute_raw(&format!("VACUUM INTO '{literal}'"))
+        .expect("native export");
     drop(reader);
     assert_strict_snapshot(&export);
-    assert_eq!(std::fs::read(primary).unwrap(), before, "export must not rewrite the source");
+    assert_eq!(
+        std::fs::read(primary).unwrap(),
+        before,
+        "export must not rewrite the source"
+    );
 }
 
 #[test]

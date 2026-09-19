@@ -29,13 +29,14 @@ fn micros_ago(now: i64, delta: i64) -> i64 {
 }
 
 fn has_column(conn: &DbConn, sql: &str, column: Option<&str>) -> Result<bool, CliError> {
-    let rows = conn.query_sync(sql, &[])
+    let rows = conn
+        .query_sync(sql, &[])
         .map_err(|error| CliError::Other(format!("overview schema probe failed: {error}")))?;
     Ok(match column {
         None => !rows.is_empty(),
-        Some(column) => rows.iter().any(|row| {
-            row.get_named::<String>("name").ok().as_deref() == Some(column)
-        }),
+        Some(column) => rows
+            .iter()
+            .any(|row| row.get_named::<String>("name").ok().as_deref() == Some(column)),
     })
 }
 
@@ -44,7 +45,11 @@ fn has_file_reservation_release_ledger(conn: &DbConn) -> Result<bool, CliError> 
 }
 
 fn has_file_reservations_released_ts_column(conn: &DbConn) -> Result<bool, CliError> {
-    has_column(conn, "PRAGMA table_info(file_reservations)", Some("released_ts"))
+    has_column(
+        conn,
+        "PRAGMA table_info(file_reservations)",
+        Some("released_ts"),
+    )
 }
 
 // Used only by the frozen pre-batching reference implementation in tests.
@@ -69,7 +74,9 @@ fn active_reservation_candidate_sql(legacy: bool, alias: &str) -> String {
 }
 
 pub(super) fn render(
-    projects: &[OverviewProject], counts: bool, format: OutputFormat,
+    projects: &[OverviewProject],
+    counts: bool,
+    format: OutputFormat,
 ) -> Result<String, CliError> {
     #[derive(Serialize)]
     struct Full<'a> {
@@ -84,16 +91,33 @@ pub(super) fn render(
         ack_overdue: usize,
     }
     if counts {
-        let mut totals = Counts { project_count: projects.len(), unread: 0, urgent: 0, ack_overdue: 0 };
+        let mut totals = Counts {
+            project_count: projects.len(),
+            unread: 0,
+            urgent: 0,
+            ack_overdue: 0,
+        };
         for project in projects {
             totals.unread = totals.unread.saturating_add(project.unread);
             totals.urgent = totals.urgent.saturating_add(project.urgent);
             totals.ack_overdue = totals.ack_overdue.saturating_add(project.ack_overdue);
         }
-        format_output(&RobotEnvelope::new("robot overview", format, totals), format)
+        format_output(
+            &RobotEnvelope::new("robot overview", format, totals),
+            format,
+        )
     } else {
-        format_output(&RobotEnvelope::new("robot overview", format,
-            Full { project_count: projects.len(), projects }), format)
+        format_output(
+            &RobotEnvelope::new(
+                "robot overview",
+                format,
+                Full {
+                    project_count: projects.len(),
+                    projects,
+                },
+            ),
+            format,
+        )
     }
 }
 
@@ -114,7 +138,8 @@ const RECIPIENTS_SQL: &str = "SELECT _rowid_ AS id, message_id,
     CASE WHEN ack_ts IS NULL THEN 1 ELSE 0 END AS unacked
     FROM message_recipients";
 const RECIPIENT_FILTER: &str = "read_ts IS NULL OR ack_ts IS NULL";
-const RESERVATIONS_SQL: &str = "SELECT fr.id, fr.project_id, fr.expires_ts FROM file_reservations fr";
+const RESERVATIONS_SQL: &str =
+    "SELECT fr.id, fr.project_id, fr.expires_ts FROM file_reservations fr";
 const RELEASE_LOOKUP_SQL: &str = "SELECT reservation_id FROM file_reservation_releases";
 
 #[derive(Clone, Copy)]
@@ -158,12 +183,15 @@ fn bounded_query(
     params: &[Value],
     work: &mut ScanWork,
 ) -> Result<Vec<Row>, CliError> {
-    let rows = conn.query_sync(sql, params)
+    let rows = conn
+        .query_sync(sql, params)
         .map_err(|error| CliError::Other(format!("overview query failed: {error}")))?;
     work.queries += 1;
     work.peak_query_rows = work.peak_query_rows.max(rows.len());
     if rows.len() > OVERVIEW_PAGE_ROWS {
-        return Err(CliError::Other("overview query exceeded its row budget".to_string()));
+        return Err(CliError::Other(
+            "overview query exceeded its row budget".to_string(),
+        ));
     }
     Ok(rows)
 }
@@ -206,7 +234,9 @@ where
         for row in &rows {
             let id = integer(row, "id")?;
             if after.is_some_and(|previous| id <= previous) {
-                return Err(CliError::Other("overview cursor did not advance".to_string()));
+                return Err(CliError::Other(
+                    "overview cursor did not advance".to_string(),
+                ));
             }
             after = Some(id);
         }
@@ -236,19 +266,29 @@ fn full_index_with_prefix(
     table: &str,
     prefix: &[&str],
 ) -> Result<Option<String>, CliError> {
-    let indexes = conn.query_sync(
-        &format!("PRAGMA index_list({})", quoted_identifier(table)), &[],
-    ).map_err(|error| CliError::Other(format!("overview index inventory failed: {error}")))?;
+    let indexes = conn
+        .query_sync(
+            &format!("PRAGMA index_list({})", quoted_identifier(table)),
+            &[],
+        )
+        .map_err(|error| CliError::Other(format!("overview index inventory failed: {error}")))?;
     for index in indexes {
         if index.get_by_name("partial").and_then(Value::as_i64) != Some(0) {
             continue;
         }
-        let Ok(name) = index.get_named::<String>("name") else { continue };
-        let columns = conn.query_sync(
-            &format!("PRAGMA index_info({})", quoted_identifier(&name)), &[],
-        ).map_err(|error| CliError::Other(format!("overview index columns failed: {error}")))?;
+        let Ok(name) = index.get_named::<String>("name") else {
+            continue;
+        };
+        let columns = conn
+            .query_sync(
+                &format!("PRAGMA index_info({})", quoted_identifier(&name)),
+                &[],
+            )
+            .map_err(|error| CliError::Other(format!("overview index columns failed: {error}")))?;
         if prefix.iter().enumerate().all(|(position, expected)| {
-            let Ok(position) = i64::try_from(position) else { return false };
+            let Ok(position) = i64::try_from(position) else {
+                return false;
+            };
             columns.iter().any(|column| {
                 column.get_by_name("seqno").and_then(Value::as_i64) == Some(position)
                     && column.get_named::<String>("name").ok().as_deref() == Some(*expected)
@@ -275,14 +315,23 @@ fn scan_project_inventory(
     projects: &mut HashMap<i64, OverviewProject>,
 ) -> Result<(), CliError> {
     let Some(index) = project_inventory_index(conn, table)? else {
-        return scan_pages(conn, work, Scan {
-            select: fallback_select, predicate: "1 = 1", key: "id", params: &[], slot,
-        }, |rows, _| {
-            for row in rows {
-                project(projects, integer(row, "project_id")?);
-            }
-            Ok(())
-        });
+        return scan_pages(
+            conn,
+            work,
+            Scan {
+                select: fallback_select,
+                predicate: "1 = 1",
+                key: "id",
+                params: &[],
+                slot,
+            },
+            |rows, _| {
+                for row in rows {
+                    project(projects, integer(row, "project_id")?);
+                }
+                Ok(())
+            },
+        );
     };
     let mut after = None;
     loop {
@@ -296,7 +345,8 @@ fn scan_project_inventory(
         let sql = format!(
             "{PROJECT_INVENTORY_SQL} {} INDEXED BY {} {predicate} \
              ORDER BY project_id LIMIT {OVERVIEW_PAGE_ROWS}",
-            quoted_identifier(table), quoted_identifier(&index),
+            quoted_identifier(table),
+            quoted_identifier(&index),
         );
         let rows = bounded_query(conn, &sql, &params, work)?;
         work.rows[slot] += rows.len();
@@ -308,7 +358,9 @@ fn scan_project_inventory(
             if after.is_some_and(|cursor| id <= cursor)
                 || previous.is_some_and(|cursor| id < cursor)
             {
-                return Err(CliError::Other("overview project cursor did not advance".to_string()));
+                return Err(CliError::Other(
+                    "overview project cursor did not advance".to_string(),
+                ));
             }
             project(projects, id);
             previous = Some(id);
@@ -336,7 +388,8 @@ where
     scan_reservation_pages_while(conn, work, predicate, now_us, |rows, work| {
         visit(rows, work)?;
         Ok(true)
-    }).map(|_| ())
+    })
+    .map(|_| ())
 }
 
 /// Return true only when the cursor is exhausted, false when the visitor stops.
@@ -356,21 +409,36 @@ where
     let mut last_id = None;
     loop {
         let (condition, order, params) = if let Some(id) = last_id {
-            ("fr.expires_ts = ? AND fr.id > ?", "fr.id",
-                vec![Value::BigInt(expiry), Value::BigInt(id)])
+            (
+                "fr.expires_ts = ? AND fr.id > ?",
+                "fr.id",
+                vec![Value::BigInt(expiry), Value::BigInt(id)],
+            )
         } else {
-            ("fr.expires_ts > ?", "fr.expires_ts, fr.id", vec![Value::BigInt(expiry)])
+            (
+                "fr.expires_ts > ?",
+                "fr.expires_ts, fr.id",
+                vec![Value::BigInt(expiry)],
+            )
         };
-        let sql = format!("{RESERVATIONS_SQL} WHERE ({predicate}) AND {condition} \
-            ORDER BY {order} LIMIT {OVERVIEW_PAGE_ROWS}");
+        let sql = format!(
+            "{RESERVATIONS_SQL} WHERE ({predicate}) AND {condition} \
+            ORDER BY {order} LIMIT {OVERVIEW_PAGE_ROWS}"
+        );
         let rows = bounded_query(conn, &sql, &params, work)?;
         work.rows[4] += rows.len();
         let mut previous = last_id.map(|id| (expiry, id));
         for row in &rows {
             let next = (integer(row, "expires_ts")?, integer(row, "id")?);
-            let valid_expiry = if last_id.is_some() { next.0 == expiry } else { next.0 > expiry };
+            let valid_expiry = if last_id.is_some() {
+                next.0 == expiry
+            } else {
+                next.0 > expiry
+            };
             if !valid_expiry || previous.is_some_and(|value| next <= value) {
-                return Err(CliError::Other("overview reservation cursor did not advance".to_string()));
+                return Err(CliError::Other(
+                    "overview reservation cursor did not advance".to_string(),
+                ));
             }
             previous = Some(next);
         }
@@ -402,7 +470,9 @@ fn lookup_ids(
         return Ok(Vec::new());
     }
     if ids.len() > OVERVIEW_PAGE_ROWS {
-        return Err(CliError::Other("overview lookup exceeded its key budget".to_string()));
+        return Err(CliError::Other(
+            "overview lookup exceeded its key budget".to_string(),
+        ));
     }
     let placeholders = vec!["?"; ids.len()].join(",");
     let sql = format!("{select} WHERE {key} IN ({placeholders}) LIMIT {OVERVIEW_PAGE_ROWS}");
@@ -436,7 +506,9 @@ fn build_at(conn: &DbConn, now_us: i64) -> Result<(Vec<OverviewProject>, ScanWor
 }
 
 fn build_at_mode(
-    conn: &DbConn, now_us: i64, counts_only: bool,
+    conn: &DbConn,
+    now_us: i64,
+    counts_only: bool,
 ) -> Result<(Vec<OverviewProject>, ScanWork), CliError> {
     // One snapshot covers EVERY page and lookup, not one snapshot per batch.
     // This nests inside a caller's transaction without committing it.
@@ -446,34 +518,49 @@ fn build_at_mode(
     let release = conn.execute_sync("RELEASE robot_overview_read", &[]);
     match (result, release) {
         (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(CliError::Other(format!("overview snapshot end failed: {error}"))),
+        (Ok(_), Err(error)) => Err(CliError::Other(format!(
+            "overview snapshot end failed: {error}"
+        ))),
         (Ok(result), Ok(_)) => Ok(result),
     }
 }
 
 fn collect_at(
-    conn: &DbConn, now_us: i64, counts_only: bool,
+    conn: &DbConn,
+    now_us: i64,
+    counts_only: bool,
 ) -> Result<(Vec<OverviewProject>, ScanWork), CliError> {
     let mut work = ScanWork::default();
     let mut projects = HashMap::new();
-    scan_pages(conn, &mut work, Scan {
-        select: PROJECTS_SQL, predicate: "1 = 1", key: "id", params: &[], slot: 0,
-    }, |rows, _| {
-        for row in rows {
-            let id = integer(row, "id")?;
-            let slug = row.get_named::<String>("slug")
-                .map_err(|error| CliError::Other(format!("overview project slug decode failed: {error}")))?;
-            project(&mut projects, id).slug = slug;
-        }
-        Ok(())
-    })?;
+    scan_pages(
+        conn,
+        &mut work,
+        Scan {
+            select: PROJECTS_SQL,
+            predicate: "1 = 1",
+            key: "id",
+            params: &[],
+            slot: 0,
+        },
+        |rows, _| {
+            for row in rows {
+                let id = integer(row, "id")?;
+                let slug = row.get_named::<String>("slug").map_err(|error| {
+                    CliError::Other(format!("overview project slug decode failed: {error}"))
+                })?;
+                project(&mut projects, id).slug = slug;
+            }
+            Ok(())
+        },
+    )?;
 
     // Inventory must still include agent-only/message-only orphan projects,
     // even if they have no pending recipients. Skip repeated history keys
     // when an appropriate full index is available; never create an index in
     // this read-only command or suppress an orphan to avoid scanning it.
     for (table, select, slot) in [
-        ("agents", AGENTS_SQL, 1), ("messages", MESSAGE_INVENTORY_SQL, 2),
+        ("agents", AGENTS_SQL, 1),
+        ("messages", MESSAGE_INVENTORY_SQL, 2),
     ] {
         scan_project_inventory(conn, &mut work, table, select, slot, &mut projects)?;
     }
@@ -505,7 +592,9 @@ fn collect_reservations(
     let legacy = has_file_reservations_released_ts_column(conn)?;
     let predicate = active_reservation_candidate_sql(legacy, "fr");
     scan_reservation_pages(conn, work, &predicate, now_us, |rows, work| {
-        let ids: Vec<_> = rows.iter().map(|row| integer(row, "id"))
+        let ids: Vec<_> = rows
+            .iter()
+            .map(|row| integer(row, "id"))
             .collect::<Result<_, _>>()?;
         let mut released = HashSet::new();
         if has_ledger {
@@ -534,45 +623,66 @@ fn collect_recipients_scan(
     projects: &mut HashMap<i64, OverviewProject>,
     work: &mut ScanWork,
 ) -> Result<(), CliError> {
-    scan_pages(conn, work, Scan {
-        select: RECIPIENTS_SQL, predicate: RECIPIENT_FILTER,
-        key: "_rowid_", params: &[], slot: 3,
-    }, |rows, work| {
-        let mut ids: Vec<_> = rows.iter().filter_map(|row| {
-            row.get_by_name("message_id").and_then(Value::as_i64)
-        }).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        let message_rows = lookup_ids(conn, MESSAGES_SQL, "id",
-            &[Value::BigInt(micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US))], &ids, work)?;
-        work.message_lookup_rows += message_rows.len();
-        let mut messages = HashMap::with_capacity(message_rows.len());
-        for row in message_rows {
-            messages.insert(integer(&row, "id")?, Message {
-                project_id: integer(&row, "project_id")?,
-                urgent: integer(&row, "urgent")? != 0,
-                overdue: integer(&row, "overdue")? != 0,
-            });
-        }
-        work.peak_message_keys = work.peak_message_keys.max(messages.len());
-        for row in rows {
-            // Match the original INNER JOIN: dangling recipients contribute
-            // nothing. Read-but-unacknowledged mail still counts as overdue.
-            let Some(message) = row.get_by_name("message_id")
-                .and_then(Value::as_i64).and_then(|id| messages.get(&id)) else {
-                continue;
-            };
-            let counts = project(projects, message.project_id);
-            if integer(row, "unread")? != 0 {
-                counts.unread += 1;
-                counts.urgent += usize::from(message.urgent);
+    scan_pages(
+        conn,
+        work,
+        Scan {
+            select: RECIPIENTS_SQL,
+            predicate: RECIPIENT_FILTER,
+            key: "_rowid_",
+            params: &[],
+            slot: 3,
+        },
+        |rows, work| {
+            let mut ids: Vec<_> = rows
+                .iter()
+                .filter_map(|row| row.get_by_name("message_id").and_then(Value::as_i64))
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            let message_rows = lookup_ids(
+                conn,
+                MESSAGES_SQL,
+                "id",
+                &[Value::BigInt(micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US))],
+                &ids,
+                work,
+            )?;
+            work.message_lookup_rows += message_rows.len();
+            let mut messages = HashMap::with_capacity(message_rows.len());
+            for row in message_rows {
+                messages.insert(
+                    integer(&row, "id")?,
+                    Message {
+                        project_id: integer(&row, "project_id")?,
+                        urgent: integer(&row, "urgent")? != 0,
+                        overdue: integer(&row, "overdue")? != 0,
+                    },
+                );
             }
-            if message.overdue && integer(row, "unacked")? != 0 {
-                counts.ack_overdue += 1;
+            work.peak_message_keys = work.peak_message_keys.max(messages.len());
+            for row in rows {
+                // Match the original INNER JOIN: dangling recipients contribute
+                // nothing. Read-but-unacknowledged mail still counts as overdue.
+                let Some(message) = row
+                    .get_by_name("message_id")
+                    .and_then(Value::as_i64)
+                    .and_then(|id| messages.get(&id))
+                else {
+                    continue;
+                };
+                let counts = project(projects, message.project_id);
+                if integer(row, "unread")? != 0 {
+                    counts.unread += 1;
+                    counts.urgent += usize::from(message.urgent);
+                }
+                if message.overdue && integer(row, "unacked")? != 0 {
+                    counts.ack_overdue += 1;
+                }
             }
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+    )
 }
 
 #[cfg(test)]
@@ -618,7 +728,10 @@ mod inventory_tests {
         }
         execute(conn, "BEGIN");
         for chunk in values.chunks(OVERVIEW_PAGE_ROWS) {
-            execute(conn, &format!("INSERT INTO messages VALUES {}", chunk.join(",")));
+            execute(
+                conn,
+                &format!("INSERT INTO messages VALUES {}", chunk.join(",")),
+            );
         }
         execute(conn, "COMMIT");
     }
@@ -627,17 +740,34 @@ mod inventory_tests {
         let mut projects = HashMap::new();
         let mut work = ScanWork::default();
         if indexed {
-            scan_project_inventory(conn, &mut work, "messages", MESSAGE_INVENTORY_SQL, 2, &mut projects)
-                .expect("project-key inventory");
+            scan_project_inventory(
+                conn,
+                &mut work,
+                "messages",
+                MESSAGE_INVENTORY_SQL,
+                2,
+                &mut projects,
+            )
+            .expect("project-key inventory");
         } else {
-            scan_pages(conn, &mut work, Scan {
-                select: MESSAGE_INVENTORY_SQL, predicate: "1 = 1", key: "id", params: &[], slot: 2,
-            }, |rows, _| {
-                for row in rows {
-                    project(&mut projects, integer(row, "project_id")?);
-                }
-                Ok(())
-            }).expect("previous ID inventory");
+            scan_pages(
+                conn,
+                &mut work,
+                Scan {
+                    select: MESSAGE_INVENTORY_SQL,
+                    predicate: "1 = 1",
+                    key: "id",
+                    params: &[],
+                    slot: 2,
+                },
+                |rows, _| {
+                    for row in rows {
+                        project(&mut projects, integer(row, "project_id")?);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("previous ID inventory");
         }
         let mut ids: Vec<_> = projects.into_keys().collect();
         ids.sort_unstable();
@@ -648,7 +778,10 @@ mod inventory_tests {
     fn history_growth_does_not_grow_indexed_inventory_results() {
         for size in [OVERVIEW_PAGE_ROWS + 1, OVERVIEW_PAGE_ROWS * 4 + 13] {
             let (_dir, conn) = fixture();
-            execute(&conn, "CREATE INDEX by_project ON messages(project_id, created_ts)");
+            execute(
+                &conn,
+                "CREATE INDEX by_project ON messages(project_id, created_ts)",
+            );
             seed(&conn, &[(77, size), (-8, size), (1, size)]);
             let (expected, old) = inventory(&conn, false);
             let (actual, new) = inventory(&conn, true);
@@ -667,7 +800,8 @@ mod inventory_tests {
         let (_dir, conn) = fixture();
         execute(&conn, "CREATE INDEX by_project ON messages(project_id)");
         let groups: Vec<_> = (0..OVERVIEW_PAGE_ROWS * 2 + 5)
-            .map(|id| (i64::try_from(id).unwrap() - 500, 1)).collect();
+            .map(|id| (i64::try_from(id).unwrap() - 500, 1))
+            .collect();
         seed(&conn, &groups);
         let (expected, old) = inventory(&conn, false);
         let (actual, new) = inventory(&conn, true);
@@ -681,7 +815,14 @@ mod inventory_tests {
     fn duplicate_page_tail_and_extreme_project_ids_preserve_every_project() {
         let (_dir, conn) = fixture();
         execute(&conn, "CREATE INDEX by_project ON messages(project_id)");
-        seed(&conn, &[(i64::MAX, OVERVIEW_PAGE_ROWS + 1), (0, 2), (i64::MIN, OVERVIEW_PAGE_ROWS - 1)]);
+        seed(
+            &conn,
+            &[
+                (i64::MAX, OVERVIEW_PAGE_ROWS + 1),
+                (0, 2),
+                (i64::MIN, OVERVIEW_PAGE_ROWS - 1),
+            ],
+        );
         let (ids, work) = inventory(&conn, true);
         assert_eq!(ids, [i64::MIN, 0, i64::MAX]);
         assert_eq!(work.rows[2], OVERVIEW_PAGE_ROWS * 2);
@@ -697,9 +838,15 @@ mod inventory_tests {
             Some("CREATE INDEX unsuitable ON messages(created_ts, project_id)"),
         ] {
             let (_dir, conn) = fixture();
-            if let Some(ddl) = ddl { execute(&conn, ddl); }
+            if let Some(ddl) = ddl {
+                execute(&conn, ddl);
+            }
             seed(&conn, &[(1, OVERVIEW_PAGE_ROWS + 3), (99, 1)]);
-            assert!(project_inventory_index(&conn, "messages").unwrap().is_none());
+            assert!(
+                project_inventory_index(&conn, "messages")
+                    .unwrap()
+                    .is_none()
+            );
             let expected = inventory(&conn, false);
             let actual = inventory(&conn, true);
             assert_eq!(actual, expected, "unsuitable index: {ddl:?}");
@@ -710,9 +857,17 @@ mod inventory_tests {
     #[test]
     fn quoted_descending_composite_index_is_usable() {
         let (_dir, conn) = fixture();
-        execute(&conn, "CREATE INDEX \"project\"\"history\" ON messages(project_id DESC, created_ts)");
+        execute(
+            &conn,
+            "CREATE INDEX \"project\"\"history\" ON messages(project_id DESC, created_ts)",
+        );
         seed(&conn, &[(9, OVERVIEW_PAGE_ROWS + 3), (-4, 1)]);
-        assert_eq!(project_inventory_index(&conn, "messages").unwrap().as_deref(), Some("project\"history"));
+        assert_eq!(
+            project_inventory_index(&conn, "messages")
+                .unwrap()
+                .as_deref(),
+            Some("project\"history")
+        );
         let (ids, work) = inventory(&conn, true);
         assert_eq!(ids, [-4, 9]);
         assert_eq!(work.rows[2], OVERVIEW_PAGE_ROWS);
@@ -731,12 +886,24 @@ mod inventory_tests {
     #[test]
     fn indexed_live_build_keeps_orphans_counts_and_caller_transaction() {
         let (_dir, conn) = fixture();
-        execute(&conn, "CREATE INDEX messages_by_project ON messages(project_id, created_ts)");
-        execute(&conn, "CREATE INDEX agents_by_project ON agents(project_id)");
-        execute(&conn, "INSERT INTO projects VALUES (1, 'alpha'), (2, 'empty')");
+        execute(
+            &conn,
+            "CREATE INDEX messages_by_project ON messages(project_id, created_ts)",
+        );
+        execute(
+            &conn,
+            "CREATE INDEX agents_by_project ON agents(project_id)",
+        );
+        execute(
+            &conn,
+            "INSERT INTO projects VALUES (1, 'alpha'), (2, 'empty')",
+        );
         execute(&conn, "INSERT INTO agents VALUES (1, 777)");
         seed(&conn, &[(1, OVERVIEW_PAGE_ROWS * 2), (888, 1)]);
-        execute(&conn, "INSERT INTO message_recipients VALUES (1, 1, NULL, NULL), (1, 2, 0, NULL)");
+        execute(
+            &conn,
+            "INSERT INTO message_recipients VALUES (1, 1, NULL, NULL), (1, 2, 0, NULL)",
+        );
         let now = ACK_OVERDUE_THRESHOLD_US * 10;
         let (before, work) = build_at(&conn, now).unwrap();
         let alpha = before.iter().find(|row| row.slug == "alpha").unwrap();
@@ -746,14 +913,20 @@ mod inventory_tests {
         assert!(before.iter().any(|row| row.slug == "[unknown-project-888]"));
         assert_eq!(work.rows[2], OVERVIEW_PAGE_ROWS + 1);
         execute(&conn, "BEGIN");
-        execute(&conn, "UPDATE messages SET project_id = 999 WHERE project_id = 888");
+        execute(
+            &conn,
+            "UPDATE messages SET project_id = 999 WHERE project_id = 888",
+        );
         let inside = build_at(&conn, now).unwrap().0;
         assert!(inside.iter().any(|row| row.slug == "[unknown-project-999]"));
         assert!(!inside.iter().any(|row| row.slug == "[unknown-project-888]"));
         execute(&conn, "ROLLBACK");
         execute(&conn, "PRAGMA query_only = ON");
         let after = build_at(&conn, now).unwrap().0;
-        assert_eq!(serde_json::to_value(before).unwrap(), serde_json::to_value(after).unwrap());
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(after).unwrap()
+        );
     }
 
     #[test]
@@ -761,8 +934,17 @@ mod inventory_tests {
         let (_dir, conn) = fixture();
         let mut work = ScanWork::default();
         let mut projects = HashMap::new();
-        assert!(scan_project_inventory(&conn, &mut work, "missing_table",
-            "SELECT id, project_id FROM missing_table", 2, &mut projects).is_err());
+        assert!(
+            scan_project_inventory(
+                &conn,
+                &mut work,
+                "missing_table",
+                "SELECT id, project_id FROM missing_table",
+                2,
+                &mut projects
+            )
+            .is_err()
+        );
         assert!(projects.is_empty());
     }
 
@@ -770,9 +952,14 @@ mod inventory_tests {
     #[ignore = "native DbConn inventory benchmark, not end-to-end CLI latency"]
     fn benchmark_project_inventory_against_id_scan() {
         let (_dir, conn) = fixture();
-        execute(&conn, "CREATE INDEX messages_by_project ON messages(project_id, created_ts)");
+        execute(
+            &conn,
+            "CREATE INDEX messages_by_project ON messages(project_id, created_ts)",
+        );
         let per_project: usize = std::env::var("AM_OVERVIEW_INVENTORY_MESSAGES_PER_PROJECT")
-            .map_or(2000, |value| value.parse().expect("positive inventory fixture size"));
+            .map_or(2000, |value| {
+                value.parse().expect("positive inventory fixture size")
+            });
         assert!(per_project > 0);
         let groups: Vec<_> = (1..=33).map(|id| (id, per_project)).collect();
         seed(&conn, &groups);
@@ -786,11 +973,18 @@ mod inventory_tests {
                 let elapsed = start.elapsed();
                 assert_eq!(ids, expected);
                 eprintln!("indexed={indexed} elapsed={elapsed:?} work={work:?}");
-                if indexed { new_times.push(elapsed); } else { old_times.push(elapsed); }
+                if indexed {
+                    new_times.push(elapsed);
+                } else {
+                    old_times.push(elapsed);
+                }
             }
         }
         old_times.sort_unstable();
         new_times.sort_unstable();
-        eprintln!("33-project native inventory only; rows_per_project={per_project}; old_median={:?}; new_median={:?}", old_times[3], new_times[3]);
+        eprintln!(
+            "33-project native inventory only; rows_per_project={per_project}; old_median={:?}; new_median={:?}",
+            old_times[3], new_times[3]
+        );
     }
 }

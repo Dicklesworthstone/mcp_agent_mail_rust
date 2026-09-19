@@ -92,7 +92,10 @@ impl NotificationAdmission {
     }
 
     pub(crate) fn admit(&mut self, notification: Notification<'_>, now_micros: i64) -> Admission {
-        if matches!(notification.class, NotificationClass::Probe | NotificationClass::Liveness) {
+        if matches!(
+            notification.class,
+            NotificationClass::Probe | NotificationClass::Liveness
+        ) {
             let Some(activity) = notification.last_activity_micros.filter(|ts| *ts > 0) else {
                 return self.record(Admission::NoActivity);
             };
@@ -108,14 +111,19 @@ impl NotificationAdmission {
             return self.record(Admission::Passive);
         }
 
-        if self.cooldowns.get(notification.key).is_some_and(|until| now_micros < *until) {
+        if self
+            .cooldowns
+            .get(notification.key)
+            .is_some_and(|until| now_micros < *until)
+        {
             return self.record(Admission::Duplicate);
         }
         if self.remaining == 0 {
             // A later proposal can retry; deferral consumes no cooldown.
             return self.record(Admission::Deferred);
         }
-        if !self.cooldowns.contains_key(notification.key) && self.cooldowns.len() >= self.key_limit {
+        if !self.cooldowns.contains_key(notification.key) && self.cooldowns.len() >= self.key_limit
+        {
             return self.record(Admission::Capacity);
         }
         self.cooldowns.insert(
@@ -141,7 +149,10 @@ impl NotificationAdmission {
     }
 
     pub(crate) fn stats(&self) -> AtcDeliveryStats {
-        AtcDeliveryStats { tracked_keys: self.cooldowns.len(), ..self.stats }
+        AtcDeliveryStats {
+            tracked_keys: self.cooldowns.len(),
+            ..self.stats
+        }
     }
 }
 
@@ -176,7 +187,10 @@ mod tests {
         for tick in 0..10_000 {
             let now = (200 + tick * 120) * SECOND;
             gate.begin_tick(now);
-            assert_eq!(gate.admit(probe("probe:p:a", Some(SECOND)), now), Admission::Passive);
+            assert_eq!(
+                gate.admit(probe("probe:p:a", Some(SECOND)), now),
+                Admission::Passive
+            );
         }
         assert_eq!(gate.stats().admitted, 0);
         assert_eq!(gate.stats().passive_liveness, 10_000);
@@ -189,7 +203,10 @@ mod tests {
             let mut gate = NotificationAdmission::new(0);
             gate.begin_tick(10 * SECOND);
             for activity in [SECOND, 2 * SECOND, SECOND - 1] {
-                assert_eq!(gate.admit(probe("probe:p:a", Some(activity)), 10 * SECOND), Admission::Passive);
+                assert_eq!(
+                    gate.admit(probe("probe:p:a", Some(activity)), 10 * SECOND),
+                    Admission::Passive
+                );
             }
             assert_eq!(gate.stats().admitted, 0);
             assert_eq!(gate.stats().tracked_keys, 0);
@@ -201,7 +218,10 @@ mod tests {
         let mut gate = NotificationAdmission::new(0);
         gate.begin_tick(10 * SECOND);
         for key in ["liveness_monitoring:p:a", "withheld_release_notice:p:a"] {
-            let notice = Notification { class: NotificationClass::Liveness, ..probe(key, Some(SECOND)) };
+            let notice = Notification {
+                class: NotificationClass::Liveness,
+                ..probe(key, Some(SECOND))
+            };
             assert_eq!(gate.admit(notice, 10 * SECOND), Admission::Passive);
         }
         assert_eq!(gate.stats().admitted, 0);
@@ -218,7 +238,10 @@ mod tests {
             );
         }
         assert_eq!(gate.stats().tracked_keys, 0);
-        assert_eq!(gate.admit(probe("probe:p:a", Some(SECOND)), 200 * SECOND), Admission::Passive);
+        assert_eq!(
+            gate.admit(probe("probe:p:a", Some(SECOND)), 200 * SECOND),
+            Admission::Passive
+        );
     }
 
     #[test]
@@ -231,7 +254,10 @@ mod tests {
                 Admission::RecentlyActive
             );
         }
-        assert_eq!(gate.admit(probe("probe:p:a", Some(SECOND)), 121 * SECOND), Admission::Passive);
+        assert_eq!(
+            gate.admit(probe("probe:p:a", Some(SECOND)), 121 * SECOND),
+            Admission::Passive
+        );
         assert_eq!(gate.stats().admitted, 0);
     }
 
@@ -241,12 +267,21 @@ mod tests {
         gate.begin_tick(10 * SECOND);
         for agent in 0..10_000 {
             let key = format!("probe:p:Agent{agent}");
-            assert_eq!(gate.admit(probe(&key, Some(SECOND)), 10 * SECOND), Admission::Passive);
+            assert_eq!(
+                gate.admit(probe(&key, Some(SECOND)), 10 * SECOND),
+                Admission::Passive
+            );
         }
         assert_eq!(gate.stats().tracked_keys, 0);
-        assert_eq!(gate.admit(conflict("deadlock:p:a"), 10 * SECOND), Admission::Admitted);
+        assert_eq!(
+            gate.admit(conflict("deadlock:p:a"), 10 * SECOND),
+            Admission::Admitted
+        );
         // Passive observations remain possible even after the mail budget is spent.
-        assert_eq!(gate.admit(probe("probe:p:late", Some(SECOND)), 10 * SECOND), Admission::Passive);
+        assert_eq!(
+            gate.admit(probe("probe:p:late", Some(SECOND)), 10 * SECOND),
+            Admission::Passive
+        );
         assert_eq!(gate.stats().admitted, 1);
     }
 
@@ -278,20 +313,38 @@ mod tests {
     fn deferred_conflict_does_not_consume_cooldown() {
         let mut gate = NotificationAdmission::with_limits(0, 1, 10);
         gate.begin_tick(10 * SECOND);
-        assert_eq!(gate.admit(conflict("deadlock:p:a"), 10 * SECOND), Admission::Admitted);
-        assert_eq!(gate.admit(conflict("deadlock:p:b"), 10 * SECOND), Admission::Deferred);
+        assert_eq!(
+            gate.admit(conflict("deadlock:p:a"), 10 * SECOND),
+            Admission::Admitted
+        );
+        assert_eq!(
+            gate.admit(conflict("deadlock:p:b"), 10 * SECOND),
+            Admission::Deferred
+        );
         gate.begin_tick(11 * SECOND);
-        assert_eq!(gate.admit(conflict("deadlock:p:b"), 11 * SECOND), Admission::Admitted);
+        assert_eq!(
+            gate.admit(conflict("deadlock:p:b"), 11 * SECOND),
+            Admission::Admitted
+        );
     }
 
     #[test]
     fn full_cache_preserves_existing_conflict_cooldowns() {
         let mut gate = NotificationAdmission::with_limits(0, 16, 1);
         gate.begin_tick(10 * SECOND);
-        assert_eq!(gate.admit(conflict("deadlock:p:a"), 10 * SECOND), Admission::Admitted);
-        assert_eq!(gate.admit(conflict("deadlock:p:b"), 10 * SECOND), Admission::Capacity);
+        assert_eq!(
+            gate.admit(conflict("deadlock:p:a"), 10 * SECOND),
+            Admission::Admitted
+        );
+        assert_eq!(
+            gate.admit(conflict("deadlock:p:b"), 10 * SECOND),
+            Admission::Capacity
+        );
         gate.begin_tick(20 * SECOND);
-        assert_eq!(gate.admit(conflict("deadlock:p:a"), 20 * SECOND), Admission::Duplicate);
+        assert_eq!(
+            gate.admit(conflict("deadlock:p:a"), 20 * SECOND),
+            Admission::Duplicate
+        );
         assert_eq!(gate.stats().tracked_keys, 1);
     }
 
@@ -309,7 +362,10 @@ mod tests {
             Admission::Duplicate
         );
         gate.begin_tick(301 * SECOND);
-        assert_eq!(gate.admit(conflict("deadlock:p:b"), 301 * SECOND), Admission::Admitted);
+        assert_eq!(
+            gate.admit(conflict("deadlock:p:b"), 301 * SECOND),
+            Admission::Admitted
+        );
         assert_eq!(gate.stats().tracked_keys, 1);
     }
 

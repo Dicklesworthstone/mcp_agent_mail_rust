@@ -8,9 +8,9 @@
 
 #[path = "atc_engine.rs"]
 mod engine;
-pub use engine::*;
 #[cfg(test)]
 pub(crate) use engine::GLOBAL_ATC_TEST_LOCK;
+pub use engine::*;
 
 #[path = "atc_population.rs"]
 mod population;
@@ -47,7 +47,9 @@ static DELIVERY: OnceLock<Mutex<DeliveryState>> = OnceLock::new();
 
 fn delivery_state() -> &'static Mutex<DeliveryState> {
     DELIVERY.get_or_init(|| {
-        Mutex::new(DeliveryState::new(AtcConfig::default().probe_interval_micros))
+        Mutex::new(DeliveryState::new(
+            AtcConfig::default().probe_interval_micros,
+        ))
     })
 }
 
@@ -95,7 +97,11 @@ pub fn atc_tick_report(now_micros: i64) -> Option<AtcTickReport> {
     state.admission.begin_tick(now_micros);
     let generated = report.effects.len();
     {
-        let DeliveryState { admission, last_notification_key, .. } = &mut *state;
+        let DeliveryState {
+            admission,
+            last_notification_key,
+            ..
+        } = &mut *state;
         admit_effects(
             &mut report.effects,
             &mut report.actions,
@@ -217,17 +223,28 @@ fn admit_effects(
     // Rotate admission priority, never execution order. Preserve fairness for
     // recurring conflict notices even when all cooldowns expire between ticks.
     // Passive checks never move the cursor or consume a delivery slot.
-    let mut candidates: Vec<_> = effects.iter().enumerate().filter_map(|(index, effect)| {
-        notification_class(&effect.kind, &effect.semantics.family, effect.semantics.high_risk_intervention)
+    let mut candidates: Vec<_> = effects
+        .iter()
+        .enumerate()
+        .filter_map(|(index, effect)| {
+            notification_class(
+                &effect.kind,
+                &effect.semantics.family,
+                effect.semantics.high_risk_intervention,
+            )
             .map(|class| (index, class))
-    }).collect();
+        })
+        .collect();
     candidates.sort_unstable_by(|left, right| {
-        effects[left.0].semantics.cooldown_key
+        effects[left.0]
+            .semantics
+            .cooldown_key
             .cmp(&effects[right.0].semantics.cooldown_key)
             .then_with(|| left.0.cmp(&right.0))
     });
     let start = last_notification_key.as_deref().map_or(0, |last| {
-        candidates.partition_point(|(index, _)| effects[*index].semantics.cooldown_key.as_str() <= last)
+        candidates
+            .partition_point(|(index, _)| effects[*index].semantics.cooldown_key.as_str() <= last)
     });
     let mut accepted = vec![true; effects.len()];
     let mut activity_by_agent = HashMap::new();
@@ -236,15 +253,19 @@ fn admit_effects(
         let activity = if class == NotificationClass::Conflict {
             None
         } else {
-            *activity_by_agent.entry(effect.agent.clone())
+            *activity_by_agent
+                .entry(effect.agent.clone())
                 .or_insert_with(|| last_activity(&effect.agent))
         };
-        accepted[index] = admission.admit(Notification {
-            key: &effect.semantics.cooldown_key,
-            class,
-            last_activity_micros: activity,
-            cooldown_micros: effect.semantics.cooldown_micros,
-        }, now_micros) == Admission::Admitted;
+        accepted[index] = admission.admit(
+            Notification {
+                key: &effect.semantics.cooldown_key,
+                class,
+                last_activity_micros: activity,
+                cooldown_micros: effect.semantics.cooldown_micros,
+            },
+            now_micros,
+        ) == Admission::Admitted;
         if accepted[index] {
             *last_notification_key = Some(effect.semantics.cooldown_key.clone());
         }
@@ -281,38 +302,78 @@ mod admission_boundary_tests {
             assert_eq!(notification_class(kind, family, false), None);
             assert_eq!(notification_class(kind, family, true), None);
         }
-        assert_eq!(notification_class("send_advisory", "liveness_monitoring", true), None);
+        assert_eq!(
+            notification_class("send_advisory", "liveness_monitoring", true),
+            None
+        );
     }
 
     #[test]
     fn only_recognized_notification_kind_and_family_pairs_are_gated() {
-        assert_eq!(notification_class("probe_agent", "liveness_probe", false), Some(NotificationClass::Probe));
+        assert_eq!(
+            notification_class("probe_agent", "liveness_probe", false),
+            Some(NotificationClass::Probe)
+        );
         for family in ["liveness_monitoring", "withheld_release_notice"] {
-            assert_eq!(notification_class("send_advisory", family, false), Some(NotificationClass::Liveness));
+            assert_eq!(
+                notification_class("send_advisory", family, false),
+                Some(NotificationClass::Liveness)
+            );
         }
-        assert_eq!(notification_class("send_advisory", "deadlock_remediation", false), Some(NotificationClass::Conflict));
-        assert_eq!(notification_class("release_reservations_requested", "liveness_monitoring", false), None);
+        assert_eq!(
+            notification_class("send_advisory", "deadlock_remediation", false),
+            Some(NotificationClass::Conflict)
+        );
+        assert_eq!(
+            notification_class(
+                "release_reservations_requested",
+                "liveness_monitoring",
+                false
+            ),
+            None
+        );
     }
 
     #[test]
     fn suppressing_monitoring_preserves_release_and_its_exact_notice() {
         let mut actions = vec![
-            AtcTickAction::ProbeAgent { agent: "BlueFox".into() },
-            AtcTickAction::SendAdvisory { agent: "BlueFox".into(), message: "monitoring".into() },
-            AtcTickAction::ReleaseReservations { agent: "BlueFox".into() },
-            AtcTickAction::SendAdvisory { agent: "BlueFox".into(), message: "released".into() },
+            AtcTickAction::ProbeAgent {
+                agent: "BlueFox".into(),
+            },
+            AtcTickAction::SendAdvisory {
+                agent: "BlueFox".into(),
+                message: "monitoring".into(),
+            },
+            AtcTickAction::ReleaseReservations {
+                agent: "BlueFox".into(),
+            },
+            AtcTickAction::SendAdvisory {
+                agent: "BlueFox".into(),
+                message: "released".into(),
+            },
         ];
         let key = ActionKey::Advisory("BlueFox".into(), "released".into());
         retain_actions(&mut actions, &mut HashMap::from([(key, 1)]));
         assert_eq!(actions.len(), 2);
-        assert!(matches!(actions[0], AtcTickAction::ReleaseReservations { .. }));
-        assert!(matches!(&actions[1], AtcTickAction::SendAdvisory { message, .. } if message == "released"));
+        assert!(matches!(
+            actions[0],
+            AtcTickAction::ReleaseReservations { .. }
+        ));
+        assert!(
+            matches!(&actions[1], AtcTickAction::SendAdvisory { message, .. } if message == "released")
+        );
     }
 
     #[test]
     fn one_retained_effect_cannot_replay_multiple_identical_actions() {
         let key = ActionKey::Advisory("BlueFox".into(), "notice".into());
-        let mut actions = vec![AtcTickAction::SendAdvisory { agent: "BlueFox".into(), message: "notice".into() }; 10_000];
+        let mut actions = vec![
+            AtcTickAction::SendAdvisory {
+                agent: "BlueFox".into(),
+                message: "notice".into()
+            };
+            10_000
+        ];
         retain_actions(&mut actions, &mut HashMap::from([(key, 1)]));
         assert_eq!(actions.len(), 1);
     }
@@ -320,7 +381,13 @@ mod admission_boundary_tests {
     #[test]
     fn multiple_genuinely_retained_notices_preserve_their_multiplicity() {
         let key = ActionKey::Advisory("BlueFox".into(), "notice".into());
-        let mut actions = vec![AtcTickAction::SendAdvisory { agent: "BlueFox".into(), message: "notice".into() }; 3];
+        let mut actions = vec![
+            AtcTickAction::SendAdvisory {
+                agent: "BlueFox".into(),
+                message: "notice".into()
+            };
+            3
+        ];
         retain_actions(&mut actions, &mut HashMap::from([(key, 2)]));
         assert_eq!(actions.len(), 2);
     }
@@ -328,8 +395,13 @@ mod admission_boundary_tests {
     #[test]
     fn orphaned_notification_actions_cannot_bypass_passive_admission() {
         let mut actions = vec![
-            AtcTickAction::ProbeAgent { agent: "BlueFox".into() },
-            AtcTickAction::SendAdvisory { agent: "BlueFox".into(), message: "monitoring".into() },
+            AtcTickAction::ProbeAgent {
+                agent: "BlueFox".into(),
+            },
+            AtcTickAction::SendAdvisory {
+                agent: "BlueFox".into(),
+                message: "monitoring".into(),
+            },
         ];
         retain_actions(&mut actions, &mut HashMap::new());
         assert!(actions.is_empty());
@@ -337,18 +409,32 @@ mod admission_boundary_tests {
 
     #[test]
     fn shared_global_reset_also_resets_notification_admission() {
-        let _guard = GLOBAL_ATC_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let config = mcp_agent_mail_core::Config { atc_enabled: true, atc_probe_interval_secs: 1, ..Default::default() };
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            atc_probe_interval_secs: 1,
+            ..Default::default()
+        };
         reset_global_atc_state_for_test(&config);
         {
-            let mut state = delivery_state().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = delivery_state()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.admission.begin_tick(200_000_000);
-            assert_eq!(state.admission.admit(Notification {
-                key: "liveness_probe:project:BlueFox",
-                class: NotificationClass::Probe,
-                last_activity_micros: Some(1_000_000),
-                cooldown_micros: 1_000_000,
-            }, 200_000_000), Admission::Passive);
+            assert_eq!(
+                state.admission.admit(
+                    Notification {
+                        key: "liveness_probe:project:BlueFox",
+                        class: NotificationClass::Probe,
+                        last_activity_micros: Some(1_000_000),
+                        cooldown_micros: 1_000_000,
+                    },
+                    200_000_000
+                ),
+                Admission::Passive
+            );
         }
         assert_eq!(atc_delivery_stats().admitted, 0);
         assert_eq!(atc_delivery_stats().passive_liveness, 1);
@@ -358,8 +444,13 @@ mod admission_boundary_tests {
 
     #[test]
     fn disabled_public_tick_entrypoints_remain_inert() {
-        let _guard = GLOBAL_ATC_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let config = mcp_agent_mail_core::Config { atc_enabled: false, ..Default::default() };
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: false,
+            ..Default::default()
+        };
         reset_global_atc_state_for_test(&config);
         assert!(atc_tick_report(200_000_000).is_none());
         assert!(atc_tick(200_000_000).is_empty());

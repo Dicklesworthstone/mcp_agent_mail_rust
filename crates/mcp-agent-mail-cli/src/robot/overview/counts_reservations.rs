@@ -137,35 +137,45 @@ fn seek_unknown_projects(
             } else {
                 format!("WHERE {}", conditions.join(" AND "))
             };
-            let sql = format!("{RESERVATION_PROJECTS_SQL} INDEXED BY {index} \
-                {filter} ORDER BY project_id LIMIT 1");
+            let sql = format!(
+                "{RESERVATION_PROJECTS_SQL} INDEXED BY {index} \
+                {filter} ORDER BY project_id LIMIT 1"
+            );
             let rows = bounded_query(conn, &sql, &params, work)?;
             work.reservation_project_rows += rows.len();
             if rows.is_empty() {
                 break;
             }
             if rows.len() != 1 {
-                return Err(CliError::Other("overview project seek exceeded one key".to_string()));
+                return Err(CliError::Other(
+                    "overview project seek exceeded one key".to_string(),
+                ));
             }
             let id = integer(&rows[0], "project_id")?;
             if after.is_some_and(|value| id <= value) || upper.is_some_and(|value| id >= value) {
-                return Err(CliError::Other("overview project seek left its gap".to_string()));
+                return Err(CliError::Other(
+                    "overview project seek left its gap".to_string(),
+                ));
             }
             after = Some(id);
             // id was decoded as i64, not interpolated from a user identifier.
             let scoped = format!("({predicate}) AND fr.project_id = {id}");
             let mut pages = 0;
-            let complete = scan_reservation_pages_while(conn, work, &scoped, now_us, |rows, work| {
-                for row in rows {
-                    if integer(row, "project_id")? != id {
-                        return Err(CliError::Other("overview reservation escaped its project".to_string()));
+            let complete =
+                scan_reservation_pages_while(conn, work, &scoped, now_us, |rows, work| {
+                    for row in rows {
+                        if integer(row, "project_id")? != id {
+                            return Err(CliError::Other(
+                                "overview reservation escaped its project".to_string(),
+                            ));
+                        }
                     }
-                }
-                add_orphans(conn, rows, ledger, projects, work)?;
-                pages += 1;
-                Ok(!projects.contains_key(&id) && pages < MAX_ORPHAN_PAGES
-                    && work.queries - started < MAX_INDEX_QUERIES)
-            })?;
+                    add_orphans(conn, rows, ledger, projects, work)?;
+                    pages += 1;
+                    Ok(!projects.contains_key(&id)
+                        && pages < MAX_ORPHAN_PAGES
+                        && work.queries - started < MAX_INDEX_QUERIES)
+                })?;
             if !complete && !projects.contains_key(&id) {
                 return Ok(false);
             }
@@ -200,15 +210,26 @@ mod tests {
         ] {
             execute(&conn, sql);
         }
-        if legacy { execute(&conn, "ALTER TABLE file_reservations ADD COLUMN released_ts INTEGER"); }
+        if legacy {
+            execute(
+                &conn,
+                "ALTER TABLE file_reservations ADD COLUMN released_ts INTEGER",
+            );
+        }
         if ledger {
-            execute(&conn, "CREATE TABLE file_reservation_releases (reservation_id INTEGER PRIMARY KEY, released_ts INTEGER)");
+            execute(
+                &conn,
+                "CREATE TABLE file_reservation_releases (reservation_id INTEGER PRIMARY KEY, released_ts INTEGER)",
+            );
         }
         (dir, conn)
     }
 
     fn index(conn: &DbConn) {
-        execute(conn, "CREATE INDEX project_expiry ON file_reservations(project_id, expires_ts)");
+        execute(
+            conn,
+            "CREATE INDEX project_expiry ON file_reservations(project_id, expires_ts)",
+        );
     }
 
     fn seed(conn: &DbConn, count: usize, project_id: i64, released: bool) {
@@ -216,20 +237,33 @@ mod tests {
         for start in (1..=count).step_by(OVERVIEW_PAGE_ROWS) {
             let end = (start + OVERVIEW_PAGE_ROWS - 1).min(count);
             let values: Vec<_> = (start..=end)
-                .map(|id| format!("({id}, {project_id}, {})", NOW + 1)).collect();
-            execute(conn, &format!("INSERT INTO file_reservations (id, project_id, expires_ts) VALUES {}", values.join(",")));
+                .map(|id| format!("({id}, {project_id}, {})", NOW + 1))
+                .collect();
+            execute(
+                conn,
+                &format!(
+                    "INSERT INTO file_reservations (id, project_id, expires_ts) VALUES {}",
+                    values.join(",")
+                ),
+            );
             if released {
                 let values: Vec<_> = (start..=end).map(|id| format!("({id}, NULL)")).collect();
-                execute(conn, &format!("INSERT INTO file_reservation_releases VALUES {}", values.join(",")));
+                execute(
+                    conn,
+                    &format!(
+                        "INSERT INTO file_reservation_releases VALUES {}",
+                        values.join(",")
+                    ),
+                );
             }
         }
         execute(conn, "COMMIT");
     }
 
     fn payload(rows: &[OverviewProject]) -> serde_json::Value {
-        let mut json: serde_json::Value = serde_json::from_str(
-            &render(rows, true, OutputFormat::Json).expect("counts render"),
-        ).expect("counts JSON");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&render(rows, true, OutputFormat::Json).expect("counts render"))
+                .expect("counts JSON");
         json.as_object_mut().unwrap().remove("_meta");
         json
     }
@@ -238,8 +272,10 @@ mod tests {
         let (full, old) = build_at(conn, now).expect("full overview");
         let (counts, new) = build_at_mode(conn, now, true).expect("counts-only overview");
         assert_eq!(payload(&counts), payload(&full));
-        assert_eq!(counts.iter().map(|row| &row.slug).collect::<Vec<_>>(),
-            full.iter().map(|row| &row.slug).collect::<Vec<_>>());
+        assert_eq!(
+            counts.iter().map(|row| &row.slug).collect::<Vec<_>>(),
+            full.iter().map(|row| &row.slug).collect::<Vec<_>>()
+        );
         assert!(counts.iter().all(|row| row.reservations == 0));
         assert!(new.peak_query_rows <= OVERVIEW_PAGE_ROWS);
         assert!(new.peak_release_keys <= OVERVIEW_PAGE_ROWS);
@@ -251,9 +287,15 @@ mod tests {
         for count in [OVERVIEW_PAGE_ROWS * 8, OVERVIEW_PAGE_ROWS * 24] {
             let (_dir, conn) = fixture(false, true);
             index(&conn);
-            execute(&conn, "INSERT INTO projects VALUES (1, 'alpha'), (2, 'empty')");
+            execute(
+                &conn,
+                "INSERT INTO projects VALUES (1, 'alpha'), (2, 'empty')",
+            );
             execute(&conn, "INSERT INTO messages VALUES (1, 1, 'urgent', 1, 0)");
-            execute(&conn, "INSERT INTO message_recipients VALUES (1, 1, NULL, NULL), (1, 2, 0, NULL)");
+            execute(
+                &conn,
+                "INSERT INTO message_recipients VALUES (1, 1, NULL, NULL), (1, 2, 0, NULL)",
+            );
             seed(&conn, count, 1, true);
             let (old, new) = compare(&conn, NOW);
             assert_eq!(old.rows[4], count);
@@ -290,21 +332,45 @@ mod tests {
                 execute(&conn, "INSERT INTO agents VALUES (1, 7)");
                 execute(&conn, "INSERT INTO messages VALUES (1, 8, 'normal', 0, 0)");
                 seed(&conn, OVERVIEW_PAGE_ROWS * 5, 1, false);
-                execute(&conn, &format!("INSERT INTO file_reservations (id, project_id, expires_ts) VALUES
+                execute(
+                    &conn,
+                    &format!(
+                        "INSERT INTO file_reservations (id, project_id, expires_ts) VALUES
                     (9001, 2, {}), (9002, 3, {}), (9003, 4, {}), (9004, 5, {}), (9005, 6, {})",
-                    NOW + 1, NOW, NOW + 1, NOW + 1, NOW + 1));
+                        NOW + 1,
+                        NOW,
+                        NOW + 1,
+                        NOW + 1,
+                        NOW + 1
+                    ),
+                );
                 if ledger {
-                    execute(&conn, "INSERT INTO file_reservation_releases VALUES (9003, NULL), (9004, 0)");
+                    execute(
+                        &conn,
+                        "INSERT INTO file_reservation_releases VALUES (9003, NULL), (9004, 0)",
+                    );
                 }
-                if legacy { execute(&conn, "UPDATE file_reservations SET released_ts = 1 WHERE id = 9005"); }
+                if legacy {
+                    execute(
+                        &conn,
+                        "UPDATE file_reservations SET released_ts = 1 WHERE id = 9005",
+                    );
+                }
                 compare(&conn, NOW);
                 let rows = build_at_mode(&conn, NOW, true).unwrap().0;
                 assert!(rows.iter().any(|row| row.slug == "[unknown-project-2]"));
                 assert!(!rows.iter().any(|row| row.slug == "[unknown-project-3]"));
                 for id in [4, 5] {
-                    assert_eq!(rows.iter().any(|row| row.slug == format!("[unknown-project-{id}]")), !ledger);
+                    assert_eq!(
+                        rows.iter()
+                            .any(|row| row.slug == format!("[unknown-project-{id}]")),
+                        !ledger
+                    );
                 }
-                assert_eq!(rows.iter().any(|row| row.slug == "[unknown-project-6]"), !legacy);
+                assert_eq!(
+                    rows.iter().any(|row| row.slug == "[unknown-project-6]"),
+                    !legacy
+                );
                 compare(&conn, NOW + 1);
             }
         }
@@ -314,28 +380,51 @@ mod tests {
     fn released_orphan_prefix_cannot_hide_a_later_unreleased_reservation() {
         let (_dir, conn) = fixture(false, true);
         index(&conn);
-        seed(&conn, OVERVIEW_PAGE_ROWS * (INITIAL_PAGES + MAX_ORPHAN_PAGES + 2), 77, true);
-        execute(&conn, &format!("INSERT INTO file_reservations VALUES (99999, 77, {})", NOW + 1));
+        seed(
+            &conn,
+            OVERVIEW_PAGE_ROWS * (INITIAL_PAGES + MAX_ORPHAN_PAGES + 2),
+            77,
+            true,
+        );
+        execute(
+            &conn,
+            &format!(
+                "INSERT INTO file_reservations VALUES (99999, 77, {})",
+                NOW + 1
+            ),
+        );
         let (_, work) = compare(&conn, NOW);
         assert!(work.reservation_project_rows > 0);
         assert_eq!(build_at_mode(&conn, NOW, true).unwrap().0.len(), 1);
-        execute(&conn, "INSERT INTO file_reservation_releases VALUES (99999, NULL)");
+        execute(
+            &conn,
+            "INSERT INTO file_reservation_releases VALUES (99999, NULL)",
+        );
         compare(&conn, NOW);
         assert!(build_at_mode(&conn, NOW, true).unwrap().0.is_empty());
     }
 
     #[test]
     fn missing_partial_or_nonleading_indexes_use_complete_fallback() {
-        for ddl in [None,
+        for ddl in [
+            None,
             Some("CREATE INDEX unsuitable ON file_reservations(project_id) WHERE project_id = 1"),
             Some("CREATE INDEX unsuitable ON file_reservations(expires_ts, project_id)"),
             Some("CREATE INDEX unsuitable ON file_reservations((project_id + 0))"),
         ] {
             let (_dir, conn) = fixture(false, true);
-            if let Some(ddl) = ddl { execute(&conn, ddl); }
+            if let Some(ddl) = ddl {
+                execute(&conn, ddl);
+            }
             execute(&conn, "INSERT INTO projects VALUES (1, 'alpha')");
             seed(&conn, OVERVIEW_PAGE_ROWS * 5, 1, true);
-            execute(&conn, &format!("INSERT INTO file_reservations VALUES (99999, 77, {})", NOW + 1));
+            execute(
+                &conn,
+                &format!(
+                    "INSERT INTO file_reservations VALUES (99999, 77, {})",
+                    NOW + 1
+                ),
+            );
             let (_, work) = compare(&conn, NOW);
             assert_eq!(work.reservation_project_rows, 0);
             assert!(work.rows[4] > OVERVIEW_PAGE_ROWS * 5);
@@ -346,11 +435,25 @@ mod tests {
     #[test]
     fn gap_seeks_preserve_signed_extremes_and_quoted_descending_indexes() {
         let (_dir, conn) = fixture(false, false);
-        execute(&conn, "CREATE INDEX \"project\"\"order\" ON file_reservations(project_id DESC)");
-        execute(&conn, "INSERT INTO projects VALUES (-1, 'left'), (0, 'middle'), (1, 'right')");
+        execute(
+            &conn,
+            "CREATE INDEX \"project\"\"order\" ON file_reservations(project_id DESC)",
+        );
+        execute(
+            &conn,
+            "INSERT INTO projects VALUES (-1, 'left'), (0, 'middle'), (1, 'right')",
+        );
         seed(&conn, OVERVIEW_PAGE_ROWS * 5, 0, false);
-        execute(&conn, &format!("INSERT INTO file_reservations VALUES (99998, {}, {}), (99999, {}, {})",
-            i64::MIN, NOW + 1, i64::MAX, NOW + 1));
+        execute(
+            &conn,
+            &format!(
+                "INSERT INTO file_reservations VALUES (99998, {}, {}), (99999, {}, {})",
+                i64::MIN,
+                NOW + 1,
+                i64::MAX,
+                NOW + 1
+            ),
+        );
         compare(&conn, NOW);
         let rows = build_at_mode(&conn, NOW, true).unwrap().0;
         assert_eq!(rows.len(), 5);
@@ -368,9 +471,21 @@ mod tests {
         seed(&conn, OVERVIEW_PAGE_ROWS * 5, 1, false);
         // These expired-only projects exhaust the discovery strategy first.
         for id in 2..=MAX_INDEX_QUERIES + 2 {
-            execute(&conn, &format!("INSERT INTO file_reservations VALUES ({}, {id}, 0)", 10000 + id));
+            execute(
+                &conn,
+                &format!(
+                    "INSERT INTO file_reservations VALUES ({}, {id}, 0)",
+                    10000 + id
+                ),
+            );
         }
-        execute(&conn, &format!("INSERT INTO file_reservations VALUES (99999, 999, {})", NOW + 1));
+        execute(
+            &conn,
+            &format!(
+                "INSERT INTO file_reservations VALUES (99999, 999, {})",
+                NOW + 1
+            ),
+        );
         let (_, work) = compare(&conn, NOW);
         assert!(work.reservation_project_rows > 0);
         let rows = build_at_mode(&conn, NOW, true).unwrap().0;
@@ -384,7 +499,13 @@ mod tests {
         index(&conn);
         seed(&conn, OVERVIEW_PAGE_ROWS * 5, 77, true);
         execute(&conn, "BEGIN");
-        execute(&conn, &format!("INSERT INTO file_reservations VALUES (99999, 88, {})", NOW + 1));
+        execute(
+            &conn,
+            &format!(
+                "INSERT INTO file_reservations VALUES (99999, 88, {})",
+                NOW + 1
+            ),
+        );
         compare(&conn, NOW);
         assert_eq!(build_at_mode(&conn, NOW, true).unwrap().0.len(), 1);
         execute(&conn, "ROLLBACK");
@@ -392,11 +513,20 @@ mod tests {
         assert!(build_at_mode(&conn, NOW, true).unwrap().0.is_empty());
         execute(&conn, "PRAGMA query_only = OFF");
         execute(&conn, "DROP TABLE file_reservation_releases");
-        execute(&conn, "CREATE TABLE file_reservation_releases (wrong_column INTEGER)");
+        execute(
+            &conn,
+            "CREATE TABLE file_reservation_releases (wrong_column INTEGER)",
+        );
         assert!(build_at_mode(&conn, NOW, true).is_err());
-        assert!(conn.execute_sync("RELEASE robot_overview_read", &[]).is_err());
+        assert!(
+            conn.execute_sync("RELEASE robot_overview_read", &[])
+                .is_err()
+        );
         execute(&conn, "DROP TABLE file_reservation_releases");
-        execute(&conn, "CREATE TABLE file_reservation_releases (reservation_id INTEGER PRIMARY KEY)");
+        execute(
+            &conn,
+            "CREATE TABLE file_reservation_releases (reservation_id INTEGER PRIMARY KEY)",
+        );
         assert_eq!(build_at_mode(&conn, NOW, true).unwrap().0.len(), 1);
     }
 
@@ -404,15 +534,20 @@ mod tests {
     fn counts_entry_point_does_not_expose_uncounted_reservation_fields() {
         let (_dir, conn) = fixture(false, false);
         execute(&conn, "INSERT INTO projects VALUES (1, 'alpha')");
-        let json: serde_json::Value = serde_json::from_str(
-            &build_counts_output(&conn, OutputFormat::Json).unwrap(),
-        ).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&build_counts_output(&conn, OutputFormat::Json).unwrap()).unwrap();
         assert_eq!(json["_meta"]["command"], "robot overview");
         assert_eq!(json["project_count"], 1);
-        for key in ["unread", "urgent", "ack_overdue"] { assert_eq!(json[key], 0); }
+        for key in ["unread", "urgent", "ack_overdue"] {
+            assert_eq!(json[key], 0);
+        }
         assert!(json.get("projects").is_none());
         assert!(json.get("reservations").is_none());
-        assert!(!build_counts_output(&conn, OutputFormat::Toon).unwrap().is_empty());
+        assert!(
+            !build_counts_output(&conn, OutputFormat::Toon)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -421,25 +556,40 @@ mod tests {
         let (_dir, conn) = fixture(false, true);
         index(&conn);
         seed(&conn, 24000, 1, true);
-        execute(&conn, "UPDATE file_reservations SET project_id = (id % 33) + 1");
+        execute(
+            &conn,
+            "UPDATE file_reservations SET project_id = (id % 33) + 1",
+        );
         let mut old_times = Vec::new();
         let mut new_times = Vec::new();
         for iteration in 0..6 {
             for counts in [iteration % 2 == 0, iteration % 2 != 0] {
                 let mut projects = HashMap::new();
-                for id in 1..=33 { project(&mut projects, id); }
+                for id in 1..=33 {
+                    project(&mut projects, id);
+                }
                 let mut work = ScanWork::default();
                 let start = Instant::now();
-                if counts { collect(&conn, NOW, &mut projects, &mut work).unwrap(); }
-                else { collect_reservations(&conn, NOW, &mut projects, &mut work).unwrap(); }
+                if counts {
+                    collect(&conn, NOW, &mut projects, &mut work).unwrap();
+                } else {
+                    collect_reservations(&conn, NOW, &mut projects, &mut work).unwrap();
+                }
                 let elapsed = start.elapsed();
                 assert_eq!(projects.len(), 33);
                 eprintln!("counts={counts} elapsed={elapsed:?} work={work:?}");
-                if counts { new_times.push(elapsed); } else { old_times.push(elapsed); }
+                if counts {
+                    new_times.push(elapsed);
+                } else {
+                    old_times.push(elapsed);
+                }
             }
         }
         old_times.sort_unstable();
         new_times.sort_unstable();
-        eprintln!("native reservation phase, 33 known projects / 24000 unexpired released rows: full={:?} counts={:?}", old_times[3], new_times[3]);
+        eprintln!(
+            "native reservation phase, 33 known projects / 24000 unexpired released rows: full={:?} counts={:?}",
+            old_times[3], new_times[3]
+        );
     }
 }

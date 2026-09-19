@@ -1193,7 +1193,10 @@ mod tests {
         let expected = original.to_string();
         let error = observe_live_integrity_result::<()>(Err(original), &breaker).unwrap_err();
         assert_eq!(error.to_string(), expected);
-        assert!(matches!(error, mcp_agent_mail_db::DbError::IntegrityCorruption { .. }));
+        assert!(matches!(
+            error,
+            mcp_agent_mail_db::DbError::IntegrityCorruption { .. }
+        ));
         assert!(breaker.is_tripped());
         assert_eq!(breaker.trip_count(), 1);
         assert!(breaker.refusal_error().is_some());
@@ -1238,8 +1241,15 @@ mod tests {
         observe_live_integrity_result::<()>(Err(hard_live_integrity_error()), &breaker)
             .unwrap_err();
         let recovery = breaker.begin_recovery_check();
-        assert!(observe_live_integrity_result(Ok(accepted()), &breaker).unwrap().ok);
-        assert!(breaker.is_tripped(), "the remaining full-cycle checks still own recovery");
+        assert!(
+            observe_live_integrity_result(Ok(accepted()), &breaker)
+                .unwrap()
+                .ok
+        );
+        assert!(
+            breaker.is_tripped(),
+            "the remaining full-cycle checks still own recovery"
+        );
         assert_eq!(breaker.trip_count(), 1);
         assert!(recovery.reset_if_unchanged());
         assert!(!breaker.is_tripped());
@@ -1253,9 +1263,13 @@ mod tests {
             .unwrap_err();
         assert!(log.observe("integrity_check", &first.to_string()).is_some());
         let recovery = breaker.begin_recovery_check();
-        let repeated = observe_live_integrity_result::<()>(Err(hard_live_integrity_error()), &breaker)
-            .unwrap_err();
-        assert!(log.observe("integrity_check", &repeated.to_string()).is_none());
+        let repeated =
+            observe_live_integrity_result::<()>(Err(hard_live_integrity_error()), &breaker)
+                .unwrap_err();
+        assert!(
+            log.observe("integrity_check", &repeated.to_string())
+                .is_none()
+        );
         assert_eq!(breaker.trip_count(), 2);
         assert!(!recovery.reset_if_unchanged());
         assert!(breaker.refusal_error().is_some());
@@ -1274,13 +1288,21 @@ mod tests {
                  'CREATE INDEX idx_live_probe ON live_probe_rows(body COLLATE NOCASE)' \
                  WHERE name='idx_live_probe'; \
              PRAGMA writable_schema=OFF; PRAGMA schema_version=100;",
-        ).unwrap();
+        )
+        .unwrap();
         let quick = conn.query_sync("PRAGMA quick_check", &[]).unwrap();
-        assert!(details_indicate_ok(&extract_check_details(&quick, CheckKind::Quick)));
+        assert!(details_indicate_ok(&extract_check_details(
+            &quick,
+            CheckKind::Quick
+        )));
         let rows = conn.query_sync("PRAGMA integrity_check", &[]).unwrap();
         let details = extract_check_details(&rows, CheckKind::Full);
         assert!(!details_indicate_ok(&details));
-        assert!(details.iter().any(|detail| detail.contains("idx_live_probe")));
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_live_probe"))
+        );
         let breaker = mcp_agent_mail_db::CorruptionCircuitBreaker::default();
         let finding = mcp_agent_mail_db::DbError::IntegrityCorruption {
             message: "live integrity probe rejected the mailbox".to_string(),
@@ -1290,32 +1312,43 @@ mod tests {
         assert!(breaker.refusal_error().is_some());
         // The observer only publishes refusal. Reads remain possible and it
         // does not REINDEX, reconstruct, or write to the reported database.
-        let remaining = conn.query_sync(
-            "SELECT body FROM live_probe_rows NOT INDEXED ORDER BY id", &[],
-        ).unwrap();
+        let remaining = conn
+            .query_sync(
+                "SELECT body FROM live_probe_rows NOT INDEXED ORDER BY id",
+                &[],
+            )
+            .unwrap();
         assert_eq!(remaining[0].get_named::<String>("body").unwrap(), "Zebra");
         assert_eq!(remaining[1].get_named::<String>("body").unwrap(), "apple");
         assert!(!details_indicate_ok(&extract_check_details(
-            &conn.query_sync("PRAGMA integrity_check", &[]).unwrap(), CheckKind::Full,
+            &conn.query_sync("PRAGMA integrity_check", &[]).unwrap(),
+            CheckKind::Full,
         )));
     }
 
     #[test]
     fn real_probe_execution_error_is_not_reclassified_as_live_corruption() {
         let conn = mcp_agent_mail_db::CanonicalDbConn::open_memory().unwrap();
-        conn.execute_raw("CREATE TABLE intact (id INTEGER PRIMARY KEY)").unwrap();
-        let error = conn.query_sync("SELECT unavailable_column FROM intact", &[]).unwrap_err();
+        conn.execute_raw("CREATE TABLE intact (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let error = conn
+            .query_sync("SELECT unavailable_column FROM intact", &[])
+            .unwrap_err();
         let breaker = mcp_agent_mail_db::CorruptionCircuitBreaker::default();
         let error = mcp_agent_mail_db::DbError::Sqlite(error.to_string());
         let expected = error.to_string();
         assert_eq!(
-            observe_live_integrity_result::<()>(Err(error), &breaker).unwrap_err().to_string(),
+            observe_live_integrity_result::<()>(Err(error), &breaker)
+                .unwrap_err()
+                .to_string(),
             expected
         );
         assert!(!breaker.is_tripped());
         assert!(breaker.refusal_error().is_none());
         conn.execute_raw("INSERT INTO intact VALUES (1)").unwrap();
-        let rows = conn.query_sync("SELECT count(*) AS n FROM intact", &[]).unwrap();
+        let rows = conn
+            .query_sync("SELECT count(*) AS n FROM intact", &[])
+            .unwrap();
         assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 1);
     }
 
@@ -1347,7 +1380,11 @@ mod tests {
             assert_eq!(schedule.next_attempt(now), None);
             assert_eq!(
                 schedule.next_attempt(now + Duration::from_secs(900)),
-                Some(if verified { BackupKind::Verified } else { BackupKind::Proactive }),
+                Some(if verified {
+                    BackupKind::Verified
+                } else {
+                    BackupKind::Proactive
+                }),
                 "admission refusal must preserve pending verified work"
             );
         }
@@ -1355,7 +1392,10 @@ mod tests {
         assert_eq!(std::fs::read(backup).unwrap(), b"verified backup");
         for ordinal in 0..3 {
             let stage = root.join(format!(".mcp-agent-mail-proactive-backup-{ordinal:06}"));
-            assert_eq!(std::fs::read(stage.join("snapshot.sqlite3")).unwrap(), b"retained evidence");
+            assert_eq!(
+                std::fs::read(stage.join("snapshot.sqlite3")).unwrap(),
+                b"retained evidence"
+            );
         }
     }
 
@@ -1407,12 +1447,14 @@ mod tests {
                 .expect("create real canonical mailbox");
             conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
                 .expect("initialize real mailbox schema");
-            conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[]).unwrap();
+            conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+                .unwrap();
             drop(conn);
             let pool = mcp_agent_mail_db::create_pool(&DbPoolConfig {
                 database_url: format!("sqlite:///{}", primary.display()),
                 ..DbPoolConfig::default()
-            }).expect("create real backup pool");
+            })
+            .expect("create real backup pool");
             let before = std::fs::read(&primary).unwrap();
             let mut schedule = AutomaticBackupSchedule::default();
             if verified {
@@ -1420,11 +1462,25 @@ mod tests {
             }
             assert!(run_automatic_backup(&pool, &mut schedule));
             let backup = mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary);
-            assert!(backup.is_file(), "the real producer must publish, not merely return best-effort success");
-            assert!(mcp_agent_mail_db::pool::sqlite_recovery_candidate_passes_full_integrity_check(&backup)
-                .expect("independent strict canonical snapshot validation"));
-            assert_eq!(mcp_agent_mail_db::snapshot::snapshot_meta_path(&primary).is_file(), verified);
-            assert_eq!(std::fs::read(primary).unwrap(), before, "backup admission must not alter live bytes");
+            assert!(
+                backup.is_file(),
+                "the real producer must publish, not merely return best-effort success"
+            );
+            assert!(
+                mcp_agent_mail_db::pool::sqlite_recovery_candidate_passes_full_integrity_check(
+                    &backup
+                )
+                .expect("independent strict canonical snapshot validation")
+            );
+            assert_eq!(
+                mcp_agent_mail_db::snapshot::snapshot_meta_path(&primary).is_file(),
+                verified
+            );
+            assert_eq!(
+                std::fs::read(primary).unwrap(),
+                before,
+                "backup admission must not alter live bytes"
+            );
             assert_eq!(schedule.consecutive_failures(), 0);
         }
     }
