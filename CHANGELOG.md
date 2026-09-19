@@ -30,6 +30,15 @@ These changes are not a published release. Dependency upgrades and the full
 release validation remain in progress; selected passing tests do not establish
 release readiness.
 
+- **Recover small archive deltas containing empty projects in place.** Missing
+  project records no longer force a full mailbox reconstruction merely because
+  they have no messages. Project and message limits apply independently;
+  malformed metadata and conflicting message IDs roll back the transaction
+  (`br-lwx55`, GH #284).
+- **Restore valid backups when live health probing finds a truncated primary.**
+  Proven header truncation now reaches recovery instead of aborting before
+  backup selection. Other namespace and file-access refusals remain errors
+  (`br-7o04e`).
 - **Update WinSafe to 0.0.29.** Windows kernel API integration passes the
   native core suite: 1,873 tests, including no-clobber moves and setup
   replacement-race regressions.

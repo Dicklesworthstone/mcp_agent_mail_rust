@@ -6355,8 +6355,9 @@ pub fn archive_delta_apply_max_messages() -> usize {
         .unwrap_or(DEFAULT_ARCHIVE_DELTA_APPLY_MAX_MESSAGES)
 }
 
-/// Apply missing archive messages and projects if the delta is small and
-/// unambiguous. The bound limits missing messages and missing projects
+/// Apply a small, unambiguous delta of missing archive messages and projects.
+///
+/// The bound limits missing messages and missing projects
 /// independently, including projects that do not yet contain messages.
 ///
 /// The caller must already have established that the database is healthy and
