@@ -37,7 +37,7 @@ extract_function() {
 
 unit_library="$scratch/exit-functions.sh"
 for fn in info ok warn err error_support_hint init_verbose_log verbose \
-    dump_verbose_tail on_error installer_path_owner_uid \
+    dump_verbose_tail on_error early_exit_dump installer_path_owner_uid \
     remove_installer_tmp_dir remove_installer_lock_dir cleanup \
     handle_binary_transaction_signal update_mcp_configs configure_mcp_clients \
     configure_mcp_clients_for_install; do
@@ -54,6 +54,7 @@ root="$2"
 source "$3"
 QUIET=0 VERBOSE=0 HAS_GUM=0 NO_GUM=1 DRY_RUN=0
 LOG_INITIALIZED=0 ERROR_TAIL_EMITTED=0 VERBOSE_DUMP_LINES=20
+INSTALLER_EXIT_SUCCESS=0
 LOG_FILE="$root/verbose.log"
 ISSUES_URL=https://example.invalid/installer-exit-test
 BINARY_TRANSACTION_ACTIVE_INSTALL_DIR=''
@@ -79,13 +80,15 @@ fail_required_step() { return 37; }
 
 case "$mode" in
     noop) TMP='' LOCKED=0 ;;
-    explicit-success) exit 0 ;;
+    explicit-success) INSTALLER_EXIT_SUCCESS=1; exit 0 ;;
+    incomplete-success) exit 0 ;;
     quiet-success) QUIET=1 VERBOSE=1 ;;
     deliberate-one) exit 1 ;;
     deliberate-23) exit 23 ;;
     unexpected) fail_required_step ;;
     pipefail) fail_required_step | cat ;;
     nounset) printf '%s' "$MISSING_INSTALLER_VARIABLE" ;;
+    early-nounset) trap early_exit_dump EXIT; printf '%s' "$MISSING_INSTALLER_VARIABLE" ;;
     guarded) if fail_required_step; then exit 99; fi ;;
     cleanup-fails-success|cleanup-fails-23)
         remove_installer_tmp_dir() { printf 'temp\n' >> "$root/cleanup.calls"; return 71; }
@@ -139,6 +142,7 @@ CLI
 esac
 # Exercise natural EOF after the production tail's false compatibility branch.
 if [ 0 -eq 1 ]; then :; fi
+INSTALLER_EXIT_SUCCESS=1
 PROBE
 
 unit_cases=0
@@ -153,7 +157,7 @@ while read -r name expected_rc expected_errs; do
     case_failed=0
     [ "$rc" -eq "$expected_rc" ] && [ "$errs" -eq "$expected_errs" ] || case_failed=1
     case "$name" in
-        noop|cleanup-fails-*) ;;
+        noop|cleanup-fails-*|early-nounset) ;;
         *) [ ! -e "$case_root/lock.d" ] && [ ! -e "$case_root/mcp-agent-mail-install.fixture" ] || case_failed=1 ;;
     esac
     case "$name" in
@@ -190,12 +194,14 @@ done <<'CASES'
 noop 0 0
 success 0 0
 explicit-success 0 0
+incomplete-success 1 0
 quiet-success 0 0
 deliberate-one 1 0
 deliberate-23 23 0
 unexpected 37 1
 pipefail 37 1
 nounset 1 0
+early-nounset 1 0
 guarded 0 0
 cleanup-fails-success 0 0
 cleanup-fails-23 23 0
@@ -215,7 +221,13 @@ if [ "${1:-}" = --unit ]; then
     exit $?
 fi
 [ "$failures" -eq 0 ] || exit 1
-command -v minisign >/dev/null 2>&1 || { echo 'The signed-release tests require minisign; use --unit for offline coverage.' >&2; exit 2; }
+minisign_bin=$(command -v minisign) || { echo 'The signed-release tests require minisign; use --unit for offline coverage.' >&2; exit 2; }
+# A clean HOME is insufficient when PATH still exposes the caller's Codex or
+# OMP binary: their presence intentionally requires successful client setup.
+# Keep real system tools and the real signature verifier, but no ambient agents.
+mkdir "$scratch/bin"
+ln -s "$minisign_bin" "$scratch/bin/minisign"
+install_test_path="$scratch/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 for mode in file stdin; do
     case_root="$scratch/$mode"
@@ -228,11 +240,11 @@ for mode in file stdin; do
         # No caller credentials, XDG locations, shell startup hooks, or installer
         # skip overrides may leak into the clean-HOME reproduction.
         if [ "$mode" = file ]; then
-            env -i HOME="$case_root/home" PATH="$PATH" SHELL=/bin/bash \
+            env -i HOME="$case_root/home" PATH="$install_test_path" SHELL=/bin/bash \
                 TMPDIR="$case_root/tmp" LOG_FILE="$verbose_log" LC_ALL=C TERM=dumb \
                 "$BASH" -x "$INSTALL_SH" --version "$VERSION" --yes --no-gum --no-service --verbose
         else
-            env -i HOME="$case_root/home" PATH="$PATH" SHELL=/bin/bash \
+            env -i HOME="$case_root/home" PATH="$install_test_path" SHELL=/bin/bash \
                 TMPDIR="$case_root/tmp" LOG_FILE="$verbose_log" LC_ALL=C TERM=dumb \
                 "$BASH" -x -s -- --version "$VERSION" --yes --no-gum --no-service --verbose < "$INSTALL_SH"
         fi

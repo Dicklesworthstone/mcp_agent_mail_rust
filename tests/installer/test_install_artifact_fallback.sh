@@ -462,7 +462,7 @@ cleanup_probe="$tmp/cleanup-exit-status.sh"
     printf '%s\n' 'BINARY_TRANSACTION_ACTIVE_INSTALL_DIR=' \
         'BINARY_TRANSACTION_RECOVERY_ACTIVE=0' \
         'BINARY_TRANSACTION_EXIT_RECOVERY_ATTEMPTED=0' \
-        'TMP=' 'LOCKED=0'
+        'TMP=' 'LOCKED=0' 'INSTALLER_EXIT_SUCCESS=1'
     printf '%s\n' 'dump_verbose_tail() { :; }' \
         'err() { :; }' \
         'trap '\''exit 97'\'' ERR'
