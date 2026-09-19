@@ -2,8 +2,8 @@
 //!
 //! With feature `agent-detect` enabled, this module re-exports detection primitives
 //! from `franken-agent-detection` and supplements its filesystem probes with
-//! Agent Mail's active OMP configuration resolver and Unix remote-client PATH
-//! probes. Discovery never executes a candidate agent binary.
+//! Agent Mail's active OMP configuration resolver, fresh remote-client config
+//! roots, and Unix PATH probes. Discovery never executes a candidate binary.
 //! Without that feature, it preserves API shape and returns a deterministic
 //! `FeatureDisabled` error.
 
@@ -13,12 +13,12 @@ pub use franken_agent_detection::{
     InstalledAgentDetectionReport, InstalledAgentDetectionSummary,
 };
 
-/// Detect installed agents, including PATH-only remote clients on Unix.
+/// Detect installed agents without requiring previous conversation history.
 ///
 /// General probes and explicit root selection belong to `franken-agent-detection`.
-/// The installer also admits Codex and OMP executables on PATH before their first
-/// launch has created a config directory. Native setup must select those clients
-/// too, rather than return success without persisting their bearer credential.
+/// The installer also admits fresh Codex/OMP config directories and executables
+/// on PATH. Native setup must select those clients too, rather than require a
+/// sessions directory before it will persist their bearer credential.
 /// OMP's runtime overrides share the resolver used by setup so automatic selection
 /// reaches the same installation that setup will configure. Invalid active OMP
 /// configuration is reported as undetected, without hiding other agents.
@@ -34,6 +34,7 @@ pub fn detect_installed_agents(
     probe_opts.include_undetected = true;
     let mut report = franken_agent_detection::detect_installed_agents(&probe_opts)?;
 
+    supplement_remote_client_config_roots(&mut report, opts);
     #[cfg(unix)]
     supplement_remote_client_executables(&mut report, opts);
 
@@ -78,6 +79,56 @@ pub fn detect_installed_agents(
         report.installed_agents.retain(|entry| entry.detected);
     }
     Ok(report)
+}
+
+#[cfg(feature = "agent-detect")]
+fn supplement_remote_client_config_roots(
+    report: &mut InstalledAgentDetectionReport,
+    opts: &AgentDetectOptions,
+) {
+    use crate::setup::AgentPlatform;
+
+    let Some(home) = dirs::home_dir().filter(|home| home.is_absolute()) else {
+        return;
+    };
+    // These are installation witnesses shared with install.sh, not new write
+    // destinations. In particular .config/codex is evidence for Codex while
+    // setup still owns the choice and protection of its canonical config file.
+    // Keep explicit library/runtime roots isolated from the default HOME.
+    for (platform, env_key, roots) in [
+        (
+            AgentPlatform::Codex,
+            "CODEX_HOME",
+            &[".codex", ".config/codex"][..],
+        ),
+        (AgentPlatform::Omp, "CASS_OMP_DATA_ROOT", &[".omp"][..]),
+    ] {
+        if explicit_root_selected(opts, platform, env_key) {
+            continue;
+        }
+        let Some(entry) = report
+            .installed_agents
+            .iter_mut()
+            .find(|entry| entry.slug == platform.slug())
+        else {
+            continue;
+        };
+        for root in roots.iter().map(|relative| home.join(relative)) {
+            // A file or dangling link named .codex/.omp is not an install.
+            // A real-directory symlink is presence evidence only: it never
+            // bypasses the setup writer's independent no-follow admission.
+            if root.is_dir() {
+                entry.detected = true;
+                let root = root.to_string_lossy().into_owned();
+                if !entry.root_paths.contains(&root) {
+                    entry.root_paths.push(root.clone());
+                    entry.evidence.push(format!(
+                        "remote MCP client configuration directory exists: {root}"
+                    ));
+                }
+            }
+        }
+    }
 }
 
 #[cfg(feature = "agent-detect")]
@@ -230,31 +281,53 @@ mod runtime_tests {
 
     #[test]
     fn path_only_remote_clients_preserve_discovery_authority() {
-        let cases = [
-            "executable",
-            "symlink",
-            "relative",
-            "empty_component",
-            "non_utf8",
-            "shadowed",
-            "absent",
-            "non_executable",
-            "directory",
-            "dangling",
-            "unset_path",
-            "roots",
-            "env_roots",
-            "env_empty",
-            "env_whitespace",
-            "invalid_omp",
-        ];
+        run_remote_client_cases(
+            "path_only_remote_clients_preserve_discovery_authority",
+            &[
+                "executable",
+                "symlink",
+                "relative",
+                "empty_component",
+                "non_utf8",
+                "shadowed",
+                "absent",
+                "non_executable",
+                "directory",
+                "dangling",
+                "unset_path",
+                "roots",
+                "env_roots",
+                "env_empty",
+                "env_whitespace",
+                "invalid_omp",
+            ],
+        );
+    }
+
+    #[test]
+    fn configuration_only_remote_clients_preserve_discovery_authority() {
+        run_remote_client_cases(
+            "configuration_only_remote_clients_preserve_discovery_authority",
+            &[
+                "config_directory",
+                "config_xdg",
+                "config_roots",
+                "config_env_roots",
+                "config_file",
+                "config_dangling",
+                "config_invalid_omp",
+            ],
+        );
+    }
+
+    fn run_remote_client_cases(test: &str, cases: &[&str]) {
         if let Ok(case) = std::env::var(PATH_CASE_ENV) {
             assert!(cases.contains(&case.as_str()));
             check_path_detection(&case);
             println!("{PATH_CASE_ENV}:{case}:executed");
             return;
         }
-        for case in cases {
+        for &case in cases {
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path().canonicalize().unwrap();
             let home = root.join("home");
@@ -266,7 +339,7 @@ mod runtime_tests {
             command
                 .args([
                     "--exact",
-                    "agent_detect::runtime_tests::path_only_remote_clients_preserve_discovery_authority",
+                    &format!("agent_detect::runtime_tests::{test}"),
                     "--nocapture",
                 ])
                 .current_dir(&project)
@@ -286,7 +359,8 @@ mod runtime_tests {
             ] {
                 command.env_remove(key);
             }
-            configure_path_child(&mut command, case, &project);
+            configure_path_child(&mut command, case, &home, &project);
+            let before = detection_tree_entries(&home);
             let output = command.output().unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -300,11 +374,25 @@ mod runtime_tests {
                 "{case}: discovery executed an agent binary"
             );
             assert_eq!(
-                std::fs::read_dir(&home).unwrap().count(),
-                0,
-                "{case}: discovery must not create config or credential files"
+                detection_tree_entries(&home),
+                before,
+                "{case}: discovery wrote files"
             );
         }
+    }
+
+    fn detection_tree_entries(root: &Path) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                paths.extend(detection_tree_entries(&path));
+            }
+            paths.push(path);
+        }
+        paths.sort();
+        paths
     }
 
     fn check_path_detection(case: &str) {
@@ -317,6 +405,10 @@ mod runtime_tests {
                 | "unset_path"
                 | "roots"
                 | "env_roots"
+                | "config_roots"
+                | "config_env_roots"
+                | "config_file"
+                | "config_dangling"
         );
         for include_undetected in [false, true] {
             for selectors in [
@@ -331,7 +423,7 @@ mod runtime_tests {
                     include_undetected,
                     ..Default::default()
                 };
-                if case == "roots" {
+                if matches!(case, "roots" | "config_roots") {
                     for slug in [" CODEX-CLI ", " OH-MY-PI "] {
                         opts.root_overrides.push(AgentDetectRootOverride {
                             slug: slug.to_string(),
@@ -347,8 +439,9 @@ mod runtime_tests {
                         &selector.trim().to_ascii_lowercase(),
                     )
                     .unwrap();
-                    let expected = available
-                        && !(case == "invalid_omp" && platform == crate::setup::AgentPlatform::Omp);
+                    let invalid_omp = matches!(case, "invalid_omp" | "config_invalid_omp")
+                        && platform == crate::setup::AgentPlatform::Omp;
+                    let expected = available && !invalid_omp;
                     expected_count += usize::from(expected);
                     let entry = report
                         .installed_agents
@@ -361,16 +454,8 @@ mod runtime_tests {
                         "{case}"
                     );
                     if let Some(entry) = entry {
-                        assert!(entry.root_paths.is_empty(), "{case}: {entry:?}");
-                        assert_eq!(
-                            entry
-                                .evidence
-                                .iter()
-                                .any(|line| line.contains("remote MCP client executable on PATH:")),
-                            expected,
-                            "{case}: {entry:?}"
-                        );
-                        if case == "invalid_omp" && platform == crate::setup::AgentPlatform::Omp {
+                        assert_remote_entry(entry, case, platform, expected);
+                        if invalid_omp {
                             assert!(
                                 entry
                                     .evidence
@@ -401,11 +486,44 @@ mod runtime_tests {
         ));
     }
 
+    fn assert_remote_entry(
+        entry: &InstalledAgentDetectionEntry,
+        case: &str,
+        platform: crate::setup::AgentPlatform,
+        expected: bool,
+    ) {
+        let config_only = case.starts_with("config_") && expected;
+        if config_only {
+            let relative = match platform {
+                crate::setup::AgentPlatform::Codex if case == "config_xdg" => ".config/codex",
+                crate::setup::AgentPlatform::Codex => ".codex",
+                _ => ".omp",
+            };
+            let root = dirs::home_dir()
+                .unwrap()
+                .join(relative)
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(entry.root_paths, vec![root], "{case}: {entry:?}");
+        } else {
+            assert!(entry.root_paths.is_empty(), "{case}: {entry:?}");
+        }
+        assert_eq!(
+            entry
+                .evidence
+                .iter()
+                .any(|line| line.contains("remote MCP client executable on PATH:")),
+            expected && !config_only,
+            "{case}: {entry:?}"
+        );
+    }
+
     fn write_path_candidate(case: &str, project: &Path, bin: &Path, slug: &str) {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
         let candidate = bin.join(slug);
         match case {
+            case if case.starts_with("config_") => {}
             "absent" => {}
             "directory" => std::fs::create_dir(&candidate).unwrap(),
             "dangling" => symlink(project.join("missing-executable"), &candidate).unwrap(),
@@ -433,7 +551,12 @@ mod runtime_tests {
         }
     }
 
-    fn configure_path_child(command: &mut std::process::Command, case: &str, project: &Path) {
+    fn configure_path_child(
+        command: &mut std::process::Command,
+        case: &str,
+        home: &Path,
+        project: &Path,
+    ) {
         use std::os::unix::ffi::OsStringExt;
         use std::os::unix::fs::PermissionsExt;
 
@@ -447,6 +570,23 @@ mod runtime_tests {
         std::fs::create_dir_all(&bin).unwrap();
         for slug in ["codex", "omp"] {
             write_path_candidate(case, project, &bin, slug);
+        }
+        if case.starts_with("config_") {
+            let codex_root = if case == "config_xdg" {
+                ".config/codex"
+            } else {
+                ".codex"
+            };
+            for relative in [codex_root, ".omp"] {
+                let root = home.join(relative);
+                match case {
+                    "config_file" => std::fs::write(&root, "not a config directory\n").unwrap(),
+                    "config_dangling" => {
+                        std::os::unix::fs::symlink(home.join("missing-root"), &root).unwrap();
+                    }
+                    _ => std::fs::create_dir_all(root).unwrap(),
+                }
+            }
         }
         command.env("PATH", &bin);
         match case {
@@ -470,7 +610,7 @@ mod runtime_tests {
                 }
                 command.env("PATH", std::env::join_paths([first, bin]).unwrap());
             }
-            "env_roots" => {
+            "env_roots" | "config_env_roots" => {
                 for key in ["CODEX_HOME", "CASS_OMP_DATA_ROOT"] {
                     command.env(key, project.join("missing-probe-root"));
                 }
@@ -480,7 +620,7 @@ mod runtime_tests {
                     command.env(key, if case == "env_empty" { "" } else { " \t " });
                 }
             }
-            "invalid_omp" => {
+            "invalid_omp" | "config_invalid_omp" => {
                 command.env("OMP_PROFILE", "../escape");
             }
             _ => {}
