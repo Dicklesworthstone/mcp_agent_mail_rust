@@ -30,6 +30,11 @@ These changes are not a published release. Dependency upgrades and the full
 release validation remain in progress; selected passing tests do not establish
 release readiness.
 
+- **Update the terminal UI to FrankenTUI 0.7.0.** Console capability detection
+  uses the new color-depth API and keeps monochrome, ANSI16 and ANSI256
+  terminals from advertising true-color support. Platform backend selection
+  remains explicit. All 3,392 selected console, TUI and golden tests pass
+  without snapshot changes.
 - **Keep Beads queries on the selected workspace and show current list results.**
   Commands clear the inherited `BEADS_DB` override, which could redirect a
   validated workspace query to another database. List decoding recognizes

@@ -1618,7 +1618,7 @@ impl ConsoleCaps {
     #[allow(clippy::missing_const_for_fn)]
     pub fn from_capabilities(caps: &ftui::TerminalCapabilities) -> Self {
         Self {
-            true_color: caps.true_color,
+            true_color: caps.color_depth.supports_true_color(),
             osc8_hyperlinks: caps.osc8_hyperlinks,
             mouse_sgr: caps.mouse_sgr,
             sync_output: caps.sync_output,
@@ -4302,7 +4302,7 @@ mod tests {
     #[test]
     fn console_caps_from_capabilities_maps_fields() {
         let mut ftui_caps = ftui::TerminalCapabilities::basic();
-        ftui_caps.true_color = true;
+        ftui_caps.color_depth = ftui::ColorDepth::TrueColor;
         ftui_caps.osc8_hyperlinks = true;
         ftui_caps.mouse_sgr = false;
         ftui_caps.sync_output = true;
@@ -4315,6 +4315,17 @@ mod tests {
         assert!(caps.sync_output);
         assert!(!caps.kitty_keyboard);
         assert!(caps.focus_events);
+        for depth in [
+            ftui::ColorDepth::Mono,
+            ftui::ColorDepth::Ansi16,
+            ftui::ColorDepth::Ansi256,
+        ] {
+            ftui_caps.color_depth = depth;
+            assert!(
+                !ConsoleCaps::from_capabilities(&ftui_caps).true_color,
+                "{depth:?} must not advertise RGB color support"
+            );
+        }
     }
 
     // ── help_overlay_addendum tests (br-1m6a.23) ──

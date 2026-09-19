@@ -20,6 +20,26 @@ Clippy passed on the warm remote worker at 21:29 and 21:33 UTC
 and the canceled queued replacement remain recorded; neither executed locally.
 These results qualify this dependency change, not the complete release.
 
+September 19 FTUI update: all seven direct family
+dependencies move from 0.5 to 0.7.0 together, resolving fifteen FTUI packages
+from upstream revision `798efa0bb746601cea78b75ad8bc859f738a6456`.
+The console now reads `TerminalCapabilities::color_depth`; the existing
+capability regression also rejects RGB support for Mono, ANSI16 and ANSI256.
+The facade's new default enables both backends, so it instead explicitly
+enables runtime/extras and retains the application's existing platform backend
+selection. The optional Asupersync executor remains disabled. The lockfile
+changes no packages outside FTUI; two FTUI edges now use the already-resolved
+base64 0.23.1. Audit reports zero vulnerabilities with the previous warning
+categories. Workspace/all-target compilation, strict Clippy and formatting
+passed remotely (`044-ftui-070-check-final.log`, `044-ftui-070-clippy.log`,
+`044-ftui-070-fmt-final.log`). All 3,392 selected console, TUI and golden
+tests passed in 49.985 seconds at 22:22 UTC, with no snapshot updates
+(`044-ftui-070-runtime-resumed.log`; 1,578 tests outside the selection).
+The initial run reached the SSH test timeout during compilation and supplied
+no runtime verdict; its log is retained. The resumed run used the correct
+`RCH_TEST_TIMEOUT_SEC` override and the same worker cache. These results
+qualify the FTUI upgrade, not the full release.
+
 September 19 Beads prerequisite review: published `beads_rust` 0.6.0 keeps
 the consumed discovery/routing APIs, but its `BEADS_DB` environment override
 takes precedence over our validated `BEADS_DIR`. A real two-workspace control
