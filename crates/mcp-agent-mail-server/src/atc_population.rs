@@ -56,7 +56,7 @@ struct HydrationState {
 }
 
 impl HydrationState {
-    const fn should_defer_refresh(&self) -> bool {
+    fn should_defer_refresh(&self) -> bool {
         self.active_refresh.is_some()
             || !self.pending.is_empty()
             // The final hydration slice deliberately yields before inference.

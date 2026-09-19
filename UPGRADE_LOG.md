@@ -293,6 +293,13 @@ statements below; v0.3.36 is published and this work targets unreleased main.
   direct-library inventory (`044-remaining-update-preview.log`). It changed
   no lockfile entries. Those candidates still require research and consumer
   validation; they have not been applied as a batch.
+- The first TOML-edit gate stopped before test execution at 03:35 UTC
+  September 19 (strict RCH exit 101). Newly merged ATC code declared
+  `should_defer_refresh` const although the pinned compiler cannot call
+  `VecDeque::is_empty` in a const function. Removed the unnecessary `const`;
+  all callers use this predicate at runtime. The original failure remains in
+  `044-toml-edit-runtime.log`. The corrected gate also selects the ATC
+  population regressions (`044-toml-edit-atc-fix-runtime.log`); result pending.
 
 ## September 16, 2026 — release qualification update
 
