@@ -69,6 +69,55 @@ Recent releases; the earlier version history continues below.
   files, while rejecting unexpected paths, duplicate entries, missing binaries,
   and links. This correction follows the v0.3.36 tag: use the documented
   installer URL on `main`, not the installer script frozen at that tag.
+- **Proactive backups stop aborting on collated-index false positives, and can no
+  longer fill the disk.** With `INTEGRITY_CHECK_ON_STARTUP=true`, a live mailbox that
+  passes canonical `integrity_check` could still fail `create_proactive_backup` every
+  quick cycle, because the exported copy writes `COLLATE NOCASE` indexes in the primary
+  engine's key order and canonical SQLite reads that ordering as corruption. Each failed
+  cycle also preserved a ~24 MB staging directory with no sweeper. Staging is now
+  admission-controlled and descriptor-bound, retry admission persists across restarts,
+  rotation can no longer overwrite quarantine evidence, and reclaim never touches a live
+  database whose name carries a recovery marker.
+  ([GH #326](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/326))
+- **`am robot overview` is much cheaper at multi-project scale.** Per-project counting
+  no longer issues a query loop: recipient counts come from one grouped query, a single
+  reservation candidate scan supplies both counts and orphan-project visibility, and
+  completed project history is skipped during inventory. The main enumeration work drops
+  from `2 + 4 x project_count` statements to a small constant.
+  ([GH #274](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/274))
+- **ATC no longer stalls MCP under large agent populations.** Recency hydration runs in
+  bounded slices before inference, notification admission is bounded before durable
+  effects are written, and routine liveness sampling no longer appends ordinary messages
+  to durable mail. Scheduling stays fair across deferred dispatch instead of reordering
+  critical effects.
+  ([GH #258](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/258),
+  [GH #264](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/264))
+- **Integrity gating requires fresh, complete evidence before writes are released.**
+  Corruption-recovery authorization is bound to a fresh observation epoch, the server
+  refuses writes after a reconciled integrity failure, migrations are checksummed and
+  drift is refused before pending work runs, and `am doctor` keeps complete hash-witnessed
+  ref backups before any destructive recovery, failing closed on unowned or failed
+  orphan-ref repair.
+- **Message archives reconcile against verified Git objects, without clobbering.**
+  Live mailbox rows reconcile with bounded catch-up and backfill against the configured
+  live database rather than a snapshot, threaded archive bundles can be recovered from
+  surviving inboxes, and the maintenance worker runs bounded archive healing. (`br-8j6cb`)
+- **Search response caches preserve query identity and fail closed.** Cache generation
+  changes are atomic with respect to reads and writes, query identity and grammar are part
+  of the cache key so distinct queries cannot alias, and search fails closed when the
+  sender visibility policy is unavailable rather than answering without it.
+- **New: sibling-project suggestions.** The database can generate bounded sibling-project
+  suggestions from live mailbox metadata, and the CLI exposes explicit task-informed
+  sibling discovery with durable write reporting.
+- **Further dependency updates.** Clap 4.6.7 (after parser and help regression tests),
+  IndexMap 2.14.2, smallvec 1.16.1, and jsonwebtoken 11.1.0.
+- **Lint gate repairs in `mcp-agent-mail-db`.** `SearchResponseCache::bump_epoch` no longer
+  holds the entries write guard while acquiring the metrics lock — the epoch bump and the
+  clear remain atomic with respect to `get`/`put`, which is what that function documents,
+  but metrics bookkeeping now happens after the guard is released. A score blend uses
+  `mul_add`, and two test assertions now report the offending value on failure. These were
+  caught by `cargo clippy --all-targets -- -D warnings`; `cargo check` and a plain
+  `cargo test` both passed with them present.
 
 ## v0.3.36 — 2026-09-16 [Release]
 
