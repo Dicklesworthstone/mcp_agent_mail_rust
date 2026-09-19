@@ -87,7 +87,8 @@ fn explicit_root_selected(
     env_key: &str,
 ) -> bool {
     opts.root_overrides.iter().any(|root| {
-        crate::setup::AgentPlatform::from_slug(&root.slug.trim().to_ascii_lowercase()) == Some(platform)
+        crate::setup::AgentPlatform::from_slug(&root.slug.trim().to_ascii_lowercase())
+            == Some(platform)
     }) || std::env::var_os(env_key).is_some_and(|root| !root.to_string_lossy().trim().is_empty())
 }
 
@@ -318,9 +319,15 @@ mod runtime_tests {
                 | "env_roots"
         );
         for include_undetected in [false, true] {
-            for selectors in [vec!["codex", "omp"], vec![" CODEX-CLI "], vec![" OH-MY-PI "]] {
+            for selectors in [
+                vec!["codex", "omp"],
+                vec![" CODEX-CLI "],
+                vec![" OH-MY-PI "],
+            ] {
                 let mut opts = AgentDetectOptions {
-                    only_connectors: Some(selectors.iter().map(|slug| (*slug).to_string()).collect()),
+                    only_connectors: Some(
+                        selectors.iter().map(|slug| (*slug).to_string()).collect(),
+                    ),
                     include_undetected,
                     ..Default::default()
                 };
@@ -348,7 +355,11 @@ mod runtime_tests {
                         .iter()
                         .find(|entry| entry.slug == platform.slug());
                     assert_eq!(entry.is_some(), include_undetected || expected, "{case}");
-                    assert_eq!(entry.is_some_and(|entry| entry.detected), expected, "{case}");
+                    assert_eq!(
+                        entry.is_some_and(|entry| entry.detected),
+                        expected,
+                        "{case}"
+                    );
                     if let Some(entry) = entry {
                         assert!(entry.root_paths.is_empty(), "{case}: {entry:?}");
                         assert_eq!(
@@ -409,7 +420,11 @@ mod runtime_tests {
                     "#!/bin/sh\nprintf executed > \"$AM_TEST_EXECUTED_BINARY_MARKER\"\nexit 91\n",
                 )
                 .unwrap();
-                let mode = if case == "non_executable" { 0o644 } else { 0o755 };
+                let mode = if case == "non_executable" {
+                    0o644
+                } else {
+                    0o755
+                };
                 std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)).unwrap();
                 if case == "symlink" {
                     symlink(&target, &candidate).unwrap();
