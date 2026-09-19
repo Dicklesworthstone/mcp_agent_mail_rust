@@ -20941,6 +20941,7 @@ fn br_json_command(beads_dir: &Path, args: &[String]) -> Result<std::process::Co
         .current_dir(project_dir)
         .env("RUST_LOG", "error")
         .env("BEADS_DIR", beads_dir_utf8)
+        .env_remove("BEADS_DB")
         .env_remove("BD_DB")
         .env_remove("BD_DATABASE")
         .args([
@@ -20981,6 +20982,8 @@ fn run_br_json(beads_dir: &Path, args: &[String]) -> Result<serde_json::Value, S
 
 fn br_issue_summary_items(value: &serde_json::Value) -> Vec<serde_json::Value> {
     value
+        .get("issues")
+        .unwrap_or(value)
         .as_array()
         .map(|issues| {
             issues
@@ -67503,6 +67506,33 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn br_issue_summary_items_handles_list_envelope_and_ready_array() {
+        let rows = serde_json::json!([{
+            "id": "selected-123",
+            "title": "selected issue",
+            "status": "open",
+            "priority": 2,
+            "issue_type": "bug",
+            "labels": ["release"]
+        }]);
+        let expected = vec![serde_json::json!({
+            "id": "selected-123",
+            "title": "selected issue",
+            "status": "open",
+            "priority": "P2",
+            "type": "bug",
+            "labels": ["release"]
+        })];
+        assert_eq!(br_issue_summary_items(&rows), expected);
+        assert_eq!(
+            br_issue_summary_items(&serde_json::json!({"issues": rows, "total": 1})),
+            expected
+        );
+        assert!(br_issue_summary_items(&serde_json::json!([])).is_empty());
+        assert!(br_issue_summary_items(&serde_json::json!({"issues": [], "total": 0})).is_empty());
+    }
+
+    #[test]
     fn br_json_command_pins_the_validated_beads_workspace() {
         let dir = tempfile::tempdir().expect("tempdir");
         let beads_dir = dir.path().join("_beads");
@@ -67519,7 +67549,54 @@ startup_timeout_sec = 42
             Some(beads_dir.as_os_str())
         );
         assert_eq!(env.get(OsStr::new("BD_DB")), Some(&None));
+        assert_eq!(env.get(OsStr::new("BEADS_DB")), Some(&None));
         assert_eq!(env.get(OsStr::new("BD_DATABASE")), Some(&None));
+    }
+
+    #[test]
+    fn br_json_command_ignores_inherited_foreign_database() {
+        const CHILD_ROOT: &str = "AM_TEST_BR_AUTHORITY_ROOT";
+        const WITNESS: &str = "validated Beads workspace retained";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let foreign_db = root.join("foreign/.beads/beads.db");
+            assert_eq!(std::env::var_os("BEADS_DB"), Some(foreign_db.into()));
+            let result = run_br_json(&root.join("selected/.beads"), &["list".to_string()])
+                .expect("query selected real database");
+            let issues = br_issue_summary_items(&result);
+            assert_eq!(issues.len(), 1, "unexpected database contents: {result}");
+            assert_eq!(issues[0]["title"], "selected-workspace-issue");
+            println!("{WITNESS}");
+            return;
+        }
+
+        let root = tempfile::tempdir().expect("isolated Beads workspaces");
+        for (name, title) in [
+            ("selected", "selected-workspace-issue"),
+            ("foreign", "foreign-workspace-issue"),
+        ] {
+            let beads_dir = root.path().join(name).join(".beads");
+            std::fs::create_dir_all(&beads_dir).expect("create private workspace");
+            run_beads_fixture_command(&beads_dir, &["init", "--prefix", name]);
+            run_beads_fixture_command(&beads_dir, &["create", title, "--type", "bug"]);
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "tests::br_json_command_ignores_inherited_foreign_database",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, root.path())
+            .env("BEADS_DB", root.path().join("foreign/.beads/beads.db"))
+            .output()
+            .expect("run isolated authority probe");
+        assert!(
+            output.status.success(),
+            "authority probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(WITNESS));
     }
 
     #[cfg(unix)]

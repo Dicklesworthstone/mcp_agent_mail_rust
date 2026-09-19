@@ -5,6 +5,24 @@
 Tracked by `br-5lgwn`. This section supersedes historical current-status
 statements below; v0.3.36 is published and this work targets unreleased main.
 
+September 19 Beads prerequisite review: published `beads_rust` 0.6.0 keeps
+the consumed discovery/routing APIs, but its `BEADS_DB` environment override
+takes precedence over our validated `BEADS_DIR`. A real two-workspace control
+with the official 0.6.0 binary returned the foreign workspace's issue. The
+application now clears that override along with `BD_DB` and `BD_DATABASE`.
+The fresh-child regression then exposed a second integration defect: current
+`list` output wraps rows in `issues`, but the application silently treated
+that object as an empty list. The shared decoder now handles the list envelope
+and the ready command's array (`br-8nski`, `br-q0b1m`). All eight selected
+tests passed against the real 0.6.0 binary, including independent workspaces
+in a fresh child and existing ready/status handlers
+(`044-beads-authority-envelope-runtime.log`). Final workspace/all-target
+check, strict Clippy and formatting passed. Earlier test-shape and
+production-decoder failures remain in the evidence logs. The embedded
+dependency is still 0.5.4; its upgrade is next. Version 0.6.0 still requires the separate 0.3.18
+engine; upgrading it will not eliminate that graph. Keep default features
+disabled to avoid its optional self-update HTTP runtime.
+
 September 19 Blake2 update: the direct release-verifier dependency
 advances from 0.10.6 to 0.11.0. Published upstream changes replace aliases with
 newtypes and move to digest 0.11; both application consumers use the unchanged

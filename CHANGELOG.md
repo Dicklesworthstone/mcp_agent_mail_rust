@@ -30,6 +30,12 @@ These changes are not a published release. Dependency upgrades and the full
 release validation remain in progress; selected passing tests do not establish
 release readiness.
 
+- **Keep Beads queries on the selected workspace and show current list results.**
+  Commands clear the inherited `BEADS_DB` override, which could redirect a
+  validated workspace query to another database. List decoding recognizes
+  the current `issues` envelope instead of silently reporting no matches;
+  ready-command arrays remain supported. Real Beads 0.6.0 integration tests
+  cover both fixes (`br-8nski`, `br-q0b1m`).
 - **Repair native Windows file and path handling.** Evidence-ledger writes
   no longer probe an incomplete drive prefix, file-lock contention uses the
   platform's actual error code, and setup status redacts native home paths.
