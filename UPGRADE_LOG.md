@@ -5,6 +5,23 @@
 Tracked by `br-5lgwn`. This section supersedes historical current-status
 statements below; v0.3.36 is published and this work targets unreleased main.
 
+September 19 WinSafe update: the Windows-only
+kernel dependency moves from exact 0.0.28 to exact 0.0.29, published from
+`71ed88c2a0d18b03ee452f6d4261f4c22f443483`. The consumed `MoveFileEx`,
+`ReplaceFile`, flags, errors and UTF-16 conversion are unchanged. The new
+optional multimedia feature is not enabled; the lockfile changes only
+WinSafe's version and checksum. Audit reports zero vulnerabilities and the
+existing unmaintained/unsound warnings. Workspace/all-target check, strict
+Clippy, formatting and the remote Windows cross-build passed. Native
+SURFACEBOOKJE execution passed 1,873 core tests with one existing ignored
+test in 22 seconds, including move collisions, NUL rejection, leaf/symlink
+replacement races and partial-move rollback. The executed SHA-256 is
+`4f21dac647f6c391e1351450e4481ffd447daec05b4b7de71d7fb10600e970de`;
+`044-winsafe-029-native-corrected.json` and its complete artifacts retain
+the receipt. The initial launcher path-quoting failure ran no tests and is
+preserved separately. This qualifies the dependency, not Windows publication
+crash durability or the full release.
+
 September 19 `dirs` update: the workspace now uses 7.0.0, and the CLI and
 core crates inherit that pin instead of independently requiring version 6.
 Upstream's sole source behavior change moves Windows `preference_dir()`

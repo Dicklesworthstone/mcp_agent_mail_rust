@@ -30,6 +30,9 @@ These changes are not a published release. Dependency upgrades and the full
 release validation remain in progress; selected passing tests do not establish
 release readiness.
 
+- **Update WinSafe to 0.0.29.** Windows kernel API integration passes the
+  native core suite: 1,873 tests, including no-clobber moves and setup
+  replacement-race regressions.
 - **Refuse mixed database generations during health probes.** Idle staging
   retains each database and recovery-sidecar identity, presence and content
   digest, then verifies the copied bytes and rechecks the source family.
