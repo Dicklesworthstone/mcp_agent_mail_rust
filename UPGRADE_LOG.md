@@ -5,16 +5,18 @@
 Tracked by `br-5lgwn`. This section supersedes historical current-status
 statements below; v0.3.36 is published and this work targets unreleased main.
 
-September 19 Blake2 update (in progress): the direct release-verifier dependency
+September 19 Blake2 update: the direct release-verifier dependency
 advances from 0.10.6 to 0.11.0. Published upstream changes replace aliases with
 newtypes and move to digest 0.11; both application consumers use the unchanged
 `Blake2b512::digest` interface and no removed feature or variable-output type.
 Version 0.11.0 already existed transitively, so resolution changes only the CLI
 dependency edge. Argon2 retains its required 0.10.6 dependency; an initial
 attempt to replace that shared version was rejected before any lockfile change.
-The real signed-release fixture and tamper/key-rotation tests are running in
-`044-blake2-011-runtime.log`; workspace check is running separately. No runtime
-pass is claimed yet.
+All 14 real signed-release fixture and tamper/key-rotation tests passed in
+`044-blake2-011-runtime.log` (strict RCH exit 0, September 19 19:44 UTC).
+Workspace/all-target check and strict Clippy passed on this dependency graph;
+later setup changes still require their own final qualification. No package
+versions were added to the audited graph by this direct-edge update.
 
 September 19 TOON update: `tru` 0.2.4 replaces 0.2.3 after review of the
 published package and upstream maintenance notes. Default features remain

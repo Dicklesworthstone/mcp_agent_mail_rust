@@ -30,6 +30,18 @@ These changes are not a published release. Dependency upgrades and the full
 release validation remain in progress; selected passing tests do not establish
 release readiness.
 
+- **Setup honors Claude Code's active configuration profile.**
+  `CLAUDE_CONFIG_DIR` now selects the user and project-local MCP configuration
+  authority, including relative overrides resolved from the launch directory.
+  Invalid overrides fail before writes, and status checks inspect the exact
+  project scope instead of allowing a healthy global entry to hide local drift.
+  ([repair](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/360bf6f55aac553d6f5cc0e7dce8eb8f4cd685ac); `br-vcwkm`)
+- **Antigravity setup writes a working HTTP transport configuration.**
+  Generated entries use `serverUrl`, as required by the current `agy` CLI;
+  the previous `httpUrl` field was interpreted as an incomplete stdio entry.
+  Status checks recognize that mismatch and setup repairs existing entries.
+  Gemini's separate `httpUrl` configuration remains supported.
+  ([repair](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/038a7d18); `br-tip25`)
 - **Mailbox dependencies move to FrankenSQLite 0.4.4.** SQLModel 0.5.0,
   Asupersync 0.5.0, FastMCP 0.10.0 and FrankenSearch 0.6.0 move together so
   database and reranker contexts remain compatible. FastMCP stays pinned to
