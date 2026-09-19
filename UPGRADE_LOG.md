@@ -300,6 +300,22 @@ statements below; v0.3.36 is published and this work targets unreleased main.
   all callers use this predicate at runtime. The original failure remains in
   `044-toml-edit-runtime.log`. The corrected gate also selects the ATC
   population regressions (`044-toml-edit-atc-fix-runtime.log`); result pending.
+- Fresh GH326 review found existing real NOCASE/export/backup regressions that
+  postdate the earlier database receipt. Their strict remote run is compiling
+  on a separate worker (`044-gh326-nocase-runtime.log`). The candidate still
+  has the uppercase-folding registry comparator; upstream `6ede4b51c` fixes
+  it, but its own commit explicitly records no executed Rust tests. The VDBE
+  byte comparator also continues past a shared NUL, unlike canonical SQLite.
+  These are source/oracle findings pending application-level reproduction;
+  neither an engine pin change nor issue closure has been made.
+- Concurrent commits captured the ATC fix and corrected ambiguous empty-vector
+  assertions in cleanup tests (`a27c2bda` merge). The first retry predates that
+  cleanup correction. A bounded shell follow-up waits for that owned RCH
+  process to exit, then validates the merged source with the TOML/ATC tests
+  plus persistent backup-admission tests, followed by workspace/all-target
+  check and Clippy only if each preceding stage passes. It does not mutate
+  dependencies or publish. Logs: `044-merged-validation-sequence.log` and
+  `044-merged-{toml-atc-runtime,check,clippy}.log`. Results remain pending.
 
 ## September 16, 2026 — release qualification update
 
