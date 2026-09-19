@@ -8870,6 +8870,10 @@ handle_binary_transaction_signal() {
 
 cleanup() {
   local rc=$?
+  # A non-zero return from an EXIT trap re-enters an inherited ERR trap on
+  # Bash, with LINENO commonly reset to 1. Preserve the real process status
+  # without manufacturing a second "unexpected" failure during cleanup.
+  trap - ERR
   trap - HUP INT QUIT TERM
   if [ -n "${BINARY_TRANSACTION_ACTIVE_INSTALL_DIR:-}" ] && \
      [ "${BINARY_TRANSACTION_RECOVERY_ACTIVE:-0}" -eq 0 ] && \
@@ -10483,3 +10487,9 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 1 ]; then
   warn "The installed Rust binaries remain on disk, but direct execution was blocked by the host."
   activate_mac_python_cli_compat_shell
 fi
+
+# Reaching the end means every required installation phase succeeded. Do not
+# let an optional final compatibility action leak its status into the EXIT
+# cleanup trap and turn a working install into a reported failure.
+verbose "install:complete rc=0"
+exit 0

@@ -455,6 +455,39 @@ if grep -q 'rm -rf "${LOCK_DIR' "$INSTALL_SH" || grep -q 'rm -rf "$LOCK_DIR' "$I
     exit 1
 fi
 
+step "scenario E2: exit cleanup preserves status without re-entering ERR"
+cleanup_probe="$tmp/cleanup-exit-status.sh"
+{
+    printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail'
+    printf '%s\n' 'BINARY_TRANSACTION_ACTIVE_INSTALL_DIR=' \
+        'BINARY_TRANSACTION_RECOVERY_ACTIVE=0' \
+        'BINARY_TRANSACTION_EXIT_RECOVERY_ATTEMPTED=0' \
+        'TMP=' 'LOCKED=0'
+    printf '%s\n' 'dump_verbose_tail() { :; }' \
+        'err() { :; }' \
+        'trap '\''exit 97'\'' ERR'
+    extract_function cleanup
+    printf '%s\n' 'trap cleanup EXIT' 'exit "${PROBE_RC:?}"'
+} >"$cleanup_probe"
+chmod 755 "$cleanup_probe"
+if PROBE_RC=23 "$cleanup_probe"; then
+    echo "FAIL: cleanup changed a deliberate failure into success" >&2
+    exit 1
+else
+    cleanup_probe_rc=$?
+fi
+if [ "$cleanup_probe_rc" -ne 23 ]; then
+    echo "FAIL: cleanup re-entered ERR or changed exit 23 to $cleanup_probe_rc" >&2
+    exit 1
+fi
+PROBE_RC=0 "$cleanup_probe" \
+    || { echo "FAIL: cleanup changed a successful exit" >&2; exit 1; }
+
+grep -Fq 'verbose "install:complete rc=0"' "$INSTALL_SH" \
+    || { echo "FAIL: installer does not explicitly mark successful completion" >&2; exit 1; }
+[ "$(tail -n 1 "$INSTALL_SH")" = 'exit 0' ] \
+    || { echo "FAIL: installer does not explicitly exit zero after successful completion" >&2; exit 1; }
+
 step "scenario F: dry-run preserves install state and --force skips installed probes"
 dry_run_dest="$tmp/dry-run-dest/nested"
 dry_run_skip_marker="$tmp/dry-run-python-migration-skipped"
