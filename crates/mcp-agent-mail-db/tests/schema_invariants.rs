@@ -780,6 +780,112 @@ fn deterministic_state_sequence_keeps_schema_invariants_healthy() {
     }
 }
 
+#[test]
+fn recovery_candidate_rejects_each_missing_mailbox_schema_predicate() {
+    use mcp_agent_mail_db::{
+        CanonicalDbConn, sqlite_recovery_candidate_is_standalone,
+        sqlite_recovery_candidate_passes_full_integrity_check,
+    };
+
+    // Independent legacy schema fixture: no production signature constant is
+    // reused, so dropping a required predicate from the validator is detectable.
+    const LEGACY_SCHEMA: &str = "
+        CREATE TABLE projects (id INTEGER, slug TEXT, human_key TEXT);
+        CREATE TABLE agents (id INTEGER, project_id INTEGER, name TEXT);
+        CREATE TABLE messages (
+            id INTEGER, project_id INTEGER, sender_id INTEGER,
+            subject TEXT, body_md TEXT
+        );
+        CREATE TABLE message_recipients (
+            message_id INTEGER, agent_id INTEGER, kind TEXT
+        );";
+    let cases = [
+        ("projects", None),
+        ("agents", None),
+        ("messages", None),
+        ("message_recipients", None),
+        ("projects", Some("id")),
+        ("projects", Some("slug")),
+        ("projects", Some("human_key")),
+        ("agents", Some("id")),
+        ("agents", Some("project_id")),
+        ("agents", Some("name")),
+        ("messages", Some("id")),
+        ("messages", Some("project_id")),
+        ("messages", Some("sender_id")),
+        ("messages", Some("subject")),
+        ("messages", Some("body_md")),
+        ("message_recipients", Some("message_id")),
+        ("message_recipients", Some("agent_id")),
+        ("message_recipients", Some("kind")),
+    ];
+
+    for (table, column) in cases {
+        // Never progressively damage one shared database: every predicate gets
+        // its own complete, independently accepted starting image.
+        let dir = tempfile::tempdir().expect("fresh schema predicate fixture");
+        let path = dir.path().join("candidate.sqlite3");
+        let conn = CanonicalDbConn::open_file(path.to_str().expect("UTF-8 fixture path"))
+            .expect("open canonical fixture");
+        conn.execute_raw(LEGACY_SCHEMA)
+            .expect("create legacy schema");
+        drop(conn);
+        assert!(
+            sqlite_recovery_candidate_passes_full_integrity_check(&path)
+                .expect("complete schema probe"),
+            "complete fixture must pass before changing {table}.{column:?}"
+        );
+
+        let (rename, restore) = column.map_or_else(
+            || {
+                (
+                    format!("ALTER TABLE {table} RENAME TO omitted_predicate"),
+                    format!("ALTER TABLE omitted_predicate RENAME TO {table}"),
+                )
+            },
+            |column| {
+                (
+                    format!("ALTER TABLE {table} RENAME COLUMN {column} TO omitted_predicate"),
+                    format!("ALTER TABLE {table} RENAME COLUMN omitted_predicate TO {column}"),
+                )
+            },
+        );
+        let conn = CanonicalDbConn::open_file(path.to_str().expect("UTF-8 fixture path"))
+            .expect("open fixture for one rename");
+        conn.execute_raw(&rename)
+            .expect("rename exactly one predicate");
+        let integrity = conn
+            .query_sync("PRAGMA integrity_check", &[])
+            .expect("canonical full integrity after rename");
+        assert_eq!(integrity.len(), 1, "{rename}: integrity row count");
+        assert_eq!(
+            integrity[0].get_as::<String>(0).expect("integrity result"),
+            "ok",
+            "{rename}: schema mutation must leave a valid SQLite file"
+        );
+        drop(conn);
+        assert!(sqlite_recovery_candidate_is_standalone(&path));
+        assert!(
+            !sqlite_recovery_candidate_passes_full_integrity_check(&path)
+                .expect("single missing predicate probe"),
+            "public validator must reject {rename}"
+        );
+
+        // Reversing only that rename must restore acceptance. This rules out
+        // unrelated corruption or sidecars being the reason for rejection.
+        let conn = CanonicalDbConn::open_file(path.to_str().expect("UTF-8 fixture path"))
+            .expect("open fixture to restore predicate");
+        conn.execute_raw(&restore)
+            .expect("restore only the missing predicate");
+        drop(conn);
+        assert!(
+            sqlite_recovery_candidate_passes_full_integrity_check(&path)
+                .expect("restored schema probe"),
+            "restoring {table}.{column:?} must restore acceptance"
+        );
+    }
+}
+
 // Heavier replay lane for local or nightly rch runs:
 // rch exec -- cargo test -p mcp-agent-mail-db schema_invariant_heavy_replay_lane -- --ignored --nocapture
 #[test]

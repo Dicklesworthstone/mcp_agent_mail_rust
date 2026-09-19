@@ -276,6 +276,38 @@ fn population_database(
     (pool, path)
 }
 
+fn drain_population_hydration(activity: i64, population: usize) {
+    let mut previous = atc::atc_population_hydration_stats().applied_agents;
+    let mut slices = 0;
+    while atc::atc_population_hydration_stats().pending_agents > 0 {
+        let now = activity + 10 * SECOND;
+        let report = atc::atc_tick_report(now).unwrap();
+        let progress = atc::atc_population_hydration_stats();
+        assert!((1..=32).contains(&(progress.applied_agents - previous)));
+        assert_eq!(
+            progress.applied_agents + progress.pending_agents,
+            population
+        );
+        assert_eq!(
+            report.summary.completeness,
+            atc::SnapshotCompleteness::Partial
+        );
+        assert_eq!(report.summary.kernel.next_due_micros, Some(now));
+        assert_eq!(
+            report.summary.tick_count, 0,
+            "inference ran on partial DB evidence"
+        );
+        assert!(report.effects.is_empty());
+        assert!(report.actions.is_empty());
+        previous = progress.applied_agents;
+        slices += 1;
+        assert!(
+            slices <= population,
+            "population hydration stopped making progress"
+        );
+    }
+}
+
 #[test]
 fn database_population_940_uses_bounded_hydration_and_noop_steady_state_refreshes() {
     let _guard = TEST_LOCK
@@ -329,32 +361,7 @@ fn database_population_940_uses_bounded_hydration_and_noop_steady_state_refreshe
                 Some("/population-hydration"),
                 observed,
             );
-            let mut previous = atc::atc_population_hydration_stats().applied_agents;
-            let mut slices = 0;
-            while atc::atc_population_hydration_stats().pending_agents > 0 {
-                let now = activity + 10 * SECOND;
-                let report = atc::atc_tick_report(now).unwrap();
-                let progress = atc::atc_population_hydration_stats();
-                assert!((1..=32).contains(&(progress.applied_agents - previous)));
-                assert_eq!(progress.applied_agents + progress.pending_agents, 940);
-                assert_eq!(
-                    report.summary.completeness,
-                    atc::SnapshotCompleteness::Partial
-                );
-                assert_eq!(report.summary.kernel.next_due_micros, Some(now));
-                assert_eq!(
-                    report.summary.tick_count, 0,
-                    "inference ran on partial DB evidence"
-                );
-                assert!(report.effects.is_empty());
-                assert!(report.actions.is_empty());
-                previous = progress.applied_agents;
-                slices += 1;
-                assert!(
-                    slices <= 940,
-                    "population hydration stopped making progress"
-                );
-            }
+            drain_population_hydration(activity, 940);
             assert_eq!(
                 tracker.snapshot().total,
                 1,

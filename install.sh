@@ -224,9 +224,16 @@ on_error() {
 
 early_exit_dump() {
   local rc=$?
+  trap - ERR
+  # Bash 3.2 can report zero to EXIT after a fatal nounset expansion.
+  # Only an explicit successful completion may authorize a zero exit.
+  if [ "$rc" -eq 0 ] && [ "${INSTALLER_EXIT_SUCCESS:-0}" -ne 1 ]; then
+    rc=1
+  fi
   if [ "$rc" -ne 0 ]; then
     dump_verbose_tail
   fi
+  return "$rc"
 }
 
 download_to_file() {
@@ -2371,7 +2378,7 @@ git_worktree_root_for_path() {
   fi
   [ -d "$cursor" ] && [ -r "$cursor" ] && [ -x "$cursor" ] || return 2
 
-  if root=$(git_authority_probe -C "$cursor" rev-parse --show-toplevel 2>/dev/null); then
+  if root=$(git_authority_probe -C "$cursor" rev-parse --show-toplevel 2>/dev/null || exit "$?"); then
     [ -n "$root" ] && [ -d "$root" ] || return 2
     printf '%s' "$root"
     return 0
@@ -2407,7 +2414,7 @@ token_env_targets_outside_git_worktrees() {
   local worktree_rc
 
   for target in "$canonical_env" "$compatibility_env"; do
-    if worktree_root=$(git_worktree_root_for_path "$target"); then
+    if worktree_root=$(git_worktree_root_for_path "$target" || exit "$?"); then
       warn "Refusing to write a token-bearing env file inside a Git worktree: $target"
       warn "Destination worktree: $worktree_root"
       warn "Move HOME/config outside every checkout, then rerun the installer; no env migration bytes were written."
@@ -2920,8 +2927,10 @@ TXN_TARGET_STATE=""
 installer_path_mode() {
   local path="$1"
   local mode=""
-  mode=$(stat -c '%a' -- "$path" 2>/dev/null) \
-    || mode=$(stat -f '%Lp' "$path" 2>/dev/null) \
+  # Guard inside the substitution: Bash 3.2 otherwise invokes inherited ERR
+  # for the expected GNU-stat failure before the BSD fallback can run.
+  mode=$(stat -c '%a' -- "$path" 2>/dev/null || exit "$?") \
+    || mode=$(stat -f '%Lp' "$path" 2>/dev/null || exit "$?") \
     || return 1
   [[ "$mode" =~ ^[0-7]+$ ]] || return 1
   printf '%s' "$mode"
@@ -2930,8 +2939,8 @@ installer_path_mode() {
 installer_path_link_count() {
   local path="$1"
   local count=""
-  count=$(stat -c '%h' -- "$path" 2>/dev/null) \
-    || count=$(stat -f '%l' "$path" 2>/dev/null) \
+  count=$(stat -c '%h' -- "$path" 2>/dev/null || exit "$?") \
+    || count=$(stat -f '%l' "$path" 2>/dev/null || exit "$?") \
     || return 1
   [[ "$count" =~ ^[0-9]+$ ]] || return 1
   printf '%s' "$count"
@@ -8450,6 +8459,7 @@ Options:
 EOFU
 }
 
+INSTALLER_EXIT_SUCCESS=0
 trap 'on_error $LINENO' ERR
 trap early_exit_dump EXIT
 
@@ -8513,7 +8523,7 @@ while [ $# -gt 0 ]; do
     --yes|-y) ASSUME_YES=1; shift;;
     --purge) PURGE=1; shift;;
     --dry-run|--preview) DRY_RUN=1; shift;;
-    -h|--help) usage; exit 0;;
+    -h|--help) usage; INSTALLER_EXIT_SUCCESS=1; exit 0;;
     *)
       err "Unknown option: $1"
       error_usage_hint
@@ -8543,6 +8553,7 @@ verbose "config VERSION=${VERSION:-latest} DEST=${DEST} SYSTEM=${SYSTEM} EASY=${
 
 if [ "$UNINSTALL" -eq 1 ]; then
   uninstall
+  INSTALLER_EXIT_SUCCESS=1
   exit 0
 fi
 
@@ -8730,6 +8741,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
   print_install_plan
   echo -e "\033[1;36m=== Dry run complete (no changes made) ===\033[0m"
   echo ""
+  INSTALLER_EXIT_SUCCESS=1
   exit 0
 fi
 
@@ -8742,6 +8754,7 @@ if [ "$EASY" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ] && [ -t 1 ] && [ -e /dev/tty ]; 
   case "$confirm" in
     [nN]*)
       info "Installation cancelled."
+      INSTALLER_EXIT_SUCCESS=1
       exit 0
       ;;
   esac
@@ -8750,8 +8763,8 @@ fi
 installer_path_owner_uid() {
   local path="$1"
   local owner=""
-  owner=$(stat -c '%u' -- "$path" 2>/dev/null) \
-    || owner=$(stat -f '%u' "$path" 2>/dev/null) \
+  owner=$(stat -c '%u' -- "$path" 2>/dev/null || exit "$?") \
+    || owner=$(stat -f '%u' "$path" 2>/dev/null || exit "$?") \
     || return 1
   [[ "$owner" =~ ^[0-9]+$ ]] || return 1
   printf '%s' "$owner"
@@ -8875,6 +8888,10 @@ cleanup() {
   # without manufacturing a second "unexpected" failure during cleanup.
   trap - ERR
   trap - HUP INT QUIT TERM
+  # Old macOS Bash loses the fatal nounset status before invoking EXIT.
+  if [ "$rc" -eq 0 ] && [ "${INSTALLER_EXIT_SUCCESS:-0}" -ne 1 ]; then
+    rc=1
+  fi
   if [ -n "${BINARY_TRANSACTION_ACTIVE_INSTALL_DIR:-}" ] && \
      [ "${BINARY_TRANSACTION_RECOVERY_ACTIVE:-0}" -eq 0 ] && \
      [ "${BINARY_TRANSACTION_EXIT_RECOVERY_ATTEMPTED:-0}" -eq 0 ]; then
@@ -10492,4 +10509,5 @@ fi
 # let an optional final compatibility action leak its status into the EXIT
 # cleanup trap and turn a working install into a reported failure.
 verbose "install:complete rc=0"
+INSTALLER_EXIT_SUCCESS=1
 exit 0
