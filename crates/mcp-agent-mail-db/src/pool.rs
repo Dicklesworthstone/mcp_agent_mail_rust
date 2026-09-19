@@ -29058,6 +29058,94 @@ mod tests {
         assert!(!reconcile_archive_state_before_init(&primary, &storage_root).unwrap());
     }
 
+    #[test]
+    fn archive_ahead_empty_project_delta_preserves_primary_identity() {
+        for include_message in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let primary = dir.path().join("storage.sqlite3");
+            let storage_root = dir.path().join("storage");
+            let msg_dir = seed_reconstructed_primary_from_archive(&primary, &storage_root);
+            if include_message {
+                push_archive_ahead(&msg_dir);
+            }
+            let project = storage_root.join("projects/project-only");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(
+                project.join("project.json"),
+                r#"{"slug":"project-only","human_key":"/project-only"}"#,
+            )
+            .unwrap();
+            let identity_before = primary_identity(&primary);
+            clear_pending_archive_drift(&primary);
+            assert!(reconcile_archive_state_before_init(&primary, &storage_root).unwrap());
+            assert_eq!(primary_identity(&primary), identity_before);
+            assert_eq!(
+                count_messages(&primary),
+                if include_message { 2 } else { 1 }
+            );
+            let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+            let rows = conn
+                .query_sync(
+                    "SELECT human_key FROM projects WHERE slug = 'project-only'",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].get_named::<String>("human_key").unwrap(),
+                "/project-only"
+            );
+            crate::close_db_conn(conn, "verify incremental project recovery");
+            assert!(!has_pending_archive_drift(&primary));
+            assert!(!reconcile_archive_state_before_init(&primary, &storage_root).unwrap());
+        }
+    }
+
+    #[test]
+    fn archive_ahead_empty_project_delta_rolls_back_on_bound_or_invalid_metadata() {
+        for invalid_metadata in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let primary = dir.path().join("storage.sqlite3");
+            let storage_root = dir.path().join("storage");
+            seed_reconstructed_primary_from_archive(&primary, &storage_root);
+            for slug in ["aaa-empty", "aab-empty"] {
+                let project = storage_root.join("projects").join(slug);
+                std::fs::create_dir_all(&project).unwrap();
+                let metadata = if invalid_metadata && slug == "aab-empty" {
+                    "{invalid".to_string()
+                } else {
+                    format!(r#"{{"slug":"{slug}","human_key":"/{slug}"}}"#)
+                };
+                std::fs::write(project.join("project.json"), metadata).unwrap();
+            }
+            let identity_before = primary_identity(&primary);
+            let limit = if invalid_metadata { 2 } else { 1 };
+            let outcome =
+                crate::reconstruct::apply_archive_ahead_delta(&primary, &storage_root, limit)
+                    .unwrap();
+            let expected_reason = if invalid_metadata {
+                "failed to parse"
+            } else {
+                "bound"
+            };
+            assert!(
+                matches!(outcome, crate::reconstruct::ArchiveDeltaApplyOutcome::NotApplicable(ref reason) if reason.contains(expected_reason)),
+                "{outcome:?}"
+            );
+            let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+            let rows = conn
+                .query_sync(
+                    "SELECT id FROM projects WHERE slug IN ('aaa-empty', 'aab-empty')",
+                    &[],
+                )
+                .unwrap();
+            assert!(rows.is_empty(), "earlier project inserts must roll back");
+            crate::close_db_conn(conn, "verify incremental project rollback");
+            assert_eq!(count_messages(&primary), 1);
+            assert_eq!(primary_identity(&primary), identity_before);
+        }
+    }
+
     /// The bound is real: above it, or when disabled, the reconcile takes the
     /// full reconstruct path (the primary file is replaced by the promoted
     /// candidate).
@@ -29087,10 +29175,9 @@ mod tests {
         );
     }
 
-    /// A canonical id already held by a different live message is not the
-    /// simple case: the apply refuses and writes nothing.
+    /// Already occupied canonical ids are excluded from the missing-id delta.
     #[test]
-    fn archive_ahead_delta_refuses_canonical_id_collisions() {
+    fn archive_ahead_delta_preserves_existing_canonical_ids() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
         let storage_root = dir.path().join("storage");
@@ -29112,10 +29199,8 @@ mod tests {
             "{outcome:?}"
         );
         assert_eq!(count_messages(&primary), 2);
-        // Now make the impostor the only delta by giving it a fresh id that the
-        // db already holds under a different identity: remove id 2's row and
-        // re-run; the archive file for id 2 is a duplicate of nothing now, so
-        // the apply must refuse rather than insert under a generated id.
+        // A changed live message must also remain untouched while another
+        // genuinely missing message is imported.
         let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
         conn.execute_raw("UPDATE messages SET subject = 'Renamed' WHERE id = 2")
             .unwrap();
@@ -29137,6 +29222,29 @@ mod tests {
             "{outcome:?}"
         );
         assert_eq!(count_messages(&primary), 3);
+    }
+
+    #[test]
+    fn archive_ahead_delta_refuses_conflicting_missing_canonical_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let msg_dir = seed_reconstructed_primary_from_archive(&primary, &storage_root);
+        push_archive_ahead(&msg_dir);
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-07-00Z__impostor__2.md"),
+            "---json\n{\"id\":2,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"Impostor\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:07:00Z\",\"attachments\":[]}\n---\n\nimpostor body\n",
+        )
+        .unwrap();
+        let identity_before = primary_identity(&primary);
+        let outcome =
+            crate::reconstruct::apply_archive_ahead_delta(&primary, &storage_root, 64).unwrap();
+        assert!(
+            matches!(outcome, crate::reconstruct::ArchiveDeltaApplyOutcome::NotApplicable(ref reason) if reason.contains("canonical id")),
+            "{outcome:?}"
+        );
+        assert_eq!(count_messages(&primary), 1, "roll back the earlier insert");
+        assert_eq!(primary_identity(&primary), identity_before);
     }
 
     /// Archive files that do not parse make the delta ambiguous: refuse.

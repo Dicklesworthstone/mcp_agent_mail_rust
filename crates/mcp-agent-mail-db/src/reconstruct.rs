@@ -6313,8 +6313,8 @@ fn extract_id_from_rows(rows: &[sqlmodel_core::Row]) -> Option<i64> {
 // and reservation into a candidate, then promote it) is the wrong tool: it is
 // slow on a large mailbox, and its promotion guard can refuse for reasons that
 // have nothing to do with the delta (GH#271). This path ingests only the
-// archive messages whose canonical ids the database lacks, plus any project or
-// agent rows they need, through the runtime engine inside one write
+// archive messages whose canonical ids the database lacks, missing projects
+// (including empty ones), and their agent rows through the runtime engine in one write
 // transaction on the live database. It refuses (and leaves the database
 // untouched) whenever the delta is not the simple case: too many messages,
 // archive files that do not parse, or a canonical id already held by a
@@ -6343,7 +6343,7 @@ pub enum ArchiveDeltaApplyOutcome {
     NotApplicable(String),
 }
 
-/// Default upper bound on the number of missing messages the incremental
+/// Default independent bound on missing messages and projects the incremental
 /// path applies; larger deltas reconstruct. `AM_ARCHIVE_DELTA_APPLY_MAX_MESSAGES`
 /// overrides it and `0` disables the path.
 pub const DEFAULT_ARCHIVE_DELTA_APPLY_MAX_MESSAGES: usize = 64;
@@ -6355,8 +6355,9 @@ pub fn archive_delta_apply_max_messages() -> usize {
         .unwrap_or(DEFAULT_ARCHIVE_DELTA_APPLY_MAX_MESSAGES)
 }
 
-/// Apply the archive messages the database at `db_path` lacks, if the delta
-/// is small and unambiguous.
+/// Apply missing archive messages and projects if the delta is small and
+/// unambiguous. The bound limits missing messages and missing projects
+/// independently, including projects that do not yet contain messages.
 ///
 /// The caller must already have established that the database is healthy and
 /// that it holds the promotion barrier / mutation admission for the file; this
@@ -6387,11 +6388,6 @@ pub fn apply_archive_ahead_delta(
     let db_ids = collect_db_message_ids(db_path)
         .map_err(|e| DbError::Sqlite(format!("incremental apply: collect db message ids: {e}")))?;
     let missing: BTreeSet<i64> = archive_ids.difference(&db_ids).copied().collect();
-    if missing.is_empty() {
-        return Ok(ArchiveDeltaApplyOutcome::NotApplicable(
-            "the database already holds every canonical archive message id".to_string(),
-        ));
-    }
     if missing.len() > max_messages {
         return Ok(ArchiveDeltaApplyOutcome::NotApplicable(format!(
             "{} archive messages are missing from the database, above the incremental bound of {max_messages}",
@@ -6430,7 +6426,7 @@ pub fn apply_archive_ahead_delta(
     conn.execute_raw("BEGIN IMMEDIATE;")
         .map_err(|e| DbError::Sqlite(format!("incremental apply: begin transaction: {e}")))?;
 
-    let outcome = apply_delta_in_transaction(&conn, &project_dirs, &missing);
+    let outcome = apply_delta_in_transaction(&conn, &project_dirs, &missing, max_messages);
     match outcome {
         Ok(ArchiveDeltaApplyOutcome::Applied(stats)) => {
             conn.execute_raw("COMMIT;")
@@ -6452,19 +6448,37 @@ fn apply_delta_in_transaction(
     conn: &DbConn,
     project_dirs: &[(String, PathBuf)],
     missing: &BTreeSet<i64>,
+    max_projects: usize,
 ) -> DbResult<ArchiveDeltaApplyOutcome> {
     let mut stats = ReconstructStats::default();
     let mut agent_ids: HashMap<(i64, String), i64> = HashMap::new();
     let mut deferred: Vec<DeferredCollisionMessage> = Vec::new();
     let mut projects_visited = 0usize;
+    let mut projects_added = 0usize;
     let mut candidate_files: Vec<(i64, PathBuf, i64, String)> = Vec::new();
 
     for (slug, project_path) in project_dirs {
         let messages_dir = project_path.join("messages");
         let mut project_files = Vec::new();
         collect_message_files_with_ids(&messages_dir, missing, &mut project_files)?;
-        if project_files.is_empty() {
+        let existing = conn
+            .query_sync(
+                "SELECT id FROM projects WHERE slug = ?",
+                &[Value::Text(slug.clone())],
+            )
+            .map_err(|e| {
+                DbError::Sqlite(format!("incremental apply: inspect project {slug}: {e}"))
+            })?;
+        if project_files.is_empty() && !existing.is_empty() {
             continue;
+        }
+        if existing.is_empty() {
+            projects_added += 1;
+            if projects_added > max_projects {
+                return Ok(ArchiveDeltaApplyOutcome::NotApplicable(format!(
+                    "missing archive projects exceed the incremental bound of {max_projects}"
+                )));
+            }
         }
         projects_visited += 1;
         let now = crate::now_micros();
@@ -6489,6 +6503,11 @@ fn apply_delta_in_transaction(
     }
 
     let expected = missing.len();
+    if expected == 0 && projects_added == 0 {
+        return Ok(ArchiveDeltaApplyOutcome::NotApplicable(
+            "the database already holds every canonical archive message id and project".to_string(),
+        ));
+    }
     let found: BTreeSet<i64> = candidate_files.iter().map(|(id, ..)| *id).collect();
     if found.len() != expected {
         return Ok(ArchiveDeltaApplyOutcome::NotApplicable(format!(
@@ -6516,7 +6535,7 @@ fn apply_delta_in_transaction(
     }
     if stats.parse_errors > 0 {
         return Ok(ArchiveDeltaApplyOutcome::NotApplicable(format!(
-            "{} archive message file(s) failed to parse during the apply",
+            "{} archive file(s) failed to parse during the apply",
             stats.parse_errors
         )));
     }
