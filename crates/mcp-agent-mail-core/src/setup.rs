@@ -1693,7 +1693,7 @@ fn omp_provider_home(params: &SetupParams) -> Option<PathBuf> {
     .ok()
 }
 
-fn omp_claude_user_base(params: &SetupParams, home: &Path) -> Result<(PathBuf, PathBuf), PathBuf> {
+fn claude_user_base(cwd: &Path, home: &Path) -> Result<(PathBuf, PathBuf), PathBuf> {
     if let Some(raw_override) = os_env_value_for_setup("CLAUDE_CONFIG_DIR") {
         let Some(override_path) = raw_override.to_str() else {
             return Err(PathBuf::from(raw_override));
@@ -1701,8 +1701,8 @@ fn omp_claude_user_base(params: &SetupParams, home: &Path) -> Result<(PathBuf, P
         let override_path = override_path.trim();
         if !override_path.is_empty() {
             let unresolved = PathBuf::from(override_path);
-            let config_dir = resolve_omp_agent_dir_override(&params.project_dir, override_path)
-                .map_err(|_| unresolved)?;
+            let config_dir =
+                resolve_omp_agent_dir_override(cwd, override_path).map_err(|_| unresolved)?;
             return Ok((config_dir.join(".claude.json"), config_dir));
         }
     }
@@ -1766,7 +1766,7 @@ fn omp_mcp_authority_sources(params: &SetupParams) -> Vec<OmpMcpAuthoritySource>
         true,
     );
     if let Some(home) = &provider_home {
-        match omp_claude_user_base(params, home) {
+        match claude_user_base(&params.project_dir, home) {
             Ok((claude_json, claude_dir)) => {
                 push_omp_mcp_authority_source(
                     &mut sources,
@@ -2119,15 +2119,20 @@ impl AgentPlatform {
         // `settings.json`/`settings.local.json` (those are hooks/permissions).
         // Writing the old location left every fresh `claude` instance with zero
         // Agent Mail tools. Mirror `claude mcp add`: local scope per-project +
-        // user scope top-level, both in `~/.claude.json` (home, not git-tracked,
-        // so the bearer token never lands in the project working tree).
-        let claude_json = home.join(".claude.json");
+        // user scope top-level, both in the active profile's `.claude.json`.
+        // The shared secret-write guard protects profiles inside a Git tree.
+        // CLAUDE_CONFIG_DIR relocates both user and local MCP scopes. Never
+        // configure a different profile when the requested authority is invalid.
+        let Ok((claude_json, _)) =
+            claude_user_base(&std::env::current_dir().unwrap_or_default(), home)
+        else {
+            return Vec::new();
+        };
         let project_key = pdir.to_string_lossy().into_owned();
         let mut actions = vec![ConfigAction {
             platform: self,
             file_path: claude_json.clone(),
-            description:
-                "Claude Code project-local MCP config (~/.claude.json local scope; secrets)".into(),
+            description: "Claude Code project-local MCP config (active profile; secrets)".into(),
             content: ConfigContent::ClaudeLocalScopeMcp {
                 project_path: project_key,
                 server_name: "mcp-agent-mail",
@@ -2140,8 +2145,7 @@ impl AgentPlatform {
             actions.push(ConfigAction {
                 platform: self,
                 file_path: claude_json,
-                description: "Claude Code user-level MCP config (~/.claude.json top-level mcpServers)"
-                    .into(),
+                description: "Claude Code user-level MCP config (active profile mcpServers)".into(),
                 content: ConfigContent::JsonMerge {
                     servers_key: "mcpServers",
                     server_name: "mcp-agent-mail",
@@ -4231,6 +4235,20 @@ pub fn run_setup(params: &SetupParams) -> Vec<SetupResult> {
         .agents
         .clone()
         .unwrap_or_else(|| AgentPlatform::ALL.to_vec());
+    if platforms.contains(&AgentPlatform::Claude)
+        && let Some(path) = invalid_claude_config_override(params)
+    {
+        return vec![SetupResult {
+            platform: AgentPlatform::Claude.display_name().to_string(),
+            actions: vec![ActionResult {
+                file_path: path.display().to_string(),
+                description: "Claude Code active-profile MCP authority preflight".to_string(),
+                outcome: ActionOutcome::Failed(
+                    "CLAUDE_CONFIG_DIR must resolve to an absolute, traversal-free UTF-8 directory; no configuration was written".to_string(),
+                ),
+            }],
+        }];
+    }
     if let Some(failure) = omp_setup_authority_preflight(params, &platforms) {
         return vec![failure];
     }
@@ -4460,6 +4478,16 @@ impl ConfigFileStatus {
     }
 }
 
+// Resolve without probing rejected paths or silently selecting the default profile.
+fn invalid_claude_config_override(params: &SetupParams) -> Option<PathBuf> {
+    let home = params.home_dir_override.clone().or_else(dirs::home_dir);
+    claude_user_base(
+        &std::env::current_dir().unwrap_or_default(),
+        home.as_deref().unwrap_or_else(|| Path::new("~")),
+    )
+    .err()
+}
+
 /// Check config status for detected agents.
 #[must_use]
 pub fn check_status(params: &SetupParams) -> Vec<AgentConfigStatus> {
@@ -4472,6 +4500,39 @@ pub fn check_status(params: &SetupParams) -> Vec<AgentConfigStatus> {
     let mut statuses = Vec::new();
 
     for platform in &platforms {
+        if *platform == AgentPlatform::Claude
+            && let Some(path) = invalid_claude_config_override(params)
+        {
+            let home = params.home_dir_override.clone().or_else(dirs::home_dir);
+            statuses.push(AgentConfigStatus {
+                platform: platform.display_name().to_string(),
+                slug: platform.slug().to_string(),
+                detected: false,
+                config_files: vec![ConfigFileStatus {
+                    redacted_path: redact_path_for_status(&path, home.as_deref()),
+                    path: path.display().to_string(),
+                    omp_active_user_config_drift: false,
+                    omp_mcp_alias_drift: false,
+                    omp_settings_config_drift: false,
+                    status_observations: Vec::new(),
+                    exists: false,
+                    has_server_entry: false,
+                    url_matches: false,
+                    expected_url: url.clone(),
+                    actual_url: None,
+                    entry_locations: Vec::new(),
+                    current_entry: None,
+                    expected_entry: Value::Null,
+                    drift_reasons: vec![ConfigDriftReason::UnsupportedConfig],
+                    primary_drift_reason: ConfigDriftReason::UnsupportedConfig,
+                    risk: risk_for_drift_reasons(&[ConfigDriftReason::UnsupportedConfig]),
+                    remediation:
+                        "Set CLAUDE_CONFIG_DIR to an absolute, traversal-free UTF-8 directory"
+                            .to_string(),
+                }],
+            });
+            continue;
+        }
         let mut actions = platform.config_actions(params);
         if *platform == AgentPlatform::Omp
             && actions.is_empty()
@@ -4704,6 +4765,17 @@ fn config_file_status_for_action(
     }
 
     let mut analysis = match &content {
+        Ok(Some(snapshot))
+            if matches!(action.content, ConfigContent::ClaudeLocalScopeMcp { .. }) =>
+        {
+            analyze_claude_local_config(
+                &snapshot.content,
+                &action.content,
+                expected_url,
+                expected_auth.as_deref(),
+                home.as_deref(),
+            )
+        }
         Ok(Some(snapshot)) => analyze_config_content(
             &action.file_path,
             &snapshot.content,
@@ -6087,6 +6159,40 @@ fn apply_omp_active_user_config_drift(
     if drift.disabled {
         push_drift_reason(reasons, ConfigDriftReason::DisabledServer);
     }
+}
+
+fn analyze_claude_local_config(
+    content: &str,
+    action: &ConfigContent,
+    expected_url: &str,
+    expected_auth: Option<&str>,
+    home: Option<&Path>,
+) -> ConfigContentAnalysis {
+    let ConfigContent::ClaudeLocalScopeMcp { project_path, .. } = action else {
+        return analyze_json_config_content(content, expected_url, expected_auth, home);
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(content) else {
+        return analyze_json_config_content(content, expected_url, expected_auth, home);
+    };
+    if !doc.is_object() {
+        return analyze_json_config_content(content, expected_url, expected_auth, home);
+    }
+    let scope = doc
+        .get("projects")
+        .and_then(|projects| projects.get(project_path))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let mut analysis =
+        analyze_json_config_content(&scope.to_string(), expected_url, expected_auth, home);
+    for location in &mut analysis.entry_locations {
+        *location = format!("projects.{project_path}.{location}");
+    }
+    if let Some(entry) = analysis.current_entry.as_mut()
+        && let Some(container) = entry.get("container").and_then(Value::as_str)
+    {
+        entry["container"] = Value::String(format!("projects.{project_path}.{container}"));
+    }
+    analysis
 }
 
 fn analyze_config_content(
@@ -10835,6 +10941,7 @@ http_headers = { Authorization = "Bearer tok" }
 
     #[test]
     fn claude_config_actions_full_set() {
+        let _profile = EnvVarGuard::unset("CLAUDE_CONFIG_DIR");
         let params = SetupParams {
             token: "tok".into(),
             project_dir: PathBuf::from("/tmp/p"),
@@ -10872,6 +10979,7 @@ http_headers = { Authorization = "Bearer tok" }
 
     #[test]
     fn claude_config_actions_skip_user_and_hooks() {
+        let _profile = EnvVarGuard::unset("CLAUDE_CONFIG_DIR");
         let params = SetupParams {
             token: "tok".into(),
             project_dir: PathBuf::from("/tmp/p"),
@@ -10881,6 +10989,193 @@ http_headers = { Authorization = "Bearer tok" }
         };
         let actions = AgentPlatform::Claude.config_actions(&params);
         assert_eq!(actions.len(), 1, "only project-local action");
+    }
+
+    #[test]
+    fn claude_setup_writes_and_checks_the_active_profile() {
+        for skip_user_config in [false, true] {
+            let tmp = setup_real_tempdir();
+            let home = tmp.path().join("home");
+            let profile = tmp.path().join("profile");
+            let project = tmp.path().join("project");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            let _profile = EnvVarGuard::set("CLAUDE_CONFIG_DIR", profile.as_os_str());
+            let params = SetupParams {
+                token: "profile-test-token".into(),
+                project_dir: project.clone(),
+                home_dir_override: Some(home.clone()),
+                agents: Some(vec![AgentPlatform::Claude]),
+                skip_user_config,
+                skip_hooks: false,
+                project_slug: "profile-test".into(),
+                agent_name: "RedFox".into(),
+                ..Default::default()
+            };
+            let results = run_setup(&params);
+            assert!(
+                results
+                    .iter()
+                    .flat_map(|r| &r.actions)
+                    .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_))),
+                "{results:?}"
+            );
+            let config_path = profile.join(".claude.json");
+            let config: Value =
+                serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+            let project_key = project.to_string_lossy();
+            assert_eq!(
+                config["projects"][project_key.as_ref()]["mcpServers"]["mcp-agent-mail"]["url"],
+                params.server_url()
+            );
+            assert_eq!(config.get("mcpServers").is_some(), !skip_user_config);
+            assert!(!home.join(".claude.json").exists());
+            assert!(project.join(".claude/settings.json").is_file());
+            let status = check_status(&params);
+            assert!(!status[0].config_files.is_empty());
+            for file in &status[0].config_files {
+                assert_eq!(file.path, config_path.display().to_string());
+                assert_eq!(file.primary_drift_reason, ConfigDriftReason::Ok);
+            }
+            // A healthy global entry must not hide drift in this project's scope.
+            let mut changed = config;
+            changed["projects"][project_key.as_ref()]["mcpServers"]["mcp-agent-mail"]["url"] =
+                json!("http://stale.invalid/mcp/");
+            std::fs::write(&config_path, changed.to_string()).unwrap();
+            assert_eq!(
+                check_status(&params)[0].config_files[0].primary_drift_reason,
+                ConfigDriftReason::StaleHttpPath
+            );
+        }
+    }
+
+    #[test]
+    fn claude_relative_profile_uses_launch_directory_not_target_project() {
+        let tmp = setup_real_tempdir();
+        let params = SetupParams {
+            project_dir: tmp.path().join("different-target"),
+            home_dir_override: Some(tmp.path().join("home")),
+            ..Default::default()
+        };
+        let _profile = EnvVarGuard::set("CLAUDE_CONFIG_DIR", "relative-profile");
+        let actions = AgentPlatform::Claude.config_actions(&params);
+        let expected = std::env::current_dir()
+            .unwrap()
+            .join("relative-profile/.claude.json");
+        assert_eq!(actions[0].file_path, expected);
+        assert_eq!(actions[1].file_path, expected);
+        assert_ne!(
+            expected,
+            params.project_dir.join("relative-profile/.claude.json")
+        );
+    }
+
+    #[test]
+    fn claude_blank_profile_preserves_default_home() {
+        let tmp = setup_real_tempdir();
+        let params = SetupParams {
+            home_dir_override: Some(tmp.path().join("home")),
+            ..Default::default()
+        };
+        let _profile = EnvVarGuard::set("CLAUDE_CONFIG_DIR", "  ");
+        let actions = AgentPlatform::Claude.config_actions(&params);
+        assert_eq!(actions[0].file_path, tmp.path().join("home/.claude.json"));
+    }
+
+    #[test]
+    fn claude_setup_rejects_invalid_profile_without_fallback_or_false_green() {
+        let tmp = setup_real_tempdir();
+        let params = SetupParams {
+            project_dir: tmp.path().join("project"),
+            home_dir_override: Some(tmp.path().join("home")),
+            agents: Some(vec![AgentPlatform::Claude]),
+            token: "must-not-be-written".into(),
+            ..Default::default()
+        };
+        let _profile = EnvVarGuard::set("CLAUDE_CONFIG_DIR", "../other-profile");
+        assert!(AgentPlatform::Claude.config_actions(&params).is_empty());
+        let results = run_setup(&params);
+        assert!(matches!(
+            results[0].actions[0].outcome,
+            ActionOutcome::Failed(_)
+        ));
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        let status = check_status(&params);
+        assert_eq!(status[0].config_files.len(), 1);
+        assert_eq!(
+            status[0].config_files[0].primary_drift_reason,
+            ConfigDriftReason::UnsupportedConfig
+        );
+        assert_eq!(status[0].config_files[0].status_observations.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_non_utf8_profile_is_rejected_without_writes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Claude);
+        let _profile = EnvVarGuard::set_os(
+            "CLAUDE_CONFIG_DIR",
+            OsString::from_vec(vec![b'/', b'p', 0xff]),
+        );
+        assert!(AgentPlatform::Claude.config_actions(&params).is_empty());
+        assert!(matches!(
+            run_setup(&params)[0].actions[0].outcome,
+            ActionOutcome::Failed(_)
+        ));
+        let status = check_status(&params);
+        assert_eq!(
+            status[0].config_files[0].primary_drift_reason,
+            ConfigDriftReason::UnsupportedConfig
+        );
+        assert!(serde_json::to_string(&status).is_ok());
+    }
+
+    #[test]
+    fn claude_profile_in_project_refuses_tracked_secret_write() {
+        let tmp = setup_real_tempdir();
+        let profile = tmp.path().join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        let path = profile.join(".claude.json");
+        let original = "{}\n";
+        std::fs::write(&path, original).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(["add", "--", "profile/.claude.json"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _profile = EnvVarGuard::set("CLAUDE_CONFIG_DIR", profile.as_os_str());
+        let params = SetupParams {
+            project_dir: tmp.path().to_path_buf(),
+            home_dir_override: Some(tmp.path().join("home")),
+            agents: Some(vec![AgentPlatform::Claude]),
+            token: "must-not-enter-index".into(),
+            skip_hooks: true,
+            ..Default::default()
+        };
+        let result = run_setup(&params);
+        assert!(
+            result[0]
+                .actions
+                .iter()
+                .all(|action| matches!(action.outcome, ActionOutcome::Failed(_)))
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(profile).unwrap().count(), 1);
     }
 
     #[test]
