@@ -1875,7 +1875,15 @@ mod tests {
         let mut cache = CleanupProbeCache::default();
         let conn = match block_on(pool.acquire(&cx)) {
             Outcome::Ok(conn) => conn,
-            other => panic!("acquire fixture connection: {other:?}"),
+            // `Outcome`'s derived `Debug` needs `T: Debug`, and `PooledConnection`
+            // is not `Debug`, so report each failure variant on its own.
+            Outcome::Err(error) => panic!("acquire fixture connection: {error:?}"),
+            Outcome::Cancelled(reason) => {
+                panic!("acquire fixture connection cancelled: {reason:?}")
+            }
+            Outcome::Panicked(payload) => {
+                panic!("acquire fixture connection panicked: {payload:?}")
+            }
         };
         // Preserve the table and its data while making the actual mail query
         // unavailable. No mocked outcome and no mutation of an operator DB.
@@ -1890,17 +1898,22 @@ mod tests {
         ));
 
         for _ in 0..2 {
-            assert!(
-                detect_and_release_stale(&config, &pool, &cx, project_id, &mut cache)
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                detect_and_release_stale(&config, &pool, &cx, project_id, &mut cache).unwrap(),
+                Vec::new()
             );
             assert_reservation_unreleased(&pool, &cx, project_id, reservation_id);
         }
 
         let conn = match block_on(pool.acquire(&cx)) {
             Outcome::Ok(conn) => conn,
-            other => panic!("reacquire fixture connection: {other:?}"),
+            Outcome::Err(error) => panic!("reacquire fixture connection: {error:?}"),
+            Outcome::Cancelled(reason) => {
+                panic!("reacquire fixture connection cancelled: {reason:?}")
+            }
+            Outcome::Panicked(payload) => {
+                panic!("reacquire fixture connection panicked: {payload:?}")
+            }
         };
         conn.execute_sync("ALTER TABLE cleanup_saved_messages RENAME TO messages", &[])
             .expect("restore mail evidence");
@@ -1922,7 +1935,15 @@ mod tests {
         ));
         let conn = match block_on(pool.acquire(&cx)) {
             Outcome::Ok(conn) => conn,
-            other => panic!("acquire fixture connection: {other:?}"),
+            // `Outcome`'s derived `Debug` needs `T: Debug`, and `PooledConnection`
+            // is not `Debug`, so report each failure variant on its own.
+            Outcome::Err(error) => panic!("acquire fixture connection: {error:?}"),
+            Outcome::Cancelled(reason) => {
+                panic!("acquire fixture connection cancelled: {reason:?}")
+            }
+            Outcome::Panicked(payload) => {
+                panic!("acquire fixture connection panicked: {payload:?}")
+            }
         };
         conn.execute_sync(
             "UPDATE agents SET last_active_ts = ? WHERE id = ?",
@@ -1936,10 +1957,9 @@ mod tests {
 
         let mut cache = CleanupProbeCache::default();
         let config = stale_cleanup_test_config(&tmp);
-        assert!(
-            detect_and_release_stale(&config, &pool, &cx, project_id, &mut cache)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            detect_and_release_stale(&config, &pool, &cx, project_id, &mut cache).unwrap(),
+            Vec::new()
         );
         assert_reservation_unreleased(&pool, &cx, project_id, reservation_id);
     }
@@ -1954,7 +1974,15 @@ mod tests {
         ));
         let conn = match block_on(pool.acquire(&cx)) {
             Outcome::Ok(conn) => conn,
-            other => panic!("acquire fixture connection: {other:?}"),
+            // `Outcome`'s derived `Debug` needs `T: Debug`, and `PooledConnection`
+            // is not `Debug`, so report each failure variant on its own.
+            Outcome::Err(error) => panic!("acquire fixture connection: {error:?}"),
+            Outcome::Cancelled(reason) => {
+                panic!("acquire fixture connection cancelled: {reason:?}")
+            }
+            Outcome::Panicked(payload) => {
+                panic!("acquire fixture connection panicked: {payload:?}")
+            }
         };
         conn.execute_sync(
             "UPDATE agents SET reaper_exempt = 1, last_active_ts = 0 WHERE id = ?",
@@ -1965,10 +1993,9 @@ mod tests {
 
         let mut cache = CleanupProbeCache::default();
         let config = stale_cleanup_test_config(&tmp);
-        assert!(
-            detect_and_release_stale(&config, &pool, &cx, project_id, &mut cache)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            detect_and_release_stale(&config, &pool, &cx, project_id, &mut cache).unwrap(),
+            Vec::new()
         );
         assert_reservation_unreleased(&pool, &cx, project_id, reservation_id);
     }

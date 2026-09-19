@@ -285,7 +285,8 @@ impl AutomaticBackupLease {
         let mut bytes = [0_u8; JOURNAL_BYTES];
         self.file.seek(SeekFrom::Start(0))?;
         self.file.read_exact(&mut bytes[..length])?;
-        for slot in bytes.chunks_exact(SLOT_BYTES) {
+        let (slots, _) = bytes.as_chunks::<SLOT_BYTES>();
+        for slot in slots {
             if slot.starts_with(b"AMBACK") && &slot[..8] != MAGIC {
                 return Err(invalid("automatic backup journal uses an unsupported version"));
             }

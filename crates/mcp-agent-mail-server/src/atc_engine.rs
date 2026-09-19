@@ -4043,6 +4043,10 @@ pub struct AtcEngine {
 const MAX_RESERVATION_EVENT_LOG: usize = 512;
 
 #[derive(Debug, Clone)]
+// `atc.rs` re-exports this module with `pub use engine::*` from a `pub mod atc`,
+// so `pub(crate)` here is NOT redundant: widening it to `pub` would add these
+// crate-internal types to the crate's public API.
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct ReservationEvent {
     pub kind: ReservationEventKind,
     pub agent: String,
@@ -4054,6 +4058,7 @@ pub(crate) struct ReservationEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) enum ReservationEventKind {
     Granted,
     Released,
@@ -4073,6 +4078,7 @@ struct PrevSnapshotState {
 }
 
 #[derive(Debug, Default)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct LivenessEvaluation {
     due_agents: usize,
     actions: Vec<(String, LivenessAction)>,
@@ -4080,6 +4086,7 @@ pub(crate) struct LivenessEvaluation {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct LivenessDecisionMetadata {
     decision_id: u64,
 }
@@ -9637,6 +9644,11 @@ const MAX_LIVENESS_REVIEWS_PER_TICK: usize = 8;
 /// window would immediately appear Dead to the liveness evaluator anyway,
 /// so loading them generates an O(agents) burst of tick effects on every
 /// cold start without any coordination value.
+// Superseded by `atc_population::atc_sync_population_from_db`, which `atc.rs`
+// re-exports explicitly; that explicit re-export shadows this one from
+// `pub use engine::*`, so nothing outside this file's own tests can reach it.
+// Kept (not deleted) because the ATC refactor is still in flight — see GH#264.
+#[allow(dead_code)]
 pub fn atc_sync_population_from_db(
     pool: &mcp_agent_mail_db::DbPool,
 ) -> Result<AtcPopulationSyncStats, String> {
@@ -10171,6 +10183,7 @@ pub fn atc_note_build_slot_released(agent: &str, slot: &str, project: &str, time
 /// Query the engine's reservation event log for the most recent outcome affecting `agent`
 /// since `since_micros`. Returns None if no relevant event found.
 #[must_use]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) fn atc_reservation_outcome_for_agent(
     agent: &str,
     since_micros: i64,
@@ -10218,6 +10231,10 @@ pub enum AtcTickAction {
 }
 
 /// Run one ATC tick: evaluate liveness, detect deadlocks, update calibration.
+// Superseded by `atc::atc_tick`, which is defined directly in `atc.rs` and
+// therefore shadows this one from `pub use engine::*`. Only this file's own
+// tests still call it. Kept (not deleted) while GH#264 ATC work is in flight.
+#[allow(dead_code)]
 #[must_use]
 pub fn atc_tick(now_micros: i64) -> Vec<AtcTickAction> {
     atc_tick_report(now_micros).map_or_else(Vec::new, |report| report.actions)
@@ -10590,10 +10607,12 @@ pub struct AgentStateSnapshot {
 
 /// Shared lock for tests that mutate global ATC state.
 #[cfg(test)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) static GLOBAL_ATC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Reset all global ATC state for a fresh test run.
 #[cfg(test)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) fn reset_global_atc_state_for_test(config: &mcp_agent_mail_core::Config) {
     let atc_config = AtcEngine::config_from_env(config);
     let fresh_engine = AtcEngine::new(atc_config);

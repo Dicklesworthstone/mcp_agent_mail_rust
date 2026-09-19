@@ -752,7 +752,7 @@ mod tests {
         assert!(report.bytes_staged > 0);
         assert_eq!(report.bytes_deleted, 0);
         assert_eq!(report.unconfirmed_moves, 0);
-        assert!(report.failures.is_empty());
+        assert_eq!(report.failures, Vec::new());
 
         // Unrelated file intact.
         assert!(tmp.path().join("do-not-touch.txt").exists());
@@ -1382,7 +1382,7 @@ mod tests {
         assert_eq!(fs::read(old).unwrap(), b"replaced");
         assert_eq!(fs::read(retained).unwrap(), b"original");
         assert_eq!(fs::read(new).unwrap(), b"original");
-        assert!(quarantined_names(root.path()).is_empty());
+        assert_eq!(quarantined_names(root.path()), Vec::<String>::new());
     }
 
     #[cfg(unix)]
@@ -1450,7 +1450,7 @@ mod tests {
         let report = rotate_with_delete_off(root.path(), 1);
         assert_eq!(report.staged, 1);
         assert_eq!(report.bytes_staged, 8);
-        assert!(report.failures.is_empty());
+        assert_eq!(report.failures, Vec::new());
         assert_eq!(report.unconfirmed_moves, 0);
         let doctor = root.path().join("doctor");
         let reclaimable = doctor.join("reclaimable");

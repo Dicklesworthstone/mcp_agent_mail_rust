@@ -4,7 +4,7 @@
 //! do not execute outgoing mailbox/archive effects or measure HTTP latency.
 //! Synthetic time avoids sleeps; passive checks stay non-mailing even in Live.
 
-use mcp_agent_mail_core::{AtcExecutorMode, AtcWriteMode, Config};
+use mcp_agent_mail_core::{AtcWriteMode, Config};
 use mcp_agent_mail_server::atc::{self, AtcSubsystem, AtcTickAction};
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -16,8 +16,11 @@ fn reset_engine(fast_probes: bool, ledger_capacity: usize) -> tempfile::TempDir 
     let storage = tempfile::tempdir().expect("isolated ATC storage root");
     let config = Config {
         atc_enabled: true,
+        // Executor mode is no longer a `Config` field: it resolves from
+        // `AM_ATC_EXECUTOR_MODE` and is consumed by the server layer, not by the
+        // `atc::` tick API these fixtures exercise. `atc_write_mode` is what makes
+        // this a Live-mode regression.
         atc_write_mode: AtcWriteMode::Live,
-        atc_executor_mode: AtcExecutorMode::Live,
         atc_probe_interval_secs: if fast_probes { 1 } else { 120 },
         atc_ledger_capacity: ledger_capacity,
         atc_safe_mode_recovery_count: 1_000_000,

@@ -82,6 +82,7 @@ pub fn atc_delivery_stats() -> AtcDeliveryStats {
 }
 
 /// Advance bounded hydration or inference, then admit actionable notifications.
+///
 /// Inference yields while a population refresh is incomplete; already-generated
 /// reservation mutations and their outcome notices retain their delivery policy.
 #[must_use]

@@ -461,7 +461,7 @@ fn rank_pair(a: &Project, b: &Project) -> Option<(f64, String)> {
         let union = a.task_tokens.union(&b.task_tokens).count();
         let overlap = task_shared.len() as f64 / union as f64;
         if overlap >= 0.5 {
-            score = score.max(0.92 + 0.07 * overlap);
+            score = score.max(0.07f64.mul_add(overlap, 0.92));
             evidence.push(format!("{} shared agent-task terms", task_shared.len()));
         }
     }

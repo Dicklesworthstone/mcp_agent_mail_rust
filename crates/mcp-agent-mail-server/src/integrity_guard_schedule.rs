@@ -181,7 +181,7 @@ mod tests {
         schedule.request_verified();
         assert_eq!(schedule.next_attempt(now), None);
         assert_eq!(
-            schedule.next_attempt(now + BACKUP_RETRY_INITIAL - Duration::from_nanos(1)),
+            schedule.next_attempt(now + BACKUP_RETRY_INITIAL.saturating_sub(Duration::from_nanos(1))),
             None
         );
         assert_eq!(

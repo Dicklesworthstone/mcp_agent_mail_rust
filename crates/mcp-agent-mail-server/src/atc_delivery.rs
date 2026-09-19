@@ -12,18 +12,18 @@
 
 use std::collections::HashMap;
 
-pub(crate) const MAX_NOTIFICATIONS_PER_TICK: usize = 16;
+pub const MAX_NOTIFICATIONS_PER_TICK: usize = 16;
 const MAX_NOTIFICATION_KEYS: usize = 16_384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NotificationClass {
+pub enum NotificationClass {
     Probe,
     Liveness,
     Conflict,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Admission {
+pub enum Admission {
     /// An actionable notification may reach the durable executor.
     Admitted,
     /// Observed only in memory; MUST NOT reach the mail/experience executor.
@@ -48,7 +48,7 @@ pub struct AtcDeliveryStats {
     pub tracked_keys: usize,
 }
 
-pub(crate) struct Notification<'a> {
+pub struct Notification<'a> {
     /// Project-, agent-, and family-scoped semantic key for actionable mail.
     pub key: &'a str,
     pub class: NotificationClass,
@@ -57,7 +57,7 @@ pub(crate) struct Notification<'a> {
 }
 
 #[derive(Debug)]
-pub(crate) struct NotificationAdmission {
+pub struct NotificationAdmission {
     cooldowns: HashMap<String, i64>,
     limit: usize,
     key_limit: usize,

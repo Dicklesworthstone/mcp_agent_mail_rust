@@ -1862,7 +1862,7 @@ mod tests {
             let destination = root.join("doctor/reclaimable/scoped-run");
             let outcome = consolidate_debris(&plan, &destination).unwrap();
             assert_eq!(outcome.moved, 1, "{:?}", outcome.failures);
-            assert!(outcome.failures.is_empty());
+            assert_eq!(outcome.failures, Vec::new());
             for path in protected {
                 assert_eq!(std::fs::read(&path).unwrap(), b"protected mailbox state");
             }

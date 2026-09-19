@@ -179,7 +179,7 @@ pub fn atc_sync_population_from_db(
         return Ok(AtcPopulationSyncStats::default());
     }
     let now = mcp_agent_mail_core::timestamps::now_micros();
-    let stats = state.refresh_with(now, || {
+    let sync_stats = state.refresh_with(now, || {
         let recency_micros = i64::try_from(mcp_agent_mail_core::config::atc_population_recency_secs())
             .unwrap_or(i64::MAX)
             .saturating_mul(1_000_000);
@@ -198,7 +198,7 @@ pub fn atc_sync_population_from_db(
         }
     })?;
     state.drain_slice();
-    Ok(stats)
+    Ok(sync_stats)
 }
 
 pub(super) fn tick_report(now_micros: i64) -> Option<AtcTickReport> {
@@ -264,8 +264,8 @@ mod tests {
     fn population_940_drains_in_bounded_fifo_slices_without_loss() {
         let input = rows(940);
         let mut state = HydrationState::default();
-        let stats = state.refresh_with(10, || Ok(input.clone())).unwrap();
-        assert_eq!(stats.agents, 940);
+        let sync_stats = state.refresh_with(10, || Ok(input.clone())).unwrap();
+        assert_eq!(sync_stats.agents, 940);
         let mut applied = Vec::new();
         let mut slices = 0;
         while !state.pending.is_empty() {
@@ -293,8 +293,8 @@ mod tests {
         state.refresh_with(10, || Ok(rows(940))).unwrap();
         state.drain_with(|_| {}, || true);
         for _ in 0..10 {
-            let stats = state.refresh_with(20, || panic!("must not re-query pending snapshot")).unwrap();
-            assert_eq!(stats.agents, 940);
+            let sync_stats = state.refresh_with(20, || panic!("must not re-query pending snapshot")).unwrap();
+            assert_eq!(sync_stats.agents, 940);
         }
         assert_eq!(state.pending.front().unwrap().name, "HydratedAgent0032");
         assert_eq!(state.progress.deferred_refreshes, 10);

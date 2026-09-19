@@ -2693,10 +2693,10 @@ mod tests {
                INSERT INTO "mail""box" (body) VALUES ('first'), ('second');"#,
         )
         .expect("create quoted identifiers");
-        assert!(
+        assert_eq!(
             index_table_cross_count(&conn, &["mail\"box"])
-                .expect("quoted identifier cross count")
-                .is_empty()
+                .expect("quoted identifier cross count"),
+            Vec::new()
         );
     }
 
