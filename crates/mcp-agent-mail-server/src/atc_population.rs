@@ -56,6 +56,16 @@ struct HydrationState {
 }
 
 impl HydrationState {
+    const fn should_defer_refresh(&self) -> bool {
+        self.active_refresh.is_some()
+            || !self.pending.is_empty()
+            // The final hydration slice deliberately yields before inference.
+            // Do not let another changed snapshot steal that inference turn
+            // and keep the operator hydrating forever. A failed refresh is
+            // different: it must retry before inference is safe again.
+            || (self.resume_pending && !self.progress.refresh_failed)
+    }
+
     fn refresh_with(
         &mut self,
         now_micros: i64,
@@ -241,6 +251,8 @@ pub fn atc_population_hydration_stats() -> AtcPopulationHydrationStats {
 /// updates. Small snapshots finish here; larger ones continue at the public tick
 /// boundary. An unfinished refresh is retained rather than restarted. Unchanged
 /// rows in subsequent complete snapshots do not touch the engine at all.
+/// After hydration finishes, the public tick gets one inference turn before a
+/// new refresh is admitted. Frequent changing snapshots cannot starve it.
 /// A failed read suspends inference, without clearing the last good snapshot,
 /// until a later read succeeds. Errors are still returned to the operator.
 pub fn atc_sync_population_from_db(
@@ -276,7 +288,7 @@ fn sync_population_with(
         if !engine::atc_enabled() {
             return Ok(AtcPopulationSyncStats::default());
         }
-        if state.active_refresh.is_some() || !state.pending.is_empty() {
+        if state.should_defer_refresh() {
             state.progress.deferred_refreshes = state.progress.deferred_refreshes.saturating_add(1);
             if state.active_refresh.is_none() {
                 state.drain_slice();
@@ -577,6 +589,92 @@ mod tests {
         assert_eq!(atc_population_hydration_stats().deferred_refreshes, 1);
         assert_eq!(atc_population_hydration_stats().applied_agents, 1);
         super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn completed_hydration_defers_a_new_read_until_the_public_tick_runs() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+        super::super::reset_global_atc_state_for_test(&config);
+        sync_population_with(10, || Ok(rows(1))).unwrap();
+        assert_eq!(atc_population_hydration_stats().pending_agents, 0);
+        assert!(hydration().lock().unwrap().resume_pending);
+        let cached = sync_population_with(20, || panic!("refresh stole the inference turn"));
+        assert_eq!(cached.unwrap().agents, 1);
+        assert_eq!(atc_population_hydration_stats().deferred_refreshes, 1);
+        assert_eq!(engine::atc_summary().unwrap().tick_count, 0);
+        assert_eq!(super::super::atc_tick_report(2_000_000).unwrap().summary.tick_count, 1);
+        assert!(!hydration().lock().unwrap().resume_pending);
+
+        let mut loaded = false;
+        sync_population_with(30, || {
+            loaded = true;
+            let mut changed = rows(1);
+            changed[0].last_active_ts = 3_000_000;
+            Ok(changed)
+        }).unwrap();
+        assert!(loaded, "completed inference did not allow the next refresh");
+        assert_eq!(engine::atc_agent_last_activity("HydratedAgent0000"), Some(3_000_000));
+        super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn failed_refresh_can_recover_even_with_an_outstanding_inference_turn() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+        super::super::reset_global_atc_state_for_test(&config);
+        sync_population_with(10, || Ok(rows(1))).unwrap();
+        {
+            let mut state = hydration().lock().unwrap();
+            assert!(state.resume_pending);
+            assert!(state.refresh_with(20, || Err("lost activity evidence".into())).is_err());
+            assert!(!state.should_defer_refresh());
+        }
+        assert_eq!(super::super::atc_tick_report(2_000_000).unwrap().summary.tick_count, 0);
+        let mut loaded = false;
+        sync_population_with(30, || {
+            loaded = true;
+            Ok(rows(1))
+        }).unwrap();
+        assert!(loaded);
+        assert!(!atc_population_hydration_stats().refresh_failed);
+        assert_eq!(super::super::atc_tick_report(3_000_000).unwrap().summary.tick_count, 1);
+        super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn refresh_gate_preserves_inference_turns_in_a_940_agent_cadence() {
+        // Exercise the actual admission gate and bounded queue transitions
+        // deterministically; the public-tick test above covers its engine edge.
+        let mut state = HydrationState::default();
+        let mut inference_turns = 0;
+        let mut reads = 0;
+        for step in 1..=300 {
+            if !state.should_defer_refresh() {
+                let mut changed = rows(940);
+                for row in &mut changed {
+                    row.last_active_ts += step;
+                }
+                state.refresh_with(step, || Ok(changed)).unwrap();
+                reads += 1;
+            }
+            // A refresh call may drain one slice; the subsequent public tick
+            // either infers on an empty queue or drains and yields, even when
+            // that tick consumes the final slice.
+            state.drain_with(|_| {}, || true);
+            if state.pending.is_empty() {
+                state.resume_pending = false;
+                inference_turns += 1;
+            } else {
+                state.drain_with(|_| {}, || true);
+            }
+        }
+        assert_eq!(inference_turns, 18);
+        assert_eq!(reads, 19);
     }
 
     #[test]
