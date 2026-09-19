@@ -284,9 +284,9 @@ dependencies = [
 
 [[package]]
 name = "asupersync"
-version = "0.4.9"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be81588a09a28a312b09d4af71e8aa8c6736e1d670a69a42e6779e874fbad1bd"
+checksum = "7e8b505d6aadb778c9c4b0ae174966641f11d578d253b7786f2407b17d5045ec"
 dependencies = [
  "aes-gcm",
  "base64 0.23.1",
@@ -499,18 +499,19 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "beads_rust"
-version = "0.5.4"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "083ed64e66db038f7b200cb4086fbf5a556e9b73fbfdb4efcb810536cae96820"
+checksum = "0d0fbac9a6c83b1ee48ab585f3d5f3fe9c8005a05cab7e039502d9293ed1cecf"
 dependencies = [
  "anyhow",
- "asupersync 0.4.9",
+ "asupersync 0.4.10",
  "cap-primitives",
  "chrono",
  "clap",
  "clap_complete",
  "crossterm",
  "dunce",
+ "flate2",
  "fsqlite 0.3.18",
  "fsqlite-ast 0.3.18",
  "fsqlite-btree 0.3.18",
@@ -543,6 +544,7 @@ dependencies = [
  "shell-words",
  "signal-hook 0.4.4",
  "similar 3.2.0",
+ "tar",
  "tempfile",
  "thiserror",
  "tracing",
@@ -2403,7 +2405,7 @@ name = "fsqlite"
 version = "0.3.18"
 source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a26bde68db23172b12aa402ed698cc309"
 dependencies = [
- "asupersync 0.4.9",
+ "asupersync 0.4.10",
  "fsqlite-core 0.3.18",
  "fsqlite-error 0.3.18",
  "fsqlite-ext-fts5 0.3.18",
@@ -2493,7 +2495,7 @@ name = "fsqlite-core"
 version = "0.3.18"
 source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a26bde68db23172b12aa402ed698cc309"
 dependencies = [
- "asupersync 0.4.9",
+ "asupersync 0.4.10",
  "blake3",
  "foldhash",
  "fsqlite-ast 0.3.18",
@@ -2725,7 +2727,7 @@ name = "fsqlite-mvcc"
 version = "0.3.18"
 source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a26bde68db23172b12aa402ed698cc309"
 dependencies = [
- "asupersync 0.4.9",
+ "asupersync 0.4.10",
  "blake3",
  "crc32c",
  "crossbeam-epoch",
@@ -2798,7 +2800,7 @@ version = "0.3.18"
 source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a26bde68db23172b12aa402ed698cc309"
 dependencies = [
  "argon2 0.5.3",
- "asupersync 0.4.9",
+ "asupersync 0.4.10",
  "blake3",
  "bumpalo",
  "chacha20poly1305",
@@ -2907,7 +2909,7 @@ name = "fsqlite-types"
 version = "0.3.18"
 source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a26bde68db23172b12aa402ed698cc309"
 dependencies = [
- "asupersync 0.4.9",
+ "asupersync 0.4.10",
  "bitflags 2.13.1",
  "blake3",
  "fsqlite-error 0.3.18",
@@ -2945,7 +2947,7 @@ name = "fsqlite-vdbe"
 version = "0.3.18"
 source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a26bde68db23172b12aa402ed698cc309"
 dependencies = [
- "asupersync 0.4.9",
+ "asupersync 0.4.10",
  "crossbeam-deque",
  "fsqlite-ast 0.3.18",
  "fsqlite-btree 0.3.18",
@@ -2992,7 +2994,7 @@ version = "0.3.18"
 source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a26bde68db23172b12aa402ed698cc309"
 dependencies = [
  "advisory-lock",
- "asupersync 0.4.9",
+ "asupersync 0.4.10",
  "fsqlite-error 0.3.18",
  "fsqlite-observability 0.3.18",
  "fsqlite-types 0.3.18",
@@ -3027,7 +3029,7 @@ name = "fsqlite-wal"
 version = "0.3.18"
 source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a26bde68db23172b12aa402ed698cc309"
 dependencies = [
- "asupersync 0.4.9",
+ "asupersync 0.4.10",
  "blake3",
  "crc32c",
  "fsqlite-error 0.3.18",
@@ -7839,6 +7841,17 @@ version = "0.7.0"
 source = "git+https://github.com/quickwit-oss/tantivy?rev=1f32c1a8af0eb9d68bd3f5576caf20941364b657#1f32c1a8af0eb9d68bd3f5576caf20941364b657"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
 ]
 
 [[package]]

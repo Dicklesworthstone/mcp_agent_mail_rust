@@ -19,9 +19,17 @@ in a fresh child and existing ready/status handlers
 (`044-beads-authority-envelope-runtime.log`). Final workspace/all-target
 check, strict Clippy and formatting passed. Earlier test-shape and
 production-decoder failures remain in the evidence logs. The embedded
-dependency is still 0.5.4; its upgrade is next. Version 0.6.0 still requires the separate 0.3.18
-engine; upgrading it will not eliminate that graph. Keep default features
-disabled to avoid its optional self-update HTTP runtime.
+dependency now uses qualified 0.6.0. All 24 selected discovery, wrapper,
+real-database handler and doctor-probe tests passed at 20:55 UTC
+(`044-beads-060-runtime.log`, strict RCH exit 0). Workspace/all-target
+check, strict Clippy and formatting passed in `044-beads-060-{check,clippy,fmt}.log`.
+Targeted
+resolution changes Beads, its exact Asupersync 0.4.9 dependency to 0.4.10,
+and adds `tar` 0.4.46; the mailbox retains Asupersync 0.5.0. Version 0.6.0
+still requires the separate patched 0.3.18 engine. Default features remain
+disabled to avoid its optional self-update HTTP runtime. The new graph's
+audit reports zero vulnerabilities, with existing warning classes retained
+in `044-beads-060-audit.json`.
 
 September 19 Blake2 update: the direct release-verifier dependency
 advances from 0.10.6 to 0.11.0. Published upstream changes replace aliases with

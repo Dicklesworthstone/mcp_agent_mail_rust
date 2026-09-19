@@ -85,7 +85,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `sqlmodel-sqlite` (`=0.5.0`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
 | `ftui` / `ftui-*` (`0.5.0`, FrankenTUI) | TUI rendering for operations console |
 | `frankensearch` (`0.6`, git revision `dd093fb230404ab08be2ed6f27776ed6c4796485`, aligned with dist.yml's `FRANKENSEARCH_COMMIT`) | Search V3 engine; lexical (Tantivy) tier by default, semantic/rerank behind the `hybrid` feature. Cargo uses the immutable revision directly; no sibling checkout is required. Its reranker shares the Asupersync 0.5 caller context |
-| `beads_rust` (`=0.5.4`) | Issue tracking integration |
+| `beads_rust` (`=0.6.0`, default features disabled) | Issue tracking integration; separate patched FrankenSQLite 0.3.18 engine |
 | `franken-agent-detection` (`0.2.2`) | Installed coding-agent detection for setup/doctor |
 | `serde` + `serde_json` | JSON serialization for MCP protocol |
 | `chrono` | Timestamp handling (i64 microseconds since epoch) |

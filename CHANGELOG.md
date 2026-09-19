@@ -35,7 +35,11 @@ release readiness.
   validated workspace query to another database. List decoding recognizes
   the current `issues` envelope instead of silently reporting no matches;
   ready-command arrays remain supported. Real Beads 0.6.0 integration tests
-  cover both fixes (`br-8nski`, `br-q0b1m`).
+  cover both fixes.
+  ([repair](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/dc856b33); `br-8nski`, `br-q0b1m`)
+- **Update embedded Beads to 0.6.0.** Workspace discovery and real CLI
+  integration pass 24 selected tests. Optional self-update features remain
+  disabled, and the separate older SQLite engine keeps its existing patches.
 - **Repair native Windows file and path handling.** Evidence-ledger writes
   no longer probe an incomplete drive prefix, file-lock contention uses the
   platform's actual error code, and setup status redacts native home paths.
