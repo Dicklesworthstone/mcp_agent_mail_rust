@@ -1,0 +1,303 @@
+diff --git a/crates/mcp-agent-mail-server/src/atc_engine.rs b/crates/mcp-agent-mail-server/src/atc_engine.rs
+--- a/crates/mcp-agent-mail-server/src/atc_engine.rs
++++ b/crates/mcp-agent-mail-server/src/atc_engine.rs
+@@ -4640,11 +4640,10 @@
+-        if let Some(tuner_lock) = ATC_LIVENESS_TUNER.get()
+-            && let Ok(mut tuner) = tuner_lock.lock()
+-        {
+-            let regret = (predicted_loss - actual_loss).abs();
+-            tuner.record_outcome(action, true_state, regret);
+-            if tuner.maybe_update(&mut self.liveness_core) {
+-                self.propagate_liveness_policy();
+-            }
++        if let Some(tuner_lock) = ATC_LIVENESS_TUNER.get() {
++            self.apply_liveness_tuner_outcome(
++                tuner_lock,
++                action,
++                true_state,
++                (predicted_loss - actual_loss).abs(),
++            );
+         }
+ 
+         let silence = self
+@@ -5352,5 +5352,27 @@
+         results.sort_by(|left, right| left.0.cmp(&right.0));
+         results
++    }
++
++    /// The caller already owns the engine. Never acquire ENGINE while holding
++    /// TUNER: tick/activity feedback and external outcome recording share this
++    /// ENGINE -> TUNER order. Release TUNER before the O(agents) policy fan-out.
++    fn apply_liveness_tuner_outcome(
++        &mut self,
++        tuner_lock: &Mutex<LossMatrixTuner<LivenessAction, LivenessState>>,
++        action: LivenessAction,
++        true_state: LivenessState,
++        regret: f64,
++    ) {
++        let changed = {
++            let Ok(mut tuner) = tuner_lock.lock() else {
++                return;
++            };
++            tuner.record_outcome(action, true_state, regret);
++            tuner.maybe_update(&mut self.liveness_core)
++        };
++        if changed {
++            self.propagate_liveness_policy();
++        }
+     }
+ 
+     fn propagate_liveness_policy(&mut self) {
+@@ -10350,9 +10350,9 @@
+-    // Feed liveness tuner (regret → PID → loss matrix feedback loop)
++    // Feed liveness tuner (regret → PID → loss matrix feedback loop).
++    // Keep the same lock order as tick/activity feedback: ENGINE, then TUNER.
+     if subsystem == AtcSubsystem::Liveness
++        && let Some(engine_lock) = ATC_ENGINE.get()
+         && let Some(tuner_lock) = ATC_LIVENESS_TUNER.get()
+-        && let Ok(mut tuner) = tuner_lock.lock()
+     {
+-        let regret = (predicted_loss - actual_loss).abs();
+         let action = if correct {
+             LivenessAction::DeclareAlive
+         } else {
+@@ -10363,14 +10363,13 @@
+         } else {
+             LivenessState::Dead
+         };
+-        tuner.record_outcome(action, state, regret);
+-
+-        if let Some(engine_lock) = ATC_ENGINE.get()
+-            && let Ok(mut engine) = engine_lock.lock()
+-            && tuner.maybe_update(&mut engine.liveness_core)
+-        {
+-            engine.propagate_liveness_policy();
+-        }
++        record_liveness_tuner_outcome(
++            engine_lock,
++            tuner_lock,
++            action,
++            state,
++            (predicted_loss - actual_loss).abs(),
++        );
+     }
+ 
+     // Feed survival estimator.
+@@ -10404,3 +10404,17 @@
++/// Shared external-feedback boundary. Taking the engine first prevents an
++/// outcome worker from holding TUNER while a tick holds ENGINE and needs TUNER.
++fn record_liveness_tuner_outcome(
++    engine_lock: &Mutex<AtcEngine>,
++    tuner_lock: &Mutex<LossMatrixTuner<LivenessAction, LivenessState>>,
++    action: LivenessAction,
++    true_state: LivenessState,
++    regret: f64,
++) {
++    if let Ok(mut engine) = engine_lock.lock() {
++        engine.apply_liveness_tuner_outcome(tuner_lock, action, true_state, regret);
++    }
++}
++
+ /// Get ATC summary for robot mode / TUI display.
+ #[must_use]
+ pub fn atc_summary() -> Option<AtcSummarySnapshot> {
+@@ -10592,3 +10592,7 @@
++#[cfg(test)]
++#[path = "atc_outcome_regression_tests.rs"]
++mod atc_outcome_regression_tests;
++
+ /// Shared lock for tests that mutate global ATC state.
+ #[cfg(test)]
+ pub(crate) static GLOBAL_ATC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+diff --git a/crates/mcp-agent-mail-server/src/atc_outcome_regression_tests.rs b/crates/mcp-agent-mail-server/src/atc_outcome_regression_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/mcp-agent-mail-server/src/atc_outcome_regression_tests.rs
+@@ -0,0 +1,187 @@
++//! Regression tests for the actual tuner update helpers, using isolated locks.
++
++use super::*;
++use std::sync::{Arc, TryLockError};
++use std::time::Duration;
++
++fn local_state(
++    interval: u64,
++) -> (
++    Mutex<AtcEngine>,
++    Mutex<LossMatrixTuner<LivenessAction, LivenessState>>,
++) {
++    let engine = AtcEngine::new_for_testing();
++    let tuner = LossMatrixTuner::from_core(&engine.liveness_core, interval);
++    (Mutex::new(engine), Mutex::new(tuner))
++}
++
++#[test]
++fn external_feedback_takes_engine_before_contended_tuner() {
++    let (engine, tuner) = local_state(10);
++    let engine = Arc::new(engine);
++    let tuner = Arc::new(tuner);
++    let held_tuner = tuner.lock().unwrap();
++    let worker_engine = Arc::clone(&engine);
++    let worker_tuner = Arc::clone(&tuner);
++    let worker = std::thread::spawn(move || {
++        record_liveness_tuner_outcome(
++            &worker_engine,
++            &worker_tuner,
++            LivenessAction::Suspect,
++            LivenessState::Dead,
++            4.0,
++        );
++    });
++
++    // The worker cannot finish while we hold TUNER. It must hold ENGINE while
++    // waiting, not acquire TUNER first. Do not assert or join until releasing
++    // TUNER, so even a reintroduced inversion fails without hanging the suite.
++    let deadline = Instant::now() + Duration::from_secs(5);
++    let engine_acquired = loop {
++        match engine.try_lock() {
++            Err(TryLockError::WouldBlock) => break true,
++            Err(TryLockError::Poisoned(_)) => break false,
++            Ok(guard) => drop(guard),
++        }
++        if Instant::now() >= deadline {
++            break false;
++        }
++        std::thread::sleep(Duration::from_millis(1));
++    };
++    drop(held_tuner);
++    worker.join().unwrap();
++    assert!(engine_acquired, "external feedback waited for TUNER before ENGINE");
++    assert_eq!(tuner.lock().unwrap().decisions_since_update, 1);
++}
++
++#[test]
++fn tuning_matches_the_existing_sequential_algorithm_exactly() {
++    let (engine, tuner) = local_state(3);
++    let mut expected_core = default_liveness_core();
++    let mut expected_tuner = LossMatrixTuner::from_core(&expected_core, 3);
++    let mut expected_revision = engine.lock().unwrap().policy_revision;
++    for regret in [1.0, 2.0, 3.0, 0.0, 5.0, 4.0, 7.0] {
++        expected_tuner.record_outcome(LivenessAction::Suspect, LivenessState::Dead, regret);
++        if expected_tuner.maybe_update(&mut expected_core) {
++            expected_revision += 1;
++        }
++        record_liveness_tuner_outcome(
++            &engine,
++            &tuner,
++            LivenessAction::Suspect,
++            LivenessState::Dead,
++            regret,
++        );
++        let actual = engine.lock().unwrap();
++        assert_eq!(actual.liveness_core.loss_matrix, expected_core.loss_matrix);
++        assert_eq!(actual.liveness_core.posterior, expected_core.posterior);
++        assert_eq!(actual.policy_revision, expected_revision);
++        assert_eq!(
++            tuner.lock().unwrap().decisions_since_update,
++            expected_tuner.decisions_since_update,
++        );
++    }
++}
++
++#[test]
++fn in_engine_feedback_propagates_policy_only_at_update_boundary() {
++    let mut engine = AtcEngine::new_for_testing();
++    engine.register_agent("BlueFox", "codex-cli", Some("/regression"));
++    let posterior = engine.agents["BlueFox"].core.posterior.clone();
++    let revision = engine.policy_revision;
++    let before = engine.liveness_core.loss_matrix.clone();
++    let tuner = Mutex::new(LossMatrixTuner::from_core(&engine.liveness_core, 3));
++    for _ in 0..2 {
++        engine.apply_liveness_tuner_outcome(
++            &tuner,
++            LivenessAction::Suspect,
++            LivenessState::Dead,
++            4.0,
++        );
++        assert_eq!(engine.policy_revision, revision);
++        assert_eq!(engine.liveness_core.loss_matrix, before);
++    }
++    engine.apply_liveness_tuner_outcome(
++        &tuner,
++        LivenessAction::Suspect,
++        LivenessState::Dead,
++        4.0,
++    );
++    assert_eq!(engine.policy_revision, revision + 1);
++    assert_ne!(engine.liveness_core.loss_matrix, before);
++    assert_eq!(
++        engine.agents["BlueFox"].core.loss_matrix,
++        engine.liveness_core.loss_matrix,
++    );
++    assert_eq!(engine.agents["BlueFox"].core.posterior, posterior);
++    assert!(tuner.try_lock().is_ok());
++}
++
++#[test]
++fn poisoned_engine_does_not_consume_tuner_feedback() {
++    let (engine, tuner) = local_state(1);
++    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++        let _guard = engine.lock().unwrap();
++        panic!("injected engine poison");
++    }));
++    assert!(failure.is_err());
++    record_liveness_tuner_outcome(
++        &engine,
++        &tuner,
++        LivenessAction::Suspect,
++        LivenessState::Dead,
++        4.0,
++    );
++    assert_eq!(tuner.lock().unwrap().decisions_since_update, 0);
++}
++
++#[test]
++fn poisoned_tuner_does_not_publish_a_partial_policy_update() {
++    let (engine, tuner) = local_state(1);
++    let before = engine.lock().unwrap().liveness_core.loss_matrix.clone();
++    let revision = engine.lock().unwrap().policy_revision;
++    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++        let _guard = tuner.lock().unwrap();
++        panic!("injected tuner poison");
++    }));
++    assert!(failure.is_err());
++    record_liveness_tuner_outcome(
++        &engine,
++        &tuner,
++        LivenessAction::Suspect,
++        LivenessState::Dead,
++        4.0,
++    );
++    let actual = engine.try_lock().unwrap();
++    assert_eq!(actual.liveness_core.loss_matrix, before);
++    assert_eq!(actual.policy_revision, revision);
++}
++
++#[test]
++fn public_outcome_boundary_preserves_liveness_only_and_disabled_gates() {
++    let _serial = GLOBAL_ATC_TEST_LOCK
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner);
++    let mut config = mcp_agent_mail_core::Config {
++        atc_enabled: true,
++        ..Default::default()
++    };
++    reset_global_atc_state_for_test(&config);
++    atc_record_outcome(AtcSubsystem::Conflict, None, 5.0, 1.0, false);
++    assert_eq!(
++        ATC_LIVENESS_TUNER.get().unwrap().lock().unwrap().decisions_since_update,
++        0,
++    );
++    atc_record_outcome(AtcSubsystem::Liveness, None, 5.0, 1.0, false);
++    assert_eq!(
++        ATC_LIVENESS_TUNER.get().unwrap().lock().unwrap().decisions_since_update,
++        1,
++    );
++    config.atc_enabled = false;
++    reset_global_atc_state_for_test(&config);
++    atc_record_outcome(AtcSubsystem::Liveness, None, 5.0, 1.0, false);
++    assert_eq!(
++        ATC_LIVENESS_TUNER.get().unwrap().lock().unwrap().decisions_since_update,
++        0,
++    );
++}

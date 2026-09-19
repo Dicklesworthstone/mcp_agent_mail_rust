@@ -1,0 +1,110 @@
+name: Land reviewed ATC reliability fixes
+
+# One-shot application of the reviewed September 18 patch series. No PR or
+# arbitrary patch inputs are accepted; both source and patch blobs are pinned.
+# Ordinary pushes, including the three resulting commits, cannot run this job.
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/land-atc-reliability-20260918.yml
+
+permissions: {}
+
+concurrency:
+  group: land-atc-reliability-20260918
+  cancel-in-progress: false
+
+jobs:
+  land:
+    if: >-
+      github.repository == 'Dicklesworthstone/mcp_agent_mail_rust' &&
+      contains(github.event.head_commit.message, '[land-atc-series-20260918]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 1
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          clean: false
+
+      - name: Verify the exact reviewed source and patch bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          test "$(git hash-object crates/mcp-agent-mail-server/src/atc_engine.rs)" = 15d035accc87770ad987bad94d5585c7cf623dca
+          test "$(git hash-object patches/atc-reliability-20260918/0001-outcome-lock-order.patch)" = cfd4bc4b78d1aaa7f71618ef53ec87e5a4b8b43d
+          test "$(git hash-object patches/atc-reliability-20260918/0002-scheduler-compaction.patch)" = 260b89fb4262c8e2806f83bebd0ea195416c0545
+          test "$(git hash-object patches/atc-reliability-20260918/0003-stale-activity.patch)" = 4f7974d705081ec3ffd4475129429e02379ace76
+
+      - name: Install the repository's pinned formatter and compiler
+        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+
+      - name: Apply, format tests, and push each fix separately to main
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          source=crates/mcp-agent-mail-server/src/atc_engine.rs
+          patches=(
+            patches/atc-reliability-20260918/0001-outcome-lock-order.patch
+            patches/atc-reliability-20260918/0002-scheduler-compaction.patch
+            patches/atc-reliability-20260918/0003-stale-activity.patch
+          )
+          tests=(
+            crates/mcp-agent-mail-server/src/atc_outcome_regression_tests.rs
+            crates/mcp-agent-mail-server/src/atc_scheduler_regression_tests.rs
+            crates/mcp-agent-mail-server/src/atc_activity_regression_tests.rs
+          )
+          subjects=(
+            'fix(atc): eliminate outcome feedback lock inversion'
+            'perf(atc): amortize scheduler compaction outside activity hot path'
+            'fix(atc): reject stale activity before liveness side effects'
+          )
+          for index in 0 1 2; do
+            git apply --check "${patches[$index]}"
+            git apply --index "${patches[$index]}"
+            rustfmt --edition 2024 "${tests[$index]}"
+            git add -- "${tests[$index]}"
+            git diff --cached --check
+            actual=$(git diff --cached --name-only | LC_ALL=C sort)
+            expected=$(printf '%s\n' "$source" "${tests[$index]}" | LC_ALL=C sort)
+            test "$actual" = "$expected"
+            rustfmt --edition 2024 --config skip_children=true --check "$source"
+            git commit -m "${subjects[$index]}" -m 'Apply the reviewed ATC patch with its six native regression tests. Patch integrity and formatting are checked before publishing. Native workspace validation follows in this workflow; this commit does not assert that those checks have passed.'
+            # A concurrent main update fails closed. Never force-push or reset.
+            git push origin HEAD:refs/heads/main
+            printf '%s %s\n' "$(git rev-parse HEAD)" "${subjects[$index]}" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Run native ATC regression modules
+        if: steps.publish.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-server --lib atc_outcome_regression_tests -- --test-threads=1
+          cargo test --locked -p mcp-agent-mail-server --lib atc_scheduler_regression_tests -- --test-threads=1
+          cargo test --locked -p mcp-agent-mail-server --lib atc_activity_regression_tests -- --test-threads=1
+
+      - name: Check the full workspace
+        if: always() && steps.publish.outcome == 'success'
+        run: cargo check --locked --workspace --all-targets
+
+      - name: Check Clippy
+        if: always() && steps.publish.outcome == 'success'
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Check formatting
+        if: always() && steps.publish.outcome == 'success'
+        run: cargo fmt --all -- --check

@@ -1,0 +1,197 @@
+diff --git a/crates/mcp-agent-mail-server/src/atc_engine.rs b/crates/mcp-agent-mail-server/src/atc_engine.rs
+--- a/crates/mcp-agent-mail-server/src/atc_engine.rs
++++ b/crates/mcp-agent-mail-server/src/atc_engine.rs
+@@ -4668,4 +4668,13 @@
+     fn resolve_pending_feedback_on_activity(&mut self, agent: &str, timestamp_micros: i64) {
++        // Arrival time is not event time. Activity that happened before this
++        // intervention cannot be its outcome, even when delivered afterwards.
++        if self
++            .pending_liveness_feedback
++            .get(agent)
++            .is_none_or(|pending| timestamp_micros <= pending.issued_at_micros)
++        {
++            return;
++        }
+         let Some(pending) = self.pending_liveness_feedback.remove(agent) else {
+             return;
+         };
+@@ -5113,7 +5113,16 @@
+         project_key: Option<&str>,
+         timestamp_micros: i64,
+     ) {
+-        if agent == ATC_AGENT_NAME {
++        if agent == ATC_AGENT_NAME || timestamp_micros <= 0 {
++            return;
++        }
++        let Some(entry) = self.agents.get(agent) else {
++            return;
++        };
++        // AgentRhythm already keeps its timestamp monotonic, but that alone
++        // does not protect resurrection, feedback, project attribution, or the
++        // scheduler. Replayed/late observations must be a no-op for all of them.
++        if timestamp_micros <= entry.rhythm.last_activity_ts {
+             return;
+         }
+         self.resolve_pending_feedback_on_activity(agent, timestamp_micros);
+@@ -10651,6 +10651,10 @@
+ #[path = "atc_scheduler_regression_tests.rs"]
+ mod atc_scheduler_regression_tests;
+ 
++#[cfg(test)]
++#[path = "atc_activity_regression_tests.rs"]
++mod atc_activity_regression_tests;
++
+ /// Shared lock for tests that mutate global ATC state.
+ #[cfg(test)]
+ pub(crate) static GLOBAL_ATC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+diff --git a/crates/mcp-agent-mail-server/src/atc_activity_regression_tests.rs b/crates/mcp-agent-mail-server/src/atc_activity_regression_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/mcp-agent-mail-server/src/atc_activity_regression_tests.rs
+@@ -0,0 +1,146 @@
++//! Event-time regressions: duplicates must not mutate liveness or its feedback.
++
++use super::*;
++
++const AGENT: &str = "BlueFox";
++const PROJECT: &str = "/activity-regression";
++
++fn isolated_engine() -> (std::sync::MutexGuard<'static, ()>, AtcEngine) {
++    let serial = GLOBAL_ATC_TEST_LOCK
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner);
++    reset_global_atc_state_for_test(&mcp_agent_mail_core::Config {
++        atc_enabled: true,
++        ..Default::default()
++    });
++    let mut engine = AtcEngine::new_for_testing();
++    engine.register_agent(AGENT, "codex-cli", Some(PROJECT));
++    engine.observe_activity(AGENT, Some(PROJECT), 1_000_000);
++    (serial, engine)
++}
++
++#[test]
++fn stale_activity_cannot_resurrect_or_consume_feedback_or_change_project() {
++    let (_serial, mut engine) = isolated_engine();
++    {
++        let entry = engine.agents.get_mut(AGENT).unwrap();
++        entry.state = LivenessState::Dead;
++        entry.suspect_since = 2_000_000;
++        entry.probe_sent_at = 3_000_000;
++        entry.sprt_log_lr = 8.0;
++    }
++    engine.schedule_entry_for_push(AGENT, i64::MAX);
++    engine.record_pending_liveness_feedback(AGENT, LivenessAction::Suspect, 2.0, 4_000_000);
++    let before = engine.agents[AGENT].clone();
++    let heap = engine.liveness_schedule.clone().into_sorted_vec();
++    let dirty = engine.dirty_agents.clone();
++    for timestamp in [i64::MIN, -1, 0, 500_000, 1_000_000, 1_000_000] {
++        engine.observe_activity(AGENT, Some("/stale-project"), timestamp);
++    }
++    let after = &engine.agents[AGENT];
++    assert_eq!(after.state, before.state);
++    assert_eq!(after.project_key, before.project_key);
++    assert_eq!(after.suspect_since, before.suspect_since);
++    assert_eq!(after.probe_sent_at, before.probe_sent_at);
++    assert_eq!(after.sprt_log_lr.to_bits(), before.sprt_log_lr.to_bits());
++    assert_eq!(after.rhythm.last_activity_ts, before.rhythm.last_activity_ts);
++    assert_eq!(after.rhythm.observation_count, before.rhythm.observation_count);
++    assert_eq!(after.rhythm.avg_interval.to_bits(), before.rhythm.avg_interval.to_bits());
++    assert_eq!(after.rhythm.var_interval.to_bits(), before.rhythm.var_interval.to_bits());
++    assert_eq!(after.rhythm.recent_intervals, before.rhythm.recent_intervals);
++    assert_eq!(after.core.posterior, before.core.posterior);
++    assert_eq!(after.schedule_version, before.schedule_version);
++    assert_eq!(engine.liveness_schedule.clone().into_sorted_vec(), heap);
++    assert_eq!(engine.dirty_agents, dirty);
++    assert!(engine.pending_liveness_feedback.contains_key(AGENT));
++    assert_eq!(engine.resolved_experience_count, 0);
++    assert!(engine.agent_intervention_counts.is_empty());
++}
++
++#[test]
++fn repeated_live_observation_does_not_churn_the_scheduler() {
++    let (_serial, mut engine) = isolated_engine();
++    engine.observe_activity(AGENT, Some(PROJECT), 2_000_000);
++    let version = engine.agents[AGENT].schedule_version;
++    let observations = engine.agents[AGENT].rhythm.observation_count;
++    let heap = engine.liveness_schedule.clone().into_sorted_vec();
++    for _ in 0..10_000 {
++        engine.observe_activity(AGENT, Some(PROJECT), 2_000_000);
++    }
++    assert_eq!(engine.agents[AGENT].schedule_version, version);
++    assert_eq!(engine.agents[AGENT].rhythm.observation_count, observations);
++    assert_eq!(engine.liveness_schedule.clone().into_sorted_vec(), heap);
++}
++
++#[test]
++fn pre_intervention_activity_updates_rhythm_but_does_not_resolve_future_feedback() {
++    let (_serial, mut engine) = isolated_engine();
++    engine.record_pending_liveness_feedback(AGENT, LivenessAction::Suspect, 2.0, 4_000_000);
++    for timestamp in [3_000_000, 4_000_000] {
++        engine.observe_activity(AGENT, Some(PROJECT), timestamp);
++        assert_eq!(engine.agents[AGENT].rhythm.last_activity_ts, timestamp);
++        assert!(engine.pending_liveness_feedback.contains_key(AGENT));
++        assert_eq!(engine.resolved_experience_count, 0);
++    }
++    engine.observe_activity(AGENT, Some(PROJECT), 4_000_001);
++    assert!(!engine.pending_liveness_feedback.contains_key(AGENT));
++    assert_eq!(engine.resolved_experience_count, 1);
++}
++
++#[test]
++fn new_activity_resurrects_and_resolves_feedback_exactly_once() {
++    let (_serial, mut engine) = isolated_engine();
++    {
++        let entry = engine.agents.get_mut(AGENT).unwrap();
++        entry.state = LivenessState::Dead;
++        entry.suspect_since = 2_000_000;
++        entry.probe_sent_at = 3_000_000;
++        entry.sprt_log_lr = 8.0;
++    }
++    engine.schedule_entry_for_push(AGENT, i64::MAX);
++    engine.record_pending_liveness_feedback(AGENT, LivenessAction::Suspect, 2.0, 4_000_000);
++    engine.observe_activity(AGENT, Some(PROJECT), 5_000_000);
++    let after = &engine.agents[AGENT];
++    assert_eq!(after.state, LivenessState::Alive);
++    assert_eq!(after.suspect_since, 0);
++    assert_eq!(after.probe_sent_at, 0);
++    assert_eq!(after.sprt_log_lr.to_bits(), 0.0_f64.to_bits());
++    assert_eq!(after.rhythm.last_activity_ts, 5_000_000);
++    assert!(after.next_review_micros < i64::MAX);
++    assert!(engine.dirty_agents.contains(AGENT));
++    assert!(!engine.pending_liveness_feedback.contains_key(AGENT));
++    assert_eq!(engine.resolved_experience_count, 1);
++    let version = after.schedule_version;
++    engine.observe_activity(AGENT, Some(PROJECT), 5_000_000);
++    assert_eq!(engine.resolved_experience_count, 1);
++    assert_eq!(engine.agents[AGENT].schedule_version, version);
++}
++
++#[test]
++fn unattributed_or_self_activity_remains_inert() {
++    let (_serial, mut engine) = isolated_engine();
++    let heap = engine.liveness_schedule.clone().into_sorted_vec();
++    for agent in ["UnknownAgent", ATC_AGENT_NAME] {
++        engine.observe_activity(agent, Some(PROJECT), 5_000_000);
++        assert!(!engine.agents.contains_key(agent));
++    }
++    assert_eq!(engine.agents.len(), 1);
++    assert_eq!(engine.liveness_schedule.clone().into_sorted_vec(), heap);
++}
++
++#[test]
++fn invalid_initial_activity_does_not_create_an_activity_anchor() {
++    let (_serial, mut engine) = isolated_engine();
++    engine.register_agent("NewAgent", "codex-cli", Some(PROJECT));
++    let version = engine.agents["NewAgent"].schedule_version;
++    for timestamp in [i64::MIN, -1, 0] {
++        engine.observe_activity("NewAgent", Some("/invalid"), timestamp);
++    }
++    let entry = &engine.agents["NewAgent"];
++    assert_eq!(entry.rhythm.last_activity_ts, 0);
++    assert_eq!(entry.rhythm.observation_count, 0);
++    assert_eq!(entry.project_key.as_deref(), Some(PROJECT));
++    assert_eq!(entry.schedule_version, version);
++    engine.observe_activity("NewAgent", Some(PROJECT), 1);
++    assert_eq!(engine.agents["NewAgent"].rhythm.last_activity_ts, 1);
++}

@@ -1,0 +1,215 @@
+diff --git a/crates/mcp-agent-mail-server/src/atc_engine.rs b/crates/mcp-agent-mail-server/src/atc_engine.rs
+--- a/crates/mcp-agent-mail-server/src/atc_engine.rs
++++ b/crates/mcp-agent-mail-server/src/atc_engine.rs
+@@ -4837,11 +4837,15 @@
+     fn compact_liveness_schedule_if_needed(&mut self) {
+-        let live_scheduled = self.scheduled_agent_count();
+-        let max_heap_entries = live_scheduled.saturating_mul(4).max(64);
++        // Every activity signal and hydrated row reaches this check under the
++        // engine mutex. Counting scheduled agents here made N updates do N full
++        // roster scans, even when the heap did not need compacting. Total tracked
++        // agents is an O(1) upper bound; rebuild only after proportional growth.
++        // Unscheduled/dead agents are still excluded from the rebuilt heap.
++        let max_heap_entries = self.agents.len().saturating_mul(4).max(64);
+         if self.liveness_schedule.len() <= max_heap_entries {
+             return;
+         }
+ 
+-        let mut rebuilt = BinaryHeap::new();
++        let mut rebuilt = Vec::with_capacity(self.agents.len());
+         for entry in self.agents.values() {
+             if entry.next_review_micros == i64::MAX {
+                 continue;
+@@ -4852,7 +4856,8 @@
+                 agent: entry.name.clone(),
+             }));
+         }
+-        self.liveness_schedule = rebuilt;
++        // Heapify once in O(N), rather than inserting N entries separately.
++        self.liveness_schedule = BinaryHeap::from(rebuilt);
+     }
+ 
+     fn effective_threshold(base_k: f64, adaptive_k: Option<f64>, fallback_active: bool) -> f64 {
+@@ -10641,6 +10641,10 @@
+ #[path = "atc_outcome_regression_tests.rs"]
+ mod atc_outcome_regression_tests;
+ 
++#[cfg(test)]
++#[path = "atc_scheduler_regression_tests.rs"]
++mod atc_scheduler_regression_tests;
++
+ /// Shared lock for tests that mutate global ATC state.
+ #[cfg(test)]
+ pub(crate) static GLOBAL_ATC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+diff --git a/crates/mcp-agent-mail-server/src/atc_scheduler_regression_tests.rs b/crates/mcp-agent-mail-server/src/atc_scheduler_regression_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/mcp-agent-mail-server/src/atc_scheduler_regression_tests.rs
+@@ -0,0 +1,167 @@
++//! Functional scheduler regressions and an opt-in activity-hot-path benchmark.
++
++use super::*;
++
++fn roster(count: usize) -> AtcEngine {
++    let mut engine = AtcEngine::new_for_testing();
++    for index in 0..count {
++        let name = format!("ScheduledAgent{index:05}");
++        engine.register_agent(&name, "codex-cli", Some("/scheduler-regression"));
++        engine.schedule_entry_for_push(&name, 1_000_000);
++    }
++    engine
++}
++
++fn live_reviews(engine: &AtcEngine) -> Vec<Reverse<ScheduledAgentReview>> {
++    let mut reviews: Vec<_> = engine
++        .agents
++        .values()
++        .filter(|entry| entry.next_review_micros < i64::MAX)
++        .map(|entry| {
++            Reverse(ScheduledAgentReview {
++                review_at_micros: entry.next_review_micros,
++                schedule_version: entry.schedule_version,
++                agent: entry.name.clone(),
++            })
++        })
++        .collect();
++    reviews.sort();
++    reviews
++}
++
++fn force_compaction(engine: &mut AtcEngine) {
++    let bound = engine.agents.len().saturating_mul(4).max(64);
++    // Model obsolete scheduler entries, including a departed/unknown agent.
++    while engine.liveness_schedule.len() <= bound {
++        engine.liveness_schedule.push(Reverse(ScheduledAgentReview {
++            review_at_micros: 1,
++            schedule_version: 0,
++            agent: "ObsoleteAgent".to_string(),
++        }));
++    }
++    engine.compact_liveness_schedule_if_needed();
++}
++
++#[test]
++fn repeated_population_updates_keep_the_heap_proportionally_bounded() {
++    let mut engine = roster(940);
++    let bound = engine.agents.len() * 4;
++    for generation in 1_i64..=12 {
++        for index in 0..940 {
++            let name = format!("ScheduledAgent{index:05}");
++            engine.schedule_entry_for_push(&name, 1_000_000 + generation);
++            assert!(engine.liveness_schedule.len() <= bound);
++        }
++    }
++    let expected = live_reviews(&engine);
++    force_compaction(&mut engine);
++    assert_eq!(engine.liveness_schedule.clone().into_sorted_vec(), expected);
++    assert_eq!(engine.liveness_schedule.len(), 940);
++}
++
++#[test]
++fn compaction_drops_obsolete_versions_but_keeps_current_reviews() {
++    let mut engine = roster(32);
++    for index in 0..32 {
++        let name = format!("ScheduledAgent{index:05}");
++        for generation in 1_i64..=4 {
++            engine.schedule_entry_for_push(&name, 2_000_000 + generation);
++        }
++    }
++    let expected = live_reviews(&engine);
++    force_compaction(&mut engine);
++    assert_eq!(engine.liveness_schedule.clone().into_sorted_vec(), expected);
++}
++
++#[test]
++fn compaction_excludes_unscheduled_and_dead_agents() {
++    let mut engine = roster(64);
++    for index in 0..32 {
++        let name = format!("ScheduledAgent{index:05}");
++        engine.agents.get_mut(&name).unwrap().state = LivenessState::Dead;
++        engine.schedule_entry_for_push(&name, i64::MAX);
++    }
++    let expected = live_reviews(&engine);
++    force_compaction(&mut engine);
++    assert_eq!(engine.liveness_schedule.clone().into_sorted_vec(), expected);
++    assert_eq!(engine.scheduled_agent_count(), 32);
++    assert_eq!(engine.liveness_schedule.len(), 32);
++}
++
++#[test]
++fn all_unscheduled_population_rebuilds_to_an_empty_heap() {
++    let mut engine = roster(64);
++    for index in 0..64 {
++        engine.schedule_entry_for_push(&format!("ScheduledAgent{index:05}"), i64::MAX);
++    }
++    force_compaction(&mut engine);
++    assert!(engine.liveness_schedule.is_empty());
++    assert_eq!(engine.next_scheduled_review_micros(), None);
++}
++
++#[test]
++fn small_rosters_keep_the_existing_fixed_headroom() {
++    let mut engine = roster(1);
++    for timestamp in 2_i64..=64 {
++        engine.schedule_entry_for_push("ScheduledAgent00000", timestamp);
++    }
++    assert_eq!(engine.liveness_schedule.len(), 64);
++    engine.schedule_entry_for_push("ScheduledAgent00000", 65);
++    assert_eq!(engine.liveness_schedule.len(), 1);
++    assert_eq!(engine.next_scheduled_review_micros(), Some(65));
++}
++
++#[test]
++fn compaction_preserves_due_order_and_eight_review_batches_without_duplicates() {
++    let mut engine = roster(940);
++    for index in 0..940 {
++        let name = format!("ScheduledAgent{index:05}");
++        // Equal due times plus different versions exercise both tie breakers.
++        for _ in 0..=index % 3 {
++            engine.schedule_entry_for_push(&name, 3_000_000);
++        }
++    }
++    let mut expected: Vec<_> = live_reviews(&engine)
++        .into_iter()
++        .map(|Reverse(review)| review)
++        .collect();
++    expected.sort();
++    let expected: Vec<_> = expected.into_iter().map(|review| review.agent).collect();
++    force_compaction(&mut engine);
++    let mut observed = Vec::new();
++    loop {
++        let batch = engine.pop_due_agents(3_000_000, MAX_LIVENESS_REVIEWS_PER_TICK);
++        assert!(batch.len() <= MAX_LIVENESS_REVIEWS_PER_TICK);
++        if batch.is_empty() {
++            break;
++        }
++        observed.extend(batch);
++    }
++    assert_eq!(observed, expected);
++    assert_eq!(observed.iter().collect::<HashSet<_>>().len(), 940);
++    assert_eq!(engine.next_scheduled_review_micros(), None);
++}
++
++#[test]
++#[ignore = "manual activity hot-path benchmark; run with --ignored --nocapture"]
++fn benchmark_scheduler_rescheduling() {
++    for count in [100_usize, 940, 4096] {
++        let mut engine = roster(count);
++        let names: Vec<_> = (0..count)
++            .map(|index| format!("ScheduledAgent{index:05}"))
++            .collect();
++        let updates = 20_000_usize;
++        let started = Instant::now();
++        for index in 0..updates {
++            let timestamp = 10_000_000 + i64::try_from(index).unwrap();
++            engine.schedule_entry_for_push(&names[index % count], timestamp);
++            std::hint::black_box(engine.liveness_schedule.len());
++        }
++        eprintln!(
++            "ATC scheduler: agents={count} updates={updates} elapsed_us={} heap_entries={}",
++            started.elapsed().as_micros(),
++            engine.liveness_schedule.len(),
++        );
++        assert!(engine.liveness_schedule.len() <= count.saturating_mul(4).max(64));
++    }
++}
