@@ -6810,6 +6810,20 @@ fn redact_value_for_status_key(key: Option<&str>, value: Value, home: Option<&Pa
 }
 
 fn redact_path_for_status(path: &Path, home: Option<&Path>) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(home) = home
+            && let Ok(relative) = path.strip_prefix(home)
+        {
+            return if relative.as_os_str().is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{}", relative.display().to_string().replace('\\', "/"))
+            };
+        }
+        path.display().to_string().replace('\\', "/")
+    }
+    #[cfg(not(windows))]
     redact_home_in_status_text(&path.display().to_string(), home)
 }
 
@@ -6828,7 +6842,10 @@ fn redact_home_in_status_text(text: &str, home: Option<&Path>) -> String {
     if let Some(rest) = text.strip_prefix(&prefix) {
         return format!("~/{rest}");
     }
-    text.replace(&prefix, "~/")
+    let redacted = text.replace(&prefix, "~/");
+    #[cfg(windows)]
+    let redacted = redacted.replace(&format!("{home}\\"), "~/");
+    redacted
 }
 
 fn push_drift_reason(reasons: &mut Vec<ConfigDriftReason>, reason: ConfigDriftReason) {
@@ -7389,7 +7406,14 @@ mod tests {
         let error = resolve_token(None, tmp.path())
             .expect_err("a directory authority must not degrade to token generation");
 
+        #[cfg(not(windows))]
         assert!(error.to_string().contains("not a regular file"), "{error}");
+        // Windows rejects opening a directory before file-type inspection.
+        #[cfg(windows)]
+        assert!(
+            matches!(error, SetupError::Io(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied),
+            "{error}"
+        );
     }
 
     #[test]
@@ -8109,7 +8133,8 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let override_path = tmp.path().join("custom[agent]/mcp*.json");
+        // Brackets are Git glob metacharacters and valid filenames on Windows.
+        let override_path = tmp.path().join("custom[agent]/mcp[local].json");
         let mut params = SetupParams {
             token: "first-secret".into(),
             project_dir: tmp.path().to_path_buf(),
@@ -8364,10 +8389,12 @@ mod tests {
 
     #[test]
     fn config_actions_omp_uses_native_http_config_paths() {
-        let home = PathBuf::from("/tmp/omp-home");
+        let temp = setup_real_tempdir();
+        let home = temp.path().join("omp-home");
+        let project = temp.path().join("project");
         let params = SetupParams {
             token: "tok".into(),
-            project_dir: PathBuf::from("/tmp/p"),
+            project_dir: project.clone(),
             home_dir_override: Some(home.clone()),
             skip_user_config: false,
             ..Default::default()
@@ -8378,7 +8405,7 @@ mod tests {
             2,
             "project-local + default-profile user config"
         );
-        assert_eq!(actions[0].file_path, PathBuf::from("/tmp/p/.omp/mcp.json"));
+        assert_eq!(actions[0].file_path, project.join(".omp/mcp.json"));
         assert_eq!(actions[1].file_path, home.join(".omp/agent/mcp.json"));
 
         for action in &actions {
@@ -8593,12 +8620,13 @@ mod tests {
 
     #[test]
     fn config_actions_omp_honors_resolved_active_profile_path() {
-        let active_profile_config =
-            PathBuf::from("/tmp/omp-home/.omp/profiles/work/agent/mcp.json");
+        let temp = setup_real_tempdir();
+        let home = temp.path().join("omp-home");
+        let active_profile_config = home.join(".omp/profiles/work/agent/mcp.json");
         let params = SetupParams {
             token: "tok".into(),
-            project_dir: PathBuf::from("/tmp/p"),
-            home_dir_override: Some(PathBuf::from("/tmp/omp-home")),
+            project_dir: temp.path().join("project"),
+            home_dir_override: Some(home),
             omp_user_config_path_override: Some(active_profile_config.clone()),
             skip_user_config: false,
             ..Default::default()
@@ -8635,7 +8663,15 @@ mod tests {
             absolute
         );
 
-        let traversing = temp.path().join("home/../outside");
+        // PathBuf::join normalizes parent components in Windows verbatim paths.
+        // Construct the raw authority so the validator actually sees traversal.
+        let traversing = PathBuf::from(format!(
+            "{}{}home{}..{}outside",
+            temp.path().display(),
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR
+        ));
         let error = require_absolute_omp_home_dir(Some(traversing))
             .expect_err("an absolute path with parent traversal must fail closed");
         assert!(error.to_string().contains("traversal-free"));
@@ -8668,7 +8704,14 @@ mod tests {
             },
             SetupParams {
                 project_dir: project.clone(),
-                omp_user_config_path_override: Some(temp.path().join("user/../escaped/mcp.json")),
+                omp_user_config_path_override: Some(PathBuf::from(format!(
+                    "{}{}user{}..{}escaped{}mcp.json",
+                    temp.path().display(),
+                    std::path::MAIN_SEPARATOR,
+                    std::path::MAIN_SEPARATOR,
+                    std::path::MAIN_SEPARATOR,
+                    std::path::MAIN_SEPARATOR
+                ))),
                 agents: Some(vec![AgentPlatform::Omp]),
                 token: "must-not-be-written".to_string(),
                 skip_hooks: true,
@@ -8713,8 +8756,11 @@ mod tests {
 
     #[test]
     fn resolve_omp_config_paths_matches_v18_profile_precedence() {
-        let home = Path::new("/home/alice");
-        let cwd = Path::new("/work/repo");
+        let temp = setup_real_tempdir();
+        let home_path = temp.path().join("home");
+        let cwd_path = temp.path().join("repo");
+        let home = home_path.as_path();
+        let cwd = cwd_path.as_path();
 
         let named = resolve_omp_config_paths(
             home,
@@ -8725,10 +8771,10 @@ mod tests {
             Some("ignored-for-named-profile"),
         )
         .unwrap();
-        assert_eq!(named.config_root, PathBuf::from("/home/alice/.custom-omp"));
+        assert_eq!(named.config_root, home.join(".custom-omp"));
         assert_eq!(
             named.user_mcp_config,
-            PathBuf::from("/home/alice/.custom-omp/profiles/work/agent/mcp.json")
+            home.join(".custom-omp/profiles/work/agent/mcp.json")
         );
 
         let explicit_default = resolve_omp_config_paths(
@@ -8742,7 +8788,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             explicit_default.user_mcp_config,
-            PathBuf::from("/work/repo/relative-agent-dir/mcp.json"),
+            cwd.join("relative-agent-dir/mcp.json"),
             "an explicitly empty OMP_PROFILE selects default and must not fall through to PI_PROFILE"
         );
 
@@ -8757,14 +8803,15 @@ mod tests {
         .unwrap();
         assert_eq!(
             legacy.user_mcp_config,
-            PathBuf::from("/home/alice/.omp/profiles/legacy/agent/mcp.json")
+            home.join(".omp/profiles/legacy/agent/mcp.json")
         );
     }
 
     #[test]
     fn resolve_omp_config_paths_rejects_traversal_and_ambiguous_prefixes() {
-        let home = Path::new("/home/alice");
-        let cwd = Path::new("/work/repo");
+        let temp = setup_real_tempdir();
+        let home = temp.path();
+        let cwd = temp.path();
 
         for config_dir in [
             "../escape",
@@ -8826,8 +8873,9 @@ mod tests {
 
     #[test]
     fn resolve_omp_config_paths_rejects_invalid_profiles_like_runtime_boot() {
-        let home = Path::new("/home/alice");
-        let cwd = Path::new("/work/repo");
+        let temp = setup_real_tempdir();
+        let home = temp.path();
+        let cwd = temp.path();
         for invalid in [".", "..", "bad profile", "Work", "CON", "LPT9.txt", "bad."] {
             let error = resolve_omp_config_paths(home, cwd, Some(invalid), None, None, None)
                 .expect_err("invalid explicit profile must fail closed");
@@ -11819,7 +11867,9 @@ http_headers = { Authorization = "Bearer tok" }
 
     #[test]
     fn omp_unsupported_provider_authorities_are_never_probed_or_fingerprinted() {
-        let tmp = setup_real_tempdir();
+        // Ordinary Windows paths preserve the raw parent component; joining
+        // a verbatim path would normalize it away before the authority check.
+        let tmp = tempfile::tempdir().unwrap();
         let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
         write_healthy_omp_project_config(&params);
 
@@ -11879,6 +11929,8 @@ http_headers = { Authorization = "Bearer tok" }
         };
         write_healthy_omp_project_config(&missing_home_params);
         let sentinel = project_dir.join("<unresolved-claude-user-home>");
+        // This diagnostic placeholder is a legal filename only on Unix.
+        #[cfg(unix)]
         std::fs::write(
             &sentinel,
             r#"{"mcpServers":{"mcp_agent_mail":{"type":"http","url":"http://stale.example/mcp"}}}"#,
@@ -12333,7 +12385,7 @@ http_headers = { Authorization = "Bearer tok" }
     #[test]
     fn check_status_omp_legacy_user_settings_fail_closed_until_main_yaml_exists() {
         for legacy_name in ["settings.json", "agent.db"] {
-            let tmp = tempfile::tempdir().unwrap();
+            let tmp = setup_real_tempdir();
             let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
             write_healthy_omp_project_config(&params);
             let agent_dir = params
@@ -12589,7 +12641,8 @@ http_headers = { Authorization = "Bearer tok" }
 
     #[test]
     fn setup_status_remediation_shell_quotes_untrusted_arguments() {
-        let home = PathBuf::from("/home/tester");
+        let temp = setup_real_tempdir();
+        let home = temp.path().join("home");
         let params = SetupParams {
             host: "host;$(touch bad)".to_string(),
             path: "/mcp path/$HOME/'".to_string(),

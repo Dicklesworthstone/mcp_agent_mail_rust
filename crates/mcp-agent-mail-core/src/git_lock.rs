@@ -187,6 +187,16 @@ pub struct RepoFlock {
     sentinel: Option<PathBuf>,
 }
 
+fn is_lock_contention(error: &io::Error) -> bool {
+    // Windows reports ERROR_LOCK_VIOLATION, which is not WouldBlock.
+    // Compare the platform code rather than its broad ErrorKind so unrelated
+    // Windows errors still propagate instead of being retried until timeout.
+    error.kind() == io::ErrorKind::WouldBlock
+        || error
+            .raw_os_error()
+            .is_some_and(|code| Some(code) == fs2::lock_contended_error().raw_os_error())
+}
+
 impl RepoFlock {
     /// Try to acquire the flock, blocking up to `timeout` total.
     ///
@@ -273,7 +283,7 @@ impl RepoFlock {
                     sentinel: Some(path),
                 });
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            Err(e) if is_lock_contention(&e) => {
                 // fall through to blocking wait
             }
             Err(e) => return Err(e),
@@ -302,7 +312,7 @@ impl RepoFlock {
                         sentinel: Some(path),
                     });
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) if is_lock_contention(&e) => {}
                 Err(e) => return Err(e),
             }
 
@@ -510,6 +520,21 @@ mod tests {
 
         let f1 = RepoFlock::acquire(&canonical).unwrap();
         assert!(f1.is_real(), "real flock expected on a proper repo");
+
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(f1.sentinel_path().unwrap())
+            .unwrap();
+        let contention = contender.try_lock_exclusive().unwrap_err();
+        assert!(is_lock_contention(&contention), "{contention:?}");
+        assert!(!is_lock_contention(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+        assert!(!is_lock_contention(&io::Error::other(
+            "unrelated lock failure"
+        )));
+        drop(contender);
 
         // Second acquire from same process — try_lock would fail
         // immediately; we use a tight timeout to avoid blocking the test.
