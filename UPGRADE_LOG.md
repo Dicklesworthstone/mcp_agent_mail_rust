@@ -246,6 +246,30 @@ statements below; v0.3.36 is published and this work targets unreleased main.
   preceding strict remote tests to pass and fresh exclusive file leases.
   Unexpected package changes, merge conflicts or any failed command stop
   the sequence for review. No source-code rewriting or publication occurs.
+- The SmallVec gate stopped with strict RCH exit 100 at 18:46 UTC
+  September 18: **163 passed, one timed out**, 153 selected tests unrun.
+  `send_message_reply_is_bounded_and_db_durable_with_async_archive` hit
+  the unchanged four-minute nextest limit. TOML-edit and TOON were not
+  updated. Seven phase markers now identify setup/send/flush progress;
+  a focused remote strace run is pending in
+  `044-smallvec-ack-fast-diagnostic.log`. This is not yet attributed to
+  SmallVec, and neither the dependency nor the test is qualified.
+- A bounded background observer waits for the diagnostic's terminal RCH
+  result and collects phase markers plus only futex/flock/fcntl trace tails
+  into `044-ack-fast-observation.txt`. It does not collect read/write payloads,
+  rerun tests, alter worker security settings, or repair the live mailbox.
+- The focused diagnostic completed September 19 at 01:40 UTC with strict
+  RCH exit 0: one passed in 3.815 seconds, 974 skipped. No hang reproduced
+  and no production fix is claimed. The full 317-test consumer repeat uses
+  the ordinary isolated runner (`044-smallvec-runtime-repeat.log`); the
+  previously timed-out test passed there in 1.032 seconds. The original
+  timeout remains retained evidence, pending the complete repeat result.
+- During the repeat, the numeric root-thread test stalled for 79.063 seconds
+  and then passed. At 01:53:54 UTC its FrankenSQLite worker was waiting in
+  filesystem journal paths (`jbd2_log_wait_commit` / `wait_transaction_locked`),
+  with host I/O full-pressure avg10 at 57.25%. Read-only evidence is retained
+  in `044-smallvec-repeat-io-observation.txt`. This explains an observed
+  storage wait in this run, not the earlier unobserved timeout.
 
 ## September 16, 2026 — release qualification update
 

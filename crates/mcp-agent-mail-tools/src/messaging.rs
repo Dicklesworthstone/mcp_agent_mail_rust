@@ -5044,9 +5044,11 @@ mod tests {
                         "/data/projects/ack-fast-{}",
                         mcp_agent_mail_db::now_micros()
                     );
+                    eprintln!("[ack-fast setup] ensuring project");
                     crate::ensure_project(&ctx, project_key.clone(), None)
                         .await
                         .expect("ensure project");
+                    eprintln!("[ack-fast setup] registering sender");
                     crate::register_agent(
                         &ctx,
                         project_key.clone(),
@@ -5062,6 +5064,7 @@ mod tests {
                     )
                     .await
                     .expect("register sender");
+                    eprintln!("[ack-fast setup] registering recipient");
                     crate::register_agent(
                         &ctx,
                         project_key.clone(),
@@ -5080,6 +5083,7 @@ mod tests {
 
                     // ~6 KB markdown body, matching the br-hpv61 field workload shape.
                     let body = "x".repeat(6 * 1024);
+                    eprintln!("[ack-fast send] awaiting durable reply");
                     let started = std::time::Instant::now();
                     let response = crate::send_message(
                         &ctx,
@@ -5136,13 +5140,16 @@ mod tests {
 
                     // (b) the archive converges once materialization runs, and the lag
                     // metric returns to zero backlog.
+                    eprintln!("[ack-fast archive] draining retry backlog");
                     assert!(
                         mcp_agent_mail_storage::archive_backlog_flush_blocking(
                             std::time::Duration::from_secs(15)
                         ),
                         "archive retry backlog drains"
                     );
+                    eprintln!("[ack-fast archive] flushing write-back queue");
                     mcp_agent_mail_storage::wbq_flush();
+                    eprintln!("[ack-fast archive] flushing asynchronous commits");
                     mcp_agent_mail_storage::flush_async_commits();
                     let lag = mcp_agent_mail_storage::archive_lag_snapshot();
                     assert_eq!(
