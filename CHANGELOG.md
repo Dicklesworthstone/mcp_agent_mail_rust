@@ -118,6 +118,41 @@ Recent releases; the earlier version history continues below.
   `mul_add`, and two test assertions now report the offending value on failure. These were
   caught by `cargo clippy --all-targets -- -D warnings`; `cargo check` and a plain
   `cargo test` both passed with them present.
+- **The test suite builds again.** Two separate refactors in this window left test-only code
+  that no longer compiled, which `cargo check` and a plain `cargo test` could not surface:
+  fixtures in `cleanup.rs` debug-formatted an `Outcome` whose success type is a pooled
+  connection (Asupersync's `Outcome<T, E>` derives `Debug`, so it only *has* `Debug` when
+  `T: Debug`), and `tests/atc_notification_admission.rs` still constructed `Config` with an
+  `atc_executor_mode` field that had moved to the `AM_ATC_EXECUTOR_MODE` environment variable
+  and the server layer. Both are fixed, and the failing fixtures now report which outcome
+  variant they actually got instead of printing the whole value.
+- **ATC fails closed after a population refresh failure**, keeping the last good roster
+  snapshot for retries rather than proceeding against a partially-loaded population, and the
+  wider ATC reliability series is folded in.
+- **`am robot overview --counts` skips more history.** Recipient counting no longer walks read
+  non-acknowledged history, and counts-only mode skips known-project reservation history
+  entirely, on top of the earlier per-project query-loop removal.
+  ([GH #274](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/274))
+- **Lint gate repairs in `mcp-agent-mail-server`.** Assertions that checked emptiness now print
+  the offending value, a constant-size chunk walk uses `as_chunks`, a retry-window computation
+  uses `Duration::saturating_sub` instead of an unchecked `Instant - Duration`, and two
+  `#[allow]`s are recorded deliberately: `redundant_pub_crate` on items that `atc.rs` re-exports
+  through `pub use engine::*` from a `pub mod atc` — widening them to `pub` would enlarge the
+  crate's public API — and `dead_code` on two engine-local duplicates of
+  `atc_sync_population_from_db`/`atc_tick` that the canonical re-exports shadow, kept rather
+  than deleted while the ATC work tracked in GH #264 is still in flight.
+
+### Build and compatibility notes
+- **Toolchain unchanged and load-bearing:** the pinned `nightly-2026-08-31` in
+  `rust-toolchain.toml` and the declared `rust-version = "1.100"` are what the lint gate is
+  calibrated against. Building with a different nightly can change which lints fire.
+- **crates.io is not a distribution channel for this project.** Every workspace member sets
+  `publish = false` ("Workspace depends on unpublished sibling path crates, so cargo publish is
+  not viable"), so the Asupersync `Outcome<T, E>` change described above cannot affect
+  downstream crate consumers of this repo — there are none. It matters only when building this
+  workspace from source, and to other projects that depend on Asupersync directly. Anyone
+  moving to Asupersync 0.5 should expect `{value:?}` on an `Outcome` to stop compiling wherever
+  the success type is not itself `Debug`, and it will surface only under `--all-targets`.
 
 ## v0.3.36 — 2026-09-16 [Release]
 
