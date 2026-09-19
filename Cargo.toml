@@ -230,26 +230,27 @@ fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev 
 # v0.4.4 omitted c76b22's prepared-DML binding and CREATE-prefix repairs.
 # Preserve the reproduced recipient UPDATE fix on the exact release base.
 # Package aliases let Beads retain its independently versioned 0.3 family.
-fsqlite-044 = { package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-ast-044 = { package = "fsqlite-ast", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-btree-044 = { package = "fsqlite-btree", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-core-044 = { package = "fsqlite-core", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-error-044 = { package = "fsqlite-error", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-ext-fts5-044 = { package = "fsqlite-ext-fts5", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-ext-icu-044 = { package = "fsqlite-ext-icu", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-ext-json-044 = { package = "fsqlite-ext-json", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-ext-misc-044 = { package = "fsqlite-ext-misc", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-ext-rtree-044 = { package = "fsqlite-ext-rtree", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-func-044 = { package = "fsqlite-func", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-mvcc-044 = { package = "fsqlite-mvcc", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-observability-044 = { package = "fsqlite-observability", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-pager-044 = { package = "fsqlite-pager", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-parser-044 = { package = "fsqlite-parser", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-planner-044 = { package = "fsqlite-planner", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-types-044 = { package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-vdbe-044 = { package = "fsqlite-vdbe", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-vfs-044 = { package = "fsqlite-vfs", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
-fsqlite-wal-044 = { package = "fsqlite-wal", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dbcc7adb5d2491504af4c07a38a58378522f5a07" }
+# Retain NOCASE ordering, INSERT SELECT UPSERT bindings, and bounded Linux descriptors.
+fsqlite-044 = { package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-ast-044 = { package = "fsqlite-ast", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-btree-044 = { package = "fsqlite-btree", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-core-044 = { package = "fsqlite-core", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-error-044 = { package = "fsqlite-error", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-ext-fts5-044 = { package = "fsqlite-ext-fts5", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-ext-icu-044 = { package = "fsqlite-ext-icu", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-ext-json-044 = { package = "fsqlite-ext-json", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-ext-misc-044 = { package = "fsqlite-ext-misc", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-ext-rtree-044 = { package = "fsqlite-ext-rtree", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-func-044 = { package = "fsqlite-func", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-mvcc-044 = { package = "fsqlite-mvcc", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-observability-044 = { package = "fsqlite-observability", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-pager-044 = { package = "fsqlite-pager", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-parser-044 = { package = "fsqlite-parser", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-planner-044 = { package = "fsqlite-planner", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-types-044 = { package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-vdbe-044 = { package = "fsqlite-vdbe", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-vfs-044 = { package = "fsqlite-vfs", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
+fsqlite-wal-044 = { package = "fsqlite-wal", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
 # The mailbox runtime uses registry Asupersync 0.5.0, SQLModel 0.5.0,
 # patched FrankenSQLite 0.4.4 and pinned FastMCP 0.10.0.
 # No mutable sibling checkout is required.

@@ -16,8 +16,11 @@ witness and effective-access/canonical-mode checks for an existing retained
 lock domain. Other platforms retain the existing implementation. Engine
 workspace/all-target check and strict Clippy both passed in
 `044-descriptor-reuse-*.log`;
-this candidate is unpublished and is not part of the application's
-`dbcc7adb` pin. Neither a deployed fix nor cross-platform closure is claimed.
+the final candidate additionally passes permission-revocation coverage on
+the non-root Linux worker. It is now published at `db458bfba780e79d099d9f8986da5a1f7b360901`
+on the isolated `am-runtime-044-20260919` branch and pinned by all twenty
+application 0.4.4 aliases. Neither a deployed fix nor cross-platform closure
+is claimed.
 
 September 19 application follow-through: all four real NOCASE backup/export
 regressions passed on `dbcc7adb` (strict RCH exit 0 at 07:21:34 UTC,
@@ -26,11 +29,45 @@ regressions passed on `dbcc7adb` (strict RCH exit 0 at 07:21:34 UTC,
 left 258 unrun. The valid 13-parameter query exposed an engine replay bug:
 `INSERT ... SELECT ... ON CONFLICT DO UPDATE` retained original UPSERT
 parameter indices while its per-row replay supplied only inserted values.
-An isolated engine repair and real SQLite differential regression are in
-progress; the application query's identity, TTL and review-race checks are
-unchanged. This failure remains a release blocker.
+Engine commit `24ae22d` repairs global UPSERT/RETURNING binding before row
+replay, including attached targets. Its real SQLite oracle first reproduced
+the failure, then all six target tests passed at 15:58 UTC. All 433 VFS tests
+passed at 15:59 UTC; engine workspace/all-target check passed at 16:07 UTC
+and strict Clippy at 16:24 UTC after correcting a test's permission literal
+from `0` to `0o0`. Final source hashes were verified before publication.
+The application query's identity, TTL and review-race checks are unchanged.
+All twelve application sibling-discovery tests now pass on the new pin,
+including the original binding failure and real reopen/persistence case
+(strict RCH exit 0 at 17:04 UTC, `044-upsert-app-sibling-runtime-j4.log`).
+The broader DB/schema/migration/search suite passed all 3,335 tests with
+seven existing skips at 17:27 UTC (strict RCH exit 0,
+`044-runtime-pin-db-broad-quiet-extract.log`). This clears the application
+UPSERT blocker; whole-release runtime and platform validation remain open.
+The first broad run was interrupted after filesystem journal waits exceeded
+three minutes. Its compiled four-binary nextest archive was transferred
+byte-identically to a quiet worker and executed with the original assertions
+and watchdogs, completing in 161.843 seconds. The archive SHA-256 is
+`7002b7d2556cec1c1aa3496a845dc8a42ecdca4b958cae452f16d5cf05b803be`.
 
-The application workspace/all-target check passed at 07:59 UTC. Strict
+The targeted `db458bf` resolution preserves the complete package/version
+inventory and changes exactly twenty engine sources. Cargo additionally
+reselected sixteen dependency references in fifteen existing packages:
+Windows bindings, tempfile's getrandom and prost-derive's itertools.
+Published local manifests allow these selections; native Windows validation
+remains pending. No forbidden runtime package was introduced. The new-pin
+workspace/all-target check passed on ovh-a at 16:51 UTC (strict RCH exit 0,
+`044-runtime-pin-app-check.log`). Strict Clippy then found one overlong ATC
+population integration test. Its bounded-hydration loop was extracted into
+a helper without changing any assertion, and the full workspace/all-target
+Clippy rerun passed at 16:55 UTC (`044-runtime-pin-app-clippy-helper.log`).
+Formatting and the final post-extraction workspace check pass; the real ATC
+integration target still needs re-execution. The older-pin TOON baseline
+continues independently on vmi1152480. The
+focused sibling-discovery gate passed on hz3 with four normally admitted
+compiler slots, reusing the interrupted one-slot build's cache. The initial
+attempt exited 143 without a test verdict; its log is retained.
+
+The earlier application workspace/all-target check passed at 07:59 UTC. Strict
 Clippy then found a missing semicolon in ATC hydration; the manual fix is
 committed as `fd7a8f5b`. Fresh Clippy admission on hz3 is currently refused
 because its Rust inventory probe cannot acquire its cache lock. These are
