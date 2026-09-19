@@ -28,6 +28,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Check shell syntax and offline exit invariants
+        shell: /bin/bash --noprofile --norc -e {0}
+        run: |
+          /bin/bash -n install.sh
+          /bin/bash -n tests/installer/test_install_exit_status.sh
+          /bin/bash tests/installer/test_install_exit_status.sh --unit
       - name: Install signature verifier
         shell: /bin/bash --noprofile --norc -e {0}
         run: |
