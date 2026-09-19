@@ -5,6 +5,17 @@
 Tracked by `br-5lgwn`. This section supersedes historical current-status
 statements below; v0.3.36 is published and this work targets unreleased main.
 
+September 19 Blake2 update (in progress): the direct release-verifier dependency
+advances from 0.10.6 to 0.11.0. Published upstream changes replace aliases with
+newtypes and move to digest 0.11; both application consumers use the unchanged
+`Blake2b512::digest` interface and no removed feature or variable-output type.
+Version 0.11.0 already existed transitively, so resolution changes only the CLI
+dependency edge. Argon2 retains its required 0.10.6 dependency; an initial
+attempt to replace that shared version was rejected before any lockfile change.
+The real signed-release fixture and tamper/key-rotation tests are running in
+`044-blake2-011-runtime.log`; workspace check is running separately. No runtime
+pass is claimed yet.
+
 September 19 TOON update: `tru` 0.2.4 replaces 0.2.3 after review of the
 published package and upstream maintenance notes. Default features remain
 empty; no optional asynchronous runtime is enabled. The targeted resolution
@@ -13,9 +24,10 @@ packages, reducing the graph from 880 to 822 packages. Its build metadata now
 shares the existing `vergen-gix` 10 stack. The remaining semantic edge changes
 select already-present Windows bindings and `gix-imara-diff`'s hashbrown;
 native Windows qualification remains required. The corrected old-version
-baseline passed all 95 selected tests at 18:20 UTC; the 95-test new-version
-runtime gate is running on the same worker. No new-version TOON runtime
-pass is claimed yet. Workspace/all-target compilation and strict Clippy
+baseline passed all 95 selected tests at 18:20 UTC; the new version passed
+all 95 selected tests at 19:02 UTC (strict RCH exit 0,
+`044-tru-024-runtime.log`), including the strengthened round-trip oracle.
+Workspace/all-target compilation and strict Clippy
 passed on the new graph (`044-tru-024-{check,clippy}.log`); the isolated
 format check also passed after correcting the test assertion's wrapping
 (`044-tru-024-fmt-corrected.log`). Details: `044-tru-024-{metadata,resolution}.log` and
@@ -91,7 +103,7 @@ decoder's documented `f64` number representation. The corrected test
 requires the exact integer array on the wire and compares decoded values
 with explicit floating-point expectations for those three numbers, retaining
 all other field and no-JSON-fallback assertions. A fresh 95-test baseline
-on the current engine pin and unchanged `tru` 0.2.3 is running; the original
+on the current engine pin and unchanged `tru` 0.2.3 passed all 95 tests; the original
 failure is retained in `044-toon-baseline-runtime.log`. The
 focused sibling-discovery gate passed on hz3 with four normally admitted
 compiler slots, reusing the interrupted one-slot build's cache. The initial
