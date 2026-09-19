@@ -1,0 +1,52 @@
+name: Installer exit status
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - install.sh
+      - tests/installer/test_install_exit_status.sh
+      - .github/workflows/installer-exit.yml
+  pull_request:
+    paths:
+      - install.sh
+      - tests/installer/test_install_exit_status.sh
+      - .github/workflows/installer-exit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  signed-release-exit:
+    name: Signed release / ${{ matrix.os }} / stock Bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install signature verifier
+        shell: /bin/bash --noprofile --norc -e {0}
+        run: |
+          if [ "$(uname -s)" = Darwin ]; then
+            command -v minisign >/dev/null || brew install minisign
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y minisign
+          fi
+      - name: Verify full file and stdin installer exit paths
+        shell: /bin/bash --noprofile --norc -e {0}
+        run: /bin/bash tests/installer/test_install_exit_status.sh
+      - name: Retain reproduction source and exit traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-exit-${{ runner.os }}
+          path: |
+            install.sh
+            tests/installer/test_install_exit_status.sh
+            tests/artifacts/installer-exit/
+          retention-days: 7
