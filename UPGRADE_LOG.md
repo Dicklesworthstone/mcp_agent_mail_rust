@@ -14,9 +14,28 @@ refusal (strict RCH exit 0 at 07:05:28 UTC; artifact
 `044-descriptor-reuse-vfs-corrected.log`). It uses a Linux O_PATH inode
 witness and effective-access/canonical-mode checks for an existing retained
 lock domain. Other platforms retain the existing implementation. Engine
-workspace check and Clippy are running in `044-descriptor-reuse-*.log`;
+workspace/all-target check and strict Clippy both passed in
+`044-descriptor-reuse-*.log`;
 this candidate is unpublished and is not part of the application's
 `dbcc7adb` pin. Neither a deployed fix nor cross-platform closure is claimed.
+
+September 19 application follow-through: all four real NOCASE backup/export
+regressions passed on `dbcc7adb` (strict RCH exit 0 at 07:21:34 UTC,
+`044-gh326-nocase-fixed-runtime.log`). The subsequent broad DB gate passed
+3,076 tests, failed one sibling-discovery rollback test, skipped seven and
+left 258 unrun. The valid 13-parameter query exposed an engine replay bug:
+`INSERT ... SELECT ... ON CONFLICT DO UPDATE` retained original UPSERT
+parameter indices while its per-row replay supplied only inserted values.
+An isolated engine repair and real SQLite differential regression are in
+progress; the application query's identity, TTL and review-race checks are
+unchanged. This failure remains a release blocker.
+
+The application workspace/all-target check passed at 07:59 UTC. Strict
+Clippy then found a missing semicolon in ATC hydration; the manual fix is
+committed as `fd7a8f5b`. Fresh Clippy admission on hz3 is currently refused
+because its Rust inventory probe cannot acquire its cache lock. These are
+pre-compilation refusals, not compiler failures or passes. The independent
+TOON/output baseline is running remotely on vmi1152480.
 
 - Verified the published `fsqlite` 0.4.4 dependency metadata and tag commit
   `9d3d98778a372aba95d76d05c5c974ac0238c96a`.
