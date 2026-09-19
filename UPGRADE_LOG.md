@@ -317,6 +317,24 @@ statements below; v0.3.36 is published and this work targets unreleased main.
   (`044-nocase-engine-candidate.log`); this is not yet a qualified fix.
   Application pins are unchanged, and actual export/backup validation is
   still required after engine qualification.
+- The initial comparator regression passed remotely on ovh-a at 05:44 UTC
+  September 19 (1 test, 441 input pairs, strict RCH exit 0). Follow-through
+  review found DISTINCT and in-memory UNIQUE keys also included bytes after
+  NUL. The candidate now normalizes those suffixes while preserving original
+  lengths and key framing; the oracle test additionally checks DISTINCT and
+  real MemTable uniqueness. The original queued checks refused changed source
+  hashes (exit 65). Fresh expanded tests/check/Clippy are running under
+  `044-nocase-final-*.log`; the initial pass does not certify these additions.
+- Strengthened the existing CLI TOON output test before its dependency update:
+  it now rejects silent JSON fallback and decodes captured TOON to verify all
+  values survive, including multiline/quoted/Unicode text and empty values.
+  Formatting passes; runtime validation remains pending. `tru` stays at 0.2.3.
+- The final expanded NOCASE runtime gate passed all 18 tests (2 function,
+  16 VDBE), including the 441-pair comparator/DISTINCT/UNIQUE oracle, at
+  05:47:27 UTC September 19 on ovh-a (strict RCH exit 0;
+  `044-nocase-final-runtime.log`). Source hashes are retained in the sequence
+  log. The workspace compiler check is now running, followed by Clippy.
+  Application export/backup tests have not yet qualified this candidate.
 - Concurrent commits captured the ATC fix and corrected ambiguous empty-vector
   assertions in cleanup tests (`a27c2bda` merge). The first retry predates that
   cleanup correction. A bounded shell follow-up waits for that owned RCH
