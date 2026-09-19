@@ -5,6 +5,8 @@
 //! update schedules and cohort state. Never apply thousands of rows in one tick.
 //! While a refresh is incomplete, publish a partial snapshot and defer inference
 //! instead of releasing reservations against an only-partially-refreshed roster.
+//! A failed refresh also blocks inference until a new database read succeeds:
+//! inability to observe activity is not evidence that an agent has died.
 
 use super::engine::{self, AtcPopulationSyncStats, AtcSummarySnapshot, AtcTickReport};
 use mcp_agent_mail_db::models::AtcPopulationAgentRow;
@@ -29,6 +31,10 @@ pub struct AtcPopulationHydrationStats {
     pub last_slice_agents: usize,
     pub deferred_refreshes: u64,
     pub snapshot_started_at_micros: i64,
+    /// Errors returned by population refreshes since the last engine reset.
+    pub refresh_failures: u64,
+    /// Inference is suspended until a subsequent refresh succeeds.
+    pub refresh_failed: bool,
 }
 
 #[derive(Default)]
@@ -55,7 +61,17 @@ impl HydrationState {
             self.progress.deferred_refreshes = self.progress.deferred_refreshes.saturating_add(1);
             return Ok(self.snapshot_stats);
         }
-        let rows = load()?;
+        // Arm the safety gate before calling the loader. If it unwinds rather
+        // than returning an error, poison recovery must not resume inference
+        // against the old roster. Keep the last good snapshot for retries.
+        self.progress.refresh_failed = true;
+        let rows = match load() {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.progress.refresh_failures = self.progress.refresh_failures.saturating_add(1);
+                return Err(error);
+            }
+        };
         let mut projects = HashSet::new();
         let mut stats = AtcPopulationSyncStats::default();
         let mut next_snapshot = HashMap::with_capacity(rows.len());
@@ -83,6 +99,7 @@ impl HydrationState {
             unchanged_agents: unchanged,
             deferred_refreshes: self.progress.deferred_refreshes,
             snapshot_started_at_micros: now_micros,
+            refresh_failures: self.progress.refresh_failures,
             ..AtcPopulationHydrationStats::default()
         };
         self.resume_pending = !self.pending.is_empty();
@@ -132,19 +149,32 @@ impl HydrationState {
     }
 
     fn annotate(&self, summary: &mut AtcSummarySnapshot, now_micros: i64) {
-        if self.resume_pending {
-            annotate_pending_summary(summary, now_micros);
+        if self.progress.refresh_failed {
+            // No immediate inference deadline: only a successful population
+            // refresh can clear this gate. Repeated ticks cannot repair a DB
+            // failure and must not turn it into a busy retry loop.
+            annotate_incomplete_summary(summary, None, "population_refresh_failed");
+        } else if self.resume_pending {
+            annotate_incomplete_summary(
+                summary,
+                Some(now_micros),
+                "population_hydration_incomplete",
+            );
         }
     }
 }
 
-fn annotate_pending_summary(summary: &mut AtcSummarySnapshot, now_micros: i64) {
+fn annotate_incomplete_summary(
+    summary: &mut AtcSummarySnapshot,
+    next_due_micros: Option<i64>,
+    reason: &str,
+) {
     summary.completeness = engine::SnapshotCompleteness::Partial;
-    summary.kernel.next_due_micros = Some(now_micros);
+    summary.kernel.next_due_micros = next_due_micros;
     summary.kernel.due_agents = 0;
     summary.kernel.pending_effects = 0;
     summary.policy.fallback_active = true;
-    summary.policy.fallback_reason = Some("population_hydration_incomplete".to_string());
+    summary.policy.fallback_reason = Some(reason.to_string());
 }
 
 static HYDRATION: OnceLock<Mutex<HydrationState>> = OnceLock::new();
@@ -171,6 +201,8 @@ pub fn atc_population_hydration_stats() -> AtcPopulationHydrationStats {
 /// updates. Small snapshots finish here; larger ones continue at the public tick
 /// boundary. An unfinished refresh is retained rather than restarted. Unchanged
 /// rows in subsequent complete snapshots do not touch the engine at all.
+/// A failed read suspends inference, without clearing the last good snapshot,
+/// until a later read succeeds. Errors are still returned to the operator.
 pub fn atc_sync_population_from_db(
     pool: &mcp_agent_mail_db::DbPool,
 ) -> Result<AtcPopulationSyncStats, String> {
@@ -208,13 +240,25 @@ pub(super) fn tick_report(now_micros: i64) -> Option<AtcTickReport> {
     if !engine::atc_enabled() {
         return None;
     }
+    let started = Instant::now();
+    if state.progress.refresh_failed {
+        state.progress.last_slice_agents = 0;
+        return partial_report(&state, now_micros, started);
+    }
     if state.pending.is_empty() {
         state.resume_pending = false;
         state.progress.last_slice_agents = 0;
         return engine::atc_tick_report(now_micros);
     }
-    let started = Instant::now();
     state.drain_slice();
+    partial_report(&state, now_micros, started)
+}
+
+fn partial_report(
+    state: &HydrationState,
+    now_micros: i64,
+    started: Instant,
+) -> Option<AtcTickReport> {
     let mut summary = engine::atc_summary()?;
     // Even the final slice yields before inference. Otherwise its work would
     // stack with the kernel budget, and a slow last batch would never yield.
@@ -241,7 +285,11 @@ pub(super) fn annotate_summary(summary: &mut AtcSummarySnapshot) {
     // Snapshot readers must not join an operator-side database wait.
     match hydration().try_lock() {
         Ok(state) => state.annotate(summary, now),
-        Err(TryLockError::WouldBlock) => annotate_pending_summary(summary, now),
+        Err(TryLockError::WouldBlock) => annotate_incomplete_summary(
+            summary,
+            Some(now),
+            "population_hydration_incomplete",
+        ),
         Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().annotate(summary, now),
     }
 }
@@ -349,8 +397,129 @@ mod tests {
         state.drain_with(|_| {}, || true);
         let before = state.progress;
         assert!(state.refresh_with(20, || Err("injected database error".into())).is_err());
-        assert_eq!(state.progress, before);
+        assert_eq!(
+            state.progress,
+            AtcPopulationHydrationStats {
+                refresh_failures: 1,
+                refresh_failed: true,
+                ..before
+            },
+        );
         assert_eq!(state.previous_snapshot.len(), 1);
+    }
+
+    #[test]
+    fn refresh_failure_count_saturates_and_success_preserves_its_history() {
+        let mut state = HydrationState::default();
+        state.progress.refresh_failures = u64::MAX - 1;
+        for _ in 0..3 {
+            assert!(state.refresh_with(10, || Err("database unavailable".into())).is_err());
+            assert!(state.progress.refresh_failed);
+            assert_eq!(state.progress.refresh_failures, u64::MAX);
+        }
+        state.refresh_with(20, || Ok(Vec::new())).unwrap();
+        assert!(!state.progress.refresh_failed);
+        assert_eq!(state.progress.refresh_failures, u64::MAX);
+    }
+
+    #[test]
+    fn loader_unwind_leaves_inference_blocked_and_the_last_good_snapshot_intact() {
+        let mut state = HydrationState::default();
+        state.refresh_with(10, || Ok(rows(1))).unwrap();
+        state.drain_with(|_| {}, || true);
+        let before = state.previous_snapshot.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = state.refresh_with(20, || panic!("population loader panicked"));
+        }));
+        assert!(result.is_err());
+        assert!(state.progress.refresh_failed);
+        assert_eq!(state.previous_snapshot, before);
+        state.refresh_with(30, || Ok(rows(1))).unwrap();
+        assert!(!state.progress.refresh_failed);
+        assert_eq!(state.progress.unchanged_agents, 1);
+    }
+
+    #[test]
+    fn failed_refresh_blocks_public_inference_until_an_unchanged_read_succeeds() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+        super::super::reset_global_atc_state_for_test(&config);
+        {
+            let mut state = hydration().lock().unwrap();
+            state.refresh_with(10, || Ok(rows(1))).unwrap();
+            state.drain_slice();
+        }
+        let before = super::super::atc_tick_report(2_000_000).unwrap().summary.tick_count;
+        assert!(hydration().lock().unwrap()
+            .refresh_with(20, || Err("database unavailable".into())).is_err());
+
+        for now in [3_000_000, 60_000_000, 86_400_000_000] {
+            let report = super::super::atc_tick_report(now).unwrap();
+            assert_eq!(report.summary.tick_count, before);
+            assert_eq!(report.actions.len(), 0);
+            assert_eq!(report.effects.len(), 0);
+            assert_eq!(report.summary.completeness, engine::SnapshotCompleteness::Partial);
+            assert_eq!(report.summary.kernel.next_due_micros, None);
+            assert_eq!(
+                report.summary.policy.fallback_reason.as_deref(),
+                Some("population_refresh_failed"),
+            );
+            let summary = super::super::atc_summary().unwrap();
+            assert_eq!(summary.policy.fallback_reason.as_deref(), Some("population_refresh_failed"));
+        }
+
+        hydration().lock().unwrap().refresh_with(30, || Ok(rows(1))).unwrap();
+        let progress = atc_population_hydration_stats();
+        assert_eq!(progress.unchanged_agents, 1);
+        assert_eq!(progress.pending_agents, 0);
+        assert_eq!(progress.refresh_failures, 1);
+        assert!(!progress.refresh_failed);
+        assert!(super::super::atc_tick_report(86_401_000_000).unwrap().summary.tick_count > before);
+        super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn recovery_with_changed_rows_still_yields_until_hydration_finishes() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+        super::super::reset_global_atc_state_for_test(&config);
+        {
+            let mut state = hydration().lock().unwrap();
+            assert!(state.refresh_with(10, || Err("cold-start failure".into())).is_err());
+        }
+        assert_eq!(super::super::atc_tick_report(2_000_000).unwrap().summary.tick_count, 0);
+        hydration().lock().unwrap().refresh_with(20, || Ok(rows(65))).unwrap();
+        assert!(!atc_population_hydration_stats().refresh_failed);
+        let mut slices = 0;
+        while atc_population_hydration_stats().pending_agents > 0 {
+            let report = super::super::atc_tick_report(3_000_000).unwrap();
+            assert_eq!(report.summary.tick_count, 0);
+            assert_eq!(report.effects.len(), 0);
+            assert_eq!(report.summary.completeness, engine::SnapshotCompleteness::Partial);
+            slices += 1;
+            assert!(slices <= 65, "recovery hydration stopped making progress");
+        }
+        assert_eq!(super::super::atc_tick_report(4_000_000).unwrap().summary.tick_count, 1);
+        super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn public_reset_clears_a_failed_population_refresh() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+        super::super::reset_global_atc_state_for_test(&config);
+        assert!(hydration().lock().unwrap()
+            .refresh_with(10, || Err("database unavailable".into())).is_err());
+        super::super::reset_global_atc_state_for_test(&config);
+        assert_eq!(atc_population_hydration_stats(), AtcPopulationHydrationStats::default());
+        assert_eq!(super::super::atc_tick_report(2_000_000).unwrap().summary.tick_count, 1);
+        super::super::reset_global_atc_state_for_test(&config);
     }
 
     #[test]
