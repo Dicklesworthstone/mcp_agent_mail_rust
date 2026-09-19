@@ -1247,7 +1247,11 @@ mod tests {
         std::fs::create_dir_all(&nested).expect("create mixed-case project path");
 
         let resolved = resolve_project_path(&nested.to_string_lossy());
-        assert_eq!(resolved, nested.canonicalize().expect("canonical path"));
+        let canonical = nested.canonicalize().expect("canonical path");
+        // Project identities deliberately omit Windows' verbatim prefix
+        // (GH#216), while canonicalize retains it.
+        assert_eq!(resolved, crate::disk::simplify_verbatim_path(&canonical));
+        assert!(same_file::is_same_file(&resolved, &nested).expect("same directory"));
         assert_eq!(
             resolved.file_name().and_then(OsStr::to_str),
             Some("SourceTree")

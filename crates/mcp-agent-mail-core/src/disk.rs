@@ -756,6 +756,9 @@ fn normalize_probe_path(path: &Path) -> PathBuf {
 ///
 /// Uses `fs2::available_space` (cross-platform) and never requires unsafe code.
 pub fn disk_free_bytes(path: &Path) -> std::io::Result<u64> {
+    // fs2's Windows implementation resolves a volume even for missing paths.
+    // Keep the existing-path contract consistent with Unix statvfs.
+    std::fs::metadata(path)?;
     fs2::available_space(path)
 }
 
@@ -1724,7 +1727,8 @@ mod tests {
 
     #[test]
     fn disk_free_bytes_fails_on_nonexistent_path() {
-        let result = disk_free_bytes(Path::new("/nonexistent_path_that_does_not_exist_12345"));
+        let temp = tempfile::tempdir().unwrap();
+        let result = disk_free_bytes(&temp.path().join("missing"));
         assert!(
             result.is_err(),
             "disk_free_bytes should fail for nonexistent path"

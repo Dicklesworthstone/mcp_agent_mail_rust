@@ -3622,7 +3622,7 @@ pub fn with_isolated_default_storage_root_and_env_overrides_for_test<R>(
     // Canonicalize so `Config::from_env`'s canonicalized `storage_root` compares
     // equal to the raw `default_storage_root_path()`; a symlinked TMPDIR would
     // otherwise make `is_default_storage_root` false for the resolved config.
-    let base = fs::canonicalize(tmp.path()).expect("canonicalize isolated tempdir");
+    let base = canonicalize_storage_root(tmp.path()).expect("canonicalize isolated tempdir");
     let home = base.join("home");
     let xdg_data = base.join("xdg-data");
     fs::create_dir_all(&home).expect("create isolated home");
@@ -6932,7 +6932,7 @@ mod tests {
         // even on a host whose real `~/.mcp_agent_mail_git_mailbox_repo/projects/`
         // exists.
         let temp_base =
-            std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp directory");
+            canonicalize_storage_root(&std::env::temp_dir()).expect("canonical temp directory");
 
         let (root, from_env_root) = with_isolated_default_storage_root_for_test(|root| {
             assert!(is_default_storage_root(root));
@@ -6971,7 +6971,7 @@ mod tests {
     #[test]
     fn isolated_default_storage_root_helper_applies_extra_overrides_but_keeps_isolation() {
         let temp_base =
-            std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp directory");
+            canonicalize_storage_root(&std::env::temp_dir()).expect("canonical temp directory");
         with_isolated_default_storage_root_and_env_overrides_for_test(
             &[
                 ("HTTP_PORT", "48123"),
@@ -7142,8 +7142,9 @@ mod tests {
         // binary case.
         let tmp = tempfile::tempdir().expect("tempdir");
         // Canonical base so `Config::from_env`'s canonicalized storage_root
-        // compares equal to the raw default path below.
-        let base = std::fs::canonicalize(tmp.path()).expect("canonical tempdir");
+        // compares equal to the raw default path below, including Windows'
+        // simplified spelling used by Config.
+        let base = canonicalize_storage_root(tmp.path()).expect("canonical tempdir");
         let home = base.join("home");
         let xdg_data = base.join("xdg-data");
         std::fs::create_dir_all(&home).unwrap();

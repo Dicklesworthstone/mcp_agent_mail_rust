@@ -8824,11 +8824,23 @@ mod tests {
             assert!(error.to_string().contains("PI_CONFIG_DIR"));
         }
 
-        for agent_dir in ["../escape", "agent/../../escape", "C:\\escape"] {
+        for agent_dir in ["../escape", "agent/../../escape", "C:escape"] {
             let error = resolve_omp_config_paths(home, cwd, None, None, None, Some(agent_dir))
                 .expect_err("unsafe PI_CODING_AGENT_DIR must fail closed");
             assert!(error.to_string().contains("PI_CODING_AGENT_DIR"));
         }
+        // A fully qualified Windows authority is valid on Windows, but is an
+        // ambiguous foreign prefix on Unix. Drive-relative C:escape above is
+        // rejected on both platforms.
+        let windows_absolute =
+            resolve_omp_config_paths(home, cwd, None, None, None, Some("C:\\escape"));
+        #[cfg(windows)]
+        assert_eq!(
+            windows_absolute.unwrap().user_mcp_config,
+            PathBuf::from("C:\\escape\\mcp.json")
+        );
+        #[cfg(not(windows))]
+        assert!(windows_absolute.is_err());
 
         let relative_cwd = resolve_omp_config_paths(
             home,
@@ -8899,10 +8911,7 @@ mod tests {
 
         let default = resolve_omp_config_paths(home, cwd, Some("default"), None, None, None)
             .expect("the explicit default profile is valid");
-        assert_eq!(
-            default.user_mcp_config,
-            PathBuf::from("/home/alice/.omp/agent/mcp.json")
-        );
+        assert_eq!(default.user_mcp_config, home.join(".omp/agent/mcp.json"));
     }
 
     #[test]
@@ -12368,7 +12377,7 @@ http_headers = { Authorization = "Bearer tok" }
         assert!(
             missing
                 .remediation
-                .contains(&missing_overlay.display().to_string())
+                .contains(&missing_overlay.display().to_string().replace('\\', "/"))
         );
 
         params.agents = Some(vec![AgentPlatform::Cline]);

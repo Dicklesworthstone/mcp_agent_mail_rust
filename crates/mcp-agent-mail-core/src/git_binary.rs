@@ -680,7 +680,11 @@ pub fn reset_cache_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::{self as sfs, File};
+    #[cfg(unix)]
+    use std::fs as sfs;
+    #[cfg(unix)]
+    use std::fs::File;
+    #[cfg(unix)]
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -688,6 +692,7 @@ mod tests {
     ///
     /// This is the minimal precursor to the full test-helpers crate (G6);
     /// once G6 lands these inlined helpers migrate there.
+    #[cfg(unix)]
     fn build_shim_script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
         let mut f = File::create(&path).expect("create shim");
@@ -846,11 +851,14 @@ mod tests {
     #[test]
     fn missing_binary_errors_clearly() {
         reset_cache_for_test();
-        let env = env_map(&[("AM_GIT_BINARY", "/nonexistent/dir/git-xyz")]);
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("nonexistent").join("git-xyz.exe");
+        assert!(missing.is_absolute());
+        let env = env_map(&[("AM_GIT_BINARY", missing.to_str().unwrap())]);
         let res = resolve_git_binary_with_env(env);
         match res {
             Err(GitBinaryError::Missing { path }) => {
-                assert_eq!(path, PathBuf::from("/nonexistent/dir/git-xyz"));
+                assert_eq!(path, missing);
             }
             other => panic!("expected Missing error, got {other:?}"),
         }
@@ -947,13 +955,16 @@ mod tests {
     fn spawn_timeout_after_5s_on_hung_shim() {
         reset_cache_for_test();
         let tmp = TempDir::new().unwrap();
-        // Shim that sleeps 30s — longer than our 5s timeout.
-        let shim = build_shim_script(
-            tmp.path(),
-            "git",
-            r#"sleep 30
-echo "git version 2.50.2""#,
-        );
+        // Keep the stalled fixture in one process, so the timeout kills and
+        // reaps the entire fixture rather than leaving a sleeping descendant.
+        #[cfg(unix)]
+        let shim = build_shim_script(tmp.path(), "git", "exec sleep 30");
+        #[cfg(windows)]
+        let shim = {
+            let path = tmp.path().join("git.cmd");
+            fs::write(&path, "@echo off\r\n:wait\r\ngoto wait\r\n").unwrap();
+            path
+        };
         let env = env_map(&[("AM_GIT_BINARY", shim.to_str().unwrap())]);
         let t0 = Instant::now();
         let res = resolve_git_binary_with_env(env);

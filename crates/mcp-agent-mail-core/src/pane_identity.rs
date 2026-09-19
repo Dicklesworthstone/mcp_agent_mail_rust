@@ -2435,15 +2435,17 @@ mod tests {
     #[test]
     fn canonical_path_has_expected_structure() {
         let path = canonical_identity_path("/data/projects/backend", "%3");
-        let path_str = path.to_string_lossy();
+        let hash = project_hash("/data/projects/backend");
+        let expected_suffix = Path::new("agent-mail")
+            .join("identity")
+            .join(&hash)
+            .join("3");
         assert!(
-            path_str.contains("agent-mail/identity/"),
-            "missing identity dir: {path_str}"
+            path.ends_with(&expected_suffix),
+            "unexpected identity path: {path:?}"
         );
-        assert!(
-            path_str.ends_with("/3"),
-            "expected pane id suffix: {path_str}"
-        );
+        assert_eq!(hash.len(), 12);
+        assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -2461,11 +2463,11 @@ mod tests {
             bare, composite,
             "composite key should produce a different path than bare pane ID"
         );
-        let composite_str = composite.to_string_lossy();
-        assert!(
-            composite_str.ends_with("/main-0-2"),
-            "expected composite key filename: {composite_str}"
+        assert_eq!(
+            composite.file_name(),
+            Some(std::ffi::OsStr::new("main-0-2"))
         );
+        assert_eq!(bare.parent(), composite.parent());
     }
 
     #[test]
@@ -3149,16 +3151,37 @@ mod tests {
 
     #[test]
     fn validate_tmux_socket_path_accepts_absolute_paths_and_trims() {
+        let tmp = tempfile::tempdir().expect("socket fixture directory");
+        let socket = tmp.path().join("tmux-1000").join("default");
+        let socket_text = socket.to_string_lossy().into_owned();
+        assert!(socket.is_absolute());
         assert_eq!(
-            validate_tmux_socket_path("/tmp/tmux-1000/default"),
-            Ok("/tmp/tmux-1000/default".to_string())
+            validate_tmux_socket_path(&socket_text),
+            Ok(socket_text.clone())
         );
         assert_eq!(
-            validate_tmux_socket_path("  /tmp/tmux-1000/ntm \t"),
-            Ok("/tmp/tmux-1000/ntm".to_string())
+            validate_tmux_socket_path(&format!("  {socket_text} \t")),
+            Ok(socket_text)
         );
         // Existence is deliberately not part of the contract.
-        assert!(validate_tmux_socket_path("/definitely/not/there").is_ok());
+        assert!(!socket.exists());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn validate_tmux_socket_path_windows_requires_drive_or_unc_root() {
+        for absolute in [r"C:\tmux\default", r"\\server\share\tmux\default"] {
+            assert_eq!(
+                validate_tmux_socket_path(absolute),
+                Ok(absolute.to_string())
+            );
+        }
+        for relative in [r"C:tmux\default", r"\tmux\default", "/tmp/tmux/default"] {
+            assert_eq!(
+                validate_tmux_socket_path(relative),
+                Err(TmuxSocketPathError::Relative)
+            );
+        }
     }
 
     #[test]
@@ -3191,9 +3214,14 @@ mod tests {
             validate_tmux_socket_path("/tmp/ok\n  "),
             Err(TmuxSocketPathError::ControlCharacter)
         );
-        let at_limit = format!("/{}", "x".repeat(MAX_TMUX_SOCKET_PATH_LEN - 1));
+        let root = if cfg!(windows) { "C:/" } else { "/" };
+        let at_limit = format!(
+            "{root}{}",
+            "x".repeat(MAX_TMUX_SOCKET_PATH_LEN - root.len())
+        );
+        assert_eq!(at_limit.len(), MAX_TMUX_SOCKET_PATH_LEN);
         assert!(validate_tmux_socket_path(&at_limit).is_ok());
-        let too_long = format!("/{}", "x".repeat(MAX_TMUX_SOCKET_PATH_LEN));
+        let too_long = format!("{at_limit}x");
         assert_eq!(
             validate_tmux_socket_path(&too_long),
             Err(TmuxSocketPathError::TooLong)
@@ -3202,15 +3230,16 @@ mod tests {
 
     #[test]
     fn tmux_env_socket_path_validated_takes_the_first_tmux_field() {
-        crate::config::with_process_env_overrides_for_test(
-            &[("TMUX", "/tmp/tmux-1000/ntm,4242,3")],
-            || {
-                assert_eq!(
-                    tmux_env_socket_path_validated().as_deref(),
-                    Some("/tmp/tmux-1000/ntm")
-                );
-            },
-        );
+        let tmp = tempfile::tempdir().expect("socket fixture directory");
+        let socket = tmp.path().join("tmux-1000").join("ntm");
+        let socket_text = socket.to_string_lossy();
+        let tmux = format!("{socket_text},4242,3");
+        crate::config::with_process_env_overrides_for_test(&[("TMUX", &tmux)], || {
+            assert_eq!(
+                tmux_env_socket_path_validated().as_deref(),
+                Some(socket_text.as_ref())
+            );
+        });
         for malformed in ["", ",1,0", "relative,1,0", "/tmp/ok\r\nX: y,1,0"] {
             crate::config::with_process_env_overrides_for_test(&[("TMUX", malformed)], || {
                 assert_eq!(

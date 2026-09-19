@@ -342,7 +342,7 @@ fn store_encoder_result(key: String, result: &EncoderSuccess) {
     cache.insert(key, result.clone());
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn clear_validation_cache_for_tests() {
     let mut cache = encoder_validation_cache()
         .lock()
@@ -351,7 +351,7 @@ fn clear_validation_cache_for_tests() {
     cache.order.clear();
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn clear_result_cache_for_tests() {
     let mut cache = encoder_result_cache()
         .lock()
@@ -827,12 +827,15 @@ pub fn apply_resource_format<S: std::hash::BuildHasher>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::sync::Mutex;
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_config() -> Config {

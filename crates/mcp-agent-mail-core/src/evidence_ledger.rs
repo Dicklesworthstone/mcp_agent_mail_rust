@@ -168,7 +168,12 @@ fn path_existing_prefix_has_symlink(path: &Path) -> io::Result<bool> {
 
     for component in path.components() {
         match component {
-            std::path::Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            std::path::Component::Prefix(prefix) => {
+                current.push(prefix.as_os_str());
+                // A drive/UNC prefix alone is not a filesystem entry. Probe
+                // after the root component completes it, not e.g. `C:`.
+                continue;
+            }
             std::path::Component::RootDir => {
                 current.push(Path::new(std::path::MAIN_SEPARATOR_STR));
             }
