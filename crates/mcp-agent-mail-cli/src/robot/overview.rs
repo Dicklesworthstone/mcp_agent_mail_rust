@@ -16,6 +16,7 @@ use mcp_agent_mail_db::DbConn;
 use serde::Serialize;
 use sqlmodel_core::{Row, Value};
 
+mod counts_reservations;
 mod sparse_recipients;
 
 const ACK_OVERDUE_THRESHOLD_US: i64 = 30 * 60 * 1_000_000;
@@ -136,6 +137,7 @@ struct ScanWork {
     rows: [usize; 5],
     message_lookup_rows: usize,
     release_lookup_rows: usize,
+    reservation_project_rows: usize,
     recipient_sample_rows: usize,
     ack_message_rows: usize,
     ack_count_rows: usize,
@@ -331,6 +333,25 @@ fn scan_reservation_pages<F>(
 where
     F: FnMut(&[Row], &mut ScanWork) -> Result<(), CliError>,
 {
+    scan_reservation_pages_while(conn, work, predicate, now_us, |rows, work| {
+        visit(rows, work)?;
+        Ok(true)
+    }).map(|_| ())
+}
+
+/// Return true only when the cursor is exhausted, false when the visitor stops.
+/// Counts-only discovery can stop after proving existence, while the full view
+/// still consumes every candidate through the same checked expiry cursor.
+fn scan_reservation_pages_while<F>(
+    conn: &DbConn,
+    work: &mut ScanWork,
+    predicate: &str,
+    now_us: i64,
+    mut visit: F,
+) -> Result<bool, CliError>
+where
+    F: FnMut(&[Row], &mut ScanWork) -> Result<bool, CliError>,
+{
     let mut expiry = now_us;
     let mut last_id = None;
     loop {
@@ -353,12 +374,12 @@ where
             }
             previous = Some(next);
         }
-        if !rows.is_empty() {
-            visit(&rows, work)?;
+        if !rows.is_empty() && !visit(&rows, work)? {
+            return Ok(false);
         }
         if rows.len() < OVERVIEW_PAGE_ROWS {
             if last_id.is_none() {
-                return Ok(());
+                return Ok(true);
             }
             // The equal-expiry group is exhausted; seek the next group.
             last_id = None;
@@ -404,12 +425,24 @@ pub(super) fn build(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
     build_at(conn, mcp_agent_mail_db::now_micros()).map(|(projects, _)| projects)
 }
 
+/// Keep partial reservation fields private: this entry point emits only counts.
+pub(super) fn build_counts_output(conn: &DbConn, format: OutputFormat) -> Result<String, CliError> {
+    let (projects, _) = build_at_mode(conn, mcp_agent_mail_db::now_micros(), true)?;
+    render(&projects, true, format)
+}
+
 fn build_at(conn: &DbConn, now_us: i64) -> Result<(Vec<OverviewProject>, ScanWork), CliError> {
+    build_at_mode(conn, now_us, false)
+}
+
+fn build_at_mode(
+    conn: &DbConn, now_us: i64, counts_only: bool,
+) -> Result<(Vec<OverviewProject>, ScanWork), CliError> {
     // One snapshot covers EVERY page and lookup, not one snapshot per batch.
     // This nests inside a caller's transaction without committing it.
     conn.execute_sync("SAVEPOINT robot_overview_read", &[])
         .map_err(|error| CliError::Other(format!("overview snapshot begin failed: {error}")))?;
-    let result = collect_at(conn, now_us);
+    let result = collect_at(conn, now_us, counts_only);
     let release = conn.execute_sync("RELEASE robot_overview_read", &[]);
     match (result, release) {
         (Err(error), _) => Err(error),
@@ -418,7 +451,9 @@ fn build_at(conn: &DbConn, now_us: i64) -> Result<(Vec<OverviewProject>, ScanWor
     }
 }
 
-fn collect_at(conn: &DbConn, now_us: i64) -> Result<(Vec<OverviewProject>, ScanWork), CliError> {
+fn collect_at(
+    conn: &DbConn, now_us: i64, counts_only: bool,
+) -> Result<(Vec<OverviewProject>, ScanWork), CliError> {
     let mut work = ScanWork::default();
     let mut projects = HashMap::new();
     scan_pages(conn, &mut work, Scan {
@@ -447,10 +482,29 @@ fn collect_at(conn: &DbConn, now_us: i64) -> Result<(Vec<OverviewProject>, ScanW
         collect_recipients_scan(conn, now_us, &mut projects, &mut work)?;
     }
 
+    if counts_only {
+        counts_reservations::collect(conn, now_us, &mut projects, &mut work)?;
+    } else {
+        collect_reservations(conn, now_us, &mut projects, &mut work)?;
+    }
+
+    let mut projects: Vec<_> = projects.into_iter().collect();
+    projects.sort_by(|(left_id, left), (right_id, right)| {
+        left.slug.cmp(&right.slug).then(left_id.cmp(right_id))
+    });
+    Ok((projects.into_iter().map(|(_, row)| row).collect(), work))
+}
+
+fn collect_reservations(
+    conn: &DbConn,
+    now_us: i64,
+    projects: &mut HashMap<i64, OverviewProject>,
+    work: &mut ScanWork,
+) -> Result<(), CliError> {
     let has_ledger = has_file_reservation_release_ledger(conn)?;
     let legacy = has_file_reservations_released_ts_column(conn)?;
     let predicate = active_reservation_candidate_sql(legacy, "fr");
-    scan_reservation_pages(conn, &mut work, &predicate, now_us, |rows, work| {
+    scan_reservation_pages(conn, work, &predicate, now_us, |rows, work| {
         let ids: Vec<_> = rows.iter().map(|row| integer(row, "id"))
             .collect::<Result<_, _>>()?;
         let mut released = HashSet::new();
@@ -465,17 +519,11 @@ fn collect_at(conn: &DbConn, now_us: i64) -> Result<(Vec<OverviewProject>, ScanW
         for row in rows {
             // Membership releases even with a NULL/zero ledger timestamp.
             if !released.contains(&integer(row, "id")?) {
-                project(&mut projects, integer(row, "project_id")?).reservations += 1;
+                project(projects, integer(row, "project_id")?).reservations += 1;
             }
         }
         Ok(())
-    })?;
-
-    let mut projects: Vec<_> = projects.into_iter().collect();
-    projects.sort_by(|(left_id, left), (right_id, right)| {
-        left.slug.cmp(&right.slug).then(left_id.cmp(right_id))
-    });
-    Ok((projects.into_iter().map(|(_, row)| row).collect(), work))
+    })
 }
 
 /// Read-only fallback for schemas without the acknowledgement indexes.

@@ -22,8 +22,12 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), crate::CliError> {
     }
     let format = OutputFormat::resolve(requested, false);
     let conn = crate::open_db_sync_robot()?;
-    let projects = overview::build(&conn)?;
-    let out = overview::render(&projects, *counts, format)?;
+    let out = if *counts {
+        overview::build_counts_output(&conn, format)?
+    } else {
+        let projects = overview::build(&conn)?;
+        overview::render(&projects, false, format)?
+    };
     ftui_runtime::ftui_println!("{out}");
     Ok(())
 }
