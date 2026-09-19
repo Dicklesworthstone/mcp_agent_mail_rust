@@ -1,8 +1,8 @@
 # GH274: integrated cold overview collection
 
 The first sections below record the initial collector's historical evidence.
-For the later bounded, indexed recipient phase, see the final section. The
-measurements cover different query models and must not be compounded.
+Later sections cover bounded recipient counts and counts-only reservation
+presence. Measurements cover different phases and must not be compounded.
 
 Implementation commit: `32b40410dcb248129c4e7fa74a6a3c5544fac5f6`.
 Evidence recorded on 2026-09-18. This is SQL-work evidence, not a native CLI
@@ -178,3 +178,94 @@ strategy sample, it avoids returning read non-ack recipient history or
 looking up those messages. It does not implement persistent counters or
 cross-process cache reuse. GH274 still needs native/original-corpus latency
 validation before a conclusive performance-closure claim.
+
+## Counts-only reservation presence: d8dbb76f
+
+`overview --counts` does not return reservation totals, but still performed
+full reservation collection before trimming its output. The live router now
+selects `build_counts_output` before collection. It shares project inventory,
+recipient counts, output formatting and the read savepoint with full overview;
+only the reservation phase differs. Full overview still counts every active,
+unreleased reservation as before.
+
+Known projects (including agent/message orphans) are already counted regardless
+of their reservations. The new phase checks only whether additional project
+IDs have at least one active, unreleased reservation. It initially consumes
+up to four bounded 256-row candidate pages, ignoring release-ledger lookups for
+known projects. For a small inventory with a verified full project-leading
+index, it then seeks gaps between known integer IDs. Each newly found ID is
+checked for active, unreleased presence, stopping when that presence is proven.
+Contiguous known IDs require only the two outer gap seeks. No index is created
+and no mailbox-wide SQL anti-join or exclusion list is introduced.
+
+Discovery has strategy budgets. If the schema lacks a suitable index, the
+known inventory is broad, too many unknown IDs need checking, or a released
+orphan prefix exhausts its page allowance, the phase completes with the exact
+bounded scan. These limits never truncate results or hide a late active
+reservation. Membership makes rereads idempotent. NULL/zero release-ledger
+membership, legacy sentinels, strict expiry and signed ID boundaries retain
+their existing semantics. Partial reservation fields never escape through the
+public full-output path: the specialized entry point renders counts only.
+
+Reproduce the diagnostic:
+
+```sh
+python3 scripts/verify_gh274_counts.py
+```
+
+Eight Python test methods passed, including 240 seeded differential fixtures
+against an independent straight-scan oracle. Assertions cover small-set,
+indexed and fallback strategies, schema variants, known/agent/message/orphan
+project sources, sparse and extreme signed IDs, unsuitable indexes, late
+unreleased candidates after long released prefixes, budget exhaustion,
+read-only access, outer transactions and cleanup after SQL failures. A real
+two-connection canonical SQLite WAL test releases one orphan's reservation and
+inserts another during gap discovery: the current snapshot retains the old
+inventory and the next call sees the new one. Separate connection opens also
+verify release, insert and expiry changes. These are not native CLI processes.
+
+The script extracts SQL projections and budgets from the committed Rust
+sources and records their SHA-256 hashes. Python models the control flow;
+this is NOT execution of Rust or FrankenSQLite. Measurements below use
+canonical SQLite 3.46.1, one progress callback per VM instruction, a minimal
+indexed ledger-only schema, and already-known project IDs 1 through 33.
+Every reservation is unexpired but released through the ledger.
+
+| Reservation-phase measurement | Full collection, 24,000 rows | Counts-only, 24,000 rows | Full collection, 240,000 rows | Counts-only, 240,000 rows |
+| --- | ---: | ---: | ---: | ---: |
+| Data statements | 189 | 6 | 1,877 | 6 |
+| Reservation candidate rows returned | 24,000 | 1,024 | 240,000 | 1,024 |
+| Release-ledger rows returned | 24,000 | 0 | 240,000 | 0 |
+| Canonical SQL VM instructions | 434,267 | 8,100 | 4,344,211 | 8,100 |
+
+For these fixtures, canonical VM work falls by approximately 98.1% and 99.8%.
+The same project inventory is returned. Data-statement counts omit schema and
+savepoint probes; VM counts include them. All figures exclude project and
+recipient collection, application-side work, database opening, formatting and
+CLI startup. Index height and native-engine planner costs can still vary as
+the corpus grows. These are not end-to-end or native latency measurements.
+
+Adverse cases are reported rather than discarded. With 24,000 released rows
+belonging entirely to an unknown project, the strategy falls back and needs
+206 versus 189 data statements, with 470,107 versus 434,267 canonical VM
+instructions (about 8.3% extra work). Without a suitable project index, the
+33-known-project fixture rereads its initial pages, but skips the ledger:
+99 statements and 201,233 VM instructions versus 189 and 434,264. Empty active
+sets take one data query in both paths. The strategy is not guaranteed to win
+for every distribution, and its budgets bound discovery attempts and Rust
+result buffers, not engine-internal memory or wall-clock execution time.
+
+Nine native regression tests and an ignored comparison benchmark live in
+`overview/counts_reservations.rs`. The benchmark alternates the actual full
+and counts-only reservation helpers on the same indexed DbConn fixture.
+
+```sh
+cargo test -p mcp-agent-mail-cli --lib robot::overview -- --nocapture
+cargo test -p mcp-agent-mail-cli --test integration_runs robot_overview_cold_processes -- --nocapture
+cargo test --release -p mcp-agent-mail-cli --lib benchmark_counts_reservations_against_full_collection -- --ignored --nocapture
+```
+
+Rust compilation, native tests, rustfmt and Clippy remain unrun in the editing
+environment: no Rust toolchain is available. The global unread-recipient scan
+is unchanged; no read-state index migration or persistent cache was added.
+GH274 still requires native/original-corpus latency validation for closure.
