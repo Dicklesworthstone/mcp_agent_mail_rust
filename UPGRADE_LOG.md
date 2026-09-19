@@ -5,6 +5,21 @@
 Tracked by `br-5lgwn`. This section supersedes historical current-status
 statements below; v0.3.36 is published and this work targets unreleased main.
 
+September 19 `dirs` update: the workspace now uses 7.0.0, and the CLI and
+core crates inherit that pin instead of independently requiring version 6.
+Upstream's sole source behavior change moves Windows `preference_dir()`
+from local to roaming application data; this project does not call that API.
+Resolution redirects five application edges to the already-present version 7;
+transitive consumers retain version 6. The parked, non-workspace local
+agent-detection crate remains outside this upgrade. All 1,960 core tests passed
+(two existing skips) through strict RCH at 21:19 UTC, and formatting passed.
+`044-dirs-700-audit.json` reports zero vulnerabilities and the existing
+unmaintained/unsound warning categories. Workspace/all-target check and strict
+Clippy passed on the warm remote worker at 21:29 and 21:33 UTC
+(`044-dirs-700-{check,clippy}-rehomed.log`). The original queue-timeout refusal
+and the canceled queued replacement remain recorded; neither executed locally.
+These results qualify this dependency change, not the complete release.
+
 September 19 Beads prerequisite review: published `beads_rust` 0.6.0 keeps
 the consumed discovery/routing APIs, but its `BEADS_DB` environment override
 takes precedence over our validated `BEADS_DIR`. A real two-workspace control
