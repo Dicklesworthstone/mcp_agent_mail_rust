@@ -146,13 +146,22 @@ INSTALLER_EXIT_SUCCESS=1
 PROBE
 
 unit_cases=0
+# ERR inheritance, LINENO, and EXIT handling must also work when Bash reads
+# the program from stdin. Use a fresh Bash, not a probe function sourced in a
+# conditional: the latter would disable errexit inside its shell functions.
+for delivery in file stdin; do
 while read -r name expected_rc expected_errs; do
-    case_root="$scratch/unit-$name"
+    case_root="$scratch/unit-$delivery-$name"
     mkdir -p "$case_root/home"
-    output="$ARTIFACT_DIR/unit-$name.log"
+    output="$ARTIFACT_DIR/unit-$delivery-$name.log"
     rc=0
-    env -i PATH="$PATH" HOME="$case_root/home" LC_ALL=C \
-        "$BASH" "$unit_probe" "$name" "$case_root" "$unit_library" > "$output" 2>&1 || rc=$?
+    if [ "$delivery" = file ]; then
+        env -i PATH="$PATH" HOME="$case_root/home" LC_ALL=C \
+            "$BASH" "$unit_probe" "$name" "$case_root" "$unit_library" > "$output" 2>&1 || rc=$?
+    else
+        env -i PATH="$PATH" HOME="$case_root/home" LC_ALL=C \
+            "$BASH" -s -- "$name" "$case_root" "$unit_library" < "$unit_probe" > "$output" 2>&1 || rc=$?
+    fi
     errs=$(grep -c 'Unexpected installer error' "$output" || true)
     case_failed=0
     [ "$rc" -eq "$expected_rc" ] && [ "$errs" -eq "$expected_errs" ] || case_failed=1
@@ -185,7 +194,7 @@ while read -r name expected_rc expected_errs; do
             grep -Fq 'MCP client authority discovery failed' "$output" || case_failed=1 ;;
     esac
     unit_cases=$((unit_cases + 1))
-    printf 'unit %-26s exit=%s expected=%s ERR=%s expected=%s\n' "$name" "$rc" "$expected_rc" "$errs" "$expected_errs"
+    printf 'unit %-5s %-26s exit=%s expected=%s ERR=%s expected=%s\n' "$delivery" "$name" "$rc" "$expected_rc" "$errs" "$expected_errs"
     if [ "$case_failed" -ne 0 ]; then
         failures=$((failures + 1))
         cat "$output" >&2
@@ -214,6 +223,7 @@ no-agents 0 0
 required-client 1 0
 authority-error 1 0
 CASES
+done
 
 printf 'Unit exit regressions: %s cases, %s failure(s)\n' "$unit_cases" "$failures"
 if [ "${1:-}" = --unit ]; then
@@ -228,8 +238,14 @@ minisign_bin=$(command -v minisign) || { echo 'The signed-release tests require 
 mkdir "$scratch/bin"
 ln -s "$minisign_bin" "$scratch/bin/minisign"
 install_test_path="$scratch/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+install_test_shell=/bin/bash
+if [ "$(uname -s)" = Darwin ]; then
+    # Bash still runs the installer; SHELL selects the user's startup files.
+    # The report's macOS sandbox updated .zshenv/.profile, not .bashrc.
+    install_test_shell=/bin/zsh
+fi
 
-for mode in file stdin; do
+for mode in file stdin file-default stdin-default; do
     case_root="$scratch/$mode"
     mkdir -p "$case_root/home" "$case_root/work" "$case_root/tmp"
     trace="$ARTIFACT_DIR/$mode.trace.log"
@@ -239,15 +255,31 @@ for mode in file stdin; do
         cd "$case_root/work"
         # No caller credentials, XDG locations, shell startup hooks, or installer
         # skip overrides may leak into the clean-HOME reproduction.
-        if [ "$mode" = file ]; then
-            env -i HOME="$case_root/home" PATH="$install_test_path" SHELL=/bin/bash \
-                TMPDIR="$case_root/tmp" LOG_FILE="$verbose_log" LC_ALL=C TERM=dumb \
-                "$BASH" -x "$INSTALL_SH" --version "$VERSION" --yes --no-gum --no-service --verbose
-        else
-            env -i HOME="$case_root/home" PATH="$install_test_path" SHELL=/bin/bash \
-                TMPDIR="$case_root/tmp" LOG_FILE="$verbose_log" LC_ALL=C TERM=dumb \
-                "$BASH" -x -s -- --version "$VERSION" --yes --no-gum --no-service --verbose < "$INSTALL_SH"
-        fi
+        case "$mode" in
+            file)
+                env -i HOME="$case_root/home" PATH="$install_test_path" SHELL="$install_test_shell" \
+                    TMPDIR="$case_root/tmp" LOG_FILE="$verbose_log" LC_ALL=C TERM=dumb \
+                    "$BASH" -x "$INSTALL_SH" --version "$VERSION" --yes --no-gum --no-service --verbose < /dev/null
+                ;;
+            stdin)
+                env -i HOME="$case_root/home" PATH="$install_test_path" SHELL="$install_test_shell" \
+                    TMPDIR="$case_root/tmp" LOG_FILE="$verbose_log" LC_ALL=C TERM=dumb \
+                    "$BASH" -x -s -- --version "$VERSION" --yes --no-gum --no-service --verbose < "$INSTALL_SH"
+                ;;
+            file-default)
+                # Match GH#327's argument-less file invocation. Pin only the
+                # release in the environment; do not change verbosity, service
+                # policy, confirmations, or the empty-argument Bash 3.2 path.
+                env -i HOME="$case_root/home" PATH="$install_test_path" SHELL="$install_test_shell" \
+                    TMPDIR="$case_root/tmp" LOG_FILE="$verbose_log" LC_ALL=C TERM=dumb VERSION="$VERSION" \
+                    "$BASH" "$INSTALL_SH" < /dev/null
+                ;;
+            stdin-default)
+                env -i HOME="$case_root/home" PATH="$install_test_path" SHELL="$install_test_shell" \
+                    TMPDIR="$case_root/tmp" LOG_FILE="$verbose_log" LC_ALL=C TERM=dumb VERSION="$VERSION" \
+                    "$BASH" < "$INSTALL_SH"
+                ;;
+        esac
     ) > "$trace" 2>&1 || rc=$?
     printf '%s installer exit=%s\n' "$mode" "$rc" | tee "$ARTIFACT_DIR/$mode.status.txt"
     if [ "$rc" -ne 0 ]; then
@@ -267,13 +299,28 @@ for mode in file stdin; do
     done
     for witness in 'verify_minisign:ok' 'verify_checksum:ok' \
         'update_mcp_configs:result rc=0' \
-        'update_mcp_configs:output No coding agents detected.'; do
+        'update_mcp_configs:output No coding agents detected.' \
+        'install:complete rc=0'; do
         if ! grep -Fq "$witness" "$verbose_log"; then
             printf '%s: missing real-path witness: %s\n' "$mode" "$witness" >&2
             failures=$((failures + 1))
         fi
     done
+    unexpected_error=0
     if grep -q '^++* on_error ' "$trace"; then
+        unexpected_error=1
+    fi
+    case "$mode" in
+        *-default)
+            # These invocations have no xtrace, so check the diagnostic itself.
+            # Do not search for this literal in traced runs: persisting the
+            # piped installer logs its source, which contains the same text.
+            if grep -Fq 'Unexpected installer error.' "$trace"; then
+                unexpected_error=1
+            fi
+            ;;
+    esac
+    if [ "$unexpected_error" -ne 0 ]; then
         echo "$mode: ERR handler ran on the successful-install path" >&2
         failures=$((failures + 1))
     fi
