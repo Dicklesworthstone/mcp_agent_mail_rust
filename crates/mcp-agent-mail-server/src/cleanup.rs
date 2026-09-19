@@ -1900,7 +1900,9 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(
                 detect_and_release_stale(&config, &pool, &cx, project_id, &mut cache).unwrap(),
-                Vec::new()
+                // Explicit element type: `Vec`'s `PartialEq` is generic over the other
+                // side's element, so a bare `Vec::new()` leaves `T` uninferable (E0282).
+                Vec::<i64>::new()
             );
             assert_reservation_unreleased(&pool, &cx, project_id, reservation_id);
         }
@@ -1959,7 +1961,9 @@ mod tests {
         let config = stale_cleanup_test_config(&tmp);
         assert_eq!(
             detect_and_release_stale(&config, &pool, &cx, project_id, &mut cache).unwrap(),
-            Vec::new()
+            // Explicit element type: `Vec`'s `PartialEq` is generic over the other
+            // side's element, so a bare `Vec::new()` leaves `T` uninferable (E0282).
+            Vec::<i64>::new()
         );
         assert_reservation_unreleased(&pool, &cx, project_id, reservation_id);
     }
@@ -1995,7 +1999,9 @@ mod tests {
         let config = stale_cleanup_test_config(&tmp);
         assert_eq!(
             detect_and_release_stale(&config, &pool, &cx, project_id, &mut cache).unwrap(),
-            Vec::new()
+            // Explicit element type: `Vec`'s `PartialEq` is generic over the other
+            // side's element, so a bare `Vec::new()` leaves `T` uninferable (E0282).
+            Vec::<i64>::new()
         );
         assert_reservation_unreleased(&pool, &cx, project_id, reservation_id);
     }
