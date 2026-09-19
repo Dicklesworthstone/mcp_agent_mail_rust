@@ -5,6 +5,19 @@
 Tracked by `br-5lgwn`. This section supersedes historical current-status
 statements below; v0.3.36 is published and this work targets unreleased main.
 
+Parallel reliability work (`br-8r6dl`, September 19): a real 0.4.4 VFS
+regression reproduced descriptor growth from 1 to 65 after 64 reopen/close
+cycles while preserving foreign-process lock exclusion. An isolated Linux
+reuse candidate now passes all 433 VFS library tests, including that bound,
+foreign lock exclusion/final unlock, path replacement and exclusive-create
+refusal (strict RCH exit 0 at 07:05:28 UTC; artifact
+`044-descriptor-reuse-vfs-corrected.log`). It uses a Linux O_PATH inode
+witness and effective-access/canonical-mode checks for an existing retained
+lock domain. Other platforms retain the existing implementation. Engine
+workspace check and Clippy are running in `044-descriptor-reuse-*.log`;
+this candidate is unpublished and is not part of the application's
+`dbcc7adb` pin. Neither a deployed fix nor cross-platform closure is claimed.
+
 - Verified the published `fsqlite` 0.4.4 dependency metadata and tag commit
   `9d3d98778a372aba95d76d05c5c974ac0238c96a`.
 - Inventoried 95 direct registry dependencies; receipt:

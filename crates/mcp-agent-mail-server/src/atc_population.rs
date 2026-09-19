@@ -399,7 +399,7 @@ pub(super) fn annotate_summary(summary: &mut AtcSummarySnapshot) {
     match hydration().try_lock() {
         Ok(state) => state.annotate(summary, now),
         Err(TryLockError::WouldBlock) => {
-            annotate_incomplete_summary(summary, Some(now), "population_hydration_incomplete")
+            annotate_incomplete_summary(summary, Some(now), "population_hydration_incomplete");
         }
         Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().annotate(summary, now),
     }
