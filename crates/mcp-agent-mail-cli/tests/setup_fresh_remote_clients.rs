@@ -151,7 +151,11 @@ impl Sandbox {
     fn assert_credentials(&self) -> String {
         for path in self.credential_paths() {
             let metadata = fs::symlink_metadata(&path).expect("credential file exists");
-            assert!(metadata.is_file(), "{} is not a regular file", path.display());
+            assert!(
+                metadata.is_file(),
+                "{} is not a regular file",
+                path.display()
+            );
             assert_eq!(
                 metadata.permissions().mode() & 0o777,
                 0o600,
@@ -166,12 +170,16 @@ impl Sandbox {
             .collect();
         assert_eq!(tokens.len(), 1, "one canonical token assignment");
         let token = tokens[0];
-        assert!(!token.is_empty(), "a zero exit must not hide a missing token");
+        assert!(
+            !token.is_empty(),
+            "a zero exit must not hide a missing token"
+        );
         let authorization = format!("Bearer {token}");
-        let codex: toml_edit::DocumentMut = fs::read_to_string(self.home.join(".codex/config.toml"))
-            .unwrap()
-            .parse()
-            .expect("real Codex TOML parses");
+        let codex: toml_edit::DocumentMut =
+            fs::read_to_string(self.home.join(".codex/config.toml"))
+                .unwrap()
+                .parse()
+                .expect("real Codex TOML parses");
         let entry = &codex["mcp_servers"]["mcp_agent_mail"];
         assert_eq!(entry["url"].as_str(), Some(URL));
         assert_eq!(
@@ -229,7 +237,10 @@ fn fresh_remote_clients_get_one_durable_credential_and_private_configs() {
         require_success(&sandbox.git(&["add", "--all"]), "stage isolated project");
         let tracked = sandbox.git(&["ls-files", "--", ".omp/mcp.json"]);
         require_success(&tracked, "inspect tracked project paths");
-        assert!(tracked.stdout.is_empty(), "git add --all staged a credential");
+        assert!(
+            tracked.stdout.is_empty(),
+            "git add --all staged a credential"
+        );
     }
 }
 

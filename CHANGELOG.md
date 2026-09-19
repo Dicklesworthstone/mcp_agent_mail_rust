@@ -30,6 +30,12 @@ These changes are not a published release. Dependency upgrades and the full
 release validation remain in progress; selected passing tests do not establish
 release readiness.
 
+- **Repair native Windows file and path handling.** Evidence-ledger writes
+  no longer probe an incomplete drive prefix, file-lock contention uses the
+  platform's actual error code, and setup status redacts native home paths.
+  Free-space queries consistently reject missing paths on Windows and Unix.
+  Native Windows core qualification passes 1,873 tests; Linux passes 1,960.
+  ([repairs](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/4532724b))
 - **Setup honors Claude Code's active configuration profile.**
   `CLAUDE_CONFIG_DIR` now selects the user and project-local MCP configuration
   authority, including relative overrides resolved from the launch directory.
