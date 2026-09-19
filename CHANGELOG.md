@@ -30,6 +30,12 @@ These changes are not a published release. Dependency upgrades and the full
 release validation remain in progress; selected passing tests do not establish
 release readiness.
 
+- **Refuse mixed database generations during health probes.** Idle staging
+  retains each database and recovery-sidecar identity, presence and content
+  digest, then verifies the copied bytes and rechecks the source family.
+  A concurrent replacement, rewrite, arrival or disappearance causes a retry
+  instead of a verdict on mismatched files. Thirty-four focused staging,
+  health and backup regressions pass (`br-zchj0`).
 - **Update the terminal UI to FrankenTUI 0.7.0.** Console capability detection
   uses the new color-depth API and keeps monochrome, ANSI16 and ANSI256
   terminals from advertising true-color support. Platform backend selection

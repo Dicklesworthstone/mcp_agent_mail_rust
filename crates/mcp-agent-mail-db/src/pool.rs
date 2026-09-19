@@ -3019,7 +3019,7 @@ pub struct DbPool {
     search_identity_path: Option<String>,
     /// Retained identity and digest of this pool's last verified backup.
     /// Clones serialize backup publication and share the same authority.
-    proactive_backup: Arc<Mutex<Option<ProactiveBackupWitness>>>,
+    proactive_backup: Arc<Mutex<Option<SqliteFileWitness>>>,
 }
 
 /// One immutable filesystem authority for a `DbPool` wrapper.
@@ -4618,7 +4618,7 @@ impl DbPool {
         }
         let existing_backup = match std::fs::symlink_metadata(&bak_path) {
             Ok(metadata) if metadata.file_type().is_file() => {
-                let observed = ProactiveBackupWitness::capture(&bak_path)?;
+                let observed = SqliteFileWitness::capture_standalone(&bak_path)?;
                 if let Some(modified) = observed.modified
                     && modified.elapsed().unwrap_or(max_age) < max_age
                     && verified_backup
@@ -4689,7 +4689,7 @@ impl DbPool {
 
         let (staged_directory, staged_backup) = create_proactive_backup_stage(primary, &bak_path)?;
         let staged_authority =
-            match ProactiveBackupWitness::capture(&staged_backup).and_then(|witness| {
+            match SqliteFileWitness::capture_standalone(&staged_backup).and_then(|witness| {
                 validate_proactive_backup_stage(primary, &staged_backup)?;
                 witness.verify(&staged_backup)?;
                 Ok(witness)
@@ -9571,6 +9571,81 @@ fn stage_sqlite_family_for_health_probe_once_in(
     source: &Path,
     root: Option<&Path>,
 ) -> std::io::Result<Option<SqliteHealthProbeSource>> {
+    stage_sqlite_family_for_health_probe_with_copy_hook(source, root, || {})
+}
+
+type HealthFamilyWitness = Vec<(&'static str, Option<SqliteFileWitness>)>;
+
+fn capture_idle_health_family(source: &Path) -> std::io::Result<Option<HealthFamilyWitness>> {
+    let mut family = Vec::new();
+    for suffix in std::iter::once("").chain(SQLITE_RECOVERY_SIDECAR_SUFFIXES.iter().copied()) {
+        let path = sqlite_sidecar_path(source, suffix);
+        let witness = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {
+                #[cfg(unix)]
+                if metadata.nlink() != 1 {
+                    return Err(std::io::Error::other(
+                        "physical health copying refuses a hard-linked family member",
+                    ));
+                }
+                let witness = SqliteFileWitness::capture_regular(&path)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::WouldBlock, error))?;
+                Some(witness)
+            }
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if suffix.is_empty() {
+                    return Ok(None);
+                }
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        family.push((suffix, witness));
+    }
+    Ok(Some(family))
+}
+
+fn verify_idle_health_family(
+    source: &Path,
+    staged: &Path,
+    before: &HealthFamilyWitness,
+) -> std::io::Result<()> {
+    let changed = || {
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "idle physical health family changed identity, presence, metadata or bytes during copy",
+        )
+    };
+    // Retain every pre-copy handle until the final whole-family recheck so an
+    // unlinked source inode cannot be recycled into the expected identity.
+    for (suffix, expected) in before {
+        let path = sqlite_sidecar_path(staged, suffix);
+        if let Some(expected) = expected {
+            let copy = SqliteFileWitness::capture_regular(&path).map_err(|_| changed())?;
+            if copy.len != expected.len || copy.sha256 != expected.sha256 {
+                return Err(changed());
+            }
+        } else if path_is_occupied(&path) {
+            return Err(changed());
+        }
+    }
+    let after = capture_idle_health_family(source)?.ok_or_else(changed)?;
+    for ((_, expected), (_, observed)) in before.iter().zip(&after) {
+        match (expected, observed) {
+            (None, None) => {}
+            (Some(expected), Some(observed)) if expected.unchanged_at_path(observed) => {}
+            _ => return Err(changed()),
+        }
+    }
+    Ok(())
+}
+
+fn stage_sqlite_family_for_health_probe_with_copy_hook(
+    source: &Path,
+    root: Option<&Path>,
+    after_main_copy: impl FnOnce(),
+) -> std::io::Result<Option<SqliteHealthProbeSource>> {
     match std::fs::symlink_metadata(source) {
         Ok(metadata) if metadata.file_type().is_file() =>
         {
@@ -9647,6 +9722,9 @@ fn stage_sqlite_family_for_health_probe_once_in(
     // The guard removes the directory when this value is dropped: on the
     // success path when the caller is done with the copy, and on every early
     // return and unwinding panic below.
+    let Some(before) = capture_idle_health_family(source)? else {
+        return Ok(None);
+    };
     let prefix = health_probe_dir_prefix_for_this_process();
     let directory = match root {
         Some(root) => CanonicalSnapshotTempDir::new_in(&prefix, root)?,
@@ -9654,6 +9732,7 @@ fn stage_sqlite_family_for_health_probe_once_in(
     };
     let staged_path = directory.path().join(HEALTH_PROBE_STAGED_STEM);
     copy_file_without_overwrite(source, &staged_path)?;
+    after_main_copy();
 
     for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         let source_sidecar = sqlite_sidecar_path(source, suffix);
@@ -9677,6 +9756,7 @@ fn stage_sqlite_family_for_health_probe_once_in(
         }
     }
 
+    verify_idle_health_family(source, &staged_path, &before)?;
     Ok(Some(SqliteHealthProbeSource {
         _directory: directory,
         path: staged_path,
@@ -13577,22 +13657,40 @@ pub fn sqlite_recovery_candidate_passes_full_integrity_check(
 
 /// A retained open handle prevents file-id reuse; a digest detects in-place
 /// writes even when the writer restores the file's length and timestamps.
-struct ProactiveBackupWitness {
+struct SqliteFileWitness {
     identity: same_file::Handle,
     len: u64,
     sha256: [u8; 32],
     modified: Option<SystemTime>,
+    #[cfg(unix)]
+    changed: (i64, i64),
 }
 
-impl ProactiveBackupWitness {
-    fn capture(path: &Path) -> DbResult<Self> {
-        use sha2::Digest as _;
-        use std::io::Read as _;
-
+impl SqliteFileWitness {
+    fn capture_standalone(path: &Path) -> DbResult<Self> {
         let capture = || -> std::io::Result<Self> {
             if !sqlite_recovery_candidate_is_standalone(path) {
                 return Err(std::io::Error::other("backup has companion state"));
             }
+            let witness = Self::capture_regular(path)?;
+            if !sqlite_recovery_candidate_is_standalone(path) {
+                return Err(std::io::Error::other("backup gained companion state"));
+            }
+            Ok(witness)
+        };
+        capture().map_err(|error| {
+            DbError::Sqlite(format!(
+                "proactive backup could not witness {}: {error}",
+                path.display()
+            ))
+        })
+    }
+
+    fn capture_regular(path: &Path) -> std::io::Result<Self> {
+        use sha2::Digest as _;
+        use std::io::Read as _;
+
+        let capture = || -> std::io::Result<Self> {
             let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
             let before = file.metadata()?;
             let identity = same_file::Handle::from_file(file.try_clone()?)?;
@@ -13625,9 +13723,7 @@ impl ProactiveBackupWitness {
                 ));
             }
             let current = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
-            if same_file::Handle::from_file(current)? != identity
-                || !sqlite_recovery_candidate_is_standalone(path)
-            {
+            if same_file::Handle::from_file(current)? != identity {
                 return Err(std::io::Error::other(
                     "backup generation changed while being witnessed",
                 ));
@@ -13637,14 +13733,11 @@ impl ProactiveBackupWitness {
                 len: observed_len,
                 sha256: digest.finalize().into(),
                 modified: after.modified().ok(),
+                #[cfg(unix)]
+                changed: (after.ctime(), after.ctime_nsec()),
             })
         };
-        capture().map_err(|error| {
-            DbError::Sqlite(format!(
-                "proactive backup could not witness {}: {error}",
-                path.display()
-            ))
-        })
+        capture()
     }
 
     fn same_generation(&self, observed: &Self) -> bool {
@@ -13653,8 +13746,16 @@ impl ProactiveBackupWitness {
             && self.sha256 == observed.sha256
     }
 
+    fn unchanged_at_path(&self, observed: &Self) -> bool {
+        #[cfg(unix)]
+        if self.changed != observed.changed {
+            return false;
+        }
+        self.same_generation(observed) && self.modified == observed.modified
+    }
+
     fn verify(&self, path: &Path) -> DbResult<()> {
-        if self.same_generation(&Self::capture(path)?) {
+        if self.same_generation(&Self::capture_standalone(path)?) {
             Ok(())
         } else {
             Err(DbError::Sqlite(format!(
@@ -13740,7 +13841,7 @@ where
 
 fn rotate_existing_proactive_backup(
     backup_path: &Path,
-    expected: &ProactiveBackupWitness,
+    expected: &SqliteFileWitness,
     mut move_backup: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> DbResult<PathBuf> {
     if !is_real_file(backup_path) || !sqlite_recovery_candidate_is_standalone(backup_path) {
@@ -29336,7 +29437,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let original = dir.path().join("retained-original.bak");
-        let before = ProactiveBackupWitness::capture(&backup).unwrap();
+        let before = SqliteFileWitness::capture_standalone(&backup).unwrap();
         rename_noreplace_preserving_source(&backup, &original).unwrap();
         std::fs::copy(&original, &backup).unwrap();
         std::fs::OpenOptions::new()
@@ -29345,7 +29446,7 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(before.modified.unwrap()))
             .unwrap();
-        let replaced = ProactiveBackupWitness::capture(&backup).unwrap();
+        let replaced = SqliteFileWitness::capture_standalone(&backup).unwrap();
         assert_eq!(before.len, replaced.len);
         assert_eq!(before.sha256, replaced.sha256);
         assert_eq!(before.modified, replaced.modified);
@@ -29393,7 +29494,7 @@ mod tests {
             let backup = dir.path().join("race.db.bak");
             let original = dir.path().join("inspected-generation.bak");
             std::fs::write(&backup, b"inspected generation").unwrap();
-            let expected = ProactiveBackupWitness::capture(&backup).unwrap();
+            let expected = SqliteFileWitness::capture_standalone(&backup).unwrap();
             let mut raced_rotation = None;
             let error = rotate_existing_proactive_backup(&backup, &expected, |from, to| {
                 // Actual filesystem replacement after the admission check,
@@ -30681,6 +30782,97 @@ mod tests {
             .expect("writer remains usable after staging");
         drop(canonical);
         crate::close_db_conn(writer, "native physical health fixture");
+    }
+
+    #[test]
+    fn idle_health_staging_refuses_generation_changes_between_copies() {
+        use std::io::Write as _;
+        for shape in [
+            "replace-main",
+            "replace-wal",
+            "rewrite-wal",
+            "appear-wal",
+            "disappear-wal",
+            "replace-main-and-wal",
+        ] {
+            let dir = tempfile::tempdir().expect("source directory");
+            let staging = tempfile::tempdir().expect("staging directory");
+            let source = dir.path().join("source.sqlite3");
+            seed_settled_diagnostic_database(&source);
+            let main_bytes = std::fs::read(&source).unwrap();
+            let wal = sqlite_sidecar_path(&source, "-wal");
+            if shape != "appear-wal" {
+                std::fs::write(&wal, [0x41; 64]).unwrap();
+            }
+            let expected_after_race = std::cell::RefCell::new(None);
+            let result = stage_sqlite_family_for_health_probe_with_copy_hook(
+                &source,
+                Some(staging.path()),
+                || {
+                    match shape {
+                        "replace-main" | "replace-main-and-wal" => {
+                            std::fs::rename(&source, dir.path().join("retained-main")).unwrap();
+                            std::fs::write(&source, &main_bytes).unwrap();
+                            if shape == "replace-main-and-wal" {
+                                std::fs::rename(&wal, dir.path().join("retained-wal")).unwrap();
+                                std::fs::write(&wal, [0x42; 64]).unwrap();
+                            }
+                        }
+                        "replace-wal" => {
+                            std::fs::rename(&wal, dir.path().join("retained-wal")).unwrap();
+                            std::fs::write(&wal, [0x41; 64]).unwrap();
+                        }
+                        "rewrite-wal" => {
+                            let modified = std::fs::metadata(&wal).unwrap().modified().unwrap();
+                            let mut file =
+                                std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
+                            file.write_all(&[0x42; 64]).unwrap();
+                            file.set_times(std::fs::FileTimes::new().set_modified(modified))
+                                .unwrap();
+                        }
+                        "appear-wal" => std::fs::write(&wal, [0x42; 64]).unwrap(),
+                        "disappear-wal" => {
+                            std::fs::rename(&wal, dir.path().join("retained-wal")).unwrap();
+                        }
+                        _ => unreachable!("fixed race shapes"),
+                    }
+                    *expected_after_race.borrow_mut() =
+                        Some(exact_diagnostic_parent_snapshot(dir.path()));
+                },
+            );
+            let error = result.err().expect("a mixed family must not be admitted");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock,
+                "{shape}: {error}"
+            );
+            assert_eq!(
+                exact_diagnostic_parent_snapshot(dir.path()),
+                expected_after_race.into_inner().expect("race hook ran"),
+                "refusing {shape} must preserve all source and displaced evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_health_staging_preserves_unchanged_family_witnesses() {
+        let dir = tempfile::tempdir().expect("source directory");
+        let source = dir.path().join("source.sqlite3");
+        seed_settled_diagnostic_database(&source);
+        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+            std::fs::write(sqlite_sidecar_path(&source, suffix), suffix.as_bytes()).unwrap();
+        }
+        let before = exact_diagnostic_parent_snapshot(dir.path());
+        let staged = stage_sqlite_family_for_health_probe(&source)
+            .expect("stable family stages")
+            .expect("regular family");
+        for suffix in std::iter::once("").chain(SQLITE_RECOVERY_SIDECAR_SUFFIXES.iter().copied()) {
+            assert_eq!(
+                std::fs::read(sqlite_sidecar_path(staged.path(), suffix)).unwrap(),
+                std::fs::read(sqlite_sidecar_path(&source, suffix)).unwrap()
+            );
+        }
+        assert_eq!(exact_diagnostic_parent_snapshot(dir.path()), before);
     }
 
     #[cfg(target_os = "linux")]
