@@ -2298,8 +2298,8 @@ impl AgentPlatform {
     /// (NOT Gemini's `~/.gemini/settings.json`). This was verified empirically
     /// by stracing the live agy 1.0.7 binary, which opens
     /// `~/.gemini/config/mcp_config.json` at session start and spawns the
-    /// configured stdio `command`. The HTTP form uses `httpUrl` + `headers`,
-    /// identical to Gemini's MCP entry shape.
+    /// configured stdio `command`. The current CLI's HTTP form uses
+    /// `serverUrl` + `headers` (verified against agy 1.2.7).
     ///
     /// Token safety (issue #148): the user-level `mcp_config.json` carries NO
     /// bearer token; only the project-local `agy.mcp.json` embeds the
@@ -2319,7 +2319,7 @@ impl AgentPlatform {
             "agy.mcp.json",
             "mcpServers",
             json!({
-                "httpUrl": url,
+                "serverUrl": url,
                 "headers": auth_headers_value(token)
             }),
             "Antigravity (agy) project-local MCP config",
@@ -2334,7 +2334,7 @@ impl AgentPlatform {
                 content: ConfigContent::JsonMerge {
                     servers_key: "mcpServers",
                     server_name: "mcp-agent-mail",
-                    server_value: json!({ "httpUrl": url }),
+                    server_value: json!({ "serverUrl": url }),
                     reconcile_omp_user_runtime_lists: false,
                 },
                 permissions: 0o644,
@@ -4765,6 +4765,14 @@ fn config_file_status_for_action(
     }
 
     let mut analysis = match &content {
+        Ok(Some(snapshot)) if action.platform == AgentPlatform::Antigravity => {
+            analyze_antigravity_config(
+                &snapshot.content,
+                expected_url,
+                expected_auth.as_deref(),
+                home.as_deref(),
+            )
+        }
         Ok(Some(snapshot))
             if matches!(action.content, ConfigContent::ClaudeLocalScopeMcp { .. }) =>
         {
@@ -6161,6 +6169,27 @@ fn apply_omp_active_user_config_drift(
     }
 }
 
+fn analyze_antigravity_config(
+    content: &str,
+    expected_url: &str,
+    expected_auth: Option<&str>,
+    home: Option<&Path>,
+) -> ConfigContentAnalysis {
+    let Ok(mut doc) = serde_json::from_str::<Value>(content) else {
+        return analyze_json_config_content(content, expected_url, expected_auth, home);
+    };
+    // agy does not accept Gemini's httpUrl or the generic url spelling.
+    // Remove them only from this analysis view, so an ignored stale field
+    // cannot mask a missing or incorrect serverUrl. Preserve the file bytes.
+    if let Some(servers) = doc.get_mut("mcpServers").and_then(Value::as_object_mut) {
+        for entry in servers.values_mut().filter_map(Value::as_object_mut) {
+            entry.remove("url");
+            entry.remove("httpUrl");
+        }
+    }
+    analyze_json_config_content(&doc.to_string(), expected_url, expected_auth, home)
+}
+
 fn analyze_claude_local_config(
     content: &str,
     action: &ConfigContent,
@@ -6361,6 +6390,7 @@ fn json_entry_url(entry: &Value) -> Option<&str> {
     entry
         .get("url")
         .or_else(|| entry.get("httpUrl"))
+        .or_else(|| entry.get("serverUrl"))
         .and_then(Value::as_str)
 }
 
@@ -8828,7 +8858,7 @@ mod tests {
     }
 
     #[test]
-    fn config_actions_antigravity_uses_http_url_and_gemini_config_path() {
+    fn config_actions_antigravity_uses_server_url_and_gemini_config_path() {
         // bd-47kjh.7.2: agy reads ~/.gemini/config/mcp_config.json (verified by
         // stracing the live agy 1.0.7 binary), NOT ~/.gemini/settings.json.
         let home = PathBuf::from("/tmp/agyhome");
@@ -8842,7 +8872,7 @@ mod tests {
         let actions = AgentPlatform::Antigravity.config_actions(&params);
         assert_eq!(actions.len(), 2, "project-local + user-level");
 
-        // Project-local agy.mcp.json carries httpUrl + the bearer header.
+        // Project-local agy.mcp.json carries serverUrl + the bearer header.
         let project = &actions[0];
         assert_eq!(project.file_path, PathBuf::from("/tmp/p/agy.mcp.json"));
         match &project.content {
@@ -8853,8 +8883,8 @@ mod tests {
             } => {
                 assert_eq!(*servers_key, "mcpServers");
                 assert!(
-                    server_value.get("httpUrl").is_some(),
-                    "agy uses httpUrl (gemini-compatible schema)"
+                    server_value.get("serverUrl").is_some(),
+                    "agy 1.2.7 uses serverUrl for HTTP transport"
                 );
                 assert!(
                     server_value.get("type").is_none(),
@@ -8878,7 +8908,7 @@ mod tests {
         );
         match &user.content {
             ConfigContent::JsonMerge { server_value, .. } => {
-                assert!(server_value.get("httpUrl").is_some());
+                assert!(server_value.get("serverUrl").is_some());
                 assert!(
                     server_value.get("headers").is_none(),
                     "user-level agy config must NOT embed a bearer token (#148)"
@@ -8911,6 +8941,78 @@ mod tests {
             }
             _ => panic!("expected JsonMerge"),
         }
+    }
+
+    #[test]
+    fn antigravity_setup_repairs_ignored_http_url_and_reports_real_transport() {
+        let tmp = setup_real_tempdir();
+        let params = SetupParams {
+            project_dir: tmp.path().join("project"),
+            home_dir_override: Some(tmp.path().join("home")),
+            agents: Some(vec![AgentPlatform::Antigravity]),
+            token: "transport-fixture-token".into(),
+            ..Default::default()
+        };
+        let actions = AgentPlatform::Antigravity.config_actions(&params);
+        for action in &actions {
+            std::fs::create_dir_all(action.file_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &action.file_path,
+                json!({"mcpServers": {"mcp-agent-mail": {
+                    "httpUrl": params.server_url()
+                }}})
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let before = check_status(&params);
+        for file in &before[0].config_files {
+            assert!(!file.url_matches, "agy ignores httpUrl: {file:?}");
+            assert_eq!(
+                file.primary_drift_reason,
+                ConfigDriftReason::UnsupportedConfig
+            );
+        }
+        let results = run_setup(&params);
+        assert!(
+            results[0]
+                .actions
+                .iter()
+                .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_)))
+        );
+        for action in &actions {
+            let doc: Value =
+                serde_json::from_slice(&std::fs::read(&action.file_path).unwrap()).unwrap();
+            let entry = &doc["mcpServers"]["mcp-agent-mail"];
+            assert_eq!(entry["serverUrl"], params.server_url());
+            assert!(entry.get("httpUrl").is_none());
+            assert!(entry.get("command").is_none());
+        }
+        let after = check_status(&params);
+        for file in &after[0].config_files {
+            assert_eq!(file.primary_drift_reason, ConfigDriftReason::Ok);
+        }
+        assert!(
+            !serde_json::to_string(&after)
+                .unwrap()
+                .contains(&params.token)
+        );
+        // A stale recognized URL cannot be masked by an ignored healthy alias.
+        let user_path = &actions[1].file_path;
+        std::fs::write(
+            user_path,
+            json!({"mcpServers": {"mcp-agent-mail": {
+                "serverUrl": "http://stale.invalid/mcp/",
+                "httpUrl": params.server_url(),
+                "url": params.server_url()
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            check_status(&params)[0].config_files[1].primary_drift_reason,
+            ConfigDriftReason::StaleHttpPath
+        );
     }
 
     #[test]
