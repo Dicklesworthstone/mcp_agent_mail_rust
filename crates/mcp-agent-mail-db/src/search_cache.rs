@@ -1113,9 +1113,16 @@ mod tests {
                                 assert_eq!(value, epoch);
                             }
                         }
-                        let epoch = cache.current_epoch();
+                        // The epoch MUST be read while the entries guard is held. This
+                        // assertion is about entries and epoch being mutually consistent;
+                        // reading the epoch first lets a concurrent `bump_epoch` land in
+                        // between, after which `entries` legitimately holds keys from a
+                        // newer epoch and the check fails spuriously. Correctness outranks
+                        // the drop-tightening lint here.
+                        #[allow(clippy::significant_drop_tightening)]
                         let (all_current_epoch, entry_count) = {
                             let entries = cache.entries.read().unwrap();
+                            let epoch = cache.current_epoch();
                             (
                                 entries.keys().all(|key| key.index_epoch == epoch),
                                 entries.len(),
