@@ -406,16 +406,23 @@ impl<T: Clone> QueryCache<T> {
     /// unreachable entries also prevents an epoch-only bump from retaining old
     /// response bodies until TTL expiry or evicting useful new-generation data.
     pub fn bump_epoch(&self) -> u64 {
-        let mut entries = self
-            .entries
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let next_epoch = self
-            .current_epoch
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
-        let count = entries.len();
-        entries.clear();
+        // The epoch bump and the clear are what must be atomic with respect to
+        // `get`/`put`; the metrics bookkeeping is not. Scope the write guard so
+        // it is released before `update_metrics` takes the metrics lock.
+        let (next_epoch, count) = {
+            let mut entries = self
+                .entries
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let next_epoch = self
+                .current_epoch
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1);
+            let count = entries.len();
+            entries.clear();
+            drop(entries);
+            (next_epoch, count)
+        };
         self.update_metrics(|metrics| {
             metrics.evictions_epoch += count as u64;
             metrics.current_entries = 0;
@@ -1106,10 +1113,16 @@ mod tests {
                                 assert_eq!(value, epoch);
                             }
                         }
-                        let entries = cache.entries.read().unwrap();
                         let epoch = cache.current_epoch();
-                        assert!(entries.keys().all(|key| key.index_epoch == epoch));
-                        assert!(entries.len() <= 8);
+                        let (all_current_epoch, entry_count) = {
+                            let entries = cache.entries.read().unwrap();
+                            (
+                                entries.keys().all(|key| key.index_epoch == epoch),
+                                entries.len(),
+                            )
+                        };
+                        assert!(all_current_epoch);
+                        assert!(entry_count <= 8);
                     }
                 });
             }
