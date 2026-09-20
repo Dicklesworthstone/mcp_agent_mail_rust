@@ -97,11 +97,7 @@ pub fn generate_snippet(text: &str, query_terms: &[String]) -> Option<String> {
 }
 
 /// The character budget excludes the optional leading/trailing ellipses.
-fn generate_snippet_with_limit(
-    text: &str,
-    query_terms: &[String],
-    max_chars: usize,
-) -> Option<String> {
+fn generate_snippet_with_limit(text: &str, query_terms: &[String], max_chars: usize) -> Option<String> {
     if text.is_empty() || query_terms.is_empty() || max_chars == 0 {
         return None;
     }
@@ -169,11 +165,7 @@ fn advance_chars(text: &str, pos: usize, count: usize) -> usize {
 
 /// Find UTF-8 byte ranges in the original text, not its lowercased copy.
 #[must_use]
-pub fn find_highlights(
-    text: &str,
-    field_name: &str,
-    query_terms: &[String],
-) -> Vec<HighlightRange> {
+pub fn find_highlights(text: &str, field_name: &str, query_terms: &[String]) -> Vec<HighlightRange> {
     if text.is_empty() || query_terms.is_empty() {
         return Vec::new();
     }
@@ -270,6 +262,90 @@ impl Default for ResponseConfig {
     }
 }
 
+/// The complete ranking key must participate in collection, not just in a
+/// sort after collection: discarded ties cannot be recovered by sorting.
+#[cfg(feature = "tantivy-engine")]
+#[derive(Debug, Clone, Copy)]
+struct LexicalRank {
+    score: f32,
+    doc_id: i64,
+}
+
+#[cfg(feature = "tantivy-engine")]
+impl PartialEq for LexicalRank {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+#[cfg(feature = "tantivy-engine")]
+impl Eq for LexicalRank {}
+
+#[cfg(feature = "tantivy-engine")]
+impl PartialOrd for LexicalRank {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[cfg(feature = "tantivy-engine")]
+impl Ord for LexicalRank {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| self.doc_id.cmp(&other.doc_id))
+    }
+}
+
+#[cfg(feature = "tantivy-engine")]
+type RankedDocuments = Vec<(LexicalRank, tantivy::DocAddress)>;
+
+#[cfg(feature = "tantivy-engine")]
+fn collect_ranked_page(
+    searcher: &tantivy::Searcher,
+    query: &dyn Query,
+    handles: &FieldHandles,
+    limit: usize,
+    offset: usize,
+) -> tantivy::Result<(usize, RankedDocuments)> {
+    let num_docs = usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX);
+    if limit == 0 || offset >= num_docs {
+        // Preserve the exact matching count, including for count-only queries
+        // and offsets far beyond the index, without allocating a top-K heap.
+        return searcher.search(query, &Count).map(|count| (count, Vec::new()));
+    }
+
+    // Bound offset + limit by the immutable snapshot's size before Tantivy
+    // allocates its collector. In particular, usize::MAX is not a heap size.
+    let page_limit = limit.min(num_docs - offset);
+    let id_field = searcher.schema().get_field_name(handles.id).to_string();
+    let id_columns = searcher
+        .segment_readers()
+        .iter()
+        .map(|segment| {
+            segment
+                .fast_fields()
+                .u64(&id_field)
+                .map(|column| (segment.segment_id(), column))
+        })
+        .collect::<tantivy::Result<HashMap<_, _>>>()?;
+
+    let collector = TopDocs::with_limit(page_limit).and_offset(offset).tweak_score(
+        move |segment: &tantivy::SegmentReader| {
+            // These are precisely the segments of this immutable searcher;
+            // opening a missing or invalid fast field already returned Err.
+            let ids = id_columns[&segment.segment_id()].clone();
+            move |doc: tantivy::DocId, score: tantivy::Score| {
+                // Match build_hit's representation of the stored document ID.
+                #[allow(clippy::cast_possible_wrap)]
+                let doc_id = ids.first(doc).unwrap_or(0) as i64;
+                LexicalRank { score, doc_id }
+            }
+        },
+    );
+    searcher.search(query, &(Count, collector))
+}
+
 /// Execute a Tantivy search and assemble results with pagination, snippets,
 /// and optional explain report.
 ///
@@ -300,57 +376,34 @@ pub fn execute_search(
         return SearchResults::empty(SearchMode::Lexical, start.elapsed());
     };
     let searcher = reader.searcher();
-
-    // Fetch more results than needed to handle offset + count total
-    let fetch_limit = offset.saturating_add(limit).max(1);
-    let Ok((total_count, top_docs)) = searcher.search(
-        query,
-        &(Count, TopDocs::with_limit(fetch_limit).order_by_score()),
-    ) else {
+    let Ok((total_count, top_docs)) =
+        collect_ranked_page(&searcher, query, handles, limit, offset)
+    else {
         return SearchResults::empty(SearchMode::Lexical, start.elapsed());
     };
 
-    // Build hits
-    let mut ranked_hits = Vec::with_capacity(top_docs.len());
     let composer_config = ExplainComposerConfig {
         verbosity: config.explain_verbosity,
         max_factors_per_stage: config.explain_max_factors,
     };
+    let mut hits = Vec::with_capacity(top_docs.len());
+    let mut explanations = Vec::new();
 
-    for (score, doc_addr) in top_docs {
+    // The collector has already ranked and paginated using the complete key.
+    // Do not load bodies, generate snippets, or explain skipped documents.
+    for (rank, doc_addr) in top_docs {
         let doc: TantivyDocument = match searcher.doc(doc_addr) {
             Ok(d) => d,
             Err(_) => continue,
         };
-
-        let hit = build_hit(&doc, handles, score, query_terms, config);
-        let explanation =
-            explain.then(|| build_explanation(&hit, score, query_terms, &composer_config));
-        ranked_hits.push((hit, explanation));
-    }
-
-    // Sort primarily by score descending, secondary by ID for determinism.
-    ranked_hits.sort_by(|(a, _), (b, _)| {
-        let score_cmp = b.score.total_cmp(&a.score);
-        if score_cmp == std::cmp::Ordering::Equal {
-            b.doc_id.cmp(&a.doc_id)
-        } else {
-            score_cmp
-        }
-    });
-
-    if offset > 0 {
-        ranked_hits.drain(0..offset.min(ranked_hits.len()));
-    }
-    if ranked_hits.len() > limit {
-        ranked_hits.truncate(limit);
-    }
-
-    let mut hits = Vec::with_capacity(ranked_hits.len());
-    let mut explanations = Vec::new();
-    for (hit, explanation) in ranked_hits {
-        if let Some(explanation) = explanation {
-            explanations.push(explanation);
+        let hit = build_hit(&doc, handles, rank.score, query_terms, config);
+        if explain {
+            explanations.push(build_explanation(
+                &hit,
+                rank.score,
+                query_terms,
+                &composer_config,
+            ));
         }
         hits.push(hit);
     }
@@ -775,8 +828,10 @@ mod tests {
             let text = format!("prefix{separator}{} NEEDLE tail", "x".repeat(50));
             let snippet = generate_snippet(&text, &["needle".to_string()]).unwrap();
             assert!(snippet.contains("NEEDLE"), "{separator:?}: {snippet}");
-            assert_eq!(snap_to_word_start(&text, text.find("NEEDLE").unwrap() - 2),
-                "prefix".len() + separator.len_utf8());
+            assert_eq!(
+                snap_to_word_start(&text, text.find("NEEDLE").unwrap() - 2),
+                "prefix".len() + separator.len_utf8()
+            );
         }
     }
 
@@ -1187,6 +1242,149 @@ mod tests {
                         window[1].doc_id
                     );
                 }
+            }
+        }
+
+        #[test]
+        fn single_result_pages_do_not_repeat_or_omit_tied_documents() {
+            let (index, handles) = setup_index();
+            let config = ResponseConfig::default();
+            let mut ids = Vec::new();
+            for offset in 0..3 {
+                let results = execute_search(
+                    &index, &AllQuery, &handles, &[], 1, offset, true, &config,
+                );
+                assert_eq!(results.total_count, 3);
+                assert_eq!(results.hits.len(), 1);
+                assert_eq!(results.explain.as_ref().unwrap().hits.len(), 1);
+                ids.push(results.hits[0].doc_id);
+            }
+            assert_eq!(ids, vec![3, 2, 1]);
+        }
+
+        #[test]
+        fn tied_pages_are_stable_across_segments_and_insertion_order() {
+            let (schema, handles) = build_schema();
+            let index = Index::create_in_ram(schema);
+            register_tokenizer(&index);
+            let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+            let ids = [12u64, 4, 8, 1, 15, 11, 3, 14, 9, 2, 7, 13, 6, 10, 5];
+            for batch in ids.chunks(5) {
+                for &id in batch {
+                    writer
+                        .add_document(doc!(
+                            handles.id => id,
+                            handles.doc_kind => "message",
+                            handles.body => "same matching text"
+                        ))
+                        .unwrap();
+                }
+                writer.commit().unwrap();
+            }
+            let reader = manual_index_reader(&index).unwrap();
+            assert_eq!(reader.searcher().segment_readers().len(), 3);
+
+            let config = ResponseConfig::default();
+            let mut paged_ids = Vec::new();
+            for offset in (0..15).step_by(2) {
+                let results = execute_search(
+                    &index, &AllQuery, &handles, &[], 2, offset, false, &config,
+                );
+                assert_eq!(results.total_count, 15);
+                paged_ids.extend(results.hits.iter().map(|hit| hit.doc_id));
+            }
+            assert_eq!(paged_ids, (1i64..=15).rev().collect::<Vec<_>>());
+        }
+
+        #[test]
+        fn relevance_precedes_id_and_original_scores_are_preserved() {
+            use tantivy::query::{BooleanQuery, Occur, TermQuery};
+            use tantivy::schema::IndexRecordOption;
+
+            let (index, handles) = setup_index();
+            let query = BooleanQuery::new(vec![
+                (Occur::Should, Box::new(AllQuery)),
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        tantivy::Term::from_field_u64(handles.id, 1),
+                        IndexRecordOption::Basic,
+                    )),
+                ),
+            ]);
+            let reader = manual_index_reader(&index).unwrap();
+            let searcher = reader.searcher();
+            let baseline = searcher
+                .search(&query, &TopDocs::with_limit(3).order_by_score())
+                .unwrap();
+            let expected_scores: HashMap<_, _> = baseline
+                .into_iter()
+                .map(|(score, address)| {
+                    let doc: TantivyDocument = searcher.doc(address).unwrap();
+                    let id = doc.get_first(handles.id).unwrap().as_u64().unwrap();
+                    (id, f64::from(score).to_bits())
+                })
+                .collect();
+            let config = ResponseConfig::default();
+            let mut ids = Vec::new();
+            for offset in 0..3 {
+                let result = execute_search(
+                    &index, &query, &handles, &[], 1, offset, true, &config,
+                );
+                let hit = &result.hits[0];
+                let id = u64::try_from(hit.doc_id).unwrap();
+                assert_eq!(hit.score.to_bits(), expected_scores[&id]);
+                ids.push(hit.doc_id);
+            }
+            assert_eq!(ids, vec![1, 3, 2]);
+        }
+
+        #[test]
+        fn zero_limit_and_out_of_range_offsets_keep_exact_counts() {
+            let (index, handles) = setup_index();
+            let config = ResponseConfig::default();
+            for (limit, offset) in [(0, 0), (0, usize::MAX), (10, 3), (1, usize::MAX)] {
+                let result = execute_search(
+                    &index, &AllQuery, &handles, &[], limit, offset, true, &config,
+                );
+                assert_eq!(result.total_count, 3);
+                assert!(result.hits.is_empty());
+                assert!(result.explain.unwrap().hits.is_empty());
+            }
+            let parser = QueryParser::for_index(&index, vec![handles.subject, handles.body]);
+            let query = parser.parse_query("migration").unwrap();
+            let result = execute_search(
+                &index, &*query, &handles, &[], 0, usize::MAX, false, &config,
+            );
+            assert_eq!(result.total_count, 1);
+        }
+
+        #[test]
+        fn oversized_limits_are_bounded_by_snapshot_size() {
+            let (index, handles) = setup_index();
+            let config = ResponseConfig::default();
+            for (offset, expected) in [(0, vec![3, 2, 1]), (1, vec![2, 1]), (2, vec![1])] {
+                let result = execute_search(
+                    &index, &AllQuery, &handles, &[], usize::MAX, offset, false, &config,
+                );
+                assert_eq!(result.total_count, 3);
+                let ids: Vec<_> = result.hits.iter().map(|hit| hit.doc_id).collect();
+                assert_eq!(ids, expected);
+            }
+        }
+
+        #[test]
+        fn lexical_rank_uses_a_total_score_order_and_id_tiebreak() {
+            let higher_score = LexicalRank { score: 2.0, doc_id: 1 };
+            let higher_id = LexicalRank { score: 1.0, doc_id: 100 };
+            let lower_id = LexicalRank { score: 1.0, doc_id: 2 };
+            assert!(higher_score > higher_id);
+            assert!(higher_id > lower_id);
+            for score in [f32::NEG_INFINITY, -0.0, 0.0, f32::INFINITY, f32::NAN] {
+                let rank = LexicalRank { score, doc_id: 1 };
+                assert_eq!(rank, rank);
+                assert_eq!(rank.partial_cmp(&rank), Some(std::cmp::Ordering::Equal));
             }
         }
     }
