@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_lines)]
 
+use asupersync::runtime::RuntimeBuilder;
 use fastmcp::{Cx, JsonRpcMessage, JsonRpcRequest, StdioTransport, Transport};
 use fastmcp_transport::http::{
     HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler, HttpTransport,
@@ -122,10 +123,18 @@ fn execute_transport(transport: TransportKind, payloads: Vec<Payload>) -> Transp
 
             let transport = StdioTransport::new(Cursor::new(input), writer);
             let handle = std::thread::spawn(move || {
-                let cx = Cx::for_testing();
-                if let Err(error) = server.run_transport_returning_with_cx(&cx, transport) {
-                    eprintln!("stdio transport stopped with an error: {error}");
-                }
+                // Legacy dispatch now owns each request in a child region;
+                // a detached testing Cx cannot supply that runtime authority.
+                let runtime = RuntimeBuilder::multi_thread()
+                    .worker_threads(2)
+                    .build()
+                    .expect("stdio test runtime");
+                runtime.block_on(async {
+                    let cx = Cx::current().expect("stdio runtime context");
+                    if let Err(error) = server.run_transport_returning_with_cx(&cx, transport) {
+                        eprintln!("stdio transport stopped with an error: {error}");
+                    }
+                });
             });
             handle.join().expect("stdio server thread");
 
@@ -151,10 +160,16 @@ fn execute_transport(transport: TransportKind, payloads: Vec<Payload>) -> Transp
             let transport =
                 HttpTransport::with_config(Cursor::new(input), writer, agent_mail_http_config());
             let handle = std::thread::spawn(move || {
-                let cx = Cx::for_testing();
-                if let Err(error) = server.run_transport_returning_with_cx(&cx, transport) {
-                    eprintln!("HTTP transport stopped with an error: {error}");
-                }
+                let runtime = RuntimeBuilder::multi_thread()
+                    .worker_threads(2)
+                    .build()
+                    .expect("HTTP test runtime");
+                runtime.block_on(async {
+                    let cx = Cx::current().expect("HTTP runtime context");
+                    if let Err(error) = server.run_transport_returning_with_cx(&cx, transport) {
+                        eprintln!("HTTP transport stopped with an error: {error}");
+                    }
+                });
             });
             handle.join().expect("http server thread");
 
@@ -521,7 +536,13 @@ fn protocol_lifecycle_initialize_then_initialized_then_tools_list() {
         let tools = execution.responses[1]
             .pointer("/result/tools")
             .and_then(Value::as_array)
-            .expect("tools/list must include tools array");
+            .unwrap_or_else(|| {
+                panic!(
+                    "tools/list must include tools array for {}: {:?}",
+                    transport.label(),
+                    execution.responses
+                )
+            });
         assert!(
             !tools.is_empty(),
             "tools/list must return tools after initialize for {}",
@@ -534,8 +555,9 @@ fn protocol_lifecycle_initialize_then_initialized_then_tools_list() {
 fn malformed_inputs_do_not_crash_the_server_loop() {
     for transport in TransportKind::ALL {
         match transport {
-            // Stdio recovers in-stream: the malformed frame is dropped and
-            // the next valid request on the same session is answered.
+            // JSON-RPC requires an uncorrelated parse-error response for
+            // invalid JSON. Stdio then answers the next valid request on
+            // the same session instead of terminating the stream.
             TransportKind::Stdio => {
                 let execution = execute_transport(
                     transport,
@@ -546,41 +568,47 @@ fn malformed_inputs_do_not_crash_the_server_loop() {
                 );
                 assert_eq!(
                     execution.responses.len(),
-                    1,
-                    "only the valid request should produce a response after malformed input for {}",
-                    transport.label()
+                    2,
+                    "parse error and subsequent valid request must both receive responses for {}: {:?}",
+                    transport.label(),
+                    execution.responses
                 );
                 assert_eq!(
-                    execution.responses[0]["id"],
+                    execution.responses[0]["error"]["code"],
+                    json!(-32700),
+                    "malformed JSON must produce the standard parse error"
+                );
+                assert_eq!(execution.responses[0]["id"], Value::Null);
+                assert!(execution.responses[0].get("result").is_none());
+                assert_eq!(
+                    execution.responses[1]["id"],
                     json!(5),
                     "server should recover and answer the next valid request for {}",
                     transport.label()
                 );
+                assert!(execution.responses[1].get("error").is_none());
+                assert!(execution.responses[1].get("result").is_some());
             }
-            // A malformed HTTP body is declined without ever echoing
-            // attacker-controlled bytes as a JSON-RPC response (since the
-            // GH#250 fastmcp rev the listener answers 400 and keeps the
-            // connection open rather than dropping it — either behavior
-            // satisfies these assertions). A fresh connection must serve
-            // valid traffic normally, i.e. the process survived.
+            // The raw request/response HTTP transport carries the same
+            // uncorrelated JSON-RPC parse error in its HTTP 200 envelope.
+            // It must not echo the malformed input or poison later sessions.
             TransportKind::Http => {
                 let poisoned =
                     execute_transport(transport, vec![Payload::Raw(b"{not-json}".to_vec())]);
-                assert!(
-                    poisoned.responses.is_empty(),
-                    "malformed http input must not produce a JSON-RPC response"
+                assert_eq!(poisoned.responses.len(), 1, "{:?}", poisoned.responses);
+                assert_eq!(poisoned.responses[0]["id"], Value::Null);
+                assert_eq!(poisoned.responses[0]["error"]["code"], json!(-32700));
+                assert_eq!(poisoned.responses[0]["error"]["message"], "Parse error");
+                assert!(poisoned.responses[0].get("result").is_none());
+                assert!(!String::from_utf8_lossy(&poisoned.raw_output).contains("{not-json}"));
+                assert_eq!(
+                    poisoned
+                        .http_headers
+                        .first()
+                        .and_then(|headers| headers.get(":status"))
+                        .map(String::as_str),
+                    Some("200")
                 );
-                if let Some(status) = poisoned
-                    .http_headers
-                    .first()
-                    .and_then(|headers| headers.get(":status"))
-                    .map(String::as_str)
-                {
-                    assert_eq!(
-                        status, "400",
-                        "malformed http body must be rejected with 400 Bad Request"
-                    );
-                }
                 let recovered =
                     execute_transport(transport, vec![Payload::Json(initialize_request(5_i64))]);
                 assert_eq!(
@@ -593,6 +621,8 @@ fn malformed_inputs_do_not_crash_the_server_loop() {
                     json!(5),
                     "http recovery response must echo the request id"
                 );
+                assert!(recovered.responses[0].get("error").is_none());
+                assert!(recovered.responses[0].get("result").is_some());
             }
         }
     }
