@@ -132,10 +132,12 @@ impl ReservationIndex {
         let req_is_glob = request_pat.is_glob();
         let req_prefix = request_pat.first_literal_segment();
 
-        if req_is_glob {
-            // Glob request: must scan relevant prefix groups + root for both
-            // exact and glob reservations, because a glob request can overlap
-            // exact paths via one-directional matching.
+        if req_is_glob || req_norm.is_empty() {
+            // Root (including ".", "/", and other root-normalizing aliases)
+            // contains every exact path. It has no descendant-prefix range,
+            // so the exact fast path would silently miss those reservations.
+            // Reuse the unpartitioned scan and the same overlap predicate as
+            // an exhaustive check. Ordinary globs still use prefix pruning.
             self.scan_glob_request::<COUNT_STATS>(request_pat, req_prefix, conflicts, stats);
         } else {
             // Exact request path: check for exact equality + overlapping globs.
@@ -230,10 +232,11 @@ impl ReservationIndex {
         }
     }
 
-    /// Scan for conflicts when the request is a glob pattern.
+    /// Scan for conflicts when the request is a glob pattern or the exact root.
     ///
     /// A glob request like `src/**` can match exact reservations like `src/main.rs`,
     /// so we must scan the exact anchor (`src`) and exact descendants (`src/...`).
+    /// The exact root has no literal prefix and must visit every group.
     fn scan_glob_request<'a, const COUNT_STATS: bool>(
         &'a self,
         request_pat: &CompiledPattern,
@@ -310,7 +313,7 @@ impl ReservationIndex {
                 }
             }
         } else {
-            // Root glob request (no prefix): must check ALL groups.
+            // No literal prefix: root-wide requests must check ALL groups.
             for entries in self.exact_by_path.values() {
                 note_exact_entries::<COUNT_STATS>(stats, entries.len());
                 for (exact_pat, rref) in entries {
@@ -427,6 +430,11 @@ mod tests {
 
     fn reservation_pattern_strategy() -> impl Strategy<Value = String> {
         prop_oneof![
+            Just(String::new()),
+            Just(".".to_string()),
+            Just("./".to_string()),
+            Just("/".to_string()),
+            Just("src/..".to_string()),
             Just("src".to_string()),
             Just("src/main.rs".to_string()),
             Just("src/lib.rs".to_string()),
@@ -854,5 +862,120 @@ mod tests {
             1,
             "Root reservation should conflict with glob request"
         );
+    }
+
+    #[test]
+    fn root_request_reports_every_bucket_and_preserves_distinct_holders() {
+        let patterns = [
+            "src/main.rs",
+            "docs/readme.md",
+            "src/main.rs",
+            ".",
+            "src/**",
+            "docs/*.md",
+            "**/*.rs",
+        ];
+        let index = ReservationIndex::build(patterns.iter().enumerate().map(|(i, pattern)| {
+            let id = i64::try_from(i).unwrap();
+            ((*pattern).to_string(), make_ref_for_pattern(id, pattern))
+        }));
+        for alias in ["", ".", "./", "/", "src/..", "a\\..", " /./ "] {
+            let request = CompiledPattern::new(alias);
+            assert_eq!(request.normalized(), "");
+            let mut conflicts = Vec::new();
+            let stats = index.find_conflicts_with_stats(&request, &mut conflicts);
+            conflicts.sort_unstable_by_key(|entry| entry.agent_id);
+            let ids: Vec<_> = conflicts.iter().map(|entry| entry.agent_id).collect();
+            assert_eq!(ids, vec![0, 1, 2, 3, 4, 5, 6], "{alias:?}");
+            assert_eq!(stats.exact_paths, 4);
+            assert_eq!(stats.prefixed_globs, 2);
+            assert_eq!(stats.root_globs, 1);
+            for (entry, pattern) in conflicts.iter().zip(patterns) {
+                assert_eq!(entry.path_pattern, pattern);
+                assert_eq!(entry.expires_ts, entry.agent_id);
+                assert!(entry.exclusive);
+            }
+        }
+    }
+
+    #[test]
+    fn root_and_file_acquisition_orders_have_the_same_conflicts() {
+        let roots: Vec<_> = ["", ".", "./", "/", "src/.."]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let paths: Vec<_> = [
+            "src/main.rs",
+            "docs/readme.md",
+            "Cargo.toml",
+            "deep/nested/file",
+            "src/**",
+            "*.rs",
+            "[abc",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_index_matches_exhaustive(&paths, &roots);
+        assert_index_matches_exhaustive(&roots, &paths);
+        assert_index_matches_exhaustive(&roots, &roots);
+    }
+
+    #[test]
+    fn root_request_visits_ten_thousand_files_and_root_exactly_once() {
+        let files = (0_i64..10_000).map(|id| {
+            let pattern = format!("project_{id}/src/lib.rs");
+            (pattern.clone(), make_ref_for_pattern(id, &pattern))
+        });
+        let index = ReservationIndex::build(
+            files.chain(std::iter::once((".".to_string(), make_ref(10_000)))),
+        );
+        let mut conflicts = Vec::new();
+        let stats = index.find_conflicts_with_stats(&CompiledPattern::new("./"), &mut conflicts);
+        let mut ids: Vec<_> = conflicts.iter().map(|entry| entry.agent_id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0_i64..=10_000).collect::<Vec<_>>());
+        assert_eq!(stats.exact_paths, 10_001);
+        assert_eq!(stats.prefixed_globs, 0);
+        assert_eq!(stats.root_globs, 0);
+    }
+
+    #[test]
+    fn root_scan_does_not_leave_stale_conflicts_in_reused_buffer() {
+        let index = ReservationIndex::build(
+            ["src/main.rs", "docs/readme.md"]
+                .into_iter()
+                .enumerate()
+                .map(|(id, pattern)| {
+                    (pattern.to_string(), make_ref(i64::try_from(id).unwrap()))
+                }),
+        );
+        let mut conflicts = Vec::new();
+        index.find_conflicts(&CompiledPattern::new("."), &mut conflicts);
+        assert_eq!(conflicts.len(), 2);
+        index.find_conflicts(&CompiledPattern::new("src/main.rs"), &mut conflicts);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].agent_id, 0);
+        index.find_conflicts(&CompiledPattern::new("unreserved.rs"), &mut conflicts);
+        assert!(conflicts.is_empty());
+        let empty = ReservationIndex::build(std::iter::empty());
+        empty.find_conflicts(&CompiledPattern::new("/"), &mut Vec::new());
+        let mut empty_conflicts = Vec::new();
+        empty.find_conflicts(&CompiledPattern::new("/"), &mut empty_conflicts);
+        assert!(empty_conflicts.is_empty());
+    }
+
+    #[test]
+    fn normalized_non_root_request_keeps_exact_path_pruning() {
+        let index = ReservationIndex::build((0_i64..10_000).map(|id| {
+            let pattern = format!("project_{id}/src/lib.rs");
+            (pattern.clone(), make_ref_for_pattern(id, &pattern))
+        }));
+        let request = CompiledPattern::new("unused/../project_7777/./src/lib.rs");
+        let mut conflicts = Vec::new();
+        let stats = index.find_conflicts_with_stats(&request, &mut conflicts);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].agent_id, 7777);
+        assert_eq!(stats.exact_paths, 1);
     }
 }
