@@ -390,6 +390,21 @@ fn restore_inbox_metadata(
     Ok(message)
 }
 
+fn merge_surviving_metadata(
+    surviving: &mut Option<Value>,
+    message: Value,
+    disagreement: &str,
+) -> Result<(), String> {
+    if let Some(previous) = surviving.as_ref() {
+        if previous != &message {
+            return Err(disagreement.to_string());
+        }
+    } else {
+        *surviving = Some(message);
+    }
+    Ok(())
+}
+
 fn reconcile_prepared(
     config: &Config,
     prepared: &PreparedMessage,
@@ -410,24 +425,29 @@ fn reconcile_prepared(
             read_surviving_message(path).map_err(|error| error.to_string())?
         {
             validate_surviving_message(prepared, &message, &body)?;
-            if let Some(previous) = &surviving {
-                if previous != &message {
-                    return Err(
-                        "canonical and outbox metadata disagree; both preserved".to_string()
-                    );
-                }
-            } else {
-                surviving = Some(message);
-            }
+            merge_surviving_metadata(
+                &mut surviving,
+                message,
+                "canonical and outbox metadata disagree; both preserved",
+            )?;
         }
     }
-    // Disk loss can leave the exact canonical payload recoverable from Git.
-    if surviving.is_none() {
+    // Open Git lazily, once. Every fallback candidate comes from one pinned
+    // tree even if an archive writer advances HEAD while we inspect copies.
+    let committed = if surviving.is_none() {
+        Some(CommittedMessages::open(&archive)?)
+    } else {
+        None
+    };
+    if let Some(committed) = &committed {
         for path in [&paths.canonical, &paths.outbox] {
-            if let Some((message, body)) = read_committed_message(&archive, path)? {
+            if let Some((message, body)) = committed.read(&archive, path)? {
                 validate_surviving_message(prepared, &message, &body)?;
-                surviving = Some(message);
-                break;
+                merge_surviving_metadata(
+                    &mut surviving,
+                    message,
+                    "committed canonical and outbox metadata disagree; both preserved",
+                )?;
             }
         }
     }
@@ -440,15 +460,28 @@ fn reconcile_prepared(
                 read_surviving_message(path).map_err(|error| error.to_string())?
             {
                 let message = restore_inbox_metadata(prepared, message, &body)?;
-                if let Some(previous) = &surviving {
-                    if previous != &message {
-                        return Err(
-                            "surviving inbox metadata disagree; all copies preserved".to_string()
-                        );
-                    }
-                } else {
-                    surviving = Some(message);
-                }
+                merge_surviving_metadata(
+                    &mut surviving,
+                    message,
+                    "surviving inbox metadata disagree; all copies preserved",
+                )?;
+            }
+        }
+    }
+    // The working tree can lose every copy while Git still retains a redacted
+    // inbox blob. It is just as useful as an on-disk inbox for recovering reply
+    // metadata. Validate all committed inbox candidates, not only the first.
+    if surviving.is_none()
+        && let Some(committed) = &committed
+    {
+        for path in &paths.inbox {
+            if let Some((message, body)) = committed.read(&archive, path)? {
+                let message = restore_inbox_metadata(prepared, message, &body)?;
+                merge_surviving_metadata(
+                    &mut surviving,
+                    message,
+                    "committed inbox metadata disagree; all copies preserved",
+                )?;
             }
         }
     }
@@ -475,58 +508,80 @@ fn reconcile_prepared(
     .map_err(|error| error.to_string())
 }
 
-fn read_committed_message(
-    archive: &ProjectArchive,
-    path: &std::path::Path,
-) -> Result<Option<(Value, String)>, String> {
-    let repo = git2::Repository::open(
-        crate::archive_repo_root_checked(archive).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    let head = match repo.head() {
-        Ok(head) => head,
-        Err(error)
-            if matches!(
-                error.code(),
-                git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound
-            ) =>
-        {
+/// Immutable Git observation for all surviving copies of one message.
+/// Holding the tree identity avoids mixing metadata from separate HEADs.
+struct CommittedMessages {
+    repo: git2::Repository,
+    tree_id: Option<git2::Oid>,
+}
+
+impl CommittedMessages {
+    fn open(archive: &ProjectArchive) -> Result<Self, String> {
+        let repo = git2::Repository::open(
+            crate::archive_repo_root_checked(archive).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let tree_id = match repo.head() {
+            Ok(head) => Some(head.peel_to_tree().map_err(|error| error.to_string())?.id()),
+            Err(error)
+                if matches!(
+                    error.code(),
+                    git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound
+                ) =>
+            {
+                None
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        Ok(Self { repo, tree_id })
+    }
+
+    fn read(
+        &self,
+        archive: &ProjectArchive,
+        path: &std::path::Path,
+    ) -> Result<Option<(Value, String)>, String> {
+        let Some(tree_id) = self.tree_id else {
             return Ok(None);
+        };
+        let relative = crate::rel_path_cached(&archive.canonical_repo_root, path)
+            .map_err(|error| error.to_string())?;
+        let tree = self.repo.find_tree(tree_id).map_err(|error| error.to_string())?;
+        let entry = match tree.get_path(std::path::Path::new(&relative)) {
+            Ok(entry) => entry,
+            Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        if entry.kind() != Some(git2::ObjectType::Blob)
+            || !matches!(entry.filemode(), 0o100644 | 0o100755)
+        {
+            return Err("committed message is not a regular-file blob".to_string());
         }
-        Err(error) => return Err(error.to_string()),
-    };
-    let relative = crate::rel_path_cached(&archive.canonical_repo_root, path)
+        let odb = self.repo.odb().map_err(|error| error.to_string())?;
+        let (size, kind) = odb.read_header(entry.id()).map_err(|error| error.to_string())?;
+        if kind != git2::ObjectType::Blob || size > super::MAX_MESSAGE_ARTIFACT_BYTES {
+            return Err("committed message exceeds the archive recovery byte bound".to_string());
+        }
+        let blob = self.repo.find_blob(entry.id()).map_err(|error| error.to_string())?;
+        let actual_id = git2::Oid::hash_object_ext(
+            git2::ObjectType::Blob,
+            blob.content(),
+            entry.id().object_format(),
+        )
         .map_err(|error| error.to_string())?;
-    let tree = head.peel_to_tree().map_err(|error| error.to_string())?;
-    let entry = match tree.get_path(std::path::Path::new(&relative)) {
-        Ok(entry) => entry,
-        Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(None),
-        Err(error) => return Err(error.to_string()),
-    };
-    if entry.kind() != Some(git2::ObjectType::Blob)
-        || !matches!(entry.filemode(), 0o100644 | 0o100755)
-    {
-        return Err("committed message is not a regular-file blob".to_string());
+        if actual_id != entry.id() {
+            return Err("committed message content does not match its object identity".to_string());
+        }
+        let text = std::str::from_utf8(blob.content())
+            .map_err(|_| "committed message is not UTF-8".to_string())?;
+        let (frontmatter, body) = text
+            .strip_prefix("---json\n")
+            .and_then(|text| text.split_once("\n---\n\n"))
+            .ok_or_else(|| "committed message has invalid canonical frontmatter".to_string())?;
+        let message = serde_json::from_str(frontmatter)
+            .map_err(|_| "committed message has invalid JSON".to_string())?;
+        Ok(Some((message, body.to_string())))
     }
-    let odb = repo.odb().map_err(|error| error.to_string())?;
-    let (size, kind) = odb
-        .read_header(entry.id())
-        .map_err(|error| error.to_string())?;
-    if kind != git2::ObjectType::Blob || size > super::MAX_MESSAGE_ARTIFACT_BYTES {
-        return Err("committed message exceeds the archive recovery byte bound".to_string());
-    }
-    let blob = repo
-        .find_blob(entry.id())
-        .map_err(|error| error.to_string())?;
-    let text = std::str::from_utf8(blob.content())
-        .map_err(|_| "committed message is not UTF-8".to_string())?;
-    let (frontmatter, body) = text
-        .strip_prefix("---json\n")
-        .and_then(|text| text.split_once("\n---\n\n"))
-        .ok_or_else(|| "committed message has invalid canonical frontmatter".to_string())?;
-    let message = serde_json::from_str(frontmatter)
-        .map_err(|_| "committed message has invalid JSON".to_string())?;
-    Ok(Some((message, body.to_string())))
 }
 
 /// Reconcile a bounded pass against the server's live mailbox pool.
@@ -826,6 +881,177 @@ mod tests {
             );
         }
         assert!(restore_inbox_metadata(&original, redacted, "different body").is_err());
+    }
+
+    /// Store message artifacts only in Git, never in the working tree. Existing
+    /// tree entries and parent commits remain intact throughout these fixtures.
+    fn commit_survivors(
+        archive: &ProjectArchive,
+        files: &[(&std::path::Path, &Value)],
+        body: &str,
+    ) -> git2::Oid {
+        let repo = git2::Repository::open(&archive.repo_root).unwrap();
+        let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+        let baseline = match &parent {
+            Some(parent) => parent.tree().unwrap(),
+            None => {
+                let id = repo.treebuilder(None).unwrap().write().unwrap();
+                repo.find_tree(id).unwrap()
+            }
+        };
+        let mut updates = git2::build::TreeUpdateBuilder::new();
+        for (path, message) in files {
+            let bytes = crate::render_message_bundle_content(message, body).unwrap();
+            let blob = repo.blob(bytes.as_bytes()).unwrap();
+            let relative = crate::rel_path_cached(&archive.canonical_repo_root, path).unwrap();
+            updates.upsert(relative.as_str(), blob, git2::FileMode::Blob);
+        }
+        let id = updates.create_updated(&repo, &baseline).unwrap();
+        let tree = repo.find_tree(id).unwrap();
+        let signature = git2::Signature::now("reconcile-test", "reconcile@test.invalid").unwrap();
+        let parents: Vec<_> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &signature, &signature, "surviving mail", &tree, &parents)
+            .unwrap()
+    }
+
+    fn git_fixture() -> (tempfile::TempDir, Config, PreparedMessage, ProjectArchive) {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            storage_root: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        let original = prepared();
+        let archive = crate::ensure_archive(&config, &original.project_slug).unwrap();
+        (temp, config, original, archive)
+    }
+
+    #[test]
+    fn committed_inbox_only_restores_all_copies_and_is_idempotent() {
+        let (_temp, config, original, archive) = git_fixture();
+        let paths = crate::message_paths_for_bundle(
+            &archive, &original.message, &original.sender, &original.recipients,
+        ).unwrap().0;
+        let mut full = original.message.clone();
+        full["reply_to"] = json!(7);
+        full["future_metadata"] = json!({"opaque": ["keep", 42]});
+        let redacted = crate::redact_message_bcc_for_inbox(&full);
+        let source = commit_survivors(
+            &archive,
+            &[(paths.inbox[0].as_path(), &redacted), (paths.inbox[1].as_path(), &redacted)],
+            &original.body,
+        );
+        for path in [&paths.canonical, &paths.outbox].into_iter().chain(paths.inbox.iter()) {
+            assert!(!path.exists());
+        }
+        let result = reconcile_prepared(&config, &original).unwrap();
+        assert_eq!(result.files_created, 4);
+        assert!(result.git_commit_needed);
+        for path in [&paths.canonical, &paths.outbox] {
+            let (message, body) = read_surviving_message(path).unwrap().unwrap();
+            assert_eq!(message, full);
+            assert_eq!(body, original.body);
+        }
+        for path in &paths.inbox {
+            let (message, body) = read_surviving_message(path).unwrap().unwrap();
+            assert_eq!(message, redacted);
+            assert_eq!(body, original.body);
+            assert_eq!(message["bcc"], json!([]));
+        }
+        let repo = git2::Repository::open(&archive.repo_root).unwrap();
+        assert!(repo.find_commit(source).is_ok());
+        let head = repo.head().unwrap().target().unwrap();
+        assert_eq!(reconcile_prepared(&config, &original).unwrap(), ReconcileResult::default());
+        assert_eq!(repo.head().unwrap().target().unwrap(), head);
+    }
+
+    #[test]
+    fn conflicting_committed_full_copies_are_not_silently_selected() {
+        let (_temp, config, original, archive) = git_fixture();
+        let paths = crate::message_paths_for_bundle(
+            &archive, &original.message, &original.sender, &original.recipients,
+        ).unwrap().0;
+        let mut first = original.message.clone();
+        first["reply_to"] = json!(7);
+        let mut second = first.clone();
+        second["reply_to"] = json!(8);
+        let head = commit_survivors(
+            &archive,
+            &[(paths.canonical.as_path(), &first), (paths.outbox.as_path(), &second)],
+            &original.body,
+        );
+        let error = reconcile_prepared(&config, &original).unwrap_err();
+        assert!(error.contains("committed canonical and outbox metadata disagree"), "{error}");
+        let repo = git2::Repository::open(&archive.repo_root).unwrap();
+        assert_eq!(repo.head().unwrap().target().unwrap(), head);
+        assert!(!paths.canonical.exists());
+        assert!(!paths.outbox.exists());
+    }
+
+    #[test]
+    fn conflicting_committed_inbox_parents_preserve_head_and_worktree() {
+        let (_temp, config, original, archive) = git_fixture();
+        let paths = crate::message_paths_for_bundle(
+            &archive, &original.message, &original.sender, &original.recipients,
+        ).unwrap().0;
+        let mut first = crate::redact_message_bcc_for_inbox(&original.message);
+        first["reply_to"] = json!(7);
+        let mut second = first.clone();
+        second["reply_to"] = json!(8);
+        let head = commit_survivors(
+            &archive,
+            &[(paths.inbox[0].as_path(), &first), (paths.inbox[1].as_path(), &second)],
+            &original.body,
+        );
+        let error = reconcile_prepared(&config, &original).unwrap_err();
+        assert!(error.contains("committed inbox metadata disagree"), "{error}");
+        let repo = git2::Repository::open(&archive.repo_root).unwrap();
+        assert_eq!(repo.head().unwrap().target().unwrap(), head);
+        for path in [&paths.canonical, &paths.outbox].into_iter().chain(paths.inbox.iter()) {
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn committed_inbox_cannot_supply_bcc_or_a_different_body() {
+        for wrong_body in [false, true] {
+            let (_temp, config, original, archive) = git_fixture();
+            let paths = crate::message_paths_for_bundle(
+                &archive, &original.message, &original.sender, &original.recipients,
+            ).unwrap().0;
+            let mut message = crate::redact_message_bcc_for_inbox(&original.message);
+            message["reply_to"] = json!(7);
+            if !wrong_body {
+                message["bcc"] = json!(["RedFox"]);
+            }
+            let body = if wrong_body { "different" } else { &original.body };
+            let head = commit_survivors(&archive, &[(paths.inbox[0].as_path(), &message)], body);
+            let error = reconcile_prepared(&config, &original).unwrap_err();
+            let expected = if wrong_body { "body conflicts" } else { "BCC redaction" };
+            assert!(error.contains(expected), "{error}");
+            let repo = git2::Repository::open(&archive.repo_root).unwrap();
+            assert_eq!(repo.head().unwrap().target().unwrap(), head);
+            assert!(!paths.canonical.exists());
+        }
+    }
+
+    #[test]
+    fn committed_message_snapshot_does_not_follow_head_advancement() {
+        let (_temp, _config, original, archive) = git_fixture();
+        let paths = crate::message_paths_for_bundle(
+            &archive, &original.message, &original.sender, &original.recipients,
+        ).unwrap().0;
+        let mut first = crate::redact_message_bcc_for_inbox(&original.message);
+        first["reply_to"] = json!(7);
+        commit_survivors(&archive, &[(paths.inbox[0].as_path(), &first)], &original.body);
+        let snapshot = CommittedMessages::open(&archive).unwrap();
+        let mut second = first.clone();
+        second["reply_to"] = json!(8);
+        commit_survivors(&archive, &[(paths.inbox[0].as_path(), &second)], &original.body);
+        let (observed, _) = snapshot.read(&archive, &paths.inbox[0]).unwrap().unwrap();
+        assert_eq!(observed, first);
+        let (observed, _) = CommittedMessages::open(&archive)
+            .unwrap().read(&archive, &paths.inbox[0]).unwrap().unwrap();
+        assert_eq!(observed, second);
     }
 
     #[test]
