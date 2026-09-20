@@ -24,6 +24,7 @@ use mcp_agent_mail_tools::{
     register_agent, request_contact, send_message, whois,
 };
 use serde_json::Value;
+use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -105,9 +106,9 @@ fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Reproduce the verifier's canonical signed bytes (see
-/// `mcp_agent_mail_tools::proof_gate::canonical_message`). Any external signer
-/// would reproduce exactly this.
+/// Independent external-signer implementation of the v2 signing contract.
+/// Lengths count UTF-8 bytes, including embedded delimiters; capabilities are
+/// individually framed rather than joined with a potentially ambiguous comma.
 #[allow(clippy::too_many_arguments)] // mirrors the signed claim set 1:1
 fn canonical_message(
     identity: &str,
@@ -126,18 +127,29 @@ fn canonical_message(
         .collect();
     c.sort();
     c.dedup();
-    format!(
-        "agent-mail-registration-proof:v1\n\
-         identity={identity}\n\
-         project_key={project_key}\n\
-         program={program}\n\
-         model={model}\n\
-         capabilities={caps}\n\
-         issued_at={issued_at}\n\
-         expires_at={expires_at}\n\
-         nonce={nonce}",
-        caps = c.join(","),
+    let mut message = String::from("agent-mail-registration-proof:v2\n");
+    for (label, value) in [
+        ("identity", identity),
+        ("project_key", project_key),
+        ("program", program),
+        ("model", model),
+    ] {
+        writeln!(message, "{label}={}:{value}", value.len())
+            .expect("formatting into a String cannot fail");
+    }
+    writeln!(message, "capabilities={}", c.len())
+        .expect("formatting into a String cannot fail");
+    for capability in c {
+        writeln!(message, "capability={}:{capability}", capability.len())
+            .expect("formatting into a String cannot fail");
+    }
+    writeln!(
+        message,
+        "issued_at={issued_at}\nexpires_at={expires_at}\nnonce={}:{nonce}",
+        nonce.len(),
     )
+    .expect("formatting into a String cannot fail");
+    message
 }
 
 /// Build a valid signed proof bundle JSON string for the given registration.
@@ -782,4 +794,82 @@ fn disabled_gate_auto_registers_via_send_message_and_request_contact() {
         .await
         .expect("AutoSender should have been auto-registered");
     });
+}
+
+#[test]
+fn scope_tampering_neither_registers_an_agent_nor_consumes_its_nonce() {
+    let key = SigningKey::from_bytes(&[34u8; 32]);
+    let trusted = b64(key.verifying_key().as_bytes());
+    run_with_env(
+        &[
+            ("AM_REGISTRATION_PROOF_GATE_ENABLED", "true"),
+            ("AM_REGISTRATION_PROOF_TRUSTED_KEYS", trusted.as_str()),
+            ("AM_REGISTRATION_PROOF_REQUIRE_NONCE", "true"),
+        ],
+        |cx| async move {
+            let ctx = McpContext::new(cx, 1);
+            let project_key = format!("/tmp/proof-scope-tamper-{}", unique_suffix());
+            ensure_project(&ctx, project_key.clone(), None)
+                .await
+                .expect("ensure_project");
+            let now = now_unix();
+            let proof = signed_proof(
+                &key,
+                "BlueLake",
+                &project_key,
+                "claude-code",
+                "opus-4.1",
+                &[
+                    "acknowledge_message,fetch_inbox",
+                    "file_reservation_paths",
+                    "send_message",
+                ],
+                now,
+                now + 120,
+                "scope-tamper-nonce",
+            );
+            let mut tampered: Value = serde_json::from_str(&proof).unwrap();
+            tampered["claims"]["capabilities"] = serde_json::json!(DEFAULT_CAPS);
+            let err = register_agent(
+                &ctx,
+                project_key.clone(),
+                "claude-code".to_string(),
+                "opus-4.1".to_string(),
+                Some("BlueLake".to_string()),
+                Some("must not be created".to_string()),
+                None,
+                None,
+                None,
+                None,
+                Some(tampered.to_string()),
+            )
+            .await
+            .expect_err("changing capability boundaries invalidates the signature");
+            assert_eq!(error_type(&err), "PROOF_BAD_SIGNATURE");
+            let err = whois(
+                &ctx,
+                project_key.clone(),
+                "BlueLake".to_string(),
+                Some(false),
+                None,
+            )
+            .await
+            .expect_err("signature refusal must not create an identity");
+            assert_eq!(error_type(&err), "AGENT_NOT_FOUND");
+
+            // Reusing this nonce with a genuinely authorized proof must work:
+            // the rejected signature must not have reached nonce consumption.
+            register_with_proof(
+                &ctx,
+                &key,
+                &project_key,
+                "BlueLake",
+                "scope-tamper-nonce",
+            )
+            .await;
+            whois(&ctx, project_key, "BlueLake".to_string(), Some(false), None)
+                .await
+                .expect("authorized identity is visible after registration");
+        },
+    );
 }

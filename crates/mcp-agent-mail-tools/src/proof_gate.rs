@@ -42,9 +42,16 @@
 //! # Canonical signing bytes
 //!
 //! To make the proof reproducible from any language, canonicalization is explicit
-//! (not dependent on JSON key ordering). See [`canonical_message`]: a
-//! domain-separation tag followed by newline-delimited `field=value` lines, with
-//! `capabilities` sorted, de-duplicated, and comma-joined.
+//! (not dependent on JSON key ordering). See [`canonical_message`]: a v2
+//! domain-separation tag, UTF-8 byte-length-prefixed strings, and a counted
+//! sequence of sorted, de-duplicated capabilities. Delimiters inside a claim
+//! cannot change field or capability boundaries.
+//!
+//! Issuers MUST use v2 and reissue any outstanding v1 proofs. There is no v1
+//! verification fallback: its newline/comma-joined representation permitted
+//! different claim sets to share signing bytes. The JSON bundle shape and the
+//! default, disabled gate are unchanged; existing registered agents and their
+//! registration tokens are not modified by this signing-format change.
 //!
 //! # Extensibility
 //!
@@ -61,10 +68,11 @@ use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::config::ProofGateConfig;
 use serde::Deserialize;
 use serde_json::json;
+use std::fmt::Write as _;
 
 /// Domain-separation tag prefixed to every canonical signed message. Bumping the
 /// version invalidates every previously issued proof.
-const PROOF_DOMAIN: &str = "agent-mail-registration-proof:v1";
+const PROOF_DOMAIN: &str = "agent-mail-registration-proof:v2";
 
 /// The concrete facts a registration is asserting, which the proof must bind.
 ///
@@ -550,40 +558,63 @@ fn mk_error(code: &str, message: impl Into<String>, detail: serde_json::Value) -
     crate::tool_util::legacy_tool_error(code, message, false, detail)
 }
 
-/// Deterministic canonical byte serialization of the claims that is signed.
+/// Deterministic v2 signing bytes, independent of JSON object ordering.
 ///
-/// Reproducible in any language: a domain tag followed by newline-delimited
-/// `field=value` lines in a fixed order. `capabilities` are sorted ascending,
-/// de-duplicated, and comma-joined so signer and verifier agree regardless of
-/// input ordering.
+/// Start with `agent-mail-registration-proof:v2\n`. Encode identity, project_key,
+/// program and model, in that order, as `label=N:value\n`, where N is the decimal
+/// UTF-8 BYTE length of value (no leading zeroes, except zero itself). Values are
+/// not escaped or trimmed. Encode `capabilities=N\n` with the normalized count,
+/// followed by one `capability=N:value\n` per capability, trimmed, nonempty,
+/// sorted by UTF-8 bytes and de-duplicated. Finish with decimal signed i64 lines
+/// `issued_at=N\n`, `expires_at=N\n`, and a length-prefixed `nonce=N:value\n`.
+/// Every line terminator, including the final one, is a single LF byte.
+///
+/// A length prefix makes embedded LF, comma, colon, equals, NUL and Unicode
+/// unambiguous. Merely rejecting delimiters in a received v1 bundle would NOT
+/// suffice: an ambiguous issuer-signed value could be reinterpreted as ordinary
+/// received values with the same v1 signing bytes. The new domain also rejects
+/// those already-issued v1 signatures rather than retaining a downgrade path.
 fn canonical_message(claims: &ProofClaims) -> String {
-    let mut caps: Vec<String> = claims
+    let mut caps: Vec<&str> = claims
         .capabilities
         .iter()
-        .map(|c| c.trim().to_string())
-        .filter(|c| !c.is_empty())
+        .map(|capability| capability.trim())
+        .filter(|capability| !capability.is_empty())
         .collect();
-    caps.sort();
+    caps.sort_unstable();
     caps.dedup();
-    format!(
-        "{PROOF_DOMAIN}\n\
-         identity={identity}\n\
-         project_key={project_key}\n\
-         program={program}\n\
-         model={model}\n\
-         capabilities={capabilities}\n\
-         issued_at={issued_at}\n\
-         expires_at={expires_at}\n\
-         nonce={nonce}",
-        identity = claims.identity,
-        project_key = claims.project_key,
-        program = claims.program,
-        model = claims.model,
-        capabilities = caps.join(","),
-        issued_at = claims.issued_at,
-        expires_at = claims.expires_at,
-        nonce = claims.nonce,
+    let mut message = String::from(PROOF_DOMAIN);
+    message.push('\n');
+    for (label, value) in [
+        ("identity", claims.identity.as_str()),
+        ("project_key", claims.project_key.as_str()),
+        ("program", claims.program.as_str()),
+        ("model", claims.model.as_str()),
+    ] {
+        append_signed_field(&mut message, label, value);
+    }
+    writeln!(message, "capabilities={}", caps.len())
+        .expect("formatting into a String cannot fail");
+    for capability in caps {
+        append_signed_field(&mut message, "capability", capability);
+    }
+    writeln!(
+        message,
+        "issued_at={}\nexpires_at={}",
+        claims.issued_at, claims.expires_at
     )
+    .expect("formatting into a String cannot fail");
+    append_signed_field(&mut message, "nonce", &claims.nonce);
+    message
+}
+
+fn append_signed_field(message: &mut String, label: &str, value: &str) {
+    message.push_str(label);
+    message.push('=');
+    message.push_str(&value.len().to_string());
+    message.push(':');
+    message.push_str(value);
+    message.push('\n');
 }
 
 /// Decode base64 (standard alphabet) into a fixed-size array, or `None` if the
@@ -728,6 +759,138 @@ mod tests {
             .and_then(Value::as_str)
             .expect("error payload type")
             .to_string()
+    }
+
+    // Test-only reproduction of the old signing format, never a verifier fallback.
+    fn legacy_message(claims: &ProofClaims) -> String {
+        let mut caps: Vec<&str> = claims
+            .capabilities
+            .iter()
+            .map(|capability| capability.trim())
+            .filter(|capability| !capability.is_empty())
+            .collect();
+        caps.sort_unstable();
+        caps.dedup();
+        format!(
+            "agent-mail-registration-proof:v1\nidentity={}\nproject_key={}\nprogram={}\nmodel={}\ncapabilities={}\nissued_at={}\nexpires_at={}\nnonce={}",
+            claims.identity,
+            claims.project_key,
+            claims.program,
+            claims.model,
+            caps.join(","),
+            claims.issued_at,
+            claims.expires_at,
+            claims.nonce,
+        )
+    }
+
+    #[test]
+    fn capability_boundaries_cannot_expand_signed_permissions() {
+        let key = signing_key(30);
+        let now = 1_000;
+        let mut grouped = ClaimsSpec::valid(now);
+        grouped.capabilities = vec![
+            "acknowledge_message,fetch_inbox".to_string(),
+            "file_reservation_paths".to_string(),
+            "send_message".to_string(),
+        ];
+        let expanded = ClaimsSpec::valid(now);
+        assert_eq!(
+            legacy_message(&grouped.to_claims()),
+            legacy_message(&expanded.to_claims())
+        );
+        assert_ne!(
+            canonical_message(&grouped.to_claims()),
+            canonical_message(&expanded.to_claims())
+        );
+        let mut bundle: Value = serde_json::from_str(&grouped.signed_bundle(&key)).unwrap();
+        bundle["claims"]["capabilities"] = json!(CAPS);
+        let tampered = bundle.to_string();
+        let err = enforce_with_config(&gate_with_anchor(&key), &request(Some(&tampered)), now)
+            .unwrap_err();
+        assert_eq!(deny_code(&err), "PROOF_BAD_SIGNATURE");
+    }
+
+    #[test]
+    fn embedded_field_delimiters_cannot_change_signed_program_and_model() {
+        let key = signing_key(31);
+        let now = 1_000;
+        let mut original = ClaimsSpec::valid(now);
+        original.program = "claude-code\nmodel=other".to_string();
+        let mut changed = ClaimsSpec::valid(now);
+        changed.model = "other\nmodel=opus-4.1".to_string();
+        assert_eq!(
+            legacy_message(&original.to_claims()),
+            legacy_message(&changed.to_claims())
+        );
+        assert_ne!(
+            canonical_message(&original.to_claims()),
+            canonical_message(&changed.to_claims())
+        );
+        let mut bundle: Value = serde_json::from_str(&original.signed_bundle(&key)).unwrap();
+        bundle["claims"]["program"] = json!(changed.program);
+        bundle["claims"]["model"] = json!(changed.model);
+        let tampered = bundle.to_string();
+        let req = RegistrationRequest {
+            model: &changed.model,
+            ..request(Some(&tampered))
+        };
+        let err = enforce_with_config(&gate_with_anchor(&key), &req, now).unwrap_err();
+        assert_eq!(deny_code(&err), "PROOF_BAD_SIGNATURE");
+    }
+
+    #[test]
+    fn old_signatures_cannot_downgrade_the_signing_format() {
+        let key = signing_key(32);
+        let now = 1_000;
+        let spec = ClaimsSpec::valid(now);
+        let old_signature = key.sign(legacy_message(&spec.to_claims()).as_bytes());
+        let mut bundle: Value = serde_json::from_str(&spec.signed_bundle(&key)).unwrap();
+        bundle["signature"] = json!(b64(&old_signature.to_bytes()));
+        let old_proof = bundle.to_string();
+        let err = enforce_with_config(&gate_with_anchor(&key), &request(Some(&old_proof)), now)
+            .unwrap_err();
+        assert_eq!(deny_code(&err), "PROOF_BAD_SIGNATURE");
+    }
+
+    #[test]
+    fn canonical_v2_has_a_cross_language_utf8_length_vector() {
+        let mut spec = ClaimsSpec::valid(1_000);
+        spec.project_key = "/é".to_string();
+        spec.program = "agent\nx".to_string();
+        spec.model.clear();
+        spec.capabilities = vec!["b".to_string(), "a".to_string(), "a".to_string()];
+        spec.nonce = "n\0x".to_string();
+        assert_eq!(
+            canonical_message(&spec.to_claims()),
+            "agent-mail-registration-proof:v2\nidentity=8:BlueLake\nproject_key=3:/é\nprogram=7:agent\nx\nmodel=0:\ncapabilities=2\ncapability=1:a\ncapability=1:b\nissued_at=1000\nexpires_at=1120\nnonce=3:n\0x\n"
+        );
+    }
+
+    #[test]
+    fn capability_normalization_preserves_semantically_equivalent_proofs() {
+        let key = signing_key(33);
+        let now = 1_000;
+        let spec = ClaimsSpec::valid(now);
+        let mut reordered = ClaimsSpec::valid(now);
+        reordered.capabilities.reverse();
+        reordered.capabilities.push(" fetch_inbox ".to_string());
+        reordered.capabilities.push(" ".to_string());
+        assert_eq!(
+            canonical_message(&spec.to_claims()),
+            canonical_message(&reordered.to_claims())
+        );
+        let mut bundle: Value = serde_json::from_str(&spec.signed_bundle(&key)).unwrap();
+        bundle["claims"]["capabilities"] = json!(reordered.capabilities);
+        let reordered_proof = bundle.to_string();
+        assert!(
+            enforce_with_config(
+                &gate_with_anchor(&key),
+                &request(Some(&reordered_proof)),
+                now,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
