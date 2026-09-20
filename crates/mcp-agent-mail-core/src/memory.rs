@@ -1,8 +1,8 @@
 //! Process memory (RSS) sampling and pressure classification.
 //!
-//! Mirrors `disk.rs`: reads `/proc/self/status` on Linux (zero-cost, no unsafe)
-//! and returns a classified pressure level used by the background health worker
-//! to trigger adaptive cache eviction and load shedding.
+//! Reads `/proc/self/status` on Linux and the system `ps` RSS field on macOS,
+//! without unsafe code. Returns the current resident set, not a lifetime peak,
+//! so the background health worker can observe both pressure and recovery.
 
 use crate::Config;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -60,7 +60,8 @@ impl MemoryPressure {
 pub struct MemorySample {
     /// Resident Set Size in bytes (physical RAM used by this process).
     pub rss_bytes: Option<u64>,
-    /// Classified pressure level based on config thresholds.
+    /// Classified pressure level based on config thresholds. After a failed
+    /// `sample_and_record`, this retains the last successfully recorded level.
     pub pressure: MemoryPressure,
     /// Best-effort error if RSS could not be read.
     pub error: Option<String>,
@@ -90,36 +91,110 @@ pub const fn classify_pressure(
     }
 }
 
-/// Read current process RSS from `/proc/self/status` (Linux).
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn parse_rss_kib(raw: &str) -> Result<u64, String> {
+    let value = raw.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("RSS must contain exactly one unsigned KiB value".to_string());
+    }
+    value
+        .parse::<u64>()
+        .ok()
+        .and_then(|kib| kib.checked_mul(1024))
+        .ok_or_else(|| "RSS value overflows its byte representation".to_string())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_rss(status: &str) -> Result<u64, String> {
+    let rest = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .ok_or_else(|| "VmRSS line not found in /proc/self/status".to_string())?;
+    let mut fields = rest.split_ascii_whitespace();
+    let value = fields.next().unwrap_or_default();
+    if fields.next().is_some_and(|unit| !matches!(unit, "kB" | "KB")) || fields.next().is_some() {
+        return Err("unexpected units or trailing fields in VmRSS".to_string());
+    }
+    parse_rss_kib(value)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_ps_rss(stdout: &[u8]) -> Result<u64, String> {
+    let value =
+        std::str::from_utf8(stdout).map_err(|error| format!("decode ps RSS output: {error}"))?;
+    parse_rss_kib(value)
+}
+
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+fn run_rss_probe(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<u64, String> {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut child = command
+        .env_clear()
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("start ps RSS probe: {error}"))?;
+    let started = Instant::now();
+    loop {
+        let error = match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(status)) => return Err(format!("ps RSS probe exited with {status}")),
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(
+                    Duration::from_millis(5).min(timeout.saturating_sub(started.elapsed())),
+                );
+                continue;
+            }
+            Ok(None) => "ps RSS probe timed out".to_string(),
+            Err(error) => format!("wait for ps RSS probe: {error}"),
+        };
+        // Do not leave a running child or a zombie after a failed sample.
+        // Reaping still depends on the OS; this is not a hard real-time bound.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("read ps RSS output: {error}"))?;
+    parse_ps_rss(&output.stdout)
+}
+
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+fn read_ps_rss_bytes() -> Result<u64, String> {
+    // Absolute system binary, no shell, no PATH lookup, and exactly our PID.
+    // Darwin's rss field is current resident memory in 1024-byte units.
+    let mut command = std::process::Command::new("/bin/ps");
+    command.args(["-o", "rss=", "-p", &std::process::id().to_string()]);
+    run_rss_probe(&mut command, std::time::Duration::from_millis(250))
+}
+
+/// Read current process RSS on Linux or macOS, in bytes.
 ///
-/// Parses the `VmRSS:` line and converts kB to bytes.
-/// Returns `None` with an error string on non-Linux platforms or if the file
-/// cannot be parsed.
+/// Unsupported platforms, failed probes, malformed output, and overflow return
+/// an error rather than a fabricated zero or a lifetime high-water mark.
 pub(crate) fn read_rss_bytes() -> Result<u64, String> {
     #[cfg(target_os = "linux")]
     {
         let status = std::fs::read_to_string("/proc/self/status")
             .map_err(|e| format!("read /proc/self/status: {e}"))?;
 
-        for line in status.lines() {
-            if let Some(rest) = line.strip_prefix("VmRSS:") {
-                let trimmed = rest.trim();
-                // Format: "123456 kB"
-                let kb_str = trimmed
-                    .strip_suffix("kB")
-                    .or_else(|| trimmed.strip_suffix("KB"))
-                    .unwrap_or(trimmed)
-                    .trim();
-                let kb: u64 = kb_str
-                    .parse()
-                    .map_err(|e| format!("parse VmRSS '{kb_str}': {e}"))?;
-                return Ok(kb * 1024);
-            }
-        }
-        Err("VmRSS line not found in /proc/self/status".to_string())
+        parse_linux_rss(&status)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        read_ps_rss_bytes()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err("RSS reading not implemented on this platform".to_string())
     }
@@ -158,32 +233,104 @@ fn now_unix_micros_u64() -> u64 {
 }
 
 /// Sample memory and update global system metrics gauges.
+///
+/// A failed probe is not evidence of recovery: retain the last successful RSS,
+/// pressure, and timestamp, and return that pressure alongside the error.
+/// Leaving the timestamp unchanged also lets admission control identify stale
+/// pressure instead of treating repeated failures as fresh measurements.
 #[must_use]
 pub fn sample_and_record(config: &Config) -> MemorySample {
     let sample = sample_memory(config);
-    let metrics = crate::global_metrics();
+    record_sample(sample, &crate::global_metrics().system, now_unix_micros_u64())
+}
 
-    if let Some(rss) = sample.rss_bytes {
-        metrics.system.memory_rss_bytes.set(rss);
+fn record_sample(
+    mut sample: MemorySample,
+    metrics: &crate::metrics::SystemMetrics,
+    sampled_at_us: u64,
+) -> MemorySample {
+    match (sample.rss_bytes, sample.error.as_ref()) {
+        (Some(rss), None) => {
+            metrics.memory_rss_bytes.set(rss);
+            metrics.memory_pressure_level.set(sample.pressure.as_u64());
+            metrics.memory_last_sample_us.set(sampled_at_us);
+        }
+        _ => {
+            metrics.memory_sample_errors_total.add(1);
+            sample.pressure = MemoryPressure::from_u64(metrics.memory_pressure_level.load());
+        }
     }
-    metrics
-        .system
-        .memory_pressure_level
-        .set(sample.pressure.as_u64());
-    metrics
-        .system
-        .memory_last_sample_us
-        .set(now_unix_micros_u64());
-    if sample.error.is_some() {
-        metrics.system.memory_sample_errors_total.add(1);
-    }
-
     sample
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rss_kib_conversion_is_checked_and_rejects_ambiguous_values() {
+        assert_eq!(parse_rss_kib(" 123456 \n").unwrap(), 126_418_944);
+        assert_eq!(parse_rss_kib("0").unwrap(), 0);
+        let largest = u64::MAX / 1024;
+        assert_eq!(parse_rss_kib(&largest.to_string()).unwrap(), largest * 1024);
+        assert!(parse_rss_kib(&(largest + 1).to_string()).is_err());
+        for invalid in ["", "-1", "+1", "1.5", "1 2", "1\n2", "18446744073709551616"] {
+            assert!(parse_rss_kib(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn linux_rss_parser_selects_current_rss_not_peak_or_virtual_size() {
+        let status = "Name:\tagent-mail\nVmPeak:\t999999 kB\nVmHWM:\t888888 kB\nVmRSS:\t1234 kB\nVmSize:\t777777 kB\n";
+        assert_eq!(parse_linux_rss(status).unwrap(), 1234 * 1024);
+        assert_eq!(parse_linux_rss("VmRSS: 12 KB").unwrap(), 12 * 1024);
+        assert_eq!(parse_linux_rss("VmRSS: 12").unwrap(), 12 * 1024);
+    }
+
+    #[test]
+    fn linux_rss_parser_rejects_missing_bad_units_and_overflow() {
+        for invalid in [
+            "VmSize: 123 kB",
+            "VmRSS:",
+            "VmRSS: 123 MB",
+            "VmRSS: 123 kB extra",
+            "VmRSS: -123 kB",
+            "VmRSS: 18446744073709551615 kB",
+        ] {
+            assert!(parse_linux_rss(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn ps_rss_parser_requires_one_headerless_process_row() {
+        assert_eq!(parse_ps_rss(b"  4096\n").unwrap(), 4 * MIB);
+        for invalid in [b"".as_slice(), b"RSS\n4096\n", b"4096\n8192\n", b"N/A", b"\xff"] {
+            assert!(parse_ps_rss(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ps_rss_probe_reads_the_current_process() {
+        assert!(read_ps_rss_bytes().expect("system ps should report our RSS") > 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn rss_probe_reports_exit_failure_and_stops_timed_out_children() {
+        use std::process::Command;
+        use std::time::Duration;
+
+        let error = run_rss_probe(&mut Command::new("/usr/bin/false"), Duration::from_secs(1))
+            .expect_err("failed probe must not become a zero RSS sample");
+        assert!(error.contains("exited"), "{error}");
+
+        let mut sleeper = Command::new("/bin/sleep");
+        sleeper.arg("60");
+        let error = run_rss_probe(&mut sleeper, Duration::ZERO)
+            .expect_err("a stuck probe must be terminated and reaped");
+        assert!(error.contains("timed out"), "{error}");
+    }
 
     #[test]
     fn pressure_classification_thresholds() {
@@ -240,10 +387,10 @@ mod tests {
         assert_eq!(MemoryPressure::from_u64(99), MemoryPressure::Ok);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn read_rss_returns_nonzero() {
-        let rss = read_rss_bytes().expect("should read RSS on Linux");
+        let rss = read_rss_bytes().expect("should read RSS on Linux and macOS");
         assert!(rss > 0, "RSS should be > 0, got {rss}");
         // Sanity check: a Rust test process should use at least 1MB
         assert!(rss > MIB, "RSS {rss} seems too small");
@@ -253,8 +400,7 @@ mod tests {
     fn sample_memory_with_default_config() {
         let config = Config::default();
         let sample = sample_memory(&config);
-        // On Linux, rss_bytes should be Some; on other platforms, error is expected
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             assert!(sample.rss_bytes.is_some());
             assert!(sample.error.is_none());
         }
@@ -340,12 +486,12 @@ mod tests {
         assert_eq!(sample.pressure, MemoryPressure::Ok);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn sample_memory_rss_within_reasonable_range() {
         let config = Config::default();
         let sample = sample_memory(&config);
-        let rss = sample.rss_bytes.expect("should have RSS on Linux");
+        let rss = sample.rss_bytes.expect("should have RSS on Linux and macOS");
         // A Rust test process should use between 1 MB and 10 GB
         assert!(rss > MIB, "RSS too small: {rss}");
         assert!(rss < 10 * 1024 * MIB, "RSS too large: {rss}");
@@ -367,29 +513,134 @@ mod tests {
     }
 
     #[test]
-    fn sample_and_record_updates_memory_metrics() {
-        let config = Config::default();
-        let metrics = crate::global_metrics();
-        metrics.system.memory_rss_bytes.set(0);
-        metrics.system.memory_pressure_level.set(0);
-        metrics.system.memory_last_sample_us.set(0);
-        metrics.system.memory_sample_errors_total.store(0);
-
-        let sample = sample_and_record(&config);
-
-        assert_eq!(
-            metrics.system.memory_pressure_level.load(),
-            sample.pressure.as_u64()
+    fn record_sample_updates_memory_metrics() {
+        let metrics = crate::metrics::SystemMetrics::default();
+        let sample = record_sample(
+            MemorySample {
+                rss_bytes: Some(3000 * MIB),
+                pressure: MemoryPressure::Warning,
+                error: None,
+            },
+            &metrics,
+            123_456,
         );
-        assert!(metrics.system.memory_last_sample_us.load() > 0);
 
-        if let Some(rss) = sample.rss_bytes {
-            assert_eq!(metrics.system.memory_rss_bytes.load(), rss);
-            assert_eq!(metrics.system.memory_sample_errors_total.load(), 0);
-        } else {
-            assert_eq!(metrics.system.memory_rss_bytes.load(), 0);
-            assert_eq!(metrics.system.memory_sample_errors_total.load(), 1);
-            assert!(sample.error.is_some());
+        assert_eq!(sample.rss_bytes, Some(3000 * MIB));
+        assert_eq!(sample.pressure, MemoryPressure::Warning);
+        assert!(sample.error.is_none());
+        assert_eq!(metrics.memory_rss_bytes.load(), 3000 * MIB);
+        assert_eq!(metrics.memory_pressure_level.load(), 1);
+        assert_eq!(metrics.memory_last_sample_us.load(), 123_456);
+        assert_eq!(metrics.memory_sample_errors_total.load(), 0);
+    }
+
+    fn failed_sample() -> MemorySample {
+        MemorySample {
+            rss_bytes: None,
+            pressure: MemoryPressure::Ok,
+            error: Some("RSS probe failed".to_string()),
         }
+    }
+
+    #[test]
+    fn failed_sample_preserves_each_pressure_level_and_last_success_time() {
+        for pressure in [
+            MemoryPressure::Ok,
+            MemoryPressure::Warning,
+            MemoryPressure::Critical,
+            MemoryPressure::Fatal,
+        ] {
+            let metrics = crate::metrics::SystemMetrics::default();
+            metrics.memory_rss_bytes.set(9000 * MIB);
+            metrics.memory_pressure_level.set(pressure.as_u64());
+            metrics.memory_last_sample_us.set(123_456);
+
+            let sample = record_sample(failed_sample(), &metrics, 999_999);
+
+            assert_eq!(sample.pressure, pressure);
+            assert!(sample.rss_bytes.is_none());
+            assert_eq!(sample.error.as_deref(), Some("RSS probe failed"));
+            assert_eq!(metrics.memory_rss_bytes.load(), 9000 * MIB);
+            assert_eq!(metrics.memory_pressure_level.load(), pressure.as_u64());
+            assert_eq!(metrics.memory_last_sample_us.load(), 123_456);
+            assert_eq!(metrics.memory_sample_errors_total.load(), 1);
+        }
+    }
+
+    #[test]
+    fn repeated_failures_do_not_keep_old_pressure_fresh() {
+        let metrics = crate::metrics::SystemMetrics::default();
+        metrics.memory_rss_bytes.set(9000 * MIB);
+        metrics.memory_pressure_level.set(MemoryPressure::Fatal.as_u64());
+        metrics.memory_last_sample_us.set(1_000_000);
+
+        for attempt in 1..=5 {
+            let sample = record_sample(failed_sample(), &metrics, attempt * 60_000_000);
+            assert_eq!(sample.pressure, MemoryPressure::Fatal);
+            assert_eq!(metrics.memory_last_sample_us.load(), 1_000_000);
+            assert_eq!(metrics.memory_sample_errors_total.load(), attempt);
+        }
+        assert_eq!(metrics.memory_rss_bytes.load(), 9000 * MIB);
+        assert_eq!(metrics.memory_pressure_level.load(), 3);
+    }
+
+    #[test]
+    fn successful_sample_records_recovery_after_probe_failure() {
+        let metrics = crate::metrics::SystemMetrics::default();
+        metrics.memory_pressure_level.set(MemoryPressure::Fatal.as_u64());
+        metrics.memory_last_sample_us.set(1);
+        let _ = record_sample(failed_sample(), &metrics, 2);
+
+        let sample = record_sample(
+            MemorySample {
+                rss_bytes: Some(500 * MIB),
+                pressure: MemoryPressure::Ok,
+                error: None,
+            },
+            &metrics,
+            3,
+        );
+
+        assert_eq!(sample.pressure, MemoryPressure::Ok);
+        assert!(sample.error.is_none());
+        assert_eq!(metrics.memory_rss_bytes.load(), 500 * MIB);
+        assert_eq!(metrics.memory_pressure_level.load(), 0);
+        assert_eq!(metrics.memory_last_sample_us.load(), 3);
+        assert_eq!(metrics.memory_sample_errors_total.load(), 1);
+    }
+
+    #[test]
+    fn failure_before_first_sample_does_not_fabricate_a_measurement() {
+        let metrics = crate::metrics::SystemMetrics::default();
+        for attempt in 1..=3 {
+            let sample = record_sample(failed_sample(), &metrics, attempt * 60_000_000);
+            assert!(sample.rss_bytes.is_none());
+            assert!(sample.error.is_some());
+            assert_eq!(sample.pressure, MemoryPressure::Ok);
+            assert_eq!(metrics.memory_last_sample_us.load(), 0);
+            assert_eq!(metrics.memory_sample_errors_total.load(), attempt);
+        }
+        assert_eq!(metrics.memory_rss_bytes.load(), 0);
+        assert_eq!(metrics.memory_pressure_level.load(), 0);
+    }
+
+    #[test]
+    fn successful_zero_rss_is_not_a_probe_failure() {
+        let metrics = crate::metrics::SystemMetrics::default();
+        metrics.memory_pressure_level.set(MemoryPressure::Fatal.as_u64());
+        let sample = record_sample(
+            MemorySample {
+                rss_bytes: Some(0),
+                pressure: MemoryPressure::Ok,
+                error: None,
+            },
+            &metrics,
+            123_456,
+        );
+        assert_eq!(sample.rss_bytes, Some(0));
+        assert!(sample.error.is_none());
+        assert_eq!(metrics.memory_pressure_level.load(), 0);
+        assert_eq!(metrics.memory_last_sample_us.load(), 123_456);
+        assert_eq!(metrics.memory_sample_errors_total.load(), 0);
     }
 }

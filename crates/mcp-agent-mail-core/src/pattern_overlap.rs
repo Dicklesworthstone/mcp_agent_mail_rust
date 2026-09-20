@@ -157,48 +157,96 @@ fn parse_simple_glob_tokens(segment: &str) -> Option<Vec<SimpleGlobToken>> {
     Some(tokens)
 }
 
-fn simple_glob_tokens_overlap(left: &[SimpleGlobToken], right: &[SimpleGlobToken]) -> bool {
-    fn visit(
-        left: &[SimpleGlobToken],
-        right: &[SimpleGlobToken],
-        i: usize,
-        j: usize,
-        memo: &mut [Vec<Option<bool>>],
-    ) -> bool {
-        if let Some(cached) = memo[i][j] {
-            return cached;
+/// Intersect sequences whose repeat token accepts zero or more arbitrary items.
+/// `compatible` must be symmetric and is used only for two non-repeat items.
+/// Both character globs (`*`) and path segments (`**`) have this recurrence.
+///
+/// Keep one suffix-DP row, not a matrix or a recursive call per input item.
+/// Auxiliary space is O(min(n, m)); worst-case DP work remains O(n*m).
+/// Mandatory anchored items are consumed first, keeping fixed-width inputs and
+/// anchored mismatches linear even when the original inputs are very long.
+fn sequence_patterns_overlap<T>(
+    mut left: &[T],
+    mut right: &[T],
+    is_repeat: impl Fn(&T) -> bool,
+    compatible: impl Fn(&T, &T) -> bool,
+) -> bool {
+    while let (Some((a, rest_a)), Some((b, rest_b))) =
+        (left.split_first(), right.split_first())
+    {
+        if is_repeat(a) || is_repeat(b) {
+            break;
         }
-
-        let overlaps = match (left.get(i), right.get(j)) {
-            (None, None) => true,
-            (Some(SimpleGlobToken::AnyString), None) => visit(left, right, i + 1, j, memo),
-            (None, Some(SimpleGlobToken::AnyString)) => visit(left, right, i, j + 1, memo),
-            (None, Some(_)) | (Some(_), None) => false,
-            (Some(SimpleGlobToken::AnyString), Some(_)) => {
-                visit(left, right, i + 1, j, memo) || visit(left, right, i, j + 1, memo)
-            }
-            (Some(_), Some(SimpleGlobToken::AnyString)) => {
-                visit(left, right, i, j + 1, memo) || visit(left, right, i + 1, j, memo)
-            }
-            (
-                Some(SimpleGlobToken::AnyChar | SimpleGlobToken::Literal(_)),
-                Some(SimpleGlobToken::AnyChar),
-            )
-            | (Some(SimpleGlobToken::AnyChar), Some(SimpleGlobToken::Literal(_))) => {
-                visit(left, right, i + 1, j + 1, memo)
-            }
-            (
-                Some(SimpleGlobToken::Literal(left_char)),
-                Some(SimpleGlobToken::Literal(right_char)),
-            ) => left_char == right_char && visit(left, right, i + 1, j + 1, memo),
-        };
-
-        memo[i][j] = Some(overlaps);
-        overlaps
+        if !compatible(a, b) {
+            return false;
+        }
+        left = rest_a;
+        right = rest_b;
+    }
+    while let (Some((a, rest_a)), Some((b, rest_b))) =
+        (left.split_last(), right.split_last())
+    {
+        if is_repeat(a) || is_repeat(b) {
+            break;
+        }
+        if !compatible(a, b) {
+            return false;
+        }
+        left = rest_a;
+        right = rest_b;
+    }
+    if left.is_empty() {
+        return right.iter().all(&is_repeat);
+    }
+    if right.is_empty() {
+        return left.iter().all(&is_repeat);
+    }
+    if left.iter().all(&is_repeat) || right.iter().all(&is_repeat) {
+        return true;
     }
 
-    let mut memo = vec![vec![None; right.len() + 1]; left.len() + 1];
-    visit(left, right, 0, 0, &mut memo)
+    // Intersection is symmetric. Put the shorter residual sequence in the
+    // retained row; a deep path against a tiny recursive glob needs tiny space.
+    let (rows, columns) = if left.len() >= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let end = columns.len();
+    let mut row = vec![false; end + 1];
+    row[end] = true;
+    for (j, item) in columns.iter().enumerate().rev() {
+        row[j] = is_repeat(item) && row[j + 1];
+    }
+    for a in rows.iter().rev() {
+        let repeats = is_repeat(a);
+        let mut diagonal = row[end];
+        row[end] = repeats && diagonal;
+        for (j, b) in columns.iter().enumerate().rev() {
+            let below = row[j];
+            // A repeat can be empty or absorb the other sequence's next item.
+            // Otherwise both items must match and both suffixes must overlap.
+            row[j] = if repeats || is_repeat(b) {
+                below || row[j + 1]
+            } else {
+                diagonal && compatible(a, b)
+            };
+            diagonal = below;
+        }
+    }
+    row[0]
+}
+
+fn simple_glob_tokens_overlap(left: &[SimpleGlobToken], right: &[SimpleGlobToken]) -> bool {
+    sequence_patterns_overlap(
+        left,
+        right,
+        |token| *token == SimpleGlobToken::AnyString,
+        |a, b| match (a, b) {
+            (SimpleGlobToken::Literal(a), SimpleGlobToken::Literal(b)) => a == b,
+            _ => true,
+        },
+    )
 }
 
 fn simple_glob_patterns_overlap(left: &str, right: &str) -> Option<bool> {
@@ -227,10 +275,15 @@ fn is_directory_prefix(prefix: &str, full: &str) -> bool {
     if prefix.is_empty() {
         return true;
     }
+    // An unrelated Unicode path can have a scalar straddling prefix.len().
+    // Compare bytes instead of slicing that path at a non-character boundary.
+    let Some(head) = full.as_bytes().get(..prefix.len()) else {
+        return false;
+    };
     let is_prefix = if cfg!(any(target_os = "macos", target_os = "windows")) {
-        full.len() >= prefix.len() && full[..prefix.len()].eq_ignore_ascii_case(prefix)
+        head.eq_ignore_ascii_case(prefix.as_bytes())
     } else {
-        full.starts_with(prefix)
+        head == prefix.as_bytes()
     };
     is_prefix
         && full
@@ -416,37 +469,12 @@ impl CompiledPattern {
 /// mismatches. More complex segment syntax like classes/alternation remains
 /// conservative.
 fn segments_overlap(s1: &[PatternSegment], s2: &[PatternSegment]) -> bool {
-    fn visit(
-        s1: &[PatternSegment],
-        s2: &[PatternSegment],
-        i: usize,
-        j: usize,
-        memo: &mut [Vec<Option<bool>>],
-    ) -> bool {
-        if let Some(cached) = memo[i][j] {
-            return cached;
-        }
-
-        let overlaps = match (s1.get(i), s2.get(j)) {
-            (None, None) => true,
-            (Some(PatternSegment::Recursive), None) => visit(s1, s2, i + 1, j, memo),
-            (None, Some(PatternSegment::Recursive)) => visit(s1, s2, i, j + 1, memo),
-            (None, Some(_)) | (Some(_), None) => false,
-            (Some(PatternSegment::Recursive), Some(_)) => {
-                visit(s1, s2, i + 1, j, memo) || visit(s1, s2, i, j + 1, memo)
-            }
-            (Some(_), Some(PatternSegment::Recursive)) => {
-                visit(s1, s2, i, j + 1, memo) || visit(s1, s2, i + 1, j, memo)
-            }
-            (Some(seg1), Some(seg2)) => seg1.overlaps(seg2) && visit(s1, s2, i + 1, j + 1, memo),
-        };
-
-        memo[i][j] = Some(overlaps);
-        overlaps
-    }
-
-    let mut memo = vec![vec![None; s2.len() + 1]; s1.len() + 1];
-    visit(s1, s2, 0, 0, &mut memo)
+    sequence_patterns_overlap(
+        s1,
+        s2,
+        |segment| matches!(segment, PatternSegment::Recursive),
+        PatternSegment::overlaps,
+    )
 }
 
 /// Returns true when two glob/literal patterns overlap under Agent Mail semantics.
@@ -721,7 +749,6 @@ mod tests {
 
     #[test]
     fn segments_overlap_same_depth_disjoint_literal() {
-        // Same depth, but different literal segments
         let a = CompiledPattern::new("src/alpha/*.rs");
         let b = CompiledPattern::new("docs/beta/*.rs");
         assert!(!segments_overlap(a.segments(), b.segments()));
@@ -931,5 +958,241 @@ mod tests {
         let cloned = p.clone();
         assert_eq!(cloned.normalized(), p.normalized());
         assert_eq!(cloned.is_glob(), p.is_glob());
+    }
+
+    // Independent oracle: intersect two small token automata using explicit
+    // epsilon/consuming transitions, rather than the production DP recurrence.
+    fn automaton_overlap(left: &[SimpleGlobToken], right: &[SimpleGlobToken]) -> bool {
+        use std::collections::HashSet;
+
+        let mut pending = vec![(0, 0)];
+        let mut seen = HashSet::new();
+        while let Some((i, j)) = pending.pop() {
+            if !seen.insert((i, j)) {
+                continue;
+            }
+            if i == left.len() && j == right.len() {
+                return true;
+            }
+            let a = left.get(i);
+            let b = right.get(j);
+            let repeat_a = a == Some(&SimpleGlobToken::AnyString);
+            let repeat_b = b == Some(&SimpleGlobToken::AnyString);
+            if repeat_a {
+                pending.push((i + 1, j));
+            }
+            if repeat_b {
+                pending.push((i, j + 1));
+            }
+            if let (Some(a), Some(b)) = (a, b) {
+                let compatible = match (a, b) {
+                    (SimpleGlobToken::Literal(a), SimpleGlobToken::Literal(b)) => a == b,
+                    _ => true,
+                };
+                if compatible {
+                    pending.push((i + usize::from(!repeat_a), j + usize::from(!repeat_b)));
+                }
+            }
+        }
+        false
+    }
+
+    fn short_token_patterns() -> Vec<Vec<SimpleGlobToken>> {
+        let alphabet = [
+            SimpleGlobToken::Literal('a'),
+            SimpleGlobToken::Literal('b'),
+            SimpleGlobToken::AnyChar,
+            SimpleGlobToken::AnyString,
+        ];
+        let mut patterns = Vec::new();
+        for length in 0_u32..=3 {
+            for mut code in 0..alphabet.len().pow(length) {
+                let mut pattern = Vec::new();
+                for _ in 0..length {
+                    pattern.push(alphabet[code % alphabet.len()]);
+                    code /= alphabet.len();
+                }
+                patterns.push(pattern);
+            }
+        }
+        patterns
+    }
+
+    #[test]
+    fn token_overlap_matches_independent_automaton_exhaustively() {
+        let patterns = short_token_patterns();
+        for left in &patterns {
+            for right in &patterns {
+                let expected = automaton_overlap(left, right);
+                assert_eq!(simple_glob_tokens_overlap(left, right), expected);
+                assert_eq!(simple_glob_tokens_overlap(right, left), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn path_overlap_matches_independent_automaton_exhaustively() {
+        let tokens = short_token_patterns();
+        let paths: Vec<Vec<PatternSegment>> = tokens
+            .iter()
+            .map(|pattern| {
+                pattern
+                    .iter()
+                    .map(|token| match token {
+                        SimpleGlobToken::Literal(ch) => PatternSegment::Literal(ch.to_string()),
+                        SimpleGlobToken::AnyString => PatternSegment::Recursive,
+                        SimpleGlobToken::AnyChar => PatternSegment::Glob {
+                            raw: "?".to_string(),
+                            matcher: GlobBuilder::new("?")
+                                .literal_separator(true)
+                                .build()
+                                .unwrap()
+                                .compile_matcher(),
+                        },
+                    })
+                    .collect()
+            })
+            .collect();
+        for (i, left) in paths.iter().enumerate() {
+            for (j, right) in paths.iter().enumerate() {
+                assert_eq!(segments_overlap(left, right), automaton_overlap(&tokens[i], &tokens[j]));
+            }
+        }
+    }
+
+    #[test]
+    fn long_fixed_width_tokens_need_no_quadratic_workspace() {
+        let left = vec![SimpleGlobToken::Literal('a'); 100_000];
+        let any = vec![SimpleGlobToken::AnyChar; 100_000];
+        assert!(simple_glob_tokens_overlap(&left, &any));
+        assert!(!simple_glob_tokens_overlap(&left, &any[..99_999]));
+        let mut different = left.clone();
+        different[99_999] = SimpleGlobToken::Literal('b');
+        assert!(!simple_glob_tokens_overlap(&left, &different));
+    }
+
+    #[test]
+    fn long_repeat_pattern_runs_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut left = vec![SimpleGlobToken::AnyString];
+                left.extend(std::iter::repeat_n(SimpleGlobToken::Literal('a'), 50_000));
+                left.extend([SimpleGlobToken::Literal('b'), SimpleGlobToken::AnyString]);
+                let right = [
+                    SimpleGlobToken::Literal('a'),
+                    SimpleGlobToken::AnyString,
+                    SimpleGlobToken::Literal('b'),
+                ];
+                assert!(simple_glob_tokens_overlap(&left, &right));
+                assert!(simple_glob_tokens_overlap(&right, &left));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn deep_recursive_path_runs_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut left = vec![PatternSegment::Recursive];
+                left.extend(std::iter::repeat_n(
+                    PatternSegment::Literal("part".to_string()),
+                    20_000,
+                ));
+                left.extend([
+                    PatternSegment::Literal("end".to_string()),
+                    PatternSegment::Recursive,
+                ]);
+                let right = [
+                    PatternSegment::Literal("start".to_string()),
+                    PatternSegment::Recursive,
+                    PatternSegment::Literal("end".to_string()),
+                ];
+                assert!(segments_overlap(&left, &right));
+                assert!(segments_overlap(&right, &left));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn anchored_mismatches_are_rejected_before_grid_work() {
+        use std::cell::Cell;
+
+        for (left, right) in [
+            (format!("a*{}*", "a".repeat(10_000)), "b*a*".to_string()),
+            (format!("*{}*a", "a".repeat(10_000)), "*a*b".to_string()),
+        ] {
+            let left = parse_simple_glob_tokens(&left).unwrap();
+            let right = parse_simple_glob_tokens(&right).unwrap();
+            let comparisons = Cell::new(0_usize);
+            assert!(!sequence_patterns_overlap(
+                &left,
+                &right,
+                |token| *token == SimpleGlobToken::AnyString,
+                |a, b| {
+                    comparisons.set(comparisons.get() + 1);
+                    a == b
+                },
+            ));
+            assert_eq!(comparisons.get(), 1);
+        }
+    }
+
+    #[test]
+    fn nullable_and_repeated_wildcards_preserve_overlap_semantics() {
+        for (left, right, expected) in [
+            ("**", "", true),
+            ("*a*", "", false),
+            ("*", "a*", true),
+            ("?", "", false),
+            ("*a", "*b", false),
+            ("a*", "*b", true),
+            ("a**b", "a*b", true),
+        ] {
+            assert_eq!(simple_glob_patterns_overlap(left, right), Some(expected));
+            assert_eq!(simple_glob_patterns_overlap(right, left), Some(expected));
+        }
+    }
+
+    #[test]
+    fn unicode_directory_prefix_checks_never_split_a_scalar() {
+        for (prefix, full) in [("a", "é/file"), ("é", "猫/file"), ("abc", "🦀/file")] {
+            assert!(!full.is_char_boundary(prefix.len()));
+            assert!(!is_directory_prefix(prefix, full));
+            assert!(!patterns_overlap(prefix, full));
+            assert!(!patterns_overlap(full, prefix));
+        }
+    }
+
+    #[test]
+    fn directory_prefix_keeps_unicode_ancestors_and_platform_case_rules() {
+        assert!(is_directory_prefix("", "猫/file"));
+        assert!(is_directory_prefix("猫", "猫/file"));
+        assert!(!is_directory_prefix("猫", "猫"));
+        assert!(!is_directory_prefix("src", "source/file"));
+        assert!(!is_directory_prefix("src/long", "src"));
+        assert_eq!(
+            is_directory_prefix("Src", "src/file"),
+            cfg!(any(target_os = "macos", target_os = "windows"))
+        );
+    }
+
+    #[test]
+    fn compiled_deep_paths_keep_glob_intersection_and_suffix_separation() {
+        let prefix = "part/".repeat(256);
+        assert!(patterns_overlap(&format!("{prefix}a*"), &format!("{prefix}*b")));
+        assert!(!patterns_overlap(
+            &format!("{prefix}**/*.rs"),
+            &format!("{prefix}**/*.txt")
+        ));
+        assert!(!patterns_overlap(
+            &format!("{prefix}*"),
+            &format!("{prefix}nested/file")
+        ));
     }
 }
