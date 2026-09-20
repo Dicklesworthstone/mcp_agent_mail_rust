@@ -607,6 +607,7 @@ const ACTIVITY_PROBE_PATH_LIMIT: usize = 5_000;
 // Matched-file limits alone do not bound a tree of empty directories or files
 // with unrelated extensions. Count every visited entry independently.
 const ACTIVITY_PROBE_ENTRY_LIMIT: usize = 40_000;
+const ACTIVITY_PROBE_PATH_DEPTH_LIMIT: usize = 256;
 const ACTIVITY_PROBE_WALK_TIMEOUT: Duration = Duration::from_millis(250);
 const ACTIVITY_PROBE_GIT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -642,15 +643,54 @@ impl ActivityWalkBudget {
     }
 }
 
-fn probe_file_activity(path: &Path, now_us: i64, grace_us: i64) -> ActivityProbeResult {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+/// Inspect existing prefixes below the selected workspace, not just the leaf.
+/// A leaf-only no-follow stat still follows intermediate directory symlinks.
+/// These conservative observations are not an atomic filesystem snapshot.
+fn probe_metadata(
+    workspace: &Path,
+    path: &Path,
+) -> Result<Option<std::fs::Metadata>, ActivityProbeResult> {
+    let relative = path
+        .strip_prefix(workspace)
+        .map_err(|_| ActivityProbeResult::Unavailable)?;
+    let mut candidate = workspace.to_path_buf();
+    let mut metadata = std::fs::symlink_metadata(&candidate)
+        .map_err(|_| ActivityProbeResult::Unavailable)?;
+    if !metadata.is_dir() {
+        return Err(ActivityProbeResult::Unavailable);
+    }
+    for (depth, component) in relative.components().enumerate() {
+        if depth >= ACTIVITY_PROBE_PATH_DEPTH_LIMIT
+            || !matches!(component, std::path::Component::Normal(_))
+            || !metadata.is_dir()
+        {
+            return Err(ActivityProbeResult::Unavailable);
+        }
+        candidate.push(component.as_os_str());
+        metadata = match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(ActivityProbeResult::Unavailable),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(ActivityProbeResult::Unavailable);
+        }
+    }
+    Ok(Some(metadata))
+}
+
+fn probe_file_activity(
+    workspace: &Path,
+    path: &Path,
+    now_us: i64,
+    grace_us: i64,
+) -> ActivityProbeResult {
+    let Ok(Some(metadata)) = probe_metadata(workspace, path) else {
         // Includes a file disappearing after enumeration: a deletion/race is
         // not a successful observation of an old unchanged file.
         return ActivityProbeResult::Unavailable;
     };
     if !metadata.is_file() {
-        // Do not follow a symlink out of the workspace or use a directory's
-        // timestamp as evidence about all of its children.
         return ActivityProbeResult::Unavailable;
     }
     let Some(modified_us) = metadata
@@ -703,9 +743,11 @@ fn path_matches_probe(
         .ok()
         .and_then(Path::to_str)
         .ok_or(ActivityProbeResult::Unavailable)?;
-    #[cfg(windows)]
-    let relative = relative.replace('\\', "/");
-    Ok(compiled.matches(relative.as_ref()))
+    if cfg!(windows) {
+        Ok(compiled.matches(&relative.replace('\\', "/")))
+    } else {
+        Ok(compiled.matches(relative))
+    }
 }
 
 fn parse_git_listed_activity(
@@ -734,12 +776,16 @@ fn parse_git_listed_activity(
             return ActivityProbeResult::Unavailable;
         };
         let path = workspace.join(relative);
-        match path_matches_probe(workspace, &path, compiled.is_glob().then_some(&*compiled)) {
+        match path_matches_probe(
+            workspace,
+            &path,
+            compiled.is_glob().then_some(compiled.as_ref()),
+        ) {
             Ok(false) => continue,
             Ok(true) => {}
             Err(error) => return error,
         }
-        match probe_file_activity(&path, now_us, grace_us) {
+        match probe_file_activity(workspace, &path, now_us, grace_us) {
             ActivityProbeResult::Inactive => {}
             other => return other,
         }
@@ -809,10 +855,7 @@ fn walk_activity(
     let mut scanned = 0usize;
     // The elapsed-time bound is cooperative between filesystem operations; it
     // cannot preempt an individual metadata/read-directory call.
-    for entry in walkdir::WalkDir::new(root)
-        .follow_links(false)
-        .max_open(16)
-    {
+    for entry in walkdir::WalkDir::new(root).follow_links(false).max_open(16) {
         if !budget.take_entry() {
             return ActivityProbeResult::Truncated;
         }
@@ -839,7 +882,7 @@ fn walk_activity(
             return ActivityProbeResult::Truncated;
         }
         scanned += 1;
-        match probe_file_activity(entry.path(), now_us, grace_us) {
+        match probe_file_activity(workspace, entry.path(), now_us, grace_us) {
             ActivityProbeResult::Inactive => {}
             other => return other,
         }
@@ -906,11 +949,9 @@ fn check_glob_activity_fallback_with_limit(
         .first_literal_segment()
         .map(|segment| workspace.join(segment))
         .unwrap_or_else(|| workspace.to_path_buf());
-    match std::fs::symlink_metadata(&scan_root) {
-        Ok(metadata) if metadata.is_dir() || metadata.is_file() => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ActivityProbeResult::Inactive;
-        }
+    match probe_metadata(workspace, &scan_root) {
+        Ok(Some(metadata)) if metadata.is_dir() || metadata.is_file() => {}
+        Ok(None) => return ActivityProbeResult::Inactive,
         _ => return ActivityProbeResult::Unavailable,
     }
     walk_activity(
@@ -950,16 +991,18 @@ fn probe_filesystem_activity(
         return check_glob_activity_fallback(workspace, &pattern, now_us, grace_us);
     }
     let candidate = workspace.join(&pattern);
-    match std::fs::symlink_metadata(&candidate) {
-        Ok(metadata) if metadata.is_dir() => {
+    match probe_metadata(workspace, &candidate) {
+        Ok(Some(metadata)) if metadata.is_dir() => {
             match check_git_listed_activity(workspace, &pattern, now_us, grace_us) {
                 ActivityProbeResult::Inactive | ActivityProbeResult::Unsupported => {}
                 other => return other,
             }
             check_directory_activity_fallback(&candidate, now_us, grace_us)
         }
-        Ok(metadata) if metadata.is_file() => probe_file_activity(&candidate, now_us, grace_us),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ActivityProbeResult::Inactive,
+        Ok(Some(metadata)) if metadata.is_file() => {
+            probe_file_activity(workspace, &candidate, now_us, grace_us)
+        }
+        Ok(None) => ActivityProbeResult::Inactive,
         _ => ActivityProbeResult::Unavailable,
     }
 }
@@ -1303,7 +1346,12 @@ mod tests {
             probe_filesystem_activity(fake, "*.rs", now_micros(), 1_000_000),
             ActivityProbeResult::Unavailable
         );
-        assert!(check_filesystem_activity(fake, "*.rs", now_micros(), 1_000_000));
+        assert!(check_filesystem_activity(
+            fake,
+            "*.rs",
+            now_micros(),
+            1_000_000
+        ));
     }
 
     #[test]
@@ -2228,7 +2276,12 @@ mod tests {
     #[test]
     fn nul_listing_refuses_partial_or_outside_workspace_records() {
         let tmp = tempfile::tempdir().unwrap();
-        for bytes in [b"partial.rs".as_slice(), b"../outside.rs\0", b"/outside.rs\0", b"\0"] {
+        for bytes in [
+            b"partial.rs".as_slice(),
+            b"../outside.rs\0",
+            b"/outside.rs\0",
+            b"\0",
+        ] {
             assert_eq!(
                 parse_git_listed_activity(tmp.path(), "**", bytes, now_micros(), 1_000_000, 10),
                 ActivityProbeResult::Unavailable
@@ -2292,7 +2345,12 @@ mod tests {
         );
         std::fs::write(tmp.path().join("not-directory"), b"preserved").unwrap();
         assert_eq!(
-            probe_filesystem_activity(tmp.path(), "not-directory/child.rs", now_micros(), 1_000_000),
+            probe_filesystem_activity(
+                tmp.path(),
+                "not-directory/child.rs",
+                now_micros(),
+                1_000_000,
+            ),
             ActivityProbeResult::Unavailable
         );
         assert_eq!(
@@ -2329,7 +2387,15 @@ mod tests {
             started: Instant::now(),
         };
         assert_eq!(
-            walk_activity(tmp.path(), tmp.path(), Some(&compiled), now_micros(), 1_000_000, 5000, &mut budget),
+            walk_activity(
+                tmp.path(),
+                tmp.path(),
+                Some(&compiled),
+                now_micros(),
+                1_000_000,
+                5000,
+                &mut budget,
+            ),
             ActivityProbeResult::Truncated
         );
         assert_eq!(budget.remaining_entries, 0);
@@ -2343,7 +2409,15 @@ mod tests {
             started: Instant::now() - Duration::from_secs(1),
         };
         assert_eq!(
-            walk_activity(tmp.path(), tmp.path(), None, now_micros(), 1_000_000, 10, &mut budget),
+            walk_activity(
+                tmp.path(),
+                tmp.path(),
+                None,
+                now_micros(),
+                1_000_000,
+                10,
+                &mut budget,
+            ),
             ActivityProbeResult::Truncated
         );
         assert_eq!(budget.remaining_entries, 10);
@@ -2358,11 +2432,19 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), tmp.path().join("linked")).unwrap();
         for pattern in ["linked", "linked/**"] {
             assert_eq!(
-                probe_filesystem_activity(tmp.path(), pattern, now_micros() + 120_000_000, 1_000_000),
+                probe_filesystem_activity(
+                    tmp.path(),
+                    pattern,
+                    now_micros() + 120_000_000,
+                    1_000_000,
+                ),
                 ActivityProbeResult::Unavailable
             );
         }
-        assert_eq!(std::fs::read(outside.path().join("old.rs")).unwrap(), b"outside work");
+        assert_eq!(
+            std::fs::read(outside.path().join("old.rs")).unwrap(),
+            b"outside work"
+        );
     }
 
     #[test]
@@ -2372,13 +2454,28 @@ mod tests {
         let now = now_micros();
         let mut cache = CleanupProbeCache::default();
         assert!(path_has_recent_activity_cached(
-            &mut cache, tmp.path(), 1, "src/missing.rs", None, now, 60_000_000,
+            &mut cache,
+            tmp.path(),
+            1,
+            "src/missing.rs",
+            None,
+            now,
+            60_000_000,
         ));
-        assert_eq!(cache.path_probes[&(1, "src/missing.rs".to_string())].fs_recent_until_us, 0);
+        assert_eq!(
+            cache.path_probes[&(1, "src/missing.rs".to_string())].fs_recent_until_us,
+            0
+        );
         std::fs::rename(tmp.path().join("src"), tmp.path().join("saved-src-file")).unwrap();
         std::fs::create_dir(tmp.path().join("src")).unwrap();
         assert!(!path_has_recent_activity_cached(
-            &mut cache, tmp.path(), 1, "src/missing.rs", None, now, 60_000_000,
+            &mut cache,
+            tmp.path(),
+            1,
+            "src/missing.rs",
+            None,
+            now,
+            60_000_000,
         ));
     }
 
@@ -2404,6 +2501,73 @@ mod tests {
             vec![reservation_id],
             "a complete negative observation still permits ordinary stale cleanup"
         );
-        assert_eq!(std::fs::read(workspace.join("saved-src-file")).unwrap(), b"preserve this evidence");
+        assert_eq!(
+            std::fs::read(workspace.join("saved-src-file")).unwrap(),
+            b"preserve this evidence"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_and_listed_leaf_checks_reject_symlinked_ancestors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("nested")).unwrap();
+        std::fs::write(outside.path().join("nested/old.rs"), b"outside evidence").unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("src")).unwrap();
+        let now = now_micros() + 120_000_000;
+        assert_eq!(
+            probe_filesystem_activity(tmp.path(), "src/nested/old.rs", now, 1_000_000),
+            ActivityProbeResult::Unavailable
+        );
+        assert_eq!(
+            parse_git_listed_activity(
+                tmp.path(),
+                "src/**",
+                b"src/nested/old.rs\0",
+                now,
+                1_000_000,
+                10,
+            ),
+            ActivityProbeResult::Unavailable
+        );
+        assert_eq!(
+            std::fs::read(outside.path().join("nested/old.rs")).unwrap(),
+            b"outside evidence"
+        );
+    }
+
+    #[test]
+    fn missing_candidate_and_missing_workspace_are_distinct_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("absent");
+        assert!(probe_metadata(tmp.path(), &absent).unwrap().is_none());
+        assert!(matches!(
+            probe_metadata(&absent, &absent.join("file.rs")),
+            Err(ActivityProbeResult::Unavailable)
+        ));
+        assert!(matches!(
+            probe_metadata(tmp.path(), Path::new("/outside-workspace/file.rs")),
+            Err(ActivityProbeResult::Unavailable)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn excessive_prefix_depth_is_unknown_not_a_negative_activity_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut path = tmp.path().to_path_buf();
+        for _ in 0..ACTIVITY_PROBE_PATH_DEPTH_LIMIT {
+            path.push("d");
+            std::fs::create_dir(&path).unwrap();
+        }
+        let file = path.join("old.rs");
+        std::fs::write(&file, b"retained deep work").unwrap();
+        assert!(probe_metadata(tmp.path(), &path).unwrap().is_some());
+        assert!(matches!(
+            probe_metadata(tmp.path(), &file),
+            Err(ActivityProbeResult::Unavailable)
+        ));
+        assert_eq!(std::fs::read(file).unwrap(), b"retained deep work");
     }
 }
