@@ -177,12 +177,11 @@ Replaces the legacy 4,000-line bash installer entirely. Built into `am` binary.
 
 **Current state:** Runtime `DbConn` uses `sqlmodel-frankensqlite`. Canonical verification and recovery cross-checks use the statically bundled C SQLite driver; they are separate from runtime mailbox queries.
 
-> **Reality note (2026-09-01):** the runtime mailbox path is FrankenSQLite only (`DbConn`, test-enforced), but the binaries still statically bundle C SQLite through `sqlmodel-sqlite` (a non-optional dependency of the db and cli crates) for verification and recovery cross-checks (`CanonicalDbConn`: doctor double-probe, reconstruct, legacy import). `BEGIN CONCURRENT` is implemented but opt-in (`FSQLITE_CONCURRENT_MODE`, default off; 85 `BEGIN IMMEDIATE` sites remain) pending the upstream MVCC snapshot-drift fix, and the `fsqlite_raptorq_enabled` config flag has no readers yet.
+> **Reality note (2026-09-01; configuration updated 2026-09-20):** the runtime mailbox path is FrankenSQLite only (`DbConn`, test-enforced), but the binaries still statically bundle C SQLite through `sqlmodel-sqlite` (a non-optional dependency of the db and cli crates) for verification and recovery cross-checks (`CanonicalDbConn`: doctor double-probe, reconstruct, legacy import). `BEGIN CONCURRENT` is implemented but opt-in (`FSQLITE_CONCURRENT_MODE`, default off; 85 `BEGIN IMMEDIATE` sites remain) pending the upstream MVCC snapshot-drift fix. Agent Mail exposes no erasure-coded WAL self-healing setting; the unused option was removed in `br-of0ra`.
 
 **Next hardening work:**
 - Close runtime engine gaps in FrankenSQLite while retaining independent canonical recovery checks.
 - Qualify `BEGIN CONCURRENT` against the recovery and contention suites before changing its opt-in default.
-- Evaluate erasure-coded WAL recovery only after a wired implementation and real corruption tests exist.
 - MVCC conflict detection already wired (`is_mvcc_conflict()` in error.rs)
 
 **Non-negotiable:** Never reintroduce a production/runtime dependency on C SQLite. The direction is forward — toward full FrankenSQLite ownership and hardening.

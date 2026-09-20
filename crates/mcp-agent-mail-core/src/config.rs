@@ -362,7 +362,7 @@ pub struct Config {
     /// ambient write throughput.
     pub integrity_check_interval_hours: u64,
 
-    // FrankenSQLite MVCC / RaptorQ
+    // FrankenSQLite MVCC
     /// Use `BEGIN CONCURRENT` for write transactions (default: **false**).
     ///
     /// Disabled by default due to known MVCC snapshot-drift bug (GH#65):
@@ -371,8 +371,6 @@ pub struct Config {
     /// (single-writer) unless you have a specific need for concurrent
     /// writers and have tested your workload.
     pub fsqlite_concurrent_mode: bool,
-    /// Enable `RaptorQ` erasure-coded self-healing on WAL + DB files (default: true).
-    pub fsqlite_raptorq_enabled: bool,
     /// Max retries on MVCC page-level conflict at COMMIT (default: 5).
     pub fsqlite_concurrent_retries: u64,
 
@@ -1589,7 +1587,6 @@ impl Default for Config {
             integrity_check_interval_hours: 1,
 
             fsqlite_concurrent_mode: false,
-            fsqlite_raptorq_enabled: true,
             fsqlite_concurrent_retries: 5,
 
             // Storage
@@ -2193,11 +2190,9 @@ impl Config {
             config.doctor_auto_reclaim_on_heal,
         );
 
-        // FrankenSQLite MVCC / RaptorQ
+        // FrankenSQLite MVCC
         config.fsqlite_concurrent_mode =
             env_bool("FSQLITE_CONCURRENT_MODE", config.fsqlite_concurrent_mode);
-        config.fsqlite_raptorq_enabled =
-            env_bool("FSQLITE_RAPTORQ_ENABLED", config.fsqlite_raptorq_enabled);
         config.fsqlite_concurrent_retries = env_u64(
             "FSQLITE_CONCURRENT_RETRIES",
             config.fsqlite_concurrent_retries,

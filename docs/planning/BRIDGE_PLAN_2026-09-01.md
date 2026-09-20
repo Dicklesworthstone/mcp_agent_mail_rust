@@ -645,14 +645,14 @@ Still unmoved: goals 5 (swarm durability), 7 (engine strategy), 13 (search in sh
 - [ ] Under (a): `rg 'open_guarded_read_only_(franken|canonical)_' crates` shows only the dispatcher, the two openers and deliberately engine-specific sites, each with a one-line justification comment; `docs/VISION.md` reality note replaced by the ADR link.
 - [ ] Under (b): `cargo tree -p mcp-agent-mail-db | rg sqlmodel-sqlite` is empty and a `tests/docs_drift_ci.rs` case asserts it.
 - [ ] Either way: the class-H tests (`br-s9d8a`, 6 doctor fixer tests) and class-B probes (`br-0dw2c`, 10 writer-lock tests) are green or rewritten to the invariant the ADR states, with the rewrite justified in the test.
-- [ ] `fsqlite_raptorq_enabled` is wired to engine behaviour with a test, or removed with its docs.
+- [x] Removed the unused erasure-coded recovery setting and its active vision promise (`br-of0ra`, 2026-09-20); the historical finding above describes the original audit snapshot.
 
 **Implementation plan.**
 1. Inventory every `CanonicalDbConn` use (`rg -n 'CanonicalDbConn' crates --type rust | wc -l` ≈ dozens) into a table: purpose, whether the input can be Franken-admitted, whether a private neutralized copy is used.
 2. Decide (maintainer). The evidence to weigh: the class-B finding that Franken and canonical share no fcntl exclusion, the readonly_shm limitation, and how often canonical caught real corruption that Franken's own `integrity_check` missed (search the doctor artifacts under `~/.mcp_agent_mail_git_mailbox_repo/doctor/`).
 3. Under (a): finish routing the remaining E1 sites (`cli::open_live_sqlite_read_only` / `open_sqlite_with_fallback` and their 13 callers; `tools::identity::open_health_check_sync_db_connection`; the cli index-repair classifier and physical probe); make `CanonicalDbConn` open sites accept only paths proven non-Franken-admitted (`pool::is_franken_admitted_family`) or private copies.
 4. Under (b): implement a Franken-native full check (`PRAGMA integrity_check` through `DbConn` exists; add page-level header validation for the cases canonical caught), then delete canonical sites crate by crate, `sqlmodel-sqlite` last.
-5. Decide `fsqlite_raptorq_enabled` with the upstream maintainers; wire or delete.
+5. Completed the removal option for the unused recovery setting (`br-of0ra`, 2026-09-20).
 
 **Dependencies.** Gap 1's harness supplies the evidence; Gap 4 supplies the class B/H test beads.
 **Complexity.** L for (a), XL for (b).
@@ -927,7 +927,7 @@ Listed separately from Gap 1 because it is reproducible today without a harness:
 
 ### Gap 17: Dead flags and documented-but-dead functions — NEW → WORKING
 
-`fsqlite_raptorq_enabled` (`br-of0ra`, see Gap 2) and `atc_record_outcome` (Gap 8). Success: both wired with a test or removed with their docs.
+The unused recovery setting was removed with its active documentation (`br-of0ra`, 2026-09-20; see Gap 2). `atc_record_outcome` (Gap 8) remains a separate task: wire it with a test or remove it with its docs.
 **Complexity.** S. **Beads:** `br-of0ra`; ATC cleanup needs a child bead under Gap 8.
 
 ### Gap 18: TUI and web polish (goals 8, 9) — WORKING → WORKING (guard)

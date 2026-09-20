@@ -82,6 +82,9 @@ slow-timeout = { period = "180s", terminate-after = 6, grace-period = "10s" }
 # reserved, i.e. effectively alone, so their latency assertions measure the
 # code on an unloaded machine — the same environment their budgets were
 # calibrated against. This costs serial wall-clock only for this short list.
+# br-ivgot: the inline modal and Mermaid timing tests need the same isolation
+# as the dedicated TUI performance binary. Their 1ms/10ms assertions remain
+# unchanged; this reserves runner capacity, not CPU time from other processes.
 # ---------------------------------------------------------------------------
 [[profile.default.overrides]]
 filter = '''
@@ -97,6 +100,8 @@ binary_id(mcp-agent-mail-storage::stress_pipeline)
 | test(rapid_key_sequences_no_panic)
 | binary_id(mcp-agent-mail-server::tui_perf_baselines)
 | binary_id(mcp-agent-mail-server::golden_snapshots)
+| test(=tui_app::tests::perf_modal_overlay_render)
+| test(=tui_widgets::tests::mermaid_contact_graph_50_nodes_stays_under_10ms)
 '''
 threads-required = "num-test-threads"
 
@@ -161,6 +166,8 @@ binary_id(mcp-agent-mail-storage::stress_pipeline)
 | test(rapid_key_sequences_no_panic)
 | binary_id(mcp-agent-mail-server::tui_perf_baselines)
 | binary_id(mcp-agent-mail-server::golden_snapshots)
+| test(=tui_app::tests::perf_modal_overlay_render)
+| test(=tui_widgets::tests::mermaid_contact_graph_50_nodes_stays_under_10ms)
 '''
 threads-required = "num-test-threads"
 

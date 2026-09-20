@@ -174,12 +174,11 @@ Replaces the legacy 4,000-line bash installer entirely. Built into `am` binary.
 
 **Current state:** `DbConn` and canonical verification/recovery paths now use `sqlmodel-frankensqlite`, and the Rust binaries no longer link `libsqlite3`.
 
-> **Reality note (2026-09-01):** the runtime mailbox path is FrankenSQLite only (`DbConn`, test-enforced), but the binaries still statically bundle C SQLite through `sqlmodel-sqlite` (a non-optional dependency of the db and cli crates) for verification and recovery cross-checks (`CanonicalDbConn`: doctor double-probe, reconstruct, legacy import). `BEGIN CONCURRENT` is implemented but opt-in (`FSQLITE_CONCURRENT_MODE`, default off; 85 `BEGIN IMMEDIATE` sites remain) pending the upstream MVCC snapshot-drift fix, and the `fsqlite_raptorq_enabled` config flag has no readers yet.
+> **Reality note (2026-09-01; configuration updated 2026-09-20):** the runtime mailbox path is FrankenSQLite only (`DbConn`, test-enforced), but the binaries still statically bundle C SQLite through `sqlmodel-sqlite` (a non-optional dependency of the db and cli crates) for verification and recovery cross-checks (`CanonicalDbConn`: doctor double-probe, reconstruct, legacy import). `BEGIN CONCURRENT` is implemented but opt-in (`FSQLITE_CONCURRENT_MODE`, default off; 85 `BEGIN IMMEDIATE` sites remain) pending the upstream MVCC snapshot-drift fix. Agent Mail exposes no erasure-coded WAL self-healing setting; the unused option was removed in `br-of0ra`.
 
 **Next hardening work:**
 - Keep closing any remaining engine feature gaps directly in FrankenSQLite rather than reintroducing C SQLite
 - Replace all `BEGIN IMMEDIATE` with `BEGIN CONCURRENT` for page-level MVCC (128 concurrent writers)
-- Enable RaptorQ erasure-coded WAL self-healing for automatic corruption recovery
 - MVCC conflict detection already wired (`is_mvcc_conflict()` in error.rs)
 
 **Non-negotiable:** Never reintroduce a production/runtime dependency on C SQLite. The direction is forward — toward full FrankenSQLite ownership and hardening.
