@@ -59037,6 +59037,88 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn startup_database_self_heal_handles_empty_project_delta_without_reconstruct() {
+        for include_message in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path().canonicalize().expect("native absolute root");
+            let message_dir = seed_archive_mailbox_project(&root);
+            // Project identities must be persistent: doctor intentionally
+            // excludes temporary project roots from authoritative recovery.
+            // Only metadata uses this path; fixture files stay in the tempdir.
+            let project_key = std::env::current_dir()
+                .unwrap()
+                .join("startup-delta-source-project");
+            std::fs::write(
+                root.join("projects/ahead-project/project.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "slug": "ahead-project",
+                    "human_key": project_key,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let db_path = root.join("live.sqlite3");
+            let seeded = mcp_agent_mail_db::reconstruct_from_archive(&db_path, &root)
+                .expect("seed matching project and agent state");
+            assert_eq!(seeded.parse_errors, 0);
+            let db_url = format!("sqlite:///{}", db_path.display());
+            assert!(matches!(
+                startup_database_self_heal_action(&db_url, &root).unwrap(),
+                StartupDatabaseSelfHealAction::None(_)
+            ));
+            let empty_project = root.join("projects/empty-project");
+            std::fs::create_dir_all(&empty_project).unwrap();
+            std::fs::write(
+                empty_project.join("project.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "slug": "empty-project",
+                    "human_key": project_key.with_file_name("startup-delta-empty-project"),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            if include_message {
+                write_archive_mailbox_message(
+                    &message_dir,
+                    "2026-03-22T12-00-00Z__archive-ahead__1.md",
+                    1,
+                    "Alice",
+                    "Archive ahead",
+                    "normal",
+                    "2026-03-22T12:00:00Z",
+                    "missing message alongside an empty project",
+                );
+            }
+            for _ in 0..2 {
+                run_startup_database_self_heal_with(
+                    &db_url,
+                    &root,
+                    || panic!("healthy archive delta must not repair"),
+                    |_| panic!("small archive delta must not reconstruct"),
+                )
+                .expect("startup applies the delta and then converges");
+            }
+            let conn =
+                mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref()).unwrap();
+            assert_eq!(
+                conn.query_sync("SELECT id FROM projects WHERE slug = 'empty-project'", &[])
+                    .unwrap()
+                    .len(),
+                // Metadata-only drift is deliberately hygiene debt at startup
+                // (GH217). A message delta must also import the empty project
+                // in the same transaction (GH284), without full reconstruction.
+                usize::from(include_message)
+            );
+            assert_eq!(
+                conn.query_sync("SELECT id FROM messages WHERE id = 1", &[])
+                    .unwrap()
+                    .len(),
+                usize::from(include_message)
+            );
+        }
+    }
+
+    #[test]
     fn startup_database_self_heal_dispatches_reconstruct_for_missing_db_with_archive() {
         let dir = tempfile::tempdir().expect("tempdir");
         seed_archive_mailbox_project(dir.path());
