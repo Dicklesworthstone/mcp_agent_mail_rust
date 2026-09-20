@@ -25,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 /// Global shutdown flag for the cleanup worker.
@@ -37,7 +38,7 @@ static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
 const PROBE_CACHE_RETENTION_US: i64 = 6 * 60 * 60 * 1_000_000;
 
 fn normalize_path_pattern_key(path_pattern: &str) -> String {
-    path_pattern.trim().trim_start_matches('/').to_string()
+    CompiledPattern::cached(path_pattern).normalized().to_string()
 }
 
 #[derive(Debug, Default)]
@@ -562,23 +563,29 @@ fn path_has_recent_activity_cached(
     grace_us: i64,
 ) -> bool {
     let normalized_pattern = normalize_path_pattern_key(path_pattern);
-    if normalized_pattern.is_empty() {
-        return false;
-    }
     let key = (project_id, normalized_pattern.clone());
     let entry = cache.path_probes.entry(key).or_default();
     entry.last_used_us = now_us;
 
-    // Filesystem side: only reuse known-positive activity through grace window.
+    // Only a successful positive observation earns a grace-window cache entry.
+    // Incomplete/error observations preserve the lease for this cycle but are
+    // retried next time; they are neither inactivity nor fabricated activity.
     if entry.fs_recent_until_us > now_us {
         return true;
     }
-    let recent_fs = check_filesystem_activity(workspace, &normalized_pattern, now_us, grace_us);
-    if recent_fs {
-        entry.fs_recent_until_us = now_us.saturating_add(grace_us);
-        return true;
+    match probe_filesystem_activity(workspace, &normalized_pattern, now_us, grace_us) {
+        ActivityProbeResult::Active => {
+            entry.fs_recent_until_us = now_us.saturating_add(grace_us);
+            return true;
+        }
+        ActivityProbeResult::Inactive => entry.fs_recent_until_us = 0,
+        ActivityProbeResult::Truncated
+        | ActivityProbeResult::Unsupported
+        | ActivityProbeResult::Unavailable => {
+            entry.fs_recent_until_us = 0;
+            return true;
+        }
     }
-    entry.fs_recent_until_us = 0;
 
     // Git side: cache latest matching commit at a specific HEAD.
     let Some(current_head) = git_head_oid else {
@@ -597,83 +604,247 @@ fn path_has_recent_activity_cached(
 }
 
 const ACTIVITY_PROBE_PATH_LIMIT: usize = 5_000;
+// Matched-file limits alone do not bound a tree of empty directories or files
+// with unrelated extensions. Count every visited entry independently.
+const ACTIVITY_PROBE_ENTRY_LIMIT: usize = 40_000;
+const ACTIVITY_PROBE_WALK_TIMEOUT: Duration = Duration::from_millis(250);
+const ACTIVITY_PROBE_GIT_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn path_modified_within_grace(path: &Path, now_us: i64, grace_us: i64) -> bool {
-    path.metadata()
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .is_some_and(|modified| {
-            let mtime_us = modified
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
-            now_us.saturating_sub(mtime_us) <= grace_us
-        })
-}
-
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActivityProbeResult {
     Active,
     Inactive,
     Truncated,
     Unsupported,
+    /// Inspection failed. This must never authorize an inactivity release.
+    Unavailable,
+}
+
+struct ActivityWalkBudget {
+    remaining_entries: usize,
+    started: Instant,
+}
+
+impl ActivityWalkBudget {
+    fn new() -> Self {
+        Self {
+            remaining_entries: ACTIVITY_PROBE_ENTRY_LIMIT,
+            started: Instant::now(),
+        }
+    }
+
+    fn take_entry(&mut self) -> bool {
+        if self.remaining_entries == 0 || self.started.elapsed() >= ACTIVITY_PROBE_WALK_TIMEOUT {
+            return false;
+        }
+        self.remaining_entries -= 1;
+        true
+    }
+}
+
+fn probe_file_activity(path: &Path, now_us: i64, grace_us: i64) -> ActivityProbeResult {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        // Includes a file disappearing after enumeration: a deletion/race is
+        // not a successful observation of an old unchanged file.
+        return ActivityProbeResult::Unavailable;
+    };
+    if !metadata.is_file() {
+        // Do not follow a symlink out of the workspace or use a directory's
+        // timestamp as evidence about all of its children.
+        return ActivityProbeResult::Unavailable;
+    }
+    let Some(modified_us) = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_micros()).ok())
+    else {
+        return ActivityProbeResult::Unavailable;
+    };
+    if now_us.saturating_sub(modified_us) <= grace_us {
+        ActivityProbeResult::Active
+    } else {
+        ActivityProbeResult::Inactive
+    }
+}
+
+fn git_listed_path(bytes: &[u8]) -> Option<PathBuf> {
+    if bytes.is_empty() {
+        return None;
+    }
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()))
+    };
+    #[cfg(not(unix))]
+    let path = PathBuf::from(std::str::from_utf8(bytes).ok()?);
+    // Git's NUL-delimited output is relative to the selected worktree. Never
+    // let a malformed record turn a read probe into traversal outside it.
+    if path
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(path)
+}
+
+fn path_matches_probe(
+    workspace: &Path,
+    path: &Path,
+    compiled: Option<&CompiledPattern>,
+) -> Result<bool, ActivityProbeResult> {
+    let Some(compiled) = compiled else {
+        return Ok(true);
+    };
+    let relative = path
+        .strip_prefix(workspace)
+        .ok()
+        .and_then(Path::to_str)
+        .ok_or(ActivityProbeResult::Unavailable)?;
+    #[cfg(windows)]
+    let relative = relative.replace('\\', "/");
+    Ok(compiled.matches(relative.as_ref()))
+}
+
+fn parse_git_listed_activity(
+    workspace: &Path,
+    pattern: &str,
+    bytes: &[u8],
+    now_us: i64,
+    grace_us: i64,
+    path_limit: usize,
+) -> ActivityProbeResult {
+    if bytes.is_empty() {
+        return ActivityProbeResult::Inactive;
+    }
+    let Some(records) = bytes.strip_suffix(&[0]) else {
+        return ActivityProbeResult::Unavailable;
+    };
+    let compiled = CompiledPattern::cached(pattern);
+    if !compiled.is_matchable() {
+        return ActivityProbeResult::Unsupported;
+    }
+    for (count, record) in records.split(|byte| *byte == 0).enumerate() {
+        if count >= path_limit {
+            return ActivityProbeResult::Truncated;
+        }
+        let Some(relative) = git_listed_path(record) else {
+            return ActivityProbeResult::Unavailable;
+        };
+        let path = workspace.join(relative);
+        match path_matches_probe(workspace, &path, compiled.is_glob().then_some(&*compiled)) {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(error) => return error,
+        }
+        match probe_file_activity(&path, now_us, grace_us) {
+            ActivityProbeResult::Inactive => {}
+            other => return other,
+        }
+    }
+    ActivityProbeResult::Inactive
 }
 
 fn check_git_listed_activity(
     workspace: &Path,
-    pathspec: &str,
+    pattern: &str,
     now_us: i64,
     grace_us: i64,
 ) -> ActivityProbeResult {
-    use std::io::{BufRead, BufReader};
-    use std::process::{Command, Stdio};
+    use mcp_agent_mail_core::git_cmd::{GitCmd, GitRunOutcome};
 
-    // br-8ujfs.4.1 (D1): streaming pattern (kill-on-match) doesn't fit
-    // GitCmd's buffered-output model cleanly, but we can still pick up
-    // AM_GIT_BINARY so ops-set overrides work here. Leaving the raw
-    // Command::new in place and documenting it as an allowed exception.
-    let git_binary = mcp_agent_mail_core::git_binary::resolved_git_binary_path();
-    let Ok(mut child) = Command::new(&git_binary)
-        .args([
-            "-C",
-            &workspace.to_string_lossy(),
-            "ls-files",
-            "-c",
-            "-o",
-            "--exclude-standard",
-            "--",
-            pathspec,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
+    let compiled = CompiledPattern::cached(pattern);
+    if !compiled.is_matchable() {
         return ActivityProbeResult::Unsupported;
+    }
+    // Git wildmatch and the reservation matcher differ (notably braces).
+    // Enumerate a conservative literal prefix and apply our matcher in Rust.
+    let prefix = if compiled.is_glob() {
+        compiled.first_literal_segment().unwrap_or(".")
+    } else if compiled.normalized().is_empty() {
+        "."
+    } else {
+        compiled.normalized()
     };
+    let pathspec = format!(":(literal){prefix}");
+    // This is a read-only worktree probe, not archive mutation. Skip both
+    // coordination locks so their waits cannot outlive the probe deadline or
+    // create a flock sentinel in the user's repository. The shared Unix runner
+    // drains/reaps the child and inherited pipes under one bounded deadline
+    // and rejects output beyond its configured capture limit. No detached
+    // reader is created here. Other platforms retain that runner's guarantees.
+    let outcome = GitCmd::new(workspace)
+        .args(["ls-files", "-z", "-c", "-o", "--exclude-standard", "--"])
+        .arg(pathspec)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .skip_flock()
+        .skip_mutex()
+        .timeout(ACTIVITY_PROBE_GIT_TIMEOUT)
+        .run_once();
+    match outcome {
+        GitRunOutcome::Finished(output) if output.status.success() => parse_git_listed_activity(
+            workspace,
+            pattern,
+            &output.stdout,
+            now_us,
+            grace_us,
+            ACTIVITY_PROBE_PATH_LIMIT,
+        ),
+        GitRunOutcome::Finished(_) => ActivityProbeResult::Unsupported,
+        _ => ActivityProbeResult::Unavailable,
+    }
+}
 
-    let Some(stdout) = child.stdout.take() else {
-        return ActivityProbeResult::Unsupported;
-    };
-
-    let reader = BufReader::new(stdout);
-    let mut count = 0;
-    for line in reader.lines().map_while(Result::ok) {
-        if path_modified_within_grace(&workspace.join(line), now_us, grace_us) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return ActivityProbeResult::Active;
-        }
-        count += 1;
-        if count >= ACTIVITY_PROBE_PATH_LIMIT {
-            let _ = child.kill();
-            let _ = child.wait();
+fn walk_activity(
+    workspace: &Path,
+    root: &Path,
+    compiled: Option<&CompiledPattern>,
+    now_us: i64,
+    grace_us: i64,
+    path_limit: usize,
+    budget: &mut ActivityWalkBudget,
+) -> ActivityProbeResult {
+    let mut scanned = 0usize;
+    // The elapsed-time bound is cooperative between filesystem operations; it
+    // cannot preempt an individual metadata/read-directory call.
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .max_open(16)
+    {
+        if !budget.take_entry() {
             return ActivityProbeResult::Truncated;
         }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return ActivityProbeResult::Unavailable,
+        };
+        let kind = entry.file_type();
+        if kind.is_symlink() {
+            return ActivityProbeResult::Unavailable;
+        }
+        if kind.is_dir() {
+            continue;
+        }
+        if !kind.is_file() {
+            return ActivityProbeResult::Unavailable;
+        }
+        match path_matches_probe(workspace, entry.path(), compiled) {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(error) => return error,
+        }
+        if scanned >= path_limit {
+            return ActivityProbeResult::Truncated;
+        }
+        scanned += 1;
+        match probe_file_activity(entry.path(), now_us, grace_us) {
+            ActivityProbeResult::Inactive => {}
+            other => return other,
+        }
     }
-
-    match child.wait() {
-        Ok(status) if status.success() => ActivityProbeResult::Inactive,
-        Ok(_) | Err(_) => ActivityProbeResult::Unsupported,
-    }
+    ActivityProbeResult::Inactive
 }
 
 fn check_directory_activity_fallback(
@@ -690,24 +861,19 @@ fn check_directory_activity_fallback_with_limit(
     grace_us: i64,
     path_limit: usize,
 ) -> ActivityProbeResult {
-    let mut scanned = 0usize;
-    for entry in walkdir::WalkDir::new(dir)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        if scanned >= path_limit {
-            return ActivityProbeResult::Truncated;
-        }
-        scanned += 1;
-        if path_modified_within_grace(entry.path(), now_us, grace_us) {
-            return ActivityProbeResult::Active;
-        }
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        _ => return ActivityProbeResult::Unavailable,
     }
-    ActivityProbeResult::Inactive
+    walk_activity(
+        dir,
+        dir,
+        None,
+        now_us,
+        grace_us,
+        path_limit,
+        &mut ActivityWalkBudget::new(),
+    )
 }
 
 fn check_glob_activity_fallback(
@@ -732,112 +898,81 @@ fn check_glob_activity_fallback_with_limit(
     grace_us: i64,
     path_limit: usize,
 ) -> ActivityProbeResult {
-    let compiled = CompiledPattern::new(pattern);
+    let compiled = CompiledPattern::cached(pattern);
     if !compiled.is_matchable() {
         return ActivityProbeResult::Unsupported;
     }
-
     let scan_root = compiled
         .first_literal_segment()
         .map(|segment| workspace.join(segment))
         .unwrap_or_else(|| workspace.to_path_buf());
-    if !scan_root.exists() {
-        return ActivityProbeResult::Inactive;
-    }
-
-    let scan_matched_file = |path: &Path, scanned: &mut usize| {
-        let Ok(relative) = path.strip_prefix(workspace) else {
-            return ActivityProbeResult::Inactive;
-        };
-        let relative = relative.to_string_lossy().replace('\\', "/");
-        if !compiled.matches(&relative) {
+    match std::fs::symlink_metadata(&scan_root) {
+        Ok(metadata) if metadata.is_dir() || metadata.is_file() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return ActivityProbeResult::Inactive;
         }
-        if *scanned >= path_limit {
-            return ActivityProbeResult::Truncated;
-        }
-        *scanned += 1;
-        if path_modified_within_grace(path, now_us, grace_us) {
-            ActivityProbeResult::Active
-        } else {
-            ActivityProbeResult::Inactive
-        }
-    };
-
-    let mut scanned = 0usize;
-    if scan_root.is_file() {
-        return scan_matched_file(&scan_root, &mut scanned);
+        _ => return ActivityProbeResult::Unavailable,
     }
-    for entry in walkdir::WalkDir::new(&scan_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        match scan_matched_file(entry.path(), &mut scanned) {
-            ActivityProbeResult::Inactive => {}
-            ActivityProbeResult::Active => return ActivityProbeResult::Active,
-            ActivityProbeResult::Truncated => return ActivityProbeResult::Truncated,
-            ActivityProbeResult::Unsupported => return ActivityProbeResult::Unsupported,
-        }
-    }
-    ActivityProbeResult::Inactive
+    walk_activity(
+        workspace,
+        &scan_root,
+        Some(&compiled),
+        now_us,
+        grace_us,
+        path_limit,
+        &mut ActivityWalkBudget::new(),
+    )
 }
 
-/// Check if any matched files have recent filesystem activity.
+/// Only a completed negative filesystem observation can support stale release.
+/// Git is a fast positive hint: its ignored-file exclusions cannot establish
+/// that all files covered by a reservation have been inactive.
+fn probe_filesystem_activity(
+    workspace: &Path,
+    path_pattern: &str,
+    now_us: i64,
+    grace_us: i64,
+) -> ActivityProbeResult {
+    match workspace.metadata() {
+        Ok(metadata) if metadata.is_dir() => {}
+        _ => return ActivityProbeResult::Unavailable,
+    }
+    let pattern = normalize_path_pattern_key(path_pattern);
+    let compiled = CompiledPattern::cached(&pattern);
+    if !compiled.is_matchable() {
+        return ActivityProbeResult::Unsupported;
+    }
+    if compiled.is_glob() {
+        match check_git_listed_activity(workspace, &pattern, now_us, grace_us) {
+            ActivityProbeResult::Inactive | ActivityProbeResult::Unsupported => {}
+            other => return other,
+        }
+        return check_glob_activity_fallback(workspace, &pattern, now_us, grace_us);
+    }
+    let candidate = workspace.join(&pattern);
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(metadata) if metadata.is_dir() => {
+            match check_git_listed_activity(workspace, &pattern, now_us, grace_us) {
+                ActivityProbeResult::Inactive | ActivityProbeResult::Unsupported => {}
+                other => return other,
+            }
+            check_directory_activity_fallback(&candidate, now_us, grace_us)
+        }
+        Ok(metadata) if metadata.is_file() => probe_file_activity(&candidate, now_us, grace_us),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ActivityProbeResult::Inactive,
+        _ => ActivityProbeResult::Unavailable,
+    }
+}
+
+#[cfg(test)]
 fn check_filesystem_activity(
     workspace: &Path,
     path_pattern: &str,
     now_us: i64,
     grace_us: i64,
 ) -> bool {
-    if !workspace.exists() {
-        return false;
-    }
-
-    let pattern = normalize_path_pattern_key(path_pattern);
-    if pattern.is_empty() {
-        return false;
-    }
-
-    let has_glob = pattern.contains('*')
-        || pattern.contains('?')
-        || pattern.contains('[')
-        || pattern.contains('{');
-
-    if has_glob {
-        let pathspec = format!(":(glob){pattern}");
-        // Fast path: let git enumerate matching files so ignored trees such as
-        // `target/` do not explode synchronous traversal cost.
-        match check_git_listed_activity(workspace, &pathspec, now_us, grace_us) {
-            ActivityProbeResult::Inactive => return false,
-            ActivityProbeResult::Active | ActivityProbeResult::Truncated => return true, // Fail closed to preserve reservation
-            ActivityProbeResult::Unsupported => {} // Fall through to glob
-        }
-
-        // Fallback: glob traversal for non-git workspaces or truncated git scans.
-        // If the fallback also truncates, fail closed and keep the reservation.
-        return matches!(
-            check_glob_activity_fallback(workspace, &pattern, now_us, grace_us),
-            ActivityProbeResult::Active | ActivityProbeResult::Truncated
-        );
-    }
-
-    let candidate = workspace.join(&pattern);
-    if candidate.is_dir() {
-        match check_git_listed_activity(workspace, &pattern, now_us, grace_us) {
-            ActivityProbeResult::Inactive => return false,
-            ActivityProbeResult::Active | ActivityProbeResult::Truncated => return true, // Fail closed
-            ActivityProbeResult::Unsupported => {}
-        }
-        return matches!(
-            check_directory_activity_fallback(&candidate, now_us, grace_us),
-            ActivityProbeResult::Active | ActivityProbeResult::Truncated
-        );
-    }
-    candidate.exists() && path_modified_within_grace(&candidate, now_us, grace_us)
+    probe_filesystem_activity(workspace, path_pattern, now_us, grace_us)
+        != ActivityProbeResult::Inactive
 }
 
 /// Check if any matched files have recent git commit activity.
@@ -1162,14 +1297,13 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_activity_nonexistent_workspace() {
+    fn filesystem_activity_nonexistent_workspace_is_unavailable() {
         let fake = Path::new("/definitely/does/not/exist");
-        assert!(!check_filesystem_activity(
-            fake,
-            "*.rs",
-            now_micros(),
-            1_000_000
-        ));
+        assert_eq!(
+            probe_filesystem_activity(fake, "*.rs", now_micros(), 1_000_000),
+            ActivityProbeResult::Unavailable
+        );
+        assert!(check_filesystem_activity(fake, "*.rs", now_micros(), 1_000_000));
     }
 
     #[test]
@@ -2031,5 +2165,245 @@ mod tests {
             std::fs::read(human_key).unwrap(),
             b"not a workspace directory"
         );
+    }
+
+    fn init_activity_repo(path: &Path) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["init", "-b", "main"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    }
+
+    #[test]
+    fn git_activity_listing_preserves_quoted_unicode_and_newline_filenames() {
+        for name in ["space name.rs", "tab\tname.rs", "line\nbreak.rs", "café.rs"] {
+            let tmp = tempfile::tempdir().unwrap();
+            init_activity_repo(tmp.path());
+            std::fs::write(tmp.path().join(name), b"active work").unwrap();
+            let now = now_micros();
+            assert_eq!(
+                check_git_listed_activity(tmp.path(), "*.rs", now, 60_000_000),
+                ActivityProbeResult::Active,
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_listing_uses_reservation_braces_not_git_wildmatch_braces() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_activity_repo(tmp.path());
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), b"active work").unwrap();
+        assert_eq!(
+            check_git_listed_activity(tmp.path(), "src/*.{rs,toml}", now_micros(), 60_000_000),
+            ActivityProbeResult::Active
+        );
+    }
+
+    #[test]
+    fn ignored_reserved_files_still_protect_their_reservation() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_activity_repo(tmp.path());
+        std::fs::write(tmp.path().join(".gitignore"), b"generated/\n").unwrap();
+        std::fs::create_dir(tmp.path().join("generated")).unwrap();
+        std::fs::write(tmp.path().join("generated/live.rs"), b"active work").unwrap();
+        let now = now_micros();
+        for pattern in ["generated", "generated/**", "generated/*.rs"] {
+            assert_eq!(
+                check_git_listed_activity(tmp.path(), pattern, now, 60_000_000),
+                ActivityProbeResult::Inactive
+            );
+            assert_eq!(
+                probe_filesystem_activity(tmp.path(), pattern, now, 60_000_000),
+                ActivityProbeResult::Active,
+                "Git exclusion is not inactivity: {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn nul_listing_refuses_partial_or_outside_workspace_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        for bytes in [b"partial.rs".as_slice(), b"../outside.rs\0", b"/outside.rs\0", b"\0"] {
+            assert_eq!(
+                parse_git_listed_activity(tmp.path(), "**", bytes, now_micros(), 1_000_000, 10),
+                ActivityProbeResult::Unavailable
+            );
+        }
+    }
+
+    #[test]
+    fn nul_listing_distinguishes_complete_empty_and_truncated_scans() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), b"old work").unwrap();
+        let now = now_micros() + 120_000_000;
+        assert_eq!(
+            parse_git_listed_activity(tmp.path(), "**", b"", now, 1_000_000, 0),
+            ActivityProbeResult::Inactive
+        );
+        assert_eq!(
+            parse_git_listed_activity(tmp.path(), "**", b"a.rs\0", now, 1_000_000, 1),
+            ActivityProbeResult::Inactive
+        );
+        assert_eq!(
+            parse_git_listed_activity(tmp.path(), "**", b"a.rs\0b.rs\0", now, 1_000_000, 1),
+            ActivityProbeResult::Truncated
+        );
+        assert_eq!(
+            parse_git_listed_activity(tmp.path(), "**", b"missing.rs\0", now, 1_000_000, 1),
+            ActivityProbeResult::Unavailable
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_git_listing_keeps_non_utf8_paths_without_lossy_substitution() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let tmp = tempfile::tempdir().unwrap();
+        init_activity_repo(tmp.path());
+        let raw = b"invalid-\xff.rs";
+        let name = std::ffi::OsString::from_vec(raw.to_vec());
+        std::fs::write(tmp.path().join(&name), b"active work").unwrap();
+        let parsed = git_listed_path(raw).unwrap();
+        assert_eq!(parsed.as_os_str().as_bytes(), raw);
+        // Root requests need no Unicode matcher and can inspect native bytes.
+        assert_eq!(
+            check_git_listed_activity(tmp.path(), "", now_micros(), 60_000_000),
+            ActivityProbeResult::Active
+        );
+        // A Unicode glob cannot certify that an undecodable path is unrelated.
+        assert_eq!(
+            check_git_listed_activity(tmp.path(), "*.rs", now_micros(), 60_000_000),
+            ActivityProbeResult::Unavailable
+        );
+    }
+
+    #[test]
+    fn walk_errors_and_nonregular_roots_are_not_inactivity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing");
+        assert_eq!(
+            check_directory_activity_fallback(&missing, now_micros(), 1_000_000),
+            ActivityProbeResult::Unavailable
+        );
+        std::fs::write(tmp.path().join("not-directory"), b"preserved").unwrap();
+        assert_eq!(
+            probe_filesystem_activity(tmp.path(), "not-directory/child.rs", now_micros(), 1_000_000),
+            ActivityProbeResult::Unavailable
+        );
+        assert_eq!(
+            probe_filesystem_activity(tmp.path(), "[unterminated", now_micros(), 1_000_000),
+            ActivityProbeResult::Unsupported
+        );
+    }
+
+    #[test]
+    fn root_aliases_inspect_files_instead_of_reporting_no_activity() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("active.rs"), b"active work").unwrap();
+        let now = now_micros();
+        for pattern in ["", ".", "./", "/", "src/..", "a\\.."] {
+            assert_eq!(normalize_path_pattern_key(pattern), "");
+            assert_eq!(
+                probe_filesystem_activity(tmp.path(), pattern, now, 60_000_000),
+                ActivityProbeResult::Active,
+                "{pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn traversal_budget_counts_empty_directories_and_unmatched_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        for index in 0..8 {
+            std::fs::create_dir(tmp.path().join(format!("dir{index}"))).unwrap();
+            std::fs::write(tmp.path().join(format!("unrelated{index}.txt")), b"x").unwrap();
+        }
+        let compiled = CompiledPattern::new("*.rs");
+        let mut budget = ActivityWalkBudget {
+            remaining_entries: 3,
+            started: Instant::now(),
+        };
+        assert_eq!(
+            walk_activity(tmp.path(), tmp.path(), Some(&compiled), now_micros(), 1_000_000, 5000, &mut budget),
+            ActivityProbeResult::Truncated
+        );
+        assert_eq!(budget.remaining_entries, 0);
+    }
+
+    #[test]
+    fn expired_walk_budget_cannot_authorize_an_empty_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut budget = ActivityWalkBudget {
+            remaining_entries: 10,
+            started: Instant::now() - Duration::from_secs(1),
+        };
+        assert_eq!(
+            walk_activity(tmp.path(), tmp.path(), None, now_micros(), 1_000_000, 10, &mut budget),
+            ActivityProbeResult::Truncated
+        );
+        assert_eq!(budget.remaining_entries, 10);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_activity_is_uncertain_and_does_not_follow_outside_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("old.rs"), b"outside work").unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("linked")).unwrap();
+        for pattern in ["linked", "linked/**"] {
+            assert_eq!(
+                probe_filesystem_activity(tmp.path(), pattern, now_micros() + 120_000_000, 1_000_000),
+                ActivityProbeResult::Unavailable
+            );
+        }
+        assert_eq!(std::fs::read(outside.path().join("old.rs")).unwrap(), b"outside work");
+    }
+
+    #[test]
+    fn unavailable_probe_is_retried_without_positive_cache_entitlement() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("src"), b"not a directory").unwrap();
+        let now = now_micros();
+        let mut cache = CleanupProbeCache::default();
+        assert!(path_has_recent_activity_cached(
+            &mut cache, tmp.path(), 1, "src/missing.rs", None, now, 60_000_000,
+        ));
+        assert_eq!(cache.path_probes[&(1, "src/missing.rs".to_string())].fs_recent_until_us, 0);
+        std::fs::rename(tmp.path().join("src"), tmp.path().join("saved-src-file")).unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        assert!(!path_has_recent_activity_cached(
+            &mut cache, tmp.path(), 1, "src/missing.rs", None, now, 60_000_000,
+        ));
+    }
+
+    #[test]
+    fn stale_cleanup_preserves_claim_on_filesystem_error_then_recovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, cx, project_id, _, reservation_id, human_key, _) = seed_active_reservation(&tmp);
+        let workspace = PathBuf::from(human_key);
+        // A real ENOTDIR replaces unavailable activity evidence, without
+        // chmod assumptions that fail when a test runner has root privileges.
+        std::fs::write(workspace.join("src"), b"preserve this evidence").unwrap();
+        let config = stale_cleanup_test_config(&tmp);
+        let mut cache = CleanupProbeCache::default();
+        assert_eq!(
+            detect_and_release_stale(&config, &pool, &cx, project_id, &mut cache).unwrap(),
+            Vec::<i64>::new()
+        );
+        assert_reservation_unreleased(&pool, &cx, project_id, reservation_id);
+        std::fs::rename(workspace.join("src"), workspace.join("saved-src-file")).unwrap();
+        std::fs::create_dir(workspace.join("src")).unwrap();
+        assert_eq!(
+            detect_and_release_stale(&config, &pool, &cx, project_id, &mut cache).unwrap(),
+            vec![reservation_id],
+            "a complete negative observation still permits ordinary stale cleanup"
+        );
+        assert_eq!(std::fs::read(workspace.join("saved-src-file")).unwrap(), b"preserve this evidence");
     }
 }
