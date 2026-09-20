@@ -232,7 +232,7 @@ fn theme_id_for_canonical_name(name: &str) -> Option<ThemeId> {
 }
 
 /// Mutex to serialize tests that mutate `ACTIVE_NAMED_THEME_INDEX`.
-#[cfg(all(test, not(feature = "browser-dashboard")))]
+#[cfg(test)]
 pub(crate) static NAMED_THEME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ──────────────────────────────────────────────────────────────────────

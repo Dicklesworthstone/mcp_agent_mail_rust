@@ -781,7 +781,8 @@ fn search_with_cost_quota_budget() {
     block_on_with_budget(
         Budget::new().with_deadline(Time::ZERO),
         move |cx| async move {
-            // FTS search via SQLite is synchronous; expired deadline doesn't cancel mid-query
+            // An already-expired request must fail at connection admission,
+            // before synchronous SQLite search work can begin.
             match execute_search_simple(
                 &cx,
                 &pool_c,
@@ -789,8 +790,13 @@ fn search_with_cost_quota_budget() {
             )
             .await
             {
-                Outcome::Ok(_) => {}
-                other => panic!("expired deadline search failed: {other:?}"),
+                Outcome::Err(mcp_agent_mail_db::DbError::Sqlite(message)) => {
+                    assert!(
+                        message.contains("acquire timeout: budget deadline reached"),
+                        "expected deadline admission failure, got: {message}"
+                    );
+                }
+                other => panic!("expired deadline search must be refused: {other:?}"),
             }
         },
     );

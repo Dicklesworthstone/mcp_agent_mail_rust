@@ -246,6 +246,10 @@ fn error_code_catalog_is_stable() {
         "ARCHIVE_ERROR",
         "AUTHENTICATION_REQUIRED",
         "BROADCAST_DISABLED",
+        // Build-slot acquisition distinguishes contention from invalid
+        // persisted state; both retain the common typed error envelope.
+        "BUILD_SLOT_BUSY",
+        "BUILD_SLOT_STATE_INVALID",
         "CONFIGURATION_ERROR",
         "CONFLICT",
         "CONTACT_BLOCKED",

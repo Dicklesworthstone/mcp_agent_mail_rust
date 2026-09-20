@@ -861,6 +861,10 @@ mod tests {
             assert_eq!(before[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
             assert_eq!(before[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
             drop(conn);
+            // Source admission canonicalizes the archive root before checking
+            // query-only mode. Match server initialization so this fixture
+            // reaches the intended refusal instead of failing on a missing root.
+            std::fs::create_dir_all(pool.storage_root()).unwrap();
             let config = Config {
                 storage_root: pool.storage_root().to_path_buf(),
                 database_url,

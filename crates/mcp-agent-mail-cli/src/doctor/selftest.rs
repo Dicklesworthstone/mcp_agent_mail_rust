@@ -1261,20 +1261,14 @@ fn run_mcp_session(project_key: &str) -> Result<Vec<Value>, String> {
     let output = writer.clone();
     let transport = StdioTransport::new(Cursor::new(input), writer);
 
-    // Run the session on a runtime-backed context rather than an out-of-band
-    // `Cx::for_request()`, so anything that discovers drivers via
-    // `Cx::current()` finds real ones.
-    //
-    // Note this alone did NOT fix the GH#203 hang, and code under test must
-    // not rely on this runtime's timers for forward progress: fastmcp's tool
-    // dispatch re-enters `block_on` on its own private current-thread runtime,
-    // and in that nested topology runtime timer wheels are not reliably
-    // pumped (confirmed by gdb: a 25 ms `asupersync::time::timeout` parked
-    // for 45+ s inside `list_agents`). The actual fix was making the
-    // archive-read gate's wait loops condvar-based and timer-free; see
-    // `mcp-agent-mail-tools/src/archive_read.rs` (`Slot::wake`).
+    // The synchronous transport polls handlers on its caller's context and
+    // may park while they await scheduled work. Keep separate runtime workers
+    // available: running this transport inside a current-thread root future
+    // prevents that same scheduler from progressing the awaited work.
+    // The parent process still enforces the unchanged hard timeout.
     let handle = std::thread::spawn(move || -> Result<(), String> {
-        let rt = RuntimeBuilder::current_thread()
+        let rt = RuntimeBuilder::multi_thread()
+            .worker_threads(2)
             .build()
             .map_err(|e| format!("build selftest runtime: {e}"))?;
         rt.block_on(async {

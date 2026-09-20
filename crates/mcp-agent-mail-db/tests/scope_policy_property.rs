@@ -278,12 +278,17 @@ fn invariant_monotonicity_adding_project_membership() {
     let result = msg(1, 99, "Agent");
 
     // Viewer only in project 1 → cross-project denied
-    let ctx_denied = viewer(10, 1);
+    let mut ctx_denied = viewer(10, 1);
+    ctx_denied.sender_policies.push(SenderPolicy {
+        project_id: 99,
+        agent_id: 20,
+        policy: ContactPolicyKind::Auto,
+    });
     let dec1 = evaluate_scope(&result, &ctx_denied);
     assert_eq!(dec1.verdict, ScopeVerdict::Deny);
 
     // Viewer in both projects → allowed (auto policy)
-    let mut ctx_multi = viewer(10, 1);
+    let mut ctx_multi = ctx_denied.clone();
     ctx_multi.viewer_project_ids.push(99);
     let dec2 = evaluate_scope(&result, &ctx_multi);
     assert_eq!(dec2.verdict, ScopeVerdict::Allow);
@@ -362,15 +367,15 @@ fn policy_cascade_block_all_denies() {
 }
 
 #[test]
-fn policy_cascade_no_policy_defaults_to_auto() {
-    // When no sender_policies entry exists, lookup returns Auto
+fn policy_cascade_no_policy_denies() {
+    // Missing authorization data cannot grant the sender's Auto policy.
     let result = msg(1, 1, "UnknownSender");
     let ctx = viewer(10, 1); // no sender_policies at all
     let dec = evaluate_scope(&result, &ctx);
-    assert_eq!(dec.verdict, ScopeVerdict::Allow);
+    assert_eq!(dec.verdict, ScopeVerdict::Deny);
     assert_eq!(
         dec.reason,
-        mcp_agent_mail_db::search_scope::ScopeReason::AutoPolicy
+        mcp_agent_mail_db::search_scope::ScopeReason::SenderPolicyUnavailable
     );
 }
 
@@ -695,9 +700,13 @@ fn adversarial_missing_from_agent() {
         ..msg(1, 1, "Agent")
     };
     let ctx = viewer(10, 1);
-    // from_agent=None: sender check fails, but auto policy allows
+    // A missing name does not supply the absent sender authorization policy.
     let dec = evaluate_scope(&result, &ctx);
-    assert_eq!(dec.verdict, ScopeVerdict::Allow);
+    assert_eq!(dec.verdict, ScopeVerdict::Deny);
+    assert_eq!(
+        dec.reason,
+        mcp_agent_mail_db::search_scope::ScopeReason::SenderPolicyUnavailable
+    );
 }
 
 #[test]
@@ -826,6 +835,11 @@ fn adversarial_zero_project_id() {
     };
     let mut ctx = viewer(10, 1);
     ctx.viewer_project_ids.push(0); // viewer is in "project 0"
+    ctx.sender_policies.push(SenderPolicy {
+        project_id: 0,
+        agent_id: 20,
+        policy: ContactPolicyKind::Auto,
+    });
     let dec = evaluate_scope(&result, &ctx);
     // Should be allowed via auto policy
     assert_eq!(dec.verdict, ScopeVerdict::Allow);
@@ -838,7 +852,14 @@ fn adversarial_zero_project_id() {
 #[test]
 fn cross_project_isolation_strict() {
     // Messages from projects the viewer is NOT in are denied
-    let ctx = viewer(10, 1); // only in project 1
+    let mut ctx = viewer(10, 1); // only in project 1
+    for project_id in [1, 2, 3] {
+        ctx.sender_policies.push(SenderPolicy {
+            project_id,
+            agent_id: 20,
+            policy: ContactPolicyKind::Auto,
+        });
+    }
     let policy = RedactionPolicy::default();
 
     let results = vec![
@@ -878,6 +899,13 @@ fn cross_project_allowed_via_contact_link() {
 fn cross_project_multiple_projects() {
     let mut ctx = viewer(10, 1);
     ctx.viewer_project_ids = vec![1, 5, 10];
+    for project_id in [1, 5, 10, 2, 6, 11, 99] {
+        ctx.sender_policies.push(SenderPolicy {
+            project_id,
+            agent_id: 20,
+            policy: ContactPolicyKind::Auto,
+        });
+    }
 
     for pid in [1, 5, 10] {
         let result = msg(pid, pid, "Agent");
@@ -957,7 +985,12 @@ fn batch_mixed_doc_kinds() {
         msg(4, 99, "B"),
         agent_result(5, 99),
     ];
-    let ctx = viewer(10, 1);
+    let mut ctx = viewer(10, 1);
+    ctx.sender_policies.push(SenderPolicy {
+        project_id: 1,
+        agent_id: 20,
+        policy: ContactPolicyKind::Auto,
+    });
     let policy = RedactionPolicy::default();
     let (visible, audit) = apply_scope(results, &ctx, &policy);
 
@@ -999,7 +1032,12 @@ fn batch_all_denied() {
 #[test]
 fn batch_all_allowed() {
     let results = (0..10).map(|i| msg(i, 1, "Agent")).collect();
-    let ctx = viewer(10, 1);
+    let mut ctx = viewer(10, 1);
+    ctx.sender_policies.push(SenderPolicy {
+        project_id: 1,
+        agent_id: 20,
+        policy: ContactPolicyKind::Auto,
+    });
     let policy = RedactionPolicy::default();
     let (visible, audit) = apply_scope(results, &ctx, &policy);
 
@@ -1104,7 +1142,7 @@ fn contact_policy_parse_case_insensitive_exhaustive() {
 }
 
 #[test]
-fn contact_policy_parse_unknown_defaults_auto() {
+fn contact_policy_parse_unknown_fails_closed() {
     let unknowns = [
         "",
         "none",
@@ -1120,8 +1158,8 @@ fn contact_policy_parse_unknown_defaults_auto() {
     for input in unknowns {
         assert_eq!(
             ContactPolicyKind::parse(input),
-            ContactPolicyKind::Auto,
-            "parse({input:?}) should default to Auto"
+            ContactPolicyKind::BlockAll,
+            "parse({input:?}) should fail closed"
         );
     }
 }
@@ -1341,7 +1379,12 @@ fn evaluation_priority_contact_before_policy() {
 #[test]
 fn scoped_result_carries_decision() {
     let results = vec![msg(1, 1, "Agent")];
-    let ctx = viewer(10, 1);
+    let mut ctx = viewer(10, 1);
+    ctx.sender_policies.push(SenderPolicy {
+        project_id: 1,
+        agent_id: 20,
+        policy: ContactPolicyKind::Auto,
+    });
     let policy = RedactionPolicy::default();
     let (visible, _) = apply_scope(results, &ctx, &policy);
 

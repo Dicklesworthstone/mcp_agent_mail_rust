@@ -81,6 +81,15 @@ impl Sandbox {
             &sandbox.git(&["-c", "init.defaultBranch=main", "init", "--quiet"]),
             "initialize isolated Git project",
         );
+        require_success(
+            &sandbox
+                .command("git")
+                .current_dir(&sandbox.home)
+                .args(["-c", "init.defaultBranch=main", "init", "--quiet"])
+                .output()
+                .unwrap(),
+            "bound home config Git discovery to the sandbox",
+        );
         sandbox
     }
 

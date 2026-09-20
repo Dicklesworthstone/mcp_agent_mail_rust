@@ -793,7 +793,7 @@ mod tests {
         });
 
         let results = index.search(&[1.0, 0.0, 0.0], 10, None).unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [VectorHit; 0]);
     }
 
     #[test]
@@ -949,8 +949,8 @@ mod tests {
         assert_eq!(meta.doc_id, 0);
         assert_eq!(meta.doc_kind, DocKind::Message);
         assert!(meta.project_id.is_none());
-        assert!(meta.model_id.is_empty());
-        assert!(meta.content_hash.is_empty());
+        assert_eq!(meta.model_id, "");
+        assert_eq!(meta.content_hash, "");
     }
 
     #[test]
@@ -1320,7 +1320,7 @@ mod tests {
             .unwrap();
 
         let results = index.search(&[1.0, 0.0, 0.0], 0, None).unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [VectorHit; 0]);
     }
 
     #[test]

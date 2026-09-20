@@ -1687,6 +1687,12 @@ fn run_fixtures_against_rust_server_router() {
         }
     }
 
+    // Resource fixtures describe the completed tool operations, including an
+    // idle archive-lock inventory. Drain both asynchronous write layers before
+    // taking that snapshot so a transient Git index lock cannot race the read.
+    mcp_agent_mail_storage::wbq_flush();
+    mcp_agent_mail_storage::flush_async_commits();
+
     for (uri, resource_fixture) in &fixtures.resources {
         for case in &resource_fixture.cases {
             let params = ReadResourceParams {
@@ -1718,8 +1724,11 @@ fn run_fixtures_against_rust_server_router() {
                         supported_compatibility_mismatch(&actual, &expected, "$")
                     {
                         panic!(
-                            "resource {uri} case {}: supported compatibility mismatch: {mismatch}",
-                            case.name
+                            "resource {uri} case {}: supported compatibility mismatch: {mismatch}; actual={actual}; archive lock inventory={:?}",
+                            case.name,
+                            mcp_agent_mail_storage::collect_lock_status(
+                                &mcp_agent_mail_core::Config::get()
+                            )
                         );
                     }
                 }

@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn test_model_search_paths() {
         let paths = Model2VecEmbedder::model_search_paths(MODEL_POTION_128M);
-        assert!(!paths.is_empty());
+        assert_ne!(paths, [] as [std::path::PathBuf; 0]);
 
         // Should include HuggingFace cache path
         assert!(
@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn model_search_paths_32m() {
         let paths = Model2VecEmbedder::model_search_paths(MODEL_POTION_32M);
-        assert!(!paths.is_empty());
+        assert_ne!(paths, [] as [std::path::PathBuf; 0]);
         assert!(
             paths
                 .iter()
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn model_search_paths_custom_name() {
         let paths = Model2VecEmbedder::model_search_paths("my-custom-model");
-        assert!(!paths.is_empty());
+        assert_ne!(paths, [] as [std::path::PathBuf; 0]);
         assert!(
             paths
                 .iter()

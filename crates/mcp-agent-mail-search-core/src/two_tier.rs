@@ -1490,7 +1490,10 @@ mod tests {
             ..TwoTierConfig::default()
         };
         let entries = (0..16)
-            .map(|idx| axis_entry(idx, 1.0 + (idx as f32 * 0.01), 1.0, true, &config))
+            .map(|idx| {
+                let offset = f32::from(u8::try_from(idx).expect("fixture index is in 0..16"));
+                axis_entry(idx, offset.mul_add(0.01, 1.0), 1.0, true, &config)
+            })
             .collect();
         let index = build_axis_index(&config, entries);
         let fast_embedder = Arc::new(StubEmbedder::new("fast", axis_query(config.fast_dimension)));
@@ -1730,7 +1733,7 @@ mod tests {
     fn test_score_normalization_empty() {
         let scores: Vec<f32> = vec![];
         let normalized = normalize_scores(&scores);
-        assert!(normalized.is_empty());
+        assert_eq!(normalized, [] as [f32; 0]);
     }
 
     #[test]
@@ -2929,7 +2932,7 @@ mod tests {
             let json = serde_json::to_string(status).unwrap();
             let restored: IndexStatus = serde_json::from_str(&json).unwrap();
             let debug = format!("{restored:?}");
-            assert!(!debug.is_empty());
+            assert_ne!(debug, "");
         }
     }
 
@@ -3174,7 +3177,7 @@ mod tests {
     fn detect_zero_quality_docs_empty_index() {
         let config = TwoTierConfig::default();
         let index = TwoTierIndex::new(&config);
-        assert!(index.detect_zero_quality_docs().is_empty());
+        assert_eq!(index.detect_zero_quality_docs(), [] as [i64; 0]);
     }
 
     #[test]

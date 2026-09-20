@@ -2550,8 +2550,13 @@ fn projects_mark_identity_no_commit_writes_marker_file() {
     std::fs::create_dir_all(&project).expect("create project dir");
 
     let project_str = project.to_string_lossy().to_string();
+    let mut child_env = env.base_env();
+    child_env.push((
+        "GIT_CEILING_DIRECTORIES".to_string(),
+        env.tmp.path().canonicalize().unwrap().display().to_string(),
+    ));
     let out = run_am(
-        &env.base_env(),
+        &child_env,
         Some(env.tmp.path()),
         &["projects", "mark-identity", &project_str, "--no-commit"],
         None,
@@ -5984,6 +5989,11 @@ fn serve_http_updates_client_configs_only_with_explicit_setup() {
 fn check_serve_http_client_config_setup(setup: bool) {
     let env = TestEnv::new();
     let project = env.hostile_repo();
+    // Bound real Git discovery even when RCH nests fixtures in its checkout.
+    // Do not use discovery environment overrides: the secret writer correctly
+    // rejects those because they could hide a tracked credential destination.
+    init_git_repo(&env.home_dir);
+    init_git_repo(project);
     // Detection keys Claude installation off its config root, not ~/.claude.json.
     std::fs::create_dir_all(env.home_dir.join(".claude/projects")).unwrap();
     std::fs::create_dir_all(env.xdg_config_home.join("claude-code/projects")).unwrap();

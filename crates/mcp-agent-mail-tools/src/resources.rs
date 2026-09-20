@@ -2104,6 +2104,36 @@ pub struct LocksResponse {
     pub summary: LocksSummary,
 }
 
+/// Build-slot mutex files retain their inode after unlock and never carry
+/// archive-owner metadata. Match only their exact archive-relative location.
+fn is_build_slot_coordination_lock(path: &std::path::Path, root: &std::path::Path) -> bool {
+    use std::path::Component::Normal;
+
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut parts = relative.components();
+    matches!(
+        (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ),
+        (
+            Some(Normal(projects)),
+            Some(Normal(_)),
+            Some(Normal(slots)),
+            Some(Normal(_)),
+            Some(Normal(file)),
+            None,
+        )
+            if projects == "projects" && slots == "build_slots" && file == ".slot.lock"
+    )
+}
+
 /// Get active archive locks.
 #[resource(
     uri = "resource://tooling/locks",
@@ -2116,11 +2146,25 @@ pub fn tooling_locks(_ctx: &McpContext) -> McpResult<String> {
         serde_json::json!({"archive_root": "", "exists": false, "locks": []})
     });
 
-    let raw_locks = lock_info
+    let archive_root = lock_info
+        .get("archive_root")
+        .and_then(serde_json::Value::as_str);
+    let raw_locks: Vec<_> = lock_info
         .get("locks")
         .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+        .into_iter()
+        .flatten()
+        .filter(|lock| {
+            !archive_root
+                .zip(lock.get("path").and_then(serde_json::Value::as_str))
+                .is_some_and(|(root, path)| {
+                    is_build_slot_coordination_lock(
+                        std::path::Path::new(path),
+                        std::path::Path::new(root),
+                    )
+                })
+        })
+        .collect();
 
     let mut locks: Vec<ArchiveLock> = raw_locks
         .iter()
@@ -8045,6 +8089,33 @@ mod query_param_tests {
         assert_eq!(err.code, McpErrorCode::InvalidParams);
         let err = tooling_metrics_query(&ctx, "project=x".to_string()).expect_err("unknown key");
         assert_eq!(err.code, McpErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn build_slot_coordination_lock_requires_exact_archive_location() {
+        let root = std::path::Path::new("archive");
+        assert!(is_build_slot_coordination_lock(
+            &root.join("projects/backend/build_slots/build/.slot.lock"),
+            root,
+        ));
+        for relative in [
+            ".slot.lock",
+            "projects/backend/.slot.lock",
+            "projects/backend/build_slots/.slot.lock",
+            "projects/backend/build_slots/build/.archive.lock",
+            "projects/backend/build_slots/build/nested/.slot.lock",
+            "projects/backend/other/build/.slot.lock",
+            "../projects/backend/build_slots/build/.slot.lock",
+        ] {
+            assert!(
+                !is_build_slot_coordination_lock(&root.join(relative), root),
+                "must retain unknown lock: {relative}"
+            );
+        }
+        assert!(!is_build_slot_coordination_lock(
+            std::path::Path::new("other/projects/backend/build_slots/build/.slot.lock"),
+            root,
+        ));
     }
 
     #[test]

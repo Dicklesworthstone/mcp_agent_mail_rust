@@ -9,7 +9,7 @@
 //! 1. Checks for potion-128M (fast tier) in `HuggingFace` cache
 //! 2. Creates a global `TwoTierSearchContext` ready for use
 //!
-//! The old FastEmbed quality tier is intentionally not compiled in this
+//! The old `FastEmbed` quality tier is intentionally not compiled in this
 //! workspace because it pulls the hf-hub/reqwest/hyper/tokio stack.
 //!
 //! # Usage
@@ -102,7 +102,7 @@ pub struct EmbedderInfo {
 const QUALITY_INSTALL_HINT: &str =
     "quality tier disabled by dependency policy; using local fast tier only";
 
-fn current_quality_embedder_info() -> Option<EmbedderInfo> {
+const fn current_quality_embedder_info() -> Option<EmbedderInfo> {
     None
 }
 
@@ -473,7 +473,7 @@ mod tests {
         ];
         for v in &variants {
             let debug = format!("{v:?}");
-            assert!(!debug.is_empty());
+            assert_ne!(debug, "");
         }
     }
 

@@ -82,7 +82,7 @@ pub fn compile_filters(filter: &SearchFilter, handles: &FieldHandles) -> Compile
     let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
     // Sender filter (exact match on STRING field). `agent` is an alias.
-    if let Some(ref sender) = filter.sender.as_ref().or(filter.agent.as_ref()) {
+    if let Some(sender) = filter.sender.as_ref().or(filter.agent.as_ref()) {
         clauses.push(term_filter(handles.sender, sender));
     }
 
@@ -641,7 +641,7 @@ mod tests {
                 ..SearchFilter::default()
             };
             let ids = search_with_filter(&index, &handles, &filter);
-            assert!(ids.is_empty());
+            assert_eq!(ids, [] as [u64; 0]);
         }
 
         #[test]
@@ -792,7 +792,7 @@ mod tests {
                 ..SearchFilter::default()
             };
             let ids = search_with_filter(&index, &handles, &filter);
-            assert!(ids.is_empty());
+            assert_eq!(ids, [] as [u64; 0]);
         }
 
         #[test]
@@ -870,7 +870,7 @@ mod tests {
                 ..SearchFilter::default()
             };
             let ids = search_with_filter(&index, &handles, &filter);
-            assert!(ids.is_empty());
+            assert_eq!(ids, [] as [u64; 0]);
         }
 
         #[test]
@@ -968,7 +968,7 @@ mod tests {
                 }),
             };
             let ids = search_with_filter(&index, &handles, &filter);
-            assert!(ids.is_empty());
+            assert_eq!(ids, [] as [u64; 0]);
         }
 
         // ── apply_to with filters wraps in BooleanQuery ──
@@ -1017,7 +1017,7 @@ mod tests {
                 ..SearchFilter::default()
             };
             let ids = search_with_filter(&index, &handles, &filter);
-            assert!(ids.is_empty());
+            assert_eq!(ids, [] as [u64; 0]);
         }
 
         // ── Date range exact boundary (inclusive) ──
@@ -1060,7 +1060,7 @@ mod tests {
                 ..SearchFilter::default()
             };
             let ids = search_with_filter(&index, &handles, &filter);
-            assert!(ids.is_empty());
+            assert_eq!(ids, [] as [u64; 0]);
         }
 
         #[test]
@@ -1071,7 +1071,7 @@ mod tests {
                 ..SearchFilter::default()
             };
             let ids = search_with_filter(&index, &handles, &filter);
-            assert!(ids.is_empty());
+            assert_eq!(ids, [] as [u64; 0]);
         }
 
         // ── compile_filters clause count for all 6 fields ──

@@ -1506,7 +1506,7 @@ mod tests {
             let hits = searcher
                 .search(&query, &TopDocs::with_limit(10).order_by_score())
                 .unwrap();
-            assert!(!hits.is_empty());
+            assert_ne!(hits, [] as [(f32, tantivy::DocAddress); 0]);
         }
 
         #[test]
@@ -1591,7 +1591,7 @@ mod tests {
                 .unwrap();
             // "deployment" is in subject of doc2 ("Deployment checklist")
             // "search" is in body of doc2 ("deploying the new search engine")
-            assert!(!hits.is_empty());
+            assert_ne!(hits, [] as [(f32, tantivy::DocAddress); 0]);
         }
 
         #[test]
@@ -1632,7 +1632,7 @@ mod tests {
                 .search(&query, &TopDocs::with_limit(10).order_by_score())
                 .unwrap();
             // "migration" term should still match doc 1
-            assert!(!hits.is_empty());
+            assert_ne!(hits, [] as [(f32, tantivy::DocAddress); 0]);
         }
 
         #[test]
@@ -1656,7 +1656,7 @@ mod tests {
             let hits = searcher
                 .search(&*query, &TopDocs::with_limit(100).order_by_score())
                 .unwrap();
-            assert!(hits.is_empty());
+            assert_eq!(hits, [] as [(f32, tantivy::DocAddress); 0]);
         }
 
         #[test]
@@ -1673,7 +1673,7 @@ mod tests {
             let hits = searcher
                 .search(&query, &TopDocs::with_limit(10).order_by_score())
                 .unwrap();
-            assert!(!hits.is_empty());
+            assert_ne!(hits, [] as [(f32, tantivy::DocAddress); 0]);
             // Doc 1 has "plan" in subject (boosted 2x) — should rank first
             let doc: TantivyDocument = searcher.doc(hits[0].1).unwrap();
             let id = doc.get_first(handles.id).unwrap().as_u64().unwrap();
@@ -1778,7 +1778,7 @@ mod tests {
             let hits = searcher
                 .search(&query, &TopDocs::with_limit(10).order_by_score())
                 .unwrap();
-            assert!(!hits.is_empty());
+            assert_ne!(hits, [] as [(f32, tantivy::DocAddress); 0]);
         }
 
         #[test]
