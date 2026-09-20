@@ -21,24 +21,30 @@
 //!   was queued, carrying a `content_sha256` over its canonical payload and a
 //!   16-char `intent_id` prefix of that hash; and
 //! - a **replay** marker (`kind == "<verb>_replay"`) appended after replay,
-//!   with `status` (`"replayed"`/`"failed"`), `intent_id`, and
+//!   with `status` (`"replayed"/"failed"`), `intent_id`, and
 //!   `intent_content_sha256`.
 //!
-//! A queued intent is outstanding until a `status == "replayed"` marker
-//! referencing its `(intent_id, content_sha256)` pair is present.
+//! A queued intent is outstanding until a terminal replay marker referencing
+//! its full `(intent_id, content_sha256)` pair is present. Readers isolate torn
+//! JSON/UTF-8 records without losing intact records on either side. They read
+//! one opened file up to its initial length, never chase a concurrent appender.
 //!
 //! NOTE: [`crate::reservations`] still carries its own private copy of the
 //! release-intent writer/reader for its automatic replay-on-success path.
 //! Migrating it onto this shared surface is tracked as a follow-up so that the
 //! single mutation chokepoint work (Track F) is not disturbed.
 
-use std::io::Write as _;
+use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use mcp_agent_mail_core::Config;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+/// Maximum bytes in one JSONL record, including its terminating newline.
+/// Oversized historical records are an explicit error, never silently omitted.
+const MAX_INTENT_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Subdirectory under `storage_root` holding every degraded-intent log.
 pub const DEGRADED_INTENTS_DIR: &str = "degraded_intents";
@@ -203,6 +209,15 @@ pub fn append_jsonl(
     lock_file_name: &str,
     record: &Value,
 ) -> std::io::Result<PathBuf> {
+    // Do not acknowledge a record that the bounded reader cannot recover.
+    let payload = serde_json::to_vec(record)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if payload.len() >= MAX_INTENT_RECORD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "degraded-intent record exceeds its byte limit",
+        ));
+    }
     let path = log_path(config, file_name);
     ensure_intent_parent(&path)?;
     reject_existing_symlink(&path)?;
@@ -253,9 +268,7 @@ pub fn append_jsonl(
     if needs_leading_newline {
         line.push(b'\n');
     }
-    line.extend_from_slice(
-        &serde_json::to_vec(record).map_err(|err| std::io::Error::other(err.to_string()))?,
-    );
+    line.extend_from_slice(&payload);
     line.push(b'\n');
     file.write_all(&line)?;
     file.sync_all()?;
@@ -264,6 +277,82 @@ pub fn append_jsonl(
         std::fs::File::open(parent)?.sync_all()?;
     }
     Ok(path)
+}
+
+/// Byte-framed reader of a single append-only log snapshot. Parsing each record
+/// independently is essential: a crash can tear a multibyte UTF-8 character,
+/// not just JSON punctuation. Whole-file `read_to_string` loses every intact
+/// record when even one such fragment exists anywhere in the log.
+struct IntentLogReader {
+    reader: std::io::BufReader<std::io::Take<std::fs::File>>,
+    line: Vec<u8>,
+    record_limit: usize,
+    skipped_records: u64,
+    finished: bool,
+}
+
+impl IntentLogReader {
+    fn open(config: &Config, file_name: &str) -> std::io::Result<Option<Self>> {
+        let path = log_path(config, file_name);
+        if let Some(parent) = path.parent() {
+            reject_existing_symlink(parent)?;
+        }
+        let file = match mcp_agent_mail_core::disk::open_regular_file_no_follow(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let snapshot_bytes = file.metadata()?.len();
+        Ok(Some(Self {
+            reader: std::io::BufReader::new(file.take(snapshot_bytes)),
+            line: Vec::new(),
+            record_limit: MAX_INTENT_RECORD_BYTES,
+            skipped_records: 0,
+            finished: false,
+        }))
+    }
+
+    fn next_record(&mut self) -> std::io::Result<Option<Value>> {
+        if self.finished {
+            return Ok(None);
+        }
+        loop {
+            self.line.clear();
+            // Bound allocation BEFORE reading, including a delimiter-free line.
+            let read = (&mut self.reader)
+                .take(self.record_limit as u64 + 1)
+                .read_until(b'\n', &mut self.line)?;
+            if read == 0 {
+                if self.reader.get_ref().limit() != 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "degraded-intent log was truncated during its snapshot read",
+                    ));
+                }
+                self.finished = true;
+                if self.skipped_records > 0 {
+                    tracing::warn!(
+                        skipped_records = self.skipped_records,
+                        "ignored malformed degraded-intent records; intact records retained"
+                    );
+                }
+                return Ok(None);
+            }
+            if self.line.len() > self.record_limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "degraded-intent record exceeds its byte limit; log preserved",
+                ));
+            }
+            if self.line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            match serde_json::from_slice(&self.line) {
+                Ok(value) => return Ok(Some(value)),
+                Err(_) => self.skipped_records = self.skipped_records.saturating_add(1),
+            }
+        }
+    }
 }
 
 // ── Ack-intent canonical hashing ────────────────────────────────────────────
@@ -406,19 +495,13 @@ pub fn append_ack_replay_record(
 
 /// Read all outstanding (un-replayed) ack intents, newest last.
 pub fn read_queued_ack_intents(config: &Config) -> std::io::Result<Vec<QueuedAckIntent>> {
-    let path = log_path(config, ACK_INTENT_LOG_FILE);
-    reject_existing_symlink(&path)?;
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
+    let Some(mut reader) = IntentLogReader::open(config, ACK_INTENT_LOG_FILE)? else {
+        return Ok(Vec::new());
     };
     let mut replayed = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
     let mut intents = Vec::new();
-    for line in content.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+    while let Some(value) = reader.next_record()? {
         match value.get("kind").and_then(Value::as_str) {
             Some(ACK_INTENT_REPLAY_KIND)
                 if value
@@ -442,7 +525,9 @@ pub fn read_queued_ack_intents(config: &Config) -> std::io::Result<Vec<QueuedAck
                     tracing::warn!("skipping ack intent with invalid content hash");
                     continue;
                 }
-                if let Ok(intent) = serde_json::from_value::<QueuedAckIntent>(value) {
+                if let Ok(intent) = serde_json::from_value::<QueuedAckIntent>(value)
+                    && seen.insert((intent.intent_id.clone(), intent.content_sha256.clone()))
+                {
                     intents.push(intent);
                 }
             }
@@ -508,19 +593,13 @@ fn release_replay_record_has_valid_hash(record: &Value) -> bool {
 pub fn read_queued_release_intents(
     config: &Config,
 ) -> std::io::Result<Vec<QueuedReleaseIntentView>> {
-    let path = log_path(config, RELEASE_INTENT_LOG_FILE);
-    reject_existing_symlink(&path)?;
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
+    let Some(mut reader) = IntentLogReader::open(config, RELEASE_INTENT_LOG_FILE)? else {
+        return Ok(Vec::new());
     };
     let mut replayed = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
     let mut intents = Vec::new();
-    for line in content.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+    while let Some(value) = reader.next_record()? {
         match value.get("kind").and_then(Value::as_str) {
             Some(RELEASE_INTENT_REPLAY_KIND)
                 if value
@@ -542,7 +621,9 @@ pub fn read_queued_release_intents(
                 if !record_has_valid_intent_hash(&value, release_intent_hash_payload) {
                     continue;
                 }
-                if let Ok(intent) = serde_json::from_value::<QueuedReleaseIntentView>(value) {
+                if let Ok(intent) = serde_json::from_value::<QueuedReleaseIntentView>(value)
+                    && seen.insert((intent.intent_id.clone(), intent.content_sha256.clone()))
+                {
                     intents.push(intent);
                 }
             }
@@ -749,13 +830,26 @@ mod tests {
     fn duplicate_ack_intent_dedupes_by_content_hash() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config = test_config(tmp.path());
-        // Two appends with identical canonical payload (same created_ts forced
-        // via identical fields is unlikely; instead assert distinct ids when
-        // payloads differ, and that reads return both).
+        let receipt = append_ack_intent(&config, "/p", "A", 1, "stage", "e").expect("append");
+        let original = std::fs::read(&receipt.intent_path).unwrap();
+        let record: Value = serde_json::from_slice(&original).unwrap();
+        append_jsonl(&config, ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE, &record).unwrap();
+        let queued = read_queued_ack_intents(&config).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].content_sha256, receipt.content_sha256);
+    }
+
+    #[test]
+    fn distinct_ack_intents_preserve_append_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tmp.path());
         let r1 = append_ack_intent(&config, "/p", "A", 1, "stage", "e").expect("append");
         let r2 = append_ack_intent(&config, "/p", "A", 2, "stage", "e").expect("append");
         assert_ne!(r1.intent_id, r2.intent_id);
-        assert_eq!(read_queued_ack_intents(&config).expect("read").len(), 2);
+        let queued = read_queued_ack_intents(&config).unwrap();
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].intent_id, r1.intent_id);
+        assert_eq!(queued[1].intent_id, r2.intent_id);
     }
 
     /// Build a release-intent record byte-identical to the one
@@ -944,5 +1038,130 @@ mod tests {
                 .is_empty(),
             "a release record with a mismatched content hash must be skipped"
         );
+    }
+
+    fn append_torn_unicode(path: &Path) {
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(b"{\"failure\":\"interrupted \xe2\x82").unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn torn_utf8_does_not_disable_ack_recovery_or_terminal_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let first = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").unwrap();
+        append_torn_unicode(&first.intent_path);
+        assert!(std::fs::read_to_string(&first.intent_path).is_err());
+        append_ack_intent(&config, "/p", "BlueLake", 2, "ack", "busy").unwrap();
+        let queued = read_queued_ack_intents(&config).unwrap();
+        assert_eq!(queued.iter().map(|intent| intent.message_id).collect::<Vec<_>>(), vec![1, 2]);
+        append_ack_replay_record(
+            &config, &first.intent_id, &first.content_sha256, REPLAY_STATUS_REPLAYED, None,
+        );
+        let queued = read_queued_ack_intents(&config).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].message_id, 2);
+    }
+
+    #[test]
+    fn torn_utf8_does_not_hide_release_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        write_release_intent_fixture(&config, 1, Value::Null, json!([1]));
+        append_torn_unicode(&log_path(&config, RELEASE_INTENT_LOG_FILE));
+        write_release_intent_fixture(&config, 2, Value::Null, json!([2]));
+        let queued = read_queued_release_intents(&config).unwrap();
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].created_ts, 1);
+        assert_eq!(queued[1].created_ts, 2);
+    }
+
+    #[test]
+    fn reader_does_not_chase_records_appended_after_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        append_jsonl(&config, ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE, &json!({"n": 1})).unwrap();
+        let mut reader = IntentLogReader::open(&config, ACK_INTENT_LOG_FILE).unwrap().unwrap();
+        append_jsonl(&config, ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE, &json!({"n": 2})).unwrap();
+        assert_eq!(reader.next_record().unwrap(), Some(json!({"n": 1})));
+        assert!(reader.next_record().unwrap().is_none());
+        assert!(reader.next_record().unwrap().is_none());
+        let mut fresh = IntentLogReader::open(&config, ACK_INTENT_LOG_FILE).unwrap().unwrap();
+        assert_eq!(fresh.next_record().unwrap(), Some(json!({"n": 1})));
+        assert_eq!(fresh.next_record().unwrap(), Some(json!({"n": 2})));
+        assert!(fresh.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn reader_bounds_delimiter_free_records_before_allocating_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let path = log_path(&config, ACK_INTENT_LOG_FILE);
+        ensure_intent_parent(&path).unwrap();
+        std::fs::write(&path, b"{\"long\":\"abcdefghijklmnopqrstuvwxyz\"}").unwrap();
+        let mut reader = IntentLogReader::open(&config, ACK_INTENT_LOG_FILE).unwrap().unwrap();
+        reader.record_limit = 16;
+        assert_eq!(reader.next_record().unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(reader.line.len(), 17);
+        assert!(std::fs::metadata(&path).unwrap().len() > 17);
+    }
+
+    #[test]
+    fn reader_accepts_exact_record_bound_and_complete_unterminated_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let path = log_path(&config, ACK_INTENT_LOG_FILE);
+        ensure_intent_parent(&path).unwrap();
+        for bytes in [b"{\"n\":1}\n".as_slice(), b"{\"n\":1}".as_slice()] {
+            std::fs::write(&path, bytes).unwrap();
+            let mut reader = IntentLogReader::open(&config, ACK_INTENT_LOG_FILE).unwrap().unwrap();
+            reader.record_limit = bytes.len();
+            assert_eq!(reader.next_record().unwrap(), Some(json!({"n": 1})));
+            assert!(reader.next_record().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn truncated_snapshot_is_not_a_successful_empty_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let path = append_jsonl(&config, ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE, &json!({"n": 1})).unwrap();
+        let mut reader = IntentLogReader::open(&config, ACK_INTENT_LOG_FILE).unwrap().unwrap();
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writer.set_len(0).unwrap();
+        assert_eq!(reader.next_record().unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn nonregular_intent_log_is_an_error_not_an_empty_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        std::fs::create_dir_all(log_path(&config, ACK_INTENT_LOG_FILE)).unwrap();
+        assert!(read_queued_ack_intents(&config).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intent_readers_refuse_symlinked_parent_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join(DEGRADED_INTENTS_DIR)).unwrap();
+        assert!(read_queued_ack_intents(&config).is_err());
+        assert!(read_queued_release_intents(&config).is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn duplicate_release_records_are_reported_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let (id, hash) = write_release_intent_fixture(&config, 1, Value::Null, json!([42]));
+        write_release_intent_fixture(&config, 1, Value::Null, json!([42]));
+        let queued = read_queued_release_intents(&config).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].intent_id, id);
+        assert_eq!(queued[0].content_sha256, hash);
     }
 }
