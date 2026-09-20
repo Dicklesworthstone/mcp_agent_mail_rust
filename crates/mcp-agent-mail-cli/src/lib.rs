@@ -5222,25 +5222,76 @@ fn prompt_live_service_choice(owner_label: &str, host: &str, port: u16) -> LiveS
     }
 }
 
+/// Refresh the snapshot, then keep its attachment guidance visible below it.
+fn render_read_only_tui_attachment_frame<W: std::io::Write>(
+    output: &mut W,
+    host: &str,
+    port: u16,
+    owner: Option<ManagedServiceKind>,
+    write_snapshot: impl FnOnce(&mut W) -> CliResult<()>,
+) -> CliResult<()> {
+    write!(output, "\x1b[2J\x1b[H")?;
+    output.flush()?;
+    write_snapshot(output)?;
+    writeln!(output)?;
+    writeln!(output, "READ-ONLY ATTACHMENT — watching the running server")?;
+    let owner_label = owner.map_or(
+        "An existing Agent Mail server",
+        managed_service_display_name,
+    );
+    writeln!(
+        output,
+        "{owner_label} owns {host}:{port}; this view cannot control its TUI."
+    )?;
+    writeln!(
+        output,
+        "Ctrl-C detaches. For the full interactive TUI: am --takeover"
+    )?;
+    if let Some(kind) = owner {
+        writeln!(
+            output,
+            "Takeover stops the managed service through its supervisor and restores it when you exit."
+        )?;
+        if matches!(kind, ManagedServiceKind::Systemd) {
+            writeln!(
+                output,
+                "To leave the user service stopped instead: systemctl --user stop {SYSTEMD_UNIT_NAME} && am"
+            )?;
+        }
+    } else {
+        writeln!(
+            output,
+            "If another supervisor manages this server, stop it there first to prevent automatic restarts."
+        )?;
+    }
+    writeln!(output)?;
+    output.flush()?;
+    Ok(())
+}
+
 /// Follow a running service's read-only TUI snapshot. This uses the existing
 /// `tui-dump` transport, whose primary path is `/mail/ws-state`; it never
 /// starts a server, acquires a mutation lock, or invokes service control.
-fn run_read_only_tui_attachment() -> CliResult<()> {
-    use std::io::Write as _;
-
-    eprintln!(
-        "[info] Read-only TUI attachment active; press Ctrl-C to detach (full TUI: `am --takeover`)."
-    );
+fn run_read_only_tui_attachment(config: &Config) -> CliResult<()> {
+    let owner = active_conflicting_managed_service(&config.http_host, config.http_port)
+        .map(|(kind, _)| kind);
+    let mut output = std::io::stdout();
     loop {
-        print!("\x1b[2J\x1b[H");
-        std::io::stdout().flush().map_err(CliError::Io)?;
-        robot::handle_robot(robot::RobotArgs {
-            format: Some(robot::OutputFormat::Toon),
-            json: false,
-            project: None,
-            agent: None,
-            command: robot::RobotSubcommand::TuiDump,
-        })?;
+        render_read_only_tui_attachment_frame(
+            &mut output,
+            &config.http_host,
+            config.http_port,
+            owner,
+            |_| {
+                robot::handle_robot(robot::RobotArgs {
+                    format: Some(robot::OutputFormat::Toon),
+                    json: false,
+                    project: None,
+                    agent: None,
+                    command: robot::RobotSubcommand::TuiDump,
+                })
+            },
+        )?;
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
@@ -7217,6 +7268,73 @@ mod restart_coordination_tests {
     }
 
     #[test]
+    fn read_only_attachment_refresh_preserves_owner_and_reclaim_guidance() {
+        for owner in [
+            None,
+            Some(ManagedServiceKind::Systemd),
+            Some(ManagedServiceKind::Launchd),
+        ] {
+            let mut output = Vec::new();
+            for _ in 0..2 {
+                render_read_only_tui_attachment_frame(
+                    &mut output,
+                    "127.0.0.1",
+                    8765,
+                    owner,
+                    |output| {
+                        // More rows than a typical terminal: guidance must
+                        // follow the snapshot rather than scroll out above it.
+                        output.extend_from_slice("snapshot row\n".repeat(100).as_bytes());
+                        Ok(())
+                    },
+                )
+                .expect("render attachment frame");
+            }
+            let output = String::from_utf8(output).expect("UTF-8 banner");
+            let clear = "\x1b[2J\x1b[H";
+            assert_eq!(output.matches(clear).count(), 2);
+            let visible = output.rsplit(clear).next().expect("last refresh");
+            assert!(
+                visible.rfind("snapshot row").expect("snapshot body")
+                    < visible.find("READ-ONLY ATTACHMENT").expect("banner")
+            );
+            assert!(visible.contains("READ-ONLY ATTACHMENT"));
+            assert!(visible.contains("owns 127.0.0.1:8765"));
+            assert!(visible.contains("am --takeover"));
+            assert!(visible.contains("Ctrl-C detaches"));
+            if let Some(kind) = owner {
+                assert!(visible.contains(managed_service_display_name(kind)));
+                assert!(visible.contains("restores it when you exit"));
+            } else {
+                assert!(visible.contains("stop it there first"));
+            }
+            assert_eq!(
+                visible.contains("systemctl --user stop agent-mail.service && am"),
+                matches!(owner, Some(ManagedServiceKind::Systemd))
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_attachment_banner_propagates_output_failure() {
+        let mut output: &mut [u8] = &mut [];
+        let mut snapshot_read = false;
+        let error =
+            render_read_only_tui_attachment_frame(&mut output, "localhost", 8765, None, |_| {
+                snapshot_read = true;
+                Ok(())
+            })
+            .expect_err("a full output buffer must fail");
+        assert!(
+            matches!(error, CliError::Io(error) if error.kind() == std::io::ErrorKind::WriteZero)
+        );
+        assert!(
+            !snapshot_read,
+            "a failed clear must prevent the snapshot read"
+        );
+    }
+
+    #[test]
     fn coordinate_acquires_when_lock_is_free() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config_with_unused_port(dir.path());
@@ -7382,7 +7500,7 @@ fn handle_serve_http(
     // attach read-only, take over through the managed-service stop/restore
     // path, or quit. Automation keeps the silent read-only attach.
     let takeover = match live_service_tui_decision(&config, config.tui_enabled, takeover) {
-        LiveServiceTuiDecision::AttachReadOnly => return run_read_only_tui_attachment(),
+        LiveServiceTuiDecision::AttachReadOnly => return run_read_only_tui_attachment(&config),
         LiveServiceTuiDecision::Quit => {
             eprintln!("[info] Leaving the running server untouched.");
             return Ok(());
