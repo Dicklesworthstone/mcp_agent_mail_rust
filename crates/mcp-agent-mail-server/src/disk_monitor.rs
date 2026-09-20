@@ -1,20 +1,57 @@
-//! Background worker for disk space monitoring and pressure classification.
+//! Background worker for disk and memory pressure monitoring.
 //!
-//! Updates core system metrics so operators can see disk free space and the
-//! current pressure tier in `health_check` and `resource://tooling/metrics_core`.
+//! Memory has its own sampling cadence and remains active when disk probes are
+//! disabled. Both feed `health_check` and `resource://tooling/metrics_core`.
 
 #![forbid(unsafe_code)]
 
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::disk::DiskPressure;
+use mcp_agent_mail_core::memory::MemoryPressure;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 const STARTUP_WARN_BYTES: u64 = 1024 * 1024 * 1024; // 1GiB
+const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Independent elapsed-time schedules; large configured disk intervals must
+/// neither delay RSS sampling nor overflow an `Instant` deadline.
+struct MonitorSchedule {
+    disk_enabled: bool,
+    disk_interval: Duration,
+    last_disk_sample: Duration,
+    last_memory_sample: Duration,
+}
+
+impl MonitorSchedule {
+    fn new(config: &Config) -> Self {
+        Self {
+            disk_enabled: config.disk_space_monitor_enabled,
+            disk_interval: monitor_interval_seconds(config.disk_space_check_interval_seconds),
+            // start() seeds both enabled probes before spawning the worker.
+            last_disk_sample: Duration::ZERO,
+            last_memory_sample: Duration::ZERO,
+        }
+    }
+
+    /// Return (disk_due, memory_due), coalescing missed intervals into one probe.
+    fn due(&mut self, elapsed: Duration) -> (bool, bool) {
+        let disk_due = self.disk_enabled
+            && elapsed.saturating_sub(self.last_disk_sample) >= self.disk_interval;
+        let memory_due = elapsed.saturating_sub(self.last_memory_sample) >= MEMORY_SAMPLE_INTERVAL;
+        if disk_due {
+            self.last_disk_sample = elapsed;
+        }
+        if memory_due {
+            self.last_memory_sample = elapsed;
+        }
+        (disk_due, memory_due)
+    }
+}
 
 #[inline]
 const fn monitor_interval_seconds(seconds: u64) -> Duration {
@@ -32,14 +69,6 @@ fn should_emit_pressure_change_alert(previous: DiskPressure, current: DiskPressu
 }
 
 pub fn start(config: &Config) {
-    if !config.disk_space_monitor_enabled {
-        return;
-    }
-
-    // Seed the gauges synchronously so tool paths can consult disk pressure
-    // immediately after startup.
-    let _ = mcp_agent_mail_core::disk::sample_and_record(config);
-
     let mut worker = WORKER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -51,12 +80,29 @@ pub fn start(config: &Config) {
         let _ = stale.join();
     }
     if worker.is_none() {
+        // Memory protection is independent of the disk-monitor switch. Seed
+        // both enabled probes before returning so admission control can see
+        // pressure even before the new thread has been scheduled.
+        let memory_pressure = mcp_agent_mail_core::memory::sample_and_record(config).pressure;
+        let disk_pressure = if config.disk_space_monitor_enabled {
+            let sample = mcp_agent_mail_core::disk::sample_and_record(config);
+            if should_emit_startup_warning(sample.effective_free_bytes) {
+                tracing::warn!(
+                    free_bytes = sample.effective_free_bytes,
+                    pressure = sample.pressure.label(),
+                    "low disk space detected (startup warning threshold)"
+                );
+            }
+            sample.pressure
+        } else {
+            DiskPressure::Ok
+        };
         let config = config.clone();
         SHUTDOWN.store(false, Ordering::Release);
         match std::thread::Builder::new()
             .name("disk-monitor".into())
             .stack_size(mcp_agent_mail_core::worker_stack_size())
-            .spawn(move || monitor_loop(&config))
+            .spawn(move || monitor_loop(&config, disk_pressure, memory_pressure))
         {
             Ok(handle) => {
                 *worker = Some(handle);
@@ -65,7 +111,7 @@ pub fn start(config: &Config) {
                 drop(worker);
                 tracing::warn!(
                     error = %err,
-                    "failed to spawn disk monitor worker; continuing without disk monitor background scans"
+                    "failed to spawn resource monitor worker; continuing without background disk or memory scans"
                 );
                 return;
             }
@@ -75,87 +121,153 @@ pub fn start(config: &Config) {
 }
 
 pub fn shutdown() {
-    SHUTDOWN.store(true, Ordering::Release);
     let mut worker = WORKER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Serialize the flag with start() so a concurrent start cannot clear the
+    // stop request while shutdown holds the worker and waits for it to exit.
+    SHUTDOWN.store(true, Ordering::Release);
     if let Some(handle) = worker.take() {
         let _ = handle.join();
     }
 }
 
-fn monitor_loop(config: &Config) {
-    let interval = monitor_interval_seconds(config.disk_space_check_interval_seconds);
+fn monitor_loop(
+    config: &Config,
+    mut last_pressure: DiskPressure,
+    mut last_memory_pressure: MemoryPressure,
+) {
+    let mut schedule = MonitorSchedule::new(config);
+    let started = Instant::now();
     tracing::info!(
-        interval_secs = interval.as_secs(),
-        "disk monitor worker started"
+        disk_enabled = schedule.disk_enabled,
+        disk_interval_secs = schedule.disk_interval.as_secs(),
+        memory_interval_secs = MEMORY_SAMPLE_INTERVAL.as_secs(),
+        "resource monitor worker started"
     );
 
-    let first = mcp_agent_mail_core::disk::sample_and_record(config);
-    let mut last_pressure = first.pressure;
-    if should_emit_startup_warning(first.effective_free_bytes) {
-        tracing::warn!(
-            free_bytes = first.effective_free_bytes,
-            pressure = last_pressure.label(),
-            "low disk space detected (startup warning threshold)"
-        );
-    }
-
-    // Track memory pressure for post-spike trim.
-    let mem_sample = mcp_agent_mail_core::memory::sample_and_record(config);
-    let mut last_memory_pressure = mem_sample.pressure;
-
     loop {
-        // Sleep in small increments to allow quick shutdown.
-        let mut remaining = interval;
-        while !remaining.is_zero() {
-            if SHUTDOWN.load(Ordering::Acquire) {
-                tracing::info!("disk monitor worker shutting down");
-                return;
-            }
-            let chunk = remaining.min(Duration::from_secs(1));
-            std::thread::sleep(chunk);
-            remaining = remaining.saturating_sub(chunk);
-        }
-
         if SHUTDOWN.load(Ordering::Acquire) {
-            tracing::info!("disk monitor worker shutting down");
+            tracing::info!("resource monitor worker shutting down");
+            return;
+        }
+        // One-second wakeups retain prompt shutdown without tying the memory
+        // cadence to a potentially very large configured disk interval.
+        std::thread::sleep(Duration::from_secs(1));
+        if SHUTDOWN.load(Ordering::Acquire) {
+            tracing::info!("resource monitor worker shutting down");
             return;
         }
 
-        let sample = mcp_agent_mail_core::disk::sample_and_record(config);
-        let pressure = sample.pressure;
-
-        if should_emit_pressure_change_alert(last_pressure, pressure) {
-            tracing::warn!(
-                from = last_pressure.label(),
-                to = pressure.label(),
-                storage_free_bytes = sample.storage_free_bytes,
-                db_free_bytes = sample.db_free_bytes,
-                effective_free_bytes = sample.effective_free_bytes,
-                "disk pressure level changed"
-            );
-            last_pressure = pressure;
+        let (disk_due, memory_due) = schedule.due(started.elapsed());
+        // Sample RSS first when both probes are due. The schedules share a
+        // worker, so slow filesystem probes can still delay a later sample.
+        if memory_due {
+            let sample = mcp_agent_mail_core::memory::sample_and_record(config);
+            if last_memory_pressure != sample.pressure {
+                tracing::info!(
+                    from = last_memory_pressure.label(),
+                    to = sample.pressure.label(),
+                    rss_bytes = sample.rss_bytes,
+                    "memory pressure level changed"
+                );
+            }
+            last_memory_pressure = sample.pressure;
         }
 
-        // Sample memory and report pressure transitions.
-        let mem_sample = mcp_agent_mail_core::memory::sample_and_record(config);
-        let mem_pressure = mem_sample.pressure;
-        if last_memory_pressure != mem_pressure {
-            tracing::info!(
-                from = last_memory_pressure.label(),
-                to = mem_pressure.label(),
-                rss_bytes = mem_sample.rss_bytes,
-                "memory pressure level changed"
-            );
+        if disk_due && !SHUTDOWN.load(Ordering::Acquire) {
+            let sample = mcp_agent_mail_core::disk::sample_and_record(config);
+            if should_emit_pressure_change_alert(last_pressure, sample.pressure) {
+                tracing::warn!(
+                    from = last_pressure.label(),
+                    to = sample.pressure.label(),
+                    storage_free_bytes = sample.storage_free_bytes,
+                    db_free_bytes = sample.db_free_bytes,
+                    effective_free_bytes = sample.effective_free_bytes,
+                    "disk pressure level changed"
+                );
+            }
+            last_pressure = sample.pressure;
         }
-        last_memory_pressure = mem_pressure;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_sampling_remains_active_when_disk_monitoring_is_disabled() {
+        let config = Config {
+            disk_space_monitor_enabled: false,
+            ..Config::default()
+        };
+        let mut schedule = MonitorSchedule::new(&config);
+        assert_eq!(schedule.due(Duration::ZERO), (false, false));
+        assert_eq!(schedule.due(Duration::from_secs(4)), (false, false));
+        assert_eq!(schedule.due(Duration::from_secs(5)), (false, true));
+        assert_eq!(schedule.due(Duration::from_secs(10)), (false, true));
+        assert_eq!(schedule.due(Duration::from_secs(3600)), (false, true));
+    }
+
+    #[test]
+    fn memory_cadence_is_independent_of_configured_disk_interval() {
+        for disk_interval in [0, 5, 60, 3600, u64::MAX] {
+            let config = Config {
+                disk_space_monitor_enabled: true,
+                disk_space_check_interval_seconds: disk_interval,
+                ..Config::default()
+            };
+            let mut schedule = MonitorSchedule::new(&config);
+            for seconds in 1..=60 {
+                let (_, memory_due) = schedule.due(Duration::from_secs(seconds));
+                assert_eq!(memory_due, seconds % 5 == 0, "disk interval {disk_interval}");
+            }
+        }
+    }
+
+    #[test]
+    fn faster_memory_sampling_does_not_increase_disk_probe_frequency() {
+        let config = Config {
+            disk_space_monitor_enabled: true,
+            disk_space_check_interval_seconds: 60,
+            ..Config::default()
+        };
+        let mut schedule = MonitorSchedule::new(&config);
+        for seconds in 1..=120 {
+            let (disk_due, memory_due) = schedule.due(Duration::from_secs(seconds));
+            assert_eq!(disk_due, seconds % 60 == 0);
+            assert_eq!(memory_due, seconds % 5 == 0);
+        }
+    }
+
+    #[test]
+    fn delayed_probes_coalesce_without_catch_up_bursts() {
+        let config = Config {
+            disk_space_monitor_enabled: true,
+            disk_space_check_interval_seconds: 60,
+            ..Config::default()
+        };
+        let mut schedule = MonitorSchedule::new(&config);
+        assert_eq!(schedule.due(Duration::from_secs(245)), (true, true));
+        assert_eq!(schedule.due(Duration::from_secs(245)), (false, false));
+        assert_eq!(schedule.due(Duration::from_secs(249)), (false, false));
+        assert_eq!(schedule.due(Duration::from_secs(250)), (false, true));
+        assert_eq!(schedule.due(Duration::from_secs(305)), (true, true));
+    }
+
+    #[test]
+    fn memory_metrics_still_sample_when_all_pressure_thresholds_are_disabled() {
+        let config = Config {
+            disk_space_monitor_enabled: false,
+            memory_warning_mb: 0,
+            memory_critical_mb: 0,
+            memory_fatal_mb: 0,
+            ..Config::default()
+        };
+        let mut schedule = MonitorSchedule::new(&config);
+        assert_eq!(schedule.due(MEMORY_SAMPLE_INTERVAL), (false, true));
+    }
 
     #[test]
     fn monitor_interval_seconds_enforces_minimum() {
