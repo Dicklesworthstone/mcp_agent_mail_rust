@@ -52,67 +52,122 @@ fn manual_index_reader(index: &Index) -> tantivy::Result<IndexReader> {
         .try_into()
 }
 
-/// Generate a text snippet from a document field, highlighting matched terms.
-///
-/// Returns a truncated excerpt centered around the first occurrence of any
-/// query term, with `**bold**` markers around matched portions.
+/// Lowercased search text with a map back to the original UTF-8 boundaries.
+/// Lowercasing can expand (`İ`) or shrink (`K`) the byte representation, so
+/// offsets in the lowercased string are not offsets in the stored message.
+struct LowercaseText {
+    text: String,
+    boundaries: Vec<(usize, usize)>,
+}
+
+impl LowercaseText {
+    fn new(original: &str) -> Self {
+        let text = original.to_lowercase();
+        let mut boundaries = Vec::new();
+        if !original.is_ascii() {
+            let mut lowered_offset = 0;
+            for (original_offset, ch) in original.char_indices() {
+                boundaries.push((lowered_offset, original_offset));
+                // str::to_lowercase also handles contextual final sigma; its
+                // two forms have the same UTF-8 width as char::to_lowercase.
+                lowered_offset += ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+            }
+            boundaries.push((text.len(), original.len()));
+        }
+        Self { text, boundaries }
+    }
+
+    /// A partial match within a lowercase expansion highlights the whole
+    /// original character, never half of its UTF-8 representation.
+    fn original_range(&self, start: usize, end: usize) -> (usize, usize) {
+        if self.boundaries.is_empty() {
+            return (start, end);
+        }
+        let first = self.boundaries.partition_point(|&(offset, _)| offset <= start) - 1;
+        let last = self.boundaries.partition_point(|&(offset, _)| offset < end);
+        (self.boundaries[first].1, self.boundaries[last].1)
+    }
+}
+
+/// Generate a plain-text excerpt centered around the first matching term.
+/// Highlight byte ranges are returned separately by [`find_highlights`].
 #[must_use]
 pub fn generate_snippet(text: &str, query_terms: &[String]) -> Option<String> {
-    if text.is_empty() || query_terms.is_empty() {
+    generate_snippet_with_limit(text, query_terms, SNIPPET_MAX_CHARS)
+}
+
+/// The character budget excludes the optional leading/trailing ellipses.
+fn generate_snippet_with_limit(
+    text: &str,
+    query_terms: &[String],
+    max_chars: usize,
+) -> Option<String> {
+    if text.is_empty() || query_terms.is_empty() || max_chars == 0 {
         return None;
     }
-
-    let lower_text = text.to_lowercase();
-
-    // Find the first matching term position
-    let mut best_pos: Option<usize> = None;
-    let mut best_term_len = 0usize;
-
+    let lowered = LowercaseText::new(text);
+    let mut best_match = None;
     for term in query_terms {
-        let lower_term = term.to_lowercase();
-        if lower_term.is_empty() {
+        let term = term.to_lowercase();
+        if term.is_empty() {
             continue;
         }
-        if let Some(pos) = lower_text.find(&lower_term)
-            && (best_pos.is_none() || pos < best_pos.unwrap_or(usize::MAX))
-        {
-            best_pos = Some(pos);
-            best_term_len = lower_term.len();
+        if let Some(pos) = lowered.text.find(&term) {
+            let range = lowered.original_range(pos, pos + term.len());
+            if best_match.is_none_or(|(start, _)| range.0 < start) {
+                best_match = Some(range);
+            }
         }
     }
-
-    let match_pos = best_pos?;
-    let match_start = floor_char_boundary(text, match_pos);
-    let match_end = ceil_char_boundary(text, match_start.saturating_add(best_term_len));
-
-    // Calculate excerpt window
-    let start = floor_char_boundary(text, match_start.saturating_sub(SNIPPET_CONTEXT));
-    let end = ceil_char_boundary(text, match_end.saturating_add(SNIPPET_CONTEXT));
-
-    // Snap to word boundaries
-    let start = snap_to_word_start(text, start);
-    let end = snap_to_word_end(text, end);
-
-    // Build snippet
-    let mut snippet = String::with_capacity(SNIPPET_MAX_CHARS + 20);
-
+    let (match_start, match_end) = best_match?;
+    let match_chars = text[match_start..match_end].chars().count();
+    let context_before = SNIPPET_CONTEXT.min(max_chars.saturating_sub(match_chars));
+    let start = retreat_chars(text, match_start, context_before);
+    let word_start = snap_to_word_start(text, start);
+    // A very long word before the match must not push the match out of the
+    // snippet. Prefer the unsnapped boundary when the word exceeds the budget.
+    let start = if text[word_start..match_end]
+        .chars()
+        .take(max_chars.saturating_add(1))
+        .count()
+        <= max_chars
+    {
+        word_start
+    } else {
+        start
+    };
+    let end = snap_to_word_end(text, advance_chars(text, match_end, SNIPPET_CONTEXT));
+    let excerpt_end = end.min(advance_chars(text, start, max_chars));
+    let mut snippet = String::new();
     if start > 0 {
         snippet.push_str("...");
     }
-
-    let max_end = ceil_char_boundary(text, start.saturating_add(SNIPPET_MAX_CHARS));
-    let excerpt_end = end.min(max_end).max(start);
-    let excerpt = &text[start..excerpt_end];
-    snippet.push_str(excerpt);
-
-    if end < text.len() {
+    snippet.push_str(&text[start..excerpt_end]);
+    if excerpt_end < text.len() {
         snippet.push_str("...");
     }
-
     Some(snippet)
 }
 
-/// Find highlight ranges for query terms within a text
+fn retreat_chars(text: &str, pos: usize, count: usize) -> usize {
+    if count == 0 {
+        return pos;
+    }
+    text[..pos]
+        .char_indices()
+        .rev()
+        .nth(count - 1)
+        .map_or(0, |(offset, _)| offset)
+}
+
+fn advance_chars(text: &str, pos: usize, count: usize) -> usize {
+    text[pos..]
+        .char_indices()
+        .nth(count)
+        .map_or(text.len(), |(offset, _)| pos + offset)
+}
+
+/// Find UTF-8 byte ranges in the original text, not its lowercased copy.
 #[must_use]
 pub fn find_highlights(
     text: &str,
@@ -122,35 +177,24 @@ pub fn find_highlights(
     if text.is_empty() || query_terms.is_empty() {
         return Vec::new();
     }
-    let lower_text = text.to_lowercase();
+    let lowered = LowercaseText::new(text);
     let mut ranges = Vec::new();
-
     for term in query_terms {
-        let lower_term = term.to_lowercase();
-        if lower_term.is_empty() {
+        let term = term.to_lowercase();
+        if term.is_empty() {
             continue;
         }
-        let mut search_from = 0;
-
-        while let Some(pos) = lower_text[search_from..].find(&lower_term) {
-            let abs_pos = search_from + pos;
-            let start = floor_char_boundary(text, abs_pos);
-            let end = ceil_char_boundary(text, abs_pos.saturating_add(lower_term.len()));
-            if end <= start {
-                search_from = abs_pos + lower_term.len();
-                continue;
-            }
+        for (pos, matched) in lowered.text.match_indices(&term) {
+            let (start, end) = lowered.original_range(pos, pos + matched.len());
             ranges.push(HighlightRange {
                 field: field_name.to_string(),
                 start,
                 end,
             });
-            search_from = abs_pos + lower_term.len();
         }
     }
-
-    // Sort by position for consistent output
-    ranges.sort_by_key(|r| r.start);
+    ranges.sort_by_key(|range| (range.start, range.end));
+    ranges.dedup_by(|a, b| a.start == b.start && a.end == b.end);
     ranges
 }
 
@@ -160,10 +204,11 @@ fn snap_to_word_start(text: &str, pos: usize) -> usize {
     if safe_pos == 0 || safe_pos >= text.len() {
         return safe_pos.min(text.len());
     }
-    // Walk backwards to find whitespace
     text[..safe_pos]
-        .rfind(|c: char| c.is_whitespace())
-        .map_or(0, |p| p + 1)
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map_or(0, |(offset, ch)| offset + ch.len_utf8())
 }
 
 /// Snap a byte position forward to the end of the nearest word
@@ -200,7 +245,7 @@ fn ceil_char_boundary(text: &str, pos: usize) -> usize {
 #[cfg(feature = "tantivy-engine")]
 #[derive(Debug, Clone)]
 pub struct ResponseConfig {
-    /// Maximum snippet length
+    /// Maximum snippet length in characters, excluding ellipses.
     pub snippet_max_chars: usize,
     /// Whether to generate snippets
     pub generate_snippets: bool,
@@ -377,7 +422,7 @@ fn build_hit(
     // Generate snippet from body (or subject if body is empty)
     let snippet = if config.generate_snippets {
         let text = if body.is_empty() { &subject } else { &body };
-        generate_snippet(text, query_terms)
+        generate_snippet_with_limit(text, query_terms, config.snippet_max_chars)
     } else {
         None
     };
@@ -724,6 +769,109 @@ mod tests {
         assert_eq!(snap_to_word_end(text, 5), 5);
     }
 
+    #[test]
+    fn snippet_handles_multibyte_whitespace() {
+        for separator in ['\u{00a0}', '\u{2003}', '\u{2028}', '\u{3000}'] {
+            let text = format!("prefix{separator}{} NEEDLE tail", "x".repeat(50));
+            let snippet = generate_snippet(&text, &["needle".to_string()]).unwrap();
+            assert!(snippet.contains("NEEDLE"), "{separator:?}: {snippet}");
+            assert_eq!(snap_to_word_start(&text, text.find("NEEDLE").unwrap() - 2),
+                "prefix".len() + separator.len_utf8());
+        }
+    }
+
+    #[test]
+    fn highlights_map_length_changing_lowercase_to_original() {
+        for prefix in ["İ", "K", "İK", "KİKİ"] {
+            let text = format!("{prefix} NEEDLE and NEEDLE");
+            let ranges = find_highlights(&text, "body", &["needle".to_string()]);
+            assert_eq!(ranges.len(), 2);
+            for range in ranges {
+                assert_eq!(&text[range.start..range.end], "NEEDLE");
+            }
+        }
+    }
+
+    #[test]
+    fn highlights_expand_partial_lowercase_match_to_whole_character() {
+        let text = "İ K";
+        let ranges = find_highlights(
+            text,
+            "body",
+            &["i".to_string(), "\u{0307}".to_string(), "k".to_string()],
+        );
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(&text[ranges[0].start..ranges[0].end], "İ");
+        assert_eq!(&text[ranges[1].start..ranges[1].end], "K");
+    }
+
+    #[test]
+    fn highlights_preserve_contextual_final_sigma() {
+        let text = "ΟΣ NEEDLE";
+        let ranges = find_highlights(text, "body", &["ος".to_string()]);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&text[ranges[0].start..ranges[0].end], "ΟΣ");
+    }
+
+    #[test]
+    fn highlights_deduplicate_repeated_terms() {
+        let ranges = find_highlights("Needle", "body", &["needle".into(), "NEEDLE".into()]);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!((ranges[0].start, ranges[0].end), (0, 6));
+    }
+
+    #[test]
+    fn snippet_keeps_match_after_long_unbroken_word() {
+        let text = format!("{}NEEDLE{}", "x".repeat(500), "y".repeat(500));
+        let snippet = generate_snippet(&text, &["needle".into()]).unwrap();
+        assert!(snippet.contains("NEEDLE"));
+        assert!(snippet.starts_with("..."));
+        assert!(snippet.ends_with("..."));
+        assert!(snippet.chars().count() <= SNIPPET_MAX_CHARS + 6);
+    }
+
+    #[test]
+    fn snippet_budget_counts_characters_not_bytes() {
+        let snippet = generate_snippet_with_limit("猫犬鳥魚熊", &["鳥".into()], 3).unwrap();
+        assert_eq!(snippet, "猫犬鳥...");
+    }
+
+    #[test]
+    fn snippet_maps_anchor_after_many_lowercase_expansions() {
+        for prefix in ["İ".repeat(500), "K".repeat(500)] {
+            let text = format!("{prefix} NEEDLE tail");
+            let snippet = generate_snippet(&text, &["needle".into()]).unwrap();
+            assert!(snippet.contains("NEEDLE"));
+        }
+    }
+
+    #[test]
+    fn snippet_marks_truncated_overlong_match() {
+        let text = "x".repeat(300);
+        let snippet = generate_snippet_with_limit(&text, &[text.clone()], 20).unwrap();
+        assert_eq!(snippet, format!("{}...", "x".repeat(20)));
+    }
+
+    #[test]
+    fn snippet_zero_budget_and_empty_terms_have_no_excerpt() {
+        assert!(generate_snippet_with_limit("needle", &["needle".into()], 0).is_none());
+        assert!(generate_snippet("needle", &[String::new()]).is_none());
+        assert!(find_highlights("needle", "body", &[String::new()]).is_empty());
+    }
+
+    #[test]
+    fn snippet_and_highlights_cover_multilingual_matches() {
+        for text in ["İK 猫 犬 鳥", "ΑΒΓ ΣΟΣ needle", "🦀\u{2003}é NEEDLE"] {
+            for term in text.split_whitespace() {
+                let terms = [term.to_string()];
+                let snippet = generate_snippet(text, &terms).unwrap();
+                assert!(snippet.contains(term));
+                let ranges = find_highlights(text, "body", &terms);
+                assert!(ranges.iter().any(|range| &text[range.start..range.end] == term));
+            }
+        }
+    }
+
     // ── Constants ──
 
     #[test]
@@ -984,6 +1132,23 @@ mod tests {
                 assert!(hit.snippet.is_none());
                 assert!(hit.highlight_ranges.is_empty());
             }
+        }
+
+        #[test]
+        fn build_hit_respects_snippet_character_budget() {
+            let (_, handles) = setup_index();
+            let document = doc!(
+                handles.id => 10u64,
+                handles.doc_kind => "message",
+                handles.body => "needle abcdefgh"
+            );
+            let config = ResponseConfig {
+                snippet_max_chars: 6,
+                ..ResponseConfig::default()
+            };
+            let hit = build_hit(&document, &handles, 1.0, &["needle".into()], &config);
+            assert_eq!(hit.snippet.as_deref(), Some("needle..."));
+            assert_eq!(hit.highlight_ranges.len(), 1);
         }
 
         #[test]
