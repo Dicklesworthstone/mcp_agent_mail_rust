@@ -3982,11 +3982,6 @@ fn write_crash_marker(storage_root: &Path, info: &std::panic::PanicHookInfo<'_>,
         return;
     }
     let path = dir.join("crash_markers.jsonl");
-    if let Ok(meta) = std::fs::metadata(&path)
-        && meta.len() > CRASH_MARKER_MAX_BYTES
-    {
-        return;
-    }
     let payload = info.payload();
     let message = payload
         .downcast_ref::<&'static str>()
@@ -4006,14 +4001,39 @@ fn write_crash_marker(storage_root: &Path, info: &std::panic::PanicHookInfo<'_>,
         "location": location,
         "backtrace": std::backtrace::Backtrace::force_capture().to_string(),
     });
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    append_crash_marker(&path, &record);
+}
+
+/// Keep complete records within the cap, including simultaneous panics.
+/// Never wait for another writer while already handling a panic.
+fn append_crash_marker(path: &Path, record: &serde_json::Value) {
+    use std::io::Write as _;
+
+    let mut line = record.to_string();
+    line.push('\n');
+    let Ok(record_bytes) = u64::try_from(line.len()) else {
+        return;
+    };
+    if record_bytes > CRASH_MARKER_MAX_BYTES {
+        return;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
-    {
-        use std::io::Write as _;
-        let _ = writeln!(file, "{record}");
+        .open(path)
+    else {
+        return;
+    };
+    if fs2::FileExt::try_lock_exclusive(&file).is_err() {
+        return;
     }
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+    if metadata.len() > CRASH_MARKER_MAX_BYTES - record_bytes {
+        return;
+    }
+    let _ = file.write_all(line.as_bytes());
 }
 
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
@@ -17887,6 +17907,125 @@ mod tests {
     static DISPATCH_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
     static COMPOSE_WRITE_BARRIER_TEST_LOCK: Mutex<()> = Mutex::new(());
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn crash_marker_hook_records_real_panic_in_isolated_process() {
+        const CHILD_ROOT: &str = "AM_TEST_CRASH_MARKER_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            install_crash_marker_panic_hook(PathBuf::from(root));
+            let caught = std::panic::catch_unwind(|| panic!("crash marker regression"));
+            assert!(caught.is_err());
+            return;
+        }
+        let dir = tempfile::tempdir().expect("private crash archive");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "tests::crash_marker_hook_records_real_panic_in_isolated_process",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, dir.path())
+            .output()
+            .expect("run isolated panic hook");
+        assert!(output.status.success(), "child failed: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("crash marker regression"));
+        let bytes = std::fs::read(dir.path().join("doctor/crash_markers.jsonl"))
+            .expect("real panic marker");
+        let record: serde_json::Value = serde_json::from_slice(&bytes).expect("complete JSON");
+        assert_eq!(record["message"], "crash marker regression");
+        assert_eq!(record["version"], env!("CARGO_PKG_VERSION"));
+        assert!(record["location"].as_str().unwrap().contains("lib.rs:"));
+        assert_ne!(record["backtrace"].as_str().unwrap(), "");
+        assert_ne!(
+            record["pid"].as_u64().unwrap(),
+            u64::from(std::process::id())
+        );
+    }
+
+    #[test]
+    fn crash_marker_append_enforces_complete_record_byte_budget() {
+        let dir = tempfile::tempdir().expect("private crash archive");
+        let path = dir.path().join("markers.jsonl");
+        let overhead = serde_json::json!({"message": ""}).to_string().len() + 1;
+        let cap = usize::try_from(CRASH_MARKER_MAX_BYTES).unwrap();
+        let oversized = serde_json::json!({"message": "x".repeat(cap - overhead + 1)});
+        append_crash_marker(&path, &oversized);
+        assert!(
+            !path.exists(),
+            "oversized first record must not create a file"
+        );
+        let exact = serde_json::json!({"message": "x".repeat(cap - overhead)});
+        append_crash_marker(&path, &exact);
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(before.len(), cap);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&before).unwrap(),
+            exact
+        );
+        append_crash_marker(&path, &serde_json::json!({"message": "later"}));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn crash_marker_append_preserves_contended_and_overfull_files() {
+        let dir = tempfile::tempdir().expect("private crash archive");
+        let path = dir.path().join("markers.jsonl");
+        let first = serde_json::json!({"message": "first"});
+        append_crash_marker(&path, &first);
+        let before = std::fs::read(&path).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        append_crash_marker(&path, &serde_json::json!({"message": "contended"}));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(held);
+        append_crash_marker(&path, &first);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            2 * before.len() as u64
+        );
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(CRASH_MARKER_MAX_BYTES + 1).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        append_crash_marker(&path, &first);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // An invalid output path must not turn diagnostics into a second panic.
+        append_crash_marker(dir.path(), &first);
+    }
+
+    #[test]
+    fn crash_marker_append_serializes_concurrent_budget_checks() {
+        let dir = tempfile::tempdir().expect("private crash archive");
+        let path = dir.path().join("markers.jsonl");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for id in 0..8 {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let record =
+                        serde_json::json!({"id": id, "message": "x".repeat(2 * 1024 * 1024)});
+                    barrier.wait();
+                    append_crash_marker(path, &record);
+                });
+            }
+        });
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!bytes.is_empty(), "at least one writer must append");
+        assert!(bytes.len() as u64 <= CRASH_MARKER_MAX_BYTES);
+        let text = String::from_utf8(bytes).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("non-interleaved JSON record"))
+            .collect();
+        assert!((1..=2).contains(&records.len()));
+        for record in records {
+            assert!(record["id"].as_u64().unwrap() < 8);
+            assert_eq!(record["message"].as_str().unwrap().len(), 2 * 1024 * 1024);
+        }
+    }
 
     #[test]
     fn shutdown_cleanup_preserves_sqlite_family_when_recovery_breaker_is_tripped() {
