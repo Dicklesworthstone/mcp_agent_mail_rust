@@ -4245,9 +4245,10 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     // sequence below (WBQ flush, worker shutdown) and killing the MCP/HTTP
     // server that other agents were still using — the primary mechanism
     // behind "am eventually terminates after days/weeks". The crash-marker
-    // panic hook has already recorded the panic to
+    // panic hook has already attempted to record the panic to
     // `<storage_root>/doctor/crash_markers.jsonl` by the time we get the
-    // payload here; converting it into an `Err` routes the process through
+    // payload here. Recording is best effort and may fail or be skipped;
+    // converting the panic into an `Err` routes the process through
     // the same orderly shutdown as any other TUI failure. `Program`'s
     // terminal guard restores the TTY during the unwind.
     let tui_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4260,9 +4261,9 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
             .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
             .unwrap_or("non-string panic payload");
         Err(std::io::Error::other(format!(
-            "TUI main thread panicked: {detail}. A crash marker with the full \
-             backtrace was appended to <storage_root>/doctor/crash_markers.jsonl; \
-             the server ran its graceful shutdown instead of aborting mid-frame."
+            "TUI main thread panicked: {detail}. Crash-marker recording is best effort; \
+             check <storage_root>/doctor/crash_markers.jsonl for a backtrace. \
+             The panic was caught; shutdown uses the normal cleanup path."
         )))
     });
     if let Some(watchdog) = startup_watchdog {
