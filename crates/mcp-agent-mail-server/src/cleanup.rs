@@ -1887,8 +1887,16 @@ mod tests {
         };
         // Preserve the table and its data while making the actual mail query
         // unavailable. No mocked outcome and no mutation of an operator DB.
-        conn.execute_sync("ALTER TABLE messages RENAME TO cleanup_saved_messages", &[])
-            .expect("hide mail evidence in fixture");
+        if let Err(error) =
+            conn.execute_sync("ALTER TABLE messages RENAME TO cleanup_saved_messages", &[])
+        {
+            // Preserve the original failure while exposing the engine's
+            // validation reason on this same connection, before it is dropped.
+            let commit_events = conn.query_sync("PRAGMA fsqlite.commit_events", &[]);
+            panic!(
+                "hide mail evidence in fixture: {error:?}; engine commit events: {commit_events:?}"
+            );
+        }
         drop(conn);
         assert!(matches!(
             block_on(get_agent_last_mail_activity(
