@@ -28,14 +28,18 @@
 //! its full `(intent_id, content_sha256)` pair is present. Readers isolate torn
 //! JSON/UTF-8 records without losing intact records on either side. They read
 //! one opened file up to its initial length, never chase a concurrent appender.
+//! Completed payloads are dropped during the scan; only their terminal keys
+//! remain to prevent a later duplicate from resurrecting completed work.
 //!
 //! NOTE: [`crate::reservations`] still carries its own private copy of the
 //! release-intent writer/reader for its automatic replay-on-success path.
 //! Migrating it onto this shared surface is tracked as a follow-up so that the
 //! single mutation chokepoint work (Track F) is not disturbed.
 
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use mcp_agent_mail_core::Config;
 use serde::{Deserialize, Serialize};
@@ -45,6 +49,11 @@ use sha2::{Digest, Sha256};
 /// Maximum bytes in one JSONL record, including its terminating newline.
 /// Oversized historical records are an explicit error, never silently omitted.
 const MAX_INTENT_RECORD_BYTES: usize = 16 * 1024 * 1024;
+/// The mailbox has already failed when this fallback is used. Bound contention
+/// on its separate journal lock instead of introducing a second indefinite wait.
+/// This is a lock-wait budget, not a deadline for filesystem I/O or `fsync`.
+const INTENT_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
+const INTENT_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Subdirectory under `storage_root` holding every degraded-intent log.
 pub const DEGRADED_INTENTS_DIR: &str = "degraded_intents";
@@ -201,8 +210,48 @@ fn ensure_intent_parent(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Append a single JSON record to an intent log under an exclusive advisory
-/// lock, with restrictive permissions and `fsync` of file + parent dir.
+fn is_lock_contention(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error
+            .raw_os_error()
+            .is_some_and(|code| Some(code) == fs2::lock_contended_error().raw_os_error())
+}
+
+fn intent_lock_timeout(timeout: Duration) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("degraded-intent journal lock exceeded {timeout:?}; intent was not appended"),
+    )
+}
+
+/// Retry only contention/interruption, under one monotonic budget. A zero
+/// budget still permits one nonblocking attempt, but never waits. The caller
+/// keeps the owned file alive through publication; dropping it releases the lock.
+fn acquire_intent_lock(file: &std::fs::File, timeout: Duration) -> std::io::Result<()> {
+    let started = Instant::now();
+    loop {
+        match fs2::FileExt::try_lock_exclusive(file) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if is_lock_contention(&error)
+                    || error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(intent_lock_timeout(timeout));
+        }
+        std::thread::sleep(remaining.min(INTENT_LOCK_RETRY_INTERVAL));
+        // Do not start a new acquisition attempt after the wait budget expired.
+        if started.elapsed() >= timeout {
+            return Err(intent_lock_timeout(timeout));
+        }
+    }
+}
+
+/// Append a single JSON record under an exclusive advisory lock, with private
+/// permissions and `fsync` of file + parent dir. Lock contention is bounded;
+/// a timeout is an error, never a receipt claiming the record was queued.
 pub fn append_jsonl(
     config: &Config,
     file_name: &str,
@@ -210,8 +259,8 @@ pub fn append_jsonl(
     record: &Value,
 ) -> std::io::Result<PathBuf> {
     // Do not acknowledge a record that the bounded reader cannot recover.
-    let payload = serde_json::to_vec(record)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let payload =
+        serde_json::to_vec(record).map_err(|error| std::io::Error::other(error.to_string()))?;
     if payload.len() >= MAX_INTENT_RECORD_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -223,18 +272,33 @@ pub fn append_jsonl(
     reject_existing_symlink(&path)?;
     let lock_file_path = lock_path(config, lock_file_name);
     reject_existing_symlink(&lock_file_path)?;
-    let lock_file = std::fs::OpenOptions::new()
+    let mut lock_options = std::fs::OpenOptions::new();
+    lock_options
         .create(true)
         .truncate(false)
         .read(true)
-        .write(true)
-        .open(&lock_file_path)?;
+        .write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        lock_options.mode(0o600);
+    }
+    let lock_file = lock_options.open(&lock_file_path)?;
+    if !lock_file.metadata()?.is_file() {
+        return Err(std::io::Error::other("degraded-intent lock is not a regular file"));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         lock_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    fs2::FileExt::lock_exclusive(&lock_file)?;
+    acquire_intent_lock(&lock_file, INTENT_LOCK_TIMEOUT)?;
+    // Another writer may have changed the log while this caller was waiting.
+    // Repeat the existing authority checks before opening the append handle.
+    if let Some(parent) = path.parent() {
+        reject_existing_symlink(parent)?;
+    }
+    reject_existing_symlink(&path)?;
     let mut options = std::fs::OpenOptions::new();
     options.create(true).read(true).append(true);
     #[cfg(unix)]
@@ -243,20 +307,19 @@ pub fn append_jsonl(
         options.mode(0o600);
     }
     let mut file = options.open(&path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("degraded-intent log is not a regular file"));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    // Defend against a torn final line from a prior crash (a partial append that
-    // never reached fsync). If the log does not currently end in a newline,
-    // write a leading one so the torn fragment stays isolated on its own
-    // (skippable) line instead of being concatenated onto — and lost together
-    // with — this otherwise-valid record on the next read.
-    let needs_leading_newline = if let Ok(meta) = file.metadata()
-        && meta.len() > 0
-    {
-        use std::io::{Read, Seek, SeekFrom};
+    // Isolate a torn prior append. Failure to inspect the tail must propagate,
+    // not masquerade as an empty log and join two records into an unreadable one.
+    let needs_leading_newline = if metadata.len() > 0 {
+        use std::io::{Seek, SeekFrom};
         file.seek(SeekFrom::End(-1))?;
         let mut last = [0u8; 1];
         file.read_exact(&mut last)?;
@@ -352,6 +415,57 @@ impl IntentLogReader {
                 Err(_) => self.skipped_records = self.skipped_records.saturating_add(1),
             }
         }
+    }
+}
+
+type IntentKey = (String, String);
+
+/// Retain live payloads, not the entire journal's historical payloads. Terminal
+/// identities must remain: a marker can precede a duplicated intent record.
+/// Memory still scales with the unresolved payloads and terminal-key history.
+struct OutstandingIntents<T> {
+    pending: HashMap<IntentKey, (u64, T)>,
+    terminal: HashSet<IntentKey>,
+    next_order: u64,
+}
+
+impl<T> OutstandingIntents<T> {
+    fn new() -> Self {
+        Self {
+            pending: HashMap::new(),
+            terminal: HashSet::new(),
+            next_order: 0,
+        }
+    }
+
+    fn insert(&mut self, key: IntentKey, intent: T) -> std::io::Result<()> {
+        if self.terminal.contains(&key) {
+            return Ok(());
+        }
+        if let Entry::Vacant(entry) = self.pending.entry(key) {
+            let order = self.next_order;
+            self.next_order = order.checked_add(1).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "degraded-intent record sequence overflow",
+                )
+            })?;
+            entry.insert((order, intent));
+        }
+        Ok(())
+    }
+
+    fn complete(&mut self, key: IntentKey) {
+        // Drop the payload now, not at EOF. A later failed marker or duplicate
+        // must not undo this verified terminal state.
+        let _ = self.pending.remove(&key);
+        self.terminal.insert(key);
+    }
+
+    fn into_intents(self) -> Vec<T> {
+        let mut pending: Vec<_> = self.pending.into_values().collect();
+        pending.sort_unstable_by_key(|(order, _)| *order);
+        pending.into_iter().map(|(_, intent)| intent).collect()
     }
 }
 
@@ -493,14 +607,12 @@ pub fn append_ack_replay_record(
     }
 }
 
-/// Read all outstanding (un-replayed) ack intents, newest last.
+/// Read all outstanding (un-replayed) ack intents in first-append order.
 pub fn read_queued_ack_intents(config: &Config) -> std::io::Result<Vec<QueuedAckIntent>> {
     let Some(mut reader) = IntentLogReader::open(config, ACK_INTENT_LOG_FILE)? else {
         return Ok(Vec::new());
     };
-    let mut replayed = std::collections::HashSet::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut intents = Vec::new();
+    let mut outstanding = OutstandingIntents::new();
     while let Some(value) = reader.next_record()? {
         match value.get("kind").and_then(Value::as_str) {
             Some(ACK_INTENT_REPLAY_KIND)
@@ -517,7 +629,7 @@ pub fn read_queued_ack_intents(config: &Config) -> std::io::Result<Vec<QueuedAck
                     value.get("intent_id").and_then(Value::as_str),
                     value.get("intent_content_sha256").and_then(Value::as_str),
                 ) {
-                    replayed.insert((intent_id.to_string(), intent_content_sha256.to_string()));
+                    outstanding.complete((intent_id.to_string(), intent_content_sha256.to_string()));
                 }
             }
             Some(ACK_INTENT_KIND) => {
@@ -525,19 +637,17 @@ pub fn read_queued_ack_intents(config: &Config) -> std::io::Result<Vec<QueuedAck
                     tracing::warn!("skipping ack intent with invalid content hash");
                     continue;
                 }
-                if let Ok(intent) = serde_json::from_value::<QueuedAckIntent>(value)
-                    && seen.insert((intent.intent_id.clone(), intent.content_sha256.clone()))
-                {
-                    intents.push(intent);
+                if let Ok(intent) = serde_json::from_value::<QueuedAckIntent>(value) {
+                    outstanding.insert(
+                        (intent.intent_id.clone(), intent.content_sha256.clone()),
+                        intent,
+                    )?;
                 }
             }
             _ => {}
         }
     }
-    intents.retain(|intent| {
-        !replayed.contains(&(intent.intent_id.clone(), intent.content_sha256.clone()))
-    });
-    Ok(intents)
+    Ok(outstanding.into_intents())
 }
 
 // ── Release-intent read-only view (for the robot status surface) ─────────────
@@ -586,7 +696,7 @@ fn release_replay_record_has_valid_hash(record: &Value) -> bool {
         && content_sha256 == hash_json_value(&release_replay_hash_payload(record))
 }
 
-/// Read all outstanding (un-replayed) release intents, newest last.
+/// Read all outstanding release intents in first-append order.
 ///
 /// Read-only view for the `am robot status` surface; the authoritative
 /// replay-on-success path lives in [`crate::reservations`].
@@ -596,9 +706,7 @@ pub fn read_queued_release_intents(
     let Some(mut reader) = IntentLogReader::open(config, RELEASE_INTENT_LOG_FILE)? else {
         return Ok(Vec::new());
     };
-    let mut replayed = std::collections::HashSet::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut intents = Vec::new();
+    let mut outstanding = OutstandingIntents::new();
     while let Some(value) = reader.next_record()? {
         match value.get("kind").and_then(Value::as_str) {
             Some(RELEASE_INTENT_REPLAY_KIND)
@@ -614,26 +722,24 @@ pub fn read_queued_release_intents(
                     value.get("intent_id").and_then(Value::as_str),
                     value.get("intent_content_sha256").and_then(Value::as_str),
                 ) {
-                    replayed.insert((intent_id.to_string(), intent_content_sha256.to_string()));
+                    outstanding.complete((intent_id.to_string(), intent_content_sha256.to_string()));
                 }
             }
             Some(RELEASE_INTENT_KIND) => {
                 if !record_has_valid_intent_hash(&value, release_intent_hash_payload) {
                     continue;
                 }
-                if let Ok(intent) = serde_json::from_value::<QueuedReleaseIntentView>(value)
-                    && seen.insert((intent.intent_id.clone(), intent.content_sha256.clone()))
-                {
-                    intents.push(intent);
+                if let Ok(intent) = serde_json::from_value::<QueuedReleaseIntentView>(value) {
+                    outstanding.insert(
+                        (intent.intent_id.clone(), intent.content_sha256.clone()),
+                        intent,
+                    )?;
                 }
             }
             _ => {}
         }
     }
-    intents.retain(|intent| {
-        !replayed.contains(&(intent.intent_id.clone(), intent.content_sha256.clone()))
-    });
-    Ok(intents)
+    Ok(outstanding.into_intents())
 }
 
 #[cfg(test)]
@@ -1041,8 +1147,12 @@ mod tests {
     }
 
     fn append_torn_unicode(path: &Path) {
-        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
-        file.write_all(b"{\"failure\":\"interrupted \xe2\x82").unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap();
+        file.write_all(b"{\"failure\":\"interrupted \xe2\x82")
+            .unwrap();
         file.sync_all().unwrap();
     }
 
@@ -1055,9 +1165,16 @@ mod tests {
         assert!(std::fs::read_to_string(&first.intent_path).is_err());
         append_ack_intent(&config, "/p", "BlueLake", 2, "ack", "busy").unwrap();
         let queued = read_queued_ack_intents(&config).unwrap();
-        assert_eq!(queued.iter().map(|intent| intent.message_id).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(
+            queued.iter().map(|intent| intent.message_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         append_ack_replay_record(
-            &config, &first.intent_id, &first.content_sha256, REPLAY_STATUS_REPLAYED, None,
+            &config,
+            &first.intent_id,
+            &first.content_sha256,
+            REPLAY_STATUS_REPLAYED,
+            None,
         );
         let queued = read_queued_ack_intents(&config).unwrap();
         assert_eq!(queued.len(), 1);
@@ -1081,13 +1198,29 @@ mod tests {
     fn reader_does_not_chase_records_appended_after_open() {
         let tmp = tempfile::tempdir().unwrap();
         let config = test_config(tmp.path());
-        append_jsonl(&config, ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE, &json!({"n": 1})).unwrap();
-        let mut reader = IntentLogReader::open(&config, ACK_INTENT_LOG_FILE).unwrap().unwrap();
-        append_jsonl(&config, ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE, &json!({"n": 2})).unwrap();
+        append_jsonl(
+            &config,
+            ACK_INTENT_LOG_FILE,
+            ACK_INTENT_LOCK_FILE,
+            &json!({"n": 1}),
+        )
+        .unwrap();
+        let mut reader = IntentLogReader::open(&config, ACK_INTENT_LOG_FILE)
+            .unwrap()
+            .unwrap();
+        append_jsonl(
+            &config,
+            ACK_INTENT_LOG_FILE,
+            ACK_INTENT_LOCK_FILE,
+            &json!({"n": 2}),
+        )
+        .unwrap();
         assert_eq!(reader.next_record().unwrap(), Some(json!({"n": 1})));
         assert!(reader.next_record().unwrap().is_none());
         assert!(reader.next_record().unwrap().is_none());
-        let mut fresh = IntentLogReader::open(&config, ACK_INTENT_LOG_FILE).unwrap().unwrap();
+        let mut fresh = IntentLogReader::open(&config, ACK_INTENT_LOG_FILE)
+            .unwrap()
+            .unwrap();
         assert_eq!(fresh.next_record().unwrap(), Some(json!({"n": 1})));
         assert_eq!(fresh.next_record().unwrap(), Some(json!({"n": 2})));
         assert!(fresh.next_record().unwrap().is_none());
@@ -1100,9 +1233,14 @@ mod tests {
         let path = log_path(&config, ACK_INTENT_LOG_FILE);
         ensure_intent_parent(&path).unwrap();
         std::fs::write(&path, b"{\"long\":\"abcdefghijklmnopqrstuvwxyz\"}").unwrap();
-        let mut reader = IntentLogReader::open(&config, ACK_INTENT_LOG_FILE).unwrap().unwrap();
+        let mut reader = IntentLogReader::open(&config, ACK_INTENT_LOG_FILE)
+            .unwrap()
+            .unwrap();
         reader.record_limit = 16;
-        assert_eq!(reader.next_record().unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            reader.next_record().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
         assert_eq!(reader.line.len(), 17);
         assert!(std::fs::metadata(&path).unwrap().len() > 17);
     }
@@ -1115,7 +1253,9 @@ mod tests {
         ensure_intent_parent(&path).unwrap();
         for bytes in [b"{\"n\":1}\n".as_slice(), b"{\"n\":1}".as_slice()] {
             std::fs::write(&path, bytes).unwrap();
-            let mut reader = IntentLogReader::open(&config, ACK_INTENT_LOG_FILE).unwrap().unwrap();
+            let mut reader = IntentLogReader::open(&config, ACK_INTENT_LOG_FILE)
+                .unwrap()
+                .unwrap();
             reader.record_limit = bytes.len();
             assert_eq!(reader.next_record().unwrap(), Some(json!({"n": 1})));
             assert!(reader.next_record().unwrap().is_none());
@@ -1126,11 +1266,22 @@ mod tests {
     fn truncated_snapshot_is_not_a_successful_empty_queue() {
         let tmp = tempfile::tempdir().unwrap();
         let config = test_config(tmp.path());
-        let path = append_jsonl(&config, ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE, &json!({"n": 1})).unwrap();
-        let mut reader = IntentLogReader::open(&config, ACK_INTENT_LOG_FILE).unwrap().unwrap();
+        let path = append_jsonl(
+            &config,
+            ACK_INTENT_LOG_FILE,
+            ACK_INTENT_LOCK_FILE,
+            &json!({"n": 1}),
+        )
+        .unwrap();
+        let mut reader = IntentLogReader::open(&config, ACK_INTENT_LOG_FILE)
+            .unwrap()
+            .unwrap();
         let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         writer.set_len(0).unwrap();
-        assert_eq!(reader.next_record().unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            reader.next_record().unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[test]
@@ -1163,5 +1314,297 @@ mod tests {
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].intent_id, id);
         assert_eq!(queued[0].content_sha256, hash);
+    }
+
+    fn open_test_lock(config: &Config) -> std::fs::File {
+        let path = lock_path(config, ACK_INTENT_LOCK_FILE);
+        ensure_intent_parent(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap()
+    }
+
+    #[test]
+    fn lock_error_recognizes_platform_contention_only() {
+        assert!(is_lock_contention(&fs2::lock_contended_error()));
+        assert!(is_lock_contention(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(!is_lock_contention(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!is_lock_contention(&std::io::Error::other("not contention")));
+    }
+
+    #[test]
+    fn uncontended_lock_succeeds_with_zero_wait_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let lock = open_test_lock(&config);
+        acquire_intent_lock(&lock, Duration::ZERO).unwrap();
+        let contender = open_test_lock(&config);
+        assert_eq!(
+            acquire_intent_lock(&contender, Duration::ZERO)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        drop(lock);
+        acquire_intent_lock(&contender, Duration::ZERO).unwrap();
+    }
+
+    #[test]
+    fn contended_append_times_out_without_record_and_retry_recovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let first = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").unwrap();
+        let before = std::fs::read(&first.intent_path).unwrap();
+        let held = open_test_lock(&config);
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        let started = Instant::now();
+        let error = append_ack_intent(&config, "/p", "BlueLake", 2, "ack", "busy")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(std::fs::read(&first.intent_path).unwrap(), before);
+        drop(held);
+        append_ack_intent(&config, "/p", "BlueLake", 2, "ack", "busy").unwrap();
+        let queued = read_queued_ack_intents(&config).unwrap();
+        assert_eq!(
+            queued.iter().map(|intent| intent.message_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn replay_marker_contention_does_not_clear_pending_intent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let receipt = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").unwrap();
+        let before = std::fs::read(&receipt.intent_path).unwrap();
+        let held = open_test_lock(&config);
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        let started = Instant::now();
+        append_ack_replay_record(
+            &config,
+            &receipt.intent_id,
+            &receipt.content_sha256,
+            REPLAY_STATUS_REPLAYED,
+            None,
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(std::fs::read(&receipt.intent_path).unwrap(), before);
+        assert_eq!(read_queued_ack_intents(&config).unwrap().len(), 1);
+        drop(held);
+        append_ack_replay_record(
+            &config,
+            &receipt.intent_id,
+            &receipt.content_sha256,
+            REPLAY_STATUS_REPLAYED,
+            None,
+        );
+        assert!(read_queued_ack_intents(&config).unwrap().is_empty());
+    }
+
+    #[test]
+    fn distinct_journal_locks_do_not_block_each_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let held = open_test_lock(&config);
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        write_release_intent_fixture(&config, 1, Value::Null, json!([42]));
+        assert_eq!(read_queued_release_intents(&config).unwrap().len(), 1);
+        assert!(!log_path(&config, ACK_INTENT_LOG_FILE).exists());
+    }
+
+    #[test]
+    fn oversized_append_is_refused_before_creating_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let record = Value::String("x".repeat(MAX_INTENT_RECORD_BYTES));
+        let error = append_jsonl(
+            &config,
+            ACK_INTENT_LOG_FILE,
+            ACK_INTENT_LOCK_FILE,
+            &record,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!tmp.path().join(DEGRADED_INTENTS_DIR).exists());
+    }
+
+    #[test]
+    fn streaming_accumulator_releases_completed_payloads_immediately() {
+        use std::sync::Arc;
+
+        let payload = Arc::new(vec![0_u8; 4096]);
+        let mut outstanding = OutstandingIntents::new();
+        for index in 0..10_000 {
+            let key = ("prefix".to_string(), index.to_string());
+            outstanding.insert(key.clone(), Arc::clone(&payload)).unwrap();
+            assert_eq!(Arc::strong_count(&payload), 2);
+            outstanding.complete(key);
+            assert_eq!(Arc::strong_count(&payload), 1);
+            assert!(outstanding.pending.is_empty());
+        }
+        assert_eq!(outstanding.terminal.len(), 10_000);
+        assert!(outstanding.into_intents().is_empty());
+    }
+
+    #[test]
+    fn streaming_accumulator_preserves_original_order_and_first_payload() {
+        let a = ("prefix".into(), "a".into());
+        let b = ("prefix".into(), "b".into());
+        let c = ("prefix".into(), "c".into());
+        let mut outstanding = OutstandingIntents::new();
+        outstanding.insert(c.clone(), 3).unwrap();
+        outstanding.insert(a.clone(), 1).unwrap();
+        outstanding.insert(c, 999).unwrap();
+        outstanding.complete(a);
+        outstanding.insert(b, 2).unwrap();
+        assert_eq!(outstanding.into_intents(), vec![3, 2]);
+    }
+
+    #[test]
+    fn streaming_accumulator_terminal_markers_cannot_be_undone() {
+        let key = ("prefix".into(), "hash".into());
+        let mut outstanding = OutstandingIntents::new();
+        outstanding.complete(key.clone());
+        outstanding.insert(key.clone(), "late original").unwrap();
+        outstanding.complete(key.clone());
+        outstanding.insert(key, "duplicate").unwrap();
+        assert!(outstanding.into_intents().is_empty());
+    }
+
+    #[test]
+    fn streaming_accumulator_keeps_full_hash_identity() {
+        let first = ("same-prefix".into(), "full-hash-one".into());
+        let second = ("same-prefix".into(), "full-hash-two".into());
+        let mut outstanding = OutstandingIntents::new();
+        outstanding.insert(first.clone(), 1).unwrap();
+        outstanding.insert(second, 2).unwrap();
+        outstanding.complete(first);
+        assert_eq!(outstanding.into_intents(), vec![2]);
+    }
+
+    #[test]
+    fn streaming_accumulator_overflow_fails_without_reordering() {
+        let mut outstanding = OutstandingIntents::new();
+        outstanding.next_order = u64::MAX - 1;
+        outstanding.insert(("prefix".into(), "first".into()), 1).unwrap();
+        let error = outstanding
+            .insert(("prefix".into(), "second".into()), 2)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(outstanding.into_intents(), vec![1]);
+    }
+
+    #[test]
+    fn ack_replay_marker_before_intent_still_clears_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let receipt = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").unwrap();
+        append_ack_replay_record(
+            &config,
+            &receipt.intent_id,
+            &receipt.content_sha256,
+            REPLAY_STATUS_REPLAYED,
+            None,
+        );
+        let records = std::fs::read_to_string(&receipt.intent_path).unwrap();
+        let lines: Vec<_> = records.lines().collect();
+        assert_eq!(lines.len(), 2);
+        // Model imported/duplicated journal history, not a new acknowledgment.
+        std::fs::write(
+            &receipt.intent_path,
+            format!("{}\n{}\n{}\n", lines[1], lines[0], lines[0]),
+        )
+        .unwrap();
+        append_ack_replay_record(
+            &config,
+            &receipt.intent_id,
+            &receipt.content_sha256,
+            REPLAY_STATUS_FAILED,
+            Some("stale failed retry"),
+        );
+        assert!(read_queued_ack_intents(&config).unwrap().is_empty());
+    }
+
+    #[test]
+    fn valid_marker_for_different_full_hash_does_not_clear_intent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let receipt = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").unwrap();
+        let mut other_hash = receipt.content_sha256.clone();
+        let replacement = if other_hash.ends_with('0') { "1" } else { "0" };
+        other_hash.replace_range(63..64, replacement);
+        assert!(other_hash.starts_with(&receipt.intent_id));
+        append_ack_replay_record(
+            &config,
+            &receipt.intent_id,
+            &other_hash,
+            REPLAY_STATUS_REPLAYED,
+            None,
+        );
+        let queued = read_queued_ack_intents(&config).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].content_sha256, receipt.content_sha256);
+    }
+
+    #[test]
+    fn malformed_terminal_marker_cannot_discard_pending_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let receipt = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").unwrap();
+        append_jsonl(
+            &config,
+            ACK_INTENT_LOG_FILE,
+            ACK_INTENT_LOCK_FILE,
+            &json!({
+                "kind": ACK_INTENT_REPLAY_KIND,
+                "schema_version": ACK_INTENT_SCHEMA_VERSION,
+                "intent_id": receipt.intent_id,
+                "intent_content_sha256": receipt.content_sha256,
+                "content_sha256": "0".repeat(64),
+                "replayed_ts": 1,
+                "status": REPLAY_STATUS_REPLAYED,
+                "error_detail": null,
+            }),
+        )
+        .unwrap();
+        assert_eq!(read_queued_ack_intents(&config).unwrap().len(), 1);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn streaming_accumulator_matches_reference(
+            history in proptest::collection::vec((0_u8..4, 0_u8..16), 0..256)
+        ) {
+            let terminal: HashSet<_> = history
+                .iter()
+                .filter_map(|(kind, id)| matches!(*kind, 1 | 2).then_some(*id))
+                .collect();
+            let mut seen = HashSet::new();
+            let expected: Vec<_> = history
+                .iter()
+                .filter_map(|(kind, id)| {
+                    (*kind == 0 && seen.insert(*id) && !terminal.contains(id)).then_some(*id)
+                })
+                .collect();
+            let mut outstanding = OutstandingIntents::new();
+            for (kind, id) in history {
+                let key = ("shared-prefix".to_string(), id.to_string());
+                match kind {
+                    0 => outstanding.insert(key, id).unwrap(),
+                    1 | 2 => outstanding.complete(key),
+                    _ => {} // Failed markers never clear or resurrect work.
+                }
+            }
+            proptest::prop_assert_eq!(outstanding.into_intents(), expected);
+        }
     }
 }
