@@ -60,7 +60,8 @@ impl MemoryPressure {
 pub struct MemorySample {
     /// Resident Set Size in bytes (physical RAM used by this process).
     pub rss_bytes: Option<u64>,
-    /// Classified pressure level based on config thresholds.
+    /// Classified pressure level based on config thresholds. After a failed
+    /// `sample_and_record`, this retains the last successfully recorded level.
     pub pressure: MemoryPressure,
     /// Best-effort error if RSS could not be read.
     pub error: Option<String>,
@@ -232,26 +233,33 @@ fn now_unix_micros_u64() -> u64 {
 }
 
 /// Sample memory and update global system metrics gauges.
+///
+/// A failed probe is not evidence of recovery: retain the last successful RSS,
+/// pressure, and timestamp, and return that pressure alongside the error.
+/// Leaving the timestamp unchanged also lets admission control identify stale
+/// pressure instead of treating repeated failures as fresh measurements.
 #[must_use]
 pub fn sample_and_record(config: &Config) -> MemorySample {
     let sample = sample_memory(config);
-    let metrics = crate::global_metrics();
+    record_sample(sample, &crate::global_metrics().system, now_unix_micros_u64())
+}
 
-    if let Some(rss) = sample.rss_bytes {
-        metrics.system.memory_rss_bytes.set(rss);
+fn record_sample(
+    mut sample: MemorySample,
+    metrics: &crate::metrics::SystemMetrics,
+    sampled_at_us: u64,
+) -> MemorySample {
+    match (sample.rss_bytes, sample.error.as_ref()) {
+        (Some(rss), None) => {
+            metrics.memory_rss_bytes.set(rss);
+            metrics.memory_pressure_level.set(sample.pressure.as_u64());
+            metrics.memory_last_sample_us.set(sampled_at_us);
+        }
+        _ => {
+            metrics.memory_sample_errors_total.add(1);
+            sample.pressure = MemoryPressure::from_u64(metrics.memory_pressure_level.load());
+        }
     }
-    metrics
-        .system
-        .memory_pressure_level
-        .set(sample.pressure.as_u64());
-    metrics
-        .system
-        .memory_last_sample_us
-        .set(now_unix_micros_u64());
-    if sample.error.is_some() {
-        metrics.system.memory_sample_errors_total.add(1);
-    }
-
     sample
 }
 
@@ -505,29 +513,134 @@ mod tests {
     }
 
     #[test]
-    fn sample_and_record_updates_memory_metrics() {
-        let config = Config::default();
-        let metrics = crate::global_metrics();
-        metrics.system.memory_rss_bytes.set(0);
-        metrics.system.memory_pressure_level.set(0);
-        metrics.system.memory_last_sample_us.set(0);
-        metrics.system.memory_sample_errors_total.store(0);
-
-        let sample = sample_and_record(&config);
-
-        assert_eq!(
-            metrics.system.memory_pressure_level.load(),
-            sample.pressure.as_u64()
+    fn record_sample_updates_memory_metrics() {
+        let metrics = crate::metrics::SystemMetrics::default();
+        let sample = record_sample(
+            MemorySample {
+                rss_bytes: Some(3000 * MIB),
+                pressure: MemoryPressure::Warning,
+                error: None,
+            },
+            &metrics,
+            123_456,
         );
-        assert!(metrics.system.memory_last_sample_us.load() > 0);
 
-        if let Some(rss) = sample.rss_bytes {
-            assert_eq!(metrics.system.memory_rss_bytes.load(), rss);
-            assert_eq!(metrics.system.memory_sample_errors_total.load(), 0);
-        } else {
-            assert_eq!(metrics.system.memory_rss_bytes.load(), 0);
-            assert_eq!(metrics.system.memory_sample_errors_total.load(), 1);
-            assert!(sample.error.is_some());
+        assert_eq!(sample.rss_bytes, Some(3000 * MIB));
+        assert_eq!(sample.pressure, MemoryPressure::Warning);
+        assert!(sample.error.is_none());
+        assert_eq!(metrics.memory_rss_bytes.load(), 3000 * MIB);
+        assert_eq!(metrics.memory_pressure_level.load(), 1);
+        assert_eq!(metrics.memory_last_sample_us.load(), 123_456);
+        assert_eq!(metrics.memory_sample_errors_total.load(), 0);
+    }
+
+    fn failed_sample() -> MemorySample {
+        MemorySample {
+            rss_bytes: None,
+            pressure: MemoryPressure::Ok,
+            error: Some("RSS probe failed".to_string()),
         }
+    }
+
+    #[test]
+    fn failed_sample_preserves_each_pressure_level_and_last_success_time() {
+        for pressure in [
+            MemoryPressure::Ok,
+            MemoryPressure::Warning,
+            MemoryPressure::Critical,
+            MemoryPressure::Fatal,
+        ] {
+            let metrics = crate::metrics::SystemMetrics::default();
+            metrics.memory_rss_bytes.set(9000 * MIB);
+            metrics.memory_pressure_level.set(pressure.as_u64());
+            metrics.memory_last_sample_us.set(123_456);
+
+            let sample = record_sample(failed_sample(), &metrics, 999_999);
+
+            assert_eq!(sample.pressure, pressure);
+            assert!(sample.rss_bytes.is_none());
+            assert_eq!(sample.error.as_deref(), Some("RSS probe failed"));
+            assert_eq!(metrics.memory_rss_bytes.load(), 9000 * MIB);
+            assert_eq!(metrics.memory_pressure_level.load(), pressure.as_u64());
+            assert_eq!(metrics.memory_last_sample_us.load(), 123_456);
+            assert_eq!(metrics.memory_sample_errors_total.load(), 1);
+        }
+    }
+
+    #[test]
+    fn repeated_failures_do_not_keep_old_pressure_fresh() {
+        let metrics = crate::metrics::SystemMetrics::default();
+        metrics.memory_rss_bytes.set(9000 * MIB);
+        metrics.memory_pressure_level.set(MemoryPressure::Fatal.as_u64());
+        metrics.memory_last_sample_us.set(1_000_000);
+
+        for attempt in 1..=5 {
+            let sample = record_sample(failed_sample(), &metrics, attempt * 60_000_000);
+            assert_eq!(sample.pressure, MemoryPressure::Fatal);
+            assert_eq!(metrics.memory_last_sample_us.load(), 1_000_000);
+            assert_eq!(metrics.memory_sample_errors_total.load(), attempt);
+        }
+        assert_eq!(metrics.memory_rss_bytes.load(), 9000 * MIB);
+        assert_eq!(metrics.memory_pressure_level.load(), 3);
+    }
+
+    #[test]
+    fn successful_sample_records_recovery_after_probe_failure() {
+        let metrics = crate::metrics::SystemMetrics::default();
+        metrics.memory_pressure_level.set(MemoryPressure::Fatal.as_u64());
+        metrics.memory_last_sample_us.set(1);
+        let _ = record_sample(failed_sample(), &metrics, 2);
+
+        let sample = record_sample(
+            MemorySample {
+                rss_bytes: Some(500 * MIB),
+                pressure: MemoryPressure::Ok,
+                error: None,
+            },
+            &metrics,
+            3,
+        );
+
+        assert_eq!(sample.pressure, MemoryPressure::Ok);
+        assert!(sample.error.is_none());
+        assert_eq!(metrics.memory_rss_bytes.load(), 500 * MIB);
+        assert_eq!(metrics.memory_pressure_level.load(), 0);
+        assert_eq!(metrics.memory_last_sample_us.load(), 3);
+        assert_eq!(metrics.memory_sample_errors_total.load(), 1);
+    }
+
+    #[test]
+    fn failure_before_first_sample_does_not_fabricate_a_measurement() {
+        let metrics = crate::metrics::SystemMetrics::default();
+        for attempt in 1..=3 {
+            let sample = record_sample(failed_sample(), &metrics, attempt * 60_000_000);
+            assert!(sample.rss_bytes.is_none());
+            assert!(sample.error.is_some());
+            assert_eq!(sample.pressure, MemoryPressure::Ok);
+            assert_eq!(metrics.memory_last_sample_us.load(), 0);
+            assert_eq!(metrics.memory_sample_errors_total.load(), attempt);
+        }
+        assert_eq!(metrics.memory_rss_bytes.load(), 0);
+        assert_eq!(metrics.memory_pressure_level.load(), 0);
+    }
+
+    #[test]
+    fn successful_zero_rss_is_not_a_probe_failure() {
+        let metrics = crate::metrics::SystemMetrics::default();
+        metrics.memory_pressure_level.set(MemoryPressure::Fatal.as_u64());
+        let sample = record_sample(
+            MemorySample {
+                rss_bytes: Some(0),
+                pressure: MemoryPressure::Ok,
+                error: None,
+            },
+            &metrics,
+            123_456,
+        );
+        assert_eq!(sample.rss_bytes, Some(0));
+        assert!(sample.error.is_none());
+        assert_eq!(metrics.memory_pressure_level.load(), 0);
+        assert_eq!(metrics.memory_last_sample_us.load(), 123_456);
+        assert_eq!(metrics.memory_sample_errors_total.load(), 0);
     }
 }
