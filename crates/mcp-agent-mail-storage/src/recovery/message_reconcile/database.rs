@@ -581,7 +581,10 @@ impl CommittedMessages {
         };
         let relative = crate::rel_path_cached(&archive.canonical_repo_root, path)
             .map_err(|error| error.to_string())?;
-        let tree = self.repo.find_tree(tree_id).map_err(|error| error.to_string())?;
+        let tree = self
+            .repo
+            .find_tree(tree_id)
+            .map_err(|error| error.to_string())?;
         let entry = match tree.get_path(std::path::Path::new(&relative)) {
             Ok(entry) => entry,
             Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(None),
@@ -593,11 +596,16 @@ impl CommittedMessages {
             return Err("committed message is not a regular-file blob".to_string());
         }
         let odb = self.repo.odb().map_err(|error| error.to_string())?;
-        let (size, kind) = odb.read_header(entry.id()).map_err(|error| error.to_string())?;
+        let (size, kind) = odb
+            .read_header(entry.id())
+            .map_err(|error| error.to_string())?;
         if kind != git2::ObjectType::Blob || size > super::MAX_MESSAGE_ARTIFACT_BYTES {
             return Err("committed message exceeds the archive recovery byte bound".to_string());
         }
-        let blob = self.repo.find_blob(entry.id()).map_err(|error| error.to_string())?;
+        let blob = self
+            .repo
+            .find_blob(entry.id())
+            .map_err(|error| error.to_string())?;
         let actual_id = git2::Oid::hash_object_ext(
             git2::ObjectType::Blob,
             blob.content(),
@@ -958,8 +966,15 @@ mod tests {
         let tree = repo.find_tree(id).unwrap();
         let signature = git2::Signature::now("reconcile-test", "reconcile@test.invalid").unwrap();
         let parents: Vec<_> = parent.iter().collect();
-        repo.commit(Some("HEAD"), &signature, &signature, "surviving mail", &tree, &parents)
-            .unwrap()
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "surviving mail",
+            &tree,
+            &parents,
+        )
+        .unwrap()
     }
 
     fn git_fixture() -> (tempfile::TempDir, Config, PreparedMessage, ProjectArchive) {
@@ -977,18 +992,29 @@ mod tests {
     fn committed_inbox_only_restores_all_copies_and_is_idempotent() {
         let (_temp, config, original, archive) = git_fixture();
         let paths = crate::message_paths_for_bundle(
-            &archive, &original.message, &original.sender, &original.recipients,
-        ).unwrap().0;
+            &archive,
+            &original.message,
+            &original.sender,
+            &original.recipients,
+        )
+        .unwrap()
+        .0;
         let mut full = original.message.clone();
         full["reply_to"] = json!(7);
         full["future_metadata"] = json!({"opaque": ["keep", 42]});
         let redacted = crate::redact_message_bcc_for_inbox(&full);
         let source = commit_survivors(
             &archive,
-            &[(paths.inbox[0].as_path(), &redacted), (paths.inbox[1].as_path(), &redacted)],
+            &[
+                (paths.inbox[0].as_path(), &redacted),
+                (paths.inbox[1].as_path(), &redacted),
+            ],
             &original.body,
         );
-        for path in [&paths.canonical, &paths.outbox].into_iter().chain(paths.inbox.iter()) {
+        for path in [&paths.canonical, &paths.outbox]
+            .into_iter()
+            .chain(paths.inbox.iter())
+        {
             assert!(!path.exists());
         }
         let result = reconcile_prepared(&config, &original).unwrap();
@@ -1008,7 +1034,10 @@ mod tests {
         let repo = git2::Repository::open(&archive.repo_root).unwrap();
         assert!(repo.find_commit(source).is_ok());
         let head = repo.head().unwrap().target().unwrap();
-        assert_eq!(reconcile_prepared(&config, &original).unwrap(), ReconcileResult::default());
+        assert_eq!(
+            reconcile_prepared(&config, &original).unwrap(),
+            ReconcileResult::default()
+        );
         assert_eq!(repo.head().unwrap().target().unwrap(), head);
     }
 
@@ -1016,19 +1045,30 @@ mod tests {
     fn conflicting_committed_full_copies_are_not_silently_selected() {
         let (_temp, config, original, archive) = git_fixture();
         let paths = crate::message_paths_for_bundle(
-            &archive, &original.message, &original.sender, &original.recipients,
-        ).unwrap().0;
+            &archive,
+            &original.message,
+            &original.sender,
+            &original.recipients,
+        )
+        .unwrap()
+        .0;
         let mut first = original.message.clone();
         first["reply_to"] = json!(7);
         let mut second = first.clone();
         second["reply_to"] = json!(8);
         let head = commit_survivors(
             &archive,
-            &[(paths.canonical.as_path(), &first), (paths.outbox.as_path(), &second)],
+            &[
+                (paths.canonical.as_path(), &first),
+                (paths.outbox.as_path(), &second),
+            ],
             &original.body,
         );
         let error = reconcile_prepared(&config, &original).unwrap_err();
-        assert!(error.contains("committed canonical and outbox metadata disagree"), "{error}");
+        assert!(
+            error.contains("committed canonical and outbox metadata disagree"),
+            "{error}"
+        );
         let repo = git2::Repository::open(&archive.repo_root).unwrap();
         assert_eq!(repo.head().unwrap().target().unwrap(), head);
         assert!(!paths.canonical.exists());
@@ -1039,22 +1079,36 @@ mod tests {
     fn conflicting_committed_inbox_parents_preserve_head_and_worktree() {
         let (_temp, config, original, archive) = git_fixture();
         let paths = crate::message_paths_for_bundle(
-            &archive, &original.message, &original.sender, &original.recipients,
-        ).unwrap().0;
+            &archive,
+            &original.message,
+            &original.sender,
+            &original.recipients,
+        )
+        .unwrap()
+        .0;
         let mut first = crate::redact_message_bcc_for_inbox(&original.message);
         first["reply_to"] = json!(7);
         let mut second = first.clone();
         second["reply_to"] = json!(8);
         let head = commit_survivors(
             &archive,
-            &[(paths.inbox[0].as_path(), &first), (paths.inbox[1].as_path(), &second)],
+            &[
+                (paths.inbox[0].as_path(), &first),
+                (paths.inbox[1].as_path(), &second),
+            ],
             &original.body,
         );
         let error = reconcile_prepared(&config, &original).unwrap_err();
-        assert!(error.contains("committed inbox metadata disagree"), "{error}");
+        assert!(
+            error.contains("committed inbox metadata disagree"),
+            "{error}"
+        );
         let repo = git2::Repository::open(&archive.repo_root).unwrap();
         assert_eq!(repo.head().unwrap().target().unwrap(), head);
-        for path in [&paths.canonical, &paths.outbox].into_iter().chain(paths.inbox.iter()) {
+        for path in [&paths.canonical, &paths.outbox]
+            .into_iter()
+            .chain(paths.inbox.iter())
+        {
             assert!(!path.exists());
         }
     }
@@ -1064,17 +1118,30 @@ mod tests {
         for wrong_body in [false, true] {
             let (_temp, config, original, archive) = git_fixture();
             let paths = crate::message_paths_for_bundle(
-                &archive, &original.message, &original.sender, &original.recipients,
-            ).unwrap().0;
+                &archive,
+                &original.message,
+                &original.sender,
+                &original.recipients,
+            )
+            .unwrap()
+            .0;
             let mut message = crate::redact_message_bcc_for_inbox(&original.message);
             message["reply_to"] = json!(7);
             if !wrong_body {
                 message["bcc"] = json!(["RedFox"]);
             }
-            let body = if wrong_body { "different" } else { &original.body };
+            let body = if wrong_body {
+                "different"
+            } else {
+                &original.body
+            };
             let head = commit_survivors(&archive, &[(paths.inbox[0].as_path(), &message)], body);
             let error = reconcile_prepared(&config, &original).unwrap_err();
-            let expected = if wrong_body { "body conflicts" } else { "BCC redaction" };
+            let expected = if wrong_body {
+                "body conflicts"
+            } else {
+                "BCC redaction"
+            };
             assert!(error.contains(expected), "{error}");
             let repo = git2::Repository::open(&archive.repo_root).unwrap();
             assert_eq!(repo.head().unwrap().target().unwrap(), head);
@@ -1086,31 +1153,68 @@ mod tests {
     fn committed_message_snapshot_does_not_follow_head_advancement() {
         let (_temp, _config, original, archive) = git_fixture();
         let paths = crate::message_paths_for_bundle(
-            &archive, &original.message, &original.sender, &original.recipients,
-        ).unwrap().0;
+            &archive,
+            &original.message,
+            &original.sender,
+            &original.recipients,
+        )
+        .unwrap()
+        .0;
         let mut first = crate::redact_message_bcc_for_inbox(&original.message);
         first["reply_to"] = json!(7);
-        commit_survivors(&archive, &[(paths.inbox[0].as_path(), &first)], &original.body);
+        commit_survivors(
+            &archive,
+            &[(paths.inbox[0].as_path(), &first)],
+            &original.body,
+        );
         let snapshot = CommittedMessages::open(&archive).unwrap();
         let mut second = first.clone();
         second["reply_to"] = json!(8);
-        commit_survivors(&archive, &[(paths.inbox[0].as_path(), &second)], &original.body);
+        commit_survivors(
+            &archive,
+            &[(paths.inbox[0].as_path(), &second)],
+            &original.body,
+        );
         let (observed, _) = snapshot.read(&archive, &paths.inbox[0]).unwrap().unwrap();
         assert_eq!(observed, first);
         let (observed, _) = CommittedMessages::open(&archive)
-            .unwrap().read(&archive, &paths.inbox[0]).unwrap().unwrap();
+            .unwrap()
+            .read(&archive, &paths.inbox[0])
+            .unwrap()
+            .unwrap();
         assert_eq!(observed, second);
     }
 
     #[test]
     fn payload_admission_distinguishes_fresh_batch_from_impossible_payload() {
-        assert_eq!(payload_admission(0, MAX_BATCH_PAYLOAD_BYTES), PayloadAdmission::Fits);
-        assert_eq!(payload_admission(1, MAX_BATCH_PAYLOAD_BYTES), PayloadAdmission::NextBatch);
-        assert_eq!(payload_admission(0, MAX_BATCH_PAYLOAD_BYTES + 1), PayloadAdmission::Oversized);
-        assert_eq!(payload_admission(MAX_BATCH_PAYLOAD_BYTES, 1), PayloadAdmission::NextBatch);
-        assert_eq!(payload_admission(usize::MAX, usize::MAX), PayloadAdmission::Oversized);
-        assert_eq!(payload_admission(usize::MAX, 1), PayloadAdmission::NextBatch);
-        assert_eq!(payload_admission(MAX_BATCH_PAYLOAD_BYTES - 1, 1), PayloadAdmission::Fits);
+        assert_eq!(
+            payload_admission(0, MAX_BATCH_PAYLOAD_BYTES),
+            PayloadAdmission::Fits
+        );
+        assert_eq!(
+            payload_admission(1, MAX_BATCH_PAYLOAD_BYTES),
+            PayloadAdmission::NextBatch
+        );
+        assert_eq!(
+            payload_admission(0, MAX_BATCH_PAYLOAD_BYTES + 1),
+            PayloadAdmission::Oversized
+        );
+        assert_eq!(
+            payload_admission(MAX_BATCH_PAYLOAD_BYTES, 1),
+            PayloadAdmission::NextBatch
+        );
+        assert_eq!(
+            payload_admission(usize::MAX, usize::MAX),
+            PayloadAdmission::Oversized
+        );
+        assert_eq!(
+            payload_admission(usize::MAX, 1),
+            PayloadAdmission::NextBatch
+        );
+        assert_eq!(
+            payload_admission(MAX_BATCH_PAYLOAD_BYTES - 1, 1),
+            PayloadAdmission::Fits
+        );
     }
 
     #[test]
@@ -1119,7 +1223,10 @@ mod tests {
         assert!(subject.len() < usize::try_from(MAX_DB_PAYLOAD_BYTES).unwrap());
         let payload = json!({"subject": subject}).to_string();
         assert!(payload.len() > MAX_BATCH_PAYLOAD_BYTES);
-        assert_eq!(payload_admission(0, payload.len()), PayloadAdmission::Oversized);
+        assert_eq!(
+            payload_admission(0, payload.len()),
+            PayloadAdmission::Oversized
+        );
     }
 
     #[test]
@@ -1134,8 +1241,14 @@ mod tests {
             let ids = interleave_ids(&[tail_next], &[history_next], cursor.next_lane_is_history);
             let (id, tail) = ids[0];
             assert!(seen.insert(id));
-            assert_eq!(payload_admission(0, MAX_BATCH_PAYLOAD_BYTES), PayloadAdmission::Fits);
-            assert_eq!(payload_admission(MAX_BATCH_PAYLOAD_BYTES, 1), PayloadAdmission::NextBatch);
+            assert_eq!(
+                payload_admission(0, MAX_BATCH_PAYLOAD_BYTES),
+                PayloadAdmission::Fits
+            );
+            assert_eq!(
+                payload_admission(MAX_BATCH_PAYLOAD_BYTES, 1),
+                PayloadAdmission::NextBatch
+            );
             // Exactly one item fits. The rejected second item must retain
             // priority across the next selection, not be perpetually second.
             cursor.advance(id, tail);
@@ -1158,8 +1271,14 @@ mod tests {
             interleave_ids(&[10, 11], &[9, 8, 7], true),
             vec![(9, false), (10, true), (8, false), (11, true), (7, false)]
         );
-        assert_eq!(interleave_ids(&[], &[9, 8], false), vec![(9, false), (8, false)]);
-        assert_eq!(interleave_ids(&[10, 11], &[], true), vec![(10, true), (11, true)]);
+        assert_eq!(
+            interleave_ids(&[], &[9, 8], false),
+            vec![(9, false), (8, false)]
+        );
+        assert_eq!(
+            interleave_ids(&[10, 11], &[], true),
+            vec![(10, true), (11, true)]
+        );
         let mut cursor = ReconcileCursor::default();
         let mut processed = HashSet::new();
         for (id, tail) in interleave_ids(&[9], &[9], false) {
@@ -1182,7 +1301,8 @@ mod tests {
                 min_connections: 1,
                 max_connections: 1,
                 ..Default::default()
-            }).unwrap();
+            })
+            .unwrap();
             let cx = Cx::for_testing();
             let conn = outcome(block_on(pool.acquire(&cx))).unwrap();
             conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(101, 'project', '/project', 1)").unwrap();
@@ -1198,7 +1318,10 @@ mod tests {
             // Literal contains no SQL quotes; control characters are stored raw
             // and expand sixfold only when the archive JSON is serialized.
             let subject = "\u{0001}".repeat(3 * 1024 * 1024);
-            conn.execute_raw(&format!("UPDATE messages SET subject = '{subject}' WHERE id = 901")).unwrap();
+            conn.execute_raw(&format!(
+                "UPDATE messages SET subject = '{subject}' WHERE id = 901"
+            ))
+            .unwrap();
             drop(conn);
             std::fs::create_dir_all(pool.storage_root()).unwrap();
             let config = Config {
@@ -1213,9 +1336,9 @@ mod tests {
                 tail_after: Some(900),
                 ..Default::default()
             };
-            let report = reconcile_message_batch(
-                &cx, &pool, &config, &mut cursor, &AtomicBool::new(false),
-            ).unwrap();
+            let report =
+                reconcile_message_batch(&cx, &pool, &config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap();
             assert_eq!(report.scanned, 2);
             assert_eq!(report.deferred, 1);
             assert_eq!(report.repaired, 1);
@@ -1223,13 +1346,24 @@ mod tests {
             assert!(!report.budget_exhausted);
             assert_eq!(cursor.tail_after, Some(902));
             let conn = outcome(block_on(pool.acquire(&cx))).unwrap();
-            let rows = conn.query_sync("SELECT subject FROM messages WHERE id = 901", &[]).unwrap();
+            let rows = conn
+                .query_sync("SELECT subject FROM messages WHERE id = 901", &[])
+                .unwrap();
             assert_eq!(rows[0].get_named::<String>("subject").unwrap(), subject);
-            let receipts = conn.query_sync(
-                "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 902", &[],
-            ).unwrap();
-            assert_eq!(receipts[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
-            assert_eq!(receipts[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+            let receipts = conn
+                .query_sync(
+                    "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 902",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(
+                receipts[0].get_named::<Option<i64>>("read_ts").unwrap(),
+                None
+            );
+            assert_eq!(
+                receipts[0].get_named::<Option<i64>>("ack_ts").unwrap(),
+                None
+            );
         });
     }
 

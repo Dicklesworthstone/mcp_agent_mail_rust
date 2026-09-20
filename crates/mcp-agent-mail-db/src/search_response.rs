@@ -101,8 +101,12 @@ impl LowercaseText {
         if self.changes.is_empty() {
             return (start, end);
         }
-        let first = self.changes.partition_point(|change| change.lowered_start <= start);
-        let last = self.changes.partition_point(|change| change.lowered_start < end);
+        let first = self
+            .changes
+            .partition_point(|change| change.lowered_start <= start);
+        let last = self
+            .changes
+            .partition_point(|change| change.lowered_start < end);
         let original_start = if first == 0 {
             start
         } else {
@@ -135,7 +139,11 @@ pub fn generate_snippet(text: &str, query_terms: &[String]) -> Option<String> {
 }
 
 /// The character budget excludes the optional leading/trailing ellipses.
-fn generate_snippet_with_limit(text: &str, query_terms: &[String], max_chars: usize) -> Option<String> {
+fn generate_snippet_with_limit(
+    text: &str,
+    query_terms: &[String],
+    max_chars: usize,
+) -> Option<String> {
     if text.is_empty() || query_terms.is_empty() || max_chars == 0 {
         return None;
     }
@@ -203,7 +211,11 @@ fn advance_chars(text: &str, pos: usize, count: usize) -> usize {
 
 /// Find UTF-8 byte ranges in the original text, not its lowercased copy.
 #[must_use]
-pub fn find_highlights(text: &str, field_name: &str, query_terms: &[String]) -> Vec<HighlightRange> {
+pub fn find_highlights(
+    text: &str,
+    field_name: &str,
+    query_terms: &[String],
+) -> Vec<HighlightRange> {
     if text.is_empty() || query_terms.is_empty() {
         return Vec::new();
     }
@@ -350,7 +362,9 @@ fn collect_ranked_page(
     if limit == 0 || offset >= num_docs {
         // Preserve the exact matching count, including for count-only queries
         // and offsets far beyond the index, without allocating a top-K heap.
-        return searcher.search(query, &Count).map(|count| (count, Vec::new()));
+        return searcher
+            .search(query, &Count)
+            .map(|count| (count, Vec::new()));
     }
 
     // Bound offset + limit by the immutable snapshot's size before Tantivy
@@ -874,7 +888,7 @@ mod tests {
 
     #[test]
     fn highlights_map_length_changing_lowercase_to_original() {
-        for prefix in ["İ", "K", "İK", "KİKİ"] {
+        for prefix in ["İ", "\u{212a}", "İ\u{212a}", "\u{212a}İ\u{212a}İ"] {
             let text = format!("{prefix} NEEDLE and NEEDLE");
             let ranges = find_highlights(&text, "body", &["needle".to_string()]);
             assert_eq!(ranges.len(), 2);
@@ -886,7 +900,7 @@ mod tests {
 
     #[test]
     fn highlights_expand_partial_lowercase_match_to_whole_character() {
-        let text = "İ K";
+        let text = "İ \u{212a}";
         let ranges = find_highlights(
             text,
             "body",
@@ -894,7 +908,7 @@ mod tests {
         );
         assert_eq!(ranges.len(), 2);
         assert_eq!(&text[ranges[0].start..ranges[0].end], "İ");
-        assert_eq!(&text[ranges[1].start..ranges[1].end], "K");
+        assert_eq!(&text[ranges[1].start..ranges[1].end], "\u{212a}");
     }
 
     #[test]
@@ -930,7 +944,7 @@ mod tests {
 
     #[test]
     fn snippet_maps_anchor_after_many_lowercase_expansions() {
-        for prefix in ["İ".repeat(500), "K".repeat(500)] {
+        for prefix in ["İ".repeat(500), "\u{212a}".repeat(500)] {
             let text = format!("{prefix} NEEDLE tail");
             let snippet = generate_snippet(&text, &["needle".into()]).unwrap();
             assert!(snippet.contains("NEEDLE"));
@@ -953,13 +967,17 @@ mod tests {
 
     #[test]
     fn snippet_and_highlights_cover_multilingual_matches() {
-        for text in ["İK 猫 犬 鳥", "ΑΒΓ ΣΟΣ needle", "🦀\u{2003}é NEEDLE"] {
+        for text in ["İ\u{212a} 猫 犬 鳥", "ΑΒΓ ΣΟΣ needle", "🦀\u{2003}é NEEDLE"] {
             for term in text.split_whitespace() {
                 let terms = [term.to_string()];
                 let snippet = generate_snippet(text, &terms).unwrap();
                 assert!(snippet.contains(term));
                 let ranges = find_highlights(text, "body", &terms);
-                assert!(ranges.iter().any(|range| &text[range.start..range.end] == term));
+                assert!(
+                    ranges
+                        .iter()
+                        .any(|range| &text[range.start..range.end] == term)
+                );
             }
         }
     }
@@ -968,17 +986,17 @@ mod tests {
     fn lowercase_offset_map_scales_with_width_changes_not_message_length() {
         let text = "Résumé ΣΟΣ 🦀 猫 — ordinary text ".repeat(10_000);
         assert!(LowercaseText::new(&text).changes.is_empty());
-        let mixed = format!("{text}İK{text}");
+        let mixed = format!("{text}İ\u{212a}{text}");
         assert_eq!(LowercaseText::new(&mixed).changes.len(), 2);
     }
 
     #[test]
     fn compact_lowercase_map_matches_dense_reference_at_all_character_boundaries() {
         for text in [
-            "İKẞȺȾ NEEDLE 猫",
+            "İ\u{212a}ẞȺȾ NEEDLE 猫",
             "plain 🦀 É ΟΣ text",
-            "İİKK\u{0307}İK end",
-            "KİKİKİ",
+            "İİ\u{212a}\u{212a}\u{0307}İ\u{212a} end",
+            "\u{212a}İ\u{212a}İ\u{212a}İ",
         ] {
             let lowered = LowercaseText::new(text);
             let mut dense = Vec::new();
@@ -1331,9 +1349,8 @@ mod tests {
             let config = ResponseConfig::default();
             let mut ids = Vec::new();
             for offset in 0..3 {
-                let results = execute_search(
-                    &index, &AllQuery, &handles, &[], 1, offset, true, &config,
-                );
+                let results =
+                    execute_search(&index, &AllQuery, &handles, &[], 1, offset, true, &config);
                 assert_eq!(results.total_count, 3);
                 assert_eq!(results.hits.len(), 1);
                 assert_eq!(results.explain.as_ref().unwrap().hits.len(), 1);
@@ -1368,9 +1385,8 @@ mod tests {
             let config = ResponseConfig::default();
             let mut paged_ids = Vec::new();
             for offset in (0..15).step_by(2) {
-                let results = execute_search(
-                    &index, &AllQuery, &handles, &[], 2, offset, false, &config,
-                );
+                let results =
+                    execute_search(&index, &AllQuery, &handles, &[], 2, offset, false, &config);
                 assert_eq!(results.total_count, 15);
                 paged_ids.extend(results.hits.iter().map(|hit| hit.doc_id));
             }
@@ -1409,9 +1425,8 @@ mod tests {
             let config = ResponseConfig::default();
             let mut ids = Vec::new();
             for offset in 0..3 {
-                let result = execute_search(
-                    &index, &query, &handles, &[], 1, offset, true, &config,
-                );
+                let result =
+                    execute_search(&index, &query, &handles, &[], 1, offset, true, &config);
                 let hit = &result.hits[0];
                 let id = u64::try_from(hit.doc_id).unwrap();
                 assert_eq!(hit.score.to_bits(), expected_scores[&id]);
@@ -1426,7 +1441,14 @@ mod tests {
             let config = ResponseConfig::default();
             for (limit, offset) in [(0, 0), (0, usize::MAX), (10, 3), (1, usize::MAX)] {
                 let result = execute_search(
-                    &index, &AllQuery, &handles, &[], limit, offset, true, &config,
+                    &index,
+                    &AllQuery,
+                    &handles,
+                    &[],
+                    limit,
+                    offset,
+                    true,
+                    &config,
                 );
                 assert_eq!(result.total_count, 3);
                 assert!(result.hits.is_empty());
@@ -1435,7 +1457,14 @@ mod tests {
             let parser = QueryParser::for_index(&index, vec![handles.subject, handles.body]);
             let query = parser.parse_query("migration").unwrap();
             let result = execute_search(
-                &index, &*query, &handles, &[], 0, usize::MAX, false, &config,
+                &index,
+                &*query,
+                &handles,
+                &[],
+                0,
+                usize::MAX,
+                false,
+                &config,
             );
             assert_eq!(result.total_count, 1);
         }
@@ -1446,7 +1475,14 @@ mod tests {
             let config = ResponseConfig::default();
             for (offset, expected) in [(0, vec![3, 2, 1]), (1, vec![2, 1]), (2, vec![1])] {
                 let result = execute_search(
-                    &index, &AllQuery, &handles, &[], usize::MAX, offset, false, &config,
+                    &index,
+                    &AllQuery,
+                    &handles,
+                    &[],
+                    usize::MAX,
+                    offset,
+                    false,
+                    &config,
                 );
                 assert_eq!(result.total_count, 3);
                 let ids: Vec<_> = result.hits.iter().map(|hit| hit.doc_id).collect();
@@ -1477,7 +1513,10 @@ mod tests {
                     doc_id: rank.doc_id,
                 };
                 assert_eq!(rank, equivalent);
-                assert_eq!(rank.partial_cmp(&equivalent), Some(std::cmp::Ordering::Equal));
+                assert_eq!(
+                    rank.partial_cmp(&equivalent),
+                    Some(std::cmp::Ordering::Equal)
+                );
             }
         }
     }

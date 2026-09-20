@@ -250,7 +250,9 @@ fn acquire_intent_lock(file: &std::fs::File, timeout: Duration) -> std::io::Resu
 }
 
 /// Append a single JSON record under an exclusive advisory lock, with private
-/// permissions and `fsync` of file + parent dir. Lock contention is bounded;
+/// permissions and `fsync` of file + parent dir.
+///
+/// Lock contention is bounded;
 /// a timeout is an error, never a receipt claiming the record was queued.
 pub fn append_jsonl(
     config: &Config,
@@ -285,7 +287,9 @@ pub fn append_jsonl(
     }
     let lock_file = lock_options.open(&lock_file_path)?;
     if !lock_file.metadata()?.is_file() {
-        return Err(std::io::Error::other("degraded-intent lock is not a regular file"));
+        return Err(std::io::Error::other(
+            "degraded-intent lock is not a regular file",
+        ));
     }
     #[cfg(unix)]
     {
@@ -309,7 +313,9 @@ pub fn append_jsonl(
     let mut file = options.open(&path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
-        return Err(std::io::Error::other("degraded-intent log is not a regular file"));
+        return Err(std::io::Error::other(
+            "degraded-intent log is not a regular file",
+        ));
     }
     #[cfg(unix)]
     {
@@ -629,7 +635,8 @@ pub fn read_queued_ack_intents(config: &Config) -> std::io::Result<Vec<QueuedAck
                     value.get("intent_id").and_then(Value::as_str),
                     value.get("intent_content_sha256").and_then(Value::as_str),
                 ) {
-                    outstanding.complete((intent_id.to_string(), intent_content_sha256.to_string()));
+                    outstanding
+                        .complete((intent_id.to_string(), intent_content_sha256.to_string()));
                 }
             }
             Some(ACK_INTENT_KIND) => {
@@ -722,7 +729,8 @@ pub fn read_queued_release_intents(
                     value.get("intent_id").and_then(Value::as_str),
                     value.get("intent_content_sha256").and_then(Value::as_str),
                 ) {
-                    outstanding.complete((intent_id.to_string(), intent_content_sha256.to_string()));
+                    outstanding
+                        .complete((intent_id.to_string(), intent_content_sha256.to_string()));
                 }
             }
             Some(RELEASE_INTENT_KIND) => {
@@ -1147,10 +1155,7 @@ mod tests {
     }
 
     fn append_torn_unicode(path: &Path) {
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(path)
-            .unwrap();
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
         file.write_all(b"{\"failure\":\"interrupted \xe2\x82")
             .unwrap();
         file.sync_all().unwrap();
@@ -1166,7 +1171,10 @@ mod tests {
         append_ack_intent(&config, "/p", "BlueLake", 2, "ack", "busy").unwrap();
         let queued = read_queued_ack_intents(&config).unwrap();
         assert_eq!(
-            queued.iter().map(|intent| intent.message_id).collect::<Vec<_>>(),
+            queued
+                .iter()
+                .map(|intent| intent.message_id)
+                .collect::<Vec<_>>(),
             vec![1, 2]
         );
         append_ack_replay_record(
@@ -1337,7 +1345,9 @@ mod tests {
         assert!(!is_lock_contention(&std::io::Error::from(
             std::io::ErrorKind::PermissionDenied
         )));
-        assert!(!is_lock_contention(&std::io::Error::other("not contention")));
+        assert!(!is_lock_contention(&std::io::Error::other(
+            "not contention"
+        )));
     }
 
     #[test]
@@ -1366,8 +1376,7 @@ mod tests {
         let held = open_test_lock(&config);
         fs2::FileExt::lock_exclusive(&held).unwrap();
         let started = Instant::now();
-        let error = append_ack_intent(&config, "/p", "BlueLake", 2, "ack", "busy")
-            .unwrap_err();
+        let error = append_ack_intent(&config, "/p", "BlueLake", 2, "ack", "busy").unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(std::fs::read(&first.intent_path).unwrap(), before);
@@ -1375,7 +1384,10 @@ mod tests {
         append_ack_intent(&config, "/p", "BlueLake", 2, "ack", "busy").unwrap();
         let queued = read_queued_ack_intents(&config).unwrap();
         assert_eq!(
-            queued.iter().map(|intent| intent.message_id).collect::<Vec<_>>(),
+            queued
+                .iter()
+                .map(|intent| intent.message_id)
+                .collect::<Vec<_>>(),
             vec![1, 2]
         );
     }
@@ -1407,7 +1419,7 @@ mod tests {
             REPLAY_STATUS_REPLAYED,
             None,
         );
-        assert!(read_queued_ack_intents(&config).unwrap().is_empty());
+        assert_eq!(read_queued_ack_intents(&config).unwrap(), []);
     }
 
     #[test]
@@ -1426,13 +1438,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = test_config(tmp.path());
         let record = Value::String("x".repeat(MAX_INTENT_RECORD_BYTES));
-        let error = append_jsonl(
-            &config,
-            ACK_INTENT_LOG_FILE,
-            ACK_INTENT_LOCK_FILE,
-            &record,
-        )
-        .unwrap_err();
+        let error =
+            append_jsonl(&config, ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE, &record).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(!tmp.path().join(DEGRADED_INTENTS_DIR).exists());
     }
@@ -1445,14 +1452,16 @@ mod tests {
         let mut outstanding = OutstandingIntents::new();
         for index in 0..10_000 {
             let key = ("prefix".to_string(), index.to_string());
-            outstanding.insert(key.clone(), Arc::clone(&payload)).unwrap();
+            outstanding
+                .insert(key.clone(), Arc::clone(&payload))
+                .unwrap();
             assert_eq!(Arc::strong_count(&payload), 2);
             outstanding.complete(key);
             assert_eq!(Arc::strong_count(&payload), 1);
             assert!(outstanding.pending.is_empty());
         }
         assert_eq!(outstanding.terminal.len(), 10_000);
-        assert!(outstanding.into_intents().is_empty());
+        assert_eq!(outstanding.into_intents(), []);
     }
 
     #[test]
@@ -1477,7 +1486,7 @@ mod tests {
         outstanding.insert(key.clone(), "late original").unwrap();
         outstanding.complete(key.clone());
         outstanding.insert(key, "duplicate").unwrap();
-        assert!(outstanding.into_intents().is_empty());
+        assert_eq!(outstanding.into_intents(), [] as [&str; 0]);
     }
 
     #[test]
@@ -1495,7 +1504,9 @@ mod tests {
     fn streaming_accumulator_overflow_fails_without_reordering() {
         let mut outstanding = OutstandingIntents::new();
         outstanding.next_order = u64::MAX - 1;
-        outstanding.insert(("prefix".into(), "first".into()), 1).unwrap();
+        outstanding
+            .insert(("prefix".into(), "first".into()), 1)
+            .unwrap();
         let error = outstanding
             .insert(("prefix".into(), "second".into()), 2)
             .unwrap_err();
@@ -1531,7 +1542,7 @@ mod tests {
             REPLAY_STATUS_FAILED,
             Some("stale failed retry"),
         );
-        assert!(read_queued_ack_intents(&config).unwrap().is_empty());
+        assert_eq!(read_queued_ack_intents(&config).unwrap(), []);
     }
 
     #[test]
