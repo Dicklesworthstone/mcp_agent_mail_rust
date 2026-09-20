@@ -10092,10 +10092,23 @@ fn sqlite_live_read_path_is_healthy(
     path: &Path,
     canonical_unavailable: SqlError,
 ) -> Result<bool, SqlError> {
-    let conn = crate::guard_db_conn(
-        open_guarded_read_only_franken_existing_file(path, "live read-only health probe")?,
-        "live read-only health probe",
-    );
+    let conn =
+        match open_guarded_read_only_franken_existing_file(path, "live read-only health probe") {
+            Ok(conn) => crate::guard_db_conn(conn, "live read-only health probe"),
+            Err(SqlError::Io(error))
+                if error.get_ref().is_some_and(
+                    <dyn std::error::Error + Send + Sync>::is::<AdmittedSqliteHeaderTruncation>,
+                ) =>
+            {
+                // This is the bound preflight's metadata-length observation, not
+                // an unconfirmed engine integrity verdict. Propagating it as an
+                // environmental refusal prevents recovery from restoring a valid
+                // backup. All other admission/open failures still fail closed.
+                note_conclusive_unhealthy_reason(path, error.to_string());
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
     for kind in [
         integrity::CheckKind::Quick,
         integrity::CheckKind::Incremental,
@@ -12691,6 +12704,16 @@ fn acquire_guarded_read_only_namespace_binding(
     Ok(binding)
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{context}: refusing live read-only FrankenSQLite open for {path} because the admitted target has a truncated SQLite database header ({bytes} bytes)"
+)]
+struct AdmittedSqliteHeaderTruncation {
+    context: String,
+    path: String,
+    bytes: u64,
+}
+
 /// File-descriptor-neutral preflight for a live, Franken-admitted database.
 ///
 /// Never open the main inode here. On Unix, closing any independently opened
@@ -12710,17 +12733,6 @@ fn preflight_bound_live_franken_family(stable_path: &Path, context: &str) -> Res
         return Err(SqlError::Custom(format!(
             "{context}: refusing live read-only FrankenSQLite open for {} because the admitted target is not a regular file",
             stable_path.display()
-        )));
-    }
-    if metadata.len() < u64::try_from(SQLITE_DATABASE_HEADER_BYTES).unwrap_or(u64::MAX) {
-        // Same wording as the canonical precheck so the corruption classifier
-        // treats both the same way: a main file shorter than the 100-byte
-        // header is not a salvageable image, and archive recovery may degrade
-        // to an archive-only rebuild instead of refusing.
-        return Err(SqlError::Custom(format!(
-            "{context}: refusing live read-only FrankenSQLite open for {} because the admitted target has a truncated SQLite database header ({} bytes)",
-            stable_path.display(),
-            metadata.len()
         )));
     }
     #[cfg(unix)]
@@ -12817,6 +12829,20 @@ fn preflight_bound_live_franken_family(stable_path: &Path, context: &str) -> Res
         return Err(SqlError::Custom(format!(
             "{context}: refusing live read-only FrankenSQLite open for {} because {reason}",
             stable_path.display()
+        )));
+    }
+
+    if metadata.len() < u64::try_from(SQLITE_DATABASE_HEADER_BYTES).unwrap_or(u64::MAX) {
+        // Only expose a recoverable corruption verdict after every authority
+        // and family admission check has passed. Truncation must not mask an
+        // alias, nonclean breaker, or unsafe sidecar refusal.
+        return Err(SqlError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            AdmittedSqliteHeaderTruncation {
+                context: context.to_string(),
+                path: stable_path.display().to_string(),
+                bytes: metadata.len(),
+            },
         )));
     }
 
@@ -29012,6 +29038,65 @@ mod tests {
         same_file::Handle::from_path(path).expect("retain primary file identity")
     }
 
+    #[test]
+    fn live_health_fallback_reports_truncated_header_without_mutating_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw("CREATE TABLE admitted_marker (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        crate::close_db_conn(conn, "seed admitted namespace before truncation");
+        let bytes = b"corrupted-data";
+        std::fs::write(&primary, bytes).unwrap();
+        let identity_before = primary_identity(&primary);
+        assert!(
+            !sqlite_live_read_path_is_healthy(
+                &primary,
+                SqlError::Custom("database is locked".to_string()),
+            )
+            .unwrap()
+        );
+        let reason = take_last_unhealthy_reason(&primary).unwrap();
+        assert!(reason.conclusive);
+        assert!(reason.detail.contains("truncated SQLite database header"));
+        assert_eq!(std::fs::read(&primary).unwrap(), bytes);
+        assert_eq!(primary_identity(&primary), identity_before);
+        #[cfg(unix)]
+        {
+            std::fs::hard_link(&primary, dir.path().join("alias.sqlite3")).unwrap();
+            assert!(
+                sqlite_live_read_path_is_healthy(
+                    &primary,
+                    SqlError::Custom("database is locked".to_string()),
+                )
+                .is_err(),
+                "truncation must not bypass hard-link admission"
+            );
+            assert!(take_last_unhealthy_reason(&primary).is_none());
+        }
+    }
+
+    #[test]
+    fn live_health_fallback_preserves_path_admission_refusals() {
+        let dir = tempfile::tempdir().unwrap();
+        for primary in [
+            dir.path().to_path_buf(),
+            dir.path().join("missing.sqlite3"),
+            dir.path()
+                .join("admitted target has a truncated SQLite database header"),
+        ] {
+            assert!(
+                sqlite_live_read_path_is_healthy(
+                    &primary,
+                    SqlError::Custom("database is locked".to_string()),
+                )
+                .is_err()
+            );
+            assert!(take_last_unhealthy_reason(&primary).is_none());
+        }
+        assert!(!dir.path().join("missing.sqlite3").exists());
+    }
+
     /// GH#284: an archive that is a couple of messages ahead of a healthy
     /// primary is applied in place; the primary file is not replaced by a
     /// reconstructed candidate.
@@ -29070,9 +29155,14 @@ mod tests {
             }
             let project = storage_root.join("projects/project-only");
             std::fs::create_dir_all(&project).unwrap();
+            let human_key = dir.path().canonicalize().unwrap().join("project-only");
             std::fs::write(
                 project.join("project.json"),
-                r#"{"slug":"project-only","human_key":"/project-only"}"#,
+                serde_json::to_vec(&serde_json::json!({
+                    "slug": "project-only",
+                    "human_key": human_key,
+                }))
+                .unwrap(),
             )
             .unwrap();
             let identity_before = primary_identity(&primary);
@@ -29093,7 +29183,7 @@ mod tests {
             assert_eq!(rows.len(), 1);
             assert_eq!(
                 rows[0].get_named::<String>("human_key").unwrap(),
-                "/project-only"
+                human_key.to_string_lossy()
             );
             crate::close_db_conn(conn, "verify incremental project recovery");
             assert!(!has_pending_archive_drift(&primary));
@@ -29114,7 +29204,11 @@ mod tests {
                 let metadata = if invalid_metadata && slug == "aab-empty" {
                     "{invalid".to_string()
                 } else {
-                    format!(r#"{{"slug":"{slug}","human_key":"/{slug}"}}"#)
+                    serde_json::json!({
+                        "slug": slug,
+                        "human_key": dir.path().canonicalize().unwrap().join(slug),
+                    })
+                    .to_string()
                 };
                 std::fs::write(project.join("project.json"), metadata).unwrap();
             }
