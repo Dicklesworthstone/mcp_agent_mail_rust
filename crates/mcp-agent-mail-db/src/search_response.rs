@@ -52,40 +52,78 @@ fn manual_index_reader(index: &Index) -> tantivy::Result<IndexReader> {
         .try_into()
 }
 
-/// Lowercased search text with a map back to the original UTF-8 boundaries.
-/// Lowercasing can expand (`İ`) or shrink (`K`) the byte representation, so
-/// offsets in the lowercased string are not offsets in the stored message.
+/// A character whose lowercase representation has a different UTF-8 width.
+struct LowercaseChange {
+    lowered_start: usize,
+    lowered_end: usize,
+    original_start: usize,
+    original_end: usize,
+}
+
+/// Lowercased search text with sparse corrections to original UTF-8 offsets.
+/// Lowercasing can expand (`İ`) or shrink (`K`) the byte representation. Most
+/// characters, including most non-ASCII text, need no correction entries.
 struct LowercaseText {
     text: String,
-    boundaries: Vec<(usize, usize)>,
+    changes: Vec<LowercaseChange>,
 }
 
 impl LowercaseText {
     fn new(original: &str) -> Self {
         let text = original.to_lowercase();
-        let mut boundaries = Vec::new();
+        let mut changes = Vec::new();
         if !original.is_ascii() {
             let mut lowered_offset = 0;
             for (original_offset, ch) in original.char_indices() {
-                boundaries.push((lowered_offset, original_offset));
                 // str::to_lowercase also handles contextual final sigma; its
                 // two forms have the same UTF-8 width as char::to_lowercase.
-                lowered_offset += ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+                let lowered_len = ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+                let lowered_end = lowered_offset + lowered_len;
+                if lowered_len != ch.len_utf8() {
+                    changes.push(LowercaseChange {
+                        lowered_start: lowered_offset,
+                        lowered_end,
+                        original_start: original_offset,
+                        original_end: original_offset + ch.len_utf8(),
+                    });
+                }
+                lowered_offset = lowered_end;
             }
-            boundaries.push((text.len(), original.len()));
+            debug_assert_eq!(lowered_offset, text.len());
         }
-        Self { text, boundaries }
+        Self { text, changes }
     }
 
     /// A partial match within a lowercase expansion highlights the whole
-    /// original character, never half of its UTF-8 representation.
+    /// original character, never half of its UTF-8 representation. Between
+    /// width-changing characters, offsets have a constant displacement.
     fn original_range(&self, start: usize, end: usize) -> (usize, usize) {
-        if self.boundaries.is_empty() {
+        if self.changes.is_empty() {
             return (start, end);
         }
-        let first = self.boundaries.partition_point(|&(offset, _)| offset <= start) - 1;
-        let last = self.boundaries.partition_point(|&(offset, _)| offset < end);
-        (self.boundaries[first].1, self.boundaries[last].1)
+        let first = self.changes.partition_point(|change| change.lowered_start <= start);
+        let last = self.changes.partition_point(|change| change.lowered_start < end);
+        let original_start = if first == 0 {
+            start
+        } else {
+            let change = &self.changes[first - 1];
+            if start < change.lowered_end {
+                change.original_start
+            } else {
+                change.original_end + (start - change.lowered_end)
+            }
+        };
+        let original_end = if last == 0 {
+            end
+        } else {
+            let change = &self.changes[last - 1];
+            if end <= change.lowered_end {
+                change.original_end
+            } else {
+                change.original_end + (end - change.lowered_end)
+            }
+        };
+        (original_start, original_end)
     }
 }
 
@@ -330,8 +368,9 @@ fn collect_ranked_page(
         })
         .collect::<tantivy::Result<HashMap<_, _>>>()?;
 
-    let collector = TopDocs::with_limit(page_limit).and_offset(offset).tweak_score(
-        move |segment: &tantivy::SegmentReader| {
+    let collector = TopDocs::with_limit(page_limit)
+        .and_offset(offset)
+        .tweak_score(move |segment: &tantivy::SegmentReader| {
             // These are precisely the segments of this immutable searcher;
             // opening a missing or invalid fast field already returned Err.
             let ids = id_columns[&segment.segment_id()].clone();
@@ -341,8 +380,7 @@ fn collect_ranked_page(
                 let doc_id = ids.first(doc).unwrap_or(0) as i64;
                 LexicalRank { score, doc_id }
             }
-        },
-    );
+        });
     searcher.search(query, &(Count, collector))
 }
 
@@ -376,8 +414,7 @@ pub fn execute_search(
         return SearchResults::empty(SearchMode::Lexical, start.elapsed());
     };
     let searcher = reader.searcher();
-    let Ok((total_count, top_docs)) =
-        collect_ranked_page(&searcher, query, handles, limit, offset)
+    let Ok((total_count, top_docs)) = collect_ranked_page(&searcher, query, handles, limit, offset)
     else {
         return SearchResults::empty(SearchMode::Lexical, start.elapsed());
     };
@@ -903,7 +940,7 @@ mod tests {
     #[test]
     fn snippet_marks_truncated_overlong_match() {
         let text = "x".repeat(300);
-        let snippet = generate_snippet_with_limit(&text, &[text.clone()], 20).unwrap();
+        let snippet = generate_snippet_with_limit(&text, std::slice::from_ref(&text), 20).unwrap();
         assert_eq!(snippet, format!("{}...", "x".repeat(20)));
     }
 
@@ -923,6 +960,49 @@ mod tests {
                 assert!(snippet.contains(term));
                 let ranges = find_highlights(text, "body", &terms);
                 assert!(ranges.iter().any(|range| &text[range.start..range.end] == term));
+            }
+        }
+    }
+
+    #[test]
+    fn lowercase_offset_map_scales_with_width_changes_not_message_length() {
+        let text = "Résumé ΣΟΣ 🦀 猫 — ordinary text ".repeat(10_000);
+        assert!(LowercaseText::new(&text).changes.is_empty());
+        let mixed = format!("{text}İK{text}");
+        assert_eq!(LowercaseText::new(&mixed).changes.len(), 2);
+    }
+
+    #[test]
+    fn compact_lowercase_map_matches_dense_reference_at_all_character_boundaries() {
+        for text in [
+            "İKẞȺȾ NEEDLE 猫",
+            "plain 🦀 É ΟΣ text",
+            "İİKK\u{0307}İK end",
+            "KİKİKİ",
+        ] {
+            let lowered = LowercaseText::new(text);
+            let mut dense = Vec::new();
+            let mut lower_offset = 0;
+            for (original_offset, ch) in text.char_indices() {
+                dense.push((lower_offset, original_offset));
+                lower_offset += ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+            }
+            dense.push((lowered.text.len(), text.len()));
+            let positions: Vec<_> = lowered
+                .text
+                .char_indices()
+                .map(|(offset, _)| offset)
+                .chain(std::iter::once(lowered.text.len()))
+                .collect();
+            for (start_index, &start) in positions.iter().enumerate() {
+                for &end in &positions[start_index + 1..] {
+                    let first = dense.partition_point(|&(offset, _)| offset <= start) - 1;
+                    let last = dense.partition_point(|&(offset, _)| offset < end);
+                    let actual = lowered.original_range(start, end);
+                    assert_eq!(actual, (dense[first].1, dense[last].1));
+                    assert!(text.is_char_boundary(actual.0));
+                    assert!(text.is_char_boundary(actual.1));
+                }
             }
         }
     }
@@ -1376,15 +1456,28 @@ mod tests {
 
         #[test]
         fn lexical_rank_uses_a_total_score_order_and_id_tiebreak() {
-            let higher_score = LexicalRank { score: 2.0, doc_id: 1 };
-            let higher_id = LexicalRank { score: 1.0, doc_id: 100 };
-            let lower_id = LexicalRank { score: 1.0, doc_id: 2 };
+            let higher_score = LexicalRank {
+                score: 2.0,
+                doc_id: 1,
+            };
+            let higher_id = LexicalRank {
+                score: 1.0,
+                doc_id: 100,
+            };
+            let lower_id = LexicalRank {
+                score: 1.0,
+                doc_id: 2,
+            };
             assert!(higher_score > higher_id);
             assert!(higher_id > lower_id);
             for score in [f32::NEG_INFINITY, -0.0, 0.0, f32::INFINITY, f32::NAN] {
                 let rank = LexicalRank { score, doc_id: 1 };
-                assert_eq!(rank, rank);
-                assert_eq!(rank.partial_cmp(&rank), Some(std::cmp::Ordering::Equal));
+                let equivalent = LexicalRank {
+                    score,
+                    doc_id: rank.doc_id,
+                };
+                assert_eq!(rank, equivalent);
+                assert_eq!(rank.partial_cmp(&equivalent), Some(std::cmp::Ordering::Equal));
             }
         }
     }
