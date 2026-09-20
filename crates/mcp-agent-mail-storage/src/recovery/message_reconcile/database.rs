@@ -31,6 +31,9 @@ pub struct ReconcileCursor {
     source_identity: String,
     tail_after: Option<i64>,
     backfill_ceiling: Option<i64>,
+    // A byte budget can admit only one message. Resume with the opposite lane
+    // after the last consumed item, not unconditionally with new-mail catch-up.
+    next_lane_is_history: bool,
 }
 
 impl ReconcileCursor {
@@ -40,6 +43,7 @@ impl ReconcileCursor {
         } else {
             self.backfill_ceiling = Some(id.saturating_sub(1));
         }
+        self.next_lane_is_history = tail;
     }
 }
 
@@ -51,9 +55,28 @@ pub struct ReconcileReport {
     pub repaired: usize,
     pub files_created: usize,
     pub deferred: usize,
+    /// Serialized payload bytes admitted to archive work, excluding rejected
+    /// oversized projections (whose SQL input has a separate byte bound).
     pub payload_bytes: usize,
     pub interrupted: bool,
     pub budget_exhausted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayloadAdmission {
+    Fits,
+    NextBatch,
+    Oversized,
+}
+
+fn payload_admission(used: usize, candidate: usize) -> PayloadAdmission {
+    if candidate > MAX_BATCH_PAYLOAD_BYTES {
+        PayloadAdmission::Oversized
+    } else if candidate > MAX_BATCH_PAYLOAD_BYTES.saturating_sub(used) {
+        PayloadAdmission::NextBatch
+    } else {
+        PayloadAdmission::Fits
+    }
 }
 
 /// Default-on non-destructive repair for file-backed mailboxes, independently
@@ -110,6 +133,25 @@ fn validate_pool_binding(pool: &DbPool, config: &Config) -> Result<(), String> {
     Ok(())
 }
 
+fn interleave_ids(tail: &[i64], history: &[i64], history_first: bool) -> Vec<(i64, bool)> {
+    let mut selected = Vec::with_capacity(tail.len() + history.len());
+    let lanes = if history_first {
+        [(history, false), (tail, true)]
+    } else {
+        [(tail, true), (history, false)]
+    };
+    for index in 0..tail.len().max(history.len()) {
+        for (ids, is_tail) in lanes {
+            if let Some(id) = ids.get(index) {
+                // Keep duplicate IDs: the caller processes the payload once but
+                // advances both independent cursors when it consumes each lane.
+                selected.push((*id, is_tail));
+            }
+        }
+    }
+    selected
+}
+
 fn select_ids(
     cx: &Cx,
     pool: &DbPool,
@@ -146,6 +188,7 @@ fn select_ids(
     if cursor.tail_after.is_some_and(|after| after > max_id) {
         cursor.tail_after = None;
         cursor.backfill_ceiling = None;
+        cursor.next_lane_is_history = false;
     }
     let mut tail = if let Some(after) = cursor.tail_after {
         conn.query_sync(
@@ -179,17 +222,9 @@ fn select_ids(
     if history.is_empty() {
         cursor.backfill_ceiling = None;
     }
-    // Interleave so a per-pass repair/byte budget cannot starve either lane.
-    let mut selected = Vec::with_capacity(tail.len() + history.len());
-    for index in 0..tail.len().max(history.len()) {
-        if let Some(id) = tail.get(index) {
-            selected.push((*id, true));
-        }
-        if let Some(id) = history.get(index) {
-            selected.push((*id, false));
-        }
-    }
-    Ok(selected)
+    // Interleave within a pass AND retain lane priority across budget-limited
+    // passes. Fixed tail-first ordering starves history at one payload per pass.
+    Ok(interleave_ids(&tail, &history, cursor.next_lane_is_history))
 }
 
 struct PreparedMessage {
@@ -587,9 +622,11 @@ impl CommittedMessages {
 /// Reconcile a bounded pass against the server's live mailbox pool.
 ///
 /// Recent catch-up and rotating history each select at most 16 IDs. At most
-/// four repairs and 16 MiB of projected payload are handled per pass. These
-/// are application work/memory bounds, not deadlines on SQL, filesystem or
-/// libgit2 calls. Normal archive writes receive a 30-second grace window.
+/// four successful repairs and 16 MiB of serialized payload are admitted to
+/// archive work per pass. SQL projections are separately bounded before JSON
+/// serialization; an expanded payload that cannot fit any batch is deferred
+/// without pinning the cursor. These are work bounds, not deadlines on SQL,
+/// filesystem or libgit2 calls. Normal archive writes receive a 30-second grace.
 /// No row, receipt, delivery, notification or thread digest is mutated. Failed
 /// messages are reported and revisited by backfill, not retried in a tight loop.
 ///
@@ -638,20 +675,31 @@ pub fn reconcile_message_batch(
         // publication. Drop each SQL connection before filesystem/Git work.
         let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
         let result = match prepare_message(cx, pool, id) {
-            Ok(prepared) => {
-                if prepared.payload_bytes
-                    > MAX_BATCH_PAYLOAD_BYTES.saturating_sub(report.payload_bytes)
-                {
+            Ok(prepared) => match payload_admission(report.payload_bytes, prepared.payload_bytes) {
+                PayloadAdmission::Oversized => {
+                    // SQL's raw-text bound does not bound JSON escaping. This
+                    // item cannot fit an empty batch either: report it and
+                    // advance below so all later mail can still converge.
+                    Err(format!(
+                        "serialized message payload exceeds per-batch limit ({} > {} bytes); source preserved",
+                        prepared.payload_bytes, MAX_BATCH_PAYLOAD_BYTES,
+                    ))
+                }
+                PayloadAdmission::NextBatch => {
+                    // This item CAN fit a fresh batch. Do not consume its
+                    // cursor or lane priority before it has been attempted.
                     report.budget_exhausted = true;
                     break;
                 }
-                report.payload_bytes += prepared.payload_bytes;
-                if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
-                    report.interrupted = true;
-                    break;
+                PayloadAdmission::Fits => {
+                    report.payload_bytes += prepared.payload_bytes;
+                    if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+                        report.interrupted = true;
+                        break;
+                    }
+                    reconcile_prepared(config, &prepared)
                 }
-                reconcile_prepared(config, &prepared)
-            }
+            },
             Err(error) => Err(error),
         };
         report.scanned += 1;
@@ -1052,6 +1100,137 @@ mod tests {
         let (observed, _) = CommittedMessages::open(&archive)
             .unwrap().read(&archive, &paths.inbox[0]).unwrap().unwrap();
         assert_eq!(observed, second);
+    }
+
+    #[test]
+    fn payload_admission_distinguishes_fresh_batch_from_impossible_payload() {
+        assert_eq!(payload_admission(0, MAX_BATCH_PAYLOAD_BYTES), PayloadAdmission::Fits);
+        assert_eq!(payload_admission(1, MAX_BATCH_PAYLOAD_BYTES), PayloadAdmission::NextBatch);
+        assert_eq!(payload_admission(0, MAX_BATCH_PAYLOAD_BYTES + 1), PayloadAdmission::Oversized);
+        assert_eq!(payload_admission(MAX_BATCH_PAYLOAD_BYTES, 1), PayloadAdmission::NextBatch);
+        assert_eq!(payload_admission(usize::MAX, usize::MAX), PayloadAdmission::Oversized);
+        assert_eq!(payload_admission(usize::MAX, 1), PayloadAdmission::NextBatch);
+        assert_eq!(payload_admission(MAX_BATCH_PAYLOAD_BYTES - 1, 1), PayloadAdmission::Fits);
+    }
+
+    #[test]
+    fn json_expansion_can_exceed_batch_limit_without_exceeding_sql_input_limit() {
+        let subject = "\u{0001}".repeat(3 * 1024 * 1024);
+        assert!(subject.len() < usize::try_from(MAX_DB_PAYLOAD_BYTES).unwrap());
+        let payload = json!({"subject": subject}).to_string();
+        assert!(payload.len() > MAX_BATCH_PAYLOAD_BYTES);
+        assert_eq!(payload_admission(0, payload.len()), PayloadAdmission::Oversized);
+    }
+
+    #[test]
+    fn lane_order_survives_single_payload_batch_budgets() {
+        let mut cursor = ReconcileCursor::default();
+        let mut tail_next = 1000;
+        let mut history_next = 999;
+        let mut tail_count = 0;
+        let mut history_count = 0;
+        let mut seen = HashSet::new();
+        for _ in 0..100 {
+            let ids = interleave_ids(&[tail_next], &[history_next], cursor.next_lane_is_history);
+            let (id, tail) = ids[0];
+            assert!(seen.insert(id));
+            assert_eq!(payload_admission(0, MAX_BATCH_PAYLOAD_BYTES), PayloadAdmission::Fits);
+            assert_eq!(payload_admission(MAX_BATCH_PAYLOAD_BYTES, 1), PayloadAdmission::NextBatch);
+            // Exactly one item fits. The rejected second item must retain
+            // priority across the next selection, not be perpetually second.
+            cursor.advance(id, tail);
+            if tail {
+                tail_count += 1;
+                tail_next += 1;
+            } else {
+                history_count += 1;
+                history_next -= 1;
+            }
+        }
+        assert_eq!((tail_count, history_count), (50, 50));
+        assert_eq!(cursor.tail_after, Some(1049));
+        assert_eq!(cursor.backfill_ceiling, Some(949));
+    }
+
+    #[test]
+    fn interleaving_preserves_each_lane_and_duplicate_cursor_updates() {
+        assert_eq!(
+            interleave_ids(&[10, 11], &[9, 8, 7], true),
+            vec![(9, false), (10, true), (8, false), (11, true), (7, false)]
+        );
+        assert_eq!(interleave_ids(&[], &[9, 8], false), vec![(9, false), (8, false)]);
+        assert_eq!(interleave_ids(&[10, 11], &[], true), vec![(10, true), (11, true)]);
+        let mut cursor = ReconcileCursor::default();
+        let mut processed = HashSet::new();
+        for (id, tail) in interleave_ids(&[9], &[9], false) {
+            processed.insert(id);
+            cursor.advance(id, tail);
+        }
+        assert_eq!(processed.len(), 1);
+        assert_eq!(cursor.tail_after, Some(9));
+        assert_eq!(cursor.backfill_ceiling, Some(8));
+    }
+
+    #[test]
+    fn oversized_projection_does_not_pin_later_mail_and_preserves_source() {
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
+            let temp = tempfile::tempdir().unwrap();
+            let db_path = temp.path().join("mail.sqlite3");
+            let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&db_path);
+            let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: database_url.clone(),
+                min_connections: 1,
+                max_connections: 1,
+                ..Default::default()
+            }).unwrap();
+            let cx = Cx::for_testing();
+            let conn = outcome(block_on(pool.acquire(&cx))).unwrap();
+            conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(101, 'project', '/project', 1)").unwrap();
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts) VALUES(101, 101, 'BlueLake', 'test', 'test', '', 1, 1), (102, 101, 'GreenStone', 'test', 'test', '', 1, 1)").unwrap();
+            for id in [901, 902] {
+                conn.execute_raw(&format!(
+                    "INSERT INTO messages(id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) VALUES({id}, 101, 101, 'small', 'body', 'normal', 0, 1000000, '{{\"to\":[\"GreenStone\"],\"cc\":[],\"bcc\":[]}}', '[]')"
+                )).unwrap();
+                conn.execute_raw(&format!(
+                    "INSERT INTO message_recipients(message_id, agent_id, kind) VALUES({id}, 102, 'to')"
+                )).unwrap();
+            }
+            // Literal contains no SQL quotes; control characters are stored raw
+            // and expand sixfold only when the archive JSON is serialized.
+            let subject = "\u{0001}".repeat(3 * 1024 * 1024);
+            conn.execute_raw(&format!("UPDATE messages SET subject = '{subject}' WHERE id = 901")).unwrap();
+            drop(conn);
+            std::fs::create_dir_all(pool.storage_root()).unwrap();
+            let config = Config {
+                database_url,
+                storage_root: pool.storage_root().to_path_buf(),
+                ..Config::default()
+            };
+            let oversized = prepare_message(&cx, &pool, 901).unwrap();
+            assert!(oversized.payload_bytes > MAX_BATCH_PAYLOAD_BYTES);
+            let mut cursor = ReconcileCursor {
+                source_identity: pool.sqlite_identity_key(),
+                tail_after: Some(900),
+                ..Default::default()
+            };
+            let report = reconcile_message_batch(
+                &cx, &pool, &config, &mut cursor, &AtomicBool::new(false),
+            ).unwrap();
+            assert_eq!(report.scanned, 2);
+            assert_eq!(report.deferred, 1);
+            assert_eq!(report.repaired, 1);
+            assert_eq!(report.files_created, 3);
+            assert!(!report.budget_exhausted);
+            assert_eq!(cursor.tail_after, Some(902));
+            let conn = outcome(block_on(pool.acquire(&cx))).unwrap();
+            let rows = conn.query_sync("SELECT subject FROM messages WHERE id = 901", &[]).unwrap();
+            assert_eq!(rows[0].get_named::<String>("subject").unwrap(), subject);
+            let receipts = conn.query_sync(
+                "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 902", &[],
+            ).unwrap();
+            assert_eq!(receipts[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
+            assert_eq!(receipts[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+        });
     }
 
     #[test]
