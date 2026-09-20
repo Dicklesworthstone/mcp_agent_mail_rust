@@ -31,6 +31,20 @@ pub enum SetupError {
     #[error("unknown agent platform: {0}")]
     UnknownPlatform(String),
 
+    /// Namespace publication occurred, but its file flush was not confirmed.
+    /// This never promises power-loss durability of directory entries.
+    #[cfg(windows)]
+    #[error(
+        "Windows setup {state} at {path}; file durability is unconfirmed; recovery artifact: {retained:?}: {source}"
+    )]
+    WindowsPublicationUnconfirmed {
+        state: &'static str,
+        path: PathBuf,
+        retained: Option<PathBuf>,
+        #[source]
+        source: Box<SetupError>,
+    },
+
     #[error("{0}")]
     Other(String),
 }
@@ -3122,7 +3136,9 @@ fn replace_windows_setup_file_retaining_displaced(
                 replaced,
                 replacement,
                 Some(retained),
-                winsafe::co::REPLACEFILE::WRITE_THROUGH,
+                // REPLACEFILE_WRITE_THROUGH is explicitly unsupported by
+                // Windows. File flush completion is handled after publication.
+                winsafe::co::REPLACEFILE::default(),
             )
         },
         |existing, new| {
@@ -3172,6 +3188,68 @@ fn replace_windows_setup_file_retaining_displaced_with(
     Err(SetupError::Other(format!(
         "could not retain the displaced Windows setup file as {suffix}"
     )))
+}
+
+#[cfg(windows)]
+fn open_windows_setup_flush_handle(
+    authority: &SetupDirectoryAuthority,
+    name: &OsStr,
+    expected: &SetupFileSnapshot,
+) -> Result<std::fs::File, SetupError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+    use cap_std::fs::OpenOptionsExt as _;
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .follow(FollowSymlinks::No)
+        .share_mode(0);
+    let file = authority.dir.open_with(name, &options)?.into_std();
+    let observed = snapshot_open_setup_file(
+        file.try_clone()?,
+        &authority.path.join(name),
+        "Windows setup flush target",
+    )?;
+    if !setup_snapshots_match(expected, &observed) {
+        return Err(SetupError::Other(
+            "Windows setup flush target changed identity, content, permissions, or link topology"
+                .into(),
+        ));
+    }
+    Ok(file)
+}
+
+/// Flush the exact published objects while exclusive leaf handles and the
+/// directory authority remain held. This is a file barrier, not directory
+/// entry durability. Failures preserve all artifacts and never retry a
+/// pathname rollback after another writer may have changed the namespace.
+#[cfg(windows)]
+fn finish_windows_setup_publication(
+    authority: &SetupDirectoryAuthority,
+    file_name: &OsStr,
+    published: &SetupFileSnapshot,
+    retained: Option<(&OsStr, &SetupFileSnapshot)>,
+    state: &'static str,
+    flush: impl Fn(&std::fs::File) -> std::io::Result<()>,
+) -> Result<(), SetupError> {
+    let result = (|| {
+        let file = open_windows_setup_flush_handle(authority, file_name, published)?;
+        let retained_file = retained
+            .map(|(name, expected)| open_windows_setup_flush_handle(authority, name, expected))
+            .transpose()?;
+        if let Some(retained_file) = &retained_file {
+            flush(retained_file)?;
+        }
+        flush(&file)?;
+        revalidate_setup_directory_authority(&authority.path, authority)
+    })();
+    result.map_err(|source| SetupError::WindowsPublicationUnconfirmed {
+        state,
+        path: authority.path.join(file_name),
+        retained: retained.map(|(name, _)| authority.path.join(name)),
+        source: Box::new(source),
+    })
 }
 
 #[cfg(windows)]
@@ -3266,6 +3344,12 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
     let (mut temp_file, temp_path) = create_persistent_windows_setup_temp(authority, file_name)?;
     temp_file.write_all(content)?;
     temp_file.sync_all()?;
+    std::io::Seek::rewind(&mut temp_file)?;
+    let published_snapshot = snapshot_open_setup_file(
+        temp_file.try_clone()?,
+        &temp_path,
+        "Windows setup staged file",
+    )?;
     drop(temp_file);
     revalidate_setup_directory_authority(parent, authority)?;
     before_publish()?;
@@ -3316,14 +3400,48 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
                 &retained_path,
                 "replaced",
             );
-            revalidate_setup_directory_authority(parent, authority)?;
-            rollback?;
+            let (rejected_name, rejected_path) =
+                rollback.map_err(|source| SetupError::WindowsPublicationUnconfirmed {
+                    state: "rollback failed after publication",
+                    path: path.to_path_buf(),
+                    retained: Some(PathBuf::from(&retained_path)),
+                    source: Box::new(source),
+                })?;
+            if let Ok(Some(restored_snapshot)) = retained {
+                finish_windows_setup_publication(
+                    authority,
+                    OsStr::new(file_name),
+                    &restored_snapshot,
+                    Some((OsStr::new(&rejected_name), &published_snapshot)),
+                    "restored",
+                    std::fs::File::sync_all,
+                )?;
+            } else {
+                return Err(SetupError::WindowsPublicationUnconfirmed {
+                    state: "restored",
+                    path: path.to_path_buf(),
+                    retained: Some(PathBuf::from(rejected_path)),
+                    source: Box::new(invalid_setup_path(
+                        label,
+                        path,
+                        "displaced leaf at publication was not a verifiable regular file",
+                    )),
+                });
+            }
             return Err(invalid_setup_path(
                 label,
                 path,
                 "changed identity, content, permissions, or link topology at publication; the attempted replacement was retained and the displaced file restored",
             ));
         }
+        finish_windows_setup_publication(
+            authority,
+            OsStr::new(file_name),
+            &published_snapshot,
+            Some((OsStr::new(&retained_name), expected)),
+            "published",
+            std::fs::File::sync_all,
+        )?;
     } else {
         winsafe::MoveFileEx(
             &temp_path,
@@ -3331,9 +3449,17 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
             winsafe::co::MOVEFILE::WRITE_THROUGH,
         )
         .map_err(windows_setup_io_error)?;
+        finish_windows_setup_publication(
+            authority,
+            OsStr::new(file_name),
+            &published_snapshot,
+            None,
+            "published",
+            std::fs::File::sync_all,
+        )?;
     }
 
-    revalidate_setup_directory_authority(parent, authority)
+    Ok(())
 }
 
 #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
@@ -9704,6 +9830,109 @@ mod tests {
             })
             .expect("the rejected replacement must be retained without deleting it");
         assert_eq!(std::fs::read(rejected.path()).unwrap(), attempted);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_publication_flushes_both_verified_files() {
+        let tmp = setup_real_tempdir();
+        let target = tmp.path().join("config.json");
+        let retained = tmp.path().join("retained.json");
+        std::fs::write(&target, "published").unwrap();
+        std::fs::write(&retained, "original").unwrap();
+        let published = read_setup_file(&target, "target").unwrap().unwrap();
+        let original = read_setup_file(&retained, "retained").unwrap().unwrap();
+        let authority = open_setup_directory_authority(tmp.path()).unwrap();
+        let calls = std::cell::Cell::new(0);
+        finish_windows_setup_publication(
+            &authority,
+            OsStr::new("config.json"),
+            &published,
+            Some((OsStr::new("retained.json"), &original)),
+            "published",
+            |file| {
+                file.sync_all()?;
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(std::fs::read(&target).unwrap(), b"published");
+        assert_eq!(std::fs::read(&retained).unwrap(), b"original");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_publication_flush_failure_preserves_both_files_and_state() {
+        for state in ["published", "restored"] {
+            for fail_at in [1, 2] {
+                let tmp = setup_real_tempdir();
+                let target = tmp.path().join("config.json");
+                let retained = tmp.path().join("retained.json");
+                std::fs::write(&target, "Bearer private-fixture").unwrap();
+                std::fs::write(&retained, "original").unwrap();
+                let published = read_setup_file(&target, "target").unwrap().unwrap();
+                let original = read_setup_file(&retained, "retained").unwrap().unwrap();
+                let authority = open_setup_directory_authority(tmp.path()).unwrap();
+                let calls = std::cell::Cell::new(0);
+                let error = finish_windows_setup_publication(
+                    &authority,
+                    OsStr::new("config.json"),
+                    &published,
+                    Some((OsStr::new("retained.json"), &original)),
+                    state,
+                    |file| {
+                        calls.set(calls.get() + 1);
+                        if calls.get() == fail_at {
+                            Err(std::io::Error::other("injected flush failure"))
+                        } else {
+                            file.sync_all()
+                        }
+                    },
+                )
+                .unwrap_err();
+                assert!(matches!(
+                    &error,
+                    SetupError::WindowsPublicationUnconfirmed {
+                        state: actual,
+                        retained: Some(path),
+                        ..
+                    } if *actual == state && *path == retained
+                ));
+                assert!(!error.to_string().contains("private-fixture"));
+                assert_eq!(std::fs::read(&target).unwrap(), b"Bearer private-fixture");
+                assert_eq!(std::fs::read(&retained).unwrap(), b"original");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_publication_flush_refuses_replaced_inode_without_flushing() {
+        let tmp = setup_real_tempdir();
+        let target = tmp.path().join("config.json");
+        let displaced = tmp.path().join("displaced.json");
+        std::fs::write(&target, "same bytes").unwrap();
+        let expected = read_setup_file(&target, "target").unwrap().unwrap();
+        std::fs::rename(&target, &displaced).unwrap();
+        std::fs::write(&target, "same bytes").unwrap();
+        let authority = open_setup_directory_authority(tmp.path()).unwrap();
+        let error = finish_windows_setup_publication(
+            &authority,
+            OsStr::new("config.json"),
+            &expected,
+            None,
+            "published",
+            |_| panic!("must reject substituted inode before flushing"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SetupError::WindowsPublicationUnconfirmed { .. }
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), b"same bytes");
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"same bytes");
     }
 
     #[cfg(windows)]
