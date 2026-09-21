@@ -137,8 +137,7 @@ fn canonical_message(
         writeln!(message, "{label}={}:{value}", value.len())
             .expect("formatting into a String cannot fail");
     }
-    writeln!(message, "capabilities={}", c.len())
-        .expect("formatting into a String cannot fail");
+    writeln!(message, "capabilities={}", c.len()).expect("formatting into a String cannot fail");
     for capability in c {
         writeln!(message, "capability={}:{capability}", capability.len())
             .expect("formatting into a String cannot fail");
@@ -859,14 +858,7 @@ fn scope_tampering_neither_registers_an_agent_nor_consumes_its_nonce() {
 
             // Reusing this nonce with a genuinely authorized proof must work:
             // the rejected signature must not have reached nonce consumption.
-            register_with_proof(
-                &ctx,
-                &key,
-                &project_key,
-                "BlueLake",
-                "scope-tamper-nonce",
-            )
-            .await;
+            register_with_proof(&ctx, &key, &project_key, "BlueLake", "scope-tamper-nonce").await;
             whois(&ctx, project_key, "BlueLake".to_string(), Some(false), None)
                 .await
                 .expect("authorized identity is visible after registration");

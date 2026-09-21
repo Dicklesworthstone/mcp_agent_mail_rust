@@ -221,7 +221,11 @@ mod tests {
             let mut schedule = MonitorSchedule::new(&config);
             for seconds in 1..=60 {
                 let (_, memory_due) = schedule.due(Duration::from_secs(seconds));
-                assert_eq!(memory_due, seconds % 5 == 0, "disk interval {disk_interval}");
+                assert_eq!(
+                    memory_due,
+                    seconds % 5 == 0,
+                    "disk interval {disk_interval}"
+                );
             }
         }
     }

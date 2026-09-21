@@ -560,7 +560,7 @@ fn mk_error(code: &str, message: impl Into<String>, detail: serde_json::Value) -
 
 /// Deterministic v2 signing bytes, independent of JSON object ordering.
 ///
-/// Start with `agent-mail-registration-proof:v2\n`. Encode identity, project_key,
+/// Start with `agent-mail-registration-proof:v2\n`. Encode identity, `project_key`,
 /// program and model, in that order, as `label=N:value\n`, where N is the decimal
 /// UTF-8 BYTE length of value (no leading zeroes, except zero itself). Values are
 /// not escaped or trimmed. Encode `capabilities=N\n` with the normalized count,
@@ -593,8 +593,7 @@ fn canonical_message(claims: &ProofClaims) -> String {
     ] {
         append_signed_field(&mut message, label, value);
     }
-    writeln!(message, "capabilities={}", caps.len())
-        .expect("formatting into a String cannot fail");
+    writeln!(message, "capabilities={}", caps.len()).expect("formatting into a String cannot fail");
     for capability in caps {
         append_signed_field(&mut message, "capability", capability);
     }

@@ -38,7 +38,9 @@ static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
 const PROBE_CACHE_RETENTION_US: i64 = 6 * 60 * 60 * 1_000_000;
 
 fn normalize_path_pattern_key(path_pattern: &str) -> String {
-    CompiledPattern::cached(path_pattern).normalized().to_string()
+    CompiledPattern::cached(path_pattern)
+        .normalized()
+        .to_string()
 }
 
 #[derive(Debug, Default)]
@@ -654,8 +656,8 @@ fn probe_metadata(
         .strip_prefix(workspace)
         .map_err(|_| ActivityProbeResult::Unavailable)?;
     let mut candidate = workspace.to_path_buf();
-    let mut metadata = std::fs::symlink_metadata(&candidate)
-        .map_err(|_| ActivityProbeResult::Unavailable)?;
+    let mut metadata =
+        std::fs::symlink_metadata(&candidate).map_err(|_| ActivityProbeResult::Unavailable)?;
     if !metadata.is_dir() {
         return Err(ActivityProbeResult::Unavailable);
     }
