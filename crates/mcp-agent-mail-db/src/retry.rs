@@ -631,11 +631,9 @@ pub static CIRCUIT_LLM: std::sync::LazyLock<CircuitBreaker> = std::sync::LazyLoc
     )
 });
 
-/// Legacy global circuit breaker — aliased to `CIRCUIT_DB` for backward compatibility.
-///
-/// New code should use `CIRCUIT_DB` directly, or the appropriate subsystem breaker.
-pub static CIRCUIT_BREAKER: std::sync::LazyLock<CircuitBreaker> =
-    std::sync::LazyLock::new(CircuitBreaker::new);
+/// Alternate public name for the database circuit, not a fifth independent gate.
+/// Both names share admission, failure history, configuration and manual reset.
+pub use self::CIRCUIT_DB as CIRCUIT_BREAKER;
 
 /// Look up the circuit breaker for a given subsystem.
 #[must_use]
@@ -2167,5 +2165,205 @@ mod tests {
         assert!(matches!(result, Err(DbError::CircuitBreakerOpen { .. })));
         assert_eq!(calls.get(), 1);
         assert_eq!(cb.failure_count(), 1);
+    }
+
+    #[test]
+    fn legacy_and_subsystem_names_share_one_database_breaker() {
+        assert!(std::ptr::eq(&*CIRCUIT_BREAKER, &*CIRCUIT_DB));
+        assert!(std::ptr::eq(
+            &*CIRCUIT_BREAKER,
+            circuit_for(Subsystem::Db),
+        ));
+        assert_eq!(CIRCUIT_BREAKER.threshold(), CIRCUIT_DB.threshold());
+        assert_eq!(CIRCUIT_BREAKER.reset_duration(), CIRCUIT_DB.reset_duration());
+    }
+
+    #[test]
+    fn legacy_failure_blocks_current_retry_and_agrees_with_health_and_reset() {
+        let _lock = HEALTH_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct ResetDatabaseCircuit;
+        impl Drop for ResetDatabaseCircuit {
+            fn drop(&mut self) {
+                CIRCUIT_DB.reset();
+            }
+        }
+        let _reset = ResetDatabaseCircuit;
+        CIRCUIT_DB.reset();
+        for _ in 0..CIRCUIT_DB.threshold() {
+            CIRCUIT_BREAKER.record_failure();
+        }
+        let calls = std::cell::Cell::new(0);
+        let result = retry_sync(&RetryConfig::default(), || {
+            calls.set(calls.get() + 1);
+            Ok(42)
+        });
+        assert!(matches!(result, Err(DbError::CircuitBreakerOpen { .. })));
+        assert_eq!(calls.get(), 0);
+        let health = db_health_status();
+        let database = health.circuits.iter().find(|status| status.subsystem == "db").unwrap();
+        assert_eq!(health.circuit_state, "open");
+        assert_eq!(database.state, health.circuit_state);
+        assert_eq!(database.failures, CIRCUIT_BREAKER.failure_count());
+        assert_eq!(database.failures, health.circuit_failures);
+        CIRCUIT_DB.reset();
+        assert_eq!(CIRCUIT_BREAKER.state(), CircuitState::Closed);
+        assert_eq!(retry_sync(&RetryConfig::default(), || Ok(42)).unwrap(), 42);
+        CIRCUIT_BREAKER.record_failure();
+        assert_eq!(CIRCUIT_DB.failure_count(), 1);
+        CIRCUIT_BREAKER.reset();
+        assert_eq!(CIRCUIT_DB.failure_count(), 0);
+    }
+
+    #[test]
+    fn result_token_moved_to_another_thread_cannot_heal_a_new_epoch() {
+        let cb = CircuitBreaker::with_params(1, Duration::from_secs(30));
+        let attempt = cb.begin_attempt().unwrap();
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+            let worker = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                attempt.record_success();
+            });
+            let started = started_rx.recv_timeout(Duration::from_secs(5));
+            if started.is_ok() {
+                cb.record_failure();
+            }
+            // Unblock and join before asserting so an assertion cannot strand
+            // the worker that owns the migrated result token.
+            let _ = finish_tx.send(());
+            let joined = worker.join();
+            assert!(started.is_ok());
+            joined.unwrap();
+        });
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert_eq!(cb.failure_count(), 1);
+        assert_eq!(cb.half_open_success_count(), 0);
+    }
+
+    #[test]
+    fn concurrent_failure_observations_do_not_lose_threshold_progress() {
+        const WORKERS: u32 = 8;
+        const FAILURES_PER_WORKER: u32 = 1_000;
+        let threshold = WORKERS * FAILURES_PER_WORKER + 1;
+        let cb = CircuitBreaker::with_params(threshold, Duration::from_secs(30));
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..WORKERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        for _ in 0..FAILURES_PER_WORKER {
+                            cb.record_failure();
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        assert_eq!(cb.failure_count(), threshold - 1);
+        assert_eq!(cb.state(), CircuitState::Closed);
+        cb.record_failure();
+        let snapshot = cb.snapshot();
+        assert_eq!(snapshot.failures, threshold);
+        assert_eq!(snapshot.state, CircuitState::Open);
+        assert_eq!(snapshot.half_open_successes, 0);
+        assert!(!snapshot.probe_in_flight);
+    }
+
+    #[test]
+    fn simultaneous_recovery_callers_admit_one_owned_probe() {
+        const WORKERS: usize = 32;
+        let cb = CircuitBreaker::with_params(1, Duration::ZERO);
+        cb.record_failure_at(0);
+        std::thread::scope(|scope| {
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let mut workers = Vec::new();
+            for _ in 0..WORKERS {
+                let result_tx = result_tx.clone();
+                let release = Arc::clone(&release);
+                let cb = &cb;
+                workers.push(scope.spawn(move || {
+                    let attempt = cb.begin_attempt_at(0);
+                    let admitted = attempt.is_ok();
+                    result_tx.send(admitted).unwrap();
+                    if admitted {
+                        let (lock, wake) = &*release;
+                        let (released, _) = wake
+                            .wait_timeout_while(
+                                lock.lock().unwrap(),
+                                Duration::from_secs(5),
+                                |released| !*released,
+                            )
+                            .unwrap();
+                        assert!(*released, "probe owner was not released by the fixture");
+                        drop(released);
+                    }
+                    drop(attempt);
+                }));
+            }
+            drop(result_tx);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let observations: Vec<_> = (0..WORKERS)
+                .map(|_| result_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())))
+                .collect();
+            // Release the winner before any fixture assertion, then join all
+            // owned workers, including those whose admission was refused.
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+            let joined: Vec<_> = workers.into_iter().map(|worker| worker.join()).collect();
+            assert!(observations.iter().all(Result::is_ok));
+            assert_eq!(observations.iter().filter(|result| matches!(result, Ok(true))).count(), 1);
+            assert!(joined.into_iter().all(|result| result.is_ok()));
+        });
+        assert!(!cb.snapshot().probe_in_flight);
+        assert_eq!(cb.half_open_success_count(), 0);
+        assert_eq!(cb.failure_count(), 1);
+    }
+
+    #[test]
+    fn runtime_commit_survives_reopen_without_repetition_or_stale_breaker_healing() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("committed-operation.sqlite3");
+        let path = path.to_str().unwrap();
+        let conn = crate::DbConn::open_file(path).expect("open runtime database");
+        conn.execute_sync(
+            "CREATE TABLE committed_operations (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)",
+            &[],
+        )
+        .expect("create actual runtime table");
+        let cb = CircuitBreaker::with_params(1, Duration::from_secs(30));
+        let calls = std::cell::Cell::new(0);
+        let result = retry_sync_with_breaker(&RetryConfig::default(), Some(&cb), || {
+            calls.set(calls.get() + 1);
+            conn.execute_sync(
+                "INSERT INTO committed_operations (id, payload) VALUES (7, 'durable')",
+                &[],
+            )
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
+            // Another operation's failure arrives after the actual commit but
+            // before this successful result reaches the retry wrapper.
+            cb.record_failure();
+            Ok(7_i64)
+        });
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls.get(), 1, "a committed operation must not be repeated");
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert_eq!(cb.failure_count(), 1);
+        conn.close_sync().expect("close committed runtime connection");
+
+        let reopened = crate::DbConn::open_file(path).expect("reopen runtime database");
+        let rows = reopened
+            .query_sync("SELECT id, payload FROM committed_operations ORDER BY id", &[])
+            .expect("read actual committed state after reopen");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 7);
+        assert_eq!(rows[0].get_named::<String>("payload").unwrap(), "durable");
+        reopened.close_sync().expect("close reopened runtime connection");
     }
 }
