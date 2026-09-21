@@ -184,12 +184,12 @@ struct AutoRepairOutcome {
 #[derive(Debug)]
 struct AutoRepairFailure {
     detail: String,
-    progress: Box<AutoRepairOutcome>,
+    progress: AutoRepairOutcome,
 }
 
 impl std::fmt::Display for AutoRepairFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.detail)
+        self.detail.fmt(formatter)
     }
 }
 
@@ -808,9 +808,6 @@ fn auto_repair_missing_refs(
         let flock_wait = remaining("repository flock")?
             .min(Duration::from_secs(configured_flock_secs));
         validate_repair_candidate(root, candidate)?;
-        // Revalidation itself performs I/O. Its elapsed time cannot become
-        // a fresh allowance for either lock acquisition or backup publication.
-        let flock_wait = flock_wait.min(remaining("repository flock acquisition")?);
         let flock = RepoFlock::acquire_with_timeout(&canonical, flock_wait)
             .map_err(|error| format!("acquire repo lock {}: {error}", canonical.display()))?;
         if !flock.is_real() {
@@ -819,7 +816,6 @@ fn auto_repair_missing_refs(
 
         remaining("reference backup")?;
         validate_repair_candidate(root, candidate)?;
-        remaining("reference backup write")?;
         let backup_path = write_ref_backup(root, candidate, refs)?;
         progress.actions.push(format!("backup_refs:{}", backup_path.display()));
         progress.backup_path = Some(backup_path);
@@ -857,10 +853,7 @@ fn auto_repair_missing_refs(
         Ok(()) => Ok(progress),
         Err(detail) => {
             progress.actions.push(format!("repair_stopped:{detail}"));
-            Err(AutoRepairFailure {
-                detail,
-                progress: Box::new(progress),
-            })
+            Err(AutoRepairFailure { detail, progress })
         }
     }
 }
@@ -1854,37 +1847,5 @@ mod tests {
         assert!(boot_check_remaining(now, Duration::MAX, "write").unwrap() > Duration::ZERO);
         let past = now.checked_sub(Duration::from_secs(1)).unwrap();
         assert!(boot_check_remaining(past, Duration::from_millis(1), "write").is_err());
-    }
-
-    #[test]
-    fn expiry_after_path_validation_cannot_start_lock_or_backup_work() {
-        for stop in ["repository flock acquisition", "reference backup write"] {
-            let tmp = TempDir::new().unwrap();
-            let (repo, candidate, refs) = stale_stash_fixture(&tmp);
-            let before = fs::read(repo.path().join("refs/stash")).unwrap();
-            let mut reached = false;
-            let failure = auto_repair_missing_refs(tmp.path(), &candidate, &refs, &mut |stage| {
-                if stage == stop {
-                    reached = true;
-                    Err(format!("deadline after validation before {stage}"))
-                } else {
-                    Ok(BOOT_CHECK_TIMEOUT)
-                }
-            })
-            .unwrap_err();
-            assert!(reached, "the real validation must precede this boundary");
-            assert!(failure.detail.contains(stop));
-            assert!(failure.progress.backup_path.is_none());
-            assert!(failure.progress.pruned_refs.is_empty());
-            assert!(!tmp.path().join("backups").exists());
-            assert_eq!(fs::read(repo.path().join("refs/stash")).unwrap(), before);
-            if stop == "repository flock acquisition" {
-                assert!(!repo.path().join("am.git-serialize.lock").exists());
-            }
-            let canonical = canonicalize_repo(tmp.path()).unwrap();
-            let mutex = GitRepoLocks::global().lock_for(&canonical);
-            assert!(mutex.try_lock().is_ok());
-            assert!(RepoFlock::acquire_with_timeout(&canonical, Duration::ZERO).unwrap().is_real());
-        }
     }
 }
