@@ -133,8 +133,13 @@ impl PopulationScope {
 
 #[cfg(test)]
 mod tests {
-    use super::super::engine::AtcEffectSemantics;
+    use super::super::engine::{self, AtcEffectSemantics};
+    use super::super::{
+        AtcPopulationHydrationStats, HydrationState, atc_population_hydration_stats,
+        hydration, sync_population_with,
+    };
     use super::*;
+    use crate::atc;
 
     fn row(name: &str, id: i64, project: &str) -> AtcPopulationAgentRow {
         AtcPopulationAgentRow {
@@ -146,7 +151,7 @@ mod tests {
         }
     }
 
-    pub(in super::super) fn effect(
+    fn effect(
         name: &str,
         project: Option<&str>,
         kind: &str,
@@ -393,5 +398,210 @@ mod tests {
                 assert!(!scope.permits(&format!("Agent{}", generation - 1), Some("/alpha")));
             }
         }
+    }
+
+    fn with_global_atc(run: impl FnOnce()) {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
+        atc::reset_global_atc_state_for_test(&config);
+        struct Reset(mcp_agent_mail_core::Config);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                atc::reset_global_atc_state_for_test(&self.0);
+            }
+        }
+        let _reset = Reset(config);
+        run();
+    }
+
+    fn release_report(names: &[&str], project: &str) -> engine::AtcTickReport {
+        let effects = names
+            .iter()
+            .map(|name| effect(name, Some(project), "release_reservations_requested", None))
+            .collect();
+        let actions = names
+            .iter()
+            .map(|name| AtcTickAction::ReleaseReservations {
+                agent: (*name).to_string(),
+            })
+            .collect();
+        let mut summary = engine::atc_summary().expect("enabled fixture summary");
+        // Make summary annotation independently observable in this typed-report
+        // fixture; this is not a claim about a mounted server's health.
+        summary.completeness = engine::SnapshotCompleteness::Full;
+        summary.policy.fallback_active = false;
+        summary.policy.fallback_reason = None;
+        engine::AtcTickReport { effects, actions, summary }
+    }
+
+    fn finish_local_hydration(state: &mut HydrationState) {
+        while !state.pending.is_empty() {
+            state.drain_with(|_| {}, || true);
+        }
+        state.resume_pending = false;
+    }
+
+    #[test]
+    fn hydration_reduction_withdraws_old_release_authority_before_delivery() {
+        with_global_atc(|| {
+            let mut state = HydrationState::default();
+            state.refresh_with(10, || Ok(vec![
+                row("BlueLake", 1, "/alpha"), row("RedFox", 1, "/alpha"),
+            ])).unwrap();
+            finish_local_hydration(&mut state);
+            let mut original = release_report(&["BlueLake", "RedFox"], "/alpha");
+            state.filter_report_scope(&mut original);
+            assert_eq!(original.effects.len(), 2);
+            assert_eq!(original.actions.len(), 2);
+            assert_eq!(state.progress.scope_effects_withheld, 0);
+
+            state.refresh_with(20, || Ok(vec![row("BlueLake", 1, "/alpha")])).unwrap();
+            assert_eq!(state.progress.unchanged_agents, 1);
+            finish_local_hydration(&mut state);
+            let mut reduced = release_report(&["RedFox", "BlueLake"], "/alpha");
+            state.filter_report_scope(&mut reduced);
+            state.annotate(&mut reduced.summary, 20);
+            assert_eq!(reduced.effects.len(), 1);
+            assert_eq!(reduced.effects[0].agent, "BlueLake");
+            assert_eq!(reduced.actions.len(), 1);
+            assert_eq!(reduced.summary.kernel.pending_effects, 1);
+            assert_eq!(reduced.summary.completeness, engine::SnapshotCompleteness::Partial);
+            assert_eq!(reduced.summary.policy.fallback_reason.as_deref(), Some("population_scope_restricted"));
+            assert_eq!(state.progress.scope_effects_withheld, 1);
+            assert_eq!(state.progress.scope_actions_withheld, 1);
+
+            state.refresh_with(30, || Ok(Vec::new())).unwrap();
+            let mut empty = release_report(&["BlueLake"], "/alpha");
+            state.filter_report_scope(&mut empty);
+            assert!(empty.effects.is_empty() && empty.actions.is_empty());
+            assert_eq!(state.progress.scope_effects_withheld, 2);
+            assert_eq!(state.progress.scope_actions_withheld, 2);
+        });
+    }
+
+    #[test]
+    fn failed_refresh_preserves_scope_and_success_preserves_saturating_history() {
+        with_global_atc(|| {
+            let mut state = HydrationState::default();
+            state.refresh_with(10, || Ok(vec![row("BlueLake", 1, "/alpha")])).unwrap();
+            finish_local_hydration(&mut state);
+            state.progress.scope_effects_withheld = u64::MAX - 1;
+            state.progress.scope_actions_withheld = u64::MAX - 1;
+            let mut blocked = release_report(&["RetiredOne", "RetiredTwo"], "/alpha");
+            state.filter_report_scope(&mut blocked);
+            assert_eq!(state.progress.scope_effects_withheld, u64::MAX);
+            assert_eq!(state.progress.scope_actions_withheld, u64::MAX);
+            assert_eq!(state.progress.last_scope_effects_withheld, 2);
+            assert!(state.refresh_with(20, || Err("unavailable DB".into())).is_err());
+            assert!(state.progress.refresh_failed);
+            assert!(state.scope.as_ref().unwrap().permits("BlueLake", Some("/alpha")));
+            assert_eq!(state.progress.last_scope_effects_withheld, 2);
+            state.refresh_with(30, || Ok(vec![row("BlueLake", 1, "/alpha")])).unwrap();
+            assert!(!state.progress.refresh_failed);
+            assert_eq!(state.progress.scope_effects_withheld, u64::MAX);
+            assert_eq!(state.progress.scope_actions_withheld, u64::MAX);
+            assert_eq!(state.progress.last_scope_effects_withheld, 0);
+            assert_eq!(state.progress.last_scope_actions_withheld, 0);
+        });
+    }
+
+    #[test]
+    fn public_tick_withholds_actual_remembered_agent_proposals_after_empty_population() {
+        with_global_atc(|| {
+            let now = mcp_agent_mail_core::timestamps::now_micros();
+            engine::atc_sync_agent_snapshot(
+                "RetiredAgent", "codex-cli", Some("/alpha"),
+                now.saturating_sub(3_600_000_000),
+            );
+            assert_eq!(engine::atc_summary().unwrap().tracked_agents.len(), 1);
+            sync_population_with(now, || Ok(Vec::new())).unwrap();
+            for step in 1..=8 {
+                let report = atc::atc_tick_report(now.saturating_add(step * 86_400_000_000)).unwrap();
+                assert!(report.effects.is_empty());
+                assert!(report.actions.is_empty());
+                assert_eq!(report.summary.kernel.pending_effects, 0);
+                if atc_population_hydration_stats().scope_effects_withheld > 0 {
+                    assert_eq!(report.summary.completeness, engine::SnapshotCompleteness::Partial);
+                    assert_eq!(atc::atc_summary().unwrap().completeness, engine::SnapshotCompleteness::Partial);
+                    break;
+                }
+            }
+            assert!(
+                atc_population_hydration_stats().scope_effects_withheld > 0,
+                "an idle engine with no proposals is not proof that public scope filtering ran"
+            );
+            assert_eq!(engine::atc_summary().unwrap().tracked_agents.len(), 1);
+        });
+    }
+
+    #[test]
+    fn public_ambiguity_reporting_and_reset_follow_installed_scope() {
+        with_global_atc(|| {
+            let now = mcp_agent_mail_core::timestamps::now_micros();
+            sync_population_with(now, || Ok(vec![
+                row("BlueLake", 1, "/alpha"), row("BlueLake", 2, "/beta"),
+            ])).unwrap();
+            // Small snapshots can yield after one row under a tight host budget.
+            // Drain through the actual public boundary, not a fabricated success.
+            for _ in 0..3 {
+                let report = atc::atc_tick_report(now).unwrap();
+                assert!(report.effects.is_empty() && report.actions.is_empty());
+                assert_eq!(report.summary.completeness, engine::SnapshotCompleteness::Partial);
+                if atc_population_hydration_stats().pending_agents == 0 {
+                    break;
+                }
+            }
+            assert_eq!(atc_population_hydration_stats().pending_agents, 0);
+            let report = atc::atc_tick_report(now).unwrap();
+            assert!(report.effects.is_empty() && report.actions.is_empty());
+            assert_eq!(report.summary.completeness, engine::SnapshotCompleteness::Partial);
+            assert_eq!(atc_population_hydration_stats().scope_unresolved_names, 1);
+            assert!(atc::atc_summary().unwrap().policy.fallback_active);
+            let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+            atc::reset_global_atc_state_for_test(&config);
+            assert_eq!(atc_population_hydration_stats(), AtcPopulationHydrationStats::default());
+            assert!(hydration().lock().unwrap().scope.is_none());
+        });
+    }
+
+    #[test]
+    fn late_pre_reset_read_cannot_restore_an_old_scope() {
+        with_global_atc(|| {
+            let now = mcp_agent_mail_core::timestamps::now_micros();
+            let stale = sync_population_with(now, || {
+                let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+                atc::reset_global_atc_state_for_test(&config);
+                sync_population_with(now + 1, || Ok(vec![row("FreshAgent", 2, "/beta")])).unwrap();
+                Ok(vec![row("OldAgent", 1, "/alpha")])
+            });
+            assert_eq!(stale.unwrap_err(), "population refresh discarded after ATC reset");
+            let state = hydration().lock().unwrap();
+            let scope = state.scope.as_ref().expect("new epoch scope");
+            assert!(scope.permits("FreshAgent", Some("/beta")));
+            assert!(!scope.permits("OldAgent", Some("/alpha")));
+            assert!(!state.progress.refresh_failed);
+            assert_eq!(state.progress.refresh_failures, 0);
+        });
+    }
+
+    #[test]
+    fn scope_annotation_cannot_erase_a_stronger_runtime_guard_reason() {
+        with_global_atc(|| {
+            let mut state = HydrationState::default();
+            state.refresh_with(10, || Ok(Vec::new())).unwrap();
+            let mut report = release_report(&["RetiredAgent"], "/alpha");
+            report.summary.policy.fallback_reason = Some("calibration_miscalibrated".into());
+            state.filter_report_scope(&mut report);
+            state.annotate(&mut report.summary, 10);
+            assert_eq!(report.summary.completeness, engine::SnapshotCompleteness::Partial);
+            assert!(report.summary.policy.fallback_active);
+            assert_eq!(report.summary.policy.fallback_reason.as_deref(), Some("calibration_miscalibrated"));
+            assert_eq!(state.progress.refresh_failures, 0, "withholding is not a failed database read");
+        });
     }
 }
