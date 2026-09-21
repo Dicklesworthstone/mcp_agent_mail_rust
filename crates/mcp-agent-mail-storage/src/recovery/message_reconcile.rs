@@ -6,6 +6,7 @@
 //! A successful result includes an independently checked Git HEAD, not merely
 //! an enqueue into the best-effort commit queue.
 
+mod attachments;
 pub mod database;
 
 use std::collections::HashSet;
@@ -46,7 +47,10 @@ fn invalid(message: impl Into<String>) -> StorageError {
 /// such as `reply_to` when known. This function deliberately does not infer
 /// those fields from a thread ID. Existing serializers, path validation,
 /// project locks, BCC redaction and canonical-ID collision checks are reused.
-/// Attachment bytes and thread digests are not reconstructed here.
+/// Referenced file attachments and retained originals are restored from verified
+/// Git blobs within the same bundle budget. Missing attachment authority defers
+/// repair; no image conversion or external fetch is attempted. Thread digests
+/// are not reconstructed here.
 ///
 /// # Errors
 ///
@@ -160,12 +164,20 @@ pub fn reconcile_message_bundle(
         (paths.outbox, full.as_bytes()),
     ];
     targets.extend(paths.inbox.into_iter().map(|path| (path, inbox.as_bytes())));
+    let message_target_count = targets.len();
     let repo_root = crate::archive_repo_root_checked(archive)?;
+    let repo = Repository::open(repo_root)?;
+    let attachment_files =
+        attachments::prepare(&repo, archive, entry.message, MAX_BUNDLE_BYTES - bytes)?;
+    targets.extend(
+        attachment_files
+            .iter()
+            .map(|(path, bytes)| (path.clone(), bytes.as_slice())),
+    );
     let rel_paths = targets
         .iter()
         .map(|(path, _)| crate::rel_path_cached(&archive.canonical_repo_root, path))
         .collect::<crate::Result<Vec<_>>>()?;
-    let repo = Repository::open(repo_root)?;
     let expected_oids = targets
         .iter()
         .map(|(_, bytes)| Oid::hash_object(ObjectType::Blob, bytes))
@@ -184,7 +196,12 @@ pub fn reconcile_message_bundle(
             .iter()
             .map(|(path, expected)| artifact_missing(path, expected))
             .collect::<crate::Result<Vec<_>>>()?;
-        if missing.iter().any(|missing| *missing) {
+        // An attachment-only repair cannot create a duplicate canonical ID.
+        if missing
+            .iter()
+            .take(message_target_count)
+            .any(|missing| *missing)
+        {
             reject_recovery_canonical_id_collision(
                 archive,
                 id,
@@ -446,7 +463,9 @@ fn head_contains(repo: &Repository, paths: &[String], oids: &[Oid]) -> crate::Re
                 Err(error) if error.code() == ErrorCode::NotFound => return Ok(false),
                 Err(error) => return Err(error.into()),
             };
-            if kind != ObjectType::Blob || size > MAX_MESSAGE_ARTIFACT_BYTES {
+            // Message inputs have their own 16 MiB bound. Attachments share
+            // the checked aggregate bundle bound rather than the message cap.
+            if kind != ObjectType::Blob || size > MAX_BUNDLE_BYTES {
                 return Ok(false);
             }
             let blob = repo.find_blob(*expected)?;

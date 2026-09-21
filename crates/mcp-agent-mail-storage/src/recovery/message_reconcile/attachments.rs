@@ -1,0 +1,493 @@
+//! Recover attachment bytes without re-running a send or an image conversion.
+//!
+//! Attachment paths must belong to this project's archive. One pinned Git tree
+//! supplies all bytes; missing objects and uncommitted files are not silently
+//! treated as repaired. The caller preflights these files together with every
+//! message copy and publishes only missing destinations, without replacement.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use git2::{ErrorCode, ObjectType, Oid, Repository};
+use serde_json::Value;
+use sha1::{Digest as _, Sha1};
+
+use super::invalid;
+use crate::ProjectArchive;
+
+const MAX_ATTACHMENT_RECORDS: usize = 128;
+const MAX_ATTACHMENT_PATH_BYTES: usize = 4096;
+
+#[derive(Default)]
+struct ExpectedFile {
+    size: Option<u64>,
+    // Image metadata hashes the ORIGINAL, not the converted WebP. Only raw
+    // files and retained originals can be checked against this digest.
+    source_sha1: Option<String>,
+}
+
+fn optional_path<'a>(attachment: &'a Value, field: &str) -> crate::Result<Option<&'a str>> {
+    match attachment.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(path)) => Ok(Some(path)),
+        Some(_) => Err(invalid(format!("attachment {field} is not a path string"))),
+    }
+}
+
+fn source_sha1(attachment: &Value) -> crate::Result<String> {
+    let digest = attachment
+        .get("sha1")
+        .and_then(Value::as_str)
+        .filter(|digest| {
+            digest.len() == 40
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+        .ok_or_else(|| invalid("attachment has no valid original-content SHA1"))?;
+    Ok(digest.to_string())
+}
+
+fn checked_path(archive: &ProjectArchive, path: &str) -> crate::Result<String> {
+    let prefix = format!("projects/{}/attachments/", archive.slug);
+    if path.len() > MAX_ATTACHMENT_PATH_BYTES
+        || !path.starts_with(&prefix)
+        || path.len() == prefix.len()
+        || path.contains('\\')
+        || path.contains(':')
+        || path.bytes().any(|byte| byte.is_ascii_control())
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || crate::validate_repo_relative_path("recovery attachment", path)? != path
+    {
+        return Err(invalid(
+            "recovery attachment path is not inside its project's attachment archive",
+        ));
+    }
+    Ok(path.to_string())
+}
+
+fn add_file(
+    files: &mut BTreeMap<String, ExpectedFile>,
+    archive: &ProjectArchive,
+    path: &str,
+    expected: ExpectedFile,
+) -> crate::Result<()> {
+    let path = checked_path(archive, path)?;
+    let previous = files.entry(path).or_default();
+    if previous.size.zip(expected.size).is_some_and(|(a, b)| a != b)
+        || previous
+            .source_sha1
+            .as_ref()
+            .zip(expected.source_sha1.as_ref())
+            .is_some_and(|(a, b)| a != b)
+    {
+        return Err(invalid("duplicate attachment path has conflicting metadata"));
+    }
+    previous.size = previous.size.or(expected.size);
+    if previous.source_sha1.is_none() {
+        previous.source_sha1 = expected.source_sha1;
+    }
+    Ok(())
+}
+
+fn required_files(
+    archive: &ProjectArchive,
+    message: &Value,
+) -> crate::Result<BTreeMap<String, ExpectedFile>> {
+    let Some(attachments) = message.get("attachments") else {
+        return Ok(BTreeMap::new());
+    };
+    let attachments = attachments
+        .as_array()
+        .ok_or_else(|| invalid("recovery attachment metadata is not an array"))?;
+    if attachments.len() > MAX_ATTACHMENT_RECORDS {
+        return Err(invalid("recovery attachment count budget exceeded"));
+    }
+    let mut files = BTreeMap::new();
+    for attachment in attachments {
+        match attachment.get("type").and_then(Value::as_str) {
+            Some("file") => {
+                let path = optional_path(attachment, "path")?
+                    .ok_or_else(|| invalid("file attachment has no archive path"))?;
+                let size = attachment
+                    .get("bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| invalid("file attachment has no valid byte length"))?;
+                let raw_prefix = format!("projects/{}/attachments/files/", archive.slug);
+                let digest = if path.starts_with(&raw_prefix) {
+                    Some(source_sha1(attachment)?)
+                } else {
+                    None
+                };
+                add_file(
+                    &mut files,
+                    archive,
+                    path,
+                    ExpectedFile {
+                        size: Some(size),
+                        source_sha1: digest,
+                    },
+                )?;
+            }
+            // The message body or data_base64 owns inline bytes. Do not decode
+            // them or manufacture an unreferenced WebP cache during recovery.
+            Some("inline") => {}
+            // External attachments are deliberately not fetched over a network.
+            Some("external") => continue,
+            _ => return Err(invalid("recovery attachment has an unsupported type")),
+        }
+        if let Some(path) = optional_path(attachment, "original_path")? {
+            add_file(
+                &mut files,
+                archive,
+                path,
+                ExpectedFile {
+                    size: None,
+                    source_sha1: Some(source_sha1(attachment)?),
+                },
+            )?;
+        }
+    }
+    Ok(files)
+}
+
+/// Prepare only explicitly referenced file/original attachments. Unique bytes
+/// share the caller's remaining bundle budget; duplicate references still have
+/// to agree about size and original-content identity. No files are written here.
+pub(super) fn prepare(
+    repo: &Repository,
+    archive: &ProjectArchive,
+    message: &Value,
+    mut remaining_bytes: usize,
+) -> crate::Result<Vec<(PathBuf, Vec<u8>)>> {
+    let files = required_files(archive, message)?;
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root = crate::archive_repo_root_checked(archive)?;
+    let head = repo.head().map_err(|error| {
+        if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) {
+            invalid("attachment recovery has no committed source; repair deferred")
+        } else {
+            error.into()
+        }
+    })?;
+    let tree = head.peel_to_tree()?;
+    let odb = repo.odb()?;
+    let mut prepared = Vec::with_capacity(files.len());
+    for (relative, expected) in files {
+        let path = root.join(&relative);
+        if crate::path_existing_prefix_has_symlink(&path)? {
+            return Err(invalid("attachment recovery refuses a symlinked destination"));
+        }
+        let entry = tree
+            .get_path(std::path::Path::new(&relative))
+            .map_err(|error| {
+                if error.code() == ErrorCode::NotFound {
+                    invalid(format!(
+                        "attachment {relative} has no committed source; repair deferred"
+                    ))
+                } else {
+                    error.into()
+                }
+            })?;
+        if entry.kind() != Some(ObjectType::Blob)
+            || !matches!(entry.filemode(), 0o100644 | 0o100755)
+        {
+            return Err(invalid("committed attachment is not a regular-file blob"));
+        }
+        let (size, kind) = odb.read_header(entry.id())?;
+        if kind != ObjectType::Blob || size > remaining_bytes {
+            return Err(invalid("attachment recovery bundle byte budget exceeded"));
+        }
+        if expected.size.is_some_and(|expected| expected != size as u64) {
+            return Err(invalid("attachment byte length conflicts with its committed blob"));
+        }
+        let blob = repo.find_blob(entry.id())?;
+        if blob.content().len() != size
+            || Oid::hash_object_ext(ObjectType::Blob, blob.content(), entry.id().object_format())?
+                != entry.id()
+        {
+            return Err(invalid("attachment content does not match its Git object identity"));
+        }
+        if let Some(expected) = expected.source_sha1
+            && hex::encode(Sha1::digest(blob.content())) != expected
+        {
+            return Err(invalid("attachment original-content SHA1 does not match"));
+        }
+        remaining_bytes -= size;
+        prepared.push((path, blob.content().to_vec()));
+    }
+    Ok(prepared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{ReconcileResult, reconcile_message_bundle};
+    use super::*;
+    use crate::{Config, EmbedPolicy, MessageBundleBatchEntry, StoredAttachment};
+    use serde_json::json;
+
+    fn fixture() -> (tempfile::TempDir, Config, ProjectArchive, Value, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            storage_root: dir.path().to_path_buf(),
+            keep_original_images: true,
+            ..Config::default()
+        };
+        let archive = crate::ensure_archive(&config, "attachments-project").unwrap();
+        let message = json!({
+            "id": 42, "from": "BlueLake", "to": ["GreenStone"], "cc": [], "bcc": ["RedFox"],
+            "subject": "Attachment handoff", "created": "2026-09-21T01:02:03.123456Z",
+            "project": "/test/attachments", "project_slug": "attachments-project",
+            "thread_id": null, "importance": "normal", "ack_required": true, "attachments": [],
+        });
+        (
+            dir,
+            config,
+            archive,
+            message,
+            vec!["GreenStone".into(), "RedFox".into()],
+        )
+    }
+
+    fn repair(
+        archive: &ProjectArchive,
+        config: &Config,
+        message: &Value,
+        recipients: &[String],
+    ) -> crate::Result<ReconcileResult> {
+        reconcile_message_bundle(
+            archive,
+            config,
+            MessageBundleBatchEntry {
+                message,
+                body_md: "Keep the attached bytes.",
+                sender: "BlueLake",
+                recipients,
+                extra_paths: &[],
+            },
+        )
+    }
+
+    fn commit_attachment(archive: &ProjectArchive, config: &Config, stored: &StoredAttachment) {
+        let paths = stored
+            .rel_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        crate::commit_paths_with_retry(&archive.repo_root, config, "fixture: attachment", &paths)
+            .unwrap();
+    }
+
+    fn raw(
+        archive: &ProjectArchive,
+        config: &Config,
+        name: &str,
+        bytes: &[u8],
+    ) -> StoredAttachment {
+        let source = config.storage_root.join(name);
+        std::fs::write(&source, bytes).unwrap();
+        let stored = crate::store_raw_attachment(archive, &source, 0).unwrap();
+        commit_attachment(archive, config, &stored);
+        stored
+    }
+
+    #[test]
+    fn raw_attachment_only_repair_restores_exact_bytes_without_a_new_commit() {
+        let (_dir, config, archive, mut message, recipients) = fixture();
+        let bytes = b"raw binary\x00\xff preserved";
+        let stored = raw(&archive, &config, "source.bin", bytes);
+        message["attachments"] = json!([stored.meta]);
+        repair(&archive, &config, &message, &recipients).unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let before = repo.head().unwrap().target().unwrap();
+        let path = archive.repo_root.join(stored.meta.path.as_ref().unwrap());
+        let evidence = config.storage_root.join("retained-attachment.bin");
+        std::fs::rename(&path, &evidence).unwrap();
+        let result = repair(&archive, &config, &message, &recipients).unwrap();
+        assert_eq!(result.files_created, 1);
+        assert!(!result.git_commit_needed);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read(&evidence).unwrap(), bytes);
+        assert_eq!(repo.head().unwrap().target().unwrap(), before);
+        assert_eq!(
+            repair(&archive, &config, &message, &recipients).unwrap(),
+            ReconcileResult::default()
+        );
+    }
+
+    #[test]
+    fn real_image_and_original_recovery_does_not_hash_webp_as_original() {
+        let (_dir, config, archive, mut message, recipients) = fixture();
+        let source = config.storage_root.join("source.png");
+        image::RgbImage::new(2, 2).save(&source).unwrap();
+        let stored =
+            crate::store_attachment(&archive, &config, &source, EmbedPolicy::File).unwrap();
+        commit_attachment(&archive, &config, &stored);
+        let webp = archive.repo_root.join(stored.meta.path.as_ref().unwrap());
+        let original = archive
+            .repo_root
+            .join(stored.meta.original_path.as_ref().unwrap());
+        let expected_webp = std::fs::read(&webp).unwrap();
+        let expected_original = std::fs::read(&original).unwrap();
+        assert_ne!(hex::encode(Sha1::digest(&expected_webp)), stored.meta.sha1);
+        assert_eq!(hex::encode(Sha1::digest(&expected_original)), stored.meta.sha1);
+        message["attachments"] = json!([stored.meta]);
+        std::fs::rename(&webp, config.storage_root.join("retained.webp")).unwrap();
+        std::fs::rename(&original, config.storage_root.join("retained.png")).unwrap();
+        let result = repair(&archive, &config, &message, &recipients).unwrap();
+        assert_eq!(result.files_created, 6);
+        assert!(result.git_commit_needed);
+        assert_eq!(std::fs::read(&webp).unwrap(), expected_webp);
+        assert_eq!(std::fs::read(&original).unwrap(), expected_original);
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        for path in paths.inbox {
+            let (copy, _) = super::super::read_surviving_message(&path).unwrap().unwrap();
+            assert_eq!(copy["bcc"], json!([]));
+            assert_eq!(copy["attachments"], message["attachments"]);
+        }
+        assert_eq!(
+            repair(&archive, &config, &message, &recipients).unwrap(),
+            ReconcileResult::default()
+        );
+    }
+
+    #[test]
+    fn attachment_conflict_preflights_before_any_message_or_attachment_is_created() {
+        let (_dir, config, archive, mut message, recipients) = fixture();
+        let first = raw(&archive, &config, "first.bin", b"first");
+        let second = raw(&archive, &config, "second.bin", b"second");
+        message["attachments"] = json!([first.meta, second.meta]);
+        let first_path = archive.repo_root.join(first.meta.path.as_ref().unwrap());
+        let second_path = archive.repo_root.join(second.meta.path.as_ref().unwrap());
+        std::fs::rename(&first_path, config.storage_root.join("retained-first.bin")).unwrap();
+        std::fs::write(&second_path, b"conflicting evidence").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let before = repo.head().unwrap().target().unwrap();
+        assert!(repair(&archive, &config, &message, &recipients).is_err());
+        assert!(!first_path.exists());
+        assert!(!archive.root.join("messages").exists());
+        assert_eq!(std::fs::read(&second_path).unwrap(), b"conflicting evidence");
+        assert_eq!(repo.head().unwrap().target().unwrap(), before);
+    }
+
+    #[test]
+    fn metadata_and_bundle_budgets_are_checked_before_publication() {
+        let (_dir, config, archive, mut message, recipients) = fixture();
+        let stored = raw(&archive, &config, "source.bin", b"12345");
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let metadata = serde_json::to_value(&stored.meta).unwrap();
+        message["attachments"] = json!([metadata, metadata]);
+        assert_eq!(prepare(&repo, &archive, &message, 5).unwrap().len(), 1);
+        assert!(prepare(&repo, &archive, &message, 4).is_err());
+        message["attachments"][1]["bytes"] = json!(6);
+        assert!(repair(&archive, &config, &message, &recipients).is_err());
+        message["attachments"] = json!([metadata]);
+        message["attachments"][0]["bytes"] = json!(6);
+        assert!(repair(&archive, &config, &message, &recipients).is_err());
+        message["attachments"][0]["bytes"] = json!(5);
+        message["attachments"][0]["sha1"] = json!("0".repeat(40));
+        assert!(repair(&archive, &config, &message, &recipients).is_err());
+        message["attachments"] = json!(vec![metadata; MAX_ATTACHMENT_RECORDS + 1]);
+        assert!(prepare(&repo, &archive, &message, usize::MAX).is_err());
+        assert!(!archive.root.join("messages").exists());
+    }
+
+    #[test]
+    fn foreign_traversal_and_missing_attachment_authority_never_create_mail() {
+        let (_dir, config, archive, mut message, recipients) = fixture();
+        for path in [
+            "projects/foreign/attachments/source.bin",
+            "projects/attachments-project/attachments/../source.bin",
+            "projects/attachments-project/attachments//source.bin",
+            "projects/attachments-project/attachments/./source.bin",
+            "projects/attachments-project/attachments/../../.git/config",
+            "projects/attachments-project/attachments/source.bin:stream",
+            "projects/attachments-project/attachments/source\0.bin",
+            "projects/attachments-project/attachments/missing.bin",
+        ] {
+            message["attachments"] = json!([{"type": "file", "bytes": 5, "path": path}]);
+            assert!(
+                repair(&archive, &config, &message, &recipients).is_err(),
+                "{path}"
+            );
+            assert!(!archive.root.join("messages").exists());
+        }
+        message["attachments"] = json!([
+            {"type": "inline", "data_base64": "aGk="},
+            {"type": "external", "url": "https://example.invalid/never-fetch"},
+        ]);
+        assert_eq!(
+            repair(&archive, &config, &message, &recipients)
+                .unwrap()
+                .files_created,
+            4
+        );
+    }
+
+    #[test]
+    fn inline_image_recovery_preserves_embedded_bytes_and_restores_its_original() {
+        let (_dir, config, archive, mut message, recipients) = fixture();
+        let source = config.storage_root.join("inline.png");
+        image::RgbImage::new(2, 2).save(&source).unwrap();
+        let stored =
+            crate::store_attachment(&archive, &config, &source, EmbedPolicy::Inline).unwrap();
+        commit_attachment(&archive, &config, &stored);
+        assert!(stored.meta.path.is_none());
+        let original = archive
+            .repo_root
+            .join(stored.meta.original_path.as_ref().unwrap());
+        let bytes = std::fs::read(&original).unwrap();
+        std::fs::rename(&original, config.storage_root.join("retained-inline.png")).unwrap();
+        message["attachments"] = json!([stored.meta]);
+        let result = repair(&archive, &config, &message, &recipients).unwrap();
+        assert_eq!(result.files_created, 5);
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        let (copy, _) = super::super::read_surviving_message(&paths.canonical)
+            .unwrap()
+            .unwrap();
+        assert_eq!(copy["attachments"][0]["data_base64"], stored.meta.data_base64.unwrap());
+    }
+
+    #[test]
+    fn attachment_larger_than_message_limit_still_verifies_under_bundle_limit() {
+        let (_dir, config, archive, mut message, recipients) = fixture();
+        let bytes = vec![42; super::super::MAX_MESSAGE_ARTIFACT_BYTES + 1];
+        let stored = raw(&archive, &config, "large.bin", &bytes);
+        message["attachments"] = json!([stored.meta]);
+        let path = archive.repo_root.join(stored.meta.path.as_ref().unwrap());
+        std::fs::rename(&path, config.storage_root.join("retained-large.bin")).unwrap();
+        let result = repair(&archive, &config, &message, &recipients).unwrap();
+        assert_eq!(result.files_created, 5);
+        assert!(result.git_commit_needed);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            repair(&archive, &config, &message, &recipients).unwrap(),
+            ReconcileResult::default()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_attachment_destinations_preserve_the_link_and_target() {
+        let (_dir, config, archive, mut message, recipients) = fixture();
+        let stored = raw(&archive, &config, "source.bin", b"source bytes");
+        message["attachments"] = json!([stored.meta]);
+        let path = archive.repo_root.join(stored.meta.path.as_ref().unwrap());
+        let outside = config.storage_root.join("retained-outside.bin");
+        std::fs::rename(&path, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        assert!(repair(&archive, &config, &message, &recipients).is_err());
+        assert_eq!(std::fs::read_link(&path).unwrap(), outside);
+        assert_eq!(std::fs::read(&outside).unwrap(), b"source bytes");
+        assert!(!archive.root.join("messages").exists());
+    }
+}
