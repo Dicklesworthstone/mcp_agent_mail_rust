@@ -31,10 +31,13 @@
 //!     renaming any member of the live SQLite generation.
 //!
 //! The promotion barrier is reentrant per thread (recovery code that re-enters
-//! helper paths must not deadlock on itself). Write activity has no per-thread
-//! exemption: async tool futures are `Send` and may migrate between executor
-//! threads. Cold pool bootstrap therefore uses an explicit promotion-barrier
-//! to writer handoff before returning the live pool.
+//! helper paths must not deadlock on itself). Exclusion ownership is distinct
+//! from a successful drain: nested helpers cannot turn a timed-out guard into
+//! permission to promote, even if its last writer subsequently finishes.
+//! Write activity has no per-thread exemption from the writer count: async
+//! tool futures are `Send` and may migrate between executor threads. Cold pool
+//! bootstrap uses an explicit promotion-barrier to writer handoff; while that
+//! writer is counted, nested promotion is unavailable.
 //!
 //! The barrier is process-global rather than per-path: promotions are rare,
 //! and a global gate keeps the lock graph trivial.
@@ -96,6 +99,15 @@ pub fn archive_reconcile_min_interval() -> Duration {
 struct BarrierState {
     writers: usize,
     promotion_active: bool,
+    /// The owning attempt observed idleness or completed its drain in budget.
+    /// A timeout leaves this false until the entire failed ownership ends.
+    promotion_ready: bool,
+}
+
+impl BarrierState {
+    const fn can_promote(&self) -> bool {
+        self.promotion_active && self.promotion_ready && self.writers == 0
+    }
 }
 
 struct Barrier {
@@ -113,6 +125,7 @@ fn barrier() -> &'static Barrier {
         state: Mutex::new(BarrierState {
             writers: 0,
             promotion_active: false,
+            promotion_ready: false,
         }),
         writers_drained: Condvar::new(),
         promotion_released: Condvar::new(),
@@ -120,7 +133,7 @@ fn barrier() -> &'static Barrier {
 }
 
 thread_local! {
-    /// Whether the current thread already holds the promotion barrier.
+    /// Exclusion ownership, including a timed-out attempt awaiting drop.
     static THREAD_BARRIER_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -128,14 +141,19 @@ fn current_thread_holds_barrier() -> bool {
     THREAD_BARRIER_DEPTH.with(Cell::get) > 0
 }
 
-/// Whether the calling thread is already inside a promotion barrier.
+/// Whether this thread owns a successfully drained, currently write-idle gate.
 ///
-/// True while executing as part of an ongoing recovery operation. Pacing
-/// gates (cooldowns, idle checks) apply only to standalone drift reconciles,
-/// never to steps nested inside a recovery that already owns the barrier.
+/// Nested recovery may bypass standalone pacing only with this entitlement.
+/// A timed-out guard still excludes new writers but returns false here, even
+/// after a late writer drains. Drop that attempt before trying again. A counted
+/// promotion-to-writer handoff also returns false until its writer is dropped.
 #[must_use]
 pub fn current_thread_holds_promotion_barrier() -> bool {
-    current_thread_holds_barrier()
+    if !current_thread_holds_barrier() {
+        return false;
+    }
+    let state = barrier().state.lock().unwrap_or_else(PoisonError::into_inner);
+    state.can_promote()
 }
 
 /// RAII lease marking one in-flight write-path operation.
@@ -157,8 +175,8 @@ pub struct WriteActivityGuard {
 pub fn begin_write_activity() -> WriteActivityGuard {
     let b = barrier();
     let mut state = b.state.lock().unwrap_or_else(PoisonError::into_inner);
-    // A thread already inside the promotion barrier is the recovery path
-    // itself re-entering a helper; it must not block on its own barrier.
+    // Raw exclusion ownership avoids self-deadlock during the explicit
+    // recovery-to-writer handoff. It does not exempt this writer from counting.
     if !current_thread_holds_barrier() {
         let wait_started = Instant::now();
         let mut warned = false;
@@ -217,12 +235,12 @@ pub enum DrainOutcome {
     Idle,
     /// Foreign writers drained within the shared acquisition timeout.
     Drained { waited: Duration },
-    /// The acquisition budget expired, either behind another promotion or
-    /// while draining writers. The returned guard retains ownership only if
-    /// this call acquired it; a queued timeout returns an inert guard.
-    /// `remaining_writers` is diagnostic and may be zero when another
-    /// promotion consumed the budget. Neither case authorizes mutation:
-    /// the caller must drop the guard and defer recovery.
+    /// The budget expired or nested acquisition lacked a successful drain.
+    /// The returned guard retains ownership only if this call acquired it;
+    /// a queued or refused nested acquisition returns an inert guard.
+    /// `remaining_writers` is diagnostic and may be zero after a late drain
+    /// or when another promotion consumed the budget. None of these cases
+    /// authorizes mutation: drop the guard and defer recovery.
     TimedOut { remaining_writers: usize },
 }
 
@@ -231,7 +249,8 @@ pub enum DrainOutcome {
 /// While held, new write activity blocks in [`begin_write_activity`].
 /// Reentrant per thread: each acquired guard contributes a lease and only
 /// the last release re-opens the write path, regardless of drop order.
-/// A guard returned after timing out before acquisition owns nothing.
+/// Exclusion alone is not promotion permission: callers must check the drain
+/// outcome. A refused queued or nested acquisition owns nothing.
 #[must_use = "the promotion barrier releases when this guard drops"]
 pub struct PromotionBarrierGuard {
     participating: bool,
@@ -274,6 +293,7 @@ impl Drop for PromotionBarrierGuard {
         }
         let b = barrier();
         let mut state = b.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.promotion_ready = false;
         state.promotion_active = false;
         drop(state);
         // Wake blocked writers and any queued promotion.
@@ -284,45 +304,74 @@ impl Drop for PromotionBarrierGuard {
 
 /// Acquire the promotion barrier only if the process is write-idle.
 ///
-/// Returns `None` when another promotion is active or when any write
-/// is in flight — the caller (an archive-drift reconcile) should defer and
-/// let the admission machinery retry later.
+/// Returns `None` when another promotion is active, any write is in flight,
+/// or this thread still owns an unsuccessful drain. Nesting cannot promote
+/// that unsuccessful attempt into permission; drop it before trying again.
 #[must_use]
 pub fn try_acquire_promotion_barrier_if_idle() -> Option<PromotionBarrierGuard> {
-    if current_thread_holds_barrier() {
-        return Some(PromotionBarrierGuard::new_held());
-    }
     let b = barrier();
     let mut state = b.state.lock().unwrap_or_else(PoisonError::into_inner);
-    if state.promotion_active {
-        return None;
+    if current_thread_holds_barrier() {
+        let ready = state.can_promote();
+        drop(state);
+        return ready.then(PromotionBarrierGuard::new_held);
     }
-    if state.writers > 0 {
+    if state.promotion_active || state.writers > 0 {
         return None;
     }
     state.promotion_active = true;
+    state.promotion_ready = true;
     drop(state);
     Some(PromotionBarrierGuard::new_held())
+}
+
+/// Decide whether a drain wait is complete, including a late release wakeup.
+/// The original budget wins even if the last writer finished before we could
+/// reacquire the mutex. Initial zero-budget idle admission is handled separately.
+fn drain_progress(
+    remaining_writers: usize,
+    waited: Duration,
+    timeout: Duration,
+) -> Option<DrainOutcome> {
+    if waited >= timeout {
+        Some(DrainOutcome::TimedOut { remaining_writers })
+    } else if remaining_writers == 0 {
+        Some(DrainOutcome::Drained { waited })
+    } else {
+        None
+    }
 }
 
 /// Acquire the promotion barrier for corruption recovery.
 ///
 /// Shares one `timeout` between waiting for a previous promotion and draining
 /// writers. Once ownership is obtained, new writers are blocked immediately.
-/// A timeout after ownership retains the barrier until the returned guard is
-/// dropped; a timeout while queued owns no barrier or thread-local exemption.
+/// A timeout after ownership retains exclusion until the guard is dropped but
+/// never grants nested promotion permission, even after a late writer drains.
+/// Queued timeouts and refused nested calls return inert guards. A nested call
+/// cannot wait on a writer that its own caller may own: it refuses immediately.
 /// Callers must treat every [`DrainOutcome::TimedOut`] as a refusal to promote,
 /// including a timeout reporting zero writers. A zero budget can acquire an
 /// immediately idle barrier, but never waits for another owner or a writer.
 pub fn acquire_promotion_barrier_draining(
     timeout: Duration,
 ) -> (PromotionBarrierGuard, DrainOutcome) {
-    if current_thread_holds_barrier() {
-        return (PromotionBarrierGuard::new_held(), DrainOutcome::Idle);
-    }
     let started = Instant::now();
     let b = barrier();
     let mut state = b.state.lock().unwrap_or_else(PoisonError::into_inner);
+    if current_thread_holds_barrier() {
+        let ready = state.can_promote();
+        let remaining_writers = state.writers;
+        drop(state);
+        return if ready {
+            (PromotionBarrierGuard::new_held(), DrainOutcome::Idle)
+        } else {
+            (
+                PromotionBarrierGuard::new_unheld(),
+                DrainOutcome::TimedOut { remaining_writers },
+            )
+        };
+    }
     // Queueing is part of the same budget as draining. A timeout here must
     // not construct a held/nested guard: that would release another owner's
     // gate or let this thread bypass it on a subsequent write operation.
@@ -352,29 +401,27 @@ pub fn acquire_promotion_barrier_draining(
         return (PromotionBarrierGuard::new_unheld(), outcome);
     }
     state.promotion_active = true;
+    state.promotion_ready = false;
 
     let outcome = if state.writers == 0 {
         DrainOutcome::Idle
     } else {
         loop {
-            let remaining = timeout.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                break DrainOutcome::TimedOut {
-                    remaining_writers: state.writers,
-                };
+            let waited = started.elapsed();
+            if let Some(outcome) = drain_progress(state.writers, waited, timeout) {
+                break outcome;
             }
+            let remaining = timeout.saturating_sub(waited);
             let (next, _timeout) = b
                 .writers_drained
                 .wait_timeout(state, remaining.min(WRITER_WAIT_WARN_INTERVAL))
                 .unwrap_or_else(PoisonError::into_inner);
             state = next;
-            if state.writers == 0 {
-                break DrainOutcome::Drained {
-                    waited: started.elapsed(),
-                };
-            }
+            // Re-evaluate the same deadline before accepting the zero-writer
+            // wakeup. A release after the budget cannot authorize promotion.
         }
     };
+    state.promotion_ready = !matches!(outcome, DrainOutcome::TimedOut { .. });
     drop(state);
     (PromotionBarrierGuard::new_held(), outcome)
 }
@@ -807,7 +854,8 @@ mod tests {
                 remaining_writers: 1
             }
         );
-        assert!(current_thread_holds_promotion_barrier());
+        assert!(current_thread_holds_barrier(), "timeout retains exclusion ownership");
+        assert!(!current_thread_holds_promotion_barrier(), "timeout grants no promotion entitlement");
         assert!(barrier().state.lock().unwrap().promotion_active);
         drop(timed_out);
         assert!(!current_thread_holds_promotion_barrier());
@@ -859,5 +907,191 @@ mod tests {
             .expect("migrated writer");
         assert_eq!(active_writer_count(), 0);
         assert!(try_acquire_promotion_barrier_if_idle().is_some());
+    }
+
+    fn assert_nested_promotion_refused(remaining_writers: usize) {
+        let depth = THREAD_BARRIER_DEPTH.with(Cell::get);
+        assert!(depth > 0);
+        assert!(!current_thread_holds_promotion_barrier());
+        assert!(try_acquire_promotion_barrier_if_idle().is_none());
+        let (nested, outcome) = acquire_promotion_barrier_draining(Duration::ZERO);
+        assert_eq!(outcome, DrainOutcome::TimedOut { remaining_writers });
+        assert!(!nested.participating, "refused nesting must not gain a lease");
+        drop(nested);
+        assert_eq!(THREAD_BARRIER_DEPTH.with(Cell::get), depth);
+        assert!(barrier().state.lock().unwrap().promotion_active);
+    }
+
+    #[test]
+    fn failed_owned_drain_cannot_be_upgraded_by_nested_recovery() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let writer = begin_write_activity();
+        let (failed, outcome) = acquire_promotion_barrier_draining(Duration::ZERO);
+        assert_eq!(outcome, DrainOutcome::TimedOut { remaining_writers: 1 });
+        assert!(failed.participating);
+        assert_nested_promotion_refused(1);
+        drop(writer);
+        // Even observing zero writers later cannot extend the expired attempt.
+        assert_nested_promotion_refused(0);
+        drop(failed);
+        let fresh = try_acquire_promotion_barrier_if_idle().expect("fresh idle admission");
+        assert!(current_thread_holds_promotion_barrier());
+        drop(fresh);
+    }
+
+    #[test]
+    fn handoff_writer_suspends_nested_promotion_until_it_finishes() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let outer = try_acquire_promotion_barrier_if_idle().expect("outer");
+        let writer = begin_write_activity();
+        assert_nested_promotion_refused(1);
+        drop(writer);
+        assert!(current_thread_holds_promotion_barrier());
+        let inner = try_acquire_promotion_barrier_if_idle().expect("handoff finished");
+        drop(outer);
+        assert!(current_thread_holds_promotion_barrier());
+        drop(inner);
+        assert!(!barrier().state.lock().unwrap().promotion_active);
+    }
+
+    #[test]
+    fn migrated_handoff_writer_cannot_be_hidden_by_promotion_thread_ownership() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let outer = try_acquire_promotion_barrier_if_idle().expect("outer");
+        let writer = begin_write_activity();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let released = release_rx.recv_timeout(Duration::from_secs(5));
+            drop(writer);
+            released
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_nested_promotion_refused(1);
+        release_tx.send(()).unwrap();
+        worker.join().unwrap().expect("release migrated writer");
+        let (inner, outcome) = acquire_promotion_barrier_draining(Duration::ZERO);
+        assert_eq!(outcome, DrainOutcome::Idle);
+        drop(outer);
+        assert!(current_thread_holds_promotion_barrier());
+        drop(inner);
+    }
+
+    #[test]
+    fn refused_nested_guard_cannot_release_a_later_fresh_attempt() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let writer = begin_write_activity();
+        let (failed, _) = acquire_promotion_barrier_draining(Duration::ZERO);
+        let (refused, outcome) = acquire_promotion_barrier_draining(Duration::ZERO);
+        assert_eq!(outcome, DrainOutcome::TimedOut { remaining_writers: 1 });
+        assert!(!refused.participating);
+        drop(writer);
+        drop(failed);
+        let fresh = try_acquire_promotion_barrier_if_idle().expect("new attempt");
+        drop(refused);
+        assert!(current_thread_holds_promotion_barrier());
+        assert!(barrier().state.lock().unwrap().promotion_active);
+        drop(fresh);
+    }
+
+    #[test]
+    fn failed_drain_still_excludes_new_writers_until_its_guard_drops() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let first_writer = begin_write_activity();
+        let (failed, _) = acquire_promotion_barrier_draining(Duration::ZERO);
+        drop(first_writer);
+        assert_nested_promotion_refused(0);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let late = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _writer = begin_write_activity();
+            entered_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before_drop = entered_rx.recv_timeout(Duration::from_millis(50));
+        drop(failed);
+        let after_drop = entered_rx.recv_timeout(Duration::from_secs(5));
+        late.join().expect("late writer");
+        assert_eq!(before_drop, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        assert!(after_drop.is_ok());
+        assert_eq!(active_writer_count(), 0);
+    }
+
+    #[test]
+    fn drain_wakeup_must_precede_the_original_deadline() {
+        let budget = Duration::from_millis(100);
+        assert_eq!(
+            drain_progress(0, Duration::from_millis(99), budget),
+            Some(DrainOutcome::Drained { waited: Duration::from_millis(99) })
+        );
+        for waited in [budget, budget + Duration::from_nanos(1), Duration::MAX] {
+            for remaining_writers in [0, 1] {
+                assert_eq!(
+                    drain_progress(remaining_writers, waited, budget),
+                    Some(DrainOutcome::TimedOut { remaining_writers })
+                );
+            }
+        }
+        assert_eq!(drain_progress(1, Duration::from_millis(99), budget), None);
+        assert_eq!(
+            drain_progress(0, Duration::ZERO, Duration::ZERO),
+            Some(DrainOutcome::TimedOut { remaining_writers: 0 })
+        );
+    }
+
+    #[test]
+    fn denied_nested_recovery_preserves_the_open_writer_file_generation() {
+        if run_in_isolated_process() {
+            return;
+        }
+        use std::io::Write;
+
+        // Real file handles and renames exercise the admission boundary, not
+        // SQLite reconstruction. Preserve both generations for inspection.
+        let root = tempfile::tempdir().unwrap().keep();
+        let live = root.join("live-generation");
+        let candidate = root.join("candidate-generation");
+        let saved = root.join("saved-generation");
+        std::fs::write(&live, b"original;").unwrap();
+        std::fs::write(&candidate, b"replacement;").unwrap();
+        let writer_guard = begin_write_activity();
+        let mut writer = std::fs::OpenOptions::new().append(true).open(&live).unwrap();
+        let (failed, _) = acquire_promotion_barrier_draining(Duration::ZERO);
+        let (nested, outcome) = acquire_promotion_barrier_draining(Duration::ZERO);
+        if matches!(outcome, DrainOutcome::Idle | DrainOutcome::Drained { .. }) {
+            std::fs::rename(&live, &saved).unwrap();
+            std::fs::rename(&candidate, &live).unwrap();
+        }
+        writer.write_all(b"acknowledged;").unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+        drop(writer_guard);
+        drop(nested);
+        assert_eq!(std::fs::read(&live).unwrap(), b"original;acknowledged;");
+        assert_eq!(std::fs::read(&candidate).unwrap(), b"replacement;");
+        assert!(!saved.exists());
+        assert_nested_promotion_refused(0);
+        drop(failed);
+
+        // Positive control: a fresh, genuinely idle admission can replace the
+        // file without stranding any writer, retaining the original contents.
+        let fresh = try_acquire_promotion_barrier_if_idle().expect("verified idle gate");
+        std::fs::rename(&live, &saved).unwrap();
+        std::fs::rename(&candidate, &live).unwrap();
+        assert_eq!(std::fs::read(&saved).unwrap(), b"original;acknowledged;");
+        assert_eq!(std::fs::read(&live).unwrap(), b"replacement;");
+        drop(fresh);
     }
 }
