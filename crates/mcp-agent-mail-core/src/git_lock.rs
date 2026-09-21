@@ -6,15 +6,17 @@
 //! - [`GitRepoLocks`] — in-process `Mutex<HashMap<PathBuf,
 //!   Arc<Mutex<()>>>>` keyed by canonical repo path. Serializes OUR
 //!   threads.
-//! - [`RepoFlock`] — OS-level `fcntl` flock on
+//! - [`RepoFlock`] — OS-level cooperative lock on
 //!   `<admin_dir>/am.git-serialize.lock`. Coordinates with peer
 //!   processes that honor the same sentinel.
 //!
 //! Acquisition order: mutex first, flock second. Release reverses.
+//! Timed admission uses one monotonic budget, including interruptions and
+//! diagnostic time. It cannot preempt an individual filesystem syscall.
 //!
 //! # When to use
 //!
-//! Callers should prefer [`GitCmd`] (in [`super::git_cmd`], B4) which
+//! Callers should prefer [`GitCmd`](super::git_cmd::GitCmd) (B4), which
 //! combines both layers with `AM_GIT_BINARY` resolution and a
 //! SIGSEGV-retry-capable runner. Direct use of [`GitRepoLocks`] /
 //! [`RepoFlock`] is for special cases (e.g., Track F's
@@ -37,7 +39,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
@@ -48,6 +50,72 @@ pub const DEFAULT_FLOCK_TIMEOUT_SECS: u64 = 60;
 
 /// How often the acquire watchdog logs WARN while waiting for flock.
 const FLOCK_WATCHDOG_TICK: Duration = Duration::from_secs(5);
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
+fn lock_timeout(timeout: Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("git lock admission exceeded {timeout:?}; operation was not admitted"),
+    )
+}
+
+/// Shared polling policy for mutexes and advisory locks. The elapsed callback
+/// starts BEFORE setup, not after the first failed acquisition. A returned
+/// value owns any acquired resource, so rejecting a late success drops it.
+/// The flock caller retains its file until this function returns, including
+/// error returns, and releases its advisory lock by dropping that file.
+fn wait_for_lock<T>(
+    timeout: Duration,
+    mut elapsed: impl FnMut() -> Duration,
+    mut acquire: impl FnMut() -> io::Result<Option<T>>,
+    mut pause: impl FnMut(Duration),
+) -> io::Result<T> {
+    let mut first = true;
+    loop {
+        // Zero means one immediate try, not an unbounded wait. Positive
+        // budgets do not get a fresh try after setup has exhausted them.
+        if (!first || !timeout.is_zero()) && elapsed() >= timeout {
+            return Err(lock_timeout(timeout));
+        }
+        first = false;
+        match acquire() {
+            Ok(Some(value)) => {
+                if !timeout.is_zero() && elapsed() >= timeout {
+                    drop(value);
+                    return Err(lock_timeout(timeout));
+                }
+                return Ok(value);
+            }
+            Ok(None) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+        let remaining = timeout.saturating_sub(elapsed());
+        if remaining.is_zero() {
+            return Err(lock_timeout(timeout));
+        }
+        pause(remaining.min(LOCK_RETRY_INTERVAL));
+    }
+}
+
+/// Bound an in-process lock wait without delegating it to an orphanable thread.
+/// Poison recovery preserves the existing state; no callback logs under the lock.
+pub(crate) fn lock_mutex_with_timeout<T>(
+    mutex: &Mutex<T>,
+    timeout: Duration,
+) -> io::Result<MutexGuard<'_, T>> {
+    let started = Instant::now();
+    wait_for_lock(
+        timeout,
+        || started.elapsed(),
+        || match mutex.try_lock() {
+            Ok(guard) => Ok(Some(guard)),
+            Err(TryLockError::Poisoned(error)) => Ok(Some(error.into_inner())),
+            Err(TryLockError::WouldBlock) => Ok(None),
+        },
+        std::thread::sleep,
+    )
+}
 
 /// Process-wide map of per-repo mutexes.
 ///
@@ -84,7 +152,23 @@ impl GitRepoLocks {
             .clone()
     }
 
-    /// Test-only: wipe all entries. Keeps tests isolated.
+    /// Like [`Self::lock_for`], but the registry wait consumes the caller's
+    /// remaining budget. This does not acquire the returned repository mutex.
+    /// A timeout never evicts or replaces another caller's lock identity.
+    pub fn lock_for_with_timeout(
+        &self,
+        canonical_repo: &Path,
+        timeout: Duration,
+    ) -> io::Result<Arc<Mutex<()>>> {
+        let mut guard = lock_mutex_with_timeout(&self.inner, timeout)?;
+        Ok(Arc::clone(
+            guard
+                .entry(canonical_repo.to_path_buf())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        ))
+    }
+
+    /// Test-only: wipe all entries. Must not race callers using this registry.
     #[cfg(test)]
     pub fn reset_for_test(&self) {
         let mut guard = self
@@ -172,14 +256,11 @@ pub fn sentinel_path(repo_canonical: &Path) -> Option<PathBuf> {
     admin_dir_for(repo_canonical).map(|ad| ad.join("am.git-serialize.lock"))
 }
 
-/// OS-level cooperative lock on a repo's sentinel file.
+/// OS-level cooperative lock on a repo's sentinel file, released on drop.
 ///
-/// Acquired via `fcntl F_SETLK LOCK_EX` (fs2 crate). Released on drop.
-///
-/// If the sentinel can't be created (read-only `.git`, permissions,
-/// network FS refusal), this returns a "phantom" `RepoFlock` that holds
-/// no file and does nothing on drop. Callers are notified via
-/// [`RepoFlock::is_real`].
+/// If the sentinel can't be created due to permissions, this returns a
+/// "phantom" `RepoFlock` holding no file. Callers can inspect [`Self::is_real`].
+/// Other failures, including contention timeout, remain errors.
 #[derive(Debug)]
 pub struct RepoFlock {
     /// Underlying file descriptor holding the lock. `None` = phantom.
@@ -198,28 +279,20 @@ fn is_lock_contention(error: &io::Error) -> bool {
 }
 
 impl RepoFlock {
-    /// Try to acquire the flock, blocking up to `timeout` total.
-    ///
-    /// # Errors
-    ///
-    /// - `io::ErrorKind::TimedOut`: waited the full timeout without
-    ///   getting the lock. Caller should abort its git op rather than
-    ///   retry forever.
-    /// - `io::ErrorKind::PermissionDenied`: sentinel file cannot be
-    ///   created; returns a phantom `RepoFlock` instead of an error
-    ///   (see [`Self::try_acquire_phantom_on_failure`]).
-    /// - Other IO errors propagate.
-    ///
-    /// # Panics
-    ///
-    /// Does not panic.
+    /// Acquire with the configured contention budget. Permission-denied or
+    /// unrecognized repositories retain the explicit phantom-lock behavior.
+    /// Contention timeout and other I/O errors are returned to the caller.
     pub fn acquire(repo_canonical: &Path) -> io::Result<Self> {
         let timeout = Duration::from_secs(flock_timeout_secs());
         Self::acquire_with_timeout(repo_canonical, timeout)
     }
 
+    /// Acquire under one monotonic budget, starting before filesystem setup.
+    /// A zero budget permits one nonblocking attempt and never sleeps. A
+    /// positive expired budget cannot be renewed by a late lock release.
     #[allow(clippy::too_many_lines)]
     pub fn acquire_with_timeout(repo_canonical: &Path, timeout: Duration) -> io::Result<Self> {
+        let started = Instant::now();
         let Some(path) = sentinel_path(repo_canonical) else {
             tracing::debug!(
                 target: "mcp_agent_mail::git_lock",
@@ -232,7 +305,6 @@ impl RepoFlock {
             });
         };
 
-        // Ensure the parent (.git/) exists before we try to open.
         if let Some(parent) = path.parent()
             && !parent.exists()
         {
@@ -254,12 +326,12 @@ impl RepoFlock {
             .truncate(false)
             .open(&path)
         {
-            Ok(f) => f,
-            Err(e) if matches!(e.kind(), io::ErrorKind::PermissionDenied) => {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 tracing::warn!(
                     target: "mcp_agent_mail::git_lock",
                     sentinel = %path.display(),
-                    err = %e,
+                    err = %error,
                     "flock_readonly_fallback"
                 );
                 return Ok(Self {
@@ -267,85 +339,47 @@ impl RepoFlock {
                     sentinel: Some(path),
                 });
             }
-            Err(e) => return Err(e),
+            Err(error) => return Err(error),
         };
 
-        // Try non-blocking first.
-        match file.try_lock_exclusive() {
-            Ok(()) => {
-                tracing::debug!(
-                    target: "mcp_agent_mail::git_lock",
-                    sentinel = %path.display(),
-                    "flock_acquired_nonblocking"
-                );
-                return Ok(Self {
-                    file: Some(file),
-                    sentinel: Some(path),
-                });
-            }
-            Err(e) if is_lock_contention(&e) => {
-                // fall through to blocking wait
-            }
-            Err(e) => return Err(e),
-        }
-
-        tracing::info!(
-            target: "mcp_agent_mail::git_lock",
-            sentinel = %path.display(),
-            "flock_waiting"
-        );
-
-        // Blocking wait with watchdog ticks.
-        let start = Instant::now();
-        let mut last_tick = start;
-        loop {
-            match file.try_lock_exclusive() {
-                Ok(()) => {
-                    tracing::info!(
+        let mut last_tick = started;
+        let result = wait_for_lock(
+            timeout,
+            || started.elapsed(),
+            || match file.try_lock_exclusive() {
+                Ok(()) => Ok(Some(())),
+                Err(error) if is_lock_contention(&error) => Ok(None),
+                Err(error) => Err(error),
+            },
+            |pause| {
+                if last_tick.elapsed() >= FLOCK_WATCHDOG_TICK {
+                    tracing::warn!(
                         target: "mcp_agent_mail::git_lock",
                         sentinel = %path.display(),
-                        wait_ms = duration_ms_u64(start.elapsed()),
-                        "flock_acquired_after_wait"
+                        waited_ms = duration_ms_u64(started.elapsed()),
+                        "flock_still_waiting"
                     );
-                    return Ok(Self {
-                        file: Some(file),
-                        sentinel: Some(path),
-                    });
+                    last_tick = Instant::now();
                 }
-                Err(e) if is_lock_contention(&e) => {}
-                Err(e) => return Err(e),
-            }
-
-            let elapsed = start.elapsed();
-            if elapsed >= timeout {
-                tracing::error!(
-                    target: "mcp_agent_mail::git_lock",
-                    sentinel = %path.display(),
-                    waited_s = elapsed.as_secs(),
-                    "flock_timeout_aborting"
-                );
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "flock on {} held by another process for {}s; aborting",
-                        path.display(),
-                        elapsed.as_secs()
-                    ),
-                ));
-            }
-
-            if last_tick.elapsed() >= FLOCK_WATCHDOG_TICK {
-                tracing::warn!(
-                    target: "mcp_agent_mail::git_lock",
-                    sentinel = %path.display(),
-                    waited_s = elapsed.as_secs(),
-                    "flock_still_waiting"
-                );
-                last_tick = Instant::now();
-            }
-
-            std::thread::sleep(Duration::from_millis(50));
+                // A slow diagnostic subscriber also spends the same budget.
+                std::thread::sleep(pause.min(timeout.saturating_sub(started.elapsed())));
+            },
+        );
+        if let Err(error) = result {
+            // Dropping the file also releases a lock acquired just too late.
+            drop(file);
+            return Err(error);
         }
+        tracing::debug!(
+            target: "mcp_agent_mail::git_lock",
+            sentinel = %path.display(),
+            wait_ms = duration_ms_u64(started.elapsed()),
+            "flock_acquired"
+        );
+        Ok(Self {
+            file: Some(file),
+            sentinel: Some(path),
+        })
     }
 
     /// True if this lock actually holds an fd; false for phantom locks
@@ -377,7 +411,7 @@ impl Drop for RepoFlock {
     }
 }
 
-fn flock_timeout_secs() -> u64 {
+pub(crate) fn flock_timeout_secs() -> u64 {
     std::env::var("AM_GIT_FLOCK_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
@@ -392,9 +426,8 @@ thread_local! {
 
 /// RAII guard that tracks held-lock state for reentrancy detection.
 ///
-/// When `GitCmd::run` (B4) enters, it calls [`reentrancy_enter`] before
-/// acquiring locks. If the repo path is already held by this thread,
-/// we panic with a clear message — nested locking would deadlock.
+/// When `GitCmd::run` enters, it calls [`Self::enter`] before acquiring locks.
+/// A nested acquisition of the same canonical repository would deadlock.
 pub struct ReentrancyGuard {
     path: PathBuf,
 }
@@ -435,6 +468,7 @@ impl Drop for ReentrancyGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use tempfile::TempDir;
@@ -447,32 +481,30 @@ mod tests {
         p
     }
 
+    fn isolated_locks() -> GitRepoLocks {
+        GitRepoLocks {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
     #[test]
     fn same_repo_two_threads_serialize() {
         const THREADS: u64 = 8;
         const PER_THREAD: u64 = 250;
 
-        GitRepoLocks::global().reset_for_test();
+        let locks = isolated_locks();
         let tmp = TempDir::new().unwrap();
         let repo = init_repo(tmp.path());
         let canonical = canonicalize_repo(&repo).unwrap();
-
-        // Each thread increments N times inside the lock; if the lock
-        // were broken we'd see lost-update races. We assert strict
-        // equality which only holds with serialization.
         let counter = Arc::new(AtomicU64::new(0));
-
         let handles: Vec<_> = (0..THREADS)
             .map(|_| {
-                let mut expected_next = 0u64;
-                let _ = &mut expected_next;
                 let c = Arc::clone(&counter);
-                let lk = GitRepoLocks::global().lock_for(&canonical);
+                let lk = locks.lock_for(&canonical);
                 thread::spawn(move || {
                     for _ in 0..PER_THREAD {
                         let _g = lk.lock().unwrap();
                         let prev = c.load(Ordering::Relaxed);
-                        // Non-atomic RMW under the lock.
                         c.store(prev + 1, Ordering::Relaxed);
                     }
                 })
@@ -486,29 +518,25 @@ mod tests {
 
     #[test]
     fn different_repos_parallel() {
-        GitRepoLocks::global().reset_for_test();
+        let locks = isolated_locks();
         let tmp = TempDir::new().unwrap();
         let repo_a = init_repo(&tmp.path().join("a"));
         let repo_b = init_repo(&tmp.path().join("b"));
         let ca = canonicalize_repo(&repo_a).unwrap();
         let cb = canonicalize_repo(&repo_b).unwrap();
-
-        // Two different repos should map to two different mutexes.
-        let la = GitRepoLocks::global().lock_for(&ca);
-        let lb = GitRepoLocks::global().lock_for(&cb);
+        let la = locks.lock_for(&ca);
+        let lb = locks.lock_for(&cb);
         assert!(!Arc::ptr_eq(&la, &lb));
     }
 
     #[test]
     fn canonical_paths_collapse_to_same_mutex() {
-        GitRepoLocks::global().reset_for_test();
+        let locks = isolated_locks();
         let tmp = TempDir::new().unwrap();
         let repo = init_repo(tmp.path());
         let canonical = canonicalize_repo(&repo).unwrap();
-
-        // Same canonical path on two lookups -> same Arc.
-        let l1 = GitRepoLocks::global().lock_for(&canonical);
-        let l2 = GitRepoLocks::global().lock_for(&canonical);
+        let l1 = locks.lock_for(&canonical);
+        let l2 = locks.lock_for(&canonical);
         assert!(Arc::ptr_eq(&l1, &l2));
     }
 
@@ -517,10 +545,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let repo = init_repo(tmp.path());
         let canonical = canonicalize_repo(&repo).unwrap();
-
         let f1 = RepoFlock::acquire(&canonical).unwrap();
         assert!(f1.is_real(), "real flock expected on a proper repo");
-
         let contender = OpenOptions::new()
             .read(true)
             .write(true)
@@ -535,9 +561,6 @@ mod tests {
             "unrelated lock failure"
         )));
         drop(contender);
-
-        // Second acquire from same process — try_lock would fail
-        // immediately; we use a tight timeout to avoid blocking the test.
         let t0 = Instant::now();
         let res = RepoFlock::acquire_with_timeout(&canonical, Duration::from_millis(200));
         let elapsed = t0.elapsed();
@@ -550,9 +573,7 @@ mod tests {
             }
             other => panic!("expected TimedOut, got {other:?}"),
         }
-
         drop(f1);
-        // After drop, acquire succeeds.
         let _f2 = RepoFlock::acquire_with_timeout(&canonical, Duration::from_millis(500))
             .expect("acquire after drop");
     }
@@ -560,7 +581,6 @@ mod tests {
     #[test]
     fn flock_on_nonrepo_path_returns_phantom() {
         let tmp = TempDir::new().unwrap();
-        // Not a repo: no .git/ dir.
         let not_a_repo = tmp.path().join("plain-dir");
         std::fs::create_dir(&not_a_repo).unwrap();
         let canonical = canonicalize_repo(&not_a_repo).unwrap();
@@ -604,7 +624,7 @@ mod tests {
         let repo = init_repo(tmp.path());
         let canonical = canonicalize_repo(&repo).unwrap();
         let _g1 = ReentrancyGuard::enter(&canonical);
-        let _g2 = ReentrancyGuard::enter(&canonical); // should panic
+        let _g2 = ReentrancyGuard::enter(&canonical);
     }
 
     #[test]
@@ -615,7 +635,7 @@ mod tests {
         let ca = canonicalize_repo(&a).unwrap();
         let cb = canonicalize_repo(&b).unwrap();
         let _g1 = ReentrancyGuard::enter(&ca);
-        let _g2 = ReentrancyGuard::enter(&cb); // must NOT panic
+        let _g2 = ReentrancyGuard::enter(&cb);
     }
 
     #[test]
@@ -625,8 +645,8 @@ mod tests {
         let canonical = canonicalize_repo(&repo).unwrap();
         {
             let _g1 = ReentrancyGuard::enter(&canonical);
-        } // dropped
-        let _g2 = ReentrancyGuard::enter(&canonical); // no panic
+        }
+        let _g2 = ReentrancyGuard::enter(&canonical);
     }
 
     #[test]
@@ -635,13 +655,164 @@ mod tests {
         let repo = init_repo(tmp.path());
         let canonical = canonicalize_repo(&repo).unwrap();
         let _g1 = ReentrancyGuard::enter(&canonical);
-        // Second thread acquiring the SAME path must not panic —
-        // reentrancy is per-thread.
         let cc = canonical;
         thread::spawn(move || {
             let _g2 = ReentrancyGuard::enter(&cc);
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn expired_positive_budget_never_attempts_acquisition() {
+        let calls = Cell::new(0);
+        let result = wait_for_lock(
+            Duration::from_millis(2),
+            || Duration::from_millis(2),
+            || {
+                calls.set(calls.get() + 1);
+                Ok(Some(()))
+            },
+            |_| panic!("an expired budget must not sleep"),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn zero_budget_makes_exactly_one_nonblocking_attempt() {
+        for ready in [false, true] {
+            let calls = Cell::new(0);
+            let result = wait_for_lock(
+                Duration::ZERO,
+                || Duration::from_secs(1),
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(ready.then_some(7))
+                },
+                |_| panic!("zero budget must not sleep"),
+            );
+            assert_eq!(calls.get(), 1);
+            assert_eq!(result.is_ok(), ready);
+        }
+    }
+
+    #[test]
+    fn overslept_budget_cannot_accept_a_late_release() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let calls = Cell::new(0);
+        let result = wait_for_lock(
+            Duration::from_millis(2),
+            || elapsed.get(),
+            || {
+                calls.set(calls.get() + 1);
+                Ok((calls.get() > 1).then_some(()))
+            },
+            |pause| {
+                assert_eq!(pause, Duration::from_millis(2));
+                elapsed.set(Duration::from_millis(3));
+            },
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn late_success_drops_its_acquired_resource() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let resource = Arc::new(());
+        let result = wait_for_lock(
+            Duration::from_millis(2),
+            || elapsed.get(),
+            || {
+                elapsed.set(Duration::from_millis(2));
+                Ok(Some(Arc::clone(&resource)))
+            },
+            |_| panic!("successful acquisition must not sleep"),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(Arc::strong_count(&resource), 1);
+    }
+
+    #[test]
+    fn interrupted_acquisitions_share_the_same_budget() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let calls = Cell::new(0);
+        let result: io::Result<()> = wait_for_lock(
+            Duration::from_millis(7),
+            || elapsed.get(),
+            || {
+                calls.set(calls.get() + 1);
+                Err(io::ErrorKind::Interrupted.into())
+            },
+            |pause| elapsed.set(elapsed.get() + pause),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(elapsed.get(), Duration::from_millis(7));
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn unrelated_lock_error_is_not_retried() {
+        let result: io::Result<()> = wait_for_lock(
+            Duration::MAX,
+            || Duration::ZERO,
+            || Err(io::ErrorKind::PermissionDenied.into()),
+            |_| panic!("unrelated error must not retry"),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn timed_mutex_preserves_holder_and_recovers_after_release() {
+        let mutex = Mutex::new(42);
+        let held = mutex.lock().unwrap();
+        let started = Instant::now();
+        let error = lock_mutex_with_timeout(&mutex, Duration::from_millis(20)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(*held, 42);
+        drop(held);
+        assert_eq!(*lock_mutex_with_timeout(&mutex, Duration::ZERO).unwrap(), 42);
+    }
+
+    #[test]
+    fn timed_mutex_recovers_poison_without_losing_state() {
+        let mutex = Mutex::new(42);
+        let result = std::panic::catch_unwind(|| {
+            let _held = mutex.lock().unwrap();
+            panic!("fixture poison");
+        });
+        assert!(result.is_err());
+        assert_eq!(*lock_mutex_with_timeout(&mutex, Duration::MAX).unwrap(), 42);
+    }
+
+    #[test]
+    fn registry_timeout_cannot_replace_an_existing_mutex() {
+        let locks = isolated_locks();
+        let path = Path::new("repo");
+        let original = locks.lock_for(path);
+        let held = locks.inner.lock().unwrap();
+        let error = locks.lock_for_with_timeout(path, Duration::ZERO).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        drop(held);
+        let subsequent = locks.lock_for_with_timeout(path, Duration::MAX).unwrap();
+        assert!(Arc::ptr_eq(&original, &subsequent));
+    }
+
+    #[test]
+    fn flock_zero_budget_and_maximum_budget_preserve_real_exclusion() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo(tmp.path());
+        let held = RepoFlock::acquire_with_timeout(&repo, Duration::ZERO).unwrap();
+        assert!(held.is_real());
+        assert_eq!(
+            RepoFlock::acquire_with_timeout(&repo, Duration::ZERO)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        drop(held);
+        assert!(RepoFlock::acquire_with_timeout(&repo, Duration::MAX).unwrap().is_real());
     }
 }
