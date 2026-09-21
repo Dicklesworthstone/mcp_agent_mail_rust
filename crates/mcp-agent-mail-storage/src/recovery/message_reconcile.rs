@@ -9,8 +9,8 @@
 pub mod database;
 
 use std::collections::HashSet;
-use std::io::{Read, Write};
-use std::path::Path;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 
 use git2::{ErrorCode, ObjectType, Oid, Repository};
 use mcp_agent_mail_core::Config;
@@ -23,6 +23,11 @@ pub const MAX_MESSAGE_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 /// Bound fan-out as well as the size of an individual message.
 const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RECIPIENTS: usize = 1024;
+/// Recovery must finish an identity scan before publishing. These limits bound
+/// enumeration and actual reads, not elapsed filesystem time. Exhaustion is
+/// unavailable evidence, never an empty index or permission to repair.
+const MAX_CANONICAL_SCAN_ENTRIES: usize = 100_000;
+const MAX_CANONICAL_SCAN_BYTES: u64 = 256 * 1024 * 1024;
 
 /// A completed reconciliation, not a queued write or a new delivery.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,11 +185,11 @@ pub fn reconcile_message_bundle(
             .map(|(path, expected)| artifact_missing(path, expected))
             .collect::<crate::Result<Vec<_>>>()?;
         if missing.iter().any(|missing| *missing) {
-            crate::reject_canonical_message_id_collision(
+            reject_recovery_canonical_id_collision(
                 archive,
-                entry.message,
+                id,
                 &paths.canonical,
-                &full,
+                &mut CanonicalScanBudget::default(),
             )?;
         }
         let mut created = 0;
@@ -219,6 +224,155 @@ pub fn reconcile_message_bundle(
         files_created,
         git_commit_needed,
     })
+}
+
+struct CanonicalScanBudget {
+    entries_left: usize,
+    bytes_left: u64,
+}
+
+impl Default for CanonicalScanBudget {
+    fn default() -> Self {
+        Self {
+            entries_left: MAX_CANONICAL_SCAN_ENTRIES,
+            bytes_left: MAX_CANONICAL_SCAN_BYTES,
+        }
+    }
+}
+
+impl CanonicalScanBudget {
+    fn visit(&mut self) -> crate::Result<()> {
+        self.entries_left = self.entries_left.checked_sub(1).ok_or_else(|| {
+            invalid("canonical recovery scan entry budget exceeded; repair refused")
+        })?;
+        Ok(())
+    }
+
+    /// Read only frontmatter. Charge actual buffered reads (including any
+    /// read-ahead), not the decoded JSON size; a huge body is never materialized.
+    fn read_id(&mut self, path: &Path) -> crate::Result<i64> {
+        let limit = self.bytes_left.min(MAX_MESSAGE_ARTIFACT_BYTES as u64);
+        if limit == 0 {
+            return Err(invalid(
+                "canonical recovery scan byte budget exhausted; repair refused",
+            ));
+        }
+        let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
+        // One extra byte distinguishes exhausted input from a complete header.
+        let mut reader = BufReader::with_capacity(1024, file.take(limit + 1));
+        let result = (|| -> crate::Result<i64> {
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            if line != "---json\n" {
+                return Err(invalid("canonical recovery source has invalid frontmatter"));
+            }
+            let mut header = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line)? == 0 {
+                    return Err(invalid("canonical recovery source has incomplete frontmatter"));
+                }
+                if line == "---\n" {
+                    break;
+                }
+                header.push_str(&line);
+            }
+            let message: serde_json::Value = serde_json::from_str(&header)?;
+            crate::positive_message_id(&message)
+                .ok_or_else(|| invalid("canonical recovery source has no positive message ID"))
+        })();
+        let consumed = limit + 1 - reader.get_ref().limit();
+        self.bytes_left = self.bytes_left.saturating_sub(consumed);
+        if consumed > limit {
+            return Err(invalid(
+                "canonical recovery frontmatter or scan byte budget exceeded; repair refused",
+            ));
+        }
+        result
+    }
+}
+
+fn canonical_date_directories(
+    root: &Path,
+    width: usize,
+    budget: &mut CanonicalScanBudget,
+) -> crate::Result<Vec<PathBuf>> {
+    if !std::fs::symlink_metadata(root)?.file_type().is_dir() {
+        return Err(invalid("canonical recovery directory is not a real directory"));
+    }
+    let mut directories = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        budget.visit()?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.len() != width || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        if !entry.file_type()?.is_dir() {
+            return Err(invalid(format!(
+                "canonical recovery date directory {} is a symlink or non-directory; repair refused",
+                entry.path().display()
+            )));
+        }
+        directories.push(entry.path());
+    }
+    Ok(directories)
+}
+
+/// Recovery needs a complete identity proof, not the best-effort inventory used
+/// by ordinary archive writes. A skipped unreadable/malformed canonical file
+/// might be precisely the conflicting generation. Never read entire message
+/// bodies just to identify candidates, or authorize publication on a partial
+/// scan. Existing destination bytes were independently checked above.
+fn reject_recovery_canonical_id_collision(
+    archive: &ProjectArchive,
+    message_id: i64,
+    target: &Path,
+    budget: &mut CanonicalScanBudget,
+) -> crate::Result<()> {
+    let root = crate::archive_project_root_checked(archive)?.join("messages");
+    if crate::path_existing_prefix_has_symlink(&root)? {
+        return Err(invalid("canonical recovery root has a symlinked authority"));
+    }
+    match std::fs::symlink_metadata(&root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    for year in canonical_date_directories(&root, 4, budget)? {
+        for month in canonical_date_directories(&year, 2, budget)? {
+            // Revalidate at descent rather than intentionally following a
+            // directory replaced by a symlink since enumeration.
+            if !std::fs::symlink_metadata(&month)?.file_type().is_dir() {
+                return Err(invalid("canonical recovery month changed type; repair refused"));
+            }
+            for entry in std::fs::read_dir(&month)? {
+                let entry = entry?;
+                budget.visit()?;
+                let path = entry.path();
+                if path.extension().is_none_or(|extension| extension != "md") {
+                    continue;
+                }
+                if !entry.file_type()?.is_file() {
+                    return Err(invalid(format!(
+                        "canonical recovery source {} is a symlink or non-file; repair refused",
+                        path.display()
+                    )));
+                }
+                let existing_id = budget.read_id(&path)?;
+                if existing_id == message_id && path != target {
+                    return Err(invalid(format!(
+                        "canonical message id {message_id} already exists at {}; repair refused",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A repair may fill a missing Git path or restore an object whose expected
@@ -645,6 +799,143 @@ mod tests {
     }
 
     #[test]
+    fn canonical_scan_reads_headers_without_loading_large_bodies() {
+        let (_dir, _config, archive, message, recipients) = fixture();
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        let source = archive.root.join("messages/2025/01/large__99.md");
+        crate::ensure_parent_dir(&source).unwrap();
+        let mut file = std::fs::File::create(&source).unwrap();
+        file.write_all(b"---json\n{\"id\": 99}\n---\n\n").unwrap();
+        // A sparse body larger than either budget must not be loaded just to
+        // prove that this unrelated canonical file belongs to another ID.
+        file.set_len(1024 * 1024 * 1024).unwrap();
+        let mut budget = CanonicalScanBudget {
+            entries_left: 10,
+            bytes_left: 2048,
+        };
+        reject_recovery_canonical_id_collision(&archive, 42, &paths.canonical, &mut budget)
+            .unwrap();
+        assert_eq!(budget.entries_left, 7);
+        assert!(budget.bytes_left >= 1024);
+        assert_eq!(file.metadata().unwrap().len(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn canonical_scan_budgets_refuse_incomplete_identity_proofs() {
+        let (_dir, _config, archive, message, recipients) = fixture();
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        let source = archive.root.join("messages/2025/01/source.md");
+        crate::ensure_parent_dir(&source).unwrap();
+        let bytes = b"---json\n{\"id\": 99}\n---\n\nkeep evidence";
+        std::fs::write(&source, bytes).unwrap();
+        for mut budget in [
+            CanonicalScanBudget {
+                entries_left: 2,
+                bytes_left: 2048,
+            },
+            CanonicalScanBudget {
+                entries_left: 10,
+                bytes_left: 16,
+            },
+        ] {
+            let error = reject_recovery_canonical_id_collision(
+                &archive,
+                42,
+                &paths.canonical,
+                &mut budget,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("budget"), "{error}");
+            assert_eq!(std::fs::read(&source).unwrap(), bytes);
+            assert!(!paths.canonical.exists());
+        }
+    }
+
+    #[test]
+    fn repair_refuses_malformed_canonical_evidence_before_creating_copies() {
+        let malformed: &[&[u8]] = &[
+            b"not canonical frontmatter",
+            b"---json\n{broken json}\n---\n\n",
+            b"---json\n{\"id\": 0}\n---\n\n",
+            b"---json\n{\"subject\": \"identity missing\"}\n---\n\n",
+            b"---json\n{\"id\": 99}\n",
+        ];
+        for bytes in malformed {
+            let (_dir, config, archive, message, recipients) = fixture();
+            let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+                .unwrap()
+                .0;
+            let source = archive.root.join("messages/2025/01/uncertain.md");
+            crate::ensure_parent_dir(&source).unwrap();
+            std::fs::write(&source, bytes).unwrap();
+
+            assert!(
+                reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).is_err()
+            );
+            assert!(!paths.canonical.exists());
+            assert!(!paths.outbox.exists());
+            assert!(paths.inbox.iter().all(|path| !path.exists()));
+            assert_eq!(std::fs::read(&source).unwrap(), *bytes);
+        }
+    }
+
+    #[test]
+    fn repair_rejects_duplicate_identity_in_another_date_shard() {
+        let (_dir, config, archive, message, recipients) = fixture();
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        let mut prior = message.clone();
+        prior["created"] = json!("2025-01-02T03:04:05Z");
+        let previous = crate::message_paths_for_bundle(&archive, &prior, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        let bytes = crate::render_message_bundle_content(&prior, "prior generation").unwrap();
+        crate::ensure_parent_dir(&previous.canonical).unwrap();
+        std::fs::write(&previous.canonical, &bytes).unwrap();
+
+        let error = reconcile_message_bundle(&archive, &config, entry(&message, &recipients))
+            .unwrap_err();
+        assert!(error.to_string().contains("canonical message id 42"));
+        assert!(!paths.canonical.exists());
+        assert!(!paths.outbox.exists());
+        assert!(paths.inbox.iter().all(|path| !path.exists()));
+        assert_eq!(std::fs::read(&previous.canonical).unwrap(), bytes.as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_refuses_symlinked_canonical_evidence_in_other_shards() {
+        for source_is_directory in [false, true] {
+            let (_dir, config, archive, message, recipients) = fixture();
+            let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+                .unwrap()
+                .0;
+            let source = if source_is_directory {
+                archive.root.join("messages/2025")
+            } else {
+                archive.root.join("messages/2025/01/uncertain.md")
+            };
+            crate::ensure_parent_dir(&source).unwrap();
+            let outside = config.storage_root.join("outside-missing");
+            std::os::unix::fs::symlink(&outside, &source).unwrap();
+
+            assert!(
+                reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).is_err()
+            );
+            assert!(!paths.canonical.exists());
+            assert!(!paths.outbox.exists());
+            assert!(paths.inbox.iter().all(|path| !path.exists()));
+            assert_eq!(std::fs::read_link(&source).unwrap(), outside);
+            assert!(!outside.exists());
+        }
+    }
+
+    #[test]
     fn publication_collision_preserves_both_generations() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("occupied.md");
@@ -729,6 +1020,7 @@ mod tests {
         )
         .unwrap();
         let paths = vec!["message.md".to_string()];
+        reject_committed_message_conflicts(&repo, &paths, &[oid]).unwrap();
         assert!(!head_contains(&repo, &paths, &[oid]).unwrap());
         assert_eq!(repo.blob(bytes).unwrap(), oid);
         assert!(head_contains(&repo, &paths, &[oid]).unwrap());
