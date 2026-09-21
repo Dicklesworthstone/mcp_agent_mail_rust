@@ -1,12 +1,13 @@
 //! Recover attachment bytes without re-running a send or an image conversion.
 //!
 //! Attachment paths must belong to this project's archive. One pinned Git tree
-//! supplies all bytes; missing objects and uncommitted files are not silently
-//! treated as repaired. The caller preflights these files together with every
-//! message copy and publishes only missing destinations, without replacement.
+//! supplies committed bytes. Uncommitted raw files and retained originals may
+//! instead be witnessed by their original-content digest; a converted WebP's
+//! original-image digest is not authority for its encoded bytes. The caller
+//! preflights every destination and commits all witnessed files with the mail.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use git2::{ErrorCode, ObjectType, Oid, Repository};
 use serde_json::Value;
@@ -167,43 +168,58 @@ pub(super) fn prepare(
         return Ok(Vec::new());
     }
     let root = crate::archive_repo_root_checked(archive)?;
-    let head = repo.head().map_err(|error| {
-        if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) {
-            invalid("attachment recovery has no committed source; repair deferred")
-        } else {
-            error.into()
-        }
-    })?;
-    let tree = head.peel_to_tree()?;
-    let odb = repo.odb()?;
+    let tree = match repo.head() {
+        Ok(head) => Some(head.peel_to_tree()?),
+        Err(error) if error.code() == ErrorCode::UnbornBranch => None,
+        Err(error) => return Err(error.into()),
+    };
     let mut prepared = Vec::with_capacity(files.len());
     for (relative, expected) in files {
         let path = root.join(&relative);
         if crate::path_existing_prefix_has_symlink(&path)? {
             return Err(invalid("attachment recovery refuses a symlinked destination"));
         }
-        let entry = tree
-            .get_path(std::path::Path::new(&relative))
-            .map_err(|error| {
-                if error.code() == ErrorCode::NotFound {
-                    invalid(format!(
-                        "attachment {relative} has no committed source; repair deferred"
-                    ))
-                } else {
-                    error.into()
-                }
-            })?;
+        let bytes = read_attachment(
+            repo,
+            tree.as_ref(),
+            &relative,
+            &path,
+            &expected,
+            remaining_bytes,
+        )?;
+        remaining_bytes -= bytes.len();
+        prepared.push((path, bytes));
+    }
+    Ok(prepared)
+}
+
+fn read_attachment(
+    repo: &Repository,
+    tree: Option<&git2::Tree<'_>>,
+    relative: &str,
+    path: &Path,
+    expected: &ExpectedFile,
+    remaining_bytes: usize,
+) -> crate::Result<Vec<u8>> {
+    let entry = match tree {
+        Some(tree) => match tree.get_path(Path::new(relative)) {
+            Ok(entry) => Some(entry),
+            Err(error) if error.code() == ErrorCode::NotFound => None,
+            Err(error) => return Err(error.into()),
+        },
+        None => None,
+    };
+    let bytes = if let Some(entry) = entry {
+        // A present Git entry is authoritative. Never fall back to potentially
+        // different local bytes on an object error, budget failure, or conflict.
         if entry.kind() != Some(ObjectType::Blob)
             || !matches!(entry.filemode(), 0o100644 | 0o100755)
         {
             return Err(invalid("committed attachment is not a regular-file blob"));
         }
-        let (size, kind) = odb.read_header(entry.id())?;
+        let (size, kind) = repo.odb()?.read_header(entry.id())?;
         if kind != ObjectType::Blob || size > remaining_bytes {
             return Err(invalid("attachment recovery bundle byte budget exceeded"));
-        }
-        if expected.size.is_some_and(|expected| expected != size as u64) {
-            return Err(invalid("attachment byte length conflicts with its committed blob"));
         }
         let blob = repo.find_blob(entry.id())?;
         if blob.content().len() != size
@@ -212,15 +228,33 @@ pub(super) fn prepare(
         {
             return Err(invalid("attachment content does not match its Git object identity"));
         }
-        if let Some(expected) = expected.source_sha1
-            && hex::encode(Sha1::digest(blob.content())) != expected
-        {
-            return Err(invalid("attachment original-content SHA1 does not match"));
+        blob.content().to_vec()
+    } else {
+        // The database commit may outlive the best-effort archive commit. Raw
+        // files and originals can still be proven without guessing their data.
+        // A WebP with only its source-image SHA1 cannot: keep that case deferred.
+        if expected.source_sha1.is_none() {
+            return Err(invalid(format!(
+                "attachment {relative} has no committed or content-hash authority; repair deferred"
+            )));
         }
-        remaining_bytes -= size;
-        prepared.push((path, blob.content().to_vec()));
+        mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+            path,
+            remaining_bytes as u64,
+        )?
+    };
+    if expected
+        .size
+        .is_some_and(|expected| expected != bytes.len() as u64)
+    {
+        return Err(invalid("attachment byte length conflicts with its metadata"));
     }
-    Ok(prepared)
+    if let Some(expected) = &expected.source_sha1
+        && hex::encode(Sha1::digest(&bytes)) != *expected
+    {
+        return Err(invalid("attachment original-content SHA1 does not match"));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -488,6 +522,139 @@ mod tests {
         assert!(repair(&archive, &config, &message, &recipients).is_err());
         assert_eq!(std::fs::read_link(&path).unwrap(), outside);
         assert_eq!(std::fs::read(&outside).unwrap(), b"source bytes");
+        assert!(!archive.root.join("messages").exists());
+    }
+
+    #[test]
+    fn uncommitted_raw_attachment_is_committed_before_recovery_reports_success() {
+        let (_dir, config, archive, mut message, recipients) = fixture();
+        let source = config.storage_root.join("not-yet-committed.bin");
+        let bytes = b"survived the database-to-Git crash window";
+        std::fs::write(&source, bytes).unwrap();
+        let stored = crate::store_raw_attachment(&archive, &source, 0).unwrap();
+        let relative = stored.meta.path.as_ref().unwrap();
+        let path = archive.repo_root.join(relative);
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        assert!(
+            repo.head()
+                .unwrap()
+                .peel_to_tree()
+                .unwrap()
+                .get_path(Path::new(relative))
+                .is_err()
+        );
+        message["attachments"] = json!([stored.meta]);
+        assert_eq!(
+            prepare(&repo, &archive, &message, bytes.len()).unwrap().len(),
+            1
+        );
+        assert!(prepare(&repo, &archive, &message, bytes.len() - 1).is_err());
+
+        let result = repair(&archive, &config, &message, &recipients).unwrap();
+        assert_eq!(result.files_created, 4);
+        assert!(result.git_commit_needed);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let entry = tree.get_path(Path::new(relative)).unwrap();
+        assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
+        let head = repo.head().unwrap().target().unwrap();
+        assert_eq!(
+            repair(&archive, &config, &message, &recipients).unwrap(),
+            ReconcileResult::default()
+        );
+        assert_eq!(repo.head().unwrap().target().unwrap(), head);
+    }
+
+    #[test]
+    fn uncommitted_missing_or_modified_raw_files_do_not_authorize_repair() {
+        for missing in [false, true] {
+            let (_dir, config, archive, mut message, recipients) = fixture();
+            let source = config.storage_root.join("source.bin");
+            std::fs::write(&source, b"12345").unwrap();
+            let stored = crate::store_raw_attachment(&archive, &source, 0).unwrap();
+            let path = archive.repo_root.join(stored.meta.path.as_ref().unwrap());
+            let evidence = config.storage_root.join("retained-source.bin");
+            if missing {
+                std::fs::rename(&path, &evidence).unwrap();
+            } else {
+                // Same length is not enough to authorize an uncommitted file.
+                std::fs::write(&path, b"54321").unwrap();
+            }
+            message["attachments"] = json!([stored.meta]);
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let head = repo.head().unwrap().target().unwrap();
+            assert!(repair(&archive, &config, &message, &recipients).is_err());
+            assert!(!archive.root.join("messages").exists());
+            assert_eq!(repo.head().unwrap().target().unwrap(), head);
+            assert_eq!(std::fs::read(&source).unwrap(), b"12345");
+            if missing {
+                assert!(!path.exists());
+                assert_eq!(std::fs::read(&evidence).unwrap(), b"12345");
+            } else {
+                assert_eq!(std::fs::read(&path).unwrap(), b"54321");
+            }
+        }
+    }
+
+    #[test]
+    fn inline_original_is_hash_verified_and_committed_after_an_interrupted_send() {
+        let (_dir, config, archive, mut message, recipients) = fixture();
+        let source = config.storage_root.join("uncommitted-inline.png");
+        image::RgbImage::new(2, 2).save(&source).unwrap();
+        let stored =
+            crate::store_attachment(&archive, &config, &source, EmbedPolicy::Inline).unwrap();
+        let relative = stored.meta.original_path.as_ref().unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        assert!(
+            repo.head()
+                .unwrap()
+                .peel_to_tree()
+                .unwrap()
+                .get_path(Path::new(relative))
+                .is_err()
+        );
+        message["attachments"] = json!([stored.meta]);
+        let result = repair(&archive, &config, &message, &recipients).unwrap();
+        assert_eq!(result.files_created, 4);
+        assert!(result.git_commit_needed);
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let entry = tree.get_path(Path::new(relative)).unwrap();
+        let blob = repo.find_blob(entry.id()).unwrap();
+        assert_eq!(blob.content(), std::fs::read(&source).unwrap());
+        assert_eq!(hex::encode(Sha1::digest(blob.content())), stored.meta.sha1);
+    }
+
+    #[test]
+    fn uncommitted_webp_cannot_use_its_original_images_digest_as_proof() {
+        let (_dir, config, archive, mut message, recipients) = fixture();
+        let source = config.storage_root.join("uncommitted-image.png");
+        image::RgbImage::new(2, 2).save(&source).unwrap();
+        let stored =
+            crate::store_attachment(&archive, &config, &source, EmbedPolicy::File).unwrap();
+        let path = archive.repo_root.join(stored.meta.path.as_ref().unwrap());
+        let before = std::fs::read(&path).unwrap();
+        message["attachments"] = json!([stored.meta]);
+        let error = repair(&archive, &config, &message, &recipients).unwrap_err();
+        assert!(error.to_string().contains("no committed or content-hash authority"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!archive.root.join("messages").exists());
+    }
+
+    #[test]
+    fn local_hash_match_cannot_override_a_different_committed_attachment() {
+        let (_dir, config, archive, mut message, recipients) = fixture();
+        let mut stored = raw(&archive, &config, "committed.bin", b"before");
+        let path = archive.repo_root.join(stored.meta.path.as_ref().unwrap());
+        std::fs::write(&path, b"after!").unwrap();
+        stored.meta.sha1 = hex::encode(Sha1::digest(b"after!"));
+        message["attachments"] = json!([stored.meta]);
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        let error = repair(&archive, &config, &message, &recipients).unwrap_err();
+        assert!(error.to_string().contains("original-content SHA1 does not match"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"after!");
+        assert_eq!(repo.head().unwrap().target().unwrap(), head);
         assert!(!archive.root.join("messages").exists());
     }
 }
