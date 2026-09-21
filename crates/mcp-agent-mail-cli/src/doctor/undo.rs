@@ -90,6 +90,42 @@ fn read_regular_file_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Validate the exact bytes that will be published, not a later read of the
+/// destination. A corrupt backup must never replace the operator's live file,
+/// including for legacy/unsealed runs that have no manifest protection.
+fn read_verified_backup(path: &Path, expected_hash: &str) -> std::io::Result<Vec<u8>> {
+    let bytes = read_regular_file_no_follow(path)?;
+    verify_backup_hash(path, &sha256_hex(&bytes), expected_hash)?;
+    Ok(bytes)
+}
+
+fn verify_backup_hash(path: &Path, actual_hash: &str, expected_hash: &str) -> std::io::Result<()> {
+    if actual_hash != expected_hash {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "backup hash mismatch for {}: expected {expected_hash}, got {actual_hash}; live target unchanged",
+                path.display(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Preview large backups without allocating their entire contents. Real DB
+/// restores still verify the bytes streamed into their publication tempfile.
+fn verify_backup_file(path: &Path, expected_hash: &str) -> std::io::Result<()> {
+    verify_backup_hash(path, &sha256_stream_no_follow(path)?, expected_hash)
+}
+
+fn read_verified_symlink_backup(path: &Path, expected_hash: &str) -> std::io::Result<PathBuf> {
+    let target = path_from_raw_bytes(read_verified_backup(path, expected_hash)?);
+    // In particular, reject malformed odd-length Windows UTF-16 instead of
+    // silently dropping a byte and discovering the mismatch after publication.
+    verify_backup_hash(path, &sha256_path_bytes(&target), expected_hash)?;
+    Ok(target)
+}
+
 /// Open `path` for reading with `O_NOFOLLOW | O_NONBLOCK`; verify
 /// the opened fd is a regular file; return the File.
 ///
@@ -777,6 +813,15 @@ pub fn run_undo_with_scopes(
             }
             let backup_file = action_backup_file(&backups_dir, &action)?;
             if dry_run {
+                if backup_file.exists()
+                    && let Err(e) = verify_backup_file(&backup_file, &action.before_hash)
+                {
+                    if strict {
+                        return Err(e);
+                    }
+                    summary.failures.push(e.to_string());
+                    continue;
+                }
                 eprintln!(
                     "[dry-run] crash-window recovery: would restore {} from backup",
                     target_file.display()
@@ -859,7 +904,7 @@ pub fn run_undo_with_scopes(
                     // hash verification was missing for non-DB
                     // crash-window restores. Mirror the
                     // completed-branch Codex-C2 defense.
-                    match read_regular_file_no_follow(&backup_file) {
+                    match read_verified_backup(&backup_file, &action.before_hash) {
                         Ok(bytes) => {
                             let write_res = super::mutate::atomic_write_file(
                                 &target_file,
@@ -898,16 +943,17 @@ pub fn run_undo_with_scopes(
                         Err(e) => Err(e),
                     }
                 };
-                if restore_result.is_ok() {
-                    summary.actions_replayed += 1;
-                } else {
-                    summary.failures.push(format!(
-                        "crash-window restore failed for {}: {}",
-                        action.path,
-                        restore_result
-                            .err()
-                            .map_or_else(String::new, |e| e.to_string()),
-                    ));
+                match restore_result {
+                    Ok(()) => summary.actions_replayed += 1,
+                    Err(e) => {
+                        if strict {
+                            return Err(e);
+                        }
+                        summary.failures.push(format!(
+                            "crash-window restore failed for {}: {e}",
+                            action.path,
+                        ));
+                    }
                 }
             } else if action.before_hash == EMPTY_FILE_SHA256 {
                 // File didn't exist before mutation. If it now exists,
@@ -1187,22 +1233,9 @@ pub fn run_undo_with_scopes(
                         }
                     }
                 }
-                if dry_run {
-                    eprintln!(
-                        "[dry-run] would restore {} from backup",
-                        target_file.display()
-                    );
-                    summary.actions_replayed += 1;
-                    continue;
-                }
-                if let Some(parent) = target_file.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                // Codex-C2 (round 2): atomic restore via tempfile. Was
-                // non-atomic `fs::copy` which could leave a torn file on
-                // disk-full / I/O fault. Now read backup bytes into memory,
-                // then atomic-write through the chokepoint helper.
-                let backup_bytes = match read_regular_file_no_follow(&backup_file) {
+                // Retain the verified bytes through publication. Reopening the
+                // backup after checking its hash would reintroduce a race.
+                let backup_bytes = match read_verified_backup(&backup_file, &action.before_hash) {
                     Ok(b) => b,
                     Err(e) => {
                         if strict {
@@ -1216,6 +1249,17 @@ pub fn run_undo_with_scopes(
                         continue;
                     }
                 };
+                if dry_run {
+                    eprintln!(
+                        "[dry-run] would restore {} from backup",
+                        target_file.display()
+                    );
+                    summary.actions_replayed += 1;
+                    continue;
+                }
+                if let Some(parent) = target_file.parent() {
+                    fs::create_dir_all(parent)?;
+                }
                 let restore_mode = action.before_mode.unwrap_or(0o644);
                 match super::mutate::atomic_write_file(&target_file, &backup_bytes, restore_mode) {
                     Ok(_) => {
@@ -1545,6 +1589,20 @@ pub fn run_undo_with_scopes(
                     continue;
                 }
 
+                let restore_target =
+                    match read_verified_symlink_backup(&backup_file, &action.before_hash) {
+                        Ok(target) => target,
+                        Err(e) => {
+                            if strict {
+                                return Err(e);
+                            }
+                            summary.failures.push(format!(
+                                "could not verify symlink backup {}: {e}",
+                                backup_file.display(),
+                            ));
+                            continue;
+                        }
+                    };
                 if dry_run {
                     eprintln!(
                         "[dry-run] would restore symlink {} from backup",
@@ -1557,8 +1615,6 @@ pub fn run_undo_with_scopes(
                 if let Some(parent) = target_file.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                let restore_target =
-                    path_from_raw_bytes(read_regular_file_no_follow(&backup_file)?);
                 match super::mutate::atomic_symlink(&target_file, &restore_target) {
                     Ok(()) => {
                         let restored_hash = symlink_target_hash(&target_file)?;
@@ -1696,6 +1752,13 @@ pub fn run_undo_with_scopes(
                     }
                 }
                 if dry_run {
+                    if let Err(e) = verify_backup_file(&backup_file, &action.before_hash) {
+                        if strict {
+                            return Err(e);
+                        }
+                        summary.failures.push(e.to_string());
+                        continue;
+                    }
                     eprintln!(
                         "[dry-run] would atomic-restore DB {} from backup {}",
                         target_file.display(),
@@ -1863,6 +1926,181 @@ mod tests {
         strict: bool,
     ) -> std::io::Result<UndoSummary> {
         run_undo_with_scopes(target, run_id, dry_run, strict, &[target.to_path_buf()])
+    }
+
+    const BACKUP_CHECK_RUN: &str = "2026-09-20T00-00-00Z__backup-check";
+
+    fn backup_check_fixture(
+        td: &TempDir,
+        op: &str,
+        phase: &str,
+        before: &[u8],
+        after: &[u8],
+    ) -> (PathBuf, PathBuf) {
+        let run_dir = scaffold_run_dir(td.path(), BACKUP_CHECK_RUN).unwrap();
+        let backup = run_dir.join("backups").join("target");
+        fs::write(&backup, b"corrupt backup").unwrap();
+        let action = serde_json::json!({
+            "path": "target",
+            "op": op,
+            "phase": phase,
+            "before_hash": sha256_hex(before),
+            "after_hash": if phase == "pending" { String::new() } else { sha256_hex(after) },
+            "before_mode": 0o600,
+            "ok": phase == "completed",
+        });
+        fs::write(run_dir.join("actions.jsonl"), format!("{action}\n")).unwrap();
+        (td.path().join("target"), backup)
+    }
+
+    fn assert_backup_check_refusal(
+        td: &TempDir,
+        result: std::io::Result<UndoSummary>,
+        strict: bool,
+        dry_run: bool,
+    ) {
+        if strict {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("backup hash mismatch"));
+        } else {
+            let summary = result.unwrap();
+            assert_eq!(summary.actions_replayed, 0);
+            assert_eq!(summary.failures.len(), 1);
+            assert!(summary.failures[0].contains("backup hash mismatch"));
+        }
+        assert!(!undo_complete(td.path(), BACKUP_CHECK_RUN));
+        if dry_run {
+            assert!(
+                !doctor_root(td.path())
+                    .join("runs")
+                    .join(BACKUP_CHECK_RUN)
+                    .join("undo.lock")
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn undo_corrupt_regular_backup_never_replaces_live_file() {
+        for op in ["WriteFile", "AppendFile", "Chmod"] {
+            for strict in [false, true] {
+                for dry_run in [false, true] {
+                    let td = TempDir::new().unwrap();
+                    let (target, backup) =
+                        backup_check_fixture(&td, op, "completed", b"before", b"after");
+                    fs::write(&target, b"after").unwrap();
+                    let result = test_undo(td.path(), BACKUP_CHECK_RUN, dry_run, strict);
+                    assert_backup_check_refusal(&td, result, strict, dry_run);
+                    assert_eq!(fs::read(&target).unwrap(), b"after");
+                    assert_eq!(fs::read(&backup).unwrap(), b"corrupt backup");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn undo_corrupt_pending_backup_never_replaces_live_file() {
+        for strict in [false, true] {
+            for dry_run in [false, true] {
+                let td = TempDir::new().unwrap();
+                let (target, _) =
+                    backup_check_fixture(&td, "WriteFile", "pending", b"before", b"after");
+                fs::write(&target, b"after").unwrap();
+                let result = test_undo(td.path(), BACKUP_CHECK_RUN, dry_run, strict);
+                assert_backup_check_refusal(&td, result, strict, dry_run);
+                assert_eq!(fs::read(&target).unwrap(), b"after");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_corrupt_symlink_backup_never_retargets_live_link() {
+        for strict in [false, true] {
+            for dry_run in [false, true] {
+                let td = TempDir::new().unwrap();
+                let (target, _) = backup_check_fixture(
+                    &td,
+                    "SymlinkAtomic",
+                    "completed",
+                    b"old-target",
+                    b"new-target",
+                );
+                std::os::unix::fs::symlink("new-target", &target).unwrap();
+                let result = test_undo(td.path(), BACKUP_CHECK_RUN, dry_run, strict);
+                assert_backup_check_refusal(&td, result, strict, dry_run);
+                assert_eq!(fs::read_link(&target).unwrap(), Path::new("new-target"));
+            }
+        }
+    }
+
+    #[test]
+    fn undo_db_dry_run_checks_backup_integrity() {
+        for op in ["DbExec", "DbMigrate"] {
+            for strict in [false, true] {
+                let td = TempDir::new().unwrap();
+                let (target, _) =
+                    backup_check_fixture(&td, op, "completed", b"before", b"after");
+                fs::write(&target, b"after").unwrap();
+                let result = test_undo(td.path(), BACKUP_CHECK_RUN, true, strict);
+                assert_backup_check_refusal(&td, result, strict, true);
+                assert_eq!(fs::read(&target).unwrap(), b"after");
+            }
+        }
+    }
+
+    #[test]
+    fn undo_verified_empty_backup_restores_an_empty_file() {
+        let td = TempDir::new().unwrap();
+        let (target, backup) =
+            backup_check_fixture(&td, "WriteFile", "completed", b"", b"after");
+        fs::write(&backup, b"").unwrap();
+        fs::write(&target, b"after").unwrap();
+        let summary = test_undo(td.path(), BACKUP_CHECK_RUN, false, true).unwrap();
+        assert_eq!(summary.actions_replayed, 1);
+        assert!(summary.failures.is_empty());
+        assert!(target.is_file());
+        assert!(fs::read(&target).unwrap().is_empty());
+    }
+
+    #[test]
+    fn verified_backup_requires_a_hash_even_for_empty_bytes() {
+        let td = TempDir::new().unwrap();
+        let backup = td.path().join("backup");
+        fs::write(&backup, b"").unwrap();
+        assert_eq!(
+            read_verified_backup(&backup, "").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(read_verified_backup(&backup, EMPTY_FILE_SHA256).unwrap().is_empty());
+    }
+
+    #[test]
+    fn verified_backup_retains_the_validated_generation() {
+        let td = TempDir::new().unwrap();
+        let backup = td.path().join("backup");
+        let target = td.path().join("target");
+        fs::write(&backup, b"original").unwrap();
+        let bytes = read_verified_backup(&backup, &sha256_hex(b"original")).unwrap();
+        fs::write(&backup, b"changed after verification").unwrap();
+        super::super::mutate::atomic_write_file(&target, &bytes, 0o600).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verified_symlink_backup_rejects_odd_length_utf16() {
+        let td = TempDir::new().unwrap();
+        let backup = td.path().join("backup");
+        let bytes = [b'a', 0, b'b'];
+        fs::write(&backup, bytes).unwrap();
+        assert_eq!(
+            read_verified_symlink_backup(&backup, &sha256_hex(&bytes))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
