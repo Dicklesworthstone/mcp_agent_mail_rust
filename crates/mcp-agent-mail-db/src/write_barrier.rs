@@ -173,41 +173,62 @@ pub struct WriteActivityGuard {
 
 /// Begin one unit of write activity.
 pub fn begin_write_activity() -> WriteActivityGuard {
+    begin_write_activity_with(
+        WRITER_WAIT_WARN_INTERVAL,
+        |waited| {
+            tracing::warn!(
+                waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                "write path is waiting on an in-progress database recovery promotion"
+            );
+        },
+        |waited| {
+            tracing::info!(
+                waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                "write path resumed after recovery promotion released the barrier"
+            );
+        },
+    )
+}
+
+/// Keep diagnostic callbacks outside the process-global admission lock.
+/// Subscribers may inspect barrier metrics or unwind. Neither may strand the
+/// mutex, leak a counted writer, or skip a successor promotion's exclusion.
+fn begin_write_activity_with(
+    warning_interval: Duration,
+    mut on_wait: impl FnMut(Duration),
+    on_resume: impl FnOnce(Duration),
+) -> WriteActivityGuard {
     let b = barrier();
+    let wait_started = Instant::now();
+    let mut warned = false;
     let mut state = b.state.lock().unwrap_or_else(PoisonError::into_inner);
     // Raw exclusion ownership avoids self-deadlock during the explicit
     // recovery-to-writer handoff. It does not exempt this writer from counting.
     if !current_thread_holds_barrier() {
-        let wait_started = Instant::now();
-        let mut warned = false;
         while state.promotion_active {
             let (next, _timeout) = b
                 .promotion_released
-                .wait_timeout(state, WRITER_WAIT_WARN_INTERVAL)
+                .wait_timeout(state, warning_interval)
                 .unwrap_or_else(PoisonError::into_inner);
             state = next;
-            if state.promotion_active
-                && !warned
-                && wait_started.elapsed() >= WRITER_WAIT_WARN_INTERVAL
-            {
+            if state.promotion_active && !warned && wait_started.elapsed() >= warning_interval {
                 warned = true;
-                tracing::warn!(
-                    waited_ms =
-                        u64::try_from(wait_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    "write path is waiting on an in-progress database recovery promotion"
-                );
+                drop(state);
+                on_wait(wait_started.elapsed());
+                state = b.state.lock().unwrap_or_else(PoisonError::into_inner);
+                // A different promotion may have acquired while diagnostics
+                // ran. Recheck the predicate under the lock before admission.
             }
-        }
-        if warned {
-            tracing::info!(
-                waited_ms = u64::try_from(wait_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                "write path resumed after recovery promotion released the barrier"
-            );
         }
     }
     state.writers = state.writers.saturating_add(1);
+    let guard = WriteActivityGuard { _priv: () };
     drop(state);
-    WriteActivityGuard { _priv: () }
+    if warned {
+        // The RAII guard already owns this count if the subscriber panics.
+        on_resume(wait_started.elapsed());
+    }
+    guard
 }
 
 impl Drop for WriteActivityGuard {
@@ -854,8 +875,14 @@ mod tests {
                 remaining_writers: 1
             }
         );
-        assert!(current_thread_holds_barrier(), "timeout retains exclusion ownership");
-        assert!(!current_thread_holds_promotion_barrier(), "timeout grants no promotion entitlement");
+        assert!(
+            current_thread_holds_barrier(),
+            "timeout retains exclusion ownership"
+        );
+        assert!(
+            !current_thread_holds_promotion_barrier(),
+            "timeout grants no promotion entitlement"
+        );
         assert!(barrier().state.lock().unwrap().promotion_active);
         drop(timed_out);
         assert!(!current_thread_holds_promotion_barrier());
@@ -1034,7 +1061,9 @@ mod tests {
         let budget = Duration::from_millis(100);
         assert_eq!(
             drain_progress(0, Duration::from_millis(99), budget),
-            Some(DrainOutcome::Drained { waited: Duration::from_millis(99) })
+            Some(DrainOutcome::Drained {
+                waited: Duration::from_millis(99)
+            })
         );
         for waited in [budget, budget + Duration::from_nanos(1), Duration::MAX] {
             for remaining_writers in [0, 1] {
@@ -1067,7 +1096,10 @@ mod tests {
         std::fs::write(&live, b"original;").unwrap();
         std::fs::write(&candidate, b"replacement;").unwrap();
         let writer_guard = begin_write_activity();
-        let mut writer = std::fs::OpenOptions::new().append(true).open(&live).unwrap();
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&live)
+            .unwrap();
         let (failed, _) = acquire_promotion_barrier_draining(Duration::ZERO);
         let (nested, outcome) = acquire_promotion_barrier_draining(Duration::ZERO);
         if matches!(outcome, DrainOutcome::Idle | DrainOutcome::Drained { .. }) {
@@ -1093,5 +1125,169 @@ mod tests {
         assert_eq!(std::fs::read(&saved).unwrap(), b"original;acknowledged;");
         assert_eq!(std::fs::read(&live).unwrap(), b"replacement;");
         drop(fresh);
+    }
+
+    fn assert_admission_observers_available(expected_writers: usize) {
+        // Fail immediately instead of hanging the test if a callback is
+        // accidentally invoked under the mutex, then exercise the real reader.
+        let state = barrier().state.try_lock().expect("diagnostic holds no admission lock");
+        assert_eq!(state.writers, expected_writers);
+        drop(state);
+        assert_eq!(active_writer_count(), expected_writers);
+        assert!(!current_thread_holds_promotion_barrier());
+    }
+
+    #[test]
+    fn writer_wait_diagnostics_can_reenter_admission_observers() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let owner = try_acquire_promotion_barrier_if_idle().expect("owner");
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut warnings = 0;
+            let mut resumes = 0;
+            let writer = begin_write_activity_with(
+                Duration::from_millis(5),
+                |_| {
+                    assert_admission_observers_available(0);
+                    warnings += 1;
+                    waiting_tx.send(()).unwrap();
+                },
+                |_| {
+                    assert_admission_observers_available(1);
+                    resumes += 1;
+                },
+            );
+            drop(writer);
+            (warnings, resumes)
+        });
+        let waiting = waiting_rx.recv_timeout(Duration::from_secs(5));
+        drop(owner);
+        let counts = worker.join().expect("diagnostic observer");
+        assert!(waiting.is_ok());
+        assert_eq!(counts, (1, 1));
+        assert_eq!(active_writer_count(), 0);
+    }
+
+    #[test]
+    fn wait_diagnostic_panic_neither_poisons_gate_nor_counts_a_writer() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let owner = try_acquire_promotion_barrier_if_idle().expect("owner");
+        let worker = std::thread::spawn(|| {
+            std::panic::catch_unwind(|| {
+                begin_write_activity_with(
+                    Duration::from_millis(5),
+                    |_| {
+                        assert_admission_observers_available(0);
+                        panic!("wait subscriber failed");
+                    },
+                    |_| panic!("a failed wait callback cannot resume"),
+                )
+            })
+            .is_err()
+        });
+        assert!(worker.join().expect("caught subscriber panic"));
+        assert!(!barrier().state.is_poisoned());
+        assert_eq!(active_writer_count(), 0);
+        assert!(current_thread_holds_promotion_barrier());
+        drop(owner);
+        let writer = begin_write_activity();
+        assert_eq!(active_writer_count(), 1);
+        drop(writer);
+    }
+
+    #[test]
+    fn resume_diagnostic_panic_releases_its_already_counted_writer() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let owner = try_acquire_promotion_barrier_if_idle().expect("owner");
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                begin_write_activity_with(
+                    Duration::from_millis(5),
+                    |_| {
+                        assert_admission_observers_available(0);
+                        waiting_tx.send(()).unwrap();
+                    },
+                    |_| {
+                        assert_admission_observers_available(1);
+                        panic!("resume subscriber failed");
+                    },
+                )
+            }))
+            .is_err()
+        });
+        let waiting = waiting_rx.recv_timeout(Duration::from_secs(5));
+        drop(owner);
+        let panicked = worker.join().expect("caught resume panic");
+        assert!(waiting.is_ok() && panicked);
+        assert!(!barrier().state.is_poisoned());
+        assert_eq!(active_writer_count(), 0);
+        assert!(try_acquire_promotion_barrier_if_idle().is_some());
+    }
+
+    #[test]
+    fn admission_rechecks_a_successor_promotion_after_unlocked_diagnostics() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let first = try_acquire_promotion_barrier_if_idle().expect("first owner");
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let writer = begin_write_activity_with(
+                Duration::from_millis(5),
+                |_| {
+                    assert_admission_observers_available(0);
+                    waiting_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                },
+                |_| assert_admission_observers_available(1),
+            );
+            entered_tx.send(()).unwrap();
+            drop(writer);
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(first);
+        let successor = try_acquire_promotion_barrier_if_idle().expect("successor owner");
+        resume_tx.send(()).unwrap();
+        let early = entered_rx.recv_timeout(Duration::from_millis(50));
+        drop(successor);
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        worker.join().expect("writer after successor");
+        assert_eq!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        assert!(entered.is_ok());
+        assert_eq!(active_writer_count(), 0);
+    }
+
+    #[test]
+    fn uncontended_and_owner_handoff_admission_emit_no_wait_diagnostics() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let writer = begin_write_activity_with(
+            Duration::from_millis(5),
+            |_| panic!("uncontended writer must not warn"),
+            |_| panic!("uncontended writer must not report resuming"),
+        );
+        assert_eq!(active_writer_count(), 1);
+        drop(writer);
+        let owner = try_acquire_promotion_barrier_if_idle().expect("bootstrap owner");
+        let writer = begin_write_activity_with(
+            Duration::from_millis(5),
+            |_| panic!("bootstrap handoff must not wait on itself"),
+            |_| panic!("bootstrap handoff must not report resuming"),
+        );
+        assert_nested_promotion_refused(1);
+        drop(writer);
+        assert!(current_thread_holds_promotion_barrier());
+        drop(owner);
+        assert_eq!(active_writer_count(), 0);
     }
 }
