@@ -2040,8 +2040,7 @@ mod tests {
         for op in ["DbExec", "DbMigrate"] {
             for strict in [false, true] {
                 let td = TempDir::new().unwrap();
-                let (target, _) =
-                    backup_check_fixture(&td, op, "completed", b"before", b"after");
+                let (target, _) = backup_check_fixture(&td, op, "completed", b"before", b"after");
                 fs::write(&target, b"after").unwrap();
                 let result = test_undo(td.path(), BACKUP_CHECK_RUN, true, strict);
                 assert_backup_check_refusal(&td, result, strict, true);
@@ -2053,8 +2052,7 @@ mod tests {
     #[test]
     fn undo_verified_empty_backup_restores_an_empty_file() {
         let td = TempDir::new().unwrap();
-        let (target, backup) =
-            backup_check_fixture(&td, "WriteFile", "completed", b"", b"after");
+        let (target, backup) = backup_check_fixture(&td, "WriteFile", "completed", b"", b"after");
         fs::write(&backup, b"").unwrap();
         fs::write(&target, b"after").unwrap();
         let summary = test_undo(td.path(), BACKUP_CHECK_RUN, false, true).unwrap();
@@ -2073,7 +2071,11 @@ mod tests {
             read_verified_backup(&backup, "").unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
         );
-        assert!(read_verified_backup(&backup, EMPTY_FILE_SHA256).unwrap().is_empty());
+        assert!(
+            read_verified_backup(&backup, EMPTY_FILE_SHA256)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

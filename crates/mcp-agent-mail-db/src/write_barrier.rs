@@ -152,7 +152,10 @@ pub fn current_thread_holds_promotion_barrier() -> bool {
     if !current_thread_holds_barrier() {
         return false;
     }
-    let state = barrier().state.lock().unwrap_or_else(PoisonError::into_inner);
+    let state = barrier()
+        .state
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     state.can_promote()
 }
 
@@ -943,7 +946,10 @@ mod tests {
         assert!(try_acquire_promotion_barrier_if_idle().is_none());
         let (nested, outcome) = acquire_promotion_barrier_draining(Duration::ZERO);
         assert_eq!(outcome, DrainOutcome::TimedOut { remaining_writers });
-        assert!(!nested.participating, "refused nesting must not gain a lease");
+        assert!(
+            !nested.participating,
+            "refused nesting must not gain a lease"
+        );
         drop(nested);
         assert_eq!(THREAD_BARRIER_DEPTH.with(Cell::get), depth);
         assert!(barrier().state.lock().unwrap().promotion_active);
@@ -956,7 +962,12 @@ mod tests {
         }
         let writer = begin_write_activity();
         let (failed, outcome) = acquire_promotion_barrier_draining(Duration::ZERO);
-        assert_eq!(outcome, DrainOutcome::TimedOut { remaining_writers: 1 });
+        assert_eq!(
+            outcome,
+            DrainOutcome::TimedOut {
+                remaining_writers: 1
+            }
+        );
         assert!(failed.participating);
         assert_nested_promotion_refused(1);
         drop(writer);
@@ -1019,7 +1030,12 @@ mod tests {
         let writer = begin_write_activity();
         let (failed, _) = acquire_promotion_barrier_draining(Duration::ZERO);
         let (refused, outcome) = acquire_promotion_barrier_draining(Duration::ZERO);
-        assert_eq!(outcome, DrainOutcome::TimedOut { remaining_writers: 1 });
+        assert_eq!(
+            outcome,
+            DrainOutcome::TimedOut {
+                remaining_writers: 1
+            }
+        );
         assert!(!refused.participating);
         drop(writer);
         drop(failed);
@@ -1076,7 +1092,9 @@ mod tests {
         assert_eq!(drain_progress(1, Duration::from_millis(99), budget), None);
         assert_eq!(
             drain_progress(0, Duration::ZERO, Duration::ZERO),
-            Some(DrainOutcome::TimedOut { remaining_writers: 0 })
+            Some(DrainOutcome::TimedOut {
+                remaining_writers: 0
+            })
         );
     }
 
@@ -1130,7 +1148,10 @@ mod tests {
     fn assert_admission_observers_available(expected_writers: usize) {
         // Fail immediately instead of hanging the test if a callback is
         // accidentally invoked under the mutex, then exercise the real reader.
-        let state = barrier().state.try_lock().expect("diagnostic holds no admission lock");
+        let state = barrier()
+            .state
+            .try_lock()
+            .expect("diagnostic holds no admission lock");
         assert_eq!(state.writers, expected_writers);
         drop(state);
         assert_eq!(active_writer_count(), expected_writers);

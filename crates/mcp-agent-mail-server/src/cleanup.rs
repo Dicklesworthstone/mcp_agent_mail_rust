@@ -861,9 +861,8 @@ fn walk_activity(
         if !budget.take_entry() {
             return ActivityProbeResult::Truncated;
         }
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => return ActivityProbeResult::Unavailable,
+        let Ok(entry) = entry else {
+            return ActivityProbeResult::Unavailable;
         };
         let kind = entry.file_type();
         if kind.is_symlink() {
@@ -2408,7 +2407,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut budget = ActivityWalkBudget {
             remaining_entries: 10,
-            started: Instant::now() - Duration::from_secs(1),
+            started: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("test clock supports an instant one second earlier"),
         };
         assert_eq!(
             walk_activity(
