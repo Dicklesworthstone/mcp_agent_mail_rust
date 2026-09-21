@@ -30,6 +30,8 @@
 //! one opened file up to its initial length, never chase a concurrent appender.
 //! Completed payloads are dropped during the scan; only their terminal keys
 //! remain to prevent a later duplicate from resurrecting completed work.
+//! Publication and snapshot completion revalidate retained directory/file
+//! handles: an observed replacement is not a durable receipt or an empty queue.
 //!
 //! NOTE: [`crate::reservations`] still carries its own private copy of the
 //! release-intent writer/reader for its automatic replay-on-success path.
@@ -38,10 +40,13 @@
 
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::io::{BufRead as _, Read as _, Write as _};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use mcp_agent_mail_core::Config;
+use mcp_agent_mail_core::journal_io::{JournalDirectory, JournalFileMode, validate_entry_name};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -166,6 +171,7 @@ pub fn log_path(config: &Config, file_name: &str) -> PathBuf {
         .join(file_name)
 }
 
+#[cfg(test)]
 fn lock_path(config: &Config, lock_file_name: &str) -> PathBuf {
     config
         .storage_root
@@ -182,7 +188,8 @@ pub fn hash_json_value(value: &Value) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Refuse to operate on a path that is (or has become) a symlink.
+/// Fixture setup only; production uses retained journal handles.
+#[cfg(test)]
 fn reject_existing_symlink(path: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::other(format!(
@@ -195,6 +202,7 @@ fn reject_existing_symlink(path: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(test)]
 fn ensure_intent_parent(path: &Path) -> std::io::Result<()> {
     let Some(parent) = path.parent() else {
         return Err(std::io::Error::other("degraded-intent log has no parent"));
@@ -250,10 +258,10 @@ fn acquire_intent_lock(file: &std::fs::File, timeout: Duration) -> std::io::Resu
 }
 
 /// Append a single JSON record under an exclusive advisory lock, with private
-/// permissions and `fsync` of file + parent dir.
+/// permissions and file sync plus retained Unix directory sync.
 ///
-/// Lock contention is bounded;
-/// a timeout is an error, never a receipt claiming the record was queued.
+/// Lock contention is bounded. A timeout or observed authority replacement is
+/// an error, never a receipt claiming that the current journal queued the intent.
 pub fn append_jsonl(
     config: &Config,
     file_name: &str,
@@ -269,59 +277,22 @@ pub fn append_jsonl(
             "degraded-intent record exceeds its byte limit",
         ));
     }
-    let path = log_path(config, file_name);
-    ensure_intent_parent(&path)?;
-    reject_existing_symlink(&path)?;
-    let lock_file_path = lock_path(config, lock_file_name);
-    reject_existing_symlink(&lock_file_path)?;
-    let mut lock_options = std::fs::OpenOptions::new();
-    lock_options
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        lock_options.mode(0o600);
-    }
-    let lock_file = lock_options.open(&lock_file_path)?;
-    if !lock_file.metadata()?.is_file() {
-        return Err(std::io::Error::other(
-            "degraded-intent lock is not a regular file",
+    validate_entry_name(file_name)?;
+    validate_entry_name(lock_file_name)?;
+    if file_name.eq_ignore_ascii_case(lock_file_name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "degraded-intent lock and log must have distinct names",
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        lock_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
+    let directory = JournalDirectory::open(&config.storage_root, DEGRADED_INTENTS_DIR, true)?;
+    let path = directory.directory_path().join(file_name);
+    let lock_file = directory.open_file(lock_file_name, JournalFileMode::Lock)?;
     acquire_intent_lock(&lock_file, INTENT_LOCK_TIMEOUT)?;
-    // Another writer may have changed the log while this caller was waiting.
-    // Repeat the existing authority checks before opening the append handle.
-    if let Some(parent) = path.parent() {
-        reject_existing_symlink(parent)?;
-    }
-    reject_existing_symlink(&path)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).read(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&path)?;
+    // A renamed/replaced lock no longer excludes appenders using its new name.
+    directory.validate_file(lock_file_name, &lock_file)?;
+    let mut file = directory.open_file(file_name, JournalFileMode::Append)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(std::io::Error::other(
-            "degraded-intent log is not a regular file",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
     // Isolate a torn prior append. Failure to inspect the tail must propagate,
     // not masquerade as an empty log and join two records into an unreadable one.
     let needs_leading_newline = if metadata.len() > 0 {
@@ -341,10 +312,9 @@ pub fn append_jsonl(
     line.push(b'\n');
     file.write_all(&line)?;
     file.sync_all()?;
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
-    }
+    directory.sync()?;
+    directory.validate_file(lock_file_name, &lock_file)?;
+    directory.validate_file(file_name, &file)?;
     Ok(path)
 }
 
@@ -353,6 +323,8 @@ pub fn append_jsonl(
 /// not just JSON punctuation. Whole-file `read_to_string` loses every intact
 /// record when even one such fragment exists anywhere in the log.
 struct IntentLogReader {
+    directory: JournalDirectory,
+    file_name: String,
     reader: std::io::BufReader<std::io::Take<std::fs::File>>,
     line: Vec<u8>,
     record_limit: usize,
@@ -362,17 +334,25 @@ struct IntentLogReader {
 
 impl IntentLogReader {
     fn open(config: &Config, file_name: &str) -> std::io::Result<Option<Self>> {
-        let path = log_path(config, file_name);
-        if let Some(parent) = path.parent() {
-            reject_existing_symlink(parent)?;
-        }
-        let file = match mcp_agent_mail_core::disk::open_regular_file_no_follow(&path) {
+        validate_entry_name(file_name)?;
+        let directory = match JournalDirectory::open(
+            &config.storage_root,
+            DEGRADED_INTENTS_DIR,
+            false,
+        ) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let file = match directory.open_file(file_name, JournalFileMode::Read) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
         let snapshot_bytes = file.metadata()?.len();
         Ok(Some(Self {
+            directory,
+            file_name: file_name.to_string(),
             reader: std::io::BufReader::new(file.take(snapshot_bytes)),
             line: Vec::new(),
             record_limit: MAX_INTENT_RECORD_BYTES,
@@ -398,6 +378,13 @@ impl IntentLogReader {
                         "degraded-intent log was truncated during its snapshot read",
                     ));
                 }
+                // Public readers do not return their accumulated queue until
+                // EOF. A detached/replaced snapshot must fail, not return a
+                // misleading empty or partial view of the current journal.
+                self.directory.validate_file(
+                    &self.file_name,
+                    self.reader.get_ref().get_ref(),
+                )?;
                 self.finished = true;
                 if self.skipped_records > 0 {
                     tracing::warn!(
@@ -1588,6 +1575,103 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_queued_ack_intents(&config).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hard_linked_ack_log_is_refused_without_changing_its_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let path = log_path(&config, ACK_INTENT_LOG_FILE);
+        ensure_intent_parent(&path).unwrap();
+        let source = tmp.path().join("source-evidence");
+        std::fs::write(&source, b"preserved evidence").unwrap();
+        std::fs::hard_link(&source, &path).unwrap();
+        assert!(append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"preserved evidence");
+        assert!(read_queued_ack_intents(&config).is_err());
+    }
+
+    #[test]
+    fn hard_linked_ack_lock_is_refused_before_the_log_is_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let path = lock_path(&config, ACK_INTENT_LOCK_FILE);
+        ensure_intent_parent(&path).unwrap();
+        let source = tmp.path().join("source-evidence");
+        std::fs::write(&source, b"preserved lock evidence").unwrap();
+        std::fs::hard_link(&source, &path).unwrap();
+        assert!(append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"preserved lock evidence");
+        assert!(!log_path(&config, ACK_INTENT_LOG_FILE).exists());
+    }
+
+    #[test]
+    fn invalid_or_aliased_entry_names_do_not_create_journal_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        for (log, lock) in [
+            ("../outside", ACK_INTENT_LOCK_FILE),
+            (ACK_INTENT_LOG_FILE, "../outside"),
+            ("ack:stream", ACK_INTENT_LOCK_FILE),
+            ("NUL", ACK_INTENT_LOCK_FILE),
+            ("same", "SAME"),
+        ] {
+            assert!(append_jsonl(&config, log, lock, &json!({"n": 1})).is_err());
+            assert!(!tmp.path().join(DEGRADED_INTENTS_DIR).exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_lock_or_log_cannot_issue_an_ack_receipt() {
+        for name in [ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE] {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = test_config(tmp.path());
+            let path = log_path(&config, name);
+            ensure_intent_parent(&path).unwrap();
+            let source = tmp.path().join("source-evidence");
+            std::fs::write(&source, b"unchanged").unwrap();
+            std::os::unix::fs::symlink(&source, &path).unwrap();
+            assert!(append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").is_err());
+            assert_eq!(std::fs::read(&source).unwrap(), b"unchanged");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_log_is_an_error_at_snapshot_completion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let path = append_jsonl(
+            &config, ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE, &json!({"n": 1}),
+        ).unwrap();
+        let mut reader = IntentLogReader::open(&config, ACK_INTENT_LOG_FILE).unwrap().unwrap();
+        assert_eq!(reader.next_record().unwrap(), Some(json!({"n": 1})));
+        std::fs::rename(&path, path.with_extension("preserved")).unwrap();
+        std::fs::write(&path, b"{\"n\":2}\n").unwrap();
+        let error = reader.next_record().unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!reader.finished);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"n\":2}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn displaced_directory_cannot_finish_as_a_successful_empty_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        append_jsonl(
+            &config, ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE, &json!({"n": 1}),
+        ).unwrap();
+        let mut reader = IntentLogReader::open(&config, ACK_INTENT_LOG_FILE).unwrap().unwrap();
+        std::fs::rename(
+            tmp.path().join(DEGRADED_INTENTS_DIR), tmp.path().join("preserved-journal"),
+        ).unwrap();
+        assert_eq!(reader.next_record().unwrap(), Some(json!({"n": 1})));
+        let error = reader.next_record().unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!reader.finished);
+        assert!(tmp.path().join("preserved-journal").join(ACK_INTENT_LOG_FILE).exists());
     }
 
     proptest::proptest! {
