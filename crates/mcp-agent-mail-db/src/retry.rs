@@ -24,9 +24,15 @@
 //! - Rate-limited half-open probes (max 1 per 5 s)
 //! - Success threshold: 3 consecutive successes required to close from half-open
 //! - WARN-level logging on state transitions
+//!
+//! Retry attempts carry their admission epoch. An operation admitted before an
+//! open/reset transition cannot heal or damage its successor epoch. Half-open
+//! retry probes are single-flight even when an operation outlives the interval;
+//! dropping a probe releases its slot without inventing a successful outcome.
 
 use crate::error::{DbError, DbResult};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -93,24 +99,118 @@ const HALF_OPEN_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 /// Number of consecutive successes required to close from half-open.
 const HALF_OPEN_SUCCESS_THRESHOLD: u32 = 3;
 
+/// One coherent observation of a subsystem, not four independent atomic reads.
+#[derive(Debug, Clone, Copy)]
+pub struct CircuitSnapshot {
+    pub state: CircuitState,
+    pub failures: u32,
+    pub half_open_successes: u32,
+    pub remaining_open_secs: f64,
+    pub probe_in_flight: bool,
+}
+
+#[derive(Debug, Default)]
+struct CircuitData {
+    failures: u32,
+    half_open_successes: u32,
+    // None is closed. Some(0) is a valid immediately half-open deadline.
+    open_until_us: Option<u64>,
+    last_probe_us: Option<u64>,
+    // Identity rather than a wrapping generation number. An outstanding attempt
+    // retains its Arc, so its identity cannot be reused by a newer generation.
+    generation: Arc<()>,
+    active_probe: Option<Arc<()>>,
+}
+
+impl CircuitData {
+    fn state(&self, now_us: u64) -> CircuitState {
+        match self.open_until_us {
+            None => CircuitState::Closed,
+            Some(until) if now_us < until => CircuitState::Open,
+            Some(_) => CircuitState::HalfOpen,
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn record_success(&mut self, now_us: u64) {
+        match self.state(now_us) {
+            CircuitState::Closed => self.failures = 0,
+            CircuitState::HalfOpen => {
+                self.half_open_successes = self.half_open_successes.saturating_add(1);
+                if self.half_open_successes >= HALF_OPEN_SUCCESS_THRESHOLD {
+                    self.clear();
+                }
+            }
+            // Concurrent calls admitted while closed can finish after another
+            // call opens the circuit. Their success is not a recovery probe.
+            CircuitState::Open => {}
+        }
+    }
+
+    fn record_failure(&mut self, now_us: u64, threshold: u32, reset_duration: Duration) {
+        self.failures = self.failures.saturating_add(1);
+        self.half_open_successes = 0;
+        if self.failures >= threshold {
+            let until = now_us.saturating_add(micros_from_duration(reset_duration));
+            self.open_until_us = Some(self.open_until_us.map_or(until, |old| old.max(until)));
+            self.generation = Arc::new(());
+            self.active_probe = None;
+            // Retain the last probe timestamp across a failed recovery. A short
+            // reset duration must not bypass the minimum probe-start interval.
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CircuitRefusal {
+    failures: u32,
+    remaining_us: u64,
+    half_open: bool,
+    probe_in_flight: bool,
+}
+
+impl CircuitRefusal {
+    fn into_error(self, subsystem: &str) -> DbError {
+        #[allow(clippy::cast_precision_loss)]
+        let remaining = self.remaining_us as f64 / 1_000_000.0;
+        let message = if self.probe_in_flight {
+            format!(
+                "[{subsystem}] Circuit breaker half-open, recovery probe already in flight. \
+                 Retry after that probe completes; its completion time is unknown."
+            )
+        } else if self.half_open {
+            format!(
+                "[{subsystem}] Circuit breaker half-open, probe rate-limited. \
+                 Next probe in {remaining:.1}s."
+            )
+        } else {
+            format!(
+                "[{subsystem}] Circuit breaker open after {} consecutive failures. \
+                 Resets in {remaining:.1}s.",
+                self.failures,
+            )
+        };
+        DbError::CircuitBreakerOpen {
+            message,
+            failures: self.failures,
+            // For an in-flight probe this is a retry hint, not a completion SLA.
+            reset_after_secs: remaining,
+        }
+    }
+}
+
 /// Thread-safe circuit breaker with per-subsystem isolation.
 ///
-/// Uses atomics for lock-free reads of state. Enhanced over the legacy
-/// single-breaker design with:
-/// - Subsystem label for diagnostics
-/// - Rate-limited half-open probes (max 1 per `HALF_OPEN_PROBE_INTERVAL`)
-/// - Success threshold: requires `HALF_OPEN_SUCCESS_THRESHOLD` consecutive
-///   successes in half-open before closing
-/// - WARN-level logging on state transitions
+/// Related state transitions and admission are serialized in a short critical
+/// section. No operation, sleep, or tracing subscriber runs under that lock.
+/// Use [`Self::begin_attempt`] for concurrent operations: its single-use result
+/// token ties feedback to the admission epoch and owns a half-open probe slot.
+#[derive(Debug)]
 pub struct CircuitBreaker {
-    /// Consecutive failure count.
-    failures: AtomicU32,
-    /// Consecutive successes in half-open state (resets on failure or close).
-    half_open_successes: AtomicU32,
-    /// Monotonic microseconds when the circuit should enter half-open (0 = not open).
-    open_until_us: AtomicU64,
-    /// Monotonic microseconds of the last half-open probe (0 = never).
-    last_probe_us: AtomicU64,
+    data: Mutex<CircuitData>,
     /// Threshold before the circuit opens.
     threshold: u32,
     /// Duration the circuit stays open before entering half-open.
@@ -145,15 +245,18 @@ impl CircuitBreaker {
         reset_duration: Duration,
     ) -> Self {
         Self {
-            failures: AtomicU32::new(0),
-            half_open_successes: AtomicU32::new(0),
-            open_until_us: AtomicU64::new(0),
-            last_probe_us: AtomicU64::new(0),
+            data: Mutex::new(CircuitData::default()),
             threshold: threshold.max(1),
             reset_duration,
             epoch: Instant::now(),
             subsystem,
         }
+    }
+
+    fn lock_data(&self) -> MutexGuard<'_, CircuitData> {
+        self.data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The subsystem label this breaker protects.
@@ -174,182 +277,204 @@ impl CircuitBreaker {
         self.reset_duration
     }
 
-    /// Current circuit state (lock-free read).
+    /// Current state and counters from the same observation.
+    #[must_use]
+    pub fn snapshot(&self) -> CircuitSnapshot {
+        let data = self.lock_data();
+        let now_us = self.now_us();
+        #[allow(clippy::cast_precision_loss)]
+        let remaining_open_secs = data
+            .open_until_us
+            .map_or(0, |until| until.saturating_sub(now_us)) as f64
+            / 1_000_000.0;
+        CircuitSnapshot {
+            state: data.state(now_us),
+            failures: data.failures,
+            half_open_successes: data.half_open_successes,
+            remaining_open_secs,
+            probe_in_flight: data.active_probe.is_some(),
+        }
+    }
+
+    /// Current circuit state.
     #[must_use]
     pub fn state(&self) -> CircuitState {
-        let open_until = self.open_until_us.load(Ordering::Acquire);
-        let now_us = self.now_us();
-
-        if open_until > 0 && now_us < open_until {
-            return CircuitState::Open;
-        }
-        if self.failures.load(Ordering::Acquire) >= self.threshold {
-            return CircuitState::HalfOpen;
-        }
-        CircuitState::Closed
+        self.snapshot().state
     }
 
     /// Number of consecutive failures.
     #[must_use]
     pub fn failure_count(&self) -> u32 {
-        self.failures.load(Ordering::Acquire)
+        self.snapshot().failures
     }
 
     /// Number of consecutive half-open successes (toward the close threshold).
     #[must_use]
     pub fn half_open_success_count(&self) -> u32 {
-        self.half_open_successes.load(Ordering::Acquire)
+        self.snapshot().half_open_successes
     }
 
-    /// Seconds remaining until the circuit transitions from `Open` to `HalfOpen`.
-    /// Returns 0.0 if not open.
+    /// Seconds remaining until `Open` becomes `HalfOpen`, or zero when not open.
     #[must_use]
     pub fn remaining_open_secs(&self) -> f64 {
-        let open_until = self.open_until_us.load(Ordering::Acquire);
-        if open_until == 0 {
-            return 0.0;
-        }
-        let now_us = self.now_us();
-        if now_us >= open_until {
-            return 0.0;
-        }
-        #[allow(clippy::cast_precision_loss)]
-        let secs = (open_until - now_us) as f64 / 1_000_000.0;
-        secs
+        self.snapshot().remaining_open_secs
     }
 
-    /// Check if a call should be allowed.
-    ///
-    /// Returns `Ok(())` if the circuit is closed, or if the circuit is half-open
-    /// and the rate-limited probe interval has elapsed.
-    /// Returns `Err(CircuitBreakerOpen)` if the circuit is open, or if we're
-    /// in half-open but a probe was already issued recently.
-    pub fn check(&self) -> DbResult<()> {
-        match self.state() {
-            CircuitState::Closed => Ok(()),
+    fn admit_state(
+        data: &mut CircuitData,
+        now_us: u64,
+    ) -> Result<CircuitState, CircuitRefusal> {
+        let state = data.state(now_us);
+        let interval_us = micros_from_duration(HALF_OPEN_PROBE_INTERVAL);
+        match state {
+            CircuitState::Closed => Ok(state),
+            CircuitState::Open => Err(CircuitRefusal {
+                failures: data.failures,
+                remaining_us: data.open_until_us.unwrap_or(now_us).saturating_sub(now_us),
+                half_open: false,
+                probe_in_flight: false,
+            }),
             CircuitState::HalfOpen => {
-                // Rate-limit probes: only allow one per HALF_OPEN_PROBE_INTERVAL.
-                let now_us = self.now_us();
-                let interval_us = micros_from_duration(HALF_OPEN_PROBE_INTERVAL);
-                loop {
-                    let last = self.last_probe_us.load(Ordering::Acquire);
+                if data.active_probe.is_some() {
+                    return Err(CircuitRefusal {
+                        failures: data.failures,
+                        remaining_us: interval_us,
+                        half_open: true,
+                        probe_in_flight: true,
+                    });
+                }
+                if let Some(last) = data.last_probe_us {
                     let elapsed = now_us.saturating_sub(last);
-                    if last > 0 && elapsed < interval_us {
-                        #[allow(clippy::cast_precision_loss)]
-                        let remaining = (interval_us - elapsed) as f64 / 1_000_000.0;
-                        return Err(DbError::CircuitBreakerOpen {
-                            message: format!(
-                                "[{subsystem}] Circuit breaker half-open, probe rate-limited. \
-                                 Next probe in {remaining:.1}s.",
-                                subsystem = self.subsystem,
-                            ),
-                            failures: self.failures.load(Ordering::Acquire),
-                            reset_after_secs: remaining,
+                    if elapsed < interval_us {
+                        return Err(CircuitRefusal {
+                            failures: data.failures,
+                            remaining_us: interval_us - elapsed,
+                            half_open: true,
+                            probe_in_flight: false,
                         });
                     }
+                }
+                data.last_probe_us = Some(now_us);
+                Ok(state)
+            }
+        }
+    }
 
-                    // Reserve the half-open probe atomically so concurrent callers
-                    // cannot all pass through on the same interval boundary.
-                    match self.last_probe_us.compare_exchange(
-                        last,
-                        now_us,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => return Ok(()),
-                        Err(observed) => {
-                            let elapsed = now_us.saturating_sub(observed);
-                            if observed > 0 && elapsed < interval_us {
-                                #[allow(clippy::cast_precision_loss)]
-                                let remaining = (interval_us - elapsed) as f64 / 1_000_000.0;
-                                return Err(DbError::CircuitBreakerOpen {
-                                    message: format!(
-                                        "[{subsystem}] Circuit breaker half-open, probe rate-limited. \
-                                         Next probe in {remaining:.1}s.",
-                                        subsystem = self.subsystem,
-                                    ),
-                                    failures: self.failures.load(Ordering::Acquire),
-                                    reset_after_secs: remaining,
-                                });
-                            }
-                        }
+    /// Check admission without retaining an operation token.
+    ///
+    /// This supports externally serialized observation callers. Concurrent or
+    /// cancelable operations must use [`Self::begin_attempt`] instead: a bare
+    /// check cannot associate a later result with the epoch that admitted it.
+    pub fn check(&self) -> DbResult<()> {
+        let admission = {
+            let mut data = self.lock_data();
+            Self::admit_state(&mut data, self.now_us())
+        };
+        admission
+            .map(|_| ())
+            .map_err(|refusal| refusal.into_error(self.subsystem))
+    }
+
+    /// Admit one operation and retain its epoch and optional recovery-probe slot.
+    /// No lock remains held while the operation executes. A dropped token is
+    /// neutral evidence, never a success or a subsystem failure.
+    pub fn begin_attempt(&self) -> DbResult<CircuitAttempt<'_>> {
+        self.begin_attempt_at(self.now_us())
+    }
+
+    fn begin_attempt_at(&self, now_us: u64) -> DbResult<CircuitAttempt<'_>> {
+        let admission = {
+            let mut data = self.lock_data();
+            Self::admit_state(&mut data, now_us).map(|admitted_state| {
+                let probe = (admitted_state == CircuitState::HalfOpen).then(|| Arc::new(()));
+                data.active_probe.clone_from(&probe);
+                CircuitAttempt {
+                    breaker: self,
+                    generation: Arc::clone(&data.generation),
+                    probe,
+                    admitted_state,
+                    completed: false,
+                }
+            })
+        };
+        admission.map_err(|refusal| refusal.into_error(self.subsystem))
+    }
+
+    /// Record an unscoped observation from an externally serialized caller.
+    /// Open circuits never close on such a success, and this cannot complete an
+    /// owned probe. Concurrent retry paths use [`CircuitAttempt::record_success`].
+    pub fn record_success(&self) {
+        let transition = {
+            let mut data = self.lock_data();
+            let now_us = self.now_us();
+            let before = data.state(now_us);
+            if data.active_probe.is_none() {
+                data.record_success(now_us);
+            }
+            (before, data.state(now_us))
+        };
+        self.log_transition(transition);
+    }
+
+    /// Record an unscoped failure observation — may open the circuit.
+    pub fn record_failure(&self) {
+        self.record_failure_at(self.now_us());
+    }
+
+    fn record_failure_at(&self, now_us: u64) {
+        let transition = {
+            let mut data = self.lock_data();
+            let before = data.state(now_us);
+            data.record_failure(now_us, self.threshold, self.reset_duration);
+            (before, data.state(now_us))
+        };
+        self.log_transition(transition);
+    }
+
+    fn finish_attempt(&self, attempt: &CircuitAttempt<'_>, result: AttemptResult, now_us: u64) {
+        let transition = {
+            let mut data = self.lock_data();
+            if !Arc::ptr_eq(&attempt.generation, &data.generation) {
+                return;
+            }
+            if let Some(probe) = attempt.probe.as_ref() {
+                if !data
+                    .active_probe
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, probe))
+                {
+                    return;
+                }
+                data.active_probe = None;
+            }
+            let before = data.state(now_us);
+            match result {
+                AttemptResult::Success => data.record_success(now_us),
+                AttemptResult::Failure => {
+                    data.record_failure(now_us, self.threshold, self.reset_duration);
+                }
+                AttemptResult::Abandoned => {
+                    // A cancellation/panic/non-retryable result cannot extend
+                    // the recovery-success streak. Keep the rate-limit timestamp.
+                    if attempt.probe.is_some() {
+                        data.half_open_successes = 0;
                     }
                 }
             }
-            CircuitState::Open => Err(DbError::CircuitBreakerOpen {
-                message: format!(
-                    "[{subsystem}] Circuit breaker open after {failures} consecutive failures. \
-                     Resets in {remaining:.1}s.",
-                    subsystem = self.subsystem,
-                    failures = self.failures.load(Ordering::Acquire),
-                    remaining = self.remaining_open_secs(),
-                ),
-                failures: self.failures.load(Ordering::Acquire),
-                reset_after_secs: self.remaining_open_secs(),
-            }),
+            (before, data.state(now_us))
+        };
+        self.log_transition(transition);
+    }
+
+    fn log_transition(&self, (from, to): (CircuitState, CircuitState)) {
+        if from != to {
+            log_transition(self.subsystem, from, to);
         }
     }
 
-    /// Record a successful operation.
-    ///
-    /// In half-open state, increments the success counter. Once
-    /// `HALF_OPEN_SUCCESS_THRESHOLD` consecutive successes are reached,
-    /// the circuit closes. In closed state, resets any stale failure count.
-    pub fn record_success(&self) {
-        let prev_state = self.state();
-        match prev_state {
-            CircuitState::HalfOpen => {
-                let prev = self.half_open_successes.fetch_add(1, Ordering::AcqRel);
-                if prev + 1 >= HALF_OPEN_SUCCESS_THRESHOLD {
-                    // Enough consecutive successes — close the circuit.
-                    self.failures.store(0, Ordering::Release);
-                    self.open_until_us.store(0, Ordering::Release);
-                    self.half_open_successes.store(0, Ordering::Release);
-                    self.last_probe_us.store(0, Ordering::Release);
-                    log_transition(self.subsystem, prev_state, CircuitState::Closed);
-                }
-            }
-            CircuitState::Closed => {
-                // Reset stale failures to prevent accumulation across calls.
-                self.failures.store(0, Ordering::Release);
-            }
-            CircuitState::Open => {
-                // Shouldn't happen (check() blocks open), but be safe.
-                self.failures.store(0, Ordering::Release);
-                self.open_until_us.store(0, Ordering::Release);
-                self.half_open_successes.store(0, Ordering::Release);
-                self.last_probe_us.store(0, Ordering::Release);
-            }
-        }
-    }
-
-    /// Record a failed operation — may open the circuit.
-    pub fn record_failure(&self) {
-        let prev_state = self.state();
-        // Reset half-open success streak on any failure.
-        self.half_open_successes.store(0, Ordering::Release);
-
-        let prev = self.failures.fetch_add(1, Ordering::AcqRel);
-        let new_count = prev + 1;
-        if new_count >= self.threshold {
-            let was_already_open = self.open_until_us.load(Ordering::Acquire) > 0
-                && self.now_us() < self.open_until_us.load(Ordering::Acquire);
-            let reset_us = micros_from_duration(self.reset_duration);
-            let open_until = self.now_us() + reset_us;
-            self.open_until_us.store(open_until, Ordering::Release);
-            let new_state = CircuitState::Open;
-            if !was_already_open && prev_state != CircuitState::Open {
-                log_transition(self.subsystem, prev_state, new_state);
-            }
-        }
-    }
-
-    /// Reset the circuit breaker to `Closed` state (for testing or manual recovery).
+    /// Reset to `Closed` and invalidate all outstanding result tokens.
     pub fn reset(&self) {
-        self.failures.store(0, Ordering::Release);
-        self.open_until_us.store(0, Ordering::Release);
-        self.half_open_successes.store(0, Ordering::Release);
-        self.last_probe_us.store(0, Ordering::Release);
+        self.lock_data().clear();
     }
 
     fn now_us(&self) -> u64 {
@@ -357,7 +482,63 @@ impl CircuitBreaker {
     }
 }
 
-/// Log a circuit state transition at WARN level.
+#[derive(Debug, Clone, Copy)]
+enum AttemptResult {
+    Success,
+    Failure,
+    Abandoned,
+}
+
+/// Single-use feedback for one admitted operation. It can move with an async
+/// task or to another thread; it holds no mutex guard. Dropping a half-open
+/// attempt releases only its own probe slot, even across resets and retrips.
+#[derive(Debug)]
+#[must_use = "retain the attempt until the operation completes"]
+pub struct CircuitAttempt<'a> {
+    breaker: &'a CircuitBreaker,
+    generation: Arc<()>,
+    probe: Option<Arc<()>>,
+    admitted_state: CircuitState,
+    completed: bool,
+}
+
+impl CircuitAttempt<'_> {
+    /// Whether this operation was admitted as a recovery probe.
+    #[must_use]
+    pub fn is_half_open_probe(&self) -> bool {
+        self.admitted_state == CircuitState::HalfOpen
+    }
+
+    /// Report successful completion. A stale token does not change its successor.
+    pub fn record_success(self) {
+        let now_us = self.breaker.now_us();
+        self.finish(AttemptResult::Success, now_us);
+    }
+
+    /// Report a retryable operation failure, once for the logical operation.
+    pub fn record_failure(self) {
+        let now_us = self.breaker.now_us();
+        self.finish(AttemptResult::Failure, now_us);
+    }
+
+    fn finish(mut self, result: AttemptResult, now_us: u64) {
+        // Feedback and its tracing callback may unwind. Do not let Drop then
+        // reinterpret an already-published result as an abandoned operation.
+        self.completed = true;
+        self.breaker.finish_attempt(&self, result, now_us);
+    }
+}
+
+impl Drop for CircuitAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.completed && self.probe.is_some() {
+            self.breaker
+                .finish_attempt(self, AttemptResult::Abandoned, self.breaker.now_us());
+        }
+    }
+}
+
+/// Log a circuit state transition at WARN level, outside the circuit lock.
 fn log_transition(subsystem: &str, from: CircuitState, to: CircuitState) {
     tracing::warn!(
         subsystem,
@@ -532,7 +713,6 @@ impl RetryConfig {
 /// We avoid pulling in `rand` — this only needs to break synchronization,
 /// not be cryptographically random.
 fn jitter_factor() -> f64 {
-    use std::sync::atomic::AtomicU64;
     static SEED: AtomicU64 = AtomicU64::new(0);
 
     // Mix in current time on first use.
@@ -586,7 +766,7 @@ fn jitter_factor() -> f64 {
 /// [`DbError::RetryBudgetExhausted`] so consumers can report the attempts
 /// made and the wall-clock time spent instead of advising another blind
 /// retry (br-bvq1x.4.3 / D3).
-pub fn retry_sync<T, F>(config: &RetryConfig, mut op: F) -> DbResult<T>
+pub fn retry_sync<T, F>(config: &RetryConfig, op: F) -> DbResult<T>
 where
     F: FnMut() -> DbResult<T>,
 {
@@ -595,58 +775,59 @@ where
     } else {
         None
     };
+    retry_sync_with_breaker(config, cb, op)
+}
 
+fn retry_sync_with_breaker<T, F>(
+    config: &RetryConfig,
+    cb: Option<&CircuitBreaker>,
+    mut op: F,
+) -> DbResult<T>
+where
+    F: FnMut() -> DbResult<T>,
+{
     let started = Instant::now();
     let mut last_err = None;
 
     for attempt in 0..=config.max_retries {
-        // Check circuit breaker before each attempt.
-        let attempt_state = if let Some(cb) = cb {
-            cb.check()?;
-            Some(cb.state())
-        } else {
-            None
-        };
+        // Admission state and feedback identity are captured together. A second
+        // state() read after check() could refer to another circuit epoch.
+        let admission = cb.map(CircuitBreaker::begin_attempt).transpose()?;
 
         match op() {
             Ok(val) => {
-                if let Some(cb) = cb {
-                    // Reset circuit breaker on any success, including
-                    // first attempt. Stale failures must not accumulate
-                    // across successful calls.
-                    cb.record_success();
+                if let Some(admission) = admission {
+                    admission.record_success();
                 }
+                // Stale feedback is ignored, but an actual successful operation
+                // still succeeds. Never retry a committed side effect to heal a circuit.
                 return Ok(val);
             }
             Err(e) => {
                 let retryable = e.is_retryable();
-                if let Some(cb) = cb
-                    && retryable
-                    && attempt_state == Some(CircuitState::HalfOpen)
+                if retryable
+                    && admission
+                        .as_ref()
+                        .is_some_and(CircuitAttempt::is_half_open_probe)
                 {
-                    // A failed half-open probe means the subsystem is still
-                    // unhealthy. Re-open immediately instead of consuming the
-                    // entire local retry budget inside the probe window.
-                    cb.record_failure();
+                    if let Some(admission) = admission {
+                        admission.record_failure();
+                    }
+                    // A recovery probe is one attempt, not a local retry storm.
                     return Err(e);
                 }
 
                 if !retryable || attempt == config.max_retries {
-                    if let Some(cb) = cb
-                        && retryable
-                    {
-                        // Count one logical operation failure after retries are
-                        // exhausted instead of charging every internal attempt.
-                        cb.record_failure();
+                    if retryable && let Some(admission) = admission {
+                        // Charge one exhausted logical operation, not each retry.
+                        admission.record_failure();
                     }
-                    // D3: a retryable error that spent a real retry budget is
-                    // wrapped so downstream envelopes can say "already retried
-                    // N times over X ms" instead of advising a blind retry.
+                    // Non-retryable errors drop the token as neutral evidence.
                     if retryable && config.max_retries > 0 {
                         return Err(DbError::RetryBudgetExhausted {
                             operation: config.operation,
-                            attempts: attempt + 1,
-                            budget: config.max_retries + 1,
+                            attempts: attempt.saturating_add(1),
+                            budget: config.max_retries.saturating_add(1),
                             elapsed_ms: u64::try_from(started.elapsed().as_millis())
                                 .unwrap_or(u64::MAX),
                             inner: Box::new(e),
@@ -655,11 +836,11 @@ where
                     return Err(e);
                 }
 
+                // Release admission before sleeping. The next attempt must
+                // re-enter the current gate rather than inherit old authority.
+                drop(admission);
                 last_err = Some(e);
-
-                // Backoff sleep.
-                let delay = config.delay_for_attempt(attempt);
-                std::thread::sleep(delay);
+                std::thread::sleep(config.delay_for_attempt(attempt));
             }
         }
     }
@@ -705,13 +886,12 @@ pub struct DbHealthStatus {
     pub circuits: Vec<SubsystemCircuitStatus>,
 }
 
-/// Return the current database health status including all subsystem circuits.
+/// Return current health with coherent per-circuit observations. Different
+/// subsystems are sampled independently; the top-level DB fields reuse its sample.
 #[must_use]
 pub fn db_health_status() -> DbHealthStatus {
-    // Primary DB circuit for backward-compatible top-level fields.
-    let db_cb = &*CIRCUIT_DB;
-    let db_state = db_cb.state();
-    let db_failures = db_cb.failure_count();
+    let db_snapshot = CIRCUIT_DB.snapshot();
+    let db_state = db_snapshot.state;
 
     let recommendation = if db_state == CircuitState::Open {
         Some(
@@ -728,7 +908,12 @@ pub fn db_health_status() -> DbHealthStatus {
         .iter()
         .map(|&sub| {
             let cb = circuit_for(sub);
-            let state = cb.state();
+            let snapshot = if sub == Subsystem::Db {
+                db_snapshot
+            } else {
+                cb.snapshot()
+            };
+            let state = snapshot.state;
             let rec = match (sub, state) {
                 (Subsystem::Db, CircuitState::Open) => Some(
                     "DB circuit OPEN: reduce concurrent operations or increase busy_timeout."
@@ -749,10 +934,10 @@ pub fn db_health_status() -> DbHealthStatus {
             SubsystemCircuitStatus {
                 subsystem: sub.to_string(),
                 state: state.to_string(),
-                failures: cb.failure_count(),
+                failures: snapshot.failures,
                 threshold: cb.threshold(),
                 reset_secs: cb.reset_duration().as_secs(),
-                half_open_successes: cb.half_open_success_count(),
+                half_open_successes: snapshot.half_open_successes,
                 recommendation: rec,
             }
         })
@@ -760,7 +945,7 @@ pub fn db_health_status() -> DbHealthStatus {
 
     DbHealthStatus {
         circuit_state: db_state.to_string(),
-        circuit_failures: db_failures,
+        circuit_failures: db_snapshot.failures,
         recommendation,
         circuits,
     }
@@ -1467,20 +1652,18 @@ mod tests {
         assert_eq!(CircuitState::HalfOpen.to_string(), "half_open");
     }
 
-    // -- record_success in Open state (defensive branch) --------------------
-
     #[test]
-    fn record_success_in_open_state_closes_circuit() {
+    fn record_success_in_open_state_preserves_the_recovery_gate() {
         let cb = CircuitBreaker::with_params(2, Duration::from_mins(5));
         cb.record_failure();
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
 
-        // Directly call record_success while open (shouldn't happen in practice
-        // since check() blocks, but test the defensive branch).
+        // A pre-trip operation can complete after check() admitted it. Its
+        // success cannot replace the required half-open recovery sequence.
         cb.record_success();
-        assert_eq!(cb.state(), CircuitState::Closed);
-        assert_eq!(cb.failure_count(), 0);
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert_eq!(cb.failure_count(), 2);
         assert_eq!(cb.half_open_success_count(), 0);
     }
 
@@ -1784,5 +1967,205 @@ mod tests {
         assert_eq!(CIRCUIT_DB.failure_count(), 0);
 
         CIRCUIT_DB.reset();
+    }
+
+    // -- Epoch-scoped admission and retry feedback --------------------------
+
+    #[test]
+    fn closed_epoch_success_cannot_count_as_later_recovery_evidence() {
+        let cb = CircuitBreaker::with_params(1, Duration::ZERO);
+        let old = cb.begin_attempt_at(0).unwrap();
+        cb.record_failure_at(0);
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        old.finish(AttemptResult::Success, 1);
+        assert_eq!(cb.failure_count(), 1);
+        assert_eq!(cb.half_open_success_count(), 0);
+        for index in 0..HALF_OPEN_SUCCESS_THRESHOLD {
+            let now = u64::from(index) * micros_from_duration(HALF_OPEN_PROBE_INTERVAL);
+            cb.begin_attempt_at(now)
+                .unwrap()
+                .finish(AttemptResult::Success, now);
+        }
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn reset_invalidates_both_success_and_failure_from_old_attempts() {
+        let cb = CircuitBreaker::with_params(5, Duration::from_secs(30));
+        let old_success = cb.begin_attempt().unwrap();
+        let old_failure = cb.begin_attempt().unwrap();
+        cb.reset();
+        cb.record_failure();
+        old_success.record_success();
+        old_failure.record_failure();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert_eq!(cb.failure_count(), 1);
+    }
+
+    #[test]
+    fn probe_slot_remains_exclusive_after_its_start_interval_expires() {
+        let cb = CircuitBreaker::with_params(1, Duration::ZERO);
+        cb.record_failure_at(0);
+        let probe = cb.begin_attempt_at(0).unwrap();
+        assert!(probe.is_half_open_probe());
+        let later = 10 * micros_from_duration(HALF_OPEN_PROBE_INTERVAL);
+        let error = cb.begin_attempt_at(later).unwrap_err();
+        assert!(error.to_string().contains("in flight"));
+        assert!(cb.snapshot().probe_in_flight);
+        drop(probe);
+        assert!(!cb.snapshot().probe_in_flight);
+        assert!(cb.begin_attempt_at(later).is_ok());
+    }
+
+    #[test]
+    fn abandoned_probe_keeps_rate_limit_but_breaks_success_streak() {
+        let cb = CircuitBreaker::with_params(1, Duration::ZERO);
+        cb.record_failure_at(0);
+        let interval = micros_from_duration(HALF_OPEN_PROBE_INTERVAL);
+        for now in [0, interval] {
+            cb.begin_attempt_at(now)
+                .unwrap()
+                .finish(AttemptResult::Success, now);
+        }
+        assert_eq!(cb.half_open_success_count(), 2);
+        let probe = cb.begin_attempt_at(2 * interval).unwrap();
+        drop(probe);
+        assert_eq!(cb.half_open_success_count(), 0);
+        assert!(cb.begin_attempt_at(2 * interval).is_err());
+        cb.begin_attempt_at(3 * interval)
+            .unwrap()
+            .finish(AttemptResult::Success, 3 * interval);
+        assert_eq!(cb.half_open_success_count(), 1);
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn old_probe_drop_does_not_release_a_successor_epoch_probe() {
+        let cb = CircuitBreaker::with_params(1, Duration::ZERO);
+        cb.record_failure_at(0);
+        let old = cb.begin_attempt_at(0).unwrap();
+        cb.reset();
+        cb.record_failure_at(0);
+        let current = cb.begin_attempt_at(0).unwrap();
+        drop(old);
+        assert!(cb.snapshot().probe_in_flight);
+        assert!(cb.begin_attempt_at(100_000_000).is_err());
+        current.finish(AttemptResult::Success, 0);
+        assert_eq!(cb.half_open_success_count(), 1);
+    }
+
+    #[test]
+    fn unscoped_success_cannot_complete_an_owned_probe() {
+        let cb = CircuitBreaker::with_params(1, Duration::ZERO);
+        cb.record_failure_at(0);
+        let probe = cb.begin_attempt_at(0).unwrap();
+        for _ in 0..10 {
+            cb.record_success();
+        }
+        assert_eq!(cb.half_open_success_count(), 0);
+        assert!(cb.snapshot().probe_in_flight);
+        probe.finish(AttemptResult::Success, 0);
+        assert_eq!(cb.half_open_success_count(), 1);
+    }
+
+    #[test]
+    fn counters_and_deadlines_saturate_without_fabricating_a_closed_circuit() {
+        let cb = CircuitBreaker::with_params(u32::MAX, Duration::MAX);
+        cb.lock_data().failures = u32::MAX - 1;
+        cb.record_failure_at(u64::MAX - 2);
+        cb.record_failure_at(u64::MAX - 1);
+        let data = cb.lock_data();
+        assert_eq!(data.failures, u32::MAX);
+        assert_eq!(data.open_until_us, Some(u64::MAX));
+        assert_eq!(data.state(u64::MAX - 1), CircuitState::Open);
+    }
+
+    #[test]
+    fn retry_preserves_success_without_healing_a_concurrently_opened_circuit() {
+        let cb = CircuitBreaker::with_params(1, Duration::from_secs(30));
+        let config = RetryConfig::default();
+        let calls = std::cell::Cell::new(0);
+        let result = retry_sync_with_breaker(&config, Some(&cb), || {
+            calls.set(calls.get() + 1);
+            cb.record_failure();
+            Ok("committed")
+        });
+        assert_eq!(result.unwrap(), "committed");
+        assert_eq!(calls.get(), 1);
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert_eq!(cb.failure_count(), 1);
+    }
+
+    #[test]
+    fn retry_probe_failure_does_not_spend_the_local_retry_budget() {
+        let cb = CircuitBreaker::with_params(1, Duration::ZERO);
+        cb.record_failure();
+        let calls = std::cell::Cell::new(0);
+        let result: DbResult<()> = retry_sync_with_breaker(
+            &RetryConfig::default(),
+            Some(&cb),
+            || {
+                calls.set(calls.get() + 1);
+                Err(DbError::ResourceBusy("still unavailable".into()))
+            },
+        );
+        assert!(matches!(result, Err(DbError::ResourceBusy(_))));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(cb.failure_count(), 2);
+        assert!(!cb.snapshot().probe_in_flight);
+    }
+
+    #[test]
+    fn retry_non_retryable_probe_error_releases_slot_without_charging_failure() {
+        let cb = CircuitBreaker::with_params(1, Duration::ZERO);
+        cb.record_failure();
+        let result: DbResult<()> = retry_sync_with_breaker(
+            &RetryConfig::default(),
+            Some(&cb),
+            || Err(DbError::not_found("agent", "absent")),
+        );
+        assert!(result.is_err());
+        assert_eq!(cb.failure_count(), 1);
+        assert_eq!(cb.half_open_success_count(), 0);
+        assert!(!cb.snapshot().probe_in_flight);
+        assert!(cb.begin_attempt().is_err(), "abandonment must retain the interval");
+    }
+
+    #[test]
+    fn panicking_probe_releases_its_slot_without_fabricating_recovery() {
+        let cb = CircuitBreaker::with_params(1, Duration::ZERO);
+        cb.record_failure();
+        let interrupted = std::panic::catch_unwind(|| {
+            let _: DbResult<()> = retry_sync_with_breaker(
+                &RetryConfig::default(),
+                Some(&cb),
+                || panic!("operation interrupted"),
+            );
+        });
+        assert!(interrupted.is_err());
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        assert_eq!(cb.failure_count(), 1);
+        assert_eq!(cb.half_open_success_count(), 0);
+        assert!(!cb.snapshot().probe_in_flight);
+        assert!(cb.begin_attempt_at(100_000_000).is_ok());
+    }
+
+    #[test]
+    fn retry_rechecks_admission_before_repeating_a_failed_operation() {
+        let cb = CircuitBreaker::with_params(1, Duration::from_secs(30));
+        let config = RetryConfig {
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            ..RetryConfig::default()
+        };
+        let calls = std::cell::Cell::new(0);
+        let result: DbResult<()> = retry_sync_with_breaker(&config, Some(&cb), || {
+            calls.set(calls.get() + 1);
+            cb.record_failure();
+            Err(DbError::ResourceBusy("concurrent failure opened the gate".into()))
+        });
+        assert!(matches!(result, Err(DbError::CircuitBreakerOpen { .. })));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(cb.failure_count(), 1);
     }
 }
