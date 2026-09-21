@@ -1,17 +1,18 @@
-//! Request coalescing (singleflight) for identical concurrent read operations.
+//! Experimental request-coalescing (singleflight) utility.
 //!
-//! When multiple threads issue the same read query simultaneously, only the
-//! first ("leader") executes; others ("joiners") block briefly and share the
-//! cloned result. This eliminates redundant DB work under thundering-herd
-//! conditions — e.g., 10 agents all calling `fetch_inbox` for the same project.
+//! This utility is not wired into production database reads or `fetch_inbox`.
+//! Its presence does not provide request coalescing for those paths.
+//!
+//! Explicit callers can share a cloned result for the same key while its
+//! in-flight entry remains present and the leader completes before the join
+//! timeout. Timeout, leader failure, or entry eviction can cause duplicate work.
 //!
 //! Design:
-//! - **Lock-free fast path**: a single `Mutex<HashMap>` guards the in-flight map.
-//!   Uncontended lock + `HashMap` lookup is ~20-50ns.
+//! - **Sharded locking**: each in-flight map shard is guarded by a mutex.
 //! - **Bounded blocking**: joiners wait on `Condvar` with a configurable timeout.
 //!   On timeout, they fall through and execute independently.
-//! - **Bounded memory**: max entries cap prevents unbounded growth; eviction is
-//!   best-effort (removes one arbitrary entry at capacity).
+//! - **Entry eviction**: per-shard capacity limits retained entries; eviction
+//!   removes one arbitrary entry at capacity without cancelling its operation.
 //! - **Metrics**: atomic counters track leader/joiner/timeout events for
 //!   observability.
 
@@ -27,9 +28,7 @@ use std::time::Duration;
 
 /// Compute shard count from available CPU parallelism.
 ///
-/// Clamped to [4, 64] — 4 shards is the minimum for any meaningful
-/// contention reduction, and beyond 64 the `inflight_count()` summation
-/// cost dominates.
+/// Clamped to [4, 64], with a fallback of 4 when parallelism is unavailable.
 fn default_num_shards() -> usize {
     std::thread::available_parallelism()
         .map_or(4, std::num::NonZero::get)
@@ -186,16 +185,21 @@ pub struct CoalesceMetrics {
 // CoalesceMap
 // ---------------------------------------------------------------------------
 
-/// A concurrent map that deduplicates in-flight read operations using 16
-/// independent shards to minimise lock contention.
+/// An experimental concurrent map for sharing in-flight read results.
+///
+/// Production database reads do not use this map. Its shard count follows
+/// available CPU parallelism, clamped to 4–64, with a fallback of 4.
 ///
 /// When [`execute_or_join`](Self::execute_or_join) is called:
 /// - If no other thread is executing the same key: this thread becomes the
-///   "leader", executes the closure, broadcasts the result, and removes the entry.
+///   "leader", executes the closure, shares the result, and removes the entry.
 /// - If another thread is already executing the same key: this thread "joins"
 ///   and blocks (with timeout) until the leader finishes, then clones the result.
 ///
-/// Keys are routed to shards via `DefaultHasher` (FNV-quality distribution).
+/// Joiners execute independently on timeout or leader failure. Eviction can
+/// allow another leader for a key whose original operation is still running.
+///
+/// Keys are routed to shards via `DefaultHasher`.
 /// Operations on keys in different shards never contend on the same mutex.
 ///
 /// # Type Parameters
@@ -215,15 +219,16 @@ pub struct ShardedCoalesceMap<K, V> {
     leader_failed_count: AtomicU64,
 }
 
-/// Backward-compatible alias. All existing code continues to use `CoalesceMap`.
+/// Short name for the experimental sharded request-coalescing utility.
 pub type CoalesceMap<K, V> = ShardedCoalesceMap<K, V>;
 
 impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
     /// Create a new `ShardedCoalesceMap`.
     ///
-    /// - `max_entries`: maximum number of concurrent in-flight operations
-    ///   (divided equally across shards). When a shard exceeds its share,
-    ///   one arbitrary entry is evicted (best-effort).
+    /// - `max_entries`: target retained-entry capacity, rounded up per shard.
+    ///   At capacity, a shard evicts one arbitrary entry before inserting.
+    ///   Even a zero-capacity shard retains the newly inserted entry. Eviction
+    ///   does not bound the number of operations still executing.
     /// - `join_timeout`: maximum time a joiner will wait for the leader.
     ///   On timeout, the joiner falls through and the closure is called
     ///   independently.

@@ -43,6 +43,7 @@ pub mod archive_anomaly;
 pub mod atc_queries;
 pub mod cache;
 pub mod circuit_breaker;
+/// Experimental request coalescing; not wired into production database reads.
 pub mod coalesce;
 pub mod error;
 pub mod forensics;
@@ -234,6 +235,7 @@ pub use circuit_breaker::{
     CorruptionBreakerSnapshot, CorruptionCircuitBreaker, corruption_circuit_breaker,
     reset_corruption_circuit_breaker,
 };
+/// Experimental utilities; production database reads do not use these types.
 pub use coalesce::{CoalesceMap, CoalesceMetrics, CoalesceOutcome};
 pub use error::{
     DB_FAILURE_ENVELOPE_SCHEMA_VERSION, DbError, DbErrorClass, DbErrorClassification,
