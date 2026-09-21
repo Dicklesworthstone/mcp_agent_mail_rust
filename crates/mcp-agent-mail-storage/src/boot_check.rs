@@ -6,8 +6,11 @@
 //! detector: it writes a backup first, then prunes only refs already classified
 //! by the recovery layer as safe-to-prune. Every deletion revalidates the
 //! original target under the Git ref lock; a stale scan cannot delete a repair.
+//! Discovery failures are findings, not evidence of an empty archive. An
+//! incomplete discovery never authorizes automatic repair of a partial list.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,6 +31,9 @@ const CALLER: &str = "startup.boot_check";
 const GIT_VERSION: &str = "libgit2";
 const ARCHIVE_ROOT_LABEL: &str = "archive-root";
 const BOOT_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Count every directory entry, including files and non-repository directories.
+/// Reaching this bound is an incomplete scan, never a clean truncated result.
+const MAX_PROJECT_ENTRIES: usize = 16_384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,6 +88,7 @@ pub struct BootCheckReport {
     pub started_at: String,
     pub completed_at: String,
     pub duration_ms: u64,
+    /// Discovered candidates, not a claim of complete coverage when findings exist.
     pub total_projects: u32,
     pub findings: Vec<BootCheckFinding>,
     pub auto_repaired_count: u32,
@@ -105,6 +112,48 @@ struct ArchiveRepoCandidate {
     path: PathBuf,
 }
 
+#[derive(Debug, Default)]
+struct CandidateDiscovery {
+    candidates: Vec<ArchiveRepoCandidate>,
+    findings: Vec<BootCheckFinding>,
+}
+
+impl CandidateDiscovery {
+    fn record_error(&mut self, project: &str, path: &Path, error: impl std::fmt::Display) {
+        self.findings.push(BootCheckFinding {
+            project: project.to_string(),
+            kind: BootCheckFindingKind::RepoBroken,
+            detail: format!("archive discovery incomplete at {}: {error}", path.display()),
+        });
+    }
+
+    fn consider(&mut self, project: String, path: PathBuf) {
+        match has_git_metadata(&path) {
+            Ok(true) => self.candidates.push(ArchiveRepoCandidate { project, path }),
+            Ok(false) => {}
+            Err(error) => self.record_error(&project, &path, error),
+        }
+    }
+
+    fn check_timeout(&mut self, root: &Path, timer: Instant, timeout: Duration) -> bool {
+        let Some(finding) = timeout_finding_if_exceeded(root, timer.elapsed(), timeout) else {
+            return false;
+        };
+        if !self.findings.iter().any(|finding| {
+            matches!(finding.kind, BootCheckFindingKind::TimeoutExceeded { .. })
+        }) {
+            self.findings.push(finding);
+        }
+        true
+    }
+
+    fn finish(mut self, root: &Path, timer: Instant, timeout: Duration) -> Self {
+        self.candidates.sort_by(|left, right| left.path.cmp(&right.path));
+        self.check_timeout(root, timer, timeout);
+        self
+    }
+}
+
 #[derive(Debug)]
 enum CandidateCheck {
     Clean,
@@ -124,24 +173,46 @@ struct AutoRepairOutcome {
     pruned_refs: Vec<String>,
 }
 
-/// Read-only boot preflight for archive git repositories.
+/// Read-only by default. Discovery is bounded and failed discovery blocks repair.
 #[must_use]
 pub fn preflight_archive_integrity(root: &Path, mode: BootCheckMode) -> BootCheckReport {
-    preflight_archive_integrity_with_timeout(root, mode, BOOT_CHECK_TIMEOUT)
+    preflight_archive_integrity_with_timeout(root, mode, BOOT_CHECK_TIMEOUT, MAX_PROJECT_ENTRIES)
 }
 
 fn preflight_archive_integrity_with_timeout(
     root: &Path,
     mode: BootCheckMode,
     timeout: Duration,
+    max_project_entries: usize,
 ) -> BootCheckReport {
     let started = Utc::now();
     let started_at = started.to_rfc3339_opts(SecondsFormat::Micros, true);
     let timer = Instant::now();
     let repo_slug = mcp_agent_mail_core::slugify(&root.display().to_string());
     let args_hash = boot_check_args_hash(root, mode);
-    let candidates = archive_repo_candidates(root);
-    let total_projects = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
+    let discovery = archive_repo_candidates(root, timer, timeout, max_project_entries);
+    let total_projects = u32::try_from(discovery.candidates.len()).unwrap_or(u32::MAX);
+    // A partial list cannot grant mutation authority, even for an apparently
+    // repairable candidate discovered before another directory failed.
+    let allow_auto_repair = mode == BootCheckMode::AutoRepair && discovery.findings.is_empty();
+    let mut findings = discovery.findings;
+    let candidates = discovery.candidates;
+    let discovery_timed_out = findings.iter().find(|finding| {
+        matches!(finding.kind, BootCheckFindingKind::TimeoutExceeded { .. })
+    });
+    let mut effective_mode = mode;
+    if let Some(finding) = discovery_timed_out {
+        effective_mode = BootCheckMode::Abort;
+        emit_timeout_exceeded(
+            &repo_slug,
+            &args_hash,
+            timeout_finding_elapsed_ms(finding),
+            duration_ms(timeout),
+            total_projects,
+            0,
+        );
+    }
+    let discovery_timed_out = discovery_timed_out.is_some();
 
     tracing::info!(
         target: TARGET,
@@ -157,10 +228,11 @@ fn preflight_archive_integrity_with_timeout(
         "boot_check_started"
     );
 
-    let mut findings = Vec::new();
     let mut auto_repaired_count = 0_u32;
-    let mut effective_mode = mode;
     for (index, candidate) in candidates.iter().enumerate() {
+        if discovery_timed_out {
+            break;
+        }
         if let Some(timeout_finding) = timeout_finding_if_exceeded(root, timer.elapsed(), timeout) {
             effective_mode = BootCheckMode::Abort;
             emit_timeout_exceeded(
@@ -182,36 +254,35 @@ fn preflight_archive_integrity_with_timeout(
                 refs,
                 findings: missing_ref_findings,
             } => {
-                if mode != BootCheckMode::AutoRepair {
+                if !allow_auto_repair {
                     findings.extend(missing_ref_findings);
-                    continue;
-                }
-
-                match auto_repair_missing_refs(root, candidate, &refs) {
-                    Ok(outcome) => {
-                        emit_auto_repair_attempted(
-                            &repo_slug, &args_hash, mode, candidate, &outcome,
-                        );
-                        record_auto_repair_evidence(candidate, &outcome);
-                        if !outcome.pruned_refs.is_empty() {
-                            auto_repaired_count = auto_repaired_count.saturating_add(1);
-                        }
-                        if !outcome.after_refs.is_empty() {
-                            findings.extend(missing_refs_findings_from_names(
-                                candidate,
-                                &outcome.after_refs,
-                            ));
-                        }
-                    }
-                    Err(error) => {
-                        emit_auto_repair_failed(&repo_slug, &args_hash, mode, candidate, &error);
-                        findings.extend(missing_ref_findings.into_iter().map(|finding| {
-                            BootCheckFinding {
-                                project: finding.project,
-                                kind: finding.kind,
-                                detail: format!("auto repair failed: {error}; {}", finding.detail),
+                } else {
+                    match auto_repair_missing_refs(root, candidate, &refs) {
+                        Ok(outcome) => {
+                            emit_auto_repair_attempted(
+                                &repo_slug, &args_hash, mode, candidate, &outcome,
+                            );
+                            record_auto_repair_evidence(candidate, &outcome);
+                            if !outcome.pruned_refs.is_empty() {
+                                auto_repaired_count = auto_repaired_count.saturating_add(1);
                             }
-                        }));
+                            if !outcome.after_refs.is_empty() {
+                                findings.extend(missing_refs_findings_from_names(
+                                    candidate,
+                                    &outcome.after_refs,
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            emit_auto_repair_failed(&repo_slug, &args_hash, mode, candidate, &error);
+                            findings.extend(missing_ref_findings.into_iter().map(|finding| {
+                                BootCheckFinding {
+                                    project: finding.project,
+                                    kind: finding.kind,
+                                    detail: format!("auto repair failed: {error}; {}", finding.detail),
+                                }
+                            }));
+                        }
                     }
                 }
             }
@@ -230,6 +301,23 @@ fn preflight_archive_integrity_with_timeout(
             findings.push(timeout_finding);
             break;
         }
+    }
+    // Empty candidate sets and the final read-only candidate must not bypass
+    // expiry. Do not emit a second timeout for an already-incomplete scan.
+    if !findings.iter().any(|finding| {
+        matches!(finding.kind, BootCheckFindingKind::TimeoutExceeded { .. })
+    }) && let Some(finding) = timeout_finding_if_exceeded(root, timer.elapsed(), timeout)
+    {
+        effective_mode = BootCheckMode::Abort;
+        emit_timeout_exceeded(
+            &repo_slug,
+            &args_hash,
+            timeout_finding_elapsed_ms(&finding),
+            duration_ms(timeout),
+            total_projects,
+            total_projects,
+        );
+        findings.push(finding);
     }
     for finding in &findings {
         tracing::warn!(
@@ -377,53 +465,120 @@ fn boot_check_args_hash(root: &Path, mode: BootCheckMode) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn archive_repo_candidates(root: &Path) -> Vec<ArchiveRepoCandidate> {
-    let mut candidates = Vec::new();
-    if path_is_nonsymlink_dir(root) && has_git_metadata(root) {
-        candidates.push(ArchiveRepoCandidate {
-            project: ARCHIVE_ROOT_LABEL.to_string(),
-            path: root.to_path_buf(),
-        });
+fn archive_repo_candidates(
+    root: &Path,
+    timer: Instant,
+    timeout: Duration,
+    max_entries: usize,
+) -> CandidateDiscovery {
+    let mut discovery = CandidateDiscovery::default();
+    if discovery.check_timeout(root, timer, timeout) {
+        return discovery;
+    }
+    match nonsymlink_directory_exists(root) {
+        Ok(true) => discovery.consider(ARCHIVE_ROOT_LABEL.to_string(), root.to_path_buf()),
+        Ok(false) => return discovery.finish(root, timer, timeout),
+        Err(error) => {
+            discovery.record_error(ARCHIVE_ROOT_LABEL, root, error);
+            return discovery.finish(root, timer, timeout);
+        }
     }
 
     let projects = root.join("projects");
-    let Ok(entries) = std::fs::read_dir(&projects) else {
-        return candidates;
+    match nonsymlink_directory_exists(&projects) {
+        Ok(true) => {}
+        Ok(false) => return discovery.finish(root, timer, timeout),
+        Err(error) => {
+            discovery.record_error(ARCHIVE_ROOT_LABEL, &projects, error);
+            return discovery.finish(root, timer, timeout);
+        }
+    }
+    let entries = match fs::read_dir(&projects) {
+        Ok(entries) => entries,
+        Err(error) => {
+            discovery.record_error(ARCHIVE_ROOT_LABEL, &projects, error);
+            return discovery.finish(root, timer, timeout);
+        }
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
+    for (index, entry) in entries.enumerate() {
+        if discovery.check_timeout(root, timer, timeout) {
+            break;
+        }
+        if index >= max_entries {
+            discovery.record_error(
+                ARCHIVE_ROOT_LABEL,
+                &projects,
+                format!("project entry budget exhausted (limit {max_entries}); scan is incomplete"),
+            );
+            break;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                discovery.record_error(ARCHIVE_ROOT_LABEL, &projects, error);
+                continue;
+            }
         };
-        if file_type.is_symlink() || !file_type.is_dir() || !has_git_metadata(&path) {
-            continue;
-        }
+        let path = entry.path();
         let project = entry.file_name().to_string_lossy().into_owned();
-        candidates.push(ArchiveRepoCandidate { project, path });
-    }
-    candidates
-}
-
-fn has_git_metadata(path: &Path) -> bool {
-    let git = path.join(".git");
-    if let Ok(meta) = std::fs::symlink_metadata(&git) {
-        let file_type = meta.file_type();
-        if file_type.is_symlink() {
-            return false;
-        }
-        if file_type.is_dir() || file_type.is_file() {
-            return true;
+        // Re-observe the path instead of trusting a cached d_type after another
+        // process replaced the entry. These are observations, not an atomic
+        // filesystem snapshot; the scan never claims protection from all races.
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                discovery.record_error(&project, &path, "project entry is a symlink; not followed");
+            }
+            Ok(metadata) if metadata.is_dir() => discovery.consider(project, path),
+            Ok(_) => {}
+            Err(error) => discovery.record_error(&project, &path, error),
         }
     }
-    path_is_nonsymlink_file(&path.join("HEAD")) && path_is_nonsymlink_dir(&path.join("objects"))
+    discovery.finish(root, timer, timeout)
 }
 
-fn path_is_nonsymlink_dir(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
+fn nonsymlink_directory_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected a non-symlink directory; path was not traversed",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
-fn path_is_nonsymlink_file(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+fn has_git_metadata(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path.join(".git")) {
+        Ok(metadata) if metadata.is_dir() || metadata.is_file() => return Ok(true),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Git metadata is not a regular file or directory; path was not followed",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    // Either bare-repository marker warrants inspection. A missing companion
+    // is a damaged candidate, not grounds to silently ignore the repository.
+    let mut present = false;
+    for (name, directory) in [("HEAD", false), ("objects", true)] {
+        match fs::symlink_metadata(path.join(name)) {
+            Ok(metadata) if (directory && metadata.is_dir()) || (!directory && metadata.is_file()) => {
+                present = true;
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bare Git marker {name} has an unsupported file type"),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(present)
 }
 
 fn check_candidate(candidate: &ArchiveRepoCandidate) -> CandidateCheck {
@@ -955,6 +1110,7 @@ mod tests {
             tmp.path(),
             BootCheckMode::Warn,
             Duration::ZERO,
+            MAX_PROJECT_ENTRIES,
         );
 
         assert_eq!(report.mode, BootCheckMode::Abort);
@@ -989,7 +1145,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn preflight_skips_symlinked_project_repos() {
+    fn preflight_skips_symlinked_project_repos_and_reports_incomplete_coverage() {
         use std::os::unix::fs::symlink;
 
         let tmp = TempDir::new().unwrap();
@@ -1008,7 +1164,9 @@ mod tests {
         let report = preflight_archive_integrity(tmp.path(), BootCheckMode::Warn);
 
         assert_eq!(report.total_projects, 0);
-        assert!(report.findings.is_empty());
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].kind, BootCheckFindingKind::RepoBroken);
+        assert!(report.findings[0].detail.contains("not followed"));
     }
 
     #[test]
@@ -1178,5 +1336,146 @@ mod tests {
         assert!(repack_refs(tmp.path(), &candidate).is_err());
         assert!(packed.is_dir());
         assert!(backup_files(tmp.path(), ARCHIVE_ROOT_LABEL).is_empty());
+    }
+
+    #[test]
+    fn empty_or_missing_scan_cannot_bypass_zero_budget() {
+        let tmp = TempDir::new().unwrap();
+        for root in [tmp.path().to_path_buf(), tmp.path().join("absent")] {
+            let report = preflight_archive_integrity_with_timeout(
+                &root, BootCheckMode::Warn, Duration::ZERO, MAX_PROJECT_ENTRIES,
+            );
+            assert_eq!(report.total_projects, 0);
+            assert!(report.should_abort());
+            assert_eq!(report.findings.len(), 1);
+            assert!(matches!(report.findings[0].kind, BootCheckFindingKind::TimeoutExceeded { .. }));
+        }
+    }
+
+    #[test]
+    fn non_directory_archive_root_is_not_a_clean_empty_archive() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("archive");
+        fs::write(&root, b"preserve").unwrap();
+        let report = preflight_archive_integrity(&root, BootCheckMode::Abort);
+        assert!(report.should_abort());
+        assert_eq!(report.findings[0].kind, BootCheckFindingKind::RepoBroken);
+        assert_eq!(fs::read(&root).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn failed_project_container_blocks_repair_of_discovered_root() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, _, _) = stale_stash_fixture(&tmp);
+        let before = fs::read(repo.path().join("refs/stash")).unwrap();
+        fs::write(tmp.path().join("projects"), b"not a directory").unwrap();
+        for mode in [BootCheckMode::Warn, BootCheckMode::Abort, BootCheckMode::AutoRepair] {
+            let report = preflight_archive_integrity(tmp.path(), mode);
+            assert_eq!(report.total_projects, 1);
+            assert!(report.findings.iter().any(|finding| finding.detail.contains("discovery incomplete")));
+            assert_eq!(report.auto_repaired_count, 0);
+            assert_eq!(report.should_abort(), mode == BootCheckMode::Abort);
+            assert_eq!(fs::read(repo.path().join("refs/stash")).unwrap(), before);
+            assert!(backup_files(tmp.path(), ARCHIVE_ROOT_LABEL).is_empty());
+        }
+    }
+
+    #[test]
+    fn project_entry_budget_counts_non_repositories_and_blocks_partial_repair() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, _, _) = stale_stash_fixture(&tmp);
+        let before = fs::read(repo.path().join("refs/stash")).unwrap();
+        let projects = tmp.path().join("projects");
+        fs::create_dir(&projects).unwrap();
+        for index in 0..4 {
+            fs::write(projects.join(format!("ordinary-{index}")), b"data").unwrap();
+        }
+        let report = preflight_archive_integrity_with_timeout(
+            tmp.path(), BootCheckMode::AutoRepair, BOOT_CHECK_TIMEOUT, 3,
+        );
+        assert!(report.findings.iter().any(|finding| finding.detail.contains("entry budget exhausted")));
+        assert_eq!(report.auto_repaired_count, 0);
+        assert_eq!(fs::read(repo.path().join("refs/stash")).unwrap(), before);
+        assert!(backup_files(tmp.path(), ARCHIVE_ROOT_LABEL).is_empty());
+        let complete = archive_repo_candidates(tmp.path(), Instant::now(), BOOT_CHECK_TIMEOUT, 4);
+        assert!(complete.findings.is_empty(), "the exact entry bound is accepted");
+        assert_eq!(complete.candidates.len(), 1);
+    }
+
+    #[test]
+    fn ordinary_project_directories_remain_valid_and_candidate_order_is_stable() {
+        let tmp = TempDir::new().unwrap();
+        let projects = tmp.path().join("projects");
+        fs::create_dir_all(projects.join("ordinary")).unwrap();
+        fs::write(projects.join("README"), b"not a repo").unwrap();
+        for name in ["zeta", "alpha"] {
+            init_repo_with_commit(&projects.join(name));
+        }
+        let discovery = archive_repo_candidates(tmp.path(), Instant::now(), BOOT_CHECK_TIMEOUT, 4);
+        assert!(discovery.findings.is_empty());
+        assert_eq!(discovery.candidates.iter().map(|candidate| candidate.project.as_str()).collect::<Vec<_>>(), vec!["alpha", "zeta"]);
+        let report = preflight_archive_integrity(tmp.path(), BootCheckMode::Abort);
+        assert_eq!(report.total_projects, 2);
+        assert!(!report.has_findings());
+    }
+
+    #[test]
+    fn partial_bare_repository_is_inspected_instead_of_ignored() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        let report = preflight_archive_integrity(tmp.path(), BootCheckMode::Abort);
+        assert_eq!(report.total_projects, 1);
+        assert!(report.should_abort());
+        assert_eq!(report.findings[0].kind, BootCheckFindingKind::RepoBroken);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_project_container_cannot_redirect_auto_repair() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let (root_repo, _, _) = stale_stash_fixture(&tmp);
+        let foreign = outside.path().join("foreign");
+        let repo = init_repo_with_commit(&foreign);
+        let missing = b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n";
+        fs::write(repo.path().join("refs/stash"), missing).unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("projects")).unwrap();
+        let report = preflight_archive_integrity(tmp.path(), BootCheckMode::AutoRepair);
+        assert_eq!(report.total_projects, 1, "foreign repository must not be visited");
+        assert!(report.has_findings());
+        assert_eq!(report.auto_repaired_count, 0);
+        assert_eq!(fs::read(repo.path().join("refs/stash")).unwrap(), missing);
+        assert_eq!(fs::read(root_repo.path().join("refs/stash")).unwrap(), missing);
+        assert!(!tmp.path().join("backups").exists());
+        assert!(!outside.path().join("backups").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_archive_root_is_reported_without_traversing_projects() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        init_repo_with_commit(&outside.path().join("projects/foreign"));
+        let linked = tmp.path().join("archive");
+        std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
+        let report = preflight_archive_integrity(&linked, BootCheckMode::Abort);
+        assert_eq!(report.total_projects, 0);
+        assert!(report.should_abort());
+        assert_eq!(report.findings.len(), 1);
+        assert!(!outside.path().join("backups").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_git_metadata_is_not_silently_treated_as_non_repository() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let repo = init_repo_with_commit(outside.path());
+        std::os::unix::fs::symlink(repo.path(), tmp.path().join(".git")).unwrap();
+        let report = preflight_archive_integrity(tmp.path(), BootCheckMode::Abort);
+        assert_eq!(report.total_projects, 0);
+        assert!(report.should_abort());
+        assert!(report.findings[0].detail.contains("Git metadata"));
+        assert!(!tmp.path().join("backups").exists());
     }
 }
