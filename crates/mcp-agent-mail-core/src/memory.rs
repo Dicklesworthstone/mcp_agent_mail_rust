@@ -112,7 +112,11 @@ fn parse_linux_rss(status: &str) -> Result<u64, String> {
         .ok_or_else(|| "VmRSS line not found in /proc/self/status".to_string())?;
     let mut fields = rest.split_ascii_whitespace();
     let value = fields.next().unwrap_or_default();
-    if fields.next().is_some_and(|unit| !matches!(unit, "kB" | "KB")) || fields.next().is_some() {
+    if fields
+        .next()
+        .is_some_and(|unit| !matches!(unit, "kB" | "KB"))
+        || fields.next().is_some()
+    {
         return Err("unexpected units or trailing fields in VmRSS".to_string());
     }
     parse_rss_kib(value)
@@ -241,7 +245,11 @@ fn now_unix_micros_u64() -> u64 {
 #[must_use]
 pub fn sample_and_record(config: &Config) -> MemorySample {
     let sample = sample_memory(config);
-    record_sample(sample, &crate::global_metrics().system, now_unix_micros_u64())
+    record_sample(
+        sample,
+        &crate::global_metrics().system,
+        now_unix_micros_u64(),
+    )
 }
 
 fn record_sample(
@@ -249,16 +257,13 @@ fn record_sample(
     metrics: &crate::metrics::SystemMetrics,
     sampled_at_us: u64,
 ) -> MemorySample {
-    match (sample.rss_bytes, sample.error.as_ref()) {
-        (Some(rss), None) => {
-            metrics.memory_rss_bytes.set(rss);
-            metrics.memory_pressure_level.set(sample.pressure.as_u64());
-            metrics.memory_last_sample_us.set(sampled_at_us);
-        }
-        _ => {
-            metrics.memory_sample_errors_total.add(1);
-            sample.pressure = MemoryPressure::from_u64(metrics.memory_pressure_level.load());
-        }
+    if let (Some(rss), None) = (sample.rss_bytes, sample.error.as_ref()) {
+        metrics.memory_rss_bytes.set(rss);
+        metrics.memory_pressure_level.set(sample.pressure.as_u64());
+        metrics.memory_last_sample_us.set(sampled_at_us);
+    } else {
+        metrics.memory_sample_errors_total.add(1);
+        sample.pressure = MemoryPressure::from_u64(metrics.memory_pressure_level.load());
     }
     sample
 }
@@ -304,7 +309,13 @@ mod tests {
     #[test]
     fn ps_rss_parser_requires_one_headerless_process_row() {
         assert_eq!(parse_ps_rss(b"  4096\n").unwrap(), 4 * MIB);
-        for invalid in [b"".as_slice(), b"RSS\n4096\n", b"4096\n8192\n", b"N/A", b"\xff"] {
+        for invalid in [
+            b"".as_slice(),
+            b"RSS\n4096\n",
+            b"4096\n8192\n",
+            b"N/A",
+            b"\xff",
+        ] {
             assert!(parse_ps_rss(invalid).is_err(), "accepted {invalid:?}");
         }
     }
@@ -491,7 +502,9 @@ mod tests {
     fn sample_memory_rss_within_reasonable_range() {
         let config = Config::default();
         let sample = sample_memory(&config);
-        let rss = sample.rss_bytes.expect("should have RSS on Linux and macOS");
+        let rss = sample
+            .rss_bytes
+            .expect("should have RSS on Linux and macOS");
         // A Rust test process should use between 1 MB and 10 GB
         assert!(rss > MIB, "RSS too small: {rss}");
         assert!(rss < 10 * 1024 * MIB, "RSS too large: {rss}");
@@ -571,7 +584,9 @@ mod tests {
     fn repeated_failures_do_not_keep_old_pressure_fresh() {
         let metrics = crate::metrics::SystemMetrics::default();
         metrics.memory_rss_bytes.set(9000 * MIB);
-        metrics.memory_pressure_level.set(MemoryPressure::Fatal.as_u64());
+        metrics
+            .memory_pressure_level
+            .set(MemoryPressure::Fatal.as_u64());
         metrics.memory_last_sample_us.set(1_000_000);
 
         for attempt in 1..=5 {
@@ -587,7 +602,9 @@ mod tests {
     #[test]
     fn successful_sample_records_recovery_after_probe_failure() {
         let metrics = crate::metrics::SystemMetrics::default();
-        metrics.memory_pressure_level.set(MemoryPressure::Fatal.as_u64());
+        metrics
+            .memory_pressure_level
+            .set(MemoryPressure::Fatal.as_u64());
         metrics.memory_last_sample_us.set(1);
         let _ = record_sample(failed_sample(), &metrics, 2);
 
@@ -627,7 +644,9 @@ mod tests {
     #[test]
     fn successful_zero_rss_is_not_a_probe_failure() {
         let metrics = crate::metrics::SystemMetrics::default();
-        metrics.memory_pressure_level.set(MemoryPressure::Fatal.as_u64());
+        metrics
+            .memory_pressure_level
+            .set(MemoryPressure::Fatal.as_u64());
         let sample = record_sample(
             MemorySample {
                 rss_bytes: Some(0),

@@ -171,9 +171,7 @@ fn sequence_patterns_overlap<T>(
     is_repeat: impl Fn(&T) -> bool,
     compatible: impl Fn(&T, &T) -> bool,
 ) -> bool {
-    while let (Some((a, rest_a)), Some((b, rest_b))) =
-        (left.split_first(), right.split_first())
-    {
+    while let (Some((a, rest_a)), Some((b, rest_b))) = (left.split_first(), right.split_first()) {
         if is_repeat(a) || is_repeat(b) {
             break;
         }
@@ -183,9 +181,7 @@ fn sequence_patterns_overlap<T>(
         left = rest_a;
         right = rest_b;
     }
-    while let (Some((a, rest_a)), Some((b, rest_b))) =
-        (left.split_last(), right.split_last())
-    {
+    while let (Some((a, rest_a)), Some((b, rest_b))) = (left.split_last(), right.split_last()) {
         if is_repeat(a) || is_repeat(b) {
             break;
         }
@@ -1055,7 +1051,10 @@ mod tests {
             .collect();
         for (i, left) in paths.iter().enumerate() {
             for (j, right) in paths.iter().enumerate() {
-                assert_eq!(segments_overlap(left, right), automaton_overlap(&tokens[i], &tokens[j]));
+                assert_eq!(
+                    segments_overlap(left, right),
+                    automaton_overlap(&tokens[i], &tokens[j])
+                );
             }
         }
     }
@@ -1185,7 +1184,10 @@ mod tests {
     #[test]
     fn compiled_deep_paths_keep_glob_intersection_and_suffix_separation() {
         let prefix = "part/".repeat(256);
-        assert!(patterns_overlap(&format!("{prefix}a*"), &format!("{prefix}*b")));
+        assert!(patterns_overlap(
+            &format!("{prefix}a*"),
+            &format!("{prefix}*b")
+        ));
         assert!(!patterns_overlap(
             &format!("{prefix}**/*.rs"),
             &format!("{prefix}**/*.txt")

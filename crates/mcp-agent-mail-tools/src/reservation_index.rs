@@ -946,9 +946,7 @@ mod tests {
             ["src/main.rs", "docs/readme.md"]
                 .into_iter()
                 .enumerate()
-                .map(|(id, pattern)| {
-                    (pattern.to_string(), make_ref(i64::try_from(id).unwrap()))
-                }),
+                .map(|(id, pattern)| (pattern.to_string(), make_ref(i64::try_from(id).unwrap()))),
         );
         let mut conflicts = Vec::new();
         index.find_conflicts(&CompiledPattern::new("."), &mut conflicts);
