@@ -160,8 +160,18 @@ pub fn reconcile_message_bundle(
         .iter()
         .map(|(path, _)| crate::rel_path_cached(&archive.canonical_repo_root, path))
         .collect::<crate::Result<Vec<_>>>()?;
+    let repo = Repository::open(repo_root)?;
+    let expected_oids = targets
+        .iter()
+        .map(|(_, bytes)| Oid::hash_object(ObjectType::Blob, bytes))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let files_created = crate::with_project_lock(archive, || {
+        // Missing working-tree copies do not erase the Git ledger's authority.
+        // Check every committed copy before publishing even the first repair;
+        // otherwise a different reply parent or extension field could silently
+        // replace history that SQLite cannot reconstruct independently.
+        reject_committed_message_conflicts(&repo, &rel_paths, &expected_oids)?;
         // Inspect every destination before publishing any repair. In particular,
         // a conflicting inbox must not be silently overwritten after repairing
         // the canonical file. The publication primitive rechecks collisions.
@@ -187,11 +197,6 @@ pub fn reconcile_message_bundle(
         Ok(created)
     })?;
 
-    let repo = Repository::open(repo_root)?;
-    let expected_oids = targets
-        .iter()
-        .map(|(_, bytes)| Oid::hash_object(ObjectType::Blob, bytes))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
     let git_commit_needed = !head_contains(&repo, &rel_paths, &expected_oids)?;
     if git_commit_needed {
         let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
@@ -214,6 +219,45 @@ pub fn reconcile_message_bundle(
         files_created,
         git_commit_needed,
     })
+}
+
+/// A repair may fill a missing Git path or restore an object whose expected
+/// identity is already recorded. It must not replace a different committed
+/// payload, even when every working-tree copy is missing or agrees with the
+/// proposed replacement. This inspects only the bundle's paths, not the whole
+/// archive, and pins one tree for all copies in this preflight.
+fn reject_committed_message_conflicts(
+    repo: &Repository,
+    paths: &[String],
+    oids: &[Oid],
+) -> crate::Result<()> {
+    if paths.len() != oids.len() {
+        return Err(invalid("archive verification path/object count mismatch"));
+    }
+    let head = match repo.head() {
+        Ok(head) => head,
+        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let tree = head.peel_to_tree()?;
+    for (path, expected) in paths.iter().zip(oids) {
+        let entry = match tree.get_path(Path::new(path)) {
+            Ok(entry) => entry,
+            Err(error) if error.code() == ErrorCode::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if entry.kind() != Some(ObjectType::Blob)
+            || !matches!(entry.filemode(), 0o100644 | 0o100755)
+            || entry.id() != *expected
+        {
+            return Err(invalid(format!(
+                "committed archive artifact {path} conflicts with authoritative message; preserved"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn head_contains(repo: &Repository, paths: &[String], oids: &[Oid]) -> crate::Result<bool> {
@@ -477,6 +521,127 @@ mod tests {
         assert_eq!(repaired.files_created, 3);
         assert!(repaired.git_commit_needed);
         assert_eq!(std::fs::read(&paths.canonical).unwrap(), full.as_bytes());
+    }
+
+    #[test]
+    fn repair_rejects_committed_conflicts_before_publishing_any_missing_copy() {
+        for copy in ["canonical", "outbox", "inbox"] {
+            let (_dir, config, archive, message, recipients) = fixture();
+            let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+                .unwrap()
+                .0;
+            let target = match copy {
+                "canonical" => &paths.canonical,
+                "outbox" => &paths.outbox,
+                _ => &paths.inbox[0],
+            };
+            let mut original = message.clone();
+            original["reply_to"] = json!(9);
+            if copy == "inbox" {
+                original = crate::redact_message_bcc_for_inbox(&original);
+            }
+            let bytes = crate::render_message_bundle_content(
+                &original,
+                entry(&message, &recipients).body_md,
+            )
+            .unwrap();
+            crate::ensure_parent_dir(target).unwrap();
+            std::fs::write(target, &bytes).unwrap();
+            let relative = crate::rel_path_cached(&archive.canonical_repo_root, target).unwrap();
+            crate::commit_paths_with_retry(
+                &archive.repo_root,
+                &config,
+                "fixture: retain original reply metadata",
+                &[relative.as_str()],
+            )
+            .unwrap();
+            // Preserve the on-disk evidence outside the bundle rather than
+            // deleting it. Every expected destination is now missing.
+            let evidence = config.storage_root.join("original-message-evidence.md");
+            std::fs::rename(target, &evidence).unwrap();
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let before = repo.head().unwrap().target().unwrap();
+
+            let error = reconcile_message_bundle(&archive, &config, entry(&message, &recipients))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("committed archive artifact"),
+                "{copy}: {error}"
+            );
+            assert!(!paths.canonical.exists(), "{copy}");
+            assert!(!paths.outbox.exists(), "{copy}");
+            assert!(paths.inbox.iter().all(|path| !path.exists()), "{copy}");
+            assert_eq!(std::fs::read(&evidence).unwrap(), bytes.as_bytes());
+            assert_eq!(repo.head().unwrap().target().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn repair_rejects_working_tree_consensus_that_disagrees_with_git() {
+        let (_dir, config, archive, mut message, recipients) = fixture();
+        reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let before = repo.head().unwrap().target().unwrap();
+        // SQLite has no immediate reply-parent column. All working copies can
+        // agree with a proposed payload while contradicting the durable one.
+        message["reply_to"] = json!(9);
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        let full =
+            crate::render_message_bundle_content(&message, entry(&message, &recipients).body_md)
+                .unwrap();
+        let inbox = crate::render_message_bundle_content(
+            &crate::redact_message_bcc_for_inbox(&message),
+            entry(&message, &recipients).body_md,
+        )
+        .unwrap();
+        std::fs::write(&paths.canonical, &full).unwrap();
+        std::fs::write(&paths.outbox, &full).unwrap();
+        for path in &paths.inbox {
+            std::fs::write(path, &inbox).unwrap();
+        }
+
+        let error = reconcile_message_bundle(&archive, &config, entry(&message, &recipients))
+            .unwrap_err();
+        assert!(error.to_string().contains("committed archive artifact"));
+        assert_eq!(repo.head().unwrap().target().unwrap(), before);
+        assert_eq!(std::fs::read(&paths.canonical).unwrap(), full.as_bytes());
+        assert_eq!(std::fs::read(&paths.outbox).unwrap(), full.as_bytes());
+        for path in &paths.inbox {
+            assert_eq!(std::fs::read(path).unwrap(), inbox.as_bytes());
+        }
+    }
+
+    #[test]
+    fn repair_restores_missing_working_copies_from_matching_committed_identity() {
+        let (_dir, config, archive, message, recipients) = fixture();
+        reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap();
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let before = repo.head().unwrap().target().unwrap();
+        let mut copies = vec![paths.canonical, paths.outbox];
+        copies.extend(paths.inbox);
+        let mut saved = Vec::new();
+        for (index, path) in copies.iter().enumerate() {
+            saved.push(std::fs::read(path).unwrap());
+            std::fs::rename(
+                path,
+                config.storage_root.join(format!("evidence-{index}.md")),
+            )
+            .unwrap();
+        }
+
+        let result =
+            reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap();
+        assert_eq!(result.files_created, copies.len());
+        assert!(!result.git_commit_needed);
+        assert_eq!(repo.head().unwrap().target().unwrap(), before);
+        for (path, expected) in copies.iter().zip(saved) {
+            assert_eq!(std::fs::read(path).unwrap(), expected);
+        }
     }
 
     #[test]
