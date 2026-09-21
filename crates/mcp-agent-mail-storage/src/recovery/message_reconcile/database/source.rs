@@ -95,13 +95,11 @@ fn read_source(
     }
     let cached: Value = serde_json::from_str(&text("recipients_json")?)
         .map_err(|_| "message recipient metadata is not valid JSON".to_string())?;
-    // Only the exact legacy default authorizes reconstruction of the cache.
-    // A malformed/partial populated cache is conflicting evidence, not absence.
-    let routing = if cached.as_object().is_some_and(serde_json::Map::is_empty) {
-        routing_from_rows(&rows[1..], id, project_id)?
-    } else {
-        cached
-    };
+    // Both the legacy fallback and a populated cache require complete delivery
+    // authority. Otherwise a stale cache could fabricate an inbox or expose a
+    // BCC recipient as TO/CC when the archive is rebuilt.
+    let durable = routing_from_rows(&rows[1..], id, project_id)?;
+    let routing = select_routing(cached, &durable)?;
     let attachments: Value = serde_json::from_str(&text("attachments")?)
         .map_err(|_| "message attachment metadata is not valid JSON".to_string())?;
     if !attachments.is_array() {
@@ -135,6 +133,42 @@ fn read_source(
     })
 }
 
+fn select_routing(cached: Value, durable: &Value) -> Result<Value, String> {
+    // Only the exact legacy default authorizes reconstruction of the cache.
+    // A malformed/partial populated cache is conflicting evidence, not absence.
+    if cached.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Ok(durable.clone());
+    }
+    let _ = routing_names(&cached)?;
+    for kind in ["to", "cc", "bcc"] {
+        let names = |routing: &Value| -> Result<Vec<String>, String> {
+            let mut names = routing
+                .get(kind)
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("message recipient metadata lacks {kind} array"))?
+                .iter()
+                .map(|name| {
+                    name.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| "non-string message recipient".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            // Do not deduplicate: repeated names are not a faithful delivery
+            // set, including a duplicate hidden among otherwise valid roles.
+            names.sort_unstable();
+            Ok(names)
+        };
+        if names(&cached)? != names(durable)? {
+            return Err(format!(
+                "cached {kind} routing conflicts with durable delivery rows; archive repair refused"
+            ));
+        }
+    }
+    // Keep original order and spelling after proving role-by-role equality.
+    // Normalizing a valid cache here can conflict with surviving archive bytes.
+    Ok(cached)
+}
+
 fn routing_names(routing: &Value) -> Result<Vec<String>, String> {
     let mut recipients = Vec::new();
     for kind in ["to", "cc", "bcc"] {
@@ -164,7 +198,7 @@ fn routing_names(routing: &Value) -> Result<Vec<String>, String> {
 
 fn routing_from_rows(rows: &[Row], id: i64, project_id: i64) -> Result<Value, String> {
     if rows.is_empty() || rows.len() > MAX_RECIPIENTS {
-        return Err("legacy message recipient set is empty or exceeds its bound".to_string());
+        return Err("message recipient set is empty or exceeds its bound".to_string());
     }
     let mut routing = json!({"to": [], "cc": [], "bcc": []});
     let mut ids = HashSet::new();
@@ -172,43 +206,36 @@ fn routing_from_rows(rows: &[Row], id: i64, project_id: i64) -> Result<Value, St
     for row in rows {
         let integer = |key| row.get_named::<i64>(key).map_err(source_error);
         if integer("row_kind")? != 1 || integer("id")? != id {
-            return Err(
-                "legacy recipient projection has a mismatched message identity".to_string(),
-            );
+            return Err("recipient projection has a mismatched message identity".to_string());
         }
         let agent_id = integer("recipient_id")?;
         if agent_id <= 0 || !ids.insert(agent_id) {
-            return Err(
-                "legacy recipient projection has duplicate or invalid identities".to_string(),
-            );
+            return Err("recipient projection has duplicate or invalid identities".to_string());
         }
         // A foreign sender is valid for a contact notice. A foreign recipient
         // is not authority to create an inbox under this message's project.
         if integer("recipient_project_id")? != project_id {
             return Err(
-                "legacy recipient belongs to a different project; archive repair refused"
-                    .to_string(),
+                "recipient belongs to a different project; archive repair refused".to_string(),
             );
         }
         let name = row
             .get_named::<Option<String>>("recipient_name")
             .map_err(source_error)?
-            .ok_or_else(|| "legacy recipient identity is missing or oversized".to_string())?;
+            .ok_or_else(|| "recipient identity is missing or oversized".to_string())?;
         crate::validate_archive_component("recipient", &name)
             .map_err(|error| error.to_string())?;
         if !names.insert(name.to_ascii_lowercase()) {
-            return Err(
-                "legacy recipient names do not identify unique archive inboxes".to_string(),
-            );
+            return Err("recipient names do not identify unique archive inboxes".to_string());
         }
         let kind = row
             .get_named::<Option<String>>("recipient_kind")
             .map_err(source_error)?
             .filter(|kind| matches!(kind.as_str(), "to" | "cc" | "bcc"))
-            .ok_or_else(|| "legacy recipient has an invalid delivery kind".to_string())?;
+            .ok_or_else(|| "recipient has an invalid delivery kind".to_string())?;
         routing[&kind]
             .as_array_mut()
-            .ok_or_else(|| "legacy recipient routing is not an array".to_string())?
+            .ok_or_else(|| "recipient routing is not an array".to_string())?
             .push(Value::String(name));
     }
     // Source rows are ordered by recipient ID, so fallback serialization is
@@ -218,9 +245,13 @@ fn routing_from_rows(rows: &[Row], id: i64, project_id: i64) -> Result<Value, St
 
 #[cfg(test)]
 mod tests {
-    use super::super::{ReconcileResult, read_surviving_message, reconcile_prepared};
+    use super::super::{
+        ReconcileCursor, ReconcileResult, read_surviving_message, reconcile_message_batch,
+        reconcile_prepared,
+    };
     use super::*;
     use mcp_agent_mail_core::Config;
+    use std::sync::atomic::AtomicBool;
 
     fn fixture(test: impl FnOnce(&Cx, &DbPool, &Config)) {
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
@@ -375,6 +406,190 @@ mod tests {
                 .filter_map(|row| row.get_named::<Option<String>>("body_md").unwrap())
                 .collect::<Vec<_>>();
             assert_eq!(bodies, vec!["Keep this body."]);
+        });
+    }
+
+    #[test]
+    fn conflicting_populated_routing_never_publishes_or_changes_delivery_receipts() {
+        fixture(|cx, pool, config| {
+            for cached in [
+                json!({"to": ["GreenStone"], "cc": ["GoldLeaf"], "bcc": []}),
+                json!({"to": ["GreenStone", "RedFox"], "cc": ["GoldLeaf"], "bcc": []}),
+                json!({"to": ["BlueLake"], "cc": ["GoldLeaf"], "bcc": ["RedFox"]}),
+                json!({"to": ["GreenStone"], "cc": ["RedFox"], "bcc": ["GoldLeaf"]}),
+                json!({"to": ["GreenStone", "GreenStone"], "cc": ["GoldLeaf"], "bcc": ["RedFox"]}),
+            ] {
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                conn.execute_raw(&format!(
+                    "UPDATE messages SET recipients_json = '{cached}' WHERE id = 901"
+                ))
+                .unwrap();
+                drop(conn);
+                let error = prepare_message(cx, pool, 901).err().unwrap();
+                assert!(
+                    error.contains("conflicts with durable delivery rows"),
+                    "{cached}: {error}"
+                );
+                let report = reconcile_message_batch(
+                    cx,
+                    pool,
+                    config,
+                    &mut ReconcileCursor::default(),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                assert_eq!(report.scanned, 1);
+                assert_eq!(report.deferred, 1);
+                assert_eq!(report.repaired, 0);
+                assert_eq!(report.files_created, 0);
+                assert!(!config.storage_root.join("projects/project/messages").exists());
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                let rows = conn
+                    .query_sync("SELECT recipients_json FROM messages WHERE id = 901", &[])
+                    .unwrap();
+                assert_eq!(
+                    rows[0].get_named::<String>("recipients_json").unwrap(),
+                    cached.to_string()
+                );
+                let rows = conn
+                    .query_sync(
+                        "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 901 AND agent_id = 102",
+                        &[],
+                    )
+                    .unwrap();
+                assert_eq!(rows[0].get_named::<i64>("read_ts").unwrap(), 7);
+                assert_eq!(rows[0].get_named::<i64>("ack_ts").unwrap(), 11);
+            }
+        });
+    }
+
+    #[test]
+    fn matching_populated_cache_preserves_order_and_existing_archive_bytes() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("INSERT INTO message_recipients(message_id, agent_id, kind) VALUES(901, 101, 'to')").unwrap();
+            conn.execute_raw("UPDATE messages SET recipients_json = '{\"to\":[\"GreenStone\",\"BlueLake\"],\"cc\":[\"GoldLeaf\"],\"bcc\":[\"RedFox\"]}' WHERE id = 901").unwrap();
+            drop(conn);
+            // Delivery rows are ordered by ID (BlueLake first); retain the
+            // reverse order in the valid cache and in the surviving outbox.
+            let message = prepare_message(cx, pool, 901).unwrap();
+            assert_eq!(message.message["to"], json!(["GreenStone", "BlueLake"]));
+            let archive = crate::ensure_archive(config, "project").unwrap();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &message.message,
+                &message.sender,
+                &message.recipients,
+            )
+            .unwrap()
+            .0;
+            let original =
+                crate::render_message_bundle_content(&message.message, &message.body).unwrap();
+            std::fs::create_dir_all(paths.outbox.parent().unwrap()).unwrap();
+            std::fs::write(&paths.outbox, original.as_bytes()).unwrap();
+            let report = reconcile_prepared(config, &message).unwrap();
+            assert_eq!(report.files_created, 5);
+            assert!(report.git_commit_needed);
+            assert_eq!(std::fs::read(&paths.outbox).unwrap(), original.as_bytes());
+            assert_eq!(std::fs::read(&paths.canonical).unwrap(), original.as_bytes());
+            assert_eq!(
+                reconcile_prepared(config, &prepare_message(cx, pool, 901).unwrap()).unwrap(),
+                ReconcileResult::default()
+            );
+        });
+    }
+
+    #[test]
+    fn populated_cache_cannot_replace_missing_or_foreign_delivery_authority() {
+        fixture(|cx, pool, _| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE messages SET recipients_json = '{\"to\":[\"GreenStone\"],\"cc\":[\"GoldLeaf\"],\"bcc\":[\"RedFox\"]}' WHERE id = 901").unwrap();
+            conn.execute_raw("UPDATE message_recipients SET agent_id = 202 WHERE message_id = 901 AND agent_id = 102").unwrap();
+            drop(conn);
+            // The name still matches, but it names the foreign project's
+            // GreenStone. A cache hit must not hide that identity mismatch.
+            let error = prepare_message(cx, pool, 901).err().unwrap();
+            assert!(error.contains("different project"), "{error}");
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("DELETE FROM message_recipients WHERE message_id = 901")
+                .unwrap();
+            drop(conn);
+            let error = prepare_message(cx, pool, 901).err().unwrap();
+            assert!(error.contains("recipient set is empty"), "{error}");
+        });
+    }
+
+    #[test]
+    fn oversized_delivery_identity_is_not_hidden_by_a_populated_cache() {
+        fixture(|cx, pool, _| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE messages SET recipients_json = '{\"to\":[\"GreenStone\"],\"cc\":[\"GoldLeaf\"],\"bcc\":[\"RedFox\"]}' WHERE id = 901").unwrap();
+            let name = "r".repeat(usize::try_from(MAX_RECIPIENT_NAME_BYTES).unwrap() + 1);
+            conn.execute_raw(&format!("UPDATE agents SET name = '{name}' WHERE id = 103"))
+                .unwrap();
+            drop(conn);
+            let error = prepare_message(cx, pool, 901).err().unwrap();
+            assert!(error.contains("missing or oversized"), "{error}");
+        });
+    }
+
+    #[test]
+    fn source_retains_an_overflow_witness_even_when_cached_routing_fits() {
+        fixture(|cx, pool, _| {
+            let additional = MAX_RECIPIENTS - 3;
+            let agents = (0..additional)
+                .map(|index| {
+                    let id = 1000 + index;
+                    format!("({id}, 101, 'Recipient{index}', 'test', 'test', '', 1, 1)")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let deliveries = (0..additional)
+                .map(|index| format!("(901, {}, 'to')", 1000 + index))
+                .collect::<Vec<_>>()
+                .join(",");
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(&format!(
+                "INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts) VALUES{agents}"
+            ))
+            .unwrap();
+            conn.execute_raw(&format!(
+                "INSERT INTO message_recipients(message_id, agent_id, kind) VALUES{deliveries}"
+            ))
+            .unwrap();
+            drop(conn);
+            let message = prepare_message(cx, pool, 901).unwrap();
+            assert_eq!(message.recipients.len(), MAX_RECIPIENTS);
+            let cached = json!({
+                "to": message.message["to"],
+                "cc": message.message["cc"],
+                "bcc": message.message["bcc"],
+            });
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(&format!(
+                "UPDATE messages SET recipients_json = '{cached}' WHERE id = 901"
+            ))
+            .unwrap();
+            // Two further deliveries make the SQL result truncate; it must
+            // still include the first excess row rather than look complete.
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts) VALUES(9000, 101, 'OverflowRecipient', 'test', 'test', '', 1, 1)").unwrap();
+            conn.execute_raw("INSERT INTO message_recipients(message_id, agent_id, kind) VALUES(901, 101, 'to'), (901, 9000, 'to')").unwrap();
+            let rows = conn
+                .query_sync(
+                    SOURCE_SQL,
+                    &[
+                        901_i64.into(),
+                        MAX_DB_PAYLOAD_BYTES.into(),
+                        MAX_RECIPIENT_NAME_BYTES.into(),
+                        901_i64.into(),
+                        i64::try_from(MAX_RECIPIENTS + 2).unwrap().into(),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(rows.len(), MAX_RECIPIENTS + 2);
+            drop(conn);
+            let error = prepare_message(cx, pool, 901).err().unwrap();
+            assert!(error.contains("exceeds its bound"), "{error}");
         });
     }
 }
