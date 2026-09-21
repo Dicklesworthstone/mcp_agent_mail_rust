@@ -8,15 +8,21 @@
 //! original target under the Git ref lock; a stale scan cannot delete a repair.
 //! Discovery failures are findings, not evidence of an empty archive. An
 //! incomplete discovery never authorizes automatic repair of a partial list.
+//! Repair retains mutex-before-flock ordering and the original boot deadline.
+//! A partial repair retains its backup and confirmed actions without claiming
+//! that an interrupted post-repair scan established a clean repository.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{SecondsFormat, Utc};
 use git2::Repository;
-use mcp_agent_mail_core::git_lock::{RepoFlock, canonicalize_repo};
+use mcp_agent_mail_core::git_lock::{
+    DEFAULT_FLOCK_TIMEOUT_SECS, GitRepoLocks, RepoFlock, canonicalize_repo,
+};
 use mcp_agent_mail_core::{EvidenceLedgerEntry, append_evidence_entry_if_configured};
 use serde::Serialize;
 use serde_json::json;
@@ -91,6 +97,7 @@ pub struct BootCheckReport {
     /// Discovered candidates, not a claim of complete coverage when findings exist.
     pub total_projects: u32,
     pub findings: Vec<BootCheckFinding>,
+    /// Repositories with confirmed prunes, including partial repairs with findings.
     pub auto_repaired_count: u32,
 }
 
@@ -170,7 +177,20 @@ struct AutoRepairOutcome {
     backup_path: Option<PathBuf>,
     before_refs: Vec<String>,
     after_refs: Vec<String>,
+    after_verified: bool,
     pruned_refs: Vec<String>,
+}
+
+#[derive(Debug)]
+struct AutoRepairFailure {
+    detail: String,
+    progress: AutoRepairOutcome,
+}
+
+impl std::fmt::Display for AutoRepairFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.detail.fmt(formatter)
+    }
 }
 
 /// Read-only by default. Discovery is bounded and failed discovery blocks repair.
@@ -257,7 +277,10 @@ fn preflight_archive_integrity_with_timeout(
                 if !allow_auto_repair {
                     findings.extend(missing_ref_findings);
                 } else {
-                    match auto_repair_missing_refs(root, candidate, &refs) {
+                    // Every candidate shares the original preflight clock. A
+                    // slow scan or lock wait cannot grant a fresh repair budget.
+                    let mut remaining = |stage: &str| boot_check_remaining(timer, timeout, stage);
+                    match auto_repair_missing_refs(root, candidate, &refs, &mut remaining) {
                         Ok(outcome) => {
                             emit_auto_repair_attempted(
                                 &repo_slug, &args_hash, mode, candidate, &outcome,
@@ -273,15 +296,25 @@ fn preflight_archive_integrity_with_timeout(
                                 ));
                             }
                         }
-                        Err(error) => {
-                            emit_auto_repair_failed(&repo_slug, &args_hash, mode, candidate, &error);
-                            findings.extend(missing_ref_findings.into_iter().map(|finding| {
-                                BootCheckFinding {
-                                    project: finding.project,
-                                    kind: finding.kind,
-                                    detail: format!("auto repair failed: {error}; {}", finding.detail),
-                                }
-                            }));
+                        Err(failure) => {
+                            emit_auto_repair_failed(
+                                &repo_slug, &args_hash, mode, candidate, &failure.detail,
+                            );
+                            record_auto_repair_evidence(candidate, &failure.progress);
+                            if !failure.progress.pruned_refs.is_empty() {
+                                auto_repaired_count = auto_repaired_count.saturating_add(1);
+                            }
+                            findings.push(BootCheckFinding {
+                                project: candidate.project.clone(),
+                                kind: BootCheckFindingKind::RepoBroken,
+                                detail: format!(
+                                    "auto repair stopped: {failure}; confirmed prunes: {:?}; \
+                                     backup: {:?}; post-repair scan complete: {}",
+                                    failure.progress.pruned_refs,
+                                    failure.progress.backup_path,
+                                    failure.progress.after_verified,
+                                ),
+                            });
                         }
                     }
                 }
@@ -668,11 +701,73 @@ fn missing_refs_findings_from_names(
     findings
 }
 
+fn boot_check_remaining(
+    timer: Instant,
+    timeout: Duration,
+    stage: &str,
+) -> Result<Duration, String> {
+    let remaining = timeout.saturating_sub(timer.elapsed());
+    if remaining.is_zero() {
+        Err(format!("archive boot check budget exhausted before {stage}"))
+    } else {
+        Ok(remaining)
+    }
+}
+
+/// No waiter thread is created. Only the production monotonic-clock callback
+/// runs here; the injected stage boundary also supports deterministic tests.
+fn lock_boot_repository<'a>(
+    mutex: &'a Mutex<()>,
+    remaining: &mut impl FnMut(&str) -> Result<Duration, String>,
+) -> Result<MutexGuard<'a, ()>, String> {
+    loop {
+        remaining("repository mutex")?;
+        let guard = match mutex.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                std::thread::sleep(
+                    remaining("repository mutex")?.min(Duration::from_millis(5)),
+                );
+                continue;
+            }
+        };
+        // A late acquisition does not authorize any later filesystem work.
+        remaining("repository mutex")?;
+        return Ok(guard);
+    }
+}
+
+fn validate_repair_candidate(root: &Path, candidate: &ArchiveRepoCandidate) -> Result<(), String> {
+    if !nonsymlink_directory_exists(root).map_err(|error| error.to_string())? {
+        return Err("archive root disappeared before repair".to_string());
+    }
+    if candidate.path != root {
+        let projects = root.join("projects");
+        if candidate.path.parent() != Some(projects.as_path()) {
+            return Err("repair candidate is outside the discovered project container".to_string());
+        }
+        if !nonsymlink_directory_exists(&projects).map_err(|error| error.to_string())? {
+            return Err("project container disappeared before repair".to_string());
+        }
+    }
+    if !nonsymlink_directory_exists(&candidate.path).map_err(|error| error.to_string())? {
+        return Err("repository directory disappeared before repair".to_string());
+    }
+    if !has_git_metadata(&candidate.path).map_err(|error| error.to_string())? {
+        return Err("Git metadata disappeared before repair".to_string());
+    }
+    Ok(())
+}
+
+/// The callback must return positive remaining time or an error. Production
+/// captures the original preflight Instant; it never restarts between stages.
 fn auto_repair_missing_refs(
     root: &Path,
     candidate: &ArchiveRepoCandidate,
     refs: &[PrunableRef],
-) -> Result<AutoRepairOutcome, String> {
+    remaining: &mut impl FnMut(&str) -> Result<Duration, String>,
+) -> Result<AutoRepairOutcome, AutoRepairFailure> {
     let before_refs = refs
         .iter()
         .map(|finding| finding.ref_name.clone())
@@ -681,63 +776,86 @@ fn auto_repair_missing_refs(
         .iter()
         .filter(|finding| finding.category == RefCategory::SafeToPrune)
         .collect::<Vec<_>>();
-    let mut actions = Vec::new();
-    if safe_refs.is_empty() {
-        actions.push("refused_no_safe_refs".to_string());
-        return Ok(AutoRepairOutcome {
-            actions,
-            backup_path: None,
-            before_refs: before_refs.clone(),
-            after_refs: before_refs,
-            pruned_refs: Vec::new(),
-        });
-    }
+    let mut progress = AutoRepairOutcome {
+        actions: Vec::new(),
+        backup_path: None,
+        before_refs: before_refs.clone(),
+        after_refs: before_refs,
+        after_verified: false,
+        pruned_refs: Vec::new(),
+    };
+    let result = (|| -> Result<(), String> {
+        remaining("repair admission")?;
+        if safe_refs.is_empty() {
+            progress.actions.push("refused_no_safe_refs".to_string());
+            return Ok(());
+        }
 
-    let canonical = canonicalize_repo(&candidate.path)
-        .ok_or_else(|| format!("canonicalize repo {}", candidate.path.display()))?;
-    let flock = RepoFlock::acquire(&canonical)
-        .map_err(|error| format!("acquire repo lock {}: {error}", canonical.display()))?;
-    if !flock.is_real() {
-        return Err("auto repair refused: repository lock is not held (phantom lock)".to_string());
-    }
+        validate_repair_candidate(root, candidate)?;
+        remaining("repository resolution")?;
+        let canonical = canonicalize_repo(&candidate.path)
+            .ok_or_else(|| format!("canonicalize repo {}", candidate.path.display()))?;
+        // Same hierarchy as GitCmd: registry -> repository mutex -> flock.
+        // Taking flock first creates a cycle with a normal command waiting on it.
+        let mutex = GitRepoLocks::global()
+            .lock_for_with_timeout(&canonical, remaining("repository lock lookup")?)
+            .map_err(|error| format!("repository lock lookup: {error}"))?;
+        let _mutex_guard = lock_boot_repository(&mutex, remaining)?;
+        let configured_flock_secs = std::env::var("AM_GIT_FLOCK_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_FLOCK_TIMEOUT_SECS);
+        let flock_wait = remaining("repository flock")?
+            .min(Duration::from_secs(configured_flock_secs));
+        validate_repair_candidate(root, candidate)?;
+        let flock = RepoFlock::acquire_with_timeout(&canonical, flock_wait)
+            .map_err(|error| format!("acquire repo lock {}: {error}", canonical.display()))?;
+        if !flock.is_real() {
+            return Err("auto repair refused: repository lock is not held (phantom lock)".to_string());
+        }
 
-    let backup_path = write_ref_backup(root, candidate, refs)?;
-    actions.push(format!("backup_refs:{}", backup_path.display()));
+        remaining("reference backup")?;
+        validate_repair_candidate(root, candidate)?;
+        let backup_path = write_ref_backup(root, candidate, refs)?;
+        progress.actions.push(format!("backup_refs:{}", backup_path.display()));
+        progress.backup_path = Some(backup_path);
 
-    let mut pruned_refs = Vec::new();
-    for finding in safe_refs {
-        match prune_missing_ref(&candidate.path, finding, false)
-            .map_err(|error| format!("revalidate/prune {}: {error}", finding.ref_name))?
-        {
-            PruneRefOutcome::Pruned => {
-                actions.push(format!("prune_ref:{}", finding.ref_name));
-                pruned_refs.push(finding.ref_name.clone());
-            }
-            outcome => {
-                actions.push(format!("skip_ref:{}:{outcome:?}", finding.ref_name));
+        for finding in safe_refs {
+            // A completed backup does not extend the deadline. Preserve it if
+            // the next destructive transaction can no longer be admitted.
+            remaining("reference prune")?;
+            match prune_missing_ref(&candidate.path, finding, false)
+                .map_err(|error| format!("revalidate/prune {}: {error}", finding.ref_name))?
+            {
+                PruneRefOutcome::Pruned => {
+                    progress.actions.push(format!("prune_ref:{}", finding.ref_name));
+                    progress.pruned_refs.push(finding.ref_name.clone());
+                }
+                outcome => {
+                    progress.actions.push(format!("skip_ref:{}:{outcome:?}", finding.ref_name));
+                }
             }
         }
+
+        if !progress.pruned_refs.is_empty() {
+            repack_refs(root, candidate, remaining)?;
+            progress.actions.push("repack_refs".to_string());
+        }
+
+        remaining("post-repair scan")?;
+        let after = detect_missing_refs(&candidate.path)
+            .map_err(|error| format!("post-repair missing-ref scan failed: {error}"))?;
+        progress.after_refs = after.into_iter().map(|finding| finding.ref_name).collect();
+        progress.after_verified = true;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(progress),
+        Err(detail) => {
+            progress.actions.push(format!("repair_stopped:{detail}"));
+            Err(AutoRepairFailure { detail, progress })
+        }
     }
-
-    if !pruned_refs.is_empty() {
-        repack_refs(root, candidate)?;
-        actions.push("repack_refs".to_string());
-    }
-
-    let after = detect_missing_refs(&candidate.path)
-        .map_err(|error| format!("post-repair missing-ref scan failed: {error}"))?;
-    let after_refs = after
-        .into_iter()
-        .map(|finding| finding.ref_name)
-        .collect::<Vec<_>>();
-
-    Ok(AutoRepairOutcome {
-        actions,
-        backup_path: Some(backup_path),
-        before_refs,
-        after_refs,
-        pruned_refs,
-    })
 }
 
 fn write_ref_backup(
@@ -762,7 +880,13 @@ fn write_ref_backup(
     Ok(backup_path)
 }
 
-fn repack_refs(root: &Path, candidate: &ArchiveRepoCandidate) -> Result<(), String> {
+/// Called with both repository mutex and real flock retained by auto repair.
+fn repack_refs(
+    root: &Path,
+    candidate: &ArchiveRepoCandidate,
+    remaining: &mut impl FnMut(&str) -> Result<Duration, String>,
+) -> Result<(), String> {
+    remaining("packed-ref inspection")?;
     // Linked worktrees share packed-refs in the common Git directory, not in
     // their individual worktree admin directories.
     let packed_refs = Repository::open(&candidate.path)
@@ -786,6 +910,7 @@ fn repack_refs(root: &Path, candidate: &ArchiveRepoCandidate) -> Result<(), Stri
         }
     };
     if has_packed_refs {
+        remaining("packed-ref backup")?;
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_micros());
@@ -805,7 +930,11 @@ fn repack_refs(root: &Path, candidate: &ArchiveRepoCandidate) -> Result<(), Stri
 
     let output = mcp_agent_mail_core::git_cmd::GitCmd::new(&candidate.path)
         .args(["pack-refs", "--all", "--prune"])
+        // Both layers are already owned in their normal acquisition order.
+        // Reacquiring the mutex here would deadlock with this very repair.
         .skip_flock()
+        .skip_mutex()
+        .timeout(remaining("reference repack")?)
         .run()
         .map_err(|error| format!("pack-refs invocation: {error}"))?;
     if !output.status.success() {
@@ -831,6 +960,13 @@ fn safe_backup_project_name(project: &str) -> String {
         .collect()
 }
 
+fn repair_after_state(outcome: &AutoRepairOutcome) -> serde_json::Value {
+    json!({
+        "missing_refs": outcome.after_verified.then_some(&outcome.after_refs),
+        "verified": outcome.after_verified,
+    })
+}
+
 fn emit_auto_repair_attempted(
     repo_slug: &str,
     args_hash: &str,
@@ -839,7 +975,7 @@ fn emit_auto_repair_attempted(
     outcome: &AutoRepairOutcome,
 ) {
     let before_state = json!({ "missing_refs": outcome.before_refs });
-    let after_state = json!({ "missing_refs": outcome.after_refs });
+    let after_state = repair_after_state(outcome);
     tracing::warn!(
         target: TARGET,
         repo_slug = %repo_slug,
@@ -890,7 +1026,7 @@ fn record_auto_repair_evidence(candidate: &ArchiveRepoCandidate, outcome: &AutoR
         "actions": outcome.actions,
         "backup_path": outcome.backup_path,
         "before_state": { "missing_refs": outcome.before_refs },
-        "after_state": { "missing_refs": outcome.after_refs },
+        "after_state": repair_after_state(outcome),
         "pruned_refs": outcome.pruned_refs,
     });
     let entry = EvidenceLedgerEntry::new(
@@ -942,6 +1078,11 @@ mod tests {
             return Vec::new();
         };
         entries.flatten().map(|entry| entry.path()).collect()
+    }
+
+    fn repair_budget() -> impl FnMut(&str) -> Result<Duration, String> {
+        let timer = Instant::now();
+        move |stage| boot_check_remaining(timer, BOOT_CHECK_TIMEOUT, stage)
     }
 
     #[test]
@@ -1206,7 +1347,8 @@ mod tests {
         repo.reference("refs/stash", healthy, true, "concurrent repair")
             .unwrap();
 
-        let outcome = auto_repair_missing_refs(tmp.path(), &candidate, &refs).unwrap();
+        let outcome = auto_repair_missing_refs(tmp.path(), &candidate, &refs, &mut repair_budget())
+            .unwrap();
 
         assert!(outcome.pruned_refs.is_empty());
         assert!(outcome.after_refs.is_empty());
@@ -1230,7 +1372,8 @@ mod tests {
         let changed = "cafebabecafebabecafebabecafebabecafebabe\n";
         fs::write(repo.path().join("refs/stash"), changed).unwrap();
 
-        let outcome = auto_repair_missing_refs(tmp.path(), &candidate, &refs).unwrap();
+        let outcome = auto_repair_missing_refs(tmp.path(), &candidate, &refs, &mut repair_budget())
+            .unwrap();
 
         assert!(outcome.pruned_refs.is_empty());
         assert_eq!(outcome.after_refs, vec!["refs/stash".to_string()]);
@@ -1249,7 +1392,9 @@ mod tests {
         fs::create_dir(sentinel).unwrap();
         let before = fs::read(repo.path().join("refs/stash")).unwrap();
 
-        assert!(auto_repair_missing_refs(tmp.path(), &candidate, &refs).is_err());
+        assert!(
+            auto_repair_missing_refs(tmp.path(), &candidate, &refs, &mut repair_budget()).is_err()
+        );
 
         assert_eq!(fs::read(repo.path().join("refs/stash")).unwrap(), before);
         assert!(backup_files(tmp.path(), ARCHIVE_ROOT_LABEL).is_empty());
@@ -1263,7 +1408,9 @@ mod tests {
         writer.lock_ref("refs/stash").unwrap();
         let before = fs::read(repo.path().join("refs/stash")).unwrap();
 
-        assert!(auto_repair_missing_refs(tmp.path(), &candidate, &refs).is_err());
+        assert!(
+            auto_repair_missing_refs(tmp.path(), &candidate, &refs, &mut repair_budget()).is_err()
+        );
 
         assert_eq!(fs::read(repo.path().join("refs/stash")).unwrap(), before);
         assert!(!backup_files(tmp.path(), ARCHIVE_ROOT_LABEL).is_empty());
@@ -1276,7 +1423,9 @@ mod tests {
         fs::write(tmp.path().join("backups"), b"not a directory").unwrap();
         let before = fs::read(repo.path().join("refs/stash")).unwrap();
 
-        assert!(auto_repair_missing_refs(tmp.path(), &candidate, &refs).is_err());
+        assert!(
+            auto_repair_missing_refs(tmp.path(), &candidate, &refs, &mut repair_budget()).is_err()
+        );
 
         assert_eq!(fs::read(repo.path().join("refs/stash")).unwrap(), before);
     }
@@ -1317,7 +1466,9 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), tmp.path().join("backups")).unwrap();
         let before = fs::read(repo.path().join("refs/stash")).unwrap();
 
-        assert!(auto_repair_missing_refs(tmp.path(), &candidate, &refs).is_err());
+        assert!(
+            auto_repair_missing_refs(tmp.path(), &candidate, &refs, &mut repair_budget()).is_err()
+        );
         assert_eq!(fs::read(repo.path().join("refs/stash")).unwrap(), before);
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }
@@ -1333,7 +1484,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
         };
 
-        assert!(repack_refs(tmp.path(), &candidate).is_err());
+        assert!(repack_refs(tmp.path(), &candidate, &mut repair_budget()).is_err());
         assert!(packed.is_dir());
         assert!(backup_files(tmp.path(), ARCHIVE_ROOT_LABEL).is_empty());
     }
@@ -1477,5 +1628,224 @@ mod tests {
         assert!(report.should_abort());
         assert!(report.findings[0].detail.contains("Git metadata"));
         assert!(!tmp.path().join("backups").exists());
+    }
+
+    #[test]
+    fn expired_repair_admission_creates_neither_lock_nor_backup() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, candidate, refs) = stale_stash_fixture(&tmp);
+        let before = fs::read(repo.path().join("refs/stash")).unwrap();
+        let timer = Instant::now();
+        let failure = auto_repair_missing_refs(tmp.path(), &candidate, &refs, &mut |stage| {
+            boot_check_remaining(timer, Duration::ZERO, stage)
+        })
+        .unwrap_err();
+        assert!(failure.detail.contains("repair admission"));
+        assert!(failure.progress.backup_path.is_none());
+        assert!(failure.progress.pruned_refs.is_empty());
+        assert_eq!(fs::read(repo.path().join("refs/stash")).unwrap(), before);
+        assert!(!repo.path().join("am.git-serialize.lock").exists());
+        assert!(!tmp.path().join("backups").exists());
+    }
+
+    #[test]
+    fn deadline_after_backup_preserves_complete_backup_without_pruning() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, candidate, refs) = stale_stash_fixture(&tmp);
+        let before = fs::read(repo.path().join("refs/stash")).unwrap();
+        let failure = auto_repair_missing_refs(tmp.path(), &candidate, &refs, &mut |stage| {
+            if stage == "reference prune" {
+                Err("deadline after complete backup".to_string())
+            } else {
+                Ok(BOOT_CHECK_TIMEOUT)
+            }
+        })
+        .unwrap_err();
+        let backup = failure.progress.backup_path.as_ref().unwrap();
+        assert!(fs::read_to_string(backup).unwrap().ends_with("# END agent-mail ref backup\n"));
+        assert!(failure.progress.pruned_refs.is_empty());
+        assert!(!failure.progress.after_verified);
+        assert_eq!(repair_after_state(&failure.progress)["missing_refs"], serde_json::Value::Null);
+        assert_eq!(fs::read(repo.path().join("refs/stash")).unwrap(), before);
+        assert!(RepoFlock::acquire_with_timeout(tmp.path(), Duration::ZERO).unwrap().is_real());
+    }
+
+    fn two_stale_refs(tmp: &TempDir) -> (Repository, ArchiveRepoCandidate, Vec<PrunableRef>) {
+        let (repo, candidate, _) = stale_stash_fixture(tmp);
+        fs::create_dir_all(repo.path().join("refs/temp")).unwrap();
+        fs::write(
+            repo.path().join("refs/temp/pending"),
+            b"cafebabecafebabecafebabecafebabecafebabe\n",
+        )
+        .unwrap();
+        let mut refs = detect_missing_refs(tmp.path()).unwrap();
+        refs.sort_by(|left, right| left.ref_name.cmp(&right.ref_name));
+        assert_eq!(refs.len(), 2);
+        (repo, candidate, refs)
+    }
+
+    #[test]
+    fn partial_deadline_failure_retains_confirmed_prunes_and_can_be_retried() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, candidate, refs) = two_stale_refs(&tmp);
+        let remaining_before = fs::read(repo.path().join(&refs[1].ref_name)).unwrap();
+        let mut prune_admissions = 0;
+        let failure = auto_repair_missing_refs(tmp.path(), &candidate, &refs, &mut |stage| {
+            if stage == "reference prune" {
+                prune_admissions += 1;
+                if prune_admissions == 2 {
+                    return Err("deadline before second prune".to_string());
+                }
+            }
+            Ok(BOOT_CHECK_TIMEOUT)
+        })
+        .unwrap_err();
+        assert_eq!(failure.progress.pruned_refs, vec![refs[0].ref_name.clone()]);
+        assert!(failure.progress.backup_path.as_ref().unwrap().is_file());
+        assert!(!failure.progress.after_verified);
+        assert!(repo.find_reference(&refs[0].ref_name).is_err());
+        assert_eq!(fs::read(repo.path().join(&refs[1].ref_name)).unwrap(), remaining_before);
+        let remaining_refs = detect_missing_refs(tmp.path()).unwrap();
+        let completed = auto_repair_missing_refs(
+            tmp.path(), &candidate, &remaining_refs, &mut repair_budget(),
+        )
+        .unwrap();
+        assert_eq!(completed.pruned_refs, vec![refs[1].ref_name.clone()]);
+        assert!(completed.after_verified);
+        assert!(completed.after_refs.is_empty());
+    }
+
+    #[test]
+    fn contended_repository_mutex_cannot_acquire_flock_or_write_backup() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, candidate, refs) = stale_stash_fixture(&tmp);
+        let canonical = canonicalize_repo(tmp.path()).unwrap();
+        let mutex = GitRepoLocks::global().lock_for(&canonical);
+        let held = mutex.lock().unwrap();
+        let mut mutex_checks = 0;
+        let failure = auto_repair_missing_refs(tmp.path(), &candidate, &refs, &mut |stage| {
+            if stage == "repository mutex" {
+                mutex_checks += 1;
+                if mutex_checks == 2 {
+                    return Err("deadline while waiting for repository mutex".to_string());
+                }
+            }
+            Ok(BOOT_CHECK_TIMEOUT)
+        })
+        .unwrap_err();
+        assert_eq!(mutex_checks, 2, "one actual try_lock must observe contention");
+        assert!(failure.detail.contains("repository mutex"));
+        assert!(!repo.path().join("am.git-serialize.lock").exists());
+        assert!(!tmp.path().join("backups").exists());
+        assert!(repo.path().join("refs/stash").exists());
+        drop(held);
+        let repaired = auto_repair_missing_refs(tmp.path(), &candidate, &refs, &mut repair_budget())
+            .unwrap();
+        assert_eq!(repaired.pruned_refs.len(), 1);
+        assert!(repaired.after_verified);
+    }
+
+    #[test]
+    fn repair_retains_both_locks_through_backup_prune_and_real_repack() {
+        let tmp = TempDir::new().unwrap();
+        let (_, candidate, refs) = stale_stash_fixture(&tmp);
+        let canonical = canonicalize_repo(tmp.path()).unwrap();
+        let mutex = GitRepoLocks::global().lock_for(&canonical);
+        let mut observed_stages = Vec::new();
+        let mut clock = repair_budget();
+        let repaired = auto_repair_missing_refs(tmp.path(), &candidate, &refs, &mut |stage| {
+            if matches!(stage, "reference backup" | "reference prune" | "reference repack") {
+                assert!(matches!(mutex.try_lock(), Err(TryLockError::WouldBlock)));
+                let error = RepoFlock::acquire_with_timeout(&canonical, Duration::ZERO).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                observed_stages.push(stage.to_string());
+            }
+            clock(stage)
+        })
+        .unwrap();
+        assert_eq!(observed_stages, vec!["reference backup", "reference prune", "reference repack"]);
+        assert!(repaired.actions.iter().any(|action| action == "repack_refs"));
+        assert!(repaired.after_verified);
+        assert!(repaired.after_refs.is_empty());
+        assert!(mutex.try_lock().is_ok());
+    }
+
+    #[test]
+    fn preflight_flock_contention_uses_boot_budget_and_retry_makes_progress() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, _, _) = stale_stash_fixture(&tmp);
+        let canonical = canonicalize_repo(tmp.path()).unwrap();
+        let held = RepoFlock::acquire(&canonical).unwrap();
+        let before = fs::read(repo.path().join("refs/stash")).unwrap();
+        let started = Instant::now();
+        let report = preflight_archive_integrity_with_timeout(
+            tmp.path(), BootCheckMode::AutoRepair, Duration::from_millis(100), MAX_PROJECT_ENTRIES,
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(report.should_abort());
+        assert_eq!(report.auto_repaired_count, 0);
+        assert_eq!(fs::read(repo.path().join("refs/stash")).unwrap(), before);
+        assert!(backup_files(tmp.path(), ARCHIVE_ROOT_LABEL).is_empty());
+        drop(held);
+        let repaired = preflight_archive_integrity(tmp.path(), BootCheckMode::AutoRepair);
+        assert_eq!(repaired.auto_repaired_count, 1);
+        assert!(!repaired.has_findings());
+    }
+
+    #[test]
+    fn preflight_reports_partial_prunes_when_a_later_ref_is_locked() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, _, refs) = two_stale_refs(&tmp);
+        let mut writer = repo.transaction().unwrap();
+        writer.lock_ref(&refs[1].ref_name).unwrap();
+        let report = preflight_archive_integrity(tmp.path(), BootCheckMode::AutoRepair);
+        assert!(report.has_findings());
+        assert_eq!(report.auto_repaired_count, 1, "confirmed changes must not disappear");
+        assert!(report.findings.iter().any(|finding| {
+            finding.detail.contains("confirmed prunes")
+                && finding.detail.contains(&refs[0].ref_name)
+                && finding.detail.contains("post-repair scan complete: false")
+        }));
+        assert!(repo.find_reference(&refs[0].ref_name).is_err());
+        assert!(repo.find_reference(&refs[1].ref_name).is_ok());
+        assert!(!backup_files(tmp.path(), ARCHIVE_ROOT_LABEL).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_redirect_observed_after_mutex_wait_stops_before_flock_or_backup() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let (_, candidate, refs) = stale_stash_fixture(&tmp);
+        let foreign = init_repo_with_commit(outside.path());
+        let before = fs::read(foreign.path().join("HEAD")).unwrap();
+        let original_git = tmp.path().join("original-git");
+        let mut swapped = false;
+        let failure = auto_repair_missing_refs(tmp.path(), &candidate, &refs, &mut |stage| {
+            if stage == "repository flock" && !swapped {
+                fs::rename(tmp.path().join(".git"), &original_git).unwrap();
+                std::os::unix::fs::symlink(foreign.path(), tmp.path().join(".git")).unwrap();
+                swapped = true;
+            }
+            Ok(BOOT_CHECK_TIMEOUT)
+        })
+        .unwrap_err();
+        assert!(swapped);
+        assert!(failure.detail.contains("Git metadata"));
+        assert!(failure.progress.backup_path.is_none());
+        assert!(failure.progress.pruned_refs.is_empty());
+        assert_eq!(fs::read(foreign.path().join("HEAD")).unwrap(), before);
+        assert!(original_git.join("refs/stash").is_file());
+        assert!(!foreign.path().join("am.git-serialize.lock").exists());
+        assert!(!tmp.path().join("backups").exists());
+    }
+
+    #[test]
+    fn remaining_budget_rejects_expiry_without_instant_overflow() {
+        let now = Instant::now();
+        assert!(boot_check_remaining(now, Duration::ZERO, "write").is_err());
+        assert!(boot_check_remaining(now, Duration::MAX, "write").unwrap() > Duration::ZERO);
+        let past = now.checked_sub(Duration::from_secs(1)).unwrap();
+        assert!(boot_check_remaining(past, Duration::from_millis(1), "write").is_err());
     }
 }
