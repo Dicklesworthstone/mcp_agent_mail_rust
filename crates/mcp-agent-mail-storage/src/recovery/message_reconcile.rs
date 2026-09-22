@@ -8,6 +8,7 @@
 
 mod attachments;
 pub mod database;
+mod identity;
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -196,17 +197,29 @@ pub fn reconcile_message_bundle(
             .iter()
             .map(|(path, expected)| artifact_missing(path, expected))
             .collect::<crate::Result<Vec<_>>>()?;
-        // An attachment-only repair cannot create a duplicate canonical ID.
-        if missing
+        let message_files_missing = missing
             .iter()
             .take(message_target_count)
-            .any(|missing| *missing)
-        {
+            .any(|missing| *missing);
+        // Disk loss does not erase a canonical ID recorded under another Git
+        // path. Share one budget across both namespaces. An interrupted repair
+        // with all files present still needs this proof before its first commit.
+        let mut identity_budget = CanonicalScanBudget::default();
+        let canonical_committed = identity::preflight(
+            &repo,
+            archive,
+            id,
+            &rel_paths[0],
+            expected_oids[0],
+            message_files_missing,
+            &mut identity_budget,
+        )?;
+        if message_files_missing || !canonical_committed {
             reject_recovery_canonical_id_collision(
                 archive,
                 id,
                 &paths.canonical,
-                &mut CanonicalScanBudget::default(),
+                &mut identity_budget,
             )?;
         }
         let mut created = 0;
@@ -595,7 +608,7 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
 
-    fn fixture() -> (
+    pub(super) fn fixture() -> (
         tempfile::TempDir,
         Config,
         ProjectArchive,
@@ -623,7 +636,7 @@ mod tests {
         )
     }
 
-    fn entry<'a>(
+    pub(super) fn entry<'a>(
         message: &'a serde_json::Value,
         recipients: &'a [String],
     ) -> MessageBundleBatchEntry<'a> {

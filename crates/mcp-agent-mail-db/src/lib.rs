@@ -39,6 +39,7 @@
     clippy::missing_const_for_fn
 )]
 
+pub mod ack_scan;
 pub mod archive_anomaly;
 pub mod atc_queries;
 pub mod cache;
