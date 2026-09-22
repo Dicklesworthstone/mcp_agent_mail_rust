@@ -5288,6 +5288,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+ "toml_edit",
  "tracing",
  "unicode-normalization",
  "winsafe",
