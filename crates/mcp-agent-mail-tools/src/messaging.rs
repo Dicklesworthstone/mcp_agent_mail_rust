@@ -1795,6 +1795,240 @@ pub struct ReplyMessageResponse {
     pub verified_sender: bool,
 }
 
+/// Render a retry from the accepted row, never from newly processed files or
+/// the current recipient/contact configuration. The caller still authenticates
+/// the sender before reading this receipt.
+fn recorded_message_response(
+    config: &Config,
+    project: &mcp_agent_mail_db::ProjectRow,
+    sender: &mcp_agent_mail_db::AgentRow,
+    message: mcp_agent_mail_db::MessageRow,
+    reply_to: Option<i64>,
+    verified_sender: bool,
+) -> McpResult<String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RecordedRecipients {
+        to: Vec<String>,
+        cc: Vec<String>,
+        bcc: Vec<String>,
+    }
+    let invalid_result = || {
+        legacy_tool_error(
+            "DATABASE_ERROR",
+            "The recorded idempotent message result is incomplete or inconsistent; no new message was sent.",
+            true,
+            json!({"message_id": message.id}),
+        )
+    };
+    let Some(id) = message.id.filter(|id| *id > 0) else {
+        return Err(invalid_result());
+    };
+    if Some(message.project_id) != project.id
+        || Some(message.sender_id) != sender.id
+        || reply_to == Some(id)
+        || !message.recipients_json.trim_start().starts_with('{')
+    {
+        return Err(invalid_result());
+    }
+    let recipients: RecordedRecipients =
+        serde_json::from_str(&message.recipients_json).map_err(|_| invalid_result())?;
+    if !has_any_recipients(&recipients.to, &recipients.cc, &recipients.bcc)
+        || recipients
+            .to
+            .iter()
+            .chain(&recipients.cc)
+            .chain(&recipients.bcc)
+            .any(|name| name.trim().is_empty())
+    {
+        return Err(invalid_result());
+    }
+    let created_ts = micros_to_iso(message.created_ts);
+    let response = if config.messaging_fail_closed_send_profile {
+        let target_outcomes =
+            redacted_send_target_outcomes(&recipients.to, &recipients.cc, &recipients.bcc);
+        if let Some(parent) = reply_to {
+            serde_json::to_string(&RedactedReplyMessageReceipt {
+                receipt_mode: "redacted".to_string(),
+                project: project.human_key.clone(),
+                message_id: id,
+                project_id: message.project_id,
+                sender_id: message.sender_id,
+                thread_id: message.thread_id,
+                created_ts,
+                reply_to: parent,
+                verified_sender,
+                target_outcomes,
+            })
+        } else {
+            serde_json::to_string(&RedactedSendMessageReceipt {
+                receipt_mode: "redacted".to_string(),
+                project: project.human_key.clone(),
+                message_id: id,
+                project_id: message.project_id,
+                sender_id: message.sender_id,
+                thread_id: message.thread_id,
+                created_ts,
+                verified_sender,
+                target_outcomes,
+            })
+        }
+    } else {
+        let attachments: Vec<Value> =
+            serde_json::from_str(&message.attachments).map_err(|_| invalid_result())?;
+        let payload = MessagePayload {
+            id,
+            project_id: message.project_id,
+            sender_id: message.sender_id,
+            thread_id: message.thread_id,
+            topic: message.topic,
+            subject: message.subject,
+            body_md: message.body_md,
+            importance: message.importance,
+            ack_required: message.ack_required != 0,
+            created_ts: Some(created_ts),
+            attachments,
+            from: sender.name.clone(),
+            to: recipients.to,
+            cc: recipients.cc,
+            bcc: recipients.bcc,
+        };
+        recorded_message_payload_response(project, payload, reply_to, verified_sender)
+    };
+    response
+        .map(|json| crate::idempotency::with_replay_marker(json, true))
+        .map_err(|error| McpError::new(McpErrorCode::InternalError, format!("JSON error: {error}")))
+}
+
+fn recorded_message_payload_response(
+    project: &mcp_agent_mail_db::ProjectRow,
+    payload: MessagePayload,
+    reply_to: Option<i64>,
+    verified_sender: bool,
+) -> serde_json::Result<String> {
+    if let Some(parent) = reply_to {
+        serde_json::to_string(&ReplyMessageResponse {
+            id: payload.id,
+            project_id: payload.project_id,
+            sender_id: payload.sender_id,
+            thread_id: payload.thread_id.clone(),
+            topic: payload.topic.clone(),
+            subject: payload.subject.clone(),
+            importance: payload.importance.clone(),
+            ack_required: payload.ack_required,
+            created_ts: payload.created_ts.clone(),
+            attachments: payload.attachments.clone(),
+            body_md: payload.body_md.clone(),
+            from: payload.from.clone(),
+            to: payload.to.clone(),
+            cc: payload.cc.clone(),
+            bcc: payload.bcc.clone(),
+            reply_to: parent,
+            deliveries: vec![DeliveryResult {
+                project: project.human_key.clone(),
+                payload,
+            }],
+            count: 1,
+            verified_sender,
+        })
+    } else {
+        let attachment_paths = payload
+            .attachments
+            .iter()
+            .filter_map(|metadata| metadata.get("path").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        serde_json::to_string(&SendMessageResponse {
+            deliveries: vec![DeliveryResult {
+                project: project.human_key.clone(),
+                payload,
+            }],
+            count: 1,
+            attachments: attachment_paths,
+            verified_sender,
+        })
+    }
+}
+
+/// A committed retry is a read of its original result. Keep it ahead of fresh
+/// admission, attachment I/O, recipient registration and contact side effects.
+/// A miss remains only a hint: the existing write transaction arbitrates every
+/// concurrent first call and its result is rendered by the same function.
+#[allow(clippy::too_many_arguments)]
+async fn try_replay_message(
+    ctx: &McpContext,
+    config: &Config,
+    project_key: &str,
+    sender_name: &str,
+    sender_token: Option<&str>,
+    key: Option<&str>,
+    fingerprint: Option<&str>,
+    reply_to: Option<i64>,
+) -> McpResult<Option<String>> {
+    let (Some(key), Some(fingerprint)) = (key, fingerprint) else {
+        return Ok(None);
+    };
+    let pool = get_db_pool()?;
+    let project = match resolve_existing_project(ctx, &pool, project_key).await {
+        Ok(project) => project,
+        Err(error)
+            if error
+                .data
+                .as_ref()
+                .and_then(|data| data["error"]["type"].as_str())
+                == Some("NOT_FOUND") =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let sender = resolve_agent(
+        ctx,
+        &pool,
+        project.id.unwrap_or(0),
+        sender_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
+    let verified_sender = verify_sender_identity(
+        sender_name,
+        sender_token,
+        sender.registration_token.as_deref(),
+        config.messaging_fail_closed_send_profile,
+    )?;
+    let claim = mcp_agent_mail_db::IdempotencyClaim {
+        project_id: project.id.unwrap_or(0),
+        tool: if reply_to.is_some() {
+            "reply_message"
+        } else {
+            "send_message"
+        },
+        key,
+        fingerprint,
+    };
+    match db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::lookup_idempotency_result::<mcp_agent_mail_db::MessageRow>(
+            ctx.cx(),
+            &pool,
+            claim,
+        )
+        .await,
+    )? {
+        Some(Ok(message)) => recorded_message_response(
+            config,
+            &project,
+            &sender,
+            message,
+            reply_to,
+            verified_sender,
+        )
+        .map(Some),
+        Some(Err(conflict)) => Err(crate::idempotency::idempotency_conflict_error(&conflict)),
+        None => Ok(None),
+    }
+}
+
 /// Send a message to one or more recipients.
 ///
 /// # Parameters
@@ -1924,6 +2158,21 @@ pub async fn send_message(
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
     let config = &Config::get();
+
+    if let Some(receipt) = try_replay_message(
+        ctx,
+        config,
+        &project_key,
+        &sender_name,
+        sender_token.as_deref(),
+        idempotency_key.as_deref(),
+        idempotency_fingerprint.as_deref(),
+        None,
+    )
+    .await?
+    {
+        return Ok(receipt);
+    }
 
     // ── Per-message size limits (subject/body) before any DB/archive work ──
     validate_message_size_limits(config, &subject, &body_md, None, None)?;
@@ -2571,6 +2820,17 @@ effective_free_bytes={free}"
         (row, false)
     };
 
+    if idempotent_replay {
+        return recorded_message_response(
+            config,
+            &project,
+            &sender,
+            message,
+            None,
+            verified_sender,
+        );
+    }
+
     let message_id = message.id.unwrap_or(0);
 
     // On an idempotent replay, skip all one-time side effects (search indexing,
@@ -2838,6 +3098,21 @@ pub async fn reply_message(
                 }),
             ));
         }
+    }
+
+    if let Some(receipt) = try_replay_message(
+        ctx,
+        config,
+        &project_key,
+        &sender_name,
+        sender_token.as_deref(),
+        idempotency_key.as_deref(),
+        idempotency_fingerprint.as_deref(),
+        Some(message_id),
+    )
+    .await?
+    {
+        return Ok(receipt);
     }
 
     // ── Per-message body limit (fail fast before any DB/archive work) ──
@@ -3521,6 +3796,17 @@ effective_free_bytes={free}"
         )?;
         (row, false)
     };
+
+    if idempotent_replay {
+        return recorded_message_response(
+            config,
+            &project,
+            &sender,
+            reply,
+            Some(message_id),
+            verified_sender,
+        );
+    }
 
     let reply_id = reply.id.unwrap_or(0);
 

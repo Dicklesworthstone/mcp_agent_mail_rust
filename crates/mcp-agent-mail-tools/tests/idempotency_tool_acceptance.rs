@@ -19,9 +19,12 @@ use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
-use mcp_agent_mail_tools::{acknowledge_message, ensure_project, register_agent, send_message};
+use mcp_agent_mail_tools::{
+    acknowledge_message, ensure_project, fetch_inbox, register_agent, reply_message, send_message,
+};
 use serde_json::Value;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,6 +49,14 @@ where
     F: FnOnce(Cx, String) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
+    run_with_storage_env(&[("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "0")], f)
+}
+
+fn run_with_storage_env<F, Fut, T>(extra_env: &[(&str, &str)], f: F) -> T
+where
+    F: FnOnce(Cx, String) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
     let _lock = TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -53,27 +64,30 @@ where
     let db_path = format!("/tmp/idem-tool-{suffix}.sqlite3");
     let database_url = format!("sqlite://{db_path}");
     let storage_root = format!("/tmp/idem-tool-storage-{suffix}");
-    let env = [
+    let mut env = vec![
         ("DATABASE_URL", database_url.as_str()),
         ("STORAGE_ROOT", storage_root.as_str()),
     ];
+    env.extend_from_slice(extra_env);
     with_process_env_overrides_for_test(&env, || {
         Config::reset_cached();
-        let cx = Cx::for_testing();
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let out = rt.block_on(f(cx, storage_root.clone()));
+        let out = rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs the tool test context");
+            f(cx, storage_root.clone()).await
+        });
         Config::reset_cached();
         out
     })
 }
 
-async fn setup_project_and_agent(ctx: &McpContext, project_key: &str, agent: &str) {
+async fn setup_project_and_agent(ctx: &McpContext, project_key: &str, agent: &str) -> String {
     ensure_project(ctx, project_key.to_string(), None)
         .await
         .expect("ensure_project");
-    register_agent(
+    let registration = register_agent(
         ctx,
         project_key.to_string(),
         "codex-cli".to_string(),
@@ -96,6 +110,10 @@ async fn setup_project_and_agent(ctx: &McpContext, project_key: &str, agent: &st
     )
     .await
     .expect("set_contact_policy");
+    serde_json::from_str::<Value>(&registration).unwrap()["registration_token"]
+        .as_str()
+        .expect("registration token")
+        .to_string()
 }
 
 /// Count canonical message `.md` artifacts on disk (those under a `messages`
@@ -157,6 +175,292 @@ async fn send_with_key(
         key.map(str::to_string),
     )
     .await
+}
+
+async fn attachment_request(
+    ctx: &McpContext,
+    project_key: &str,
+    source: &Path,
+    parent: Option<i64>,
+    body: &str,
+    token: Option<&str>,
+) -> Result<String, fastmcp::McpError> {
+    let attachments = Some(vec![source.to_string_lossy().into_owned()]);
+    let bcc = Some(vec!["RedFox".to_string()]);
+    let token = token.map(str::to_string);
+    let key = Some("attachment-retry".to_string());
+    if let Some(parent) = parent {
+        reply_message(
+            ctx,
+            project_key.to_string(),
+            parent,
+            "GreenCastle".to_string(),
+            body.to_string(),
+            Some(vec!["BlueLake".to_string()]),
+            None,
+            bcc,
+            None,
+            None,
+            None,
+            attachments,
+            Some(false),
+            token,
+            key,
+        )
+        .await
+    } else {
+        send_message(
+            ctx,
+            project_key.to_string(),
+            "GreenCastle".to_string(),
+            vec!["BlueLake".to_string()],
+            "Attachment retry".to_string(),
+            body.to_string(),
+            None,
+            bcc,
+            attachments,
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            token,
+            key,
+        )
+        .await
+    }
+}
+
+fn snapshot_delivery_files(storage_root: &str) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if !path.file_name().is_some_and(|name| name == ".git") {
+                    visit(&path, files);
+                }
+            } else if path.components().any(|part| {
+                matches!(
+                    part.as_os_str().to_str(),
+                    Some("messages" | "inbox" | "outbox" | "attachments")
+                )
+            }) {
+                files.insert(path.clone(), std::fs::read(path).unwrap());
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    visit(&Path::new(storage_root).join("projects"), &mut files);
+    files
+}
+
+async fn inbox_snapshot(ctx: &McpContext, project_key: &str) -> Value {
+    let inbox = fetch_inbox(
+        ctx,
+        project_key.to_string(),
+        "BlueLake".to_string(),
+        None,
+        None,
+        Some(100),
+        Some(true),
+        None,
+        None,
+        None,
+        Some(false),
+    )
+    .await
+    .expect("peek persisted inbox");
+    serde_json::from_str(&inbox).unwrap()
+}
+
+fn assert_error_type(error: &fastmcp::McpError, expected: &str) {
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("error"))
+            .and_then(|error| error.get("type"))
+            .and_then(Value::as_str),
+        Some(expected)
+    );
+}
+
+fn assert_exact_replay(fresh: &Value, replay: &str) {
+    let mut replay: Value = serde_json::from_str(replay).unwrap();
+    assert_eq!(
+        replay.as_object_mut().unwrap().remove("idempotent_replay"),
+        Some(Value::Bool(true))
+    );
+    assert_eq!(&replay, fresh);
+}
+
+async fn attachment_replay_case(cx: Cx, storage_root: String, reply: bool) {
+    let ctx = McpContext::new(cx, 1);
+    let project_key = format!("{storage_root}/workspace");
+    std::fs::create_dir_all(&project_key).unwrap();
+    for agent in ["GreenCastle", "BlueLake", "RedFox"] {
+        setup_project_and_agent(&ctx, &project_key, agent).await;
+    }
+    let parent = if reply {
+        let original = send_with_key(
+            &ctx,
+            &project_key,
+            "GreenCastle",
+            "BlueLake",
+            "Parent",
+            "Original body",
+            None,
+        )
+        .await
+        .unwrap();
+        Some(
+            serde_json::from_str::<Value>(&original).unwrap()["deliveries"][0]["payload"]["id"]
+                .as_i64()
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let source = Path::new(&project_key).join("source.bin");
+    let original_bytes = b"accepted attachment bytes";
+    std::fs::write(&source, original_bytes).unwrap();
+    let body = "The accepted body and attachment must survive retries.";
+    let fresh = attachment_request(&ctx, &project_key, &source, parent, body, None)
+        .await
+        .expect("fresh attachment send");
+    let fresh: Value = serde_json::from_str(&fresh).unwrap();
+    assert!(
+        !fresh["deliveries"][0]["payload"]["attachments"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    mcp_agent_mail_storage::wbq_flush();
+    let files = snapshot_delivery_files(&storage_root);
+    let inbox = inbox_snapshot(&ctx, &project_key).await;
+    assert_eq!(
+        count_canonical_messages(&storage_root),
+        if reply { 2 } else { 1 }
+    );
+
+    let retained = source.with_extension("retained.bin");
+    std::fs::rename(&source, &retained).unwrap();
+    let replay = attachment_request(&ctx, &project_key, &source, parent, body, None)
+        .await
+        .expect("retry must not reopen a missing original attachment");
+    assert_exact_replay(&fresh, &replay);
+    let conflict = attachment_request(&ctx, &project_key, &source, parent, "changed body", None)
+        .await
+        .expect_err("a changed request must conflict before checking missing source files");
+    assert_error_type(&conflict, "IDEMPOTENCY_KEY_CONFLICT");
+
+    std::fs::write(&source, b"new bytes at the old source path").unwrap();
+    let replay = attachment_request(&ctx, &project_key, &source, parent, body, None)
+        .await
+        .expect("retry must use the accepted attachment metadata");
+    assert_exact_replay(&fresh, &replay);
+    mcp_agent_mail_storage::wbq_flush();
+    assert_eq!(snapshot_delivery_files(&storage_root), files);
+    assert_eq!(inbox_snapshot(&ctx, &project_key).await, inbox);
+    assert_eq!(std::fs::read(retained).unwrap(), original_bytes);
+    assert_eq!(
+        std::fs::read(source).unwrap(),
+        b"new bytes at the old source path"
+    );
+}
+
+#[test]
+fn send_message_attachment_replay_ignores_missing_and_changed_sources() {
+    run_with_storage(|cx, storage_root| attachment_replay_case(cx, storage_root, false));
+}
+
+#[test]
+fn reply_message_attachment_replay_ignores_missing_and_changed_sources() {
+    run_with_storage(|cx, storage_root| attachment_replay_case(cx, storage_root, true));
+}
+
+#[test]
+fn attachment_replays_require_current_sender_proof_and_keep_redacted_receipts() {
+    run_with_storage_env(
+        &[("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "1")],
+        |cx, storage_root| async move {
+            let ctx = McpContext::new(cx, 1);
+            let project_key = format!("{storage_root}/workspace");
+            std::fs::create_dir_all(&project_key).unwrap();
+            let token = setup_project_and_agent(&ctx, &project_key, "GreenCastle").await;
+            for agent in ["BlueLake", "RedFox"] {
+                setup_project_and_agent(&ctx, &project_key, agent).await;
+            }
+            let source = Path::new(&project_key).join("private.bin");
+            std::fs::write(&source, b"private attachment").unwrap();
+            let body = "Private accepted body";
+            let fresh_send =
+                attachment_request(&ctx, &project_key, &source, None, body, Some(&token))
+                    .await
+                    .expect("verified fresh send");
+            let fresh_send: Value = serde_json::from_str(&fresh_send).unwrap();
+            let parent = fresh_send["message_id"].as_i64().unwrap();
+            let fresh_reply = attachment_request(
+                &ctx,
+                &project_key,
+                &source,
+                Some(parent),
+                body,
+                Some(&token),
+            )
+            .await
+            .expect("verified fresh reply");
+            let fresh_reply: Value = serde_json::from_str(&fresh_reply).unwrap();
+            mcp_agent_mail_storage::wbq_flush();
+            let files = snapshot_delivery_files(&storage_root);
+            let inbox = inbox_snapshot(&ctx, &project_key).await;
+            std::fs::rename(&source, source.with_extension("retained.bin")).unwrap();
+
+            for (parent, fresh) in [(None, fresh_send), (Some(parent), fresh_reply)] {
+                for (proof, expected) in [
+                    (None, "SENDER_TOKEN_REQUIRED"),
+                    (
+                        Some("incorrect-registration-token"),
+                        "SENDER_TOKEN_MISMATCH",
+                    ),
+                ] {
+                    let error =
+                        attachment_request(&ctx, &project_key, &source, parent, body, proof)
+                            .await
+                            .expect_err(
+                                "a prior accepted key must not bypass current sender proof",
+                            );
+                    assert_error_type(&error, expected);
+                }
+                let replay =
+                    attachment_request(&ctx, &project_key, &source, parent, body, Some(&token))
+                        .await
+                        .expect("verified replay after the source was moved");
+                assert_exact_replay(&fresh, &replay);
+                assert_eq!(fresh["receipt_mode"], "redacted");
+                assert_eq!(fresh["verified_sender"], true);
+                for field in [
+                    "subject",
+                    "body_md",
+                    "attachments",
+                    "deliveries",
+                    "to",
+                    "cc",
+                    "bcc",
+                ] {
+                    assert!(
+                        fresh.get(field).is_none(),
+                        "redacted receipt exposed {field}"
+                    );
+                }
+            }
+            mcp_agent_mail_storage::wbq_flush();
+            assert_eq!(snapshot_delivery_files(&storage_root), files);
+            assert_eq!(inbox_snapshot(&ctx, &project_key).await, inbox);
+        },
+    );
 }
 
 #[test]
