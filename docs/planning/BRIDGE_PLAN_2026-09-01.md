@@ -306,6 +306,21 @@ interrupted transport recovery and independent review remain open acceptance.
 The fixed log is `20260922-rainyforest-staged-fixed-tests.log`, SHA-256
 `be5d7943065d25ad72bcbc8f6b21d21035417052de21ca2e108aed1c01542b90`.
 
+The fix was published in `7352a3d3`; its source bytes match that passing run.
+Workspace/all-target `cargo check` and `cargo clippy -- -D warnings`, both with
+`--features mcp-agent-mail-search-core/hybrid`, passed through strict RCH at
+13:00:04 and 13:03:31 UTC respectively. Formatting and whitespace checks pass.
+A metadata-only RCH invocation confirmed the tested storage executable remains
+fresh; its hash is retained in `20260922-rainyforest-staged-test-elf.sha256`,
+alongside matching local and worker source receipts. The two-file UBS comparison
+against `5a298c07` exits 0 with zero new critical, 107 warning and 17 information
+findings. Reviewed warnings cover fixture assertions/setup, bounded fixture
+cloning, line-shifted existing tests, private scratch writes and header indexing
+protected by a checked 12-byte slice. No new suppressions or assertion changes
+were needed. An initial check invocation was refused before execution because
+its nextest-specific jobs flag did not constrain Cargo; the corrected `-j 1`
+invocation passed. There was no local build fallback or full-release claim.
+
 RainyForest read all 1,350 lines of current AGENTS.md and 2,053 lines of README.md.
 The current vision, durability, threat, browser and ATC contracts were compared
 with source, the verification ledger, dependency upgrade log, previous full
