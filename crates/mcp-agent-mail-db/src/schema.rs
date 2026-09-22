@@ -84,7 +84,8 @@ CREATE TABLE IF NOT EXISTS messages (
     ack_required INTEGER NOT NULL DEFAULT 0,
     created_ts INTEGER NOT NULL,
     recipients_json TEXT NOT NULL DEFAULT '{}',
-    attachments TEXT NOT NULL DEFAULT '[]'
+    attachments TEXT NOT NULL DEFAULT '[]',
+    archive_metadata_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_project_created ON messages(project_id, created_ts);
 CREATE INDEX IF NOT EXISTS idx_messages_project_sender_created ON messages(project_id, sender_id, created_ts);
@@ -580,6 +581,26 @@ const TRG_INBOX_DELIVERY_EVENTS_RECIPIENT_INSERT_SQL: &str = "CREATE TRIGGER IF 
              FROM messages AS m WHERE m.id = NEW.message_id; \
          END";
 
+// This exact statement (including its comment and whitespace) was already
+// recorded with a checksum before v30. The latest bootstrap DDL may evolve;
+// an applied migration may not. Fresh and existing ledgers both add the new
+// column through v30 without weakening drift detection or rewriting history.
+const V1_CREATE_MESSAGES_MIGRATION_SQL: &str = r"-- Messages table
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    sender_id INTEGER NOT NULL REFERENCES agents(id),
+    thread_id TEXT,
+    topic TEXT COLLATE NOCASE,
+    subject TEXT NOT NULL,
+    body_md TEXT NOT NULL,
+    importance TEXT NOT NULL DEFAULT 'normal',
+    ack_required INTEGER NOT NULL DEFAULT 0,
+    created_ts INTEGER NOT NULL,
+    recipients_json TEXT NOT NULL DEFAULT '{}',
+    attachments TEXT NOT NULL DEFAULT '[]'
+)";
+
 /// Return the complete list of schema migrations.
 ///
 /// Migrations are designed so each `up` is a single `SQLite` statement (compatible with
@@ -601,7 +622,12 @@ pub fn schema_migrations() -> Vec<Migration> {
             continue;
         };
 
-        let migration = Migration::new(id, desc, stmt.to_string(), String::new());
+        let up = if id == "v1_create_table_messages" {
+            V1_CREATE_MESSAGES_MIGRATION_SQL
+        } else {
+            stmt
+        };
+        let migration = Migration::new(id, desc, up.to_string(), String::new());
         if COLUMN_DEPENDENT_INDEX_MIGRATION_IDS.contains(&migration.id.as_str()) {
             deferred_column_dependent_indexes.push(migration);
         } else {
@@ -2429,6 +2455,16 @@ pub fn schema_migrations() -> Vec<Migration> {
         ));
     }
 
+    // NULL retains the uncertainty of legacy rows. A fresh send explicitly
+    // stores {}, while a reply stores its exact immediate parent. Never
+    // backfill from thread_id: it identifies a conversation, not a parent.
+    migrations.push(Migration::new(
+        "v30_add_archive_metadata_json_to_messages".to_string(),
+        "retain exact reply metadata in the accepted message transaction".to_string(),
+        "ALTER TABLE messages ADD COLUMN archive_metadata_json TEXT".to_string(),
+        String::new(),
+    ));
+
     // These indexes are also present in the latest static DDL, which gives
     // them generated v1 migration IDs. On an existing pre-v27/v28 database,
     // however, their columns do not exist until the explicit evolution
@@ -3164,6 +3200,7 @@ pub async fn validate_startup_schema_gate<C: Connection>(
                 "created_ts",
                 "recipients_json",
                 "attachments",
+                "archive_metadata_json",
             ],
         ),
         (
@@ -5054,6 +5091,152 @@ mod tests {
             )
             .expect("query migration row");
         assert_eq!(rows.len(), 1, "expected migration row to be recorded");
+    }
+
+    #[test]
+    fn archive_metadata_upgrade_preserves_the_complete_pre_v30_migration_ledger() {
+        const V30: &str = "v30_add_archive_metadata_json_to_messages";
+        // FNV-1a witness independently calculated from the pre-change v1 SQL.
+        // Deriving both the old ledger and assertion from mutable latest DDL
+        // would miss the upgrade-blocking checksum drift this test prevents.
+        const OLD_V1_CHECKSUM: &str = "2ffd052cfb02efea";
+        let conn = crate::CanonicalDbConn::open_memory().expect("open canonical database");
+        block_on(|cx| async move {
+            init_migrations_table(&cx, &conn)
+                .await
+                .into_result()
+                .expect("initialize old migration ledger");
+            let old = schema_migrations()
+                .into_iter()
+                .filter(|migration| migration.id != V30)
+                .collect::<Vec<_>>();
+            let original = old
+                .iter()
+                .find(|migration| migration.id == "v1_create_table_messages")
+                .unwrap();
+            assert_eq!(original.checksum(), OLD_V1_CHECKSUM);
+            run_specific_migrations(&cx, &conn, old)
+                .await
+                .into_result()
+                .expect("apply the complete pre-v30 migration ledger");
+            let columns = conn.query_sync("PRAGMA table_info(messages)", &[]).unwrap();
+            assert!(columns.iter().all(
+                |column| column.get_named::<String>("name").unwrap() != "archive_metadata_json"
+            ));
+            conn.execute_raw(
+                "INSERT INTO projects(id,slug,human_key,created_at) VALUES(1,'old','/old',1); \
+                 INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) \
+                 VALUES(1,1,'BlueLake','test','test',1,1); \
+                 INSERT INTO messages(id,project_id,sender_id,thread_id,subject,body_md,created_ts) \
+                 VALUES(1,1,1,'unknown-parent','legacy mail','preserve body',1)"
+            ).unwrap();
+            let before = conn.query_sync(&format!("SELECT checksum, applied_at FROM {MIGRATIONS_TABLE_NAME} WHERE id = 'v1_create_table_messages'"), &[]).unwrap();
+            assert_eq!(
+                before[0].get_named::<String>("checksum").unwrap(),
+                OLD_V1_CHECKSUM
+            );
+            let applied = run_specific_migrations(&cx, &conn, schema_migrations())
+                .await
+                .into_result()
+                .expect("upgrade old checked ledger without checksum drift");
+            assert_eq!(applied, vec![V30.to_string()]);
+            let after = conn.query_sync(&format!("SELECT checksum, applied_at FROM {MIGRATIONS_TABLE_NAME} WHERE id = 'v1_create_table_messages'"), &[]).unwrap();
+            assert_eq!(
+                after[0].get_named::<String>("checksum").unwrap(),
+                OLD_V1_CHECKSUM
+            );
+            assert_eq!(
+                after[0].get_named::<i64>("applied_at").unwrap(),
+                before[0].get_named::<i64>("applied_at").unwrap()
+            );
+            let rows = conn
+                .query_sync(
+                    "SELECT body_md, archive_metadata_json FROM messages WHERE id = 1",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(
+                rows[0].get_named::<String>("body_md").unwrap(),
+                "preserve body"
+            );
+            assert!(
+                rows[0]
+                    .get_named::<Option<String>>("archive_metadata_json")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                run_specific_migrations(&cx, &conn, schema_migrations())
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn archive_metadata_migration_preserves_unknown_legacy_lineage_and_known_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("archive_metadata_migration.db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open connection");
+        conn.execute_raw("CREATE TABLE messages (id INTEGER PRIMARY KEY, thread_id TEXT)")
+            .expect("create legacy table");
+        conn.execute_raw("INSERT INTO messages (id, thread_id) VALUES (1, 'legacy-thread')")
+            .expect("seed legacy message");
+        let migration = schema_migrations()
+            .into_iter()
+            .find(|migration| migration.id == "v30_add_archive_metadata_json_to_messages")
+            .expect("archive metadata migration");
+        assert!(
+            schema_migrations_base()
+                .iter()
+                .any(|candidate| candidate.id == migration.id),
+            "the live runtime must apply the new column migration"
+        );
+        block_on({
+            let conn = &conn;
+            let migration = &migration;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("initialize migrations table");
+                run_single_migration_with_lock_retry(&cx, conn, migration)
+                    .await
+                    .into_result()
+                    .expect("apply archive metadata migration");
+            }
+        });
+        conn.execute_raw(
+            "INSERT INTO messages (id, thread_id, archive_metadata_json) \
+             VALUES (2, 'fresh-thread', '{}'), (3, 'fresh-thread', '{\"reply_to\":2}')",
+        )
+        .expect("insert known lineage");
+        block_on({
+            let conn = &conn;
+            let migration = &migration;
+            move |cx| async move {
+                run_single_migration_with_lock_retry(&cx, conn, migration)
+                    .await
+                    .into_result()
+                    .expect("reapply migration without resetting metadata");
+            }
+        });
+        let rows = conn
+            .query_sync(
+                "SELECT archive_metadata_json FROM messages ORDER BY id",
+                &[],
+            )
+            .expect("read migrated lineage");
+        let actual = rows
+            .iter()
+            .map(|row| row.get_as::<Option<String>>(0).expect("nullable metadata"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![None, Some("{}".into()), Some("{\"reply_to\":2}".into())]
+        );
     }
 
     #[test]

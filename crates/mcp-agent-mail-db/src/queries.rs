@@ -7596,8 +7596,8 @@ pub async fn create_message(
 
         // Insert message with an explicit id (mcp_agent_mail#176).
         let sql = "INSERT INTO messages \
-	               (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-	               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+	               (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments, archive_metadata_json) \
+	               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}')";
         let params = [
             Value::BigInt(message_id),
             Value::BigInt(project_id),
@@ -7825,6 +7825,7 @@ pub async fn create_message_with_recipients(
         body_md,
         thread_id,
         None,
+        None,
         importance,
         ack_required,
         attachments,
@@ -7833,7 +7834,11 @@ pub async fn create_message_with_recipients(
     .await
 }
 
-/// Create a message with an optional topic and all recipients atomically.
+/// Create a message with an optional topic, exact reply parent and all recipients atomically.
+///
+/// `reply_to` is the immediate parent, never inferred from `thread_id`. `None`
+/// records authoritative absence, allowing a fresh threaded send to recover
+/// even if its first archive write and journal enqueue both fail.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_message_with_recipients_topic(
     cx: &Cx,
@@ -7844,6 +7849,7 @@ pub async fn create_message_with_recipients_topic(
     body_md: &str,
     thread_id: Option<&str>,
     topic: Option<&str>,
+    reply_to: Option<i64>,
     importance: &str,
     ack_required: bool,
     attachments: &str,
@@ -7858,6 +7864,7 @@ pub async fn create_message_with_recipients_topic(
         body_md,
         thread_id,
         topic,
+        reply_to,
         importance,
         ack_required,
         attachments,
@@ -7915,6 +7922,7 @@ pub async fn create_message_with_recipients_idempotent(
         body_md,
         thread_id,
         None,
+        None,
         importance,
         ack_required,
         attachments,
@@ -7935,6 +7943,7 @@ pub async fn create_message_with_recipients_idempotent_topic(
     body_md: &str,
     thread_id: Option<&str>,
     topic: Option<&str>,
+    reply_to: Option<i64>,
     importance: &str,
     ack_required: bool,
     attachments: &str,
@@ -7950,6 +7959,7 @@ pub async fn create_message_with_recipients_idempotent_topic(
         body_md,
         thread_id,
         topic,
+        reply_to,
         importance,
         ack_required,
         attachments,
@@ -7969,12 +7979,22 @@ async fn create_message_with_recipients_impl(
     body_md: &str,
     thread_id: Option<&str>,
     topic: Option<&str>,
+    reply_to: Option<i64>,
     importance: &str,
     ack_required: bool,
     attachments: &str,
     recipients: &[(i64, &str)], // (agent_id, kind)
     idempotency: Option<IdempotencyClaim<'_>>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
+    if reply_to.is_some_and(|parent| parent <= 0)
+        || (reply_to.is_some() && thread_id.is_none_or(str::is_empty))
+    {
+        return Outcome::Err(DbError::InvalidArgument {
+            field: "reply_to",
+            message: "a reply requires a positive immediate parent and a nonempty thread"
+                .to_string(),
+        });
+    }
     // Use the owned guard because this critical section intentionally spans
     // async database and archive I/O. The borrowed guard is deliberately
     // thread-affine, which would make this public future non-Send.
@@ -8073,6 +8093,7 @@ async fn create_message_with_recipients_impl(
                     body_md,
                     thread_id,
                     topic,
+                    reply_to,
                     importance,
                     ack_required,
                     attachments,
@@ -8363,6 +8384,7 @@ async fn create_message_with_recipients_tx(
     body_md: &str,
     thread_id: Option<&str>,
     topic: Option<&str>,
+    reply_to: Option<i64>,
     importance: &str,
     ack_required: bool,
     attachments: &str,
@@ -8443,6 +8465,13 @@ async fn create_message_with_recipients_tx(
         tracked,
         elect_message_id_in_tx(cx, tracked, archive_seed).await
     );
+    if reply_to == Some(message_id) {
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(DbError::InvalidArgument {
+            field: "reply_to",
+            message: "a message cannot be its own reply parent".to_string(),
+        });
+    }
 
     // Fetch recipient names to build recipients_json
     let mut to_names = Vec::new();
@@ -8485,6 +8514,13 @@ async fn create_message_with_recipients_tx(
     })
     .to_string();
 
+    // Persist before COMMIT and inside the idempotency gate. A replay neither
+    // invents a missing legacy parent nor rewrites the original lineage.
+    let archive_metadata_json = reply_to.map_or_else(
+        || "{}".to_string(),
+        |parent| serde_json::json!({"reply_to": parent}).to_string(),
+    );
+
     // Insert the message with an EXPLICIT id (mcp_agent_mail#176). We do not
     // rely on AUTOINCREMENT + a deterministic read-back here: the id was
     // allocated by the process-wide monotonic allocator in the caller, so it
@@ -8494,8 +8530,8 @@ async fn create_message_with_recipients_tx(
     // engine state. (Inserting an explicit id > the current sequence also
     // advances `sqlite_sequence`, keeping any non-explicit path consistent.)
     let sql = "INSERT INTO messages \
-               (id, project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+               (id, project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments, archive_metadata_json) \
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     let params = [
         Value::BigInt(message_id),
         Value::BigInt(project_id),
@@ -8509,6 +8545,7 @@ async fn create_message_with_recipients_tx(
         Value::BigInt(now),
         Value::Text(recipients_json_val.clone()),
         Value::Text(attachments.to_string()),
+        Value::Text(archive_metadata_json),
     ];
 
     try_in_tx!(
@@ -8632,6 +8669,70 @@ async fn create_message_with_recipients_tx(
 // for BEGIN/COMMIT/ROLLBACK) so the key record commits atomically with the
 // mutation it guards. See `crate::idempotency` for the durability rationale.
 
+/// Look up an already committed, unexpired idempotency result without mutating
+/// the database or waiting for a writer transaction.
+///
+/// `None` means the key is absent or expired. `Some(Ok(result))` is the original
+/// result, while `Some(Err(conflict))` rejects a changed request. A miss is only
+/// an optimization hint: the mutating entry point must still check and record
+/// the claim inside its own transaction to serialize concurrent first calls.
+/// Expired records are ignored here; pruning belongs to the write path.
+pub async fn lookup_idempotency_result<T: DeserializeOwned>(
+    cx: &Cx,
+    pool: &DbPool,
+    claim: IdempotencyClaim<'_>,
+) -> Outcome<Option<std::result::Result<T, IdempotencyConflict>>, DbError> {
+    run_read_with_mvcc_retry(cx, "lookup_idempotency_result", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+        };
+        let tracked = tracked(&*conn);
+        // A deferred transaction refreshes the snapshot without taking the
+        // writer lock used by the mutation's authoritative claim check.
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(tracked.execute(cx, "BEGIN", &[]).await)
+        );
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT payload_fingerprint, result_json, created_ts FROM idempotency_keys \
+                     WHERE project_id = ? AND tool = ? AND idempotency_key = ? AND expires_ts >= ?",
+                    &[
+                        Value::BigInt(claim.project_id),
+                        Value::Text(claim.tool.to_string()),
+                        Value::Text(claim.key.to_string()),
+                        Value::BigInt(now_micros()),
+                    ],
+                )
+                .await
+            )
+        );
+        try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+
+        match decode_idempotency_check(rows.first(), claim) {
+            Ok(IdempotencyCheck::Proceed) => Outcome::Ok(None),
+            Ok(IdempotencyCheck::Replay(result_json)) => {
+                match decode_idempotency_result(&result_json, claim.tool) {
+                    Ok(result) => Outcome::Ok(Some(Ok(result))),
+                    Err(error) => Outcome::Err(error),
+                }
+            }
+            Ok(IdempotencyCheck::Conflict(conflict)) => Outcome::Ok(Some(Err(conflict))),
+            Err(error) => Outcome::Err(error),
+        }
+    })
+    .await
+}
+
 /// Resolve an idempotency claim against `idempotency_keys` inside an already-open
 /// transaction.
 ///
@@ -8683,17 +8784,27 @@ async fn idempotency_check_in_tx(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    let Some(row) = rows.first() else {
-        return Outcome::Ok(IdempotencyCheck::Proceed);
+    match decode_idempotency_check(rows.first(), claim) {
+        Ok(result) => Outcome::Ok(result),
+        Err(error) => Outcome::Err(error),
+    }
+}
+
+fn decode_idempotency_check(
+    row: Option<&SqlRow>,
+    claim: IdempotencyClaim<'_>,
+) -> std::result::Result<IdempotencyCheck, DbError> {
+    let Some(row) = row else {
+        return Ok(IdempotencyCheck::Proceed);
     };
-    let stored_fingerprint = row.get_as::<String>(0).unwrap_or_default();
-    let result_json = row.get_as::<String>(1).unwrap_or_default();
-    let original_created_ts = row.get_as::<i64>(2).unwrap_or(0);
+    let stored_fingerprint = row.get_as::<String>(0).map_err(|e| map_sql_error(&e))?;
+    let result_json = row.get_as::<String>(1).map_err(|e| map_sql_error(&e))?;
+    let original_created_ts = row.get_as::<i64>(2).map_err(|e| map_sql_error(&e))?;
 
     if stored_fingerprint == claim.fingerprint {
-        Outcome::Ok(IdempotencyCheck::Replay(result_json))
+        Ok(IdempotencyCheck::Replay(result_json))
     } else {
-        Outcome::Ok(IdempotencyCheck::Conflict(IdempotencyConflict {
+        Ok(IdempotencyCheck::Conflict(IdempotencyConflict {
             tool: claim.tool.to_string(),
             key: claim.key.to_string(),
             original_fingerprint: stored_fingerprint,
@@ -13351,7 +13462,19 @@ async fn create_file_reservations_impl(
                         )));
                     };
                     row.expires_ts = row.expires_ts.max(now).saturating_add(lease_extension);
-                    let renew_params = [Value::BigInt(row.expires_ts), Value::BigInt(id)];
+                    // Re-acquisition applies the new request's intent as well
+                    // as its TTL. In particular, shared -> exclusive must not
+                    // report a successful acquisition that still lets peers
+                    // acquire shared leases. The requested mode was checked
+                    // against every peer above in this same transaction.
+                    row.exclusive = i64::from(exclusive);
+                    row.reason = reason.to_string();
+                    let renew_params = [
+                        Value::BigInt(row.expires_ts),
+                        Value::BigInt(row.exclusive),
+                        Value::Text(row.reason.clone()),
+                        Value::BigInt(id),
+                    ];
                     try_in_tx!(
                         cx,
                         &tracked,
@@ -13359,7 +13482,8 @@ async fn create_file_reservations_impl(
                             traw_execute(
                                 cx,
                                 &tracked,
-                                "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
+                                "UPDATE file_reservations \
+                                 SET expires_ts = ?, \"exclusive\" = ?, reason = ? WHERE id = ?",
                                 &renew_params,
                             )
                             .await
@@ -30613,6 +30737,7 @@ mod tests {
                 "body A",
                 Some("THREAD-A"),
                 Some("br-search.1"),
+                None,
                 "normal",
                 false,
                 "[]",
@@ -31364,6 +31489,7 @@ mod tests {
                 "topic body",
                 Some("topic-thread"),
                 Some("Br-Abc.1"),
+                None,
                 "normal",
                 false,
                 "[]",
