@@ -115,8 +115,8 @@ impl JournalDirectory {
         validate_entry_name(name)?;
         self.validate_binding()?;
         check_regular_single_link(file)?;
-        let named =
-            open_file_at(&self.directory, name, JournalFileMode::Read).map_err(binding_error)?;
+        let named = open_file_at(&self.directory, name, JournalFileMode::Read)
+            .map_err(|error| binding_error(&error))?;
         check_regular_single_link(&named)?;
         require_same_file(file, &named)
     }
@@ -140,15 +140,15 @@ impl JournalDirectory {
     }
 
     fn validate_binding(&self) -> io::Result<()> {
-        let root = open_root(&self.root_path).map_err(binding_error)?;
+        let root = open_root(&self.root_path).map_err(|error| binding_error(&error))?;
         require_same_file(&self.root, &root)?;
-        let directory =
-            open_directory_at(&self.root, &self.directory_name, false).map_err(binding_error)?;
+        let directory = open_directory_at(&self.root, &self.directory_name, false)
+            .map_err(|error| binding_error(&error))?;
         require_same_file(&self.directory, &directory)
     }
 }
 
-fn binding_error(error: io::Error) -> io::Error {
+fn binding_error(error: &io::Error) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!("journal authority could not be revalidated: {error}"),

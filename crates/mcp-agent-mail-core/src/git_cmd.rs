@@ -61,7 +61,7 @@ const SEGFAULT_BACKOFFS_MS: [u64; 3] = [100, 400, 1600];
 pub const DEFAULT_GIT_MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
 /// One monotonic origin survives lock admission, child setup and retries.
-/// Duration arithmetic avoids overflowing Instant for a Duration::MAX caller.
+/// Duration arithmetic avoids overflowing `Instant` for a `Duration::MAX` caller.
 #[derive(Debug, Clone, Copy)]
 struct GitBudget {
     started: Instant,

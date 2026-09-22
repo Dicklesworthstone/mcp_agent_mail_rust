@@ -80,8 +80,8 @@ legacy/cross-project routing, exact attachment recovery, journal authority,
 bounded Git/retry admission and ATC population scoping. These are existing
 upstream implementations to qualify, not missing features to duplicate. The
 pre-merge results above do not qualify this combined candidate. Selected
-recovery/stdio tests passed; workspace compiler/lint checks are running through
-the same strict RCH lane. Incoming formatting drift was corrected manually; two
+recovery/stdio tests passed; workspace check passed at 02:24:20 UTC. Incoming
+formatting drift was corrected manually; two
 delegates handled eight files and the parent reviewed their full diffs and
 reran formatting checks. One intentional, caught test panic needed a documented
 same-line UBS false-positive exception after formatting changed its fingerprint.
@@ -105,6 +105,30 @@ disabled to execute every selected control; assertions and pass conditions were
 unchanged. Receipt: `20260922-rainyforest-merged-recovery-pass.log`. Fifteen
 source/lock hashes matched the worker; the executed `am` SHA-256 was
 `64c301bd33bfe5160f688fb0496c98c1ee7cb132b2bf053f6c3a5856e0dbc0a9`.
+
+Merge `48af590d` subsequently reached main and its required mirror. Final-source
+workspace/all-target Clippy with warnings denied passed through strict RCH at
+02:51:13 UTC after direct fixes to incoming diagnostics: documentation markup,
+borrowed journal errors, a boxed private repair error, and equivalent ATC/retry
+test syntax. No assertions, lint rules or runtime refusal conditions changed.
+The 14-file UBS comparison still exits 0 with zero new critical findings,
+230 warnings and 66 informational records; the last changed fingerprint is the
+same breaker-identity test assertion with explicit pointer syntax.
+
+Final-source runtime qualification passed through strict RCH on `vmi1264463`:
+100/100 tests at 03:19:43 UTC (57 archive reconciliation, 39 boot-repair, two
+retry and two real stdio cases; 11,597 outside selection; 76.241 seconds after a
+25m55s build). The actual `atc::population::scope` module then passed 17/17 at
+03:20:24 UTC (11,680 outside selection; 0.609 seconds), correcting the initial
+filename-style filter that matched none of those tests. Logs are
+`20260922-rainyforest-final-selected-tests-pass.log` and
+`20260922-rainyforest-final-atc-scope-tests-pass.log` in the artifact directory
+above. Fifteen source files and Cargo.lock match the worker; the executed `am`
+SHA-256 is `2823775d964be14cea7360120c7f6645b16fe2c742fa15dd2487c0bc96d348e7`.
+Final workspace/all-target check passed at 03:23:32 UTC; formatting and whitespace
+checks pass. These selected checks do not close
+the original journal/backlog transport acceptance, independent review, or the
+full release gate; the broader recovery bead remains open.
 
 RainyForest read all 1,350 lines of current AGENTS.md and 2,053 lines of README.md.
 The current vision, durability, threat, browser and ATC contracts were compared

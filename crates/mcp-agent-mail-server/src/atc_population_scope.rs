@@ -228,10 +228,7 @@ mod tests {
     fn ambiguity_is_order_independent_and_cannot_be_overwritten_by_a_duplicate() {
         let a = row("BlueLake", 1, "/alpha");
         let b = row("BlueLake", 2, "/beta");
-        for rows in [
-            vec![a.clone(), b.clone(), a.clone()],
-            vec![b.clone(), a.clone(), b.clone()],
-        ] {
+        for rows in [vec![a.clone(), b.clone(), a.clone()], vec![b.clone(), a, b]] {
             let scope = PopulationScope::from_rows(&rows);
             assert_eq!(scope.unresolved_names(), 1);
             assert!(!scope.permits("BlueLake", Some("/alpha")));
@@ -265,7 +262,7 @@ mod tests {
             row("BlueLake", 1, " "),
             row(" ", 1, "/alpha"),
         ] {
-            let scope = PopulationScope::from_rows(&[invalid.clone()]);
+            let scope = PopulationScope::from_rows(std::slice::from_ref(&invalid));
             assert_eq!(scope.unresolved_names(), 1);
             assert!(!scope.permits(&invalid.name, Some("/alpha")));
         }
@@ -443,8 +440,8 @@ mod tests {
         summary.policy.fallback_active = false;
         summary.policy.fallback_reason = None;
         engine::AtcTickReport {
-            effects,
             actions,
+            effects,
             summary,
         }
     }
@@ -635,7 +632,7 @@ mod tests {
     fn late_pre_reset_read_cannot_restore_an_old_scope() {
         with_global_atc(|| {
             let now = mcp_agent_mail_core::timestamps::now_micros();
-            let stale = sync_population_with(now, || {
+            let pre_reset_read = sync_population_with(now, || {
                 let config = mcp_agent_mail_core::Config {
                     atc_enabled: true,
                     ..Default::default()
@@ -645,7 +642,7 @@ mod tests {
                 Ok(vec![row("OldAgent", 1, "/alpha")])
             });
             assert_eq!(
-                stale.unwrap_err(),
+                pre_reset_read.unwrap_err(),
                 "population refresh discarded after ATC reset"
             );
             let state = hydration().lock().unwrap();

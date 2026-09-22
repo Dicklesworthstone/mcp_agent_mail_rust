@@ -780,7 +780,7 @@ fn auto_repair_missing_refs(
     candidate: &ArchiveRepoCandidate,
     refs: &[PrunableRef],
     remaining: &mut impl FnMut(&str) -> Result<Duration, String>,
-) -> Result<AutoRepairOutcome, AutoRepairFailure> {
+) -> Result<AutoRepairOutcome, Box<AutoRepairFailure>> {
     let before_refs = refs
         .iter()
         .map(|finding| finding.ref_name.clone())
@@ -874,7 +874,7 @@ fn auto_repair_missing_refs(
         Ok(()) => Ok(progress),
         Err(detail) => {
             progress.actions.push(format!("repair_stopped:{detail}"));
-            Err(AutoRepairFailure { detail, progress })
+            Err(Box::new(AutoRepairFailure { detail, progress }))
         }
     }
 }

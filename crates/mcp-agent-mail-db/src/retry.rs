@@ -486,8 +486,9 @@ enum AttemptResult {
     Abandoned,
 }
 
-/// Single-use feedback for one admitted operation. It can move with an async
-/// task or to another thread; it holds no mutex guard. Dropping a half-open
+/// Single-use feedback for one admitted operation.
+///
+/// It can move with an async task or to another thread; it holds no mutex guard. Dropping a half-open
 /// attempt releases only its own probe slot, even across resets and retrips.
 #[derive(Debug)]
 #[must_use = "retain the attempt until the operation completes"]
@@ -2167,8 +2168,14 @@ mod tests {
 
     #[test]
     fn legacy_and_subsystem_names_share_one_database_breaker() {
-        assert!(std::ptr::eq(&*CIRCUIT_BREAKER, &*CIRCUIT_DB));
-        assert!(std::ptr::eq(&*CIRCUIT_BREAKER, circuit_for(Subsystem::Db),));
+        assert!(std::ptr::eq(
+            &raw const *CIRCUIT_BREAKER,
+            &raw const *CIRCUIT_DB
+        ));
+        assert!(std::ptr::eq(
+            &raw const *CIRCUIT_BREAKER,
+            circuit_for(Subsystem::Db),
+        ));
         assert_eq!(CIRCUIT_BREAKER.threshold(), CIRCUIT_DB.threshold());
         assert_eq!(
             CIRCUIT_BREAKER.reset_duration(),
@@ -2318,7 +2325,10 @@ mod tests {
             let (lock, wake) = &*release;
             *lock.lock().unwrap() = true;
             wake.notify_all();
-            let joined: Vec<_> = workers.into_iter().map(|worker| worker.join()).collect();
+            let joined: Vec<_> = workers
+                .into_iter()
+                .map(std::thread::ScopedJoinHandle::join)
+                .collect();
             assert!(observations.iter().all(Result::is_ok));
             assert_eq!(
                 observations
