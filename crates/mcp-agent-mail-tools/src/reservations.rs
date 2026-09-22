@@ -3589,7 +3589,9 @@ mod tests {
                     replay["conflicts"]
                         .as_array()
                         .expect("current conflicts")
-                        .is_empty()
+                        .is_empty(),
+                    "released peer must leave no current conflicts: {}",
+                    replay["conflicts"]
                 );
                 let active = queries::get_active_reservations(&cx, &pool, project_id)
                     .await
@@ -3632,7 +3634,9 @@ mod tests {
                     first["granted"]
                         .as_array()
                         .expect("empty grants")
-                        .is_empty()
+                        .is_empty(),
+                    "conflicting paths must grant nothing: {}",
+                    first["granted"]
                 );
                 release_file_reservations(&ctx, project_key.clone(), peer.name, None, None)
                     .await
@@ -3650,7 +3654,9 @@ mod tests {
                     replay["granted"]
                         .as_array()
                         .expect("replayed empty grants")
-                        .is_empty()
+                        .is_empty(),
+                    "replay must preserve the empty grant: {}",
+                    replay["granted"]
                 );
 
                 let changed = file_reservation_paths(
