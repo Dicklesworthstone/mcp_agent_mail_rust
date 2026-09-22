@@ -161,13 +161,61 @@ and 69 storage controls. The one failure occurred during a new staged fixture's
 setup: libgit2 rejected a missing object when adding to a repository-owned index,
 before reconciliation ran. The fixture now opens its index without an attached
 object database and asserts the object is absent, so the original refusal and
-preservation assertions can execute. This test-only correction awaits rerun.
+preservation assertions can execute. The corrected test subsequently passed in
+the 68-test run recorded below.
 The failed terminal log remains `20260922-rainyforest-combined-runtime.log`;
 the executed `am` SHA-256 was
 `804383fc0242465041af0fdaa4054177dd6ec971011d4937a2b21af11d5d70a3`.
 Publication remains pending. Upstream `2f7ee9ed` adds exhaustive ACK page-bound
 regressions and retryable model discovery; those are the next fixed integration
 cut. Search helper tests alone will not establish real-model loading coverage.
+
+**Live search follow-through (`br-drpda`, in progress):** tracing the imports
+revealed that the newer discovery fix modified only the optional `search-core`
+module. The mailbox actually uses DB `search_model2vec` and `search_auto_init`;
+neither the loader's permanent negative cache nor the context's permanent
+unavailable snapshot was repaired there. The DB path now has ordered fallback,
+retryable failed discovery, stable successful model references, and lazy metadata
+that lets the same context observe a later installation. Model I/O occurs outside
+the context initialization lock. Initial metrics retain their historical meaning.
+Seven deterministic controls were transferred manually and reviewed. A separate
+opt-in subprocess regression requires actual registered potion artifacts, tests
+the production cooldown and late installation behind a broken first cache, and
+checks a normalized embedding plus stable context/model references. It is ignored
+in ordinary model-free runs and must be explicitly executed for this bead's
+closure. Tiny synthetic weights cannot qualify this path: the pinned dependency
+correctly requires the registered artifact identity. The real model is present on
+`vmi1264463`. Default workspace Clippy at 05:16:13 UTC did
+not enable the optional `search-core` semantic module and predates these DB edits.
+The current strict RCH gate explicitly enables that feature. The earlier cold
+feature test job was cancelled before tests (exit 143, no verdict); its log is
+retained. No model admission policy, runtime assertion or test threshold was
+relaxed. This remains model-discovery/context qualification, not full semantic
+transport or performance certification.
+
+The frozen candidate passed all 68 selected tests through strict RCH on
+`vmi1264463` at 08:00:51 UTC: 12 ACK scan, 19 live context, 15 live model-loader,
+14 optional model-loader and eight staged-recovery tests (4,999 outside selection;
+86.432 seconds). The registered-model subprocess passed in 33.464 seconds and
+emitted its required completion marker. The missing-object fixture passed in
+0.089 seconds. The receipt is `20260922-rainyforest-live-search-focused-tests-warm.log`
+under the artifact directory above (SHA-256
+`3299b38995d527cfcf85b3a29137fab46d5d3a1b2b4cc57a636d0bbe59d48f6d`).
+The preceding 90-minute cold compilation timed out before tests and is excluded.
+Metadata-only remote inspection confirmed all three test binaries were unchanged;
+their hashes are retained in `20260922-rainyforest-live-search-test-elf.sha256`.
+All 24 selected source/lock hashes matched the worker. Optional-feature workspace
+Clippy passed at 06:11:16 UTC; final library timestamp invalidation and workspace
+gates remain to be completed on the publication candidate.
+
+Upstream subsequently advanced eight commits to `ae296364`, adding transactional
+ACK admission, explorer pagination/privacy repairs, ATC reset/locking repairs and
+optional-context promotion. These are the next fixed integration base; the
+68-test result does not qualify their new behavior. A separate source audit found
+that the legacy `SemanticBridge` can retain a 384-dimension index while the live
+fast model emits 256 dimensions. Exact call sites were sent to GentleBeaver's
+existing `br-kp1in.7` work (Mail 42841). This is a source finding awaiting a real
+indexing/search reproducer, not a claim that full semantic transport now recovers.
 
 RainyForest read all 1,350 lines of current AGENTS.md and 2,053 lines of README.md.
 The current vision, durability, threat, browser and ATC contracts were compared

@@ -20,7 +20,11 @@ use crate::{DbError, DbPool, DbResult};
 /// Maximum delivered rows in one observation, excluding its overflow witness.
 pub const MAX_ACK_SCAN_PAGE_SIZE: usize = 128;
 
-const PAGE_SQL: &str = "\
+// The pinned engine evaluates a compound SELECT's outer LIMIT separately from
+// its bound parameters (see the September 22 bridge integration receipt). Only
+// the validated internal integer limit is appended below; every data value
+// remains a binding with an explicit, statement-wide index.
+const PAGE_SQL_PREFIX: &str = "\
 WITH input AS (\
     SELECT ?1 AS resume, ?2 AS expected_generation, ?3 AS previous_upper_id, \
            ?4 AS previous_before_ts, ?5 AS current_before_ts, \
@@ -47,7 +51,7 @@ FROM messages m JOIN message_recipients mr ON mr.message_id = m.id CROSS JOIN bo
 WHERE m.ack_required = 1 AND mr.ack_ts IS NULL AND m.created_ts <= b.before_ts \
   AND m.id <= b.upper_id \
   AND (m.id > b.after_message OR (m.id = b.after_message AND mr.agent_id > b.after_agent)) \
-ORDER BY row_kind, message_id, agent_id";
+ORDER BY row_kind, message_id, agent_id LIMIT ";
 
 /// Opaque process-local continuation. It represents consumed deliveries, not a
 /// message delivery cursor and not proof that an escalation succeeded.
@@ -121,6 +125,9 @@ fn page_query(
     let generation = cursor
         .and_then(|cursor| cursor.generation_id.clone())
         .map_or(Value::Null, Value::Text);
+    // The check above makes addition bounded (3..=130). No external string is
+    // interpolated, including generation IDs that contain SQL punctuation.
+    let sql = format!("{PAGE_SQL_PREFIX}{}", page_size + 2);
     let params = vec![
         i64::from(cursor.is_some()).into(),
         generation,
@@ -132,10 +139,7 @@ fn page_query(
         cursor.map_or(0, |cursor| cursor.after_message).into(),
         cursor.map_or(0, |cursor| cursor.after_agent).into(),
     ];
-    // The pinned engine evaluates a compound SELECT's final LIMIT without its
-    // bindings. Render only this validated integer (metadata + page + witness);
-    // all mailbox values remain bound, and the observation stays one statement.
-    Ok((format!("{PAGE_SQL} LIMIT {}", page_size + 2), params))
+    Ok((sql, params))
 }
 
 fn decode_page(database_scope: String, rows: Vec<Row>, page_size: usize) -> DbResult<AckScanPage> {
@@ -445,6 +449,67 @@ mod tests {
             .unwrap();
             let (sql, params) = page_query("db", None, 10, 1).unwrap();
             assert!(decode_page("db".into(), conn.query_sync(&sql, &params).unwrap(), 1).is_err());
+        });
+    }
+
+    #[test]
+    fn compound_limit_is_internal_and_all_data_bindings_are_explicit() {
+        for size in 1..=MAX_ACK_SCAN_PAGE_SIZE {
+            let (sql, params) = page_query("db", None, i64::MIN, size).unwrap();
+            assert_eq!(params.len(), 7);
+            assert_eq!(
+                sql.strip_prefix(PAGE_SQL_PREFIX),
+                Some((size + 2).to_string().as_str())
+            );
+            assert!(!sql.contains("LIMIT ?"));
+            for index in 1..=7 {
+                assert_eq!(sql.matches(&format!("?{index} ")).count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn every_supported_page_size_keeps_exactly_one_overflow_witness() {
+        fixture(|conn| {
+            let recipients: Vec<i64> = (1..=130).collect();
+            seed(conn, 1, &recipients, 10);
+            for size in 1..=MAX_ACK_SCAN_PAGE_SIZE {
+                let (sql, params) = page_query("db", None, 10, size).unwrap();
+                let rows = conn.query_sync(&sql, &params).unwrap();
+                assert_eq!(rows.len(), size + 2, "metadata plus page plus witness");
+                let observed = decode_page("db".into(), rows, size).unwrap();
+                assert_eq!(observed.rows.len(), size);
+                assert!(observed.has_more);
+                assert!(observed.continuation_after(size + 1).is_err());
+                let cursor = observed.continuation_after(size).unwrap().unwrap();
+                let next = page(conn, "db", Some(&cursor), 999, size);
+                assert_eq!(next.rows[0].agent_id, i64::try_from(size + 1).unwrap());
+                assert_eq!(next.window.before_ts, 10);
+            }
+        });
+    }
+
+    #[test]
+    fn quoted_generation_is_data_on_both_compound_arms() {
+        fixture(|conn| {
+            let generation = "generation' UNION SELECT ?8; -- 🦀";
+            conn.execute_sync(
+                "UPDATE db_identity SET generation_id = ?1 WHERE singleton = 0",
+                &[generation.into()],
+            )
+            .unwrap();
+            seed(conn, 7, &[11, 13, 17], 19);
+            let first = page(conn, "mailbox", None, 23, 1);
+            let cursor = first.continuation_after(1).unwrap().unwrap();
+            let (sql, params) = page_query("mailbox", Some(&cursor), 29, 1).unwrap();
+            assert!(!sql.contains(generation));
+            assert_eq!(params.len(), 7);
+            let next =
+                decode_page("mailbox".into(), conn.query_sync(&sql, &params).unwrap(), 1).unwrap();
+            assert_eq!(keys(&next), vec![(7, 13)]);
+            assert_eq!(next.generation_id(), Some(generation));
+            assert_eq!(next.window.before_ts, 23);
+            assert_eq!(next.window.upper_id, 7);
         });
     }
 }

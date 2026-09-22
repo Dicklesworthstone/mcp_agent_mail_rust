@@ -78,12 +78,10 @@ impl std::fmt::Display for TwoTierAvailability {
 /// and search infrastructure.
 #[derive(Debug)]
 pub struct TwoTierContext {
-    /// Availability status.
-    availability: TwoTierAvailability,
     /// Configuration.
     config: TwoTierConfig,
     /// Fast embedder info (if available).
-    fast_info: Option<EmbedderInfo>,
+    fast_info: OnceLock<EmbedderInfo>,
     /// Quality embedder info (if available).
     quality_info: Option<EmbedderInfo>,
     /// Initialization timing and mode metrics.
@@ -125,17 +123,13 @@ const fn quality_embedder_id() -> &'static str {
 }
 
 impl TwoTierContext {
-    /// Initialize the context, detecting available embedders.
-    fn init() -> Self {
+    /// Initialize metadata from discovery performed outside the context lock.
+    fn init(fast_embedder: Option<&Model2VecEmbedder>, fast_embedder_load_ms: u64) -> Self {
         let _init_span = tracing::info_span!("two_tier.init").entered();
 
         let init_attempts = next_init_attempt();
         let init_timestamp = crate::timestamps::now_micros() / 1_000_000;
 
-        let fast_start = Instant::now();
-        let fast_embedder = get_fast_embedder();
-        #[allow(clippy::cast_possible_truncation)]
-        let fast_embedder_load_ms = fast_start.elapsed().as_millis() as u64;
         let has_fast = fast_embedder.is_some();
 
         let quality_start = Instant::now();
@@ -218,31 +212,39 @@ impl TwoTierContext {
             }
         }
 
+        let fast_info_cell = OnceLock::new();
+        if let Some(info) = fast_info {
+            let _ = fast_info_cell.set(info);
+        }
         Self {
-            availability,
             config,
-            fast_info,
+            fast_info: fast_info_cell,
             quality_info,
             init_metrics,
         }
     }
 
-    /// Get the availability status.
+    /// Get current availability, including a model installed after initialization.
     #[must_use]
-    pub const fn availability(&self) -> TwoTierAvailability {
-        self.availability
+    pub fn availability(&self) -> TwoTierAvailability {
+        match (self.fast_info().is_some(), self.quality_info.is_some()) {
+            (true, true) => TwoTierAvailability::Full,
+            (true, false) => TwoTierAvailability::FastOnly,
+            (false, true) => TwoTierAvailability::QualityOnly,
+            (false, false) => TwoTierAvailability::None,
+        }
     }
 
     /// Check if two-tier search is available (at least one embedder).
     #[must_use]
     pub fn is_available(&self) -> bool {
-        self.availability != TwoTierAvailability::None
+        self.availability() != TwoTierAvailability::None
     }
 
     /// Check if full two-tier search is available (both embedders).
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.availability == TwoTierAvailability::Full
+        self.availability() == TwoTierAvailability::Full
     }
 
     /// Get the configuration.
@@ -253,8 +255,15 @@ impl TwoTierContext {
 
     /// Get fast embedder info (if available).
     #[must_use]
-    pub const fn fast_info(&self) -> Option<&EmbedderInfo> {
-        self.fast_info.as_ref()
+    pub fn fast_info(&self) -> Option<&EmbedderInfo> {
+        if let Some(info) = self.fast_info.get() {
+            return Some(info);
+        }
+        let embedder = get_fast_embedder()?;
+        Some(self.fast_info.get_or_init(|| EmbedderInfo {
+            id: embedder.id().to_string(),
+            dimension: embedder.dimension(),
+        }))
     }
 
     /// Get quality embedder info (if available).
@@ -263,7 +272,9 @@ impl TwoTierContext {
         self.quality_info.as_ref()
     }
 
-    /// Get initialization timing and availability metrics.
+    /// Get the original initialization timing and availability snapshot.
+    ///
+    /// Use `availability()` for current state after model discovery retries.
     #[must_use]
     pub const fn init_metrics(&self) -> &TwoTierInitMetrics {
         &self.init_metrics
@@ -420,7 +431,16 @@ fn next_init_attempt() -> u32 {
 /// Auto-initializes on first call. Thread-safe.
 #[must_use]
 pub fn get_two_tier_context() -> &'static TwoTierContext {
-    CONTEXT.get_or_init(TwoTierContext::init)
+    if let Some(context) = CONTEXT.get() {
+        return context;
+    }
+    // Model I/O must not hold the context's initialization lock. A contending
+    // reader can publish an unavailable context, which observes later success
+    // through fast_info(), while the original model loader is still running.
+    let started = Instant::now();
+    let fast_embedder = get_fast_embedder();
+    let load_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    CONTEXT.get_or_init(|| TwoTierContext::init(fast_embedder, load_ms))
 }
 
 /// Check if two-tier search is available.
