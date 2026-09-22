@@ -92,6 +92,8 @@ struct PendingReservationConflict {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReservationResponse {
     pub granted: Vec<GrantedReservation>,
+    /// Current conflict snapshot, including when `granted` replays a previous
+    /// keyed request. A replay never grants paths that became free afterward.
     pub conflicts: Vec<ReservationConflict>,
 }
 
@@ -1674,24 +1676,6 @@ pub async fn file_reservation_paths(
     let is_exclusive = exclusive.unwrap_or(true);
     let reason_str = reason.unwrap_or_default();
 
-    // Idempotency fingerprint over the normalized request payload (computed only
-    // when a key was supplied). A retry with the same key must carry the same
-    // logical payload; anything else is a typed conflict.
-    let idempotency_fingerprint = idempotency_key.as_ref().map(|_| {
-        let mut sorted_paths = paths.clone();
-        sorted_paths.sort();
-        crate::idempotency::compute_fingerprint(
-            "file_reservation_paths",
-            &[
-                ("agent", agent_name.clone()),
-                ("paths", sorted_paths.join("\u{1f}")),
-                ("ttl", ttl.to_string()),
-                ("exclusive", is_exclusive.to_string()),
-                ("reason", reason_str.clone()),
-            ],
-        )
-    });
-
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
@@ -1771,6 +1755,54 @@ pub async fn file_reservation_paths(
     .await?;
     let agent_id = agent.id.unwrap_or(0);
 
+    // Fingerprint the actual normalized path set, not its input spelling or
+    // duplicate/order artifacts. JSON preserves list boundaries even when a
+    // filename contains the separator the older join-based encoding used.
+    let idempotency_fingerprint = idempotency_key.as_ref().map(|_| {
+        let mut canonical_paths = normalized_paths.clone();
+        canonical_paths.sort();
+        canonical_paths.dedup();
+        crate::idempotency::compute_fingerprint(
+            "file_reservation_paths",
+            &[
+                ("agent", agent.name.clone()),
+                ("paths", json!(canonical_paths).to_string()),
+                ("ttl", ttl.to_string()),
+                ("exclusive", is_exclusive.to_string()),
+                ("reason", reason_str.clone()),
+            ],
+        )
+    });
+    // Resolve a committed claim before live conflict checks can hide it. The
+    // original lease may already have expired or been released and replaced by
+    // a peer's lease; replay must return its original IDs/timestamps without
+    // renewing or resurrecting it. A changed payload is always a key conflict,
+    // including when every requested path is currently held by another agent.
+    let replayed_rows = if let Some(key) = idempotency_key.as_deref()
+        && let Some(fingerprint) = idempotency_fingerprint.as_deref()
+    {
+        let claim = mcp_agent_mail_db::IdempotencyClaim {
+            project_id,
+            tool: "file_reservation_paths",
+            key,
+            fingerprint,
+        };
+        match acquire_outcome(
+            mcp_agent_mail_db::queries::lookup_idempotency_result::<
+                Vec<mcp_agent_mail_db::FileReservationRow>,
+            >(ctx.cx(), &pool, claim)
+            .await,
+            &paths,
+            "file_reservation_paths",
+        )? {
+            Some(Ok(rows)) => Some(rows),
+            Some(Err(info)) => return Err(crate::idempotency::idempotency_conflict_error(&info)),
+            None => None,
+        }
+    } else {
+        None
+    };
+
     // Check for conflicts with existing active reservations. F5: if this read
     // fails (DB/index corrupt, busy/unavailable), surface a fail-closed
     // reservation-acquire envelope that names the cause and the do-not-edit set
@@ -1792,8 +1824,9 @@ pub async fn file_reservation_paths(
     // reserve. The released-row half (br-74sxo) rewrites stale-ACTIVE artifacts
     // whose release write was skipped (disk-critical) or lost (crash-gap), so
     // the guard stops honoring a released holder before `expires_ts`.
-    if let asupersync::Outcome::Ok(agent_rows) =
-        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await
+    if replayed_rows.is_none()
+        && let asupersync::Outcome::Ok(agent_rows) =
+            mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await
     {
         let agent_names: HashMap<i64, String> = agent_rows
             .into_iter()
@@ -1947,13 +1980,21 @@ pub async fn file_reservation_paths(
     // missed (e.g. due to a stale WAL read snapshot — Bug #86), convert
     // the ResourceBusy error into a structured conflict response instead
     // of propagating an opaque MCP error.
-    let mut idempotent_replay = false;
-    let (granted_rows, conflicts) = if paths_to_grant.is_empty() {
+    let mut idempotent_replay = replayed_rows.is_some();
+    let (granted_rows, conflicts) = if let Some(rows) = replayed_rows {
+        // Conflict information is a fresh observation, while the grants are
+        // the original result. In particular, newly available paths from a
+        // partial grant must not be acquired by a retry of that old request.
+        (rows, conflicts)
+    } else if paths_to_grant.is_empty() && idempotency_key.is_none() {
         (vec![], conflicts)
     } else {
         // Route through the idempotent DB entry point when the client supplied a
         // key: a matching prior key replays the original grant (no second lease,
         // no second archive write); a differing payload is a typed conflict.
+        // Check even an empty grant set: a concurrent first request may have
+        // recorded the key after the read-only lookup, and a wholly contended
+        // first request must not become a fresh grant on a later keyed retry.
         let create_outcome = if let Some(fingerprint) = idempotency_fingerprint.as_deref() {
             let key = idempotency_key.as_deref().unwrap_or_default();
             let claim = mcp_agent_mail_db::IdempotencyClaim {
@@ -3364,6 +3405,365 @@ mod tests {
             Outcome::Ok(mut rows) => rows.pop().expect("reservation row"),
             other => panic!("create reservation {path:?} failed: {other:?}"),
         }
+    }
+
+    async fn keyed_reservation_response(
+        ctx: &McpContext,
+        project_key: &str,
+        agent_name: &str,
+        paths: &[&str],
+        key: Option<&str>,
+    ) -> Value {
+        serde_json::from_str(
+            &file_reservation_paths(
+                ctx,
+                project_key.to_string(),
+                agent_name.to_string(),
+                paths.iter().map(|path| (*path).to_string()).collect(),
+                None,
+                None,
+                None,
+                key.map(str::to_string),
+            )
+            .await
+            .expect("reservation tool succeeds"),
+        )
+        .expect("reservation response JSON")
+    }
+
+    #[test]
+    fn reservation_key_replays_released_grants_without_touching_current_holder() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/reservation-key-released-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let original = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let peer = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let ctx = McpContext::new(cx.clone(), 1);
+                let paths = ["src/lib.rs", "src/main.rs"];
+                let first = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &original.name,
+                    &paths,
+                    Some("lost-reply"),
+                )
+                .await;
+                assert_eq!(first["granted"].as_array().expect("grants").len(), 2);
+
+                let normalized_retry = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &original.name,
+                    &["src/main.rs", "./src/lib.rs", "src/lib.rs"],
+                    Some("lost-reply"),
+                )
+                .await;
+                assert_eq!(normalized_retry["idempotent_replay"], true);
+                assert_eq!(normalized_retry["granted"], first["granted"]);
+
+                release_file_reservations(
+                    &ctx,
+                    project_key.clone(),
+                    original.name.clone(),
+                    None,
+                    None,
+                )
+                .await
+                .expect("release original grants");
+                let peer_response =
+                    keyed_reservation_response(&ctx, &project_key, &peer.name, &paths, None).await;
+
+                let reservation_dir = Config::get()
+                    .storage_root
+                    .join("projects")
+                    .join(&project.slug)
+                    .join("file_reservations");
+                let mut artifacts_before = Vec::new();
+                for grant in first["granted"]
+                    .as_array()
+                    .expect("original grants")
+                    .iter()
+                    .chain(peer_response["granted"].as_array().expect("peer grants"))
+                {
+                    let path =
+                        mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                            &reservation_dir,
+                            grant["id"].as_i64().expect("grant id"),
+                        )
+                        .expect("reservation artifact");
+                    let bytes = std::fs::read(&path).expect("artifact bytes");
+                    artifacts_before.push((path, bytes));
+                }
+
+                let replay = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &original.name,
+                    &paths,
+                    Some("lost-reply"),
+                )
+                .await;
+                assert_eq!(replay["idempotent_replay"], true);
+                assert_eq!(replay["granted"], first["granted"]);
+                let conflicts = replay["conflicts"].as_array().expect("current conflicts");
+                assert_eq!(conflicts.len(), 2);
+                assert!(conflicts.iter().all(|conflict| {
+                    conflict["holders"]
+                        .as_array()
+                        .expect("holders")
+                        .iter()
+                        .all(|holder| holder["agent"] == peer.name)
+                }));
+
+                let changed = file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    original.name,
+                    paths.iter().map(|path| (*path).to_string()).collect(),
+                    Some(7200),
+                    None,
+                    None,
+                    Some("lost-reply".to_string()),
+                )
+                .await
+                .expect_err("changed TTL must conflict even when every path is held");
+                assert_eq!(
+                    changed.data.expect("typed key conflict")["error"]["type"],
+                    "IDEMPOTENCY_KEY_CONFLICT"
+                );
+                let active = queries::get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .expect("active rows");
+                assert_eq!(active.len(), 2);
+                assert!(active.iter().all(|row| Some(row.agent_id) == peer.id));
+                for (path, bytes) in artifacts_before {
+                    assert_eq!(std::fs::read(path).expect("artifact after retries"), bytes);
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn reservation_key_partial_grant_does_not_acquire_newly_available_paths() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/reservation-key-partial-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let caller = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let peer = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let ctx = McpContext::new(cx.clone(), 1);
+                keyed_reservation_response(&ctx, &project_key, &peer.name, &["src/held.rs"], None)
+                    .await;
+                let paths = ["src/held.rs", "src/free.rs"];
+                let first = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &caller.name,
+                    &paths,
+                    Some("partial"),
+                )
+                .await;
+                assert_eq!(first["granted"].as_array().expect("grants").len(), 1);
+                assert_eq!(first["conflicts"].as_array().expect("conflicts").len(), 1);
+                release_file_reservations(&ctx, project_key.clone(), peer.name, None, None)
+                    .await
+                    .expect("peer release");
+
+                let replay = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &caller.name,
+                    &paths,
+                    Some("partial"),
+                )
+                .await;
+                assert_eq!(replay["idempotent_replay"], true);
+                assert_eq!(replay["granted"], first["granted"]);
+                assert!(
+                    replay["conflicts"]
+                        .as_array()
+                        .expect("current conflicts")
+                        .is_empty()
+                );
+                let active = queries::get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .expect("active rows");
+                assert_eq!(active.len(), 1, "retry must not acquire the freed path");
+                assert_eq!(active[0].path_pattern, "src/free.rs");
+                assert_eq!(
+                    micros_to_iso(active[0].expires_ts),
+                    first["granted"][0]["expires_ts"]
+                        .as_str()
+                        .expect("original expiry")
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn reservation_key_records_empty_grants_and_rejects_ambiguous_path_lists() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/reservation-key-empty-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let caller = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let peer = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let ctx = McpContext::new(cx.clone(), 1);
+                let paths = ["src/a", "src/b"];
+                keyed_reservation_response(&ctx, &project_key, &peer.name, &paths, None).await;
+                let first = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &caller.name,
+                    &paths,
+                    Some("empty-grant"),
+                )
+                .await;
+                assert!(
+                    first["granted"]
+                        .as_array()
+                        .expect("empty grants")
+                        .is_empty()
+                );
+                release_file_reservations(&ctx, project_key.clone(), peer.name, None, None)
+                    .await
+                    .expect("peer release");
+                let replay = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &caller.name,
+                    &paths,
+                    Some("empty-grant"),
+                )
+                .await;
+                assert_eq!(replay["idempotent_replay"], true);
+                assert!(
+                    replay["granted"]
+                        .as_array()
+                        .expect("replayed empty grants")
+                        .is_empty()
+                );
+
+                let changed = file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    caller.name.clone(),
+                    vec!["src/a\u{1f}src/b".to_string()],
+                    None,
+                    None,
+                    None,
+                    Some("empty-grant".to_string()),
+                )
+                .await
+                .expect_err("one path containing a separator is distinct from two paths");
+                assert_eq!(
+                    changed.data.expect("typed key conflict")["error"]["type"],
+                    "IDEMPOTENCY_KEY_CONFLICT"
+                );
+                let fresh = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &caller.name,
+                    &paths,
+                    Some("new-attempt"),
+                )
+                .await;
+                assert_eq!(fresh["granted"].as_array().expect("fresh grants").len(), 2);
+            });
+        });
+    }
+
+    #[test]
+    fn reservation_reacquire_publishes_mode_and_reason_to_conflict_checks_and_archive() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/reservation-reacquire-mode-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let caller = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let peer = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let ctx = McpContext::new(cx.clone(), 1);
+                let reservation_dir = Config::get()
+                    .storage_root
+                    .join("projects")
+                    .join(&project.slug)
+                    .join("file_reservations");
+                let mut original_id = None;
+
+                for (exclusive, reason) in [(false, "observe"), (true, "edit"), (false, "review")] {
+                    let response: Value = serde_json::from_str(
+                        &file_reservation_paths(
+                            &ctx,
+                            project_key.clone(),
+                            caller.name.clone(),
+                            vec!["src/lib.rs".to_string()],
+                            None,
+                            Some(exclusive),
+                            Some(reason.to_string()),
+                            None,
+                        )
+                        .await
+                        .expect("acquire requested intent"),
+                    )
+                    .expect("grant JSON");
+                    let grant = &response["granted"][0];
+                    let id = grant["id"].as_i64().expect("grant id");
+                    assert_eq!(
+                        *original_id.get_or_insert(id),
+                        id,
+                        "reacquire reuses the lease"
+                    );
+                    assert_eq!(grant["exclusive"], exclusive);
+                    assert_eq!(grant["reason"], reason);
+
+                    let conflict: ReservationConflictCheckResponse = serde_json::from_str(
+                        &check_file_reservation_conflicts(
+                            &ctx,
+                            project_key.clone(),
+                            peer.name.clone(),
+                            vec!["src/lib.rs".to_string()],
+                        )
+                        .await
+                        .expect("peer authoritative conflict check"),
+                    )
+                    .expect("conflict JSON");
+                    assert_eq!(conflict.conflict_free, !exclusive);
+
+                    let artifact_path =
+                        mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                            &reservation_dir,
+                            id,
+                        )
+                        .expect("guard-visible artifact");
+                    let artifact: Value = serde_json::from_slice(
+                        &std::fs::read(artifact_path).expect("artifact bytes"),
+                    )
+                    .expect("artifact JSON");
+                    assert_eq!(artifact["exclusive"], exclusive);
+                    assert_eq!(artifact["reason"], reason);
+                }
+
+                let active = queries::get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .expect("active leases");
+                assert_eq!(
+                    active.len(),
+                    1,
+                    "changing intent must not leave sibling leases"
+                );
+            });
+        });
     }
 
     #[test]

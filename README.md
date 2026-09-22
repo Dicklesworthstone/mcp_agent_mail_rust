@@ -724,6 +724,16 @@ grant without a second lease or archive write and mark the response
 the configured retention window, and are optional; this is not a blanket
 idempotency claim for every mutating tool.
 
+On replay, `granted` contains the original IDs and expiries, even after release
+or expiry; it does not reacquire those paths. `conflicts` is a current snapshot.
+A partial or empty original grant stays partial or empty; use a new key for a
+new acquisition attempt. Fresh reacquisition of an active lease reuses its ID
+and applies the requested exclusive/shared mode and reason after checking peers.
+
+Keys recorded before the normalized path-set fingerprint update can return
+`IDEMPOTENCY_KEY_CONFLICT` after an upgrade, even within their retention window.
+The original grants remain unchanged; inspect them before making a new attempt.
+
 ### 25 MCP Resources
 
 Read-only resources span environment/config inspection, project and agent discovery, inbox and thread views, reservation views, and tooling diagnostics. They are there so agents can fetch state cheaply without mutating anything.

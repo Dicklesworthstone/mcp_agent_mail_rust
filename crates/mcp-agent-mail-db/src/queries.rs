@@ -8669,6 +8669,70 @@ async fn create_message_with_recipients_tx(
 // for BEGIN/COMMIT/ROLLBACK) so the key record commits atomically with the
 // mutation it guards. See `crate::idempotency` for the durability rationale.
 
+/// Look up an already committed, unexpired idempotency result without mutating
+/// the database or waiting for a writer transaction.
+///
+/// `None` means the key is absent or expired. `Some(Ok(result))` is the original
+/// result, while `Some(Err(conflict))` rejects a changed request. A miss is only
+/// an optimization hint: the mutating entry point must still check and record
+/// the claim inside its own transaction to serialize concurrent first calls.
+/// Expired records are ignored here; pruning belongs to the write path.
+pub async fn lookup_idempotency_result<T: DeserializeOwned>(
+    cx: &Cx,
+    pool: &DbPool,
+    claim: IdempotencyClaim<'_>,
+) -> Outcome<Option<std::result::Result<T, IdempotencyConflict>>, DbError> {
+    run_read_with_mvcc_retry(cx, "lookup_idempotency_result", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+        };
+        let tracked = tracked(&*conn);
+        // A deferred transaction refreshes the snapshot without taking the
+        // writer lock used by the mutation's authoritative claim check.
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(tracked.execute(cx, "BEGIN", &[]).await)
+        );
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT payload_fingerprint, result_json, created_ts FROM idempotency_keys \
+                     WHERE project_id = ? AND tool = ? AND idempotency_key = ? AND expires_ts >= ?",
+                    &[
+                        Value::BigInt(claim.project_id),
+                        Value::Text(claim.tool.to_string()),
+                        Value::Text(claim.key.to_string()),
+                        Value::BigInt(now_micros()),
+                    ],
+                )
+                .await
+            )
+        );
+        try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+
+        match decode_idempotency_check(rows.first(), claim) {
+            Ok(IdempotencyCheck::Proceed) => Outcome::Ok(None),
+            Ok(IdempotencyCheck::Replay(result_json)) => {
+                match decode_idempotency_result(&result_json, claim.tool) {
+                    Ok(result) => Outcome::Ok(Some(Ok(result))),
+                    Err(error) => Outcome::Err(error),
+                }
+            }
+            Ok(IdempotencyCheck::Conflict(conflict)) => Outcome::Ok(Some(Err(conflict))),
+            Err(error) => Outcome::Err(error),
+        }
+    })
+    .await
+}
+
 /// Resolve an idempotency claim against `idempotency_keys` inside an already-open
 /// transaction.
 ///
@@ -8720,17 +8784,27 @@ async fn idempotency_check_in_tx(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    let Some(row) = rows.first() else {
-        return Outcome::Ok(IdempotencyCheck::Proceed);
+    match decode_idempotency_check(rows.first(), claim) {
+        Ok(result) => Outcome::Ok(result),
+        Err(error) => Outcome::Err(error),
+    }
+}
+
+fn decode_idempotency_check(
+    row: Option<&SqlRow>,
+    claim: IdempotencyClaim<'_>,
+) -> std::result::Result<IdempotencyCheck, DbError> {
+    let Some(row) = row else {
+        return Ok(IdempotencyCheck::Proceed);
     };
-    let stored_fingerprint = row.get_as::<String>(0).unwrap_or_default();
-    let result_json = row.get_as::<String>(1).unwrap_or_default();
-    let original_created_ts = row.get_as::<i64>(2).unwrap_or(0);
+    let stored_fingerprint = row.get_as::<String>(0).map_err(|e| map_sql_error(&e))?;
+    let result_json = row.get_as::<String>(1).map_err(|e| map_sql_error(&e))?;
+    let original_created_ts = row.get_as::<i64>(2).map_err(|e| map_sql_error(&e))?;
 
     if stored_fingerprint == claim.fingerprint {
-        Outcome::Ok(IdempotencyCheck::Replay(result_json))
+        Ok(IdempotencyCheck::Replay(result_json))
     } else {
-        Outcome::Ok(IdempotencyCheck::Conflict(IdempotencyConflict {
+        Ok(IdempotencyCheck::Conflict(IdempotencyConflict {
             tool: claim.tool.to_string(),
             key: claim.key.to_string(),
             original_fingerprint: stored_fingerprint,
@@ -13388,7 +13462,19 @@ async fn create_file_reservations_impl(
                         )));
                     };
                     row.expires_ts = row.expires_ts.max(now).saturating_add(lease_extension);
-                    let renew_params = [Value::BigInt(row.expires_ts), Value::BigInt(id)];
+                    // Re-acquisition applies the new request's intent as well
+                    // as its TTL. In particular, shared -> exclusive must not
+                    // report a successful acquisition that still lets peers
+                    // acquire shared leases. The requested mode was checked
+                    // against every peer above in this same transaction.
+                    row.exclusive = i64::from(exclusive);
+                    row.reason = reason.to_string();
+                    let renew_params = [
+                        Value::BigInt(row.expires_ts),
+                        Value::BigInt(row.exclusive),
+                        Value::Text(row.reason.clone()),
+                        Value::BigInt(id),
+                    ];
                     try_in_tx!(
                         cx,
                         &tracked,
@@ -13396,7 +13482,8 @@ async fn create_file_reservations_impl(
                             traw_execute(
                                 cx,
                                 &tracked,
-                                "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
+                                "UPDATE file_reservations \
+                                 SET expires_ts = ?, \"exclusive\" = ?, reason = ? WHERE id = ?",
                                 &renew_params,
                             )
                             .await

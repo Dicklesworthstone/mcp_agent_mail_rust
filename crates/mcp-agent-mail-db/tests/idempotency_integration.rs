@@ -551,6 +551,310 @@ fn file_reservation_idempotent_replays_and_conflicts() {
 }
 
 #[test]
+fn idempotency_lookup_is_read_only_and_preserves_scope_and_expired_rows() {
+    let (pool, _dir, db_path) = make_pool();
+    let pid = setup_project(&pool);
+    let other_pid = setup_project(&pool);
+    let agent = setup_agent(&pool, pid, "GreenCastle");
+    let IdempotentOutcome::Fresh(original) =
+        reserve_idem(&pool, pid, agent, "src/lib.rs", "LOOKUP", "fp-A")
+    else {
+        panic!("first reservation is fresh");
+    };
+    let read_pool = DbPool::new_query_only(&DbPoolConfig {
+        database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().expect("db parent").join("storage")),
+        max_connections: 1,
+        min_connections: 1,
+        run_migrations: false,
+        warmup_connections: 0,
+        ..DbPoolConfig::default()
+    })
+    .expect("query-only idempotency pool");
+
+    block_on(|cx| async {
+        let claim = IdempotencyClaim {
+            project_id: pid,
+            tool: "file_reservation_paths",
+            key: "LOOKUP",
+            fingerprint: "fp-A",
+        };
+        let replay =
+            queries::lookup_idempotency_result::<Vec<mcp_agent_mail_db::FileReservationRow>>(
+                &cx, &read_pool, claim,
+            )
+            .await
+            .into_result()
+            .expect("query-only lookup")
+            .expect("recorded key")
+            .expect("matching payload");
+        assert_eq!(replay[0].id, original[0].id);
+        assert_eq!(replay[0].expires_ts, original[0].expires_ts);
+
+        let changed =
+            queries::lookup_idempotency_result::<Vec<mcp_agent_mail_db::FileReservationRow>>(
+                &cx,
+                &read_pool,
+                IdempotencyClaim {
+                    fingerprint: "fp-B",
+                    ..claim
+                },
+            )
+            .await
+            .into_result()
+            .expect("query-only conflict lookup")
+            .expect("recorded key")
+            .expect_err("changed payload is a typed conflict");
+        assert_eq!(changed.original_fingerprint, "fp-A");
+        assert_eq!(changed.attempted_fingerprint, "fp-B");
+
+        for missing in [
+            IdempotencyClaim {
+                project_id: other_pid,
+                ..claim
+            },
+            IdempotencyClaim {
+                tool: "send_message",
+                ..claim
+            },
+            IdempotencyClaim {
+                key: "MISSING",
+                ..claim
+            },
+        ] {
+            let lookup =
+                queries::lookup_idempotency_result::<serde_json::Value>(&cx, &read_pool, missing)
+                    .await
+                    .into_result()
+                    .expect("scoped lookup");
+            assert!(lookup.is_none(), "unrelated scope cannot replay the key");
+        }
+    });
+
+    expire_all_idempotency_keys(&db_path);
+    let expired = block_on(|cx| async {
+        queries::lookup_idempotency_result::<serde_json::Value>(
+            &cx,
+            &read_pool,
+            IdempotencyClaim {
+                project_id: pid,
+                tool: "file_reservation_paths",
+                key: "LOOKUP",
+                fingerprint: "fp-A",
+            },
+        )
+        .await
+    })
+    .into_result()
+    .expect("expired lookup remains read-only");
+    assert!(expired.is_none());
+    assert_eq!(
+        count_rows(&db_path, "SELECT COUNT(*) FROM idempotency_keys"),
+        1,
+        "read-only lookup must not prune an expired key"
+    );
+    assert_eq!(
+        count_rows(&db_path, "SELECT COUNT(*) FROM file_reservations"),
+        1,
+        "lookups never alter the recorded grant"
+    );
+}
+
+#[test]
+fn idempotency_lookup_rejects_corrupt_recorded_results_without_regranting() {
+    let (pool, _dir, db_path) = make_pool();
+    let pid = setup_project(&pool);
+    let agent = setup_agent(&pool, pid, "GreenCastle");
+    reserve_idem(&pool, pid, agent, "src/lib.rs", "CORRUPT", "fp-A");
+    let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+        .expect("open corruption fixture connection");
+    conn.execute_raw("UPDATE idempotency_keys SET result_json = 'not JSON'")
+        .expect("corrupt only the retained result");
+    drop(conn);
+
+    let result = block_on(|cx| async {
+        queries::lookup_idempotency_result::<Vec<mcp_agent_mail_db::FileReservationRow>>(
+            &cx,
+            &pool,
+            IdempotencyClaim {
+                project_id: pid,
+                tool: "file_reservation_paths",
+                key: "CORRUPT",
+                fingerprint: "fp-A",
+            },
+        )
+        .await
+    });
+    let Outcome::Err(error) = result else {
+        panic!("corrupt replay must fail closed, got {result:?}");
+    };
+    assert!(error.to_string().contains("stored result is undecodable"));
+    assert_eq!(
+        count_rows(&db_path, "SELECT COUNT(*) FROM file_reservations"),
+        1
+    );
+    assert_eq!(
+        count_rows(&db_path, "SELECT COUNT(*) FROM idempotency_keys"),
+        1
+    );
+}
+
+#[test]
+fn reservation_reacquire_updates_intent_without_bypassing_conflicts_or_replay() {
+    let (pool, _dir, db_path) = make_pool();
+    let pid = setup_project(&pool);
+    let holder = setup_agent(&pool, pid, "GreenCastle");
+    let peer = setup_agent(&pool, pid, "BlueLake");
+
+    block_on(|cx| async {
+        let shared = queries::create_file_reservations(
+            &cx,
+            &pool,
+            pid,
+            holder,
+            &["src/lib.rs"],
+            3600,
+            false,
+            "observe",
+        )
+        .await
+        .into_result()
+        .expect("shared lease");
+        let id = shared[0].id;
+        let claim = IdempotencyClaim {
+            project_id: pid,
+            tool: "file_reservation_paths",
+            key: "UPGRADE",
+            fingerprint: "exclusive-edit",
+        };
+        let upgraded = queries::create_file_reservations_idempotent(
+            &cx,
+            &pool,
+            pid,
+            holder,
+            &["src/lib.rs"],
+            3600,
+            true,
+            "edit",
+            claim,
+        )
+        .await
+        .into_result()
+        .expect("exclusive upgrade");
+        let IdempotentOutcome::Fresh(upgraded) = upgraded else {
+            panic!("upgrade must be fresh");
+        };
+        assert_eq!(upgraded[0].id, id);
+        assert_eq!(upgraded[0].exclusive, 1);
+        assert_eq!(upgraded[0].reason, "edit");
+
+        let refused = queries::create_file_reservations(
+            &cx,
+            &pool,
+            pid,
+            peer,
+            &["src/lib.rs"],
+            3600,
+            false,
+            "peer observe",
+        )
+        .await;
+        assert!(matches!(
+            refused,
+            Outcome::Err(mcp_agent_mail_db::DbError::ResourceBusy(_))
+        ));
+
+        let downgraded = queries::create_file_reservations(
+            &cx,
+            &pool,
+            pid,
+            holder,
+            &["src/lib.rs"],
+            3600,
+            false,
+            "review",
+        )
+        .await
+        .into_result()
+        .expect("shared downgrade");
+        assert_eq!(downgraded[0].id, id);
+        assert_eq!(downgraded[0].exclusive, 0);
+        assert_eq!(downgraded[0].reason, "review");
+
+        let replay = queries::create_file_reservations_idempotent(
+            &cx,
+            &pool,
+            pid,
+            holder,
+            &["src/lib.rs"],
+            3600,
+            true,
+            "edit",
+            claim,
+        )
+        .await
+        .into_result()
+        .expect("replay original upgrade");
+        let IdempotentOutcome::Replayed(replayed) = replay else {
+            panic!("old key must replay");
+        };
+        assert_eq!(replayed[0].id, id);
+        assert_eq!(replayed[0].exclusive, 1);
+        assert_eq!(replayed[0].reason, "edit");
+        assert_eq!(replayed[0].expires_ts, upgraded[0].expires_ts);
+
+        queries::create_file_reservations(
+            &cx,
+            &pool,
+            pid,
+            peer,
+            &["src/lib.rs"],
+            3600,
+            false,
+            "peer observe",
+        )
+        .await
+        .into_result()
+        .expect("replay must preserve current shared mode, so peer can join");
+        let refused_upgrade = queries::create_file_reservations(
+            &cx,
+            &pool,
+            pid,
+            holder,
+            &["src/lib.rs"],
+            3600,
+            true,
+            "blocked edit",
+        )
+        .await;
+        assert!(matches!(
+            refused_upgrade,
+            Outcome::Err(mcp_agent_mail_db::DbError::ResourceBusy(_))
+        ));
+
+        let active = queries::get_active_reservations(&cx, &pool, pid)
+            .await
+            .into_result()
+            .expect("active leases");
+        let current = active
+            .iter()
+            .find(|row| row.agent_id == holder)
+            .expect("holder lease");
+        assert_eq!(current.id, id);
+        assert_eq!(
+            current.exclusive, 0,
+            "failed upgrade must not change shared intent"
+        );
+        assert_eq!(current.reason, "review");
+        assert_eq!(current.expires_ts, downgraded[0].expires_ts);
+    });
+    assert_eq!(
+        count_rows(&db_path, "SELECT COUNT(*) FROM file_reservations"),
+        2
+    );
+}
+
+#[test]
 fn retention_window_replays_in_window_but_prunes_after_expiry() {
     // Criterion (c): a replay inside the window succeeds (covered above and here),
     // and once the record is past `expires_ts` the pruning check treats the key
