@@ -101,7 +101,7 @@ fn sha256_hex(data: &str) -> String {
 struct TrackedConnection<'conn> {
     inner: &'conn crate::DbConn,
     transaction_write_intent: TransactionWriteIntent,
-    retire_after_deferred_checkpoint: Option<&'conn AtomicBool>,
+    retire_on_drop: Option<&'conn AtomicBool>,
 }
 
 impl<'conn> TrackedConnection<'conn> {
@@ -109,23 +109,23 @@ impl<'conn> TrackedConnection<'conn> {
         Self {
             inner,
             transaction_write_intent: TransactionWriteIntent::default(),
-            retire_after_deferred_checkpoint: None,
+            retire_on_drop: None,
         }
     }
 
     fn with_retirement_signal(
         inner: &'conn crate::DbConn,
-        retire_after_deferred_checkpoint: &'conn AtomicBool,
+        retire_on_drop: &'conn AtomicBool,
     ) -> Self {
         Self {
             inner,
             transaction_write_intent: TransactionWriteIntent::default(),
-            retire_after_deferred_checkpoint: Some(retire_after_deferred_checkpoint),
+            retire_on_drop: Some(retire_on_drop),
         }
     }
 
-    fn retire_after_deferred_checkpoint(&self) {
-        if let Some(signal) = self.retire_after_deferred_checkpoint {
+    fn retire_on_drop(&self) {
+        if let Some(signal) = self.retire_on_drop {
             signal.store(true, Ordering::Release);
         }
     }
@@ -1257,18 +1257,19 @@ fn recent_contact_union_sql(item_count: usize) -> &'static str {
 /// A contended fail-fast post-commit checkpoint leaves the durable commit on
 /// the connection worker until that worker closes. The flag lets the tracked
 /// transaction request retirement without taking ownership away from its
-/// caller. Detaching closes only this checkout; pool waiters recheck capacity
-/// on their bounded 100ms acquisition loop.
+/// caller. Reads can also retire a handle whose pager snapshot cannot advance
+/// on a new transaction. Detaching closes only this checkout; pool waiters
+/// recheck capacity on their bounded 100ms acquisition loop.
 struct RetirablePooledHandle {
     inner: Option<sqlmodel_pool::PooledConnection<crate::DbConn>>,
-    retire_after_deferred_checkpoint: AtomicBool,
+    retire_on_drop: AtomicBool,
 }
 
 impl RetirablePooledHandle {
     fn new(inner: sqlmodel_pool::PooledConnection<crate::DbConn>) -> Self {
         Self {
             inner: Some(inner),
-            retire_after_deferred_checkpoint: AtomicBool::new(false),
+            retire_on_drop: AtomicBool::new(false),
         }
     }
 
@@ -1300,10 +1301,7 @@ impl Drop for RetirablePooledHandle {
         let Some(pooled) = self.inner.take() else {
             return;
         };
-        if !self
-            .retire_after_deferred_checkpoint
-            .load(Ordering::Acquire)
-        {
+        if !self.retire_on_drop.load(Ordering::Acquire) {
             drop(pooled);
             return;
         }
@@ -1314,7 +1312,7 @@ impl Drop for RetirablePooledHandle {
             tracing::warn!(
                 db_path = %db_path,
                 error = %error,
-                "deferred_checkpoint_connection_retirement_failed"
+                "pooled_connection_retirement_failed"
             );
         }
     }
@@ -1668,7 +1666,7 @@ impl TrackedConnectionSource for RetirablePooledHandle {
     }
 
     fn retirement_signal(&self) -> Option<&AtomicBool> {
-        Some(&self.retire_after_deferred_checkpoint)
+        Some(&self.retire_on_drop)
     }
 }
 
@@ -1827,7 +1825,7 @@ async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbEr
                     );
                 }
                 if retire {
-                    tracked.retire_after_deferred_checkpoint();
+                    tracked.retire_on_drop();
                 }
             }
             Outcome::Ok(())
@@ -8690,45 +8688,59 @@ pub async fn lookup_idempotency_result<T: DeserializeOwned>(
             Outcome::Panicked(panic) => return Outcome::Panicked(panic),
         };
         let tracked = tracked(&*conn);
-        // A deferred transaction refreshes the snapshot without taking the
-        // writer lock used by the mutation's authoritative claim check.
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(tracked.execute(cx, "BEGIN", &[]).await)
-        );
-        let rows = try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(
-                traw_query(
-                    cx,
-                    &tracked,
-                    "SELECT payload_fingerprint, result_json, created_ts FROM idempotency_keys \
-                     WHERE project_id = ? AND tool = ? AND idempotency_key = ? AND expires_ts >= ?",
-                    &[
-                        Value::BigInt(claim.project_id),
-                        Value::Text(claim.tool.to_string()),
-                        Value::Text(claim.key.to_string()),
-                        Value::BigInt(now_micros()),
-                    ],
+        let result = async {
+            // Observe one read snapshot without the writer lock used by the
+            // mutation's authoritative claim check.
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(tracked.execute(cx, "BEGIN", &[]).await)
+            );
+            let rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(
+                    traw_query(
+                        cx,
+                        &tracked,
+                        "SELECT payload_fingerprint, result_json, created_ts FROM idempotency_keys \
+                         WHERE project_id = ? AND tool = ? AND idempotency_key = ? AND expires_ts >= ?",
+                        &[
+                            Value::BigInt(claim.project_id),
+                            Value::Text(claim.tool.to_string()),
+                            Value::Text(claim.key.to_string()),
+                            Value::BigInt(now_micros()),
+                        ],
+                    )
+                    .await
                 )
-                .await
-            )
-        );
-        try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+            );
+            try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
 
-        match decode_idempotency_check(rows.first(), claim) {
-            Ok(IdempotencyCheck::Proceed) => Outcome::Ok(None),
-            Ok(IdempotencyCheck::Replay(result_json)) => {
-                match decode_idempotency_result(&result_json, claim.tool) {
-                    Ok(result) => Outcome::Ok(Some(Ok(result))),
-                    Err(error) => Outcome::Err(error),
+            match decode_idempotency_check(rows.first(), claim) {
+                Ok(IdempotencyCheck::Proceed) => Outcome::Ok(None),
+                Ok(IdempotencyCheck::Replay(result_json)) => {
+                    match decode_idempotency_result(&result_json, claim.tool) {
+                        Ok(result) => Outcome::Ok(Some(Ok(result))),
+                        Err(error) => Outcome::Err(error),
+                    }
                 }
+                Ok(IdempotencyCheck::Conflict(conflict)) => Outcome::Ok(Some(Err(conflict))),
+                Err(error) => Outcome::Err(error),
             }
-            Ok(IdempotencyCheck::Conflict(conflict)) => Outcome::Ok(Some(Err(conflict))),
-            Err(error) => Outcome::Err(error),
         }
+        .await;
+        if let Outcome::Err(error) = &result
+            && is_mvcc_error(error)
+        {
+            // BEGIN/ROLLBACK cannot repair an opened pager whose visibility
+            // predates this connection's execution clock (br-9m5il). Returning
+            // it to the pool retries the same obsolete view until exhaustion.
+            // Rollback has completed above; retire only this failed checkout
+            // so the existing bounded retry obtains a fresh runtime handle.
+            tracked.retire_on_drop();
+        }
+        result
     })
     .await
 }

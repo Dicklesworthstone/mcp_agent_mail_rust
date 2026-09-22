@@ -238,7 +238,7 @@ fn snapshot_delivery_files(storage_root: &str) -> BTreeMap<PathBuf, Vec<u8>> {
         for entry in std::fs::read_dir(path).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
-                if !path.file_name().is_some_and(|name| name == ".git") {
+                if path.file_name().is_none_or(|name| name != ".git") {
                     visit(&path, files);
                 }
             } else if path.components().any(|part| {
@@ -296,14 +296,14 @@ fn assert_exact_replay(fresh: &Value, replay: &str) {
     assert_eq!(&replay, fresh);
 }
 
-async fn attachment_replay_case(cx: Cx, storage_root: String, reply: bool) {
+async fn attachment_replay_case(cx: Cx, storage_root: String, is_reply: bool) {
     let ctx = McpContext::new(cx, 1);
     let project_key = format!("{storage_root}/workspace");
     std::fs::create_dir_all(&project_key).unwrap();
     for agent in ["GreenCastle", "BlueLake", "RedFox"] {
         setup_project_and_agent(&ctx, &project_key, agent).await;
     }
-    let parent = if reply {
+    let parent = if is_reply {
         let original = send_with_key(
             &ctx,
             &project_key,
@@ -335,14 +335,15 @@ async fn attachment_replay_case(cx: Cx, storage_root: String, reply: bool) {
         !fresh["deliveries"][0]["payload"]["attachments"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .is_empty(),
+        "fresh delivery must contain the accepted attachment"
     );
     mcp_agent_mail_storage::wbq_flush();
     let files = snapshot_delivery_files(&storage_root);
     let inbox = inbox_snapshot(&ctx, &project_key).await;
     assert_eq!(
         count_canonical_messages(&storage_root),
-        if reply { 2 } else { 1 }
+        if is_reply { 2 } else { 1 }
     );
 
     let retained = source.with_extension("retained.bin");
