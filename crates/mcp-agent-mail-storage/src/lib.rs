@@ -9019,7 +9019,12 @@ pub struct AttachmentMeta {
     pub kind: String,
     pub media_type: String,
     pub bytes: usize,
+    /// SHA1 of the original source bytes, before image conversion.
     pub sha1: String,
+    /// SHA256 of the exact stored/embedded bytes. Older metadata lacks this
+    /// witness; its original-image SHA1 cannot authorize converted WebP bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
     pub width: u32,
     pub height: u32,
     /// Base64-encoded WebP data (only for inline type)
@@ -9111,7 +9116,15 @@ fn store_attachment_from_cache(
 
     let webp_rel = rel_path_cached(&archive.canonical_repo_root, webp_path)?;
     let manifest_rel = rel_path_cached(&archive.canonical_repo_root, manifest_path)?;
-    let webp_bytes_len = fs::metadata(webp_path)?.len() as usize;
+    // Hash the same bytes used for the metadata and inline payload. A cached
+    // file may predate its first Git commit, so its encoded content also needs
+    // a durable witness in the accepted message's attachment metadata.
+    let webp_bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        webp_path,
+        fs::metadata(webp_path)?.len(),
+    )?;
+    let webp_bytes_len = webp_bytes.len();
+    let content_sha256 = hex::encode(Sha256::digest(&webp_bytes));
 
     let original_rel = if config.keep_original_images {
         match manifest.original_path.as_deref() {
@@ -9158,13 +9171,13 @@ fn store_attachment_from_cache(
     };
 
     let meta = if should_inline {
-        let webp_bytes = fs::read(webp_path)?;
         let encoded = base64::engine::general_purpose::STANDARD.encode(&webp_bytes);
         AttachmentMeta {
             kind: "inline".to_string(),
             media_type: "image/webp".to_string(),
             bytes: webp_bytes_len,
             sha1: digest.to_string(),
+            content_sha256: Some(content_sha256),
             width: manifest.width,
             height: manifest.height,
             data_base64: Some(encoded),
@@ -9177,6 +9190,7 @@ fn store_attachment_from_cache(
             media_type: "image/webp".to_string(),
             bytes: webp_bytes_len,
             sha1: digest.to_string(),
+            content_sha256: Some(content_sha256),
             width: manifest.width,
             height: manifest.height,
             data_base64: None,
@@ -9298,6 +9312,7 @@ pub fn store_attachment(
         .encode(&rgba, width, height, image::ExtendedColorType::Rgba8)
         .map_err(|e| StorageError::InvalidPath(format!("WebP encode error: {e}")))?;
 
+    let content_sha256 = hex::encode(Sha256::digest(&webp_bytes));
     atomic_write_bytes(&webp_path, &webp_bytes, true)?;
     let webp_rel = rel_path_cached(&archive.canonical_repo_root, &webp_path)?;
     rel_paths.push(webp_rel.clone());
@@ -9362,6 +9377,7 @@ pub fn store_attachment(
             media_type: "image/webp".to_string(),
             bytes: webp_bytes.len(),
             sha1: digest,
+            content_sha256: Some(content_sha256),
             width,
             height,
             data_base64: Some(encoded),
@@ -9374,6 +9390,7 @@ pub fn store_attachment(
             media_type: "image/webp".to_string(),
             bytes: webp_bytes.len(),
             sha1: digest,
+            content_sha256: Some(content_sha256),
             width,
             height,
             data_base64: None,
@@ -9469,6 +9486,7 @@ pub fn store_raw_attachment(
         media_type: "application/octet-stream".to_string(),
         bytes: bytes.len(),
         sha1: digest,
+        content_sha256: Some(hex::encode(Sha256::digest(&bytes))),
         width: 0,
         height: 0,
         data_base64: None,
@@ -16662,6 +16680,13 @@ mod tests {
         second_rel_paths.sort();
         assert_eq!(second_rel_paths, first_rel_paths);
         assert_eq!(second.meta.sha1, first_sha1);
+        let stored_bytes =
+            fs::read(archive.repo_root.join(first.meta.path.as_ref().unwrap())).unwrap();
+        assert_eq!(
+            first.meta.content_sha256.as_deref(),
+            Some(hex::encode(Sha256::digest(&stored_bytes)).as_str())
+        );
+        assert_eq!(second.meta.content_sha256, first.meta.content_sha256);
         assert_eq!(second.meta.width, first.meta.width);
         assert_eq!(second.meta.height, first.meta.height);
         assert_eq!(second.meta.kind, "file");
@@ -16705,6 +16730,8 @@ mod tests {
         // Cache hit — inline mode re-reads the WebP and base64-encodes it.
         let second = store_attachment(&archive, &config, &img_path, EmbedPolicy::Inline).unwrap();
         assert_eq!(second.meta.kind, "inline");
+        assert!(first.meta.content_sha256.is_some());
+        assert_eq!(second.meta.content_sha256, first.meta.content_sha256);
         assert_eq!(
             second.meta.data_base64.unwrap(),
             first_b64,

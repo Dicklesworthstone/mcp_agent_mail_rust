@@ -2,8 +2,9 @@
 //!
 //! Attachment paths must belong to this project's archive. One pinned Git tree
 //! supplies committed bytes. Uncommitted raw files and retained originals may
-//! instead be witnessed by their original-content digest; a converted WebP's
-//! original-image digest is not authority for its encoded bytes. The caller
+//! instead be witnessed by their original-content digest. Converted WebP files
+//! need their exact-content SHA256; the original-image digest is not authority
+//! for encoded bytes. The caller
 //! preflights every destination and commits all witnessed files with the mail.
 
 use std::collections::BTreeMap;
@@ -12,6 +13,7 @@ use std::path::{Path, PathBuf};
 use git2::{ErrorCode, ObjectType, Oid, Repository};
 use serde_json::Value;
 use sha1::{Digest as _, Sha1};
+use sha2::Sha256;
 
 use super::invalid;
 use crate::ProjectArchive;
@@ -25,6 +27,8 @@ struct ExpectedFile {
     // Image metadata hashes the ORIGINAL, not the converted WebP. Only raw
     // files and retained originals can be checked against this digest.
     source_sha1: Option<String>,
+    // The exact stored file's digest, independent of original-image identity.
+    content_sha256: Option<String>,
 }
 
 fn optional_path<'a>(attachment: &'a Value, field: &str) -> crate::Result<Option<&'a str>> {
@@ -47,6 +51,21 @@ fn source_sha1(attachment: &Value) -> crate::Result<String> {
         })
         .ok_or_else(|| invalid("attachment has no valid original-content SHA1"))?;
     Ok(digest.to_string())
+}
+
+fn content_sha256(attachment: &Value) -> crate::Result<Option<String>> {
+    match attachment.get("content_sha256") {
+        None => Ok(None),
+        Some(Value::String(digest))
+            if digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')) =>
+        {
+            Ok(Some(digest.clone()))
+        }
+        _ => Err(invalid("attachment has an invalid exact-content SHA256")),
+    }
 }
 
 fn checked_path(archive: &ProjectArchive, path: &str) -> crate::Result<String> {
@@ -86,6 +105,11 @@ fn add_file(
             .as_ref()
             .zip(expected.source_sha1.as_ref())
             .is_some_and(|(a, b)| a != b)
+        || previous
+            .content_sha256
+            .as_ref()
+            .zip(expected.content_sha256.as_ref())
+            .is_some_and(|(a, b)| a != b)
     {
         return Err(invalid(
             "duplicate attachment path has conflicting metadata",
@@ -94,6 +118,9 @@ fn add_file(
     previous.size = previous.size.or(expected.size);
     if previous.source_sha1.is_none() {
         previous.source_sha1 = expected.source_sha1;
+    }
+    if previous.content_sha256.is_none() {
+        previous.content_sha256 = expected.content_sha256;
     }
     Ok(())
 }
@@ -134,6 +161,7 @@ fn required_files(
                     ExpectedFile {
                         size: Some(size),
                         source_sha1: digest,
+                        content_sha256: content_sha256(attachment)?,
                     },
                 )?;
             }
@@ -152,6 +180,7 @@ fn required_files(
                 ExpectedFile {
                     size: None,
                     source_sha1: Some(source_sha1(attachment)?),
+                    content_sha256: None,
                 },
             )?;
         }
@@ -241,8 +270,9 @@ fn read_attachment(
     } else {
         // The database commit may outlive the best-effort archive commit. Raw
         // files and originals can still be proven without guessing their data.
-        // A WebP with only its source-image SHA1 cannot: keep that case deferred.
-        if expected.source_sha1.is_none() {
+        // New image metadata also witnesses exact encoded bytes. A legacy WebP
+        // with only its source-image SHA1 must still remain deferred.
+        if expected.source_sha1.is_none() && expected.content_sha256.is_none() {
             return Err(invalid(format!(
                 "attachment {relative} has no committed or content-hash authority; repair deferred"
             )));
@@ -264,6 +294,11 @@ fn read_attachment(
         && hex::encode(Sha1::digest(&bytes)) != *expected
     {
         return Err(invalid("attachment original-content SHA1 does not match"));
+    }
+    if let Some(expected) = &expected.content_sha256
+        && hex::encode(Sha256::digest(&bytes)) != *expected
+    {
+        return Err(invalid("attachment exact-content SHA256 does not match"));
     }
     Ok(bytes)
 }
@@ -660,8 +695,11 @@ mod tests {
         let (_dir, config, archive, mut message, recipients) = fixture();
         let source = config.storage_root.join("uncommitted-image.png");
         image::RgbImage::new(2, 2).save(&source).unwrap();
-        let stored =
+        let mut stored =
             crate::store_attachment(&archive, &config, &source, EmbedPolicy::File).unwrap();
+        // Legacy metadata has only the original image's digest. It must not
+        // authorize a different representation of those bytes.
+        stored.meta.content_sha256 = None;
         let path = archive.repo_root.join(stored.meta.path.as_ref().unwrap());
         let before = std::fs::read(&path).unwrap();
         message["attachments"] = json!([stored.meta]);
@@ -673,6 +711,156 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(!archive.root.join("messages").exists());
+    }
+
+    #[test]
+    fn uncommitted_webp_content_digest_recovers_fresh_and_cached_images() {
+        for cached in [false, true] {
+            let (_dir, config, archive, mut message, recipients) = fixture();
+            let source = config.storage_root.join("recoverable-image.png");
+            image::RgbImage::new(2, 2).save(&source).unwrap();
+            let original_bytes = std::fs::read(&source).unwrap();
+            let first =
+                crate::store_attachment(&archive, &config, &source, EmbedPolicy::File).unwrap();
+            let stored = if cached {
+                let second =
+                    crate::store_attachment(&archive, &config, &source, EmbedPolicy::File).unwrap();
+                assert_eq!(second.meta.content_sha256, first.meta.content_sha256);
+                second
+            } else {
+                first
+            };
+            let webp_relative = stored.meta.path.as_ref().unwrap();
+            let original_relative = stored.meta.original_path.as_ref().unwrap();
+            let webp_bytes = std::fs::read(archive.repo_root.join(webp_relative)).unwrap();
+            assert_eq!(
+                stored.meta.content_sha256,
+                Some(hex::encode(sha2::Sha256::digest(&webp_bytes)))
+            );
+            assert_eq!(stored.meta.sha1, hex::encode(Sha1::digest(&original_bytes)));
+            assert_ne!(stored.meta.sha1, hex::encode(Sha1::digest(&webp_bytes)));
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let before = repo.head().unwrap().peel_to_tree().unwrap();
+            for relative in [webp_relative, original_relative] {
+                assert!(before.get_path(Path::new(relative)).is_err());
+            }
+            // Exercise the metadata round trip used to persist the accepted
+            // attachment, not an in-memory recovery-only digest.
+            let persisted: crate::AttachmentMeta =
+                serde_json::from_str(&serde_json::to_string(&stored.meta).unwrap()).unwrap();
+            message["attachments"] = json!([persisted]);
+            let result = repair(&archive, &config, &message, &recipients).unwrap();
+            assert_eq!(result.files_created, 4);
+            assert!(result.git_commit_needed);
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            for (relative, expected) in [
+                (webp_relative, &webp_bytes),
+                (original_relative, &original_bytes),
+            ] {
+                let entry = tree.get_path(Path::new(relative)).unwrap();
+                assert_eq!(
+                    repo.find_blob(entry.id()).unwrap().content(),
+                    expected.as_slice()
+                );
+                assert_eq!(
+                    std::fs::read(archive.repo_root.join(relative)).unwrap(),
+                    expected.as_slice()
+                );
+            }
+            assert_eq!(std::fs::read(&source).unwrap(), original_bytes);
+            let paths =
+                crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+                    .unwrap()
+                    .0;
+            for path in paths.inbox {
+                let (copy, body) = super::super::read_surviving_message(&path)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(copy["bcc"], json!([]));
+                assert_eq!(copy["attachments"], message["attachments"]);
+                assert_eq!(body, "Keep the attached bytes.");
+            }
+            let head = repo.head().unwrap().target().unwrap();
+            assert_eq!(
+                repair(&archive, &config, &message, &recipients).unwrap(),
+                ReconcileResult::default()
+            );
+            assert_eq!(repo.head().unwrap().target().unwrap(), head);
+        }
+    }
+
+    #[test]
+    fn webp_content_digest_or_byte_conflicts_do_not_publish_recovery() {
+        for (committed, corrupt_bytes) in
+            [(false, true), (true, true), (false, false), (true, false)]
+        {
+            let (_dir, config, archive, mut message, recipients) = fixture();
+            let source = config.storage_root.join("conflicting-image.png");
+            image::RgbImage::new(2, 2).save(&source).unwrap();
+            let original_bytes = std::fs::read(&source).unwrap();
+            let stored =
+                crate::store_attachment(&archive, &config, &source, EmbedPolicy::File).unwrap();
+            if committed {
+                commit_attachment(&archive, &config, &stored);
+            }
+            let path = archive.repo_root.join(stored.meta.path.as_ref().unwrap());
+            let mut surviving_bytes = std::fs::read(&path).unwrap();
+            message["attachments"] = json!([stored.meta]);
+            if corrupt_bytes {
+                // Identical length and original-image provenance do not prove
+                // that the accepted encoded bytes survived.
+                surviving_bytes[0] ^= 1;
+                std::fs::write(&path, &surviving_bytes).unwrap();
+            } else {
+                message["attachments"][0]["content_sha256"] = json!("0".repeat(64));
+            }
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let head = repo.head().unwrap().target().unwrap();
+            assert!(repair(&archive, &config, &message, &recipients).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), surviving_bytes);
+            assert_eq!(std::fs::read(&source).unwrap(), original_bytes);
+            assert!(!archive.root.join("messages").exists());
+            assert_eq!(repo.head().unwrap().target().unwrap(), head);
+        }
+    }
+
+    #[test]
+    fn malformed_or_disagreeing_webp_content_digests_fail_before_publication() {
+        let (_dir, config, archive, mut message, recipients) = fixture();
+        let source = config.storage_root.join("digest-validation.png");
+        image::RgbImage::new(2, 2).save(&source).unwrap();
+        let stored =
+            crate::store_attachment(&archive, &config, &source, EmbedPolicy::File).unwrap();
+        let metadata = serde_json::to_value(&stored.meta).unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        for malformed in [
+            json!(""),
+            json!("0".repeat(63)),
+            json!("0".repeat(65)),
+            json!("g".repeat(64)),
+            json!("A".repeat(64)),
+            Value::Null,
+            json!(42),
+            json!([]),
+        ] {
+            message["attachments"] = json!([metadata]);
+            message["attachments"][0]["content_sha256"] = malformed;
+            assert!(repair(&archive, &config, &message, &recipients).is_err());
+            assert!(!archive.root.join("messages").exists());
+            assert_eq!(repo.head().unwrap().target().unwrap(), head);
+        }
+        message["attachments"] = json!([metadata, metadata]);
+        assert_eq!(
+            prepare(&repo, &archive, &message, usize::MAX)
+                .unwrap()
+                .len(),
+            2
+        );
+        message["attachments"][1]["content_sha256"] = json!("0".repeat(64));
+        assert!(repair(&archive, &config, &message, &recipients).is_err());
+        assert!(!archive.root.join("messages").exists());
+        assert_eq!(repo.head().unwrap().target().unwrap(), head);
     }
 
     #[test]
