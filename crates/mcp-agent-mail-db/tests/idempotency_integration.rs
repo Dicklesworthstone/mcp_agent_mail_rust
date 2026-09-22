@@ -572,7 +572,8 @@ fn idempotency_lookup_is_read_only_and_preserves_scope_and_expired_rows() {
     })
     .expect("query-only idempotency pool");
 
-    block_on(|cx| async {
+    let replay_pool = &read_pool;
+    block_on(|cx| async move {
         let claim = IdempotencyClaim {
             project_id: pid,
             tool: "file_reservation_paths",
@@ -581,7 +582,9 @@ fn idempotency_lookup_is_read_only_and_preserves_scope_and_expired_rows() {
         };
         let replay =
             queries::lookup_idempotency_result::<Vec<mcp_agent_mail_db::FileReservationRow>>(
-                &cx, &read_pool, claim,
+                &cx,
+                replay_pool,
+                claim,
             )
             .await
             .into_result()
@@ -594,7 +597,7 @@ fn idempotency_lookup_is_read_only_and_preserves_scope_and_expired_rows() {
         let changed =
             queries::lookup_idempotency_result::<Vec<mcp_agent_mail_db::FileReservationRow>>(
                 &cx,
-                &read_pool,
+                replay_pool,
                 IdempotencyClaim {
                     fingerprint: "fp-B",
                     ..claim
@@ -623,7 +626,7 @@ fn idempotency_lookup_is_read_only_and_preserves_scope_and_expired_rows() {
             },
         ] {
             let lookup =
-                queries::lookup_idempotency_result::<serde_json::Value>(&cx, &read_pool, missing)
+                queries::lookup_idempotency_result::<serde_json::Value>(&cx, replay_pool, missing)
                     .await
                     .into_result()
                     .expect("scoped lookup");
@@ -632,7 +635,7 @@ fn idempotency_lookup_is_read_only_and_preserves_scope_and_expired_rows() {
     });
 
     expire_all_idempotency_keys(&db_path);
-    let expired = block_on(|cx| async {
+    let expired = block_on(|cx| async move {
         queries::lookup_idempotency_result::<serde_json::Value>(
             &cx,
             &read_pool,
@@ -672,7 +675,7 @@ fn idempotency_lookup_rejects_corrupt_recorded_results_without_regranting() {
         .expect("corrupt only the retained result");
     drop(conn);
 
-    let result = block_on(|cx| async {
+    let result = block_on(|cx| async move {
         queries::lookup_idempotency_result::<Vec<mcp_agent_mail_db::FileReservationRow>>(
             &cx,
             &pool,
@@ -706,7 +709,7 @@ fn reservation_reacquire_updates_intent_without_bypassing_conflicts_or_replay() 
     let holder = setup_agent(&pool, pid, "GreenCastle");
     let peer = setup_agent(&pool, pid, "BlueLake");
 
-    block_on(|cx| async {
+    block_on(|cx| async move {
         let shared = queries::create_file_reservations(
             &cx,
             &pool,
