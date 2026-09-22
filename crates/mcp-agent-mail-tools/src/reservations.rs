@@ -20,8 +20,8 @@ use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 #[cfg(test)]
-use std::io::Write as IoWrite;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
 use crate::degraded_intents::{
     QueuedReleaseIntentView as QueuedReleaseIntent, append_jsonl as append_degraded_intent_jsonl,
@@ -5689,10 +5689,10 @@ mod tests {
                 1,
                 None,
             );
+            let queued = read_queued_release_intents(&config).expect("read after replay");
             assert!(
-                read_queued_release_intents(&config)
-                    .expect("read after replay")
-                    .is_empty()
+                queued.is_empty(),
+                "replayed intents remain queued: {queued:?}"
             );
         });
     }

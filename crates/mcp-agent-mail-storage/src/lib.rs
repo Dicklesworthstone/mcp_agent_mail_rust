@@ -462,9 +462,7 @@ struct WriteBehindQueue {
     receiver_slot: Arc<Mutex<Option<std::sync::mpsc::Receiver<WbqMsg>>>>,
 }
 
-// WBQ timing defaults. Capacity and batch limits come from `Config`.
-const WBQ_FLUSH_INTERVAL_MS: u64 = 100;
-const WBQ_ENQUEUE_TIMEOUT_MS: u64 = 100;
+// WBQ retry backoff and control-message budgets. Runtime tuning comes from `Config`.
 const WBQ_ENQUEUE_MAX_BACKOFF_MS: u64 = 8;
 /// Total budget for a flush round-trip: delivering the Flush message AND
 /// receiving the drain acknowledgement share this single deadline (br-lrrry).
@@ -1125,7 +1123,8 @@ fn wbq_enqueue_with_sender(
                 .inc();
             // std::sync::mpsc::SyncSender does not expose a stable send_timeout; emulate with
             // try_send + bounded exponential backoff until a deadline.
-            let deadline = Instant::now() + Duration::from_millis(WBQ_ENQUEUE_TIMEOUT_MS);
+            let deadline =
+                Instant::now() + Duration::from_millis(Config::get().wbq_enqueue_timeout_ms);
             let mut cur = msg;
             let mut backoff = Duration::from_millis(1);
             let max_backoff = Duration::from_millis(WBQ_ENQUEUE_MAX_BACKOFF_MS);
@@ -2891,7 +2890,7 @@ fn wbq_drain_loop(
     channel_capacity: usize,
     drain_batch_cap: usize,
 ) {
-    let flush_interval = Duration::from_millis(WBQ_FLUSH_INTERVAL_MS);
+    let flush_interval = Duration::from_millis(Config::get().wbq_flush_interval_ms);
     let mut flush_waiters: Vec<std::sync::mpsc::SyncSender<()>> = Vec::new();
     let mut shutting_down = false;
 
@@ -18786,6 +18785,81 @@ mod tests {
     }
 
     #[test]
+    fn wbq_enqueue_honors_configured_deadline_in_fresh_process() {
+        const CHILD_TIMEOUT: &str = "AM_TEST_WBQ_CONFIGURED_TIMEOUT";
+        const COMPLETED: &str = "configured WBQ deadline verified";
+        if let Ok(timeout) = std::env::var(CHILD_TIMEOUT) {
+            let timeout: u64 = timeout.parse().unwrap();
+            assert_eq!(Config::get().wbq_enqueue_timeout_ms, timeout);
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            tx.send(WbqMsg::Op(WbqOpEnvelope {
+                enqueued_at: Instant::now(),
+                op: Box::new(wbq_test_clear_signal_op("configured-prefill")),
+            }))
+            .unwrap();
+            // Release real channel pressure after the old hardcoded 100 ms
+            // deadline, but before the configured long deadline. The short
+            // deadline must refuse without consuming or replacing the first op.
+            let drain = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let second = rx.recv_timeout(Duration::from_secs(5));
+                (first, second)
+            });
+            let depth = AtomicU64::new(0);
+            let result =
+                wbq_enqueue_with_sender(&tx, &depth, wbq_test_clear_signal_op("configured-second"));
+            drop(tx);
+            let (first, second) = drain.join().unwrap();
+            assert!(matches!(
+                first,
+                WbqMsg::Op(envelope)
+                    if matches!(&*envelope.op, WriteOp::ClearSignal { project_slug, .. }
+                        if project_slug == "configured-prefill")
+            ));
+            if timeout > 500 {
+                assert_eq!(result, WbqEnqueueResult::Enqueued);
+                assert_eq!(depth.load(Ordering::Relaxed), 1);
+                assert!(matches!(
+                    second.unwrap(),
+                    WbqMsg::Op(envelope)
+                        if matches!(&*envelope.op, WriteOp::ClearSignal { project_slug, .. }
+                            if project_slug == "configured-second")
+                ));
+            } else {
+                assert_eq!(result, WbqEnqueueResult::QueueUnavailable);
+                assert_eq!(depth.load(Ordering::Relaxed), 0);
+                assert!(matches!(
+                    second,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+                ));
+            }
+            println!("{COMPLETED}");
+            return;
+        }
+
+        for timeout in ["2500", "10"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::wbq_enqueue_honors_configured_deadline_in_fresh_process",
+                    "--nocapture",
+                ])
+                .env(CHILD_TIMEOUT, timeout)
+                .env("AM_WBQ_ENQUEUE_TIMEOUT_MS", timeout)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "timeout={timeout}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETED));
+        }
+    }
+
+    #[test]
     fn wbq_enqueue_with_sender_timeout_preserves_prefilled_item() {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         tx.send(WbqMsg::Op(WbqOpEnvelope {
@@ -19931,7 +20005,7 @@ mod tests {
                 WbqEnqueueResult::Enqueued => actually_enqueued += 1,
                 WbqEnqueueResult::SkippedDiskCritical => {}
                 WbqEnqueueResult::QueueUnavailable => {
-                    panic!("WBQ should not become unavailable during burst (op {i})");
+                    panic!("WBQ should not become unavailable during burst (op {i})"); // ubs:ignore -- Test-only assertion: unavailable burst operations must fail the test.
                 }
             }
         }
@@ -20374,6 +20448,7 @@ mod tests {
             }
             if std::time::Instant::now() >= deadline {
                 panic!(
+                    // ubs:ignore -- Test-only deadline assertion: incomplete draining must fail the test.
                     "WBQ drain did not complete within 10s \
                      (enqueued {actually_enqueued}, drained delta {drained_delta})"
                 );
@@ -21099,7 +21174,7 @@ mod tests {
                     }
                 }
                 if let Some(e) = last_err {
-                    panic!("agent {i} commit failed after retries: {e}");
+                    panic!("agent {i} commit failed after retries: {e}"); // ubs:ignore -- Test-only assertion: exhausted concurrent commit retries must fail the test.
                 }
             }));
         }
