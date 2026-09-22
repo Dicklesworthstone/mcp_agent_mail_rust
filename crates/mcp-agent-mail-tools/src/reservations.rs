@@ -16,13 +16,17 @@ use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 use mcp_agent_mail_db::{DbError, micros_to_iso};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
+#[cfg(test)]
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 
+use crate::degraded_intents::{
+    QueuedReleaseIntentView as QueuedReleaseIntent, append_jsonl as append_degraded_intent_jsonl,
+    hash_json_value, read_queued_release_intents,
+};
 use crate::messaging::{
     enqueue_message_semantic_index, try_dispatch_archive_write, try_write_message_archive,
 };
@@ -39,6 +43,7 @@ use crate::tool_util::{
 const RELEASE_INTENT_SCHEMA_VERSION: u32 = 1;
 const RELEASE_INTENT_KIND: &str = "release_file_reservations_intent";
 const RELEASE_INTENT_REPLAY_KIND: &str = "release_file_reservations_replay";
+#[cfg(test)]
 const RELEASE_INTENT_DIR: &str = "degraded_intents";
 const RELEASE_INTENT_LOG_FILE: &str = "release_file_reservations.jsonl";
 const RELEASE_INTENT_LOCK_FILE: &str = ".release_file_reservations.jsonl.lock";
@@ -130,19 +135,6 @@ struct ReleaseIntentReceipt {
     intent_id: String,
     intent_path: PathBuf,
     content_sha256: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct QueuedReleaseIntent {
-    kind: String,
-    intent_id: String,
-    content_sha256: String,
-    project_key: String,
-    agent_name: String,
-    #[serde(default)]
-    paths: Option<Vec<String>>,
-    #[serde(default)]
-    file_reservation_ids: Option<Vec<i64>>,
 }
 
 /// Renewal result
@@ -876,6 +868,7 @@ fn released_ts_json_value(released_ts: Option<i64>) -> serde_json::Value {
     })
 }
 
+#[cfg(test)]
 fn release_intent_log_path(config: &Config) -> PathBuf {
     config
         .storage_root
@@ -883,6 +876,7 @@ fn release_intent_log_path(config: &Config) -> PathBuf {
         .join(RELEASE_INTENT_LOG_FILE)
 }
 
+#[cfg(test)]
 fn release_intent_lock_path(config: &Config) -> PathBuf {
     config
         .storage_root
@@ -890,160 +884,13 @@ fn release_intent_lock_path(config: &Config) -> PathBuf {
         .join(RELEASE_INTENT_LOCK_FILE)
 }
 
-fn reject_existing_symlink(path: &Path) -> std::io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::other(format!(
-            "release intent path must not be a symlink: {}",
-            path.display()
-        ))),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-fn ensure_release_intent_parent(path: &Path) -> std::io::Result<()> {
-    let Some(parent) = path.parent() else {
-        return Err(std::io::Error::other("release intent log has no parent"));
-    };
-    reject_existing_symlink(parent)?;
-    std::fs::create_dir_all(parent)?;
-    reject_existing_symlink(parent)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-fn hash_json_value(value: &Value) -> String {
-    let bytes = serde_json::to_vec(value).expect("serializing serde_json::Value should not fail");
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
-
-fn release_intent_hash_payload(record: &Value) -> Value {
-    json!({
-        "schema_version": record["schema_version"].clone(),
-        "kind": record["kind"].clone(),
-        "created_ts": record["created_ts"].clone(),
-        "project_key": record["project_key"].clone(),
-        "agent_name": record["agent_name"].clone(),
-        "paths": record["paths"].clone(),
-        "file_reservation_ids": record["file_reservation_ids"].clone(),
-        "failure": record["failure"].clone(),
-    })
-}
-
-fn release_replay_hash_payload(record: &Value) -> Value {
-    json!({
-        "schema_version": record["schema_version"].clone(),
-        "kind": record["kind"].clone(),
-        "intent_id": record["intent_id"].clone(),
-        "intent_content_sha256": record["intent_content_sha256"].clone(),
-        "replayed_ts": record["replayed_ts"].clone(),
-        "status": record["status"].clone(),
-        "released": record["released"].clone(),
-        "error_detail": record["error_detail"].clone(),
-    })
-}
-
-fn release_intent_record_has_valid_hash(record: &Value) -> bool {
-    let Some(content_sha256) = record.get("content_sha256").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(intent_id) = record.get("intent_id").and_then(Value::as_str) else {
-        return false;
-    };
-    let computed_hash = hash_json_value(&release_intent_hash_payload(record));
-    content_sha256.len() == 64
-        && intent_id.len() == 16
-        && content_sha256 == computed_hash
-        && content_sha256.starts_with(intent_id)
-}
-
-fn release_replay_record_has_valid_hash(record: &Value) -> bool {
-    let Some(content_sha256) = record.get("content_sha256").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(intent_id) = record.get("intent_id").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(intent_content_sha256) = record.get("intent_content_sha256").and_then(Value::as_str)
-    else {
-        return false;
-    };
-    content_sha256.len() == 64
-        && intent_id.len() == 16
-        && intent_content_sha256.len() == 64
-        && intent_content_sha256.starts_with(intent_id)
-        && content_sha256 == hash_json_value(&release_replay_hash_payload(record))
-}
-
 fn append_release_intent_jsonl(config: &Config, record: &Value) -> std::io::Result<PathBuf> {
-    let path = release_intent_log_path(config);
-    ensure_release_intent_parent(&path)?;
-    reject_existing_symlink(&path)?;
-    let lock_path = release_intent_lock_path(config);
-    reject_existing_symlink(&lock_path)?;
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        lock_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    fs2::FileExt::lock_exclusive(&lock_file)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).read(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    // Defend against a torn final line from a prior crash (a partial append that
-    // never reached fsync). If the log does not currently end in a newline,
-    // write a leading one so the torn fragment stays isolated on its own
-    // (skippable) line instead of being concatenated onto — and lost together
-    // with — this otherwise-valid record on the next read.
-    let needs_leading_newline = if let Ok(meta) = file.metadata()
-        && meta.len() > 0
-    {
-        use std::io::{Read, Seek, SeekFrom};
-        file.seek(SeekFrom::End(-1))?;
-        let mut last = [0u8; 1];
-        file.read_exact(&mut last)?;
-        last[0] != b'\n'
-    } else {
-        false
-    };
-    let mut line = Vec::new();
-    if needs_leading_newline {
-        line.push(b'\n');
-    }
-    line.extend_from_slice(
-        &serde_json::to_vec(record).map_err(|err| std::io::Error::other(err.to_string()))?,
-    );
-    line.push(b'\n');
-    file.write_all(&line)?;
-    file.sync_all()?;
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
-    }
-    Ok(path)
+    append_degraded_intent_jsonl(
+        config,
+        RELEASE_INTENT_LOG_FILE,
+        RELEASE_INTENT_LOCK_FILE,
+        record,
+    )
 }
 
 fn append_release_intent(
@@ -1205,64 +1052,6 @@ fn mcp_error_supports_release_intent(error: &McpError) -> bool {
         })
 }
 
-fn read_queued_release_intents(config: &Config) -> std::io::Result<Vec<QueuedReleaseIntent>> {
-    let path = release_intent_log_path(config);
-    reject_existing_symlink(&path)?;
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-    let mut terminal = HashSet::new();
-    let mut intents = Vec::new();
-    for line in content.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        match value.get("kind").and_then(Value::as_str) {
-            // A replay marker is terminal when the intent either succeeded
-            // ("replayed") or is permanently un-replayable ("abandoned" — e.g.
-            // the agent or project no longer exists). Both clear the queued
-            // intent so it is not retried forever (mirrors the ack-intent
-            // design in messaging.rs); only a retryable "failed" marker leaves
-            // the intent queued for the next replay attempt.
-            Some(RELEASE_INTENT_REPLAY_KIND)
-                if matches!(
-                    value.get("status").and_then(Value::as_str),
-                    Some("replayed" | "abandoned")
-                ) =>
-            {
-                if !release_replay_record_has_valid_hash(&value) {
-                    tracing::warn!("skipping replay marker with invalid content hash");
-                    continue;
-                }
-                if let Some(intent_id) = value.get("intent_id").and_then(Value::as_str) {
-                    let Some(intent_content_sha256) =
-                        value.get("intent_content_sha256").and_then(Value::as_str)
-                    else {
-                        continue;
-                    };
-                    terminal.insert((intent_id.to_string(), intent_content_sha256.to_string()));
-                }
-            }
-            Some(RELEASE_INTENT_KIND) => {
-                if !release_intent_record_has_valid_hash(&value) {
-                    tracing::warn!("skipping release intent with invalid content hash");
-                    continue;
-                }
-                if let Ok(intent) = serde_json::from_value::<QueuedReleaseIntent>(value) {
-                    intents.push(intent);
-                }
-            }
-            _ => {}
-        }
-    }
-    intents.retain(|intent| {
-        !terminal.contains(&(intent.intent_id.clone(), intent.content_sha256.clone()))
-    });
-    Ok(intents)
-}
-
 fn dispatch_release_archive_write(
     project: &mcp_agent_mail_db::ProjectRow,
     agent: &mcp_agent_mail_db::AgentRow,
@@ -1297,9 +1086,8 @@ async fn replay_single_release_intent(
     config: &Config,
     intent: &QueuedReleaseIntent,
 ) -> Result<usize, (String, bool)> {
-    if intent.kind != RELEASE_INTENT_KIND {
-        return Ok(0);
-    }
+    // Shared recovery admits only full-hash-verified release records and
+    // validates the bounded journal snapshot before replay mutates the database.
     let project = resolve_project(ctx, pool, &intent.project_key)
         .await
         .map_err(|error| (error.to_string(), mcp_error_supports_release_intent(&error)))?;
