@@ -139,9 +139,39 @@ pub fn atc_tick_report(now_micros: i64) -> Option<AtcTickReport> {
 
 fn admit_report(
     epoch: &Arc<()>,
-    mut report: AtcTickReport,
+    report: AtcTickReport,
     now_micros: i64,
 ) -> Option<AtcTickReport> {
+    admit_report_with_activity(epoch, report, now_micros, engine::atc_agent_last_activity)
+}
+
+fn admit_report_with_activity(
+    epoch: &Arc<()>,
+    mut report: AtcTickReport,
+    now_micros: i64,
+    mut last_activity: impl FnMut(&str) -> Option<i64>,
+) -> Option<AtcTickReport> {
+    if !delivery_epoch_is_current(epoch) {
+        return None;
+    }
+    // Never acquire the engine mutex while owning delivery admission. Engine
+    // diagnostics can themselves inspect delivery metrics. These observations
+    // only classify passive liveness counters; they authorize no mail or release.
+    let mut activity_by_agent = HashMap::new();
+    for effect in &report.effects {
+        if matches!(
+            notification_class(
+                &effect.kind,
+                &effect.semantics.family,
+                effect.semantics.high_risk_intervention,
+            ),
+            Some(NotificationClass::Probe | NotificationClass::Liveness)
+        ) {
+            activity_by_agent
+                .entry(effect.agent.clone())
+                .or_insert_with(|| last_activity(&effect.agent));
+        }
+    }
     let mut state = delivery_state()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -165,7 +195,7 @@ fn admit_report(
             admission,
             last_notification_key,
             now_micros,
-            engine::atc_agent_last_activity,
+            |agent| activity_by_agent.get(agent).copied().flatten(),
         );
     }
     report.summary.kernel.pending_effects = report.effects.len();
@@ -515,6 +545,152 @@ mod admission_boundary_tests {
         }
         assert!(finish_summary(&epoch, &mut summary).is_none());
         assert_eq!(summary.kernel.pending_effects, original_pending);
+        reset_global_atc_state_for_test(&config);
+    }
+
+    fn passive_report(now: i64) -> AtcTickReport {
+        let mut report = staged_report(now);
+        let effect = &mut report.effects[0];
+        effect.kind = "probe_agent".into();
+        effect.semantics.family = "liveness_probe".into();
+        effect.semantics.high_risk_intervention = false;
+        report.actions = vec![AtcTickAction::ProbeAgent { agent: "BlueFox".into() }];
+        report
+    }
+
+    #[test]
+    fn activity_observer_can_read_metrics_and_reset_before_admission() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        let report = passive_report(200_000_000);
+        let mut observed = 0;
+        assert!(admit_report_with_activity(&epoch, report, 200_000_000, |_| {
+            // An engine-side observer can reenter delivery without reversing
+            // the engine/admission lock order. Check before calling metrics so
+            // a regression fails instead of deliberately deadlocking this test.
+            match delivery_state().try_lock() {
+                Ok(guard) => drop(guard),
+                Err(std::sync::TryLockError::Poisoned(error)) => drop(error.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => panic!("activity under delivery lock"),
+            }
+            assert_eq!(atc_delivery_stats(), AtcDeliveryStats::default());
+            observed += 1;
+            reset_global_atc_state_for_test(&config);
+            Some(1_000_000)
+        }).is_none());
+        assert_eq!(observed, 1);
+        assert_eq!(atc_delivery_stats(), AtcDeliveryStats::default());
+        assert!(!delivery_epoch_is_current(&epoch));
+        assert!(atc_tick_report(201_000_000).is_some());
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn stalled_activity_lookup_does_not_block_reset_or_publish_after_it() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        let report = passive_report(200_000_000);
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let worker = scope.spawn(move || {
+                admit_report_with_activity(&epoch, report, 200_000_000, |_| {
+                    started_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                    Some(1_000_000)
+                })
+            });
+            started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            // This must complete while the old lookup is suspended. The
+            // scoped worker is joined on success and failure, never detached.
+            reset_global_atc_state_for_test(&config);
+            resume_tx.send(()).unwrap();
+            assert!(worker.join().unwrap().is_none());
+        });
+        assert_eq!(atc_delivery_stats(), AtcDeliveryStats::default());
+        assert!(atc_tick_report(201_000_000).is_some());
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn failed_activity_observation_does_not_charge_or_poison_admission() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        let report = passive_report(200_000_000);
+        let was_poisoned = delivery_state().is_poisoned();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            admit_report_with_activity(&epoch, report, 200_000_000, |_| {
+                panic!("interrupted activity observation")
+            })
+        })).is_err());
+        assert_eq!(delivery_state().is_poisoned(), was_poisoned);
+        assert!(delivery_epoch_is_current(&epoch));
+        assert_eq!(atc_delivery_stats(), AtcDeliveryStats::default());
+        let state = delivery_state()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(state.last_tick_count.is_none());
+        drop(state);
+        assert!(atc_tick_report(201_000_000).is_some());
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn already_stale_report_skips_activity_observation_entirely() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let old_epoch = capture_delivery_epoch().unwrap();
+        let report = passive_report(200_000_000);
+        reset_global_atc_state_for_test(&config);
+        assert!(admit_report_with_activity(&old_epoch, report, 201_000_000, |_| {
+            panic!("stale report must not query the replacement engine")
+        }).is_none());
+        assert_eq!(atc_delivery_stats(), AtcDeliveryStats::default());
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn passive_activity_is_sampled_once_per_agent_and_never_for_releases() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        let mut report = passive_report(200_000_000);
+        let duplicate = passive_report(201_000_000);
+        report.effects.extend(duplicate.effects);
+        report.actions.extend(duplicate.actions);
+        let mut calls = 0;
+        let passive = admit_report_with_activity(&epoch, report, 202_000_000, |agent| {
+            assert_eq!(agent, "BlueFox");
+            calls += 1;
+            Some(1_000_000)
+        }).unwrap();
+        assert_eq!(calls, 1);
+        assert!(passive.effects.is_empty() && passive.actions.is_empty());
+        assert_eq!(atc_delivery_stats().passive_liveness, 2);
+        let critical = admit_report_with_activity(
+            &epoch, staged_report(203_000_000), 203_000_000,
+            |_| panic!("release admission must not load passive activity"),
+        ).unwrap();
+        assert_eq!(critical.effects.len(), 1);
+        assert_eq!(critical.actions.len(), 1);
         reset_global_atc_state_for_test(&config);
     }
 
