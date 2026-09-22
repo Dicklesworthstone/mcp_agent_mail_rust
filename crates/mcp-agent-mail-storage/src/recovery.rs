@@ -24,6 +24,7 @@
 //!   caller (Track F's `am doctor fix-orphan-refs` command) decides
 //!   when to prune.
 
+pub mod agent_reconcile;
 pub mod message_reconcile;
 pub mod ref_backup;
 

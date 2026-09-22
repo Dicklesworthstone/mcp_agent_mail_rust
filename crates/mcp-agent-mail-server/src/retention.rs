@@ -35,6 +35,7 @@ use mcp_agent_mail_db::{
     DbPool, DbPoolConfig, create_pool, now_micros,
     queries::{MessagePruneReport, count_prunable_messages, prune_settled_messages},
 };
+use mcp_agent_mail_storage::recovery::agent_reconcile::{self, AgentReconcileCursor};
 use mcp_agent_mail_storage::recovery::message_reconcile::database::{
     self as message_archive_reconcile, ReconcileCursor,
 };
@@ -167,6 +168,7 @@ fn retention_loop(config: &Config) {
     let needs_db = message_retention_needs_db(config) || repair_enabled;
     let mut pool: Option<DbPool> = None;
     let mut cursor = ReconcileCursor::default();
+    let mut agent_cursor = AgentReconcileCursor::default();
     let mut last_report: Option<Instant> = None;
 
     info!(
@@ -244,6 +246,41 @@ fn retention_loop(config: &Config) {
                             event = "message_archive_reconcile_source_unavailable",
                             error = %error,
                             "message archive reconciliation refused; preserving source and retrying next cycle"
+                        );
+                        retire_pool = true;
+                    }
+                }
+            }
+            if !retire_pool && let Some(live_pool) = pool.as_ref() {
+                let cx = worker_cx();
+                match agent_reconcile::reconcile_agent_batch(
+                    &cx,
+                    live_pool,
+                    config,
+                    &mut agent_cursor,
+                    &SHUTDOWN,
+                ) {
+                    Ok(report) => {
+                        if report.scanned > 0 || report.interrupted {
+                            info!(
+                                target: "maintenance",
+                                event = "agent_archive_reconcile",
+                                scanned = report.scanned,
+                                unchanged = report.unchanged,
+                                repaired = report.repaired,
+                                deferred = report.deferred,
+                                interrupted = report.interrupted,
+                                budget_exhausted = report.budget_exhausted,
+                                "bounded agent profile reconciliation pass completed"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "maintenance",
+                            event = "agent_archive_reconcile_source_unavailable",
+                            error = %error,
+                            "agent profile reconciliation refused; retrying next cycle"
                         );
                         retire_pool = true;
                     }

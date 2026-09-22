@@ -2359,6 +2359,13 @@ fn discover_agents(
             .unwrap_or_else(|| inception_ts.unwrap_or_else(crate::now_micros));
         let inception_ts = inception_ts.unwrap_or(last_active_ts);
         let retired_at = parse_ts_from_json(&profile, "retired_at");
+        // Exempt agents must remain exempt after rebuilding from the archive;
+        // otherwise the inactivity reaper can retire an identity that the
+        // operator explicitly protected. Older profiles omit this field.
+        let reaper_exempt = profile
+            .get("reaper_exempt")
+            .and_then(|value| value.as_bool().or_else(|| value.as_i64().map(|n| n != 0)))
+            .unwrap_or(false);
         // Older archives encoded deregistration only through the Python-style
         // tombstone plus block_all. Newer profiles carry the explicit ledger
         // timestamp, but reconstruction must preserve both representations.
@@ -2373,8 +2380,8 @@ fn discover_agents(
 
         conn.execute_sync(
             "INSERT OR IGNORE INTO agents \
-             (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, retired_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, retired_at, reaper_exempt) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 Value::BigInt(project_id),
                 Value::Text(agent_name.clone()),
@@ -2386,6 +2393,7 @@ fn discover_agents(
                 Value::Text(attachments_policy),
                 Value::Text(contact_policy),
                 retired_at.map_or(Value::Null, Value::BigInt),
+                Value::BigInt(i64::from(reaper_exempt)),
             ],
         )
         .map_err(|e| DbError::Sqlite(format!("reconstruct: insert agent {agent_name}: {e}")))?;
@@ -8138,6 +8146,61 @@ mod tests {
                 .expect("deregistered_at"),
             crate::iso_to_micros("2026-02-22T13:00:00Z").unwrap()
         );
+    }
+
+    #[test]
+    fn reconstruct_preserves_agent_reaper_exemptions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reaper_exemptions.db");
+        let storage_root = tmp.path().join("storage");
+        let cases = [
+            ("BluePine", Some(serde_json::json!(true)), 1_i64),
+            ("GreenMaple", Some(serde_json::json!(false)), 0),
+            ("RedBirch", None, 0),
+            ("GoldOak", Some(serde_json::json!(1)), 1),
+            ("SilverElm", Some(serde_json::json!(0)), 0),
+        ];
+        for (name, exemption, _) in &cases {
+            let agent_dir = storage_root.join("projects/demo/agents").join(name);
+            std::fs::create_dir_all(&agent_dir).expect("create agent archive directory");
+            let mut profile = serde_json::json!({
+                "name": name,
+                "program": "claude-code",
+                "model": "opus-4.6",
+                "inception_ts": "2026-02-22T12:00:00Z",
+                "last_active_ts": "2026-02-22T12:00:00Z",
+            });
+            if let Some(exemption) = exemption {
+                profile["reaper_exempt"] = exemption.clone();
+            }
+            std::fs::write(
+                agent_dir.join("profile.json"),
+                serde_json::to_vec(&profile).expect("serialize profile"),
+            )
+            .expect("write archived profile");
+        }
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root)
+            .expect("reconstruct archived agent profiles");
+        assert_eq!(stats.agents, cases.len());
+        assert_eq!(stats.parse_errors, 0);
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open rebuilt db");
+        for (name, _, expected_exemption) in cases {
+            let rows = conn
+                .query_sync(
+                    "SELECT reaper_exempt FROM agents WHERE name = ?",
+                    &[Value::Text(name.to_string())],
+                )
+                .expect("read reconstructed exemption");
+            assert_eq!(rows.len(), 1, "missing reconstructed agent {name}");
+            assert_eq!(
+                rows[0]
+                    .get_named::<i64>("reaper_exempt")
+                    .expect("exemption"),
+                expected_exemption,
+                "reconstruction changed the reaper exemption for {name}"
+            );
+        }
     }
 
     #[test]

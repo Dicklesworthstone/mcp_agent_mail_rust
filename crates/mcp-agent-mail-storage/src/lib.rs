@@ -7862,14 +7862,19 @@ pub fn write_agent_profile_with_config(
     let name = validate_archive_component("agent name", name)?;
 
     let repo_root = archive_repo_root_checked(archive)?;
-    let project_root = archive_project_root_checked(archive)?;
-    let profile_dir = project_root.join("agents").join(name);
-    ensure_dir(&profile_dir)?;
+    // Keep ordinary profile writes in the same cross-process critical section
+    // as lifecycle reconciliation. The publication fence precedes the project
+    // lock, matching every other archive writer's lock order.
+    let _mutation = ArchiveMutationGuard::begin_at(repo_root);
+    let rel = with_project_lock(archive, || {
+        let project_root = archive_project_root_checked(archive)?;
+        let profile_dir = project_root.join("agents").join(name);
+        ensure_dir(&profile_dir)?;
 
-    let profile_path = profile_dir.join("profile.json");
-    write_json(&profile_path, agent, true)?;
-
-    let rel = rel_path_cached(&archive.canonical_repo_root, &profile_path)?;
+        let profile_path = profile_dir.join("profile.json");
+        write_json(&profile_path, agent, true)?;
+        rel_path_cached(&archive.canonical_repo_root, &profile_path)
+    })?;
     enqueue_async_commit(repo_root, config, &format!("agent: profile {name}"), &[rel]);
 
     Ok(())
