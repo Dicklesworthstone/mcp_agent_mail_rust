@@ -1869,9 +1869,10 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
     mcp_agent_mail_storage::wbq_start();
     // Ack-fast crash recovery (br-ack-fast-storage-commit-reply-3ac88): replay any
     // archive writes journaled by a process killed after the DB commit but before
-    // materialization. Messages have no DB->archive reconcile-on-read, so this is
-    // their crash-safety path.
+    // materialization. The retention worker also reconciles DB-only messages
+    // without requiring a client read or retry, matching HTTP/TUI startup.
     mcp_agent_mail_storage::archive_backlog_recover(config);
+    retention::start(config);
 
     // Initialize the Air Traffic Controller engine for proactive agent coordination.
     atc::init_global_atc(config);
@@ -1906,6 +1907,7 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
         stop_atc_operator_runtime();
         integrity_guard::shutdown();
         disk_monitor::shutdown();
+        retention::shutdown();
         maintenance::shutdown();
         mcp_agent_mail_storage::wbq_shutdown();
         mcp_agent_mail_storage::flush_async_commits();

@@ -665,6 +665,122 @@ fn seed_startup_recovery_orphan_recipient(env: &TestEnv) {
 }
 
 #[test]
+fn serve_stdio_reconciles_db_only_mail_without_client_reads() {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
+    insert_project(
+        &conn,
+        1,
+        "idle-recovery",
+        &env.hostile_repo.display().to_string(),
+    );
+    insert_agent(&conn, 1, 1, "BlueLake", "test", "test");
+    insert_agent(&conn, 2, 1, "GreenStone", "test", "test");
+    insert_message(
+        &conn,
+        1,
+        1,
+        1,
+        "idle recovery",
+        "Retain this accepted message.",
+    );
+    insert_recipient(&conn, 1, 2);
+    conn.execute_raw(
+        "UPDATE messages SET recipients_json = '{\"to\":[\"GreenStone\"],\"cc\":[],\"bcc\":[]}', attachments = '[]' WHERE id = 1",
+    ).unwrap();
+    conn.close_sync().unwrap();
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
+
+    let stdout_path = env.tmp.path().join("stdio.stdout");
+    let stderr_path = env.tmp.path().join("stdio.stderr");
+    let mut child = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("AM_ATC_ENABLED", "false")
+        .env("AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED", "true")
+        .env("RETENTION_REPORT_ENABLED", "false")
+        .env("QUOTA_ENABLED", "false")
+        .current_dir(env.hostile_repo())
+        .arg("serve-stdio")
+        .stdin(Stdio::piped())
+        .stdout(std::fs::File::create(&stdout_path).unwrap())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .expect("start real stdio server");
+    // No tool call, resend or read can trigger recovery in this session.
+    let input = format!(
+        "{}\n{}\n",
+        initialize_request(),
+        json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized"
+        })
+    );
+    let sent = child.stdin.as_mut().unwrap().write_all(input.as_bytes());
+    let project = env.storage_root.join("projects/idle-recovery");
+    let filename = "2024/01/2024-01-01T00-00-00Z__idle-recovery__1.md";
+    let paths = [
+        format!("messages/{filename}"),
+        format!("agents/BlueLake/outbox/{filename}"),
+        format!("agents/GreenStone/inbox/{filename}"),
+    ];
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut committed = false;
+    while sent.is_ok() && Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if paths.iter().all(|path| project.join(path).is_file()) {
+            committed = paths.iter().all(|path| {
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&project)
+                    .args(["show", &format!("HEAD:projects/idle-recovery/{path}")])
+                    .output()
+                    .is_ok_and(|out| {
+                        out.status.success()
+                            && String::from_utf8_lossy(&out.stdout)
+                                .contains("Retain this accepted message.")
+                    })
+            });
+            if committed {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    // Reap our child before assertions, including the regression timeout path.
+    drop(child.stdin.take());
+    let _ = child.kill();
+    child.wait().expect("reap stdio server");
+    let stdout = std::fs::read_to_string(stdout_path).unwrap();
+    let stderr = std::fs::read_to_string(stderr_path).unwrap();
+    assert!(sent.is_ok(), "initialize write failed: {sent:?}; {stderr}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| serde_json::from_str::<Value>(line)
+                .is_ok_and(|response| response["id"] == 1 && response.get("result").is_some())),
+        "MCP initialization failed: {stdout}; {stderr}"
+    );
+    assert!(
+        committed,
+        "idle stdio did not commit all archive copies: {stderr}"
+    );
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
+    let rows = conn
+        .query_sync(
+            "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 1",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
+    assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+    conn.close_sync().unwrap();
+}
+
+#[test]
 fn robot_overview_cold_processes_preserve_project_counts_after_mutations() {
     let env = TestEnv::new();
     init_cli_schema(&env.db_path);
