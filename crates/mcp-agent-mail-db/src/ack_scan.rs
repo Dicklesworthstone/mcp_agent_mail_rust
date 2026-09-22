@@ -11,6 +11,10 @@
 //! provide the same generation-change detection. This is a bounded observation,
 //! not a transaction authorizing a later mutation or a query execution deadline.
 
+#[path = "ack_escalation.rs"]
+mod escalation;
+pub use escalation::{AckEscalationRequest, grant_ack_escalation};
+
 use asupersync::{Cx, Outcome};
 use sqlmodel_core::{Connection as _, Row, Value};
 
@@ -77,7 +81,7 @@ pub struct AckScanPage {
 impl AckScanPage {
     /// Scope for the caller's bounded, process-local warning cache.
     #[must_use]
-pub fn database_scope(&self) -> &str {
+    pub fn database_scope(&self) -> &str {
         &self.window.database_scope
     }
 
@@ -227,7 +231,7 @@ pub async fn overdue_ack_page(
     };
     let conn = match pool.acquire(cx).await {
         Outcome::Ok(conn) => conn,
-        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Err(error) => return Outcome::Err(DbError::Sqlite(error.to_string())),
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
