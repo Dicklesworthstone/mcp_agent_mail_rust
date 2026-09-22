@@ -495,6 +495,11 @@ pub struct ReconstructStats {
     /// itemization stops.
     pub suppressed_warnings: usize,
     duplicate_canonical_id_set: BTreeSet<i64>,
+    // Transient exceptions to original identity preservation. Ordinary
+    // canonical messages need no in-memory entry; generated IDs are not
+    // evidence that an original parent retained its ID.
+    generated_archive_message_ids: HashSet<i64>,
+    ambiguous_canonical_parent_ids: HashSet<(i64, i64)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -623,6 +628,8 @@ impl ReconstructStats {
         file_path: &Path,
     ) {
         self.cross_project_canonical_collisions += 1;
+        self.ambiguous_canonical_parent_ids
+            .insert((new_project_id, message_id));
         if self.cross_project_canonical_collisions <= DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT {
             self.warnings.push(format!(
                 "Cross-project canonical message id {message_id} collision in {}: \
@@ -641,6 +648,8 @@ impl ReconstructStats {
         file_path: &Path,
     ) {
         self.same_project_canonical_identity_collisions += 1;
+        self.ambiguous_canonical_parent_ids
+            .insert((project_id, message_id));
         if self.same_project_canonical_identity_collisions
             <= DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT
         {
@@ -1797,6 +1806,11 @@ fn reconstruct_from_archive_impl(
             }
         }
 
+        // A reply may be discovered before its parent's collision is known.
+        // Validate only after every canonical and deferred identity is settled,
+        // before any reconstructed metadata becomes durable authority.
+        invalidate_unresolved_archive_reply_parents(&conn, &mut stats)?;
+
         // ATC telemetry now lives in a dedicated sidecar DB (atc.sqlite3) that
         // is NOT part of the Git archive (br-bvq1x.11.7). Reconstruct rebuilds
         // the primary mailbox DB from the archive and intentionally materializes
@@ -2612,6 +2626,30 @@ fn parse_and_insert_message(
                     && existing_created_ts == created_ts
                     && existing_subject == subject
                 {
+                    // Duplicate identity does not prove agreement about the
+                    // immediate parent or understood envelope extensions.
+                    // Keep the existing message and its recipients, but only
+                    // retain known metadata when every copy agrees. Once an
+                    // earlier copy made it unknown, a later copy cannot
+                    // restore authority by winning archive traversal order.
+                    let duplicate_thread = raw_thread_id.and_then(sanitize_reconstructed_thread_id);
+                    let duplicate_metadata = reconstructed_archive_metadata(
+                        frontmatter,
+                        &msg,
+                        Some(cid),
+                        duplicate_thread.as_deref(),
+                    );
+                    conn.execute_sync(
+                        "UPDATE messages SET archive_metadata_json = NULL \
+                         WHERE id = ? AND archive_metadata_json IS NOT NULL \
+                           AND archive_metadata_json IS NOT ?",
+                        &[Value::BigInt(cid), duplicate_metadata],
+                    )
+                    .map_err(|error| {
+                        DbError::Sqlite(format!(
+                            "retain unknown duplicate archive metadata for {cid}: {error}"
+                        ))
+                    })?;
                     stats.record_duplicate_canonical_message(cid, file_path);
                     return Ok(());
                 }
@@ -2664,6 +2702,8 @@ fn parse_and_insert_message(
         .as_deref()
         .map_or_else(|| Value::Null, |t| Value::Text(t.to_string()));
     let topic_val = topic.map_or_else(|| Value::Null, |value| Value::Text(value.to_string()));
+    let archive_metadata =
+        reconstructed_archive_metadata(frontmatter, &msg, canonical_id, thread_id.as_deref());
 
     let message_id = if let Some(cid) = canonical_id {
         // Plain INSERT: the id was verified free above. A conflict here means
@@ -2672,8 +2712,8 @@ fn parse_and_insert_message(
         // recipient rows.
         conn.execute_sync(
             "INSERT INTO messages \
-             (id, project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (id, project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments, archive_metadata_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 Value::BigInt(cid),
                 Value::BigInt(project_id),
@@ -2687,6 +2727,7 @@ fn parse_and_insert_message(
                 Value::BigInt(created_ts),
                 Value::Text(recipients_json.clone()),
                 Value::Text(attachments),
+                archive_metadata,
             ],
         )
         .map_err(|e| DbError::Sqlite(format!("insert message with id {cid}: {e}")))?;
@@ -2694,8 +2735,8 @@ fn parse_and_insert_message(
     } else {
         conn.execute_sync(
             "INSERT INTO messages \
-             (project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments, archive_metadata_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 Value::BigInt(project_id),
                 Value::BigInt(sender_id),
@@ -2708,6 +2749,7 @@ fn parse_and_insert_message(
                 Value::BigInt(created_ts),
                 Value::Text(recipients_json.clone()),
                 Value::Text(attachments),
+                archive_metadata,
             ],
         )
         .map_err(|e| DbError::Sqlite(format!("insert message: {e}")))?;
@@ -2716,6 +2758,9 @@ fn parse_and_insert_message(
         query_last_insert_rowid(conn)?
     };
 
+    if canonical_id.is_none() {
+        stats.generated_archive_message_ids.insert(message_id);
+    }
     stats.messages += 1;
 
     // Insert recipients
@@ -2736,6 +2781,196 @@ fn parse_and_insert_message(
     }
 
     Ok(())
+}
+
+/// Remove only the metadata authority of replies whose original parent no
+/// longer has one unambiguous canonical identity in the same project. Message
+/// bodies, archive artifacts and delivery rows are retained unchanged.
+fn invalidate_unresolved_archive_reply_parents(
+    conn: &DbConn,
+    stats: &mut ReconstructStats,
+) -> DbResult<()> {
+    let generated_ids = std::mem::take(&mut stats.generated_archive_message_ids);
+    let ambiguous_parents = std::mem::take(&mut stats.ambiguous_canonical_parent_ids);
+    let mut floor = 0_i64;
+    let mut invalidated = 0_usize;
+    loop {
+        // The database is the private reconstruction candidate and this pass
+        // remains inside its caller-owned transaction. Read only the bounded
+        // metadata projection, never materialize message bodies or the table.
+        let rows = conn
+            .query_sync(
+                &format!(
+                    "SELECT id, project_id, thread_id, archive_metadata_json FROM messages \
+                     WHERE id > ? AND archive_metadata_json IS NOT NULL \
+                       AND archive_metadata_json != '{{}}' \
+                     ORDER BY id LIMIT {SALVAGE_MESSAGE_BATCH_ROWS}"
+                ),
+                &[Value::BigInt(floor)],
+            )
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "reconstruct: inspect reply parent identities: {error}"
+                ))
+            })?;
+        for row in &rows {
+            let id = row.get_named::<i64>("id").map_err(|error| {
+                DbError::Sqlite(format!("reconstruct: decode reply identity: {error}"))
+            })?;
+            floor = id;
+            let project_id = row.get_named::<i64>("project_id").map_err(|error| {
+                DbError::Sqlite(format!("reconstruct: decode reply project: {error}"))
+            })?;
+            let thread_id = row
+                .get_named::<Option<String>>("thread_id")
+                .map_err(|error| {
+                    DbError::Sqlite(format!("reconstruct: decode reply thread: {error}"))
+                })?;
+            let raw = row
+                .get_named::<String>("archive_metadata_json")
+                .map_err(|error| {
+                    DbError::Sqlite(format!("reconstruct: decode reply metadata: {error}"))
+                })?;
+            let parent = validated_recovered_archive_metadata(&raw, id, thread_id.as_deref())
+                .and_then(|metadata| metadata.get("reply_to").and_then(serde_json::Value::as_i64));
+            if let Some(parent) = parent
+                && !generated_ids.contains(&parent)
+                && !ambiguous_parents.contains(&(project_id, parent))
+            {
+                let parent_rows = conn
+                    .query_sync(
+                        "SELECT project_id FROM messages WHERE id = ?",
+                        &[Value::BigInt(parent)],
+                    )
+                    .map_err(|error| {
+                        DbError::Sqlite(format!(
+                            "reconstruct: inspect original reply parent: {error}"
+                        ))
+                    })?;
+                if let Some(parent_row) = parent_rows.first() {
+                    let parent_project =
+                        parent_row.get_named::<i64>("project_id").map_err(|error| {
+                            DbError::Sqlite(format!(
+                                "reconstruct: decode original parent project: {error}"
+                            ))
+                        })?;
+                    if parent_project == project_id {
+                        continue;
+                    }
+                }
+            }
+            conn.execute_sync(
+                "UPDATE messages SET archive_metadata_json = NULL WHERE id = ?",
+                &[Value::BigInt(id)],
+            )
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "reconstruct: clear unresolved reply metadata: {error}"
+                ))
+            })?;
+            invalidated += 1;
+        }
+        if rows.len() < SALVAGE_MESSAGE_BATCH_ROWS {
+            break;
+        }
+    }
+    if invalidated > 0 {
+        stats.push_warning(format!(
+            "Retained {invalidated} reconstructed reply message(s) with unknown archive metadata \
+             because their original parent identity was missing, remapped, cross-project or ambiguous"
+        ));
+    }
+    Ok(())
+}
+
+/// Retain only complete, understood archive metadata. Unknown extensions and
+/// remapped identities remain NULL so reconciliation must find an original
+/// bundle instead of silently dropping fields or inventing reply lineage.
+fn reconstructed_archive_metadata(
+    raw: &str,
+    message: &serde_json::Value,
+    canonical_id: Option<i64>,
+    thread_id: Option<&str>,
+) -> Value {
+    #[derive(serde::Deserialize)]
+    struct ReplyProjection {
+        #[serde(default, deserialize_with = "deserialize_recovered_reply_parent")]
+        reply_to: Option<i64>,
+    }
+    let Some(id) = canonical_id else {
+        return Value::Null;
+    };
+    // Decode from the original JSON too: Value has already collapsed any
+    // duplicate keys, while the typed parent projection rejects ambiguity.
+    let Ok(parent_projection) = serde_json::from_str::<ReplyProjection>(raw) else {
+        return Value::Null;
+    };
+    let Some(object) = message.as_object() else {
+        return Value::Null;
+    };
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "id" | "from"
+                | "to"
+                | "cc"
+                | "bcc"
+                | "subject"
+                | "created"
+                | "thread_id"
+                | "topic"
+                | "project"
+                | "project_slug"
+                | "importance"
+                | "ack_required"
+                | "attachments"
+                | "reply_to"
+        )
+    }) || message.get("thread_id").and_then(serde_json::Value::as_str) != thread_id
+    {
+        return Value::Null;
+    }
+    let metadata = parent_projection.reply_to.map_or_else(
+        || serde_json::json!({}),
+        |parent| serde_json::json!({"reply_to": parent}),
+    );
+    validated_recovered_archive_metadata(&metadata.to_string(), id, thread_id)
+        .map_or(Value::Null, |metadata| Value::Text(metadata.to_string()))
+}
+
+fn deserialize_recovered_reply_parent<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <i64 as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+fn validated_recovered_archive_metadata(
+    raw: &str,
+    message_id: i64,
+    thread_id: Option<&str>,
+) -> Option<serde_json::Value> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Metadata {
+        #[serde(default, deserialize_with = "deserialize_recovered_reply_parent")]
+        reply_to: Option<i64>,
+    }
+    // Current durable metadata is either {} or one positive integer parent.
+    // Bound decoding even when the salvage source is damaged.
+    if raw.len() > 128 || !raw.trim_start().starts_with('{') {
+        return None;
+    }
+    // Typed decoding rejects duplicate reply_to keys instead of accepting the
+    // last value as if the source had one unambiguous parent.
+    let metadata: Metadata = serde_json::from_str(raw).ok()?;
+    metadata.reply_to.map_or_else(
+        || Some(serde_json::json!({})),
+        |parent| {
+            (parent > 0 && parent != message_id && thread_id.is_some_and(|id| !id.is_empty()))
+                .then(|| serde_json::json!({"reply_to": parent}))
+        },
+    )
 }
 
 /// Ensure an agent row exists, creating a placeholder if needed.
@@ -5413,6 +5648,7 @@ fn merge_salvaged_database(
                     "created_ts",
                     "recipients_json",
                     "attachments",
+                    "archive_metadata_json",
                 ],
                 stats,
                 salvage_db_path,
@@ -5568,10 +5804,32 @@ fn merge_salvaged_database(
                         placeholder_id
                     };
 
-                    let thread_id = row
-                        .get_named::<String>("thread_id")
+                    let raw_thread_id = row.get_named::<String>("thread_id").ok();
+                    let thread_id = raw_thread_id
+                        .as_deref()
+                        .and_then(sanitize_reconstructed_thread_id);
+                    let archive_metadata = row
+                        .get_named::<String>("archive_metadata_json")
                         .ok()
-                        .and_then(|raw: String| sanitize_reconstructed_thread_id(raw.as_str()));
+                        .filter(|_| raw_thread_id.as_deref() == thread_id.as_deref())
+                        .and_then(|raw| {
+                            validated_recovered_archive_metadata(
+                                &raw,
+                                source_message_id,
+                                thread_id.as_deref(),
+                            )
+                        })
+                        .filter(|metadata| {
+                            // A known parent must have retained its identity in
+                            // this candidate. Unresolved or remapped references
+                            // need the surviving archive's stronger authority.
+                            metadata.get("reply_to").is_none_or(|parent| {
+                                parent.as_i64().is_some_and(|parent| {
+                                    message_id_map.get(&parent) == Some(&parent)
+                                })
+                            })
+                        })
+                        .map_or(Value::Null, |metadata| Value::Text(metadata.to_string()));
                     let thread_value = thread_id.map_or(Value::Null, Value::Text);
                     let topic_value = row
                         .get_named::<String>("topic")
@@ -5590,7 +5848,7 @@ fn merge_salvaged_database(
                         source_message_id,
                         stats,
                     );
-                    let values = [
+                    let mut values = [
                         Value::BigInt(target_project_id),
                         Value::BigInt(target_sender_id),
                         thread_value,
@@ -5607,14 +5865,18 @@ fn merge_salvaged_database(
                         Value::BigInt(source_created_ts),
                         Value::Text(recipients_json),
                         Value::Text(attachments),
+                        archive_metadata,
                     ];
                     let existing_project_id = message_project_id(&target_conn, source_message_id)?;
                     let target_message_id = if let Some(existing_project_id) = existing_project_id {
+                        // This row receives a new identity. Do not attest that
+                        // its old bundle metadata describes the remapped row.
+                        values[11] = Value::Null;
                         target_conn
                         .execute_sync(
                             "INSERT INTO messages \
-                             (project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             (project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments, archive_metadata_json) \
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             &values,
                         )
                         .map_err(|e| {
@@ -5635,8 +5897,8 @@ fn merge_salvaged_database(
                         target_conn
                         .execute_sync(
                             "INSERT INTO messages \
-                             (id, project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             (id, project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments, archive_metadata_json) \
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             &values_with_id,
                         )
                         .map_err(|e| {
@@ -6549,6 +6811,22 @@ fn apply_delta_in_transaction(
             )
             .map_err(|e| DbError::Sqlite(format!("incremental apply: verify id {id}: {e}")))?;
         if !rows.is_empty() {
+            // This delta inspects only missing IDs. A pre-existing parent can
+            // share an ID and project with an unrelated archived generation;
+            // neither physical DB health nor that numeric match proves lineage.
+            // Keep known sends, but require surviving archive evidence for an
+            // imported reply. Bound the change to this delta's newly added IDs.
+            conn.execute_sync(
+                "UPDATE messages SET archive_metadata_json = NULL \
+                 WHERE id = ? AND archive_metadata_json IS NOT NULL \
+                   AND archive_metadata_json != '{}'",
+                &[Value::BigInt(*id)],
+            )
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "incremental apply: retain unknown reply lineage for {id}: {error}"
+                ))
+            })?;
             applied += 1;
         }
     }
@@ -6618,6 +6896,506 @@ fn collect_message_files_with_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovered_archive_metadata_rejects_unknown_or_invalid_lineage() {
+        for raw in [
+            "null",
+            "[]",
+            "{broken",
+            r#"{"reply_to":null}"#,
+            r#"{"reply_to":0}"#,
+            r#"{"reply_to":2}"#,
+            r#"{"reply_to":"1"}"#,
+            r#"{"reply_to":1,"extension":"lost"}"#,
+            r#"{"reply_to":1,"reply_to":3}"#,
+        ] {
+            assert!(
+                validated_recovered_archive_metadata(raw, 2, Some("thread")).is_none(),
+                "invalid authority must remain unknown: {raw}"
+            );
+        }
+        assert!(validated_recovered_archive_metadata(r#"{"reply_to":1}"#, 2, None).is_none());
+        assert_eq!(
+            validated_recovered_archive_metadata("{}", 2, Some("thread")),
+            Some(serde_json::json!({}))
+        );
+        let message = serde_json::json!({"id":2,"thread_id":"thread","reply_to":1});
+        assert!(matches!(
+            reconstructed_archive_metadata(&message.to_string(), &message, None, Some("thread")),
+            Value::Null
+        ));
+        assert!(matches!(
+            reconstructed_archive_metadata(
+                &message.to_string(),
+                &message,
+                Some(2),
+                Some("changed-thread")
+            ),
+            Value::Null
+        ));
+        let ambiguous = r#"{"id":2,"thread_id":"thread","reply_to":1,"reply_to":3}"#;
+        assert!(matches!(
+            reconstructed_archive_metadata(
+                ambiguous,
+                &serde_json::from_str(ambiguous).unwrap(),
+                Some(2),
+                Some("thread")
+            ),
+            Value::Null
+        ));
+    }
+
+    fn assert_incremental_reply_metadata_rows(conn: &SqliteDbConn) {
+        let rows = conn
+            .query_sync(
+                "SELECT id, subject, body_md, archive_metadata_json FROM messages ORDER BY id",
+                &[],
+            )
+            .expect("read all retained messages");
+        assert_eq!(rows.len(), 4);
+        for (row, expected) in rows.iter().zip([
+            (7, "unrelated live parent", "keep live parent", Some("{}")),
+            (
+                8,
+                "existing reply",
+                "keep existing reply",
+                Some("{\"reply_to\":7}"),
+            ),
+            (9, "02-imported-reply", "body for 02-imported-reply", None),
+            (
+                10,
+                "03-imported-send",
+                "body for 03-imported-send",
+                Some("{}"),
+            ),
+        ]) {
+            assert_eq!(row.get_named::<i64>("id").unwrap(), expected.0);
+            assert_eq!(row.get_named::<String>("subject").unwrap(), expected.1);
+            assert_eq!(
+                row.get_named::<String>("body_md").unwrap().trim(),
+                expected.2
+            );
+            assert_eq!(
+                row.get_named::<Option<String>>("archive_metadata_json")
+                    .unwrap()
+                    .as_deref(),
+                expected.3
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_reply_metadata_does_not_attest_an_existing_same_project_parent_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = tmp.path().join("archive");
+        let mut artifacts = Vec::new();
+        for (subject, id, parent) in [
+            ("01-original-parent", 7, None),
+            ("02-imported-reply", 9, Some(7)),
+            ("03-imported-send", 10, None),
+        ] {
+            artifacts.push(write_reply_identity_fixture_message(
+                &storage, "project", subject, id, parent, false,
+            ));
+        }
+        let db = tmp.path().join("existing.db");
+        let conn = SqliteDbConn::open_file(db.to_str().unwrap()).expect("existing database");
+        conn.execute_raw(&schema::init_schema_sql_base())
+            .expect("existing schema");
+        conn.execute_raw(
+            "INSERT INTO projects(id,slug,human_key,created_at) VALUES(1,'project','/project',1);
+             INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts)
+               VALUES(1,1,'Alice','test','test',1,1),(2,1,'Bob','test','test',1,1);
+             INSERT INTO messages(id,project_id,sender_id,thread_id,subject,body_md,created_ts,archive_metadata_json)
+               VALUES(7,1,1,'different-thread','unrelated live parent','keep live parent',1,'{}'),
+                     (8,1,1,'different-thread','existing reply','keep existing reply',2,'{\"reply_to\":7}');
+             INSERT INTO message_recipients(message_id,agent_id,kind,read_ts,ack_ts)
+               VALUES(8,2,'to',123,456);"
+        ).expect("seed unrelated same-project parent and existing receipt");
+        drop(conn);
+        let outcome = apply_archive_ahead_delta(&db, &storage, 2).expect("apply bounded delta");
+        let ArchiveDeltaApplyOutcome::Applied(stats) = outcome else {
+            panic!("valid message delta must remain applicable");
+        };
+        assert_eq!(stats.missing_message_ids, 2);
+        assert_eq!(stats.messages_applied, 2);
+        let conn = SqliteDbConn::open_file(db.to_str().unwrap()).expect("inspect delta");
+        assert_incremental_reply_metadata_rows(&conn);
+        let receipts = conn
+            .query_sync(
+                "SELECT message_id, read_ts, ack_ts FROM message_recipients ORDER BY message_id",
+                &[],
+            )
+            .expect("read retained and new delivery receipts");
+        assert_eq!(receipts.len(), 3);
+        assert_eq!(receipts[0].get_as::<i64>(0).unwrap(), 8);
+        assert_eq!(receipts[0].get_as::<i64>(1).unwrap(), 123);
+        assert_eq!(receipts[0].get_as::<i64>(2).unwrap(), 456);
+        for receipt in &receipts[1..] {
+            assert!(receipt.get_as::<Option<i64>>(1).unwrap().is_none());
+            assert!(receipt.get_as::<Option<i64>>(2).unwrap().is_none());
+        }
+        drop(conn);
+        for (path, bytes) in artifacts {
+            assert_eq!(std::fs::read(path).expect("retained archive"), bytes);
+        }
+        assert!(matches!(
+            apply_archive_ahead_delta(&db, &storage, 2).expect("repeat bounded delta"),
+            ArchiveDeltaApplyOutcome::NotApplicable(_)
+        ));
+    }
+
+    #[test]
+    fn reconstruct_duplicate_archive_metadata_requires_agreement() {
+        for (first_parent, second_parent, first_extension, second_extension, expected) in [
+            (Some(1), Some(2), false, false, None),
+            (None, Some(1), false, false, None),
+            (Some(1), None, false, false, None),
+            (Some(1), Some(1), false, true, None),
+            (Some(1), Some(1), true, false, None),
+            (Some(1), Some(1), false, false, Some("{\"reply_to\":1}")),
+            (None, None, false, false, Some("{}")),
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let storage = tmp.path().join("archive");
+            let mut artifacts = Vec::new();
+            for (subject, id) in [("01-parent", 1), ("02-other-parent", 2)] {
+                artifacts.push(write_reply_identity_fixture_message(
+                    &storage, "project", subject, id, None, false,
+                ));
+            }
+            let (first_path, first_bytes) = write_reply_identity_fixture_message(
+                &storage,
+                "project",
+                "03-duplicate",
+                3,
+                first_parent,
+                first_extension,
+            );
+            let first_text = std::str::from_utf8(&first_bytes).expect("first artifact UTF-8");
+            let mut duplicate: serde_json::Value =
+                serde_json::from_str(extract_json_frontmatter(first_text).unwrap()).unwrap();
+            let object = duplicate.as_object_mut().unwrap();
+            object.remove("reply_to");
+            object.remove("custom_extension");
+            if let Some(parent) = second_parent {
+                object.insert("reply_to".to_string(), serde_json::json!(parent));
+            }
+            if second_extension {
+                object.insert("custom_extension".to_string(), serde_json::json!("retain"));
+            }
+            let second_path = first_path
+                .parent()
+                .unwrap()
+                .join("2026-09-22T00-01-00Z__duplicate__3.md");
+            let second_bytes =
+                format!("---json\n{duplicate}\n---\n\nsecond artifact body\n").into_bytes();
+            std::fs::write(&second_path, &second_bytes).expect("conflicting duplicate");
+            // A later agreeing copy must not promote an earlier uncertainty
+            // back into known metadata merely because it is visited last.
+            let third_path = first_path
+                .parent()
+                .unwrap()
+                .join("2026-09-22T00-02-00Z__duplicate__3.md");
+            std::fs::write(&third_path, &first_bytes).expect("later agreeing copy");
+            artifacts.push((third_path, first_bytes.clone()));
+            artifacts.push((first_path, first_bytes));
+            artifacts.push((second_path, second_bytes));
+
+            let db = tmp.path().join("reconstructed.db");
+            let stats = reconstruct_from_archive(&db, &storage).expect("reconstruct duplicates");
+            assert_eq!(stats.messages, 3);
+            assert_eq!(stats.recipients, 3, "duplicate recipients stay unmerged");
+            assert_eq!(stats.duplicate_canonical_message_files, 2);
+            let conn = SqliteDbConn::open_file(db.to_str().unwrap()).expect("inspect database");
+            let rows = conn
+                .query_sync(
+                    "SELECT body_md, archive_metadata_json FROM messages WHERE id = 3",
+                    &[],
+                )
+                .expect("retained duplicate row");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].get_named::<String>("body_md").unwrap().trim(),
+                "body for 03-duplicate"
+            );
+            assert_eq!(
+                rows[0]
+                    .get_named::<Option<String>>("archive_metadata_json")
+                    .unwrap()
+                    .as_deref(),
+                expected,
+                "parent agreement: {first_parent:?}/{second_parent:?}, extensions: {first_extension}/{second_extension}"
+            );
+            for (path, bytes) in artifacts {
+                assert_eq!(std::fs::read(path).expect("retained archive"), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn reconstruct_reply_metadata_rejects_cross_project_and_allocated_parent_aliases() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = tmp.path().join("archive");
+        let mut artifacts = Vec::new();
+        for (slug, subject, id, parent, extension) in [
+            ("project-a", "01-original-parent", 1, None, false),
+            ("project-a", "02-good-reply", 2, Some(1), false),
+            ("project-a", "03-extended-parent", 3, None, true),
+            ("project-a", "04-good-extended-reply", 4, Some(3), false),
+            ("project-b", "01-colliding-parent", 1, None, false),
+            ("project-b", "02-wrong-project-reply", 5, Some(1), false),
+            // The deferred parent gets generated ID 7 after canonical ID 6.
+            // That allocation cannot prove an original reference to ID 7.
+            ("project-b", "03-unresolved-reply", 6, Some(7), false),
+        ] {
+            artifacts.push(write_reply_identity_fixture_message(
+                &storage, slug, subject, id, parent, extension,
+            ));
+        }
+        let db = tmp.path().join("reconstructed.db");
+        let stats = reconstruct_from_archive(&db, &storage).expect("reconstruct collisions");
+        assert_eq!(stats.messages, 7, "every original message is retained");
+        assert_eq!(stats.recipients, 7);
+        assert_eq!(stats.cross_project_canonical_collisions, 1);
+
+        let conn = SqliteDbConn::open_file(db.to_str().unwrap()).expect("inspect database");
+        let rows = conn
+            .query_sync(
+                "SELECT m.id, p.slug, m.subject, m.body_md, m.archive_metadata_json \
+             FROM messages m JOIN projects p ON p.id=m.project_id ORDER BY m.id",
+                &[],
+            )
+            .expect("reconstructed messages");
+        assert_eq!(rows.len(), 7);
+        for row in &rows {
+            let id = row.get_named::<i64>("id").unwrap();
+            let metadata = row
+                .get_named::<Option<String>>("archive_metadata_json")
+                .unwrap();
+            let expected = match id {
+                1 => Some("{}"),
+                2 => Some(r#"{"reply_to":1}"#),
+                4 => Some(r#"{"reply_to":3}"#),
+                _ => None,
+            };
+            assert_eq!(
+                metadata.as_deref(),
+                expected,
+                "parent authority for message {id}"
+            );
+            let subject = row.get_named::<String>("subject").unwrap();
+            assert_eq!(
+                row.get_named::<String>("body_md").unwrap().trim(),
+                format!("body for {subject}")
+            );
+            assert_eq!(
+                row.get_named::<String>("slug").unwrap(),
+                if id <= 4 { "project-a" } else { "project-b" }
+            );
+        }
+        assert_eq!(
+            rows[6].get_named::<String>("subject").unwrap(),
+            "01-colliding-parent"
+        );
+        assert!(stats.generated_archive_message_ids.is_empty());
+        assert!(stats.ambiguous_canonical_parent_ids.is_empty());
+        for (path, bytes) in artifacts {
+            assert_eq!(std::fs::read(path).expect("retained archive"), bytes);
+        }
+    }
+
+    #[test]
+    fn reconstruct_reply_metadata_rejects_late_same_project_parent_collision() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = tmp.path().join("archive");
+        let mut artifacts = Vec::new();
+        for (subject, id, parent) in [
+            ("01-original-parent", 1, None),
+            ("02-ambiguous-reply", 2, Some(1)),
+            // This collision is discovered after the reply was inserted.
+            ("03-reused-parent", 1, None),
+            ("04-stable-parent", 3, None),
+            ("05-unaffected-reply", 4, Some(3)),
+        ] {
+            artifacts.push(write_reply_identity_fixture_message(
+                &storage, "project", subject, id, parent, false,
+            ));
+        }
+        let db = tmp.path().join("reconstructed.db");
+        let stats = reconstruct_from_archive(&db, &storage).expect("reconstruct reused parent");
+        assert_eq!(stats.messages, 5);
+        assert_eq!(stats.recipients, 5);
+        assert_eq!(stats.same_project_canonical_identity_collisions, 1);
+        let conn = SqliteDbConn::open_file(db.to_str().unwrap()).expect("inspect database");
+        let rows = conn
+            .query_sync(
+                "SELECT id, subject, body_md, archive_metadata_json FROM messages ORDER BY id",
+                &[],
+            )
+            .expect("reconstructed messages");
+        assert_eq!(rows.len(), 5);
+        for row in &rows {
+            let id = row.get_named::<i64>("id").unwrap();
+            let metadata = row
+                .get_named::<Option<String>>("archive_metadata_json")
+                .unwrap();
+            let expected = match id {
+                1 | 3 => Some("{}"),
+                4 => Some(r#"{"reply_to":3}"#),
+                _ => None,
+            };
+            assert_eq!(
+                metadata.as_deref(),
+                expected,
+                "parent authority for message {id}"
+            );
+            let subject = row.get_named::<String>("subject").unwrap();
+            assert_eq!(
+                row.get_named::<String>("body_md").unwrap().trim(),
+                format!("body for {subject}")
+            );
+        }
+        assert_eq!(
+            rows[4].get_named::<String>("subject").unwrap(),
+            "03-reused-parent"
+        );
+        for (path, bytes) in artifacts {
+            assert_eq!(std::fs::read(path).expect("retained archive"), bytes);
+        }
+    }
+
+    fn write_reply_identity_fixture_message(
+        storage: &Path,
+        slug: &str,
+        subject: &str,
+        id: i64,
+        parent: Option<i64>,
+        extension: bool,
+    ) -> (PathBuf, Vec<u8>) {
+        let project = storage.join("projects").join(slug);
+        let messages = project.join("messages/2026/09");
+        std::fs::create_dir_all(&messages).expect("message directory");
+        std::fs::write(
+            project.join("project.json"),
+            format!(r#"{{"slug":"{slug}","human_key":"/{slug}","created_at":1}}"#),
+        )
+        .expect("project metadata");
+        let mut message = serde_json::json!({
+            "id":id,"from":"Alice","to":["Bob"],"cc":[],"bcc":[],
+            "thread_id":"thread","subject":subject,
+            "created":"2026-09-22T00:00:00Z","attachments":[],
+            "importance":"normal","ack_required":false
+        });
+        if let Some(parent) = parent {
+            message["reply_to"] = serde_json::json!(parent);
+        }
+        if extension {
+            message["custom_extension"] = serde_json::json!("original parent extension");
+        }
+        let bytes = format!("---json\n{message}\n---\n\nbody for {subject}\n").into_bytes();
+        let path = messages.join(format!("2026-09-22T00-00-00Z__{subject}__{id}.md"));
+        std::fs::write(&path, &bytes).expect("message artifact");
+        (path, bytes)
+    }
+
+    #[test]
+    fn reconstruct_preserves_complete_archive_reply_metadata() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = tmp.path().join("archive");
+        let project = storage.join("projects/lineage");
+        let messages = project.join("messages/2026/09");
+        std::fs::create_dir_all(&messages).expect("message directory");
+        std::fs::write(
+            project.join("project.json"),
+            r#"{"slug":"lineage","human_key":"/lineage","created_at":1}"#,
+        )
+        .expect("project metadata");
+        for id in 1..=3 {
+            let mut message = serde_json::json!({
+                "id":id,"from":"Alice","to":["Bob"],"cc":[],"bcc":[],
+                "thread_id":"lineage-thread","subject":format!("message {id}"),
+                "created":"2026-09-22T00:00:00Z","attachments":[],
+                "importance":"normal","ack_required":true
+            });
+            if id > 1 {
+                message["reply_to"] = serde_json::json!(1);
+            }
+            if id == 3 {
+                message["custom_extension"] = serde_json::json!("must survive");
+            }
+            std::fs::write(
+                messages.join(format!("2026-09-22T00-00-00Z__message__{id}.md")),
+                format!("---json\n{message}\n---\n\nbody\n"),
+            )
+            .expect("message artifact");
+        }
+        let db = tmp.path().join("reconstructed.db");
+        let stats = reconstruct_from_archive(&db, &storage).expect("reconstruct");
+        assert_eq!(stats.messages, 3);
+        let conn = SqliteDbConn::open_file(db.to_str().unwrap()).expect("inspect database");
+        let rows = conn
+            .query_sync(
+                "SELECT archive_metadata_json FROM messages ORDER BY id",
+                &[],
+            )
+            .expect("read archive authority");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].get_as::<String>(0).unwrap(), "{}");
+        assert_eq!(rows[1].get_as::<String>(0).unwrap(), r#"{"reply_to":1}"#);
+        assert_eq!(rows[2].get_as::<Option<String>>(0).unwrap(), None);
+    }
+
+    #[test]
+    fn salvage_preserves_known_reply_metadata_and_legacy_uncertainty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = tmp.path().join("archive");
+        std::fs::create_dir_all(storage.join("projects")).expect("archive directory");
+        let source_path = tmp.path().join("source.db");
+        let source = SqliteDbConn::open_file(source_path.to_str().unwrap()).expect("source");
+        source
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("source schema");
+        source.execute_raw(
+            "INSERT INTO projects(id,slug,human_key,created_at) VALUES(1,'lineage','/lineage',1);
+             INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts)
+               VALUES(1,1,'Alice','test','test',1,1),(2,1,'Bob','test','test',1,1);
+             INSERT INTO messages(id,project_id,sender_id,thread_id,subject,body_md,created_ts,archive_metadata_json)
+               VALUES(1,1,1,'lineage-thread','root','body',1,'{}'),
+                     (2,1,1,'lineage-thread','reply','body',2,'{\"reply_to\":1}'),
+                     (3,1,1,'lineage-thread','legacy','body',3,NULL),
+                     (4,1,1,'lineage-thread','invalid','body',4,'{\"reply_to\":999}');
+             INSERT INTO message_recipients(message_id,agent_id,kind,read_ts,ack_ts)
+               VALUES(2,2,'to',123,456);"
+        ).expect("seed source");
+        drop(source);
+        let db = tmp.path().join("reconstructed.db");
+        let stats = reconstruct_from_archive_with_salvage(&db, &storage, Some(&source_path))
+            .expect("salvage");
+        assert_eq!(stats.salvaged_messages, 4);
+        let conn = SqliteDbConn::open_file(db.to_str().unwrap()).expect("inspect database");
+        let rows = conn
+            .query_sync(
+                "SELECT archive_metadata_json FROM messages ORDER BY id",
+                &[],
+            )
+            .expect("read archive authority");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].get_as::<String>(0).unwrap(), "{}");
+        assert_eq!(rows[1].get_as::<String>(0).unwrap(), r#"{"reply_to":1}"#);
+        assert_eq!(rows[2].get_as::<Option<String>>(0).unwrap(), None);
+        assert_eq!(rows[3].get_as::<Option<String>>(0).unwrap(), None);
+        let receipts = conn
+            .query_sync(
+                "SELECT read_ts,ack_ts FROM message_recipients WHERE message_id=2",
+                &[],
+            )
+            .expect("read receipts");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].get_as::<i64>(0).unwrap(), 123);
+        assert_eq!(receipts[0].get_as::<i64>(1).unwrap(), 456);
+    }
 
     fn exact_test_directory_files(
         directory: &Path,
@@ -7129,6 +7907,8 @@ mod tests {
             warnings: vec![],
             suppressed_warnings: 0,
             duplicate_canonical_id_set: BTreeSet::new(),
+            generated_archive_message_ids: HashSet::new(),
+            ambiguous_canonical_parent_ids: HashSet::new(),
         };
         let display = stats.to_string();
         assert!(display.contains("2 projects"));
