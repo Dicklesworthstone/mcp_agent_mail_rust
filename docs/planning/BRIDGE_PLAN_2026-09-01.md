@@ -270,12 +270,41 @@ assertions. The full historical scan is still not a release clearance.
 
 The live discovery/context bead is closed on this evidence, published in
 `169143db` to main and its required mirror. The broader `br-8j6cb` recovery
-acceptance remains open. In particular, source review confirms that the ordinary
-successful commit path calls
-`try_restore_index_to_head`, while staged metadata is snapshotted per message.
-A real multi-message test is still needed to establish whether the first repair
-discards another message's only staged metadata; a per-pass cache alone would
-not address later batches or restarts. No runtime loss or fix is claimed here.
+acceptance remains open.
+
+The next continuation reproduced the staged-metadata loss on `5a298c07` plus a
+new regression, before changing production code. The first threaded message
+repaired and repeated idempotently in fresh processes; the next message failed
+because resetting the shared Git index had discarded its only reply metadata.
+Strict RCH run `a1004463-1617-465f-9214-3486dfd081cb` failed that one test at
+12:46:28 UTC on September 22. Its complete log and source receipt are retained
+as `20260922-rainyforest-staged-initial-{reproducer.log,source.sha256}` under
+`/data/projects/am-release-20260912`. The test's later ordinary-commit variant
+was not reached in that failing run.
+
+Archive commits now construct trees independently of the shared index. After a
+successful commit, index maintenance holds Git's `index.lock` from observation
+through atomic replacement, and updates only an index clean relative to that
+commit's actual parent. Dirty, locked and invalid indexes stay byte-identical;
+unrelated staged-only objects are excluded from the committed tree. Maintenance
+failure warns without retrying an already-durable commit. A busy lock can leave
+the index stale, so this does not promise clean status after every concurrent
+commit.
+
+The corrected selection passed **80/80** tests on strict RCH `vmi1264463`, run
+`24ddec7d-0776-442d-a05d-8565c9ab3f11`, terminal 12:56:03 UTC, 28.730 seconds
+runtime, 5,015 tests outside selection. The real-Git regression repairs six
+staged-only replies in separate processes, both with and without an earlier
+ordinary archive commit. It verifies exact reply/extension metadata, BCC
+redaction, body and committed bytes, retained evidence and idempotence. Another
+regression crosses three commit strategies with clean, staged, locked and
+corrupt indexes, including rejected-path preservation. Existing recovery and
+commit concurrency controls also pass. The six processes establish evidence
+survival beyond a four-repair batch's lifetime; they do not exercise the actual
+batch cursor or transport backlog. Journal-enqueue failure, backlog exhaustion,
+interrupted transport recovery and independent review remain open acceptance.
+The fixed log is `20260922-rainyforest-staged-fixed-tests.log`, SHA-256
+`be5d7943065d25ad72bcbc8f6b21d21035417052de21ca2e108aed1c01542b90`.
 
 RainyForest read all 1,350 lines of current AGENTS.md and 2,053 lines of README.md.
 The current vision, durability, threat, browser and ATC contracts were compared
