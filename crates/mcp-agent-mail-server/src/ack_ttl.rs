@@ -14,13 +14,18 @@
 //! active claims are checked again on later laps, including after an error.
 //! Attempts are coalesced per recipient/month within each slice, and lookup
 //! failures never authorize a broader inbox pattern or a different holder.
+//! A proposal is revalidated in the grant transaction using its observed
+//! generation. Only a confirmed new grant authorizes archive publication.
 
 #![forbid(unsafe_code)]
 
 use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_db::ack_scan::{AckScanCursor, MAX_ACK_SCAN_PAGE_SIZE, overdue_ack_page};
+use mcp_agent_mail_db::ack_scan::{
+    AckEscalationRequest, AckScanCursor, MAX_ACK_SCAN_PAGE_SIZE, grant_ack_escalation,
+    overdue_ack_page,
+};
 use mcp_agent_mail_db::{DbPool, DbPoolConfig, create_pool, micros_to_iso, now_micros, queries};
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -331,7 +336,7 @@ fn run_ack_ttl_slice(
                 row.agent_id,
                 inbox_month_path(row.created_ts),
             ))
-            && let Err(error) = escalate(config, pool, &cx, row, now)
+            && let Err(error) = escalate_observed(config, pool, &cx, row, page.generation_id())
         {
             warn!(
                 event = "ack_escalation_deferred",
@@ -353,8 +358,9 @@ fn run_ack_ttl_slice(
 }
 
 fn inbox_month_path(created_ts: i64) -> String {
-    let ts_secs = created_ts / 1_000_000;
-    let dt = chrono::DateTime::from_timestamp(ts_secs, 0)
+    // This is only a coalescing key. The grant API independently refuses an
+    // unrepresentable timestamp instead of granting against an epoch fallback.
+    let dt = chrono::DateTime::from_timestamp_micros(created_ts)
         .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
     dt.format("%Y/%m").to_string()
 }
@@ -374,31 +380,24 @@ fn validate_escalation_agent_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Escalate an overdue ACK via the configured escalation mode.
-fn escalate(
+/// Execute the proposal with the generation captured by its scan, not a newly
+/// observed generation that could make an old proposal appear current.
+fn escalate_observed(
     config: &Config,
     pool: &DbPool,
     cx: &Cx,
     row: &queries::UnackedMessageRow,
-    _now: i64,
+    generation_id: Option<&str>,
 ) -> Result<(), String> {
-    let mode = config.ack_escalation_mode.to_lowercase();
-    if mode != "file_reservation" {
-        // "log" mode (or unknown): logging was already done above.
+    if !config.ack_escalation_mode.eq_ignore_ascii_case("file_reservation") {
         return Ok(());
     }
 
-    // Fetch project to get slug for archive write.
-    let project =
-        match block_on(async { queries::get_project_by_id(cx, pool, row.project_id).await }) {
-            Outcome::Ok(p) => p,
-            other => return Err(format!("failed to fetch project: {other:?}")),
-        };
-
-    // An unresolved or cross-project identity never authorizes a wildcard
-    // reservation over every agent's inbox. Retry after metadata is available.
-    let recipient = match block_on(async { queries::get_agent_by_id(cx, pool, row.agent_id).await })
-    {
+    let project = match block_on(queries::get_project_by_id(cx, pool, row.project_id)) {
+        Outcome::Ok(project) => project,
+        other => return Err(format!("failed to fetch project: {other:?}")),
+    };
+    let recipient = match block_on(queries::get_agent_by_id(cx, pool, row.agent_id)) {
         Outcome::Ok(agent) => agent,
         other => return Err(format!("failed to resolve escalation recipient: {other:?}")),
     };
@@ -407,35 +406,25 @@ fn escalate(
     }
     validate_escalation_agent_name(&recipient.name)?;
     let recipient_name = recipient.name;
-    let month_path = inbox_month_path(row.created_ts);
-    let pattern = format!("agents/{recipient_name}/inbox/{month_path}/*.md");
 
-    // Determine holder agent. An explicit custom holder is an identity
-    // requirement, not permission to silently fall back to the recipient.
+    // Custom-holder setup remains preparatory. The eventual lease transaction
+    // revalidates this exact holder, and never silently selects a replacement.
     let holder_name_cfg = &config.ack_escalation_claim_holder_name;
     let (holder_agent_id, holder_agent_name) = if holder_name_cfg.is_empty() {
-        // Use the recipient agent as the holder.
-        (row.agent_id, recipient_name)
+        (row.agent_id, recipient_name.clone())
     } else {
         validate_escalation_agent_name(holder_name_cfg)?;
-        let holder = match block_on(async {
-            queries::insert_system_agent(
-                cx,
-                pool,
-                row.project_id,
-                holder_name_cfg,
-                "ops",
-                "system",
-                "ops-escalation",
-            )
-            .await
-        }) {
+        let holder = match block_on(queries::insert_system_agent(
+            cx,
+            pool,
+            row.project_id,
+            holder_name_cfg,
+            "ops",
+            "system",
+            "ops-escalation",
+        )) {
             Outcome::Ok(agent) => agent,
-            other => {
-                return Err(format!(
-                    "failed to resolve custom escalation holder: {other:?}"
-                ));
-            }
+            other => return Err(format!("failed to resolve custom escalation holder: {other:?}")),
         };
         if holder.project_id != row.project_id {
             return Err("ACK escalation holder belongs to another project".to_string());
@@ -448,102 +437,85 @@ fn escalate(
         (holder_id, holder.name)
     };
 
-    // Create the file reservation.
-    let ttl_s = i64::try_from(config.ack_escalation_claim_ttl_seconds).unwrap_or(3600);
-    let has_existing = match block_on(async {
-        // Only treat *active* matching reservations as dedupe candidates.
-        // Historical released/expired rows must not block new escalation claims.
-        queries::list_file_reservations(cx, pool, row.project_id, true).await
-    }) {
-        Outcome::Ok(existing) => existing.into_iter().any(|reservation| {
-            reservation.agent_id == holder_agent_id
-                && reservation.path_pattern == pattern
-                && reservation.reason == "ack-overdue"
-                && (reservation.exclusive != 0) == config.ack_escalation_claim_exclusive
-        }),
-        other => {
-            return Err(format!(
-                "failed to check existing escalation claims: {other:?}"
-            ));
-        }
+    let request = AckEscalationRequest {
+        observed: row,
+        generation_id,
+        project_slug: &project.slug,
+        project_key: &project.human_key,
+        recipient_name: &recipient_name,
+        holder_id: holder_agent_id,
+        holder_name: &holder_agent_name,
+        ttl_seconds: i64::try_from(config.ack_escalation_claim_ttl_seconds).unwrap_or(3600),
+        exclusive: config.ack_escalation_claim_exclusive,
     };
-    if has_existing {
-        return Ok(());
-    }
+    let reservation = match block_on(grant_ack_escalation(cx, pool, &request)) {
+        Outcome::Ok(Some(reservation)) => reservation,
+        // An ACK or identity change after paging is normal. An existing active
+        // automatic claim is also a no-op: no renewal and no archive dispatch.
+        Outcome::Ok(None) => return Ok(()),
+        other => return Err(format!("failed to admit escalation reservation: {other:?}")),
+    };
+    info!(
+        event = "ack_escalation",
+        message_id = row.message_id,
+        project_id = row.project_id,
+        holder_agent_id,
+        pattern = %reservation.path_pattern,
+        reservations_created = 1,
+        "ACK escalation: committed file reservation"
+    );
 
-    match block_on(async {
-        queries::create_file_reservations(
-            cx,
-            pool,
-            row.project_id,
-            holder_agent_id,
-            &[pattern.as_str()],
-            ttl_s,
-            config.ack_escalation_claim_exclusive,
-            "ack-overdue",
-        )
-        .await
-    }) {
-        Outcome::Ok(reservations) => {
-            info!(
-                event = "ack_escalation",
-                message_id = row.message_id,
-                project_id = row.project_id,
-                holder_agent_id,
-                pattern = %pattern,
-                reservations_created = reservations.len(),
-                "ACK escalation: created file reservation"
+    let mut artifact = serde_json::json!({
+        "id": reservation.id,
+        "project": &project.human_key,
+        "agent": &holder_agent_name,
+        "path_pattern": &reservation.path_pattern,
+        "exclusive": reservation.exclusive != 0,
+        "reason": &reservation.reason,
+        "created_ts": micros_to_iso(reservation.created_ts),
+        "expires_ts": micros_to_iso(reservation.expires_ts),
+    });
+    if let Some(generation) = generation_id {
+        artifact["db_generation"] = serde_json::json!(generation);
+    }
+    let op = mcp_agent_mail_storage::WriteOp::FileReservation {
+        project_slug: project.slug.clone(),
+        config: config.clone(),
+        reservations: vec![artifact],
+    };
+    // Preserve direct grant publication (GH#178). A delayed queued active
+    // grant could resurrect an artifact after a later directly written release.
+    // The worker still holds its page's generation/write lease here. A failed
+    // archive write is repaired by the existing reconcile-on-read path.
+    match mcp_agent_mail_storage::write_op_sync_direct(&op) {
+        mcp_agent_mail_storage::DirectArchiveWrite::Written
+        | mcp_agent_mail_storage::DirectArchiveWrite::SkippedDiskCritical => {}
+        mcp_agent_mail_storage::DirectArchiveWrite::Failed(error) => {
+            warn!(
+                error = %error,
+                project = %project.slug,
+                "ACK escalation archive write failed; leaving the artifact to reconcile-on-read"
             );
-
-            // Write reservation artifacts to git archive (best-effort).
-            if !reservations.is_empty() {
-                let res_jsons: Vec<serde_json::Value> = reservations
-                    .iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "id": r.id.unwrap_or(0),
-                            "project": &project.human_key,
-                            "agent": &holder_agent_name,
-                            "path_pattern": &r.path_pattern,
-                            "exclusive": r.exclusive != 0,
-                            "reason": &r.reason,
-                            "created_ts": micros_to_iso(r.created_ts),
-                            "expires_ts": micros_to_iso(r.expires_ts),
-                        })
-                    })
-                    .collect();
-                let op = mcp_agent_mail_storage::WriteOp::FileReservation {
-                    project_slug: project.slug.clone(),
-                    config: config.clone(),
-                    reservations: res_jsons,
-                };
-                // Write the grant artifact directly (GH#178 semantics), never
-                // via the write-behind queue: a QUEUED active-grant op drained
-                // after the holder's later direct-written release would
-                // resurrect a stale-active artifact — a wrong holder that the
-                // released-row reconcile pass (br-74sxo) would only repair on
-                // a later reservation access. On failure the DB row stays
-                // authoritative and reconcile-on-read re-emits the artifact on
-                // the next reservation read in this project.
-                match mcp_agent_mail_storage::write_op_sync_direct(&op) {
-                    mcp_agent_mail_storage::DirectArchiveWrite::Written
-                    | mcp_agent_mail_storage::DirectArchiveWrite::SkippedDiskCritical => {}
-                    mcp_agent_mail_storage::DirectArchiveWrite::Failed(error) => {
-                        warn!(
-                            error = %error,
-                            project = %project.slug,
-                            "ACK escalation archive write failed; leaving the artifact to reconcile-on-read"
-                        );
-                    }
-                }
-            }
-
-            Ok(())
         }
-        other => Err(format!(
-            "failed to create escalation reservation: {other:?}"
-        )),
     }
+    Ok(())
+}
+
+/// Existing direct-call fixtures create a fresh observation. Production always
+/// passes the generation of its already-fetched page to `escalate_observed`.
+#[cfg(test)]
+fn escalate(
+    config: &Config,
+    pool: &DbPool,
+    cx: &Cx,
+    row: &queries::UnackedMessageRow,
+    _now: i64,
+) -> Result<(), String> {
+    let page = match block_on(overdue_ack_page(cx, pool, None, i64::MAX, 1)) {
+        Outcome::Ok(page) => page,
+        other => return Err(format!("test observation: {other:?}")),
+    };
+    escalate_observed(config, pool, cx, row, page.generation_id())
 }
 
 #[cfg(test)]
@@ -1689,5 +1661,122 @@ mod tests {
             (3, 3)
         );
         assert_eq!(state.warned.len(), 3);
+    }
+
+    fn escalation_config(tmp: &tempfile::TempDir) -> Config {
+        let mut config = test_config(tmp);
+        config.ack_ttl_seconds = 0;
+        config.ack_escalation_enabled = true;
+        config.ack_escalation_mode = "file_reservation".into();
+        config.ack_escalation_claim_holder_name.clear();
+        config
+    }
+
+    fn claim_rows(cx: &Cx, pool: &DbPool, project_id: i64) -> Vec<mcp_agent_mail_db::FileReservationRow> {
+        match block_on(queries::list_file_reservations(cx, pool, project_id, false)) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("read observed grants: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acknowledgment_between_page_read_and_execution_creates_no_grant_or_artifact() {
+        let (tmp, pool, cx, original) = seed_unacked_message();
+        seeded_generation(&cx, &pool);
+        let config = escalation_config(&tmp);
+        let mut state = AckScanState::default();
+        let mut checks = 0;
+        let result = run_ack_ttl_slice(
+            &config,
+            &pool,
+            &mut state,
+            || {
+                checks += 1;
+                // Entry and post-barrier checks precede paging. The third is
+                // immediately before processing the already-observed first row.
+                if checks == 3 {
+                    match block_on(queries::acknowledge_message(
+                        &cx, &pool, original.agent_id, original.message_id,
+                    )) {
+                        Outcome::Ok(_) => {}
+                        other => panic!("ACK after page read: {other:?}"),
+                    }
+                }
+                false
+            },
+            || true,
+        ).unwrap();
+        assert_eq!(checks, 3, "the interleaving must actually execute");
+        assert_eq!(result, (1, 1));
+        assert!(claim_rows(&cx, &pool, original.project_id).is_empty());
+        assert!(!config.storage_root.exists());
+        assert_eq!(run_ack_ttl_cycle(&config, &pool).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn changed_generation_refuses_old_proposal_but_a_fresh_one_can_progress() {
+        let (tmp, pool, cx, original) = seed_unacked_message();
+        let old_generation = seeded_generation(&cx, &pool);
+        let config = escalation_config(&tmp);
+        let new_generation = format!("{old_generation}ab");
+        set_test_generation(&cx, &pool, &new_generation);
+        escalate_observed(&config, &pool, &cx, &original, Some(&old_generation)).unwrap();
+        assert!(claim_rows(&cx, &pool, original.project_id).is_empty());
+        assert!(!config.storage_root.exists());
+        // This is a new observation, not silently rebinding the old proposal.
+        assert_eq!(run_ack_ttl_cycle(&config, &pool).unwrap(), (1, 1));
+        assert_eq!(claim_rows(&cx, &pool, original.project_id).len(), 1);
+    }
+
+    #[test]
+    fn committed_grant_artifact_is_stamped_and_duplicate_does_not_renew_it() {
+        let (tmp, pool, cx, original) = seed_unacked_message();
+        let generation = seeded_generation(&cx, &pool);
+        let config = escalation_config(&tmp);
+        assert_eq!(run_ack_ttl_cycle(&config, &pool).unwrap(), (1, 1));
+        let before = claim_rows(&cx, &pool, original.project_id);
+        assert_eq!(before.len(), 1);
+        let project = match block_on(queries::get_project_by_id(&cx, &pool, original.project_id)) {
+            Outcome::Ok(project) => project,
+            other => panic!("project for actual artifact: {other:?}"),
+        };
+        let filename = mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+            Some(&generation), before[0].id.unwrap(),
+        );
+        let path = config.storage_root.join("projects").join(project.slug)
+            .join("file_reservations").join(filename);
+        let bytes = std::fs::read(&path).expect("confirmed grant must be published by the direct archive path");
+        let artifact: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(artifact["db_generation"], generation);
+        assert_eq!(artifact["id"], before[0].id.unwrap());
+        assert_eq!(artifact["path_pattern"], before[0].path_pattern);
+        assert_eq!(run_ack_ttl_cycle(&config, &pool).unwrap(), (1, 1));
+        let after = claim_rows(&cx, &pool, original.project_id);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, before[0].id);
+        assert_eq!(after[0].expires_ts, before[0].expires_ts);
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn acknowledgment_after_committed_grant_does_not_revoke_or_renew_the_lease() {
+        let (tmp, pool, cx, original) = seed_unacked_message();
+        let generation = seeded_generation(&cx, &pool);
+        let config = escalation_config(&tmp);
+        escalate_observed(&config, &pool, &cx, &original, Some(&generation)).unwrap();
+        let before = claim_rows(&cx, &pool, original.project_id);
+        assert_eq!(before.len(), 1);
+        match block_on(queries::acknowledge_message(
+            &cx, &pool, original.agent_id, original.message_id,
+        )) {
+            Outcome::Ok(_) => {}
+            other => panic!("ACK after committed grant: {other:?}"),
+        }
+        escalate_observed(&config, &pool, &cx, &original, Some(&generation)).unwrap();
+        let after = claim_rows(&cx, &pool, original.project_id);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, before[0].id);
+        assert_eq!(after[0].expires_ts, before[0].expires_ts);
+        assert_eq!(after[0].released_ts, before[0].released_ts);
     }
 }
