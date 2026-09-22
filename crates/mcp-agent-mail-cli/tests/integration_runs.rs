@@ -692,6 +692,160 @@ fn serve_stdio_reconciles_db_only_mail_without_client_reads() {
     conn.close_sync().unwrap();
     mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
 
+    assert_idle_stdio_reconciles(&env, "2024/01/2024-01-01T00-00-00Z__idle-recovery__1.md", 1);
+}
+
+#[test]
+fn serve_stdio_recovers_accepted_send_after_archive_failure_and_restart() {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
+    insert_project(
+        &conn,
+        1,
+        "idle-recovery",
+        &env.hostile_repo.display().to_string(),
+    );
+    insert_agent(&conn, 1, 1, "BlueLake", "test", "test");
+    insert_agent(&conn, 2, 1, "GreenStone", "test", "test");
+    conn.execute_raw("UPDATE agents SET contact_policy = 'open'")
+        .unwrap();
+    conn.close_sync().unwrap();
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
+
+    // Real filesystem failures, confined to this private mailbox. Leave the
+    // canonical messages directory readable for the ID-floor safety scan;
+    // obstruct the outbox so materialization fails after the DB accepts mail.
+    let project = env.storage_root.join("projects/idle-recovery");
+    std::fs::create_dir_all(project.join("agents/BlueLake")).unwrap();
+    let blocked_outbox = project.join("agents/BlueLake/outbox");
+    let blocked_journal = env.storage_root.join(".archive_backlog");
+    std::fs::write(&blocked_outbox, b"preserve archive obstruction").unwrap();
+    std::fs::write(&blocked_journal, b"preserve journal obstruction").unwrap();
+    let stdout_path = env.tmp.path().join("failed-send.stdout");
+    let stderr_path = env.tmp.path().join("failed-send.stderr");
+    let mut child = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("AM_ATC_ENABLED", "false")
+        .env("RUST_LOG", "warn")
+        .current_dir(env.hostile_repo())
+        .arg("serve-stdio")
+        .stdin(Stdio::piped())
+        .stdout(std::fs::File::create(&stdout_path).unwrap())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .expect("start server with obstructed archive");
+    let input = format!(
+        "{}\n{}\n{}\n",
+        initialize_request(),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        tool_call(
+            2,
+            "send_message",
+            json!({
+                "project_key": env.hostile_repo.display().to_string(),
+                "sender_name": "BlueLake", "to": ["GreenStone"],
+                "subject": "idle recovery", "body_md": "Retain this accepted message."
+            })
+        )
+    );
+    let sent = child.stdin.as_mut().unwrap().write_all(input.as_bytes());
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut accepted = None;
+    let mut failed_materialization = false;
+    while sent.is_ok() && Instant::now() < deadline {
+        let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+        accepted = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|response| response["id"] == 2);
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        failed_materialization = stderr.contains("[wbq-drain] op failed after retries");
+        if accepted.as_ref().is_some_and(|response| {
+            response.get("error").is_some() || response["result"]["isError"] == true
+        }) {
+            break;
+        }
+        if accepted.is_some() && failed_materialization || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    // Abruptly stop the owned process after the accepted reply and observed
+    // failed archive write, retaining the DB and both obstruction witnesses.
+    let _ = child.kill();
+    child.wait().expect("reap failed-archive server");
+    let stderr = std::fs::read_to_string(stderr_path).unwrap();
+    assert!(
+        sent.is_ok(),
+        "send request write failed: {sent:?}; {stderr}"
+    );
+    assert!(accepted.is_some(), "no send_message response: {stderr}");
+    let accepted = accepted.expect("send_message response");
+    assert!(accepted.get("error").is_none(), "{accepted}; {stderr}");
+    assert_ne!(accepted["result"]["isError"], true, "{accepted}; {stderr}");
+    let payload: Value =
+        serde_json::from_str(accepted["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["count"], 1, "{payload}");
+    let message_id = payload["deliveries"][0]["payload"]["id"].as_i64().unwrap();
+    assert!(
+        failed_materialization,
+        "archive failure was not observed: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&blocked_outbox).unwrap(),
+        b"preserve archive obstruction"
+    );
+    assert_eq!(
+        std::fs::read(&blocked_journal).unwrap(),
+        b"preserve journal obstruction"
+    );
+
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
+    let rows = conn
+        .query_sync("SELECT id, created_ts, body_md FROM messages", &[])
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one accepted message survives the stop"
+    );
+    assert_eq!(rows[0].get_named::<i64>("id").unwrap(), message_id);
+    assert_eq!(
+        rows[0].get_named::<String>("body_md").unwrap(),
+        "Retain this accepted message."
+    );
+    let created_ts = rows[0].get_named::<i64>("created_ts").unwrap();
+    conn.close_sync().unwrap();
+    std::fs::rename(
+        &blocked_outbox,
+        env.tmp.path().join("outbox-obstruction.saved"),
+    )
+    .unwrap();
+    std::fs::rename(
+        &blocked_journal,
+        env.tmp.path().join("journal-obstruction.saved"),
+    )
+    .unwrap();
+
+    // Respect the production 30-second grace period; never age or rewrite the
+    // accepted DB row just to make the recovery test pass.
+    let wait_us = created_ts
+        .saturating_add(31_000_000)
+        .saturating_sub(mcp_agent_mail_db::now_micros());
+    if wait_us > 0 {
+        thread::sleep(Duration::from_micros(u64::try_from(wait_us).unwrap()));
+    }
+    let created = chrono::DateTime::from_timestamp_micros(created_ts).unwrap();
+    let filename = format!(
+        "{}__idle-recovery__{message_id}.md",
+        created.format("%Y/%m/%Y-%m-%dT%H-%M-%SZ")
+    );
+    assert_idle_stdio_reconciles(&env, &filename, message_id);
+}
+
+fn assert_idle_stdio_reconciles(env: &TestEnv, filename: &str, message_id: i64) {
     let stdout_path = env.tmp.path().join("stdio.stdout");
     let stderr_path = env.tmp.path().join("stdio.stderr");
     let mut child = Command::new(am_bin())
@@ -718,7 +872,6 @@ fn serve_stdio_reconciles_db_only_mail_without_client_reads() {
     );
     let sent = child.stdin.as_mut().unwrap().write_all(input.as_bytes());
     let project = env.storage_root.join("projects/idle-recovery");
-    let filename = "2024/01/2024-01-01T00-00-00Z__idle-recovery__1.md";
     let paths = [
         format!("messages/{filename}"),
         format!("agents/BlueLake/outbox/{filename}"),
@@ -770,8 +923,8 @@ fn serve_stdio_reconciles_db_only_mail_without_client_reads() {
     let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
     let rows = conn
         .query_sync(
-            "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 1",
-            &[],
+            "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
+            &[SqlValue::BigInt(message_id)],
         )
         .unwrap();
     assert_eq!(rows.len(), 1);

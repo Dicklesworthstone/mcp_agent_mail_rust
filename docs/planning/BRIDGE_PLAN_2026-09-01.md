@@ -1,5 +1,396 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## September 21, 2026 assessment
+
+**The product is substantial and useful, and its ordinary workspace gate has
+passed since the previous assessment. The current dependency migration, sustained
+reliability, archive convergence under failure, and strict release acceptance are
+still unfinished.** Prioritize those outcomes over more features or another
+planning campaign. This section supersedes the dated conclusions below; retained
+historical failures are not a current failure count.
+
+### Evidence boundary
+
+**Implementation investigation correction:** bounded DB-to-archive reconciliation
+already exists in `storage/src/recovery/message_reconcile/database.rs` and is
+called by the server retention worker. HTTP and TUI start that worker; stdio
+omitted it. Earlier conclusions inferred missing machinery from stale comments.
+The stdio lifecycle wiring and real idle-session regression landed in
+`ce784836`; failure-path qualification remains in progress. Threaded messages
+without surviving authoritative reply metadata remain deliberately deferred.
+
+**Execution update:** the strict RCH baseline workspace/all-targets Clippy run
+completed successfully on `vmi1264463` at 15:10:24 UTC, September 21 (536 seconds;
+`/tmp/rainyforest-archive-baseline-clippy.log`, exit 0). This supersedes the
+baseline Clippy NO_VERDICT below, not the wider release gate. Subsequent stdio
+wiring and its integration test require their own validation.
+
+The stdio wiring now has real-process evidence: strict RCH nextest on
+`vmi1264463` passed `serve_stdio_reconciles_db_only_mail_without_client_reads`
+in 12.826 seconds (one test passed; 81 outside the selection), terminal
+September 21 at 16:18:17 UTC. The private fixture verifies initialized stdio,
+canonical/outbox/inbox content in Git HEAD without client reads/retries, and
+unchanged read/ack state. Retained log:
+`/data/projects/am-release-20260912/20260921-rainyforest-stdio-reconcile-pass.log`.
+The preceding capacity refusal and 1,800-second compilation timeout are excluded
+attempts, not test failures or passes. This closes the observed wiring defect's
+positive regression, not the bead's full fault/restart acceptance. The patch
+received a two-file UBS scan with 98 critical and 3,924 warning heuristic
+findings, not a clean full scan. September 22 triage established that all 98
+critical findings also occur at unchanged HEAD: test panics and test-executable
+setup, route/status comparisons misidentified as secrets, snapshot directory
+names, and guarded CORS/JWT test paths. The supported baseline comparison
+completed with zero new critical findings and 30 warning/10 informational
+records, reviewed as test assertions/setup, fixed paths, bounded polling and
+ordinal-shifted existing statements. No suppressions or scanner rules changed.
+The installed scanner omitted per-finding output due to a missing helper path;
+an isolated copy of the same binary linked to its existing helpers produced the
+complete comparison. This is patch-level review, not full-scan/release clearance.
+Edited-source workspace/all-targets check passed at 16:27:07 UTC (480.6 seconds)
+and Clippy with `-D warnings` passed at 16:29:30 UTC (102.1 seconds), both through
+strict RCH on the same worker. Fresh formatting and whitespace checks passed.
+`br-g2ip0` is closed for its compiler/format scope; this is self-verification,
+not independent review or broader release acceptance.
+
+**September 22 failure/restart qualification:** 25 existing storage reconciliation
+tests passed through strict RCH on `vmi1264463` (405 outside selection; 5.225
+seconds). Both CLI subprocess tests then passed (81 outside selection; 58.189
+seconds total), including a real accepted send, an observed outbox write failure,
+an abrupt owned-process stop, and an idle restart that commits all three message
+copies without reads/resends or read/ack changes. The journal directory was also
+unavailable, but the journal-enqueue failure branch and backlog exhaustion were
+not exercised. The first fixture incorrectly blocked the canonical ID scan and
+was refused before acceptance; its failed run is retained separately. Correcting
+the obstruction to the outbox preserved every acceptance assertion. Logs are
+`20260922-rainyforest-reconcile-controls.log` and
+`20260922-rainyforest-restart-pass.log` under the artifact directory above.
+The broader bead remains in progress for the original journal/backlog,
+attachment, threaded-metadata and interrupted-repair acceptance. Existing unit
+negatives support their own scope; they do not replace those transport cases.
+Final workspace/all-target check and Clippy with warnings denied passed through
+strict RCH at 01:47:55 and 01:48:55 UTC, respectively; formatting passed. The final
+complete UBS baseline comparison exited 0 with zero new critical findings;
+83 warnings and 32 informational records were reviewed as test setup/assertions,
+fixed paths, bounded polling and shifted pre-existing occurrences. The full
+historical scan remains nonzero. All verification here was self-executed.
+
+RainyForest read all 1,350 lines of current AGENTS.md and 2,053 lines of README.md.
+The current vision, durability, threat, browser and ATC contracts were compared
+with source, the verification ledger, dependency upgrade log, previous full
+plan/spec audit and tracker. Historical plan/spec coverage is reused explicitly;
+this is not a claim that every historical document was freshly reread. The prior
+assessment's conclusions were challenged against newer source and terminal
+artifacts, rather than inherited as present truth.
+
+- Source inspected: `17be6b647049d8a775661a2737c59466932665fc`, main. The only
+  initially dirty tracked files were the two Beads JSONL files. No production
+  source was edited or shared mailbox repaired in this assessment.
+- Live GitHub API: latest public release **v0.3.36**, published September 16 at
+  10:14:19 UTC, 15 assets. Publication is not a verdict on current main. Local
+  `am --version` is also 0.3.36, SHA-256
+  `e6cf98a365fae0d569d865e3f43e1068153191bb18641d663fbf4803705e77a7`.
+  Version equality alone does not establish identical source or release assets.
+- Important correction: `br-l1q6z` is **closed with a later full green run**.
+  Its September 16 terminal receipt reports 17,547 tests passed, zero failed,
+  36 excluded, zero passing-leaky. Inspected retained
+  `all-eleven-fixes-full-workspace-vmi1227854.{log,result.json,source.json}` in
+  `/data/projects/am-release-20260912`; exit 0 and `source_stable=true`.
+  This predates the current 0.4.4 runtime migration. Do not reopen that historical
+  restoration task merely because a newer candidate needs qualification.
+- More recent selected evidence is also real: inspected terminal logs show
+  3,335 DB/schema/search tests passed with seven skips on September 19, and
+  3,392 FTUI/console tests passed with 1,578 tests outside that selection.
+  Logs are `044-runtime-pin-db-broad-quiet-extract.log` and
+  `044-ftui-070-runtime-resumed.log` in the same artifact directory. These are
+  retained executions, not fresh runs performed by this assessment.
+- At assessment start, whole-workspace Clippy had **NO_VERDICT**:
+  the preceding continuation hit a Cargo `color_quant` source-cache panic on
+  hz2, then a 1,800-second remote build timeout on vmi1264463, then a capacity
+  refusal. The later terminal workspace passes above supersede that state and
+  close `br-g2ip0`. Focused passes cannot certify later merged source. No local
+  build fallback was used.
+- Fresh live coordination succeeded: message 42750 persisted with both named
+  recipients; its delivery receipt explicitly says no signal or acknowledgment
+  witnessed. Plan reservation 11785 was granted without conflict. This proves
+  a bounded live path, not every tool or disaster recovery.
+- Fresh live MCP health returned `status=ok`, **health_level=red**. Critical
+  integrity/connectivity verdicts were green; pressure was red. WBQ p95 was
+  1,047 ms and commit-queue p95 4,195 ms. Current pressure classification has
+  a 250 ms red queue threshold, so empty queues and the separate 15-second
+  coalescer degradation threshold do not make this contradictory or healthy.
+  Archive/DB message counts were 42,144/42,173 within configured tolerance;
+  that is not row-level parity proof. This observation is not a benchmark.
+- Local `am doctor health` exited 1 with `local_config_unattested`, one orphan
+  page in its private probe and 32 reservation-field differences. That is a
+  different, unattested target; do not merge it with the live integrity verdict.
+- Initial tracker: **44 open + 92 in progress + 13 blocked = 149 unfinished**,
+  plus 2,359 closed. Assignees and in-progress flags are not proof of current
+  activity. CASS health reports a stale index; no fresh session-search coverage
+  is claimed. Recent git, actual artifacts and Beads comments supply history.
+
+### Architecture and numbered vision checklist
+
+The native CLI/server drive FastMCP stdio/HTTP handlers and shared tools/resources.
+Tools use the SQLModel pool and FrankenSQLite runtime for canonical operational
+rows, then feed Git archival and search indexing. Core owns configuration,
+models, metrics and safety contracts; storage owns archive/coalescing; guard and
+share are separate consumers. Server supplies the TUI and authenticated HTML
+mail UI; CLI adds setup, robot, doctor and native E2E/bench runners. This is a
+12-member workspace, with the public dashboard replay built separately.
+
+Runtime is Asupersync 0.5 / SQLModel 0.5 / patched FrankenSQLite 0.4.4; embedded
+Beads retains a separate patched 0.3.18 engine. Canonical C SQLite remains a
+verification/recovery exception, not the runtime mailbox. FrankenSearch and
+FastMCP are now immutable Git pins; the old gated sibling-clone story is stale.
+
+`PARTIAL` means real implementation with incomplete acceptance or known gaps.
+`UNPROVEN` does not mean absent. A live sampled path is deliberately narrower
+than whole-family certification. Paths below are relative to `crates/` unless
+otherwise stated. Existing implementation/test pairs are retained.
+
+| # | Testable promise | Source and actual status | Remaining acceptance / Beads |
+|---|---|---|---|
+| 1 | 45 tools and 25 resource contracts | tools modules and server registration are real; protocol upgrade PARTIAL | `br-s3xbp`, `br-w9v59.1`, conformance at final candidate |
+| 2 | Explicit send/reply/read/ack and durable receipts | `tools/src/messaging.rs`; fresh persisted send WORKING within that sample | `br-kp1in.1/.2`, identity/recipient reconciliation across restart |
+| 3 | Broadcast always refused | messaging normalization and handler both reject it; implemented | Preserve negative transport coverage; no broadcast feature |
+| 4 | Reliable DB-to-Git convergence | Bounded background reconciliation now wired for HTTP/TUI/stdio; real idle stdio recovery passes; PARTIAL | `br-8j6cb`, `br-kp1in.2/.9/.10`; broader failure/restart qualification |
+| 5 | Concurrent operations without lost/duplicate accepted mail | Transactional/idempotency paths real; sustained current proof UNPROVEN | `br-htobc`, `br-sa58k`, `br-22gm3`, `br-kp1in.1/.2` |
+| 6 | Safe recovery and retained namespace authority | `db/src/pool.rs`, write barriers and CLI recovery real; PARTIAL | `br-xzgcj`, `br-8asz3`, `br-cdsge`, `br-oyget`, `br-3p187`, `br-qfvd6` |
+| 7 | Bounded engine/pool lifetime and real dependency behavior | Current pin includes retained-FD repair; selected tests pass; PARTIAL | `br-5lgwn`, `br-8r6dl`, `br-eru3j`, `br-oiok2`, `br-mmnyj` |
+| 8 | Identity, contact and topic semantics | Real typed handlers, proof gate and persisted topics; PARTIAL | `br-sgaee`, `br-g6c0z`, `br-qayvs`; transport/restart matrix |
+| 9 | Leases, conflicts, renew/release and guard | Real reservations plus fresh successful plan lease; wider PARTIAL | `br-9bwnb`, `br-ssog9`, mixed workflow and real commit guard |
+| 10 | Product membership and build-slot coordination | `tools/src/products.rs`, `build_slots.rs` are implemented | `br-kp1in.1/.2`; scope/TTL tests, advisory slots are not mutexes |
+| 11 | Bare am and automatic agent setup | CLI startup and core setup real; authority races remain PARTIAL | `br-49eak`, `br-siq0z`, `br-db75q`, `br-fphbm`, `br-7znpo` |
+| 12 | Safe credentials and client configuration | Real token/config logic and hardening, still PARTIAL | `br-ww5js`, `br-x5a8y`, `br-q8k82`, `br-6u4hx`, `br-x2jf5` |
+| 13 | 16-screen TUI with responsive input | Real FTUI screens; retained 3,392 selected passes; PARTIAL qualification | `br-ivgot`, `br-l4fk6`; quiet input/resize/attachment/read-only scenarios |
+| 14 | Authenticated web mail and usable share/export | Real `mail_ui.rs` and share crypto/snapshot modules; current full UNPROVEN | `br-ji2f0`, real HTTP/auth/export tamper lanes |
+| 15 | Fast truthful robot/doctor health | Implemented; fresh health explains red pressure; performance PARTIAL | `br-es9fm`, `br-eru3j`, health latency task, `br-kp1in.5/.6` |
+| 16 | Reversible owner-safe doctor | Real mutation/undo machinery; latest backup/writer fixes unqualified together | `br-qfvd6`, `br-qdgio`, `br-r6psd`, `br-sd3md`, recovery owner tests |
+| 17 | Search-as-you-type and scoped Search V3 | Real lexical/private-snapshot/optional hybrid routes; PARTIAL | `br-7x5fm`, `br-eh8bj`, `br-kp1in.7/.8`; retain safe SQL fallback |
+| 18 | Real optional model/TOON quality | Implemented selected paths; TOON retained real tests improve prior picture | `br-kp1in.7/.8`; actual model/encoder and privacy/relevance controls |
+| 19 | ATC learns while defaults stay quiet | Hooks, persistence and bounded hydration real; long-duration UNPROVEN | `br-hwney`, `br-au76r`, `br-kp1in.1/.2`; shadow/write-off retained |
+| 20 | Signed install/update on supported targets | v0.3.36 published; installer/source pin logic real; acceptance PARTIAL | `br-nq2kb`, `br-bx73n`, installer and platform owners |
+| 21 | Lossless Python import and explicit cutover | Legacy code implemented; namespace/publication cases PARTIAL | `br-lkhxw`, `br-dbt24`, `br-1m1tv`, `br-ajiq8` |
+| 22 | Complete current correctness and reproducible release gate | Older full green exists; current candidate UNPROVEN | `br-5lgwn`, `br-g2ip0`, `br-kp1in.3/.4`, `br-bx73n` |
+| 23 | Measured operational latency/resource budgets | Bench infrastructure real; current general claims UNPROVEN | `br-kp1in.5/.6`, stress tasks; no historical-number extrapolation |
+| 24 | Honest active docs and deliberate distribution scope | Current README boundaries much improved; VISION/old tasks conflict | `br-4meup`, `br-95spu`, `br-ajiq8`; reconcile authority without deleting history |
+| 25 | Privacy-safe public WASM replay | Standalone real screen/replay exists; deployment not reverified here | `br-f9avw.10`, `br-mq9q1`; live browser mirror stays deferred |
+
+No entirely uncovered feature family was found. The backlog already covers the
+goals, but literal completion of stale descriptions would **not** finish them.
+Examples: `br-kp1in.3` still describes mtime selection although current
+`read_incident_scorecard` consumes exact producer identity/digest; `br-ku0kl`
+describes an obsolete sibling clone; `br-yzk37` calls knobs inert despite engine
+implementations now present. These need current acceptance, not duplicate code.
+Project-addressed mailboxes and session-bound identity remain explicit future
+requests, not prerequisites silently added to today's trusted-local contract.
+
+### Bridge: smallest coherent route to the promised product
+
+1. **Finish the current candidate, not another dependency campaign (M).**
+   `br-5lgwn` owns final combined-runtime qualification; `br-g2ip0` owns outstanding
+   compiler/lint verification. Use one admitted RCH build lane with a frozen
+   source/lock/features manifest, then reuse its artifacts for focused and full
+   gates. Classify each of the 36 older exclusions under the new engine; do not
+   silently carry obsolete trigger/concurrency excuses or count exclusions green.
+   Preserve original failures and watchdogs. Source fixes are not deployed fixes.
+2. **Close accepted-message recovery and publication gaps (M–L, critical).**
+   Promote `br-8j6cb` from P3: an accepted DB row must eventually regain its
+   canonical, sender and recipient archive records after a failed queue/journal
+   and restart, even if no client reads/retries it. Wire the existing bounded
+   reconciliation worker into stdio; retain its authority and no-clobber checks.
+   Recovery/path/snapshot owners retain their scopes. Prove real positive repair
+   and no-clobber/scope negatives, not merely a safe refusal.
+3. **Complete one coherent real user history (L).** `br-kp1in.1/.2/.9/.10`
+   join messaging, contacts/products, leases, quiet ATC, cancellation and restart.
+   Begin with bounded smoke; then controlled faults on private fixtures; only
+   then the already-specified 24-hour/two-host profiles. Track committed versus
+   returned versus archived state separately; a timeout is initially unknown.
+   Require row/recipient witnesses and bounded resource growth, not equal counts.
+4. **Make performance explain the observed route (M).** `br-kp1in.5/.6`
+   report queue latency, archive lag, pressure, tool deadlines, RSS/FDs and
+   retry amplification together. Empty queues must not erase observed latency.
+   Keep absolute budget breaches when comparative controls are inadmissible.
+   Profile current health/global-search routes before changing algorithms or
+   weakening thresholds; preserve private-snapshot SQL fallback correctness.
+5. **Qualify the exact executable and gate publication (M).** Scorecard producer
+   binding already exists; finish its adversarial tests and actual manual
+   publisher consumer (`br-kp1in.3/.4`, `br-nq2kb`, `br-bx73n`). Require explicit
+   installed parity, selected real-path suites and native target evidence.
+   Shipping, signatures and full default tests are three different conclusions.
+   Do not enable Actions or publish a test release for this assessment.
+6. **Independent user-surface lanes (S–M each).** Finish setup/config authority,
+   legacy import/reopen, interactive TUI, optional dependency quality and share
+   export with existing owners. Optional model absence cannot certify that model
+   or block an explicitly lexical-only candidate. Preserve all existing features.
+7. **Reconcile active promises (S).** `br-4meup` must resolve VISION's automatic
+   stale-process killing, no-C-SQLite, byte-for-byte prose, zero ignored tests,
+   and deferred-web statements against newer governing contracts. Preserve the
+   goal and date the supersession; do not weaken safety or invent acceptance to
+   make old checkboxes true. Product decisions remain `br-ajiq8`/`br-95spu`.
+
+Implementation does not wait for an audit epic. The genuine dependency chain is
+candidate fixes → combined gates → real sustained/installed acceptance → release.
+Harness, measurement and adversarial-test development can proceed independently;
+certification waits on product correctness. No new architecture or tracker is
+needed. Exact Bead refinements and final graph validation follow below.
+
+### September 21 plan refinement record
+
+Phase 3a and Phase 5 use the frozen prompts retained verbatim below. The existing
+implementation/test graph is regenerated by updating its current evidence and
+acceptance rather than duplicating its issues. No implementation or release
+closure is credited to this assessment.
+
+**Ambition round 1: recovery without a helpful client.** A read-triggered healer
+alone does not close the archive promise: a message may never be read again.
+Require bounded startup/background reconciliation after transient archive failure
+and restart, with no client read or retry. An idempotent retry skips one-time
+archive dispatch by design, so it cannot be assumed to repair the missing copy.
+Keep source DB durability and eventual Git convergence as separate assertions.
+Do not attempt recovery of bytes no authoritative source retains. Companion
+tests must prove actual repaired artifacts, not only a logged degradation.
+
+**Ambition round 2: bounded progress under sustained contention.** Successful
+eventual retries can hide overload. Extend existing measurements to report
+offered, admitted, committed, replied and reconciled operations; attempt count
+and oldest outstanding age accompany percentiles. Bound the reconciliation
+backlog by work scheduling, not by dropping accepted DB truth. Sweep load until
+saturation on an owned fixture, then show recovery after load removal. Measure
+FD/RSS slopes and cold initialization separately from steady state. An admission
+refusal is a distinct outcome, never a fast successful operation. This improves
+the existing workload and performance pairs without a new telemetry subsystem.
+
+**Ambition round 3: separate transaction order from eventual convergence.** The
+existing bounded history checker should use partial-order constraints for
+transactional message/recipient/idempotency operations, with explicit barriers
+and durable witnesses for ambiguous responses. Archive convergence uses a
+different predicate after an admitted bounded drain; it must not be forced into
+an invented synchronous Git contract. Partition independent histories only while
+retaining cross-project global ID and recovery-generation constraints. Show a
+minimal counterexample for duplicate/lost rows or wrong-generation repair;
+exhaustion is NO_VERDICT. This is a useful application of history checking, not
+a new general model-checking framework or a universal correctness proof.
+
+Bead regeneration updated `br-kp1in.2/.3/.5/.9` and the existing product,
+migration and documentation tasks. The initial frozen instruction remains
+unchanged; improvements are embedded in the Beads, not only this document.
+
+**Refinement 1 — scope and source:** corrected obsolete dependency/scorecard
+assumptions, retained the legitimately closed older full gate, and left all
+ownership/status claims intact. Updated `br-ku0kl` with the current immutable
+dependency graph; its old sibling-clone title must not trigger duplicate work.
+
+**Refinement 2 — preserved behavior and test realism:** extended existing
+companions `.6` and `.10` with independently calculated accounting controls,
+no-client-trigger reconciliation, wrong-generation and missing-byte cases.
+Archive-only recovery cannot invent metadata it never stored. All existing
+scope/contact/identity, advisory-slot and broadcast-refusal assertions remain.
+
+**Refinement 3 — evidence:** inspected the retained full-gate terminal result and
+source manifest plus selected DB/FTUI terminal summaries, and updated `br-bx73n`.
+The released, locally installed, live-daemon and source candidates remain
+distinct. No recreated wrapper or inferred current pass substitutes for a
+terminal result; the old red count is explicitly superseded.
+
+**Refinement 4 — dependency order:** the existing workflow certification task
+`.2` had no dependency on the remaining archive convergence acceptance. Added
+exactly `br-kp1in.2 -> br-8j6cb` (the former depends on the latter). Test authoring
+need not wait, but certification cannot close while accepted messages still
+require luck or a client request to regain their recovery archive. The repair
+itself does not wait on the history checker, avoiding a cycle. Retained all
+other implementation/test pairings and assignees.
+
+**Refinement 5 — convergence:** reread the current 25-goal matrix and revised
+Beads against the original promises. No further scope, acceptance, priority or
+dependency change was needed. All literal issue IDs resolve; no issues were
+added or removed. This assessment changed 11 existing issues, with no status or
+assignee changes; the pre-existing `br-g2ip0` blocked-status update is also present
+in the shared JSONL diff. `br dep cycles --json` reports zero active cycles.
+Final `bv --robot-triage` reports 149 unfinished, 124 actionable and 25 not
+actionable; actionable includes owned work and is not permission to claim it.
+`br sync --flush-only` completed. `git diff --check` passed.
+
+The assessment-only UBS invocation returned **exit 3: no supported languages,
+nothing scanned** for Markdown/JSONL. It was not a pass, and those changes were
+initially left uncommitted. The subsequent implementation received the complete
+Rust baseline comparison and triage recorded above; `UBS_ALLOW_NO_SCAN` was never
+enabled. Neither an unsupported-language result nor a patch comparison proves
+that the complete release gate is green.
+
+### Requested-work and honesty disposition
+
+Window: the September 21 reality-check request only. The creation-gate consumer
+is the user explicitly requesting this assessment; the decision is where to
+direct implementation effort. Observed defects justifying it are the stale red
+gate narrative, obsolete dependency tasks and under-prioritized missing archive
+convergence. This section retires as active guidance at the next assessment;
+history is retained, never deleted. Running product code does not branch on it.
+The integrity-control exception is unnecessary because the request supplies the
+gate. Highest-value ready capability work is stable path authority (`br-xzgcj`)
+and archive convergence (`br-8j6cb`); another hour implementing those would offer
+more runtime value than extending this already complete requested assessment.
+
+Real-work inventory: **zero USER implementations, zero ENABLER implementations,
+one PROCESS assessment with its associated tracker updates**. There is no new
+feature to demonstrate; fresh live sends/receipts exercise existing capability.
+Without this work the binaries would be identical, but the requested steering
+would still rely on obsolete status. The long-standing corruption/recovery work
+remains important; this window served the explicit assessment request. No swarm
+was dispatched, no close count used as progress, no original acceptance split
+off to permit closure. Disposition: bounded requested process, zero runtime
+credit; stop planning and hand the existing implementation graph back to owners.
+
+Honesty inventory (solo review, not independent certification):
+
+1. No tests weakened/deleted/ignored (checked: only plan/JSONL changes).
+2. No doubles introduced (checked: no code/test changes).
+3. No goldens regenerated (checked: no fixture changes).
+4. No gate/validator relaxation (checked: no workflow/config changes; UBS's
+   suggested no-scan override was not used).
+5. No gate gaming (checked: all acceptance remains open; no publication).
+6. No zero-run green (checked: retained terminal counts, UBS explicitly no scan).
+7. No unrun-test claim (checked: retained versus fresh probes distinguished;
+   historical plan/spec audit reuse and unavailable current full gate disclosed).
+8. No lower-grade evidence promoted (checked: source presence, earlier tests,
+   live persisted receipt and released assets each retain their own scope).
+9. Corrected the previous assessment's obsolete red-test conclusion in place;
+   retained actual later green and current NO_VERDICT without projecting a count.
+10. No stderr suppression used for cited evidence (checked: tool output and
+    retained logs; truncated display output was not treated as a complete read).
+11. No unmet task closed (checked: IDs/statuses and assignees preserved).
+12. No spec weakened to fit code (checked: historical contradictions are assigned
+    to the existing docs task; safety/quality requirements remain intact).
+13–16. No delegated agents or delegated closures in this window; historical
+    peer receipts inspected as retained evidence, not independently rerun.
+17. No peer agreement counted as proof (checked: evidence comes from code,
+    terminal artifacts, API observations and tracker, not endorsement).
+18. No postselected performance denominator (checked: no performance win claim;
+    retained test totals and exclusions are shown together).
+19. Explainable limits: broad tool output can truncate, so neither `cat` alone
+    nor earlier audit reuse means every historical document was freshly read.
+    CASS's stale index precluded a claimed fresh history survey. The requested
+    AGENTS and README were read completely before assessment. The initial UBS
+    landing limitation and subsequent scoped triage are recorded above; no
+    permission or repair request is hidden behind a success claim.
+20. Strongest evidence: the inspected September 16 terminal full-gate receipt,
+    the exact current archive failure/replay paths, fresh persisted message
+    receipt and reproducible plan/Beads graph diff. These support the assessment,
+    not a claim that the remaining product gaps are fixed.
+
+Countermeasure for stale/overbroad success or failure reporting: keep exact
+candidate, selected scope and terminal evidence attached to every conclusion;
+no planning revision may stand in for product
+delivery (RH-10). No fresh CASS-wide retrospective honesty sweep is claimed.
+
+**Handoff:** assessment, bridge, initial Bead refinement, three ambition rounds,
+regeneration and five refinement passes are complete within the stated evidence
+limits. No new issues, runtime edits, default changes, release, or live repair.
+Resume the existing candidate/recovery/archive lanes; do not launch another
+assessment to avoid their remaining implementation work.
+
+## Historical September 8 assessment (superseded)
+
 **Current assessment: September 8, 2026 — requested complete reality check.**
 This assessment supersedes the September 4 and September 2 assessments retained
 below. The audit began at `ba2ad9ce`; peer changes subsequently advanced the code
