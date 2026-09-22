@@ -13,7 +13,7 @@
 
 #[path = "ack_escalation.rs"]
 mod escalation;
-pub use escalation::{AckEscalationRequest, grant_ack_escalation};
+pub use escalation::{AckEscalationOutcome, AckEscalationRequest, grant_ack_escalation};
 
 use asupersync::{Cx, Outcome};
 use sqlmodel_core::{Connection as _, Row, Value};
@@ -88,6 +88,13 @@ impl AckScanPage {
     #[must_use]
     pub fn generation_id(&self) -> Option<&str> {
         self.window.generation_id.as_deref()
+    }
+
+    /// Frozen eligibility bound to carry into the grant transaction. Resuming
+    /// a lap does not replace this with the latest wall-clock cutoff.
+    #[must_use]
+    pub const fn overdue_before_ts(&self) -> i64 {
+        self.window.before_ts
     }
 
     /// Advance only past rows the caller actually handled. Zero preserves the
@@ -370,6 +377,8 @@ mod tests {
             .unwrap();
             let second = page(conn, "db", Some(&cursor), 999, 2);
             assert_eq!(keys(&second), vec![(3, 1)]);
+            assert_eq!(first.overdue_before_ts(), 30);
+            assert_eq!(second.overdue_before_ts(), 30);
             assert!(second.continuation_after(1).unwrap().is_none());
             assert_eq!(keys(&page(conn, "db", None, 999, 4)), vec![(3, 1), (4, 1)]);
         });
@@ -389,7 +398,7 @@ mod tests {
             let restarted = page(conn, "db", Some(&cursor), 20, 1);
             assert_eq!(keys(&restarted), vec![(1, 1)]);
             assert_eq!(restarted.generation_id(), Some("generation-two"));
-            assert_eq!(restarted.window.before_ts, 20);
+            assert_eq!(restarted.overdue_before_ts(), 20);
         });
     }
 
@@ -481,7 +490,7 @@ mod tests {
                 let cursor = observed.continuation_after(size).unwrap().unwrap();
                 let next = page(conn, "db", Some(&cursor), 999, size);
                 assert_eq!(next.rows[0].agent_id, i64::try_from(size + 1).unwrap());
-                assert_eq!(next.window.before_ts, 10);
+                assert_eq!(next.overdue_before_ts(), 10);
             }
         });
     }
@@ -509,7 +518,7 @@ mod tests {
             .unwrap();
             assert_eq!(keys(&next), vec![(7, 13)]);
             assert_eq!(next.generation_id(), Some(generation));
-            assert_eq!(next.window.before_ts, 23);
+            assert_eq!(next.overdue_before_ts(), 23);
             assert_eq!(next.window.upper_id, 7);
         });
     }

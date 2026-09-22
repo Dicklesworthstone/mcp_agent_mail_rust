@@ -15,7 +15,8 @@
 //! Attempts are coalesced per recipient/month within each slice, and lookup
 //! failures never authorize a broader inbox pattern or a different holder.
 //! A proposal is revalidated in the grant transaction using its observed
-//! generation. Only a confirmed new grant authorizes archive publication.
+//! generation and frozen cutoff. Only a confirmed new grant authorizes archive
+//! publication; a stale delivery cannot suppress a pending sibling's proposal.
 
 #![forbid(unsafe_code)]
 
@@ -23,8 +24,8 @@ use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::ack_scan::{
-    AckEscalationRequest, AckScanCursor, MAX_ACK_SCAN_PAGE_SIZE, grant_ack_escalation,
-    overdue_ack_page,
+    AckEscalationOutcome, AckEscalationRequest, AckScanCursor, MAX_ACK_SCAN_PAGE_SIZE,
+    grant_ack_escalation, overdue_ack_page,
 };
 use mcp_agent_mail_db::{DbPool, DbPoolConfig, create_pool, micros_to_iso, now_micros, queries};
 use std::collections::HashSet;
@@ -327,25 +328,29 @@ fn run_ack_ttl_slice(
                 "ACK overdue"
             );
         }
-        // Coalesce by claim within this bounded slice, not by warning history.
-        // A failed claim must not pin the cursor or be mistaken for success;
-        // later laps retry it and the durable claim check prevents duplication.
-        if config.ack_escalation_enabled
-            && attempted_escalations.insert((
-                row.project_id,
-                row.agent_id,
-                inbox_month_path(row.created_ts),
-            ))
-            && let Err(error) = escalate_observed(config, pool, &cx, row, page.generation_id())
-        {
-            warn!(
-                event = "ack_escalation_deferred",
-                message_id = row.message_id,
-                project_id = row.project_id,
-                agent_id = row.agent_id,
-                error = %error,
-                "ACK escalation failed; will retry on a later overdue scan"
-            );
+        // Staleness applies to one delivery, not its whole recipient/month.
+        // Coalesce only a grant, existing coverage or a deferred error. Errors
+        // remain bounded to one per group per slice and retry on a later lap.
+        if config.ack_escalation_enabled {
+            let key = (row.project_id, row.agent_id, inbox_month_path(row.created_ts));
+            if !attempted_escalations.contains(&key) {
+                let result = escalate_observed(
+                    config, pool, &cx, row, page.generation_id(), page.overdue_before_ts(),
+                );
+                if !matches!(&result, Ok(false)) {
+                    attempted_escalations.insert(key);
+                }
+                if let Err(error) = result {
+                    warn!(
+                        event = "ack_escalation_deferred",
+                        message_id = row.message_id,
+                        project_id = row.project_id,
+                        agent_id = row.agent_id,
+                        error = %error,
+                        "ACK escalation failed; will retry on a later overdue scan"
+                    );
+                }
+            }
         }
         consumed += 1;
     }
@@ -380,17 +385,19 @@ fn validate_escalation_agent_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Execute the proposal with the generation captured by its scan, not a newly
-/// observed generation that could make an old proposal appear current.
+/// Execute with the original scan's generation and cutoff, never refreshed ones.
+/// `Ok(false)` is a stale delivery: another message in its group must still be
+/// considered. `Ok(true)` settles the group (grant, existing coverage or log mode).
 fn escalate_observed(
     config: &Config,
     pool: &DbPool,
     cx: &Cx,
     row: &queries::UnackedMessageRow,
     generation_id: Option<&str>,
-) -> Result<(), String> {
+    overdue_before_ts: i64,
+) -> Result<bool, String> {
     if !config.ack_escalation_mode.eq_ignore_ascii_case("file_reservation") {
-        return Ok(());
+        return Ok(true);
     }
 
     let project = match block_on(queries::get_project_by_id(cx, pool, row.project_id)) {
@@ -439,6 +446,7 @@ fn escalate_observed(
 
     let request = AckEscalationRequest {
         observed: row,
+        overdue_before_ts,
         generation_id,
         project_slug: &project.slug,
         project_key: &project.human_key,
@@ -449,10 +457,9 @@ fn escalate_observed(
         exclusive: config.ack_escalation_claim_exclusive,
     };
     let reservation = match block_on(grant_ack_escalation(cx, pool, &request)) {
-        Outcome::Ok(Some(reservation)) => reservation,
-        // An ACK or identity change after paging is normal. An existing active
-        // automatic claim is also a no-op: no renewal and no archive dispatch.
-        Outcome::Ok(None) => return Ok(()),
+        Outcome::Ok(AckEscalationOutcome::Granted(reservation)) => reservation,
+        Outcome::Ok(AckEscalationOutcome::NoLongerOverdue) => return Ok(false),
+        Outcome::Ok(AckEscalationOutcome::AlreadyCovered) => return Ok(true),
         other => return Err(format!("failed to admit escalation reservation: {other:?}")),
     };
     info!(
@@ -498,11 +505,11 @@ fn escalate_observed(
             );
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Existing direct-call fixtures create a fresh observation. Production always
-/// passes the generation of its already-fetched page to `escalate_observed`.
+/// passes the generation and cutoff of its already-fetched page.
 #[cfg(test)]
 fn escalate(
     config: &Config,
@@ -515,7 +522,8 @@ fn escalate(
         Outcome::Ok(page) => page,
         other => return Err(format!("test observation: {other:?}")),
     };
-    escalate_observed(config, pool, cx, row, page.generation_id())
+    escalate_observed(config, pool, cx, row, page.generation_id(), page.overdue_before_ts())
+        .map(|_| ())
 }
 
 #[cfg(test)]
@@ -1720,7 +1728,7 @@ mod tests {
         let config = escalation_config(&tmp);
         let new_generation = format!("{old_generation}ab");
         set_test_generation(&cx, &pool, &new_generation);
-        escalate_observed(&config, &pool, &cx, &original, Some(&old_generation)).unwrap();
+        assert!(!escalate_observed(&config, &pool, &cx, &original, Some(&old_generation), original.created_ts).unwrap());
         assert!(claim_rows(&cx, &pool, original.project_id).is_empty());
         assert!(!config.storage_root.exists());
         // This is a new observation, not silently rebinding the old proposal.
@@ -1763,7 +1771,7 @@ mod tests {
         let (tmp, pool, cx, original) = seed_unacked_message();
         let generation = seeded_generation(&cx, &pool);
         let config = escalation_config(&tmp);
-        escalate_observed(&config, &pool, &cx, &original, Some(&generation)).unwrap();
+        assert!(escalate_observed(&config, &pool, &cx, &original, Some(&generation), original.created_ts).unwrap());
         let before = claim_rows(&cx, &pool, original.project_id);
         assert_eq!(before.len(), 1);
         match block_on(queries::acknowledge_message(
@@ -1772,11 +1780,102 @@ mod tests {
             Outcome::Ok(_) => {}
             other => panic!("ACK after committed grant: {other:?}"),
         }
-        escalate_observed(&config, &pool, &cx, &original, Some(&generation)).unwrap();
+        assert!(!escalate_observed(&config, &pool, &cx, &original, Some(&generation), original.created_ts).unwrap());
         let after = claim_rows(&cx, &pool, original.project_id);
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, before[0].id);
         assert_eq!(after[0].expires_ts, before[0].expires_ts);
         assert_eq!(after[0].released_ts, before[0].released_ts);
+    }
+
+    #[test]
+    fn acknowledged_page_head_does_not_suppress_a_pending_sibling() {
+        let (tmp, pool, cx, original) = seed_unacked_message();
+        seed_more_overdue(&cx, &pool, &original, 1..=2);
+        let config = escalation_config(&tmp);
+        let mut state = AckScanState::default();
+        let mut checks = 0;
+        let result = run_ack_ttl_slice(
+            &config, &pool, &mut state,
+            || {
+                checks += 1;
+                if checks == 3 {
+                    match block_on(queries::acknowledge_message(
+                        &cx, &pool, original.agent_id, original.message_id,
+                    )) {
+                        Outcome::Ok(_) => {}
+                        other => panic!("ACK after page read: {other:?}"),
+                    }
+                }
+                false
+            },
+            || true,
+        ).unwrap();
+        assert_eq!(checks, 5);
+        assert_eq!(result, (3, 3));
+        let claims = claim_rows(&cx, &pool, original.project_id);
+        assert_eq!(claims.len(), 1, "a pending sibling must get a grant in the same slice");
+        assert_eq!(claims[0].agent_id, original.agent_id);
+        assert_eq!(claims[0].reason, "ack-overdue");
+        assert!(state.cursor.is_none());
+        assert_eq!(run_ack_ttl_cycle(&config, &pool).unwrap(), (2, 2));
+        let repeated = claim_rows(&cx, &pool, original.project_id);
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(repeated[0].expires_ts, claims[0].expires_ts);
+    }
+
+    #[test]
+    fn all_stale_siblings_finish_without_grants_or_artifacts() {
+        let (tmp, pool, cx, original) = seed_unacked_message();
+        seed_more_overdue(&cx, &pool, &original, 1..=2);
+        let config = escalation_config(&tmp);
+        let mut state = AckScanState::default();
+        let mut checks = 0;
+        let result = run_ack_ttl_slice(
+            &config, &pool, &mut state,
+            || {
+                checks += 1;
+                if checks == 3 {
+                    for offset in 0..=2 {
+                        match block_on(queries::acknowledge_message(
+                            &cx, &pool, original.agent_id, original.message_id + offset,
+                        )) {
+                            Outcome::Ok(_) => {}
+                            other => panic!("ACK stale sibling: {other:?}"),
+                        }
+                    }
+                }
+                false
+            },
+            || true,
+        ).unwrap();
+        assert_eq!(checks, 5);
+        assert_eq!(result, (3, 3));
+        assert!(state.cursor.is_none());
+        assert!(claim_rows(&cx, &pool, original.project_id).is_empty());
+        assert!(!config.storage_root.exists());
+    }
+
+    #[test]
+    fn worker_carries_original_cutoff_to_transactional_admission() {
+        let (tmp, pool, cx, original) = seed_unacked_message();
+        let generation = seeded_generation(&cx, &pool);
+        let config = escalation_config(&tmp);
+        assert!(!escalate_observed(
+            &config, &pool, &cx, &original, Some(&generation), original.created_ts - 1,
+        ).unwrap());
+        assert!(claim_rows(&cx, &pool, original.project_id).is_empty());
+        assert!(!config.storage_root.exists());
+        assert!(escalate_observed(
+            &config, &pool, &cx, &original, Some(&generation), original.created_ts,
+        ).unwrap());
+        let claims = claim_rows(&cx, &pool, original.project_id);
+        assert_eq!(claims.len(), 1);
+        assert!(escalate_observed(
+            &config, &pool, &cx, &original, Some(&generation), original.created_ts,
+        ).unwrap(), "coverage, unlike staleness, settles the coalescing group");
+        let covered = claim_rows(&cx, &pool, original.project_id);
+        assert_eq!(covered.len(), 1);
+        assert_eq!(covered[0].expires_ts, claims[0].expires_ts);
     }
 }

@@ -1,9 +1,10 @@
 //! Transactional admission for automatic overdue-ACK reservation grants.
 //!
 //! A scan row is a proposal, not permission to mutate. Recheck its exact
-//! delivery, project, identities, generation and active conflicts in the same
-//! immediate transaction as the grant. An ACK committed before admission makes
-//! the proposal a no-op. A later ACK does not retroactively revoke a valid grant.
+//! delivery, frozen overdue cutoff, project, identities, generation and active
+//! conflicts in the same immediate transaction as the grant. An ACK committed
+//! before admission makes the proposal a no-op. A later ACK does not
+//! retroactively revoke a valid grant.
 
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
@@ -21,6 +22,8 @@ const REASON: &str = "ack-overdue";
 /// `generation_id == None` means an unstamped database, not a wildcard.
 pub struct AckEscalationRequest<'a> {
     pub observed: &'a UnackedMessageRow,
+    /// The original scan lap's cutoff, not a newer wall-clock observation.
+    pub overdue_before_ts: i64,
     pub generation_id: Option<&'a str>,
     pub project_slug: &'a str,
     pub project_key: &'a str,
@@ -31,6 +34,17 @@ pub struct AckEscalationRequest<'a> {
     pub exclusive: bool,
 }
 
+/// Only `Granted` authorizes a new archive artifact. A stale delivery must not
+/// suppress an eligible sibling in the same recipient/month coalescing group.
+#[derive(Debug)]
+pub enum AckEscalationOutcome {
+    Granted(FileReservationRow),
+    /// A matching active lease already covers this eligible delivery; no renewal.
+    AlreadyCovered,
+    /// Eligibility or an observed identity no longer agrees with the transaction.
+    NoLongerOverdue,
+}
+
 const AUTHORIZED_SQL: &str = "\
 SELECT 1 AS authorized \
 FROM messages m JOIN message_recipients mr ON mr.message_id = m.id \
@@ -38,6 +52,7 @@ JOIN agents recipient ON recipient.id = mr.agent_id \
 JOIN projects p ON p.id = m.project_id \
 JOIN agents holder ON holder.id = ?5 \
 WHERE m.id = ?1 AND m.project_id = ?2 AND m.created_ts = ?3 \
+  AND m.created_ts <= ?11 \
   AND m.ack_required = 1 AND mr.agent_id = ?4 AND mr.ack_ts IS NULL \
   AND recipient.project_id = ?2 AND recipient.name = ?6 COLLATE BINARY \
   AND holder.project_id = ?2 AND holder.name = ?7 COLLATE BINARY \
@@ -117,7 +132,7 @@ async fn apply_claim(
     cx: &Cx,
     request: &AckEscalationRequest<'_>,
     pattern: &str,
-) -> Outcome<Option<FileReservationRow>, DbError> {
+) -> Outcome<AckEscalationOutcome, DbError> {
     let observed = request.observed;
     let authorized = take_sql!(query(
         tx,
@@ -134,10 +149,11 @@ async fn apply_claim(
             request.project_slug.into(),
             request.project_key.into(),
             request.generation_id.map_or(Value::Null, |value| Value::Text(value.to_string())),
+            request.overdue_before_ts.into(),
         ],
     ).await);
     if authorized.is_empty() {
-        return Outcome::Ok(None);
+        return Outcome::Ok(AckEscalationOutcome::NoLongerOverdue);
     }
 
     let now = crate::now_micros();
@@ -195,7 +211,7 @@ async fn apply_claim(
     }
     if already_claimed {
         // Repeated scans must not indefinitely extend a matching active lease.
-        return Outcome::Ok(None);
+        return Outcome::Ok(AckEscalationOutcome::AlreadyCovered);
     }
 
     let mut reservation = FileReservationRow {
@@ -225,7 +241,7 @@ async fn apply_claim(
         _ => return Outcome::Err(DbError::Internal("ACK grant has no valid inserted row ID".into())),
     };
     reservation.id = Some(id);
-    Outcome::Ok(Some(reservation))
+    Outcome::Ok(AckEscalationOutcome::Granted(reservation))
 }
 
 async fn grant_on_connection(
@@ -233,24 +249,24 @@ async fn grant_on_connection(
     conn: &DbConn,
     request: &AckEscalationRequest<'_>,
     pattern: &str,
-) -> Outcome<Option<FileReservationRow>, DbError> {
+) -> Outcome<AckEscalationOutcome, DbError> {
     // SQLModel's SQLite/FrankenSQLite ReadCommitted mode maps to BEGIN IMMEDIATE.
     // Do not nest the ordinary pool-acquiring reservation writer inside this tx.
     let tx = take_sql!(conn.begin_with(cx, IsolationLevel::ReadCommitted).await);
     let result = apply_claim(&tx, cx, request, pattern).await;
     match result {
-        Outcome::Ok(Some(reservation)) => {
+        Outcome::Ok(AckEscalationOutcome::Granted(reservation)) => {
             let started = crate::tracking::query_timer();
             let committed = tx.commit(cx).await;
             mcp_agent_mail_core::metrics::record_database_write_latency(
                 crate::tracking::elapsed_us(started),
             );
             take_sql!(committed);
-            Outcome::Ok(Some(reservation))
+            Outcome::Ok(AckEscalationOutcome::Granted(reservation))
         }
-        Outcome::Ok(None) => {
+        Outcome::Ok(outcome @ (AckEscalationOutcome::AlreadyCovered | AckEscalationOutcome::NoLongerOverdue)) => {
             take_sql!(tx.rollback(cx).await);
-            Outcome::Ok(None)
+            Outcome::Ok(outcome)
         }
         other => {
             // The native transaction rolls back on drop, also during unwinding.
@@ -276,15 +292,15 @@ impl Drop for ClaimLease {
 }
 
 /// Create one automatic grant only while its exact delivery remains eligible.
-/// `None` means stale observation or an already-active matching claim. Neither
-/// creates/renews a lease or authorizes another archive write. No local retry
-/// loop is added: transient errors are retried by the worker's next scan lap.
-/// The caller retains the existing generation/write lease through publication.
+/// Stale observations and already-covered deliveries are distinct no-write
+/// outcomes: only the latter suppresses sibling proposals in the same group.
+/// No local retry loop is added: transient errors are retried by the worker's
+/// next scan lap. The caller retains the generation/write lease through publication.
 pub async fn grant_ack_escalation(
     cx: &Cx,
     pool: &DbPool,
     request: &AckEscalationRequest<'_>,
-) -> Outcome<Option<FileReservationRow>, DbError> {
+) -> Outcome<AckEscalationOutcome, DbError> {
     let pattern = match claim_pattern(request) {
         Ok(pattern) => pattern,
         Err(error) => return Outcome::Err(error),
@@ -353,21 +369,22 @@ mod tests {
 
     fn request<'a>(generation: &'a str, observed: &'a UnackedMessageRow) -> AckEscalationRequest<'a> {
         AckEscalationRequest {
-            observed, generation_id: Some(generation), project_slug: "project",
+            observed, overdue_before_ts: observed.created_ts,
+            generation_id: Some(generation), project_slug: "project",
             project_key: "/project", recipient_name: "BlueBear", holder_id: 102,
             holder_name: "BlueBear", ttl_seconds: 3600, exclusive: true,
         }
     }
 
-    fn granted(outcome: Outcome<Option<FileReservationRow>, DbError>) -> FileReservationRow {
+    fn granted(outcome: Outcome<AckEscalationOutcome, DbError>) -> FileReservationRow {
         match outcome {
-            Outcome::Ok(Some(row)) => row,
+            Outcome::Ok(AckEscalationOutcome::Granted(row)) => row,
             other => panic!("expected committed grant: {other:?}"),
         }
     }
 
-    fn stale(outcome: Outcome<Option<FileReservationRow>, DbError>) {
-        assert!(matches!(outcome, Outcome::Ok(None)), "{outcome:?}");
+    fn stale(outcome: Outcome<AckEscalationOutcome, DbError>) {
+        assert!(matches!(outcome, Outcome::Ok(AckEscalationOutcome::NoLongerOverdue)), "{outcome:?}");
     }
 
     #[test]
@@ -376,7 +393,7 @@ mod tests {
             let request = request(generation, observed);
             let first = granted(run(grant_ack_escalation(cx, pool, &request)));
             assert_eq!(first.path_pattern, "agents/BlueBear/inbox/1970/01/*.md");
-            stale(run(grant_ack_escalation(cx, pool, &request)));
+            assert!(matches!(run(grant_ack_escalation(cx, pool, &request)), Outcome::Ok(AckEscalationOutcome::AlreadyCovered)));
             assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"), 1);
             assert_eq!(scalar(pool, cx, "SELECT expires_ts FROM file_reservations"), first.expires_ts);
             match run(crate::queries::release_reservations(cx, pool, 101, 102, None, Some(&[first.id.unwrap()]))) {
@@ -500,5 +517,52 @@ mod tests {
         }
         observed.created_ts = i64::MAX;
         assert!(claim_pattern(&request("generation", &observed)).is_err());
+    }
+
+    #[test]
+    fn original_cutoff_is_inclusive_and_not_replaced_by_admission_time() {
+        fixture(|pool, cx, generation, observed| {
+            let mut request = request(generation, observed);
+            request.overdue_before_ts = observed.created_ts - 1;
+            stale(run(grant_ack_escalation(cx, pool, &request)));
+            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"), 0);
+            request.overdue_before_ts = observed.created_ts;
+            granted(run(grant_ack_escalation(cx, pool, &request)));
+            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"), 1);
+        });
+    }
+
+    #[test]
+    fn cutoff_check_cannot_be_bypassed_by_an_existing_claim() {
+        fixture(|pool, cx, generation, observed| {
+            let mut request = request(generation, observed);
+            let first = granted(run(grant_ack_escalation(cx, pool, &request)));
+            request.overdue_before_ts = observed.created_ts - 1;
+            stale(run(grant_ack_escalation(cx, pool, &request)));
+            assert_eq!(scalar(pool, cx, "SELECT expires_ts FROM file_reservations"), first.expires_ts);
+        });
+    }
+
+    #[test]
+    fn acknowledged_delivery_is_stale_even_when_its_claim_still_exists() {
+        fixture(|pool, cx, generation, observed| {
+            let request = request(generation, observed);
+            let first = granted(run(grant_ack_escalation(cx, pool, &request)));
+            execute(pool, cx, "UPDATE message_recipients SET ack_ts = 42 WHERE message_id = 901 AND agent_id = 102");
+            stale(run(grant_ack_escalation(cx, pool, &request)));
+            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"), 1);
+            assert_eq!(scalar(pool, cx, "SELECT expires_ts FROM file_reservations"), first.expires_ts);
+        });
+    }
+
+    #[test]
+    fn signed_cutoffs_do_not_wrap_during_admission() {
+        fixture(|pool, cx, generation, observed| {
+            let mut request = request(generation, observed);
+            request.overdue_before_ts = i64::MIN;
+            stale(run(grant_ack_escalation(cx, pool, &request)));
+            request.overdue_before_ts = i64::MAX;
+            granted(run(grant_ack_escalation(cx, pool, &request)));
+        });
     }
 }
