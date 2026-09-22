@@ -1856,22 +1856,22 @@ pub enum FileReservationsCommand {
         /// Extension in seconds, clamped to 60..=31536000 (default: 1800).
         #[arg(long, default_value_t = 1800)]
         extend_seconds: i64,
-        /// Restrict renewal to specific paths.
-        #[arg(long)]
+        /// Restrict renewal to specific paths (comma-separated list is split).
+        #[arg(long, value_delimiter = ',')]
         paths: Vec<String>,
-        /// Restrict renewal to specific reservation IDs.
-        #[arg(long)]
+        /// Restrict renewal to specific reservation IDs (comma-separated list is split).
+        #[arg(long, value_delimiter = ',')]
         ids: Vec<i64>,
     },
     /// Release file reservations.
     Release {
         project: String,
         agent: String,
-        /// Restrict release to specific paths.
-        #[arg(long)]
+        /// Restrict release to specific paths (comma-separated list is split).
+        #[arg(long, value_delimiter = ',')]
         paths: Vec<String>,
-        /// Restrict release to specific reservation IDs.
-        #[arg(long)]
+        /// Restrict release to specific reservation IDs (comma-separated list is split).
+        #[arg(long, value_delimiter = ',')]
         ids: Vec<i64>,
     },
     /// Check for conflicts on proposed paths without creating reservations.
@@ -19477,8 +19477,7 @@ fn handle_file_reservations_mutation_locally(action: &FileReservationsCommand) -
         };
         parse_tool_json_payload(tool, &result.map_err(mcp_error_to_cli_error)?)
     })?;
-    emit_proxied_file_reservations_output(action, &payload);
-    Ok(())
+    emit_proxied_file_reservations_output(action, &payload)
 }
 
 /// Make the provenance of a direct CLI reservation read explicit. A readable
@@ -19541,7 +19540,7 @@ fn try_proxy_file_reservations_mutation(action: &FileReservationsCommand) -> Cli
         return Ok(false);
     };
 
-    emit_proxied_file_reservations_output(action, &payload);
+    emit_proxied_file_reservations_output(action, &payload)?;
     Ok(true)
 }
 
@@ -19629,10 +19628,14 @@ fn file_reservations_proxy_request(
 }
 
 /// Render the reservation tool result identically for daemon and offline calls.
+///
+/// Returns `Err` when a restricted release (`--paths`/`--ids`) matches nothing:
+/// a silent `Released 0` would let the caller believe holds were lifted while
+/// every reservation survived to its TTL.
 fn emit_proxied_file_reservations_output(
     action: &FileReservationsCommand,
     payload: &serde_json::Value,
-) {
+) -> CliResult<()> {
     match action {
         FileReservationsCommand::Reserve { .. } => {
             // Local shape: pretty `{granted, conflicts}` JSON + conflict warning.
@@ -19650,7 +19653,24 @@ fn emit_proxied_file_reservations_output(
                 ));
             }
         }
-        FileReservationsCommand::Renew { .. } => {
+        FileReservationsCommand::Renew {
+            project,
+            agent,
+            paths,
+            ids,
+            ..
+        } => {
+            // Renew never returns a queued envelope (only release degrades to
+            // queue), so a zero count here is a real zero-match result.
+            let renewed = payload
+                .get("renewed")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if renewed == 0 && (!paths.is_empty() || !ids.is_empty()) {
+                return Err(CliError::Usage(format!(
+                    "restricted renewal matched nothing for {agent} in {project} (paths: {paths:?}, ids: {ids:?}); no reservation was renewed — pass each path/id as a separate flag occurrence, or drop the restriction, and confirm with 'am file_reservations list'"
+                )));
+            }
             let rows = payload
                 .get("file_reservations")
                 .and_then(serde_json::Value::as_array)
@@ -19676,7 +19696,12 @@ fn emit_proxied_file_reservations_output(
             }
             table.render();
         }
-        FileReservationsCommand::Release { project, agent, .. } => {
+        FileReservationsCommand::Release {
+            project,
+            agent,
+            paths,
+            ids,
+        } => {
             if payload.get("queued").and_then(serde_json::Value::as_bool) == Some(true)
                 || payload.get("status").and_then(serde_json::Value::as_str) == Some("queued")
             {
@@ -19685,18 +19710,24 @@ fn emit_proxied_file_reservations_output(
                     serde_json::to_string_pretty(payload).unwrap_or_default()
                 );
                 output::warn("Reservation release is queued; the lease is not yet released.");
-                return;
+                return Ok(());
             }
             let released = payload
                 .get("released")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
+            if released == 0 && (!paths.is_empty() || !ids.is_empty()) {
+                return Err(CliError::Usage(format!(
+                    "restricted release matched nothing for {agent} in {project} (paths: {paths:?}, ids: {ids:?}); no reservation was released — pass each path/id as a separate flag occurrence, or drop the restriction, and confirm with 'am file_reservations list'"
+                )));
+            }
             output::success(&format!(
                 "Released {released} reservation(s) for {agent} in {project}."
             ));
         }
         _ => {}
     }
+    Ok(())
 }
 
 fn active_reservation_predicate_sql(table_ref: &str) -> String {
@@ -44077,7 +44108,7 @@ mod tests {
             }
         });
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        emit_proxied_file_reservations_output(&action, &payload);
+        emit_proxied_file_reservations_output(&action, &payload).unwrap();
         let output = capture.drain_to_string();
         assert!(output.contains("release-intent-1"), "{output}");
         assert!(
@@ -69336,6 +69367,191 @@ startup_timeout_sec = 42
             .and_then(|row| row.get_named("n").ok())
             .unwrap_or_default();
         assert_eq!(active_count, 0, "all active reservations must be released");
+    }
+
+    #[test]
+    fn clap_parses_comma_separated_release_restriction_lists() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "file_reservations",
+            "release",
+            "proj",
+            "BlueLake",
+            "--paths",
+            "src/a.rs,src/b.rs",
+            "--ids",
+            "1,2",
+        ])
+        .expect("comma-separated restriction lists must parse");
+        match cli.command.expect("expected command") {
+            Commands::FileReservations {
+                action: FileReservationsCommand::Release { paths, ids, .. },
+            } => {
+                assert_eq!(paths, vec!["src/a.rs", "src/b.rs"]);
+                assert_eq!(ids, vec![1, 2]);
+            }
+            other => panic!("expected FileReservations Release, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_comma_separated_renew_restriction_lists() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "file_reservations",
+            "renew",
+            "proj",
+            "BlueLake",
+            "--paths",
+            "src/a.rs,src/b.rs",
+            "--ids",
+            "7,8",
+        ])
+        .expect("comma-separated restriction lists must parse");
+        match cli.command.expect("expected command") {
+            Commands::FileReservations {
+                action: FileReservationsCommand::Renew { paths, ids, .. },
+            } => {
+                assert_eq!(paths, vec!["src/a.rs", "src/b.rs"]);
+                assert_eq!(ids, vec![7, 8]);
+            }
+            other => panic!("expected FileReservations Renew, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn integration_file_reservations_restricted_release_matching_nothing_fails_loud() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        drop(conn);
+
+        let _capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
+            FileReservationsCommand::Release {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                paths: vec!["does/not/exist.rs".to_string()],
+                ids: vec![],
+            },
+        );
+        assert!(
+            result.is_err(),
+            "restricted release matching nothing must fail loudly: {result:?}"
+        );
+        let error_text = format!("{}", result.unwrap_err());
+        assert!(
+            error_text.contains("matched nothing") && error_text.contains("does/not/exist.rs"),
+            "error must name the unmatched pattern, got: {error_text}"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_unrestricted_release_zero_stays_ok() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        // The shared seeder always plants one active hold for BlueLake; the
+        // zero-hold premise of this test requires releasing it up front so the
+        // command below runs against an empty active set.
+        conn.execute_sync(
+            "UPDATE file_reservations SET released_ts = ? WHERE id = 1",
+            &[mcp_agent_mail_db::timestamps::now_micros().into()],
+        )
+        .expect("release seeded hold");
+        drop(conn);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
+            FileReservationsCommand::Release {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                paths: vec![],
+                ids: vec![],
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(
+            result.is_ok(),
+            "unrestricted release of an empty hold set must stay Ok: {result:?}"
+        );
+        assert!(
+            output.contains("Released 0 reservation(s)"),
+            "expected silent-zero release output, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_restricted_renew_matching_nothing_fails_loud() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        drop(conn);
+
+        let _capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
+            FileReservationsCommand::Renew {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                extend_seconds: 1800,
+                paths: vec!["does/not/exist.rs".to_string()],
+                ids: vec![],
+            },
+        );
+        assert!(
+            result.is_err(),
+            "restricted renewal matching nothing must fail loudly: {result:?}"
+        );
+        let error_text = format!("{}", result.unwrap_err());
+        assert!(
+            error_text.contains("renewal matched nothing")
+                && error_text.contains("does/not/exist.rs"),
+            "error must name the unmatched pattern, got: {error_text}"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_restricted_renew_with_match_stays_ok() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        drop(conn);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
+            FileReservationsCommand::Renew {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                extend_seconds: 1800,
+                paths: vec!["src/api/*.rs".to_string()],
+                ids: vec![],
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "restricted renewal matching a live hold must stay Ok: {result:?}"
+        );
+        let output = capture.drain_to_string();
+        assert!(
+            output.contains("Renewed 1 reservation(s)"),
+            "expected the matching hold to renew, got: {output}"
+        );
     }
 
     #[test]
