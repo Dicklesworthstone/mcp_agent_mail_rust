@@ -9,6 +9,11 @@
 //! 1. Checks for potion-128M (fast tier) in `HuggingFace` cache
 //! 2. Creates a global `TwoTierSearchContext` ready for use
 //!
+//! Missing models are retried on demand by the model loader. A later successful
+//! load promotes the global context without restarting the server. Previously
+//! returned references remain valid, immutable snapshots; reacquire the context
+//! to observe newly available models.
+//!
 //! The old `FastEmbed` quality tier is intentionally not compiled in this
 //! workspace because it pulls the hf-hub/reqwest/hyper/tokio stack.
 //!
@@ -36,6 +41,7 @@
 //! }
 //! ```
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -125,23 +131,19 @@ const fn quality_embedder_id() -> &'static str {
 }
 
 impl TwoTierContext {
-    /// Initialize the context, detecting available embedders.
-    fn init() -> Self {
+    /// Build one coherent snapshot from the model actually discovered by the
+    /// caller. No model I/O occurs while a context publication lock is held.
+    fn init(fast_embedder: Option<&Model2VecEmbedder>, fast_embedder_load_ms: u64) -> Self {
         let _init_span = tracing::info_span!("two_tier.init").entered();
 
         let init_attempts = next_init_attempt();
         let init_timestamp = chrono::Utc::now().timestamp();
-
-        let fast_start = Instant::now();
-        let fast_embedder = get_fast_embedder();
-        #[allow(clippy::cast_possible_truncation)]
-        let fast_embedder_load_ms = fast_start.elapsed().as_millis() as u64;
         let has_fast = fast_embedder.is_some();
 
         let quality_start = Instant::now();
         let quality_info = current_quality_embedder_info();
-        #[allow(clippy::cast_possible_truncation)]
-        let quality_embedder_load_ms = quality_start.elapsed().as_millis() as u64;
+        let quality_embedder_load_ms =
+            u64::try_from(quality_start.elapsed().as_millis()).unwrap_or(u64::MAX);
         let has_quality = quality_info.is_some();
 
         let availability = match (has_fast, has_quality) {
@@ -396,8 +398,44 @@ impl TwoTierEmbedder for QualityEmbedderWrapper {
 // Global context singleton
 // ────────────────────────────────────────────────────────────────────
 
-/// Global two-tier search context.
-static CONTEXT: OnceLock<TwoTierContext> = OnceLock::new();
+/// Two bounded, immutable snapshots: a lexical fallback and the first usable
+/// model context. Discovery runs outside either publication lock, so another
+/// request can take the fallback while a model is being loaded.
+struct ContextCache {
+    ready: OnceLock<TwoTierContext>,
+    unavailable: OnceLock<TwoTierContext>,
+}
+
+impl ContextCache {
+    const fn new() -> Self {
+        Self {
+            ready: OnceLock::new(),
+            unavailable: OnceLock::new(),
+        }
+    }
+
+    fn get_or_init<T>(
+        &self,
+        discover: impl FnOnce() -> Option<T>,
+        initialize: impl FnOnce(T) -> TwoTierContext,
+        unavailable: impl FnOnce() -> TwoTierContext,
+    ) -> &TwoTierContext {
+        if let Some(context) = self.ready.get() {
+            return context;
+        }
+        match discover() {
+            Some(model) => self.ready.get_or_init(|| initialize(model)),
+            // A concurrent discovery can publish while this probe reports a
+            // miss. Never return an older negative snapshot once ready is visible.
+            None => self
+                .ready
+                .get()
+                .unwrap_or_else(|| self.unavailable.get_or_init(unavailable)),
+        }
+    }
+}
+
+static CONTEXT: ContextCache = ContextCache::new();
 static INIT_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 
 fn next_init_attempt() -> u32 {
@@ -413,10 +451,23 @@ fn next_init_attempt() -> u32 {
 
 /// Get the global two-tier search context.
 ///
-/// Auto-initializes on first call. Thread-safe.
+/// Auto-initializes on first call. Failed discovery remains eligible for the
+/// model loader's bounded retries. After recovery, later calls return a ready
+/// snapshot with matching availability, model metadata, dimensions and metrics.
+/// Older references remain valid snapshots; successful models are not replaced.
 #[must_use]
 pub fn get_two_tier_context() -> &'static TwoTierContext {
-    CONTEXT.get_or_init(TwoTierContext::init)
+    let load_ms = Cell::new(0);
+    CONTEXT.get_or_init(
+        || {
+            let start = Instant::now();
+            let embedder = get_fast_embedder();
+            load_ms.set(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
+            embedder
+        },
+        |embedder| TwoTierContext::init(Some(embedder), load_ms.get()),
+        || TwoTierContext::init(None, load_ms.get()),
+    )
 }
 
 /// Check if two-tier search is available.
@@ -439,6 +490,139 @@ pub fn is_full_two_tier_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn fixture_context(ready: bool, attempt: u32) -> TwoTierContext {
+        let availability = if ready {
+            TwoTierAvailability::FastOnly
+        } else {
+            TwoTierAvailability::None
+        };
+        TwoTierContext {
+            availability,
+            config: TwoTierConfig {
+                fast_dimension: if ready { 128 } else { 256 },
+                ..TwoTierConfig::default()
+            },
+            fast_info: ready.then(|| EmbedderInfo {
+                id: "installed-after-startup".into(),
+                dimension: 128,
+            }),
+            quality_info: None,
+            init_metrics: TwoTierInitMetrics {
+                init_timestamp: 1,
+                fast_embedder_load_ms: 7,
+                quality_embedder_load_ms: 0,
+                availability,
+                init_attempts: attempt,
+            },
+        }
+    }
+
+    #[test]
+    fn unavailable_context_promotes_with_coherent_metadata_after_model_install() {
+        let cache = ContextCache::new();
+        let old = cache.get_or_init(|| None::<()>, |_| panic!("no model"), || fixture_context(false, 1));
+        assert!(!old.is_available());
+        for _ in 0..100 {
+            let fallback = cache.get_or_init(
+                || None::<()>,
+                |_| panic!("no model"),
+                || panic!("reuse fallback without rebuilding or relogging"),
+            );
+            assert!(std::ptr::eq(old, fallback));
+        }
+        let ready = cache.get_or_init(|| Some(()), |()| fixture_context(true, 2), || panic!("ready"));
+        assert!(ready.is_available());
+        assert_eq!(ready.availability(), TwoTierAvailability::FastOnly);
+        assert_eq!(ready.fast_info().unwrap().id, "installed-after-startup");
+        assert_eq!(ready.config().fast_dimension, ready.fast_info().unwrap().dimension);
+        assert_eq!(ready.init_metrics().availability, ready.availability());
+        assert_eq!(ready.init_metrics().init_attempts, 2);
+        assert!(!std::ptr::eq(old, ready));
+        // Publication never mutates or invalidates an earlier borrowed snapshot.
+        assert!(!old.is_available());
+        assert!(old.fast_info().is_none());
+        let again = cache.get_or_init(
+            || -> Option<()> { panic!("ready path must not rediscover") },
+            |_| panic!("ready path must not rebuild"),
+            || panic!("ready path must not downgrade"),
+        );
+        assert!(std::ptr::eq(ready, again));
+    }
+
+    #[test]
+    fn ready_first_context_never_allocates_an_unavailable_snapshot() {
+        let cache = ContextCache::new();
+        let context = cache.get_or_init(|| Some(()), |()| fixture_context(true, 1), || panic!("ready"));
+        assert!(context.is_available());
+        assert!(cache.unavailable.get().is_none());
+    }
+
+    #[test]
+    fn concurrent_recovery_publishes_one_ready_context() {
+        let cache = ContextCache::new();
+        cache.get_or_init(|| None::<()>, |_| panic!("missing"), || fixture_context(false, 1));
+        let initialized = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..16 {
+                workers.push(scope.spawn(|| {
+                    cache.get_or_init(
+                        || Some(()),
+                        |()| {
+                            initialized.fetch_add(1, Ordering::SeqCst);
+                            fixture_context(true, 2)
+                        },
+                        || panic!("model is ready"),
+                    )
+                }));
+            }
+            let published = workers.pop().unwrap().join().unwrap();
+            for worker in workers {
+                assert!(std::ptr::eq(published, worker.join().unwrap()));
+            }
+        });
+        assert_eq!(initialized.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn discovery_does_not_hold_the_fallback_publication_lock() {
+        let cache = ContextCache::new();
+        let ready = cache.get_or_init(
+            || {
+                let fallback = cache.get_or_init(
+                    || None::<()>,
+                    |_| panic!("still loading"),
+                    || fixture_context(false, 1),
+                );
+                assert!(!fallback.is_available());
+                Some(())
+            },
+            |()| fixture_context(true, 2),
+            || panic!("outer discovery succeeded"),
+        );
+        assert!(ready.is_available());
+    }
+
+    #[test]
+    fn a_late_negative_probe_cannot_hide_a_published_ready_context() {
+        let cache = ContextCache::new();
+        let context = cache.get_or_init(
+            || {
+                cache.get_or_init(
+                    || Some(()),
+                    |()| fixture_context(true, 1),
+                    || panic!("model is ready"),
+                );
+                None::<()>
+            },
+            |_| panic!("outer probe missed"),
+            || panic!("do not publish a stale negative snapshot"),
+        );
+        assert!(context.is_available());
+        assert!(cache.unavailable.get().is_none());
+    }
 
     #[test]
     fn test_availability_display() {
@@ -602,13 +786,15 @@ mod tests {
     #[test]
     fn is_two_tier_available_matches_context() {
         let ctx = get_two_tier_context();
-        assert_eq!(is_two_tier_available(), ctx.is_available());
+        // A model may finish loading between these calls. Availability can
+        // improve, but must never regress after a usable snapshot is published.
+        assert!(!ctx.is_available() || is_two_tier_available());
     }
 
     #[test]
     fn is_full_two_tier_available_matches_context() {
         let ctx = get_two_tier_context();
-        assert_eq!(is_full_two_tier_available(), ctx.is_full());
+        assert!(!ctx.is_full() || is_full_two_tier_available());
     }
 
     // ── Embedder info accessors ──
