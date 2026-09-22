@@ -9,6 +9,10 @@
 //! - [`fetch_explorer_page`] runs the query and returns [`ExplorerPage`].
 //! - All queries work across projects when `project_id` is `None`.
 
+#[cfg(test)]
+#[path = "mail_explorer_regression_tests.rs"]
+mod regression_tests;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::DbError;
@@ -178,6 +182,11 @@ pub async fn fetch_explorer_page(
     query: &ExplorerQuery,
 ) -> Outcome<ExplorerPage, DbError> {
     let timer = std::time::Instant::now();
+    // Validate before any database access: overflow must not become a negative
+    // SQLite LIMIT (which means unlimited) or a panic while slicing the page.
+    if let Err(error) = candidate_limit(query) {
+        return Outcome::Err(error);
+    }
 
     // Resolve agent_id across projects
     let agent_ids = match resolve_agent_ids(cx, pool, &query.agent_name, query.project_id).await {
@@ -217,10 +226,13 @@ pub async fn fetch_explorer_page(
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         }
     };
-    let total_count = match query.direction {
-        Direction::Inbound => total_inbound,
-        Direction::Outbound => total_outbound,
-        Direction::All => total_inbound + total_outbound,
+    let total_count = match total_inbound.checked_add(total_outbound) {
+        Some(total) => total,
+        None => {
+            return Outcome::Err(DbError::Serialization(
+                "mail explorer total count exceeds usize".to_string(),
+            ));
+        }
     };
 
     // Fetch inbound and/or outbound entries
@@ -256,7 +268,7 @@ pub async fn fetch_explorer_page(
 
     // Apply offset + limit
     let start = query.offset.min(all_entries.len());
-    let end = (start + query.limit).min(all_entries.len());
+    let end = start.saturating_add(query.limit).min(all_entries.len());
     let page_entries: Vec<ExplorerEntry> = all_entries[start..end].to_vec();
 
     // Group if requested
@@ -323,16 +335,14 @@ async fn resolve_agent_ids(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    let ids: AgentIds = rows
+    match rows
         .iter()
-        .filter_map(|row| {
-            let pid: i64 = row.get_named("project_id").ok()?;
-            let aid: i64 = row.get_named("id").ok()?;
-            Some((pid, aid))
-        })
-        .collect();
-
-    Outcome::Ok(ids)
+        .map(map_agent_row)
+        .collect::<Result<AgentIds, _>>()
+    {
+        Ok(ids) => Outcome::Ok(ids),
+        Err(error) => Outcome::Err(error),
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -378,11 +388,18 @@ async fn count_inbound(
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
-        let cnt: i64 = rows
-            .first()
-            .and_then(|row| row.get_named("cnt").ok())
-            .unwrap_or(0);
-        total = total.saturating_add(usize::try_from(cnt).unwrap_or(0));
+        let count = match map_count_rows(&rows) {
+            Ok(count) => count,
+            Err(error) => return Outcome::Err(error),
+        };
+        total = match total.checked_add(count) {
+            Some(total) => total,
+            None => {
+                return Outcome::Err(DbError::Serialization(
+                    "mail explorer total count exceeds usize".to_string(),
+                ));
+            }
+        };
     }
 
     Outcome::Ok(total)
@@ -426,11 +443,18 @@ async fn count_outbound(
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
-        let cnt: i64 = rows
-            .first()
-            .and_then(|row| row.get_named("cnt").ok())
-            .unwrap_or(0);
-        total = total.saturating_add(usize::try_from(cnt).unwrap_or(0));
+        let count = match map_count_rows(&rows) {
+            Ok(count) => count,
+            Err(error) => return Outcome::Err(error),
+        };
+        total = match total.checked_add(count) {
+            Some(total) => total,
+            None => {
+                return Outcome::Err(DbError::Serialization(
+                    "mail explorer total count exceeds usize".to_string(),
+                ));
+            }
+        };
     }
 
     Outcome::Ok(total)
@@ -481,13 +505,17 @@ async fn fetch_inbound(
              JOIN messages m ON m.id = r.message_id \
              LEFT JOIN agents s ON s.id = m.sender_id \
              LEFT JOIN projects p ON p.id = m.project_id \
-             LEFT JOIN message_recipients mr2 ON mr2.message_id = m.id \
+             LEFT JOIN message_recipients mr2 ON mr2.message_id = m.id AND mr2.kind IN ('to', 'cc') \
              LEFT JOIN agents a_recip ON a_recip.id = mr2.agent_id \
              WHERE {where_clause} \
              GROUP BY m.id \
-             ORDER BY m.created_ts DESC \
+             ORDER BY {order_by} \
              LIMIT {limit}",
-            limit = query.limit + query.offset
+            order_by = sql_order_by(query.sort, true),
+            limit = match candidate_limit(query) {
+                Ok(limit) => limit,
+                Err(error) => return Outcome::Err(error),
+            }
         );
 
         let rows = match map_sql_outcome(raw_query(cx, &*conn, &sql, &params).await) {
@@ -498,8 +526,9 @@ async fn fetch_inbound(
         };
 
         for row in &rows {
-            if let Some(entry) = map_inbound_row(row) {
-                all_entries.push(entry);
+            match map_inbound_row(row) {
+                Ok(entry) => all_entries.push(entry),
+                Err(error) => return Outcome::Err(error),
             }
         }
     }
@@ -554,9 +583,13 @@ async fn fetch_outbound(
              LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
              WHERE {where_clause} \
              GROUP BY m.id \
-             ORDER BY m.created_ts DESC \
+             ORDER BY {order_by} \
              LIMIT {limit}",
-            limit = query.limit + query.offset
+            order_by = sql_order_by(query.sort, false),
+            limit = match candidate_limit(query) {
+                Ok(limit) => limit,
+                Err(error) => return Outcome::Err(error),
+            }
         );
 
         let rows = match map_sql_outcome(raw_query(cx, &*conn, &sql, &params).await) {
@@ -567,8 +600,9 @@ async fn fetch_outbound(
         };
 
         for row in &rows {
-            if let Some(entry) = map_outbound_row(row) {
-                all_entries.push(entry);
+            match map_outbound_row(row) {
+                Ok(entry) => all_entries.push(entry),
+                Err(error) => return Outcome::Err(error),
             }
         }
     }
@@ -652,41 +686,75 @@ fn apply_filters(
 // Internal: row mapping
 // ────────────────────────────────────────────────────────────────────
 
-fn map_inbound_row(row: &SqlRow) -> Option<ExplorerEntry> {
-    let message_id: i64 = row.get_as(0).ok()?;
-    Some(ExplorerEntry {
+// Missing or mistyped database fields are not an empty mailbox, a normal
+// priority, or an unread receipt. Preserve real SQL NULLs, but fail the whole
+// projection when its schema/values cannot be decoded.
+fn explorer_decode_error(error: sqlmodel_core::Error) -> DbError {
+    DbError::Serialization(format!(
+        "invalid mail explorer database projection: {error}"
+    ))
+}
+
+fn map_agent_row(row: &SqlRow) -> Result<(i64, i64), DbError> {
+    Ok((
+        row.get_named("project_id").map_err(explorer_decode_error)?,
+        row.get_named("id").map_err(explorer_decode_error)?,
+    ))
+}
+
+fn map_count_rows(rows: &[SqlRow]) -> Result<usize, DbError> {
+    let row = rows.first().ok_or_else(|| {
+        DbError::Serialization("mail explorer count query returned no row".to_string())
+    })?;
+    let count = row.get_named::<i64>("cnt").map_err(explorer_decode_error)?;
+    usize::try_from(count).map_err(|_| {
+        DbError::Serialization("mail explorer count is negative or exceeds usize".to_string())
+    })
+}
+
+fn map_inbound_row(row: &SqlRow) -> Result<ExplorerEntry, DbError> {
+    let message_id: i64 = row.get_as(0).map_err(explorer_decode_error)?;
+    Ok(ExplorerEntry {
         message_id,
-        project_id: row.get_as(1).ok()?,
-        project_slug: row.get_as(13).unwrap_or_default(),
-        sender_name: row.get_as(12).unwrap_or_default(),
-        to_agents: row.get_as(14).unwrap_or_default(),
-        subject: row.get_as(4).unwrap_or_default(),
-        body_md: row.get_as(5).unwrap_or_default(),
-        thread_id: row.get_as(3).ok(),
-        importance: row.get_as(6).unwrap_or_else(|_| "normal".to_string()),
-        ack_required: row.get_as::<i64>(7).unwrap_or(0) != 0,
-        created_ts: row.get_as(8).ok()?,
-        kind: row.get_as(9).ok(),
-        read_ts: row.get_as(10).ok(),
-        ack_ts: row.get_as(11).ok(),
+        project_id: row.get_as(1).map_err(explorer_decode_error)?,
+        project_slug: row.get_as(13).map_err(explorer_decode_error)?,
+        sender_name: row.get_as(12).map_err(explorer_decode_error)?,
+        to_agents: row.get_as(14).map_err(explorer_decode_error)?,
+        subject: row.get_as(4).map_err(explorer_decode_error)?,
+        body_md: row.get_as(5).map_err(explorer_decode_error)?,
+        thread_id: row
+            .get_as::<Option<String>>(3)
+            .map_err(explorer_decode_error)?,
+        importance: row.get_as(6).map_err(explorer_decode_error)?,
+        ack_required: row.get_as::<i64>(7).map_err(explorer_decode_error)? != 0,
+        created_ts: row.get_as(8).map_err(explorer_decode_error)?,
+        kind: Some(row.get_as(9).map_err(explorer_decode_error)?),
+        read_ts: row
+            .get_as::<Option<i64>>(10)
+            .map_err(explorer_decode_error)?,
+        ack_ts: row
+            .get_as::<Option<i64>>(11)
+            .map_err(explorer_decode_error)?,
         direction: Direction::Inbound,
     })
 }
 
-fn map_outbound_row(row: &SqlRow) -> Option<ExplorerEntry> {
-    let message_id: i64 = row.get_as(0).ok()?;
-    Some(ExplorerEntry {
+fn map_outbound_row(row: &SqlRow) -> Result<ExplorerEntry, DbError> {
+    let message_id: i64 = row.get_as(0).map_err(explorer_decode_error)?;
+    Ok(ExplorerEntry {
         message_id,
-        project_id: row.get_as(1).ok()?,
-        project_slug: row.get_as(10).unwrap_or_default(),
-        sender_name: row.get_as(9).unwrap_or_default(),
-        to_agents: row.get_as(11).unwrap_or_default(),
-        subject: row.get_as(4).unwrap_or_default(),
-        body_md: row.get_as(5).unwrap_or_default(),
-        thread_id: row.get_as(3).ok(),
-        importance: row.get_as(6).unwrap_or_else(|_| "normal".to_string()),
-        ack_required: row.get_as::<i64>(7).unwrap_or(0) != 0,
-        created_ts: row.get_as(8).ok()?,
+        project_id: row.get_as(1).map_err(explorer_decode_error)?,
+        project_slug: row.get_as(10).map_err(explorer_decode_error)?,
+        sender_name: row.get_as(9).map_err(explorer_decode_error)?,
+        to_agents: row.get_as(11).map_err(explorer_decode_error)?,
+        subject: row.get_as(4).map_err(explorer_decode_error)?,
+        body_md: row.get_as(5).map_err(explorer_decode_error)?,
+        thread_id: row
+            .get_as::<Option<String>>(3)
+            .map_err(explorer_decode_error)?,
+        importance: row.get_as(6).map_err(explorer_decode_error)?,
+        ack_required: row.get_as::<i64>(7).map_err(explorer_decode_error)? != 0,
+        created_ts: row.get_as(8).map_err(explorer_decode_error)?,
         kind: None,
         read_ts: None,
         ack_ts: None,
@@ -698,19 +766,47 @@ fn map_outbound_row(row: &SqlRow) -> Option<ExplorerEntry> {
 // Internal: sorting
 // ────────────────────────────────────────────────────────────────────
 
-fn sort_entries(entries: &mut [ExplorerEntry], mode: SortMode) {
+/// Each project/direction must select its best offset + limit candidates using
+/// the SAME order as the final merge. Sorting a newest-only subset afterward
+/// loses old, urgent and alphabetically earlier messages permanently.
+fn sql_order_by(mode: SortMode, inbound: bool) -> &'static str {
     match mode {
-        SortMode::DateDesc => entries.sort_by_key(|e| std::cmp::Reverse(e.created_ts)),
-        SortMode::DateAsc => entries.sort_by_key(|e| e.created_ts),
+        SortMode::DateDesc => "m.created_ts DESC, m.id DESC",
+        SortMode::DateAsc => "m.created_ts ASC, m.id ASC",
         SortMode::ImportanceDesc => {
-            entries.sort_by(|a, b| {
-                let ia = importance_rank(&a.importance);
-                let ib = importance_rank(&b.importance);
-                ib.cmp(&ia).then_with(|| b.created_ts.cmp(&a.created_ts))
-            });
+            "CASE m.importance COLLATE BINARY WHEN 'urgent' THEN 4 WHEN 'high' THEN 3 WHEN 'normal' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, m.created_ts DESC, m.id DESC"
         }
-        SortMode::AgentAlpha => {
-            entries.sort_by(|a, b| {
+        // SQLite NOCASE and the merge comparator both fold ASCII only.
+        SortMode::AgentAlpha if inbound => {
+            "sender_name COLLATE NOCASE ASC, m.created_ts DESC, m.id DESC"
+        }
+        SortMode::AgentAlpha => "to_agents COLLATE NOCASE ASC, m.created_ts DESC, m.id DESC",
+    }
+}
+
+fn candidate_limit(query: &ExplorerQuery) -> Result<i64, DbError> {
+    if query.limit == 0 {
+        return Ok(0);
+    }
+    query
+        .offset
+        .checked_add(query.limit)
+        .and_then(|limit| i64::try_from(limit).ok())
+        .ok_or_else(|| DbError::InvalidArgument {
+            field: "pagination",
+            message: "offset + limit exceeds the supported SQLite integer range".to_string(),
+        })
+}
+
+fn sort_entries(entries: &mut [ExplorerEntry], mode: SortMode) {
+    entries.sort_by(|a, b| {
+        let primary = match mode {
+            SortMode::DateDesc => b.created_ts.cmp(&a.created_ts),
+            SortMode::DateAsc => a.created_ts.cmp(&b.created_ts),
+            SortMode::ImportanceDesc => importance_rank(&b.importance)
+                .cmp(&importance_rank(&a.importance))
+                .then_with(|| b.created_ts.cmp(&a.created_ts)),
+            SortMode::AgentAlpha => {
                 let agent_a = if a.direction == Direction::Inbound {
                     &a.sender_name
                 } else {
@@ -721,15 +817,32 @@ fn sort_entries(entries: &mut [ExplorerEntry], mode: SortMode) {
                 } else {
                     &b.to_agents
                 };
-
                 agent_a
                     .bytes()
-                    .map(|b| b.to_ascii_lowercase())
-                    .cmp(agent_b.bytes().map(|b| b.to_ascii_lowercase()))
+                    .map(|byte| byte.to_ascii_lowercase())
+                    .cmp(agent_b.bytes().map(|byte| byte.to_ascii_lowercase()))
                     .then_with(|| b.created_ts.cmp(&a.created_ts))
-            });
-        }
-    }
+            }
+        };
+        primary
+            .then_with(|| {
+                if mode == SortMode::DateAsc {
+                    a.message_id.cmp(&b.message_id)
+                } else {
+                    b.message_id.cmp(&a.message_id)
+                }
+            })
+            // Self-addressed mail can appear once in each direction. Give it
+            // stable page membership independently of project iteration order.
+            .then_with(|| {
+                let rank = |direction| match direction {
+                    Direction::Inbound => 0_u8,
+                    Direction::Outbound => 1,
+                    Direction::All => 2,
+                };
+                rank(a.direction).cmp(&rank(b.direction))
+            })
+    });
 }
 
 fn importance_rank(imp: &str) -> u8 {

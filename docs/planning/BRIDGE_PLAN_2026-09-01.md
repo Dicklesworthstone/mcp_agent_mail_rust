@@ -217,6 +217,37 @@ fast model emits 256 dimensions. Exact call sites were sent to GentleBeaver's
 existing `br-kp1in.7` work (Mail 42841). This is a source finding awaiting a real
 indexing/search reproducer, not a claim that full semantic transport now recovers.
 
+Checkpoint `0c72bac5` preserves the live DB fix and the 68-test result. The
+`ae296364` integration required manual formatting plus direct compiler/lint
+repairs: ACK candidate coalescing now inserts a key before attempting admission
+and removes it only for a stale delivery, retaining eligible siblings and bounded
+error retries; fixture checkout uses `Outcome::expect`; optional context
+publication uses equivalent lazy `map_or_else` branches and explicit unit
+patterns. Strict RCH workspace/all-target Clippy with the optional search feature
+and warnings denied passed at 08:28:14 UTC on `vmi1264463` (receipt
+`20260922-rainyforest-ae296-clippy-final4.log`). The workspace/all-target compiler
+check with the same feature passed at 08:37:31 UTC (475.871 seconds; receipt
+`20260922-rainyforest-ae296-check.log`). The combined DB/storage/search-core
+candidate passed 158/158 selected native tests at 08:59:07 UTC (4,935 outside
+selection, 162.597 seconds after a 14m51s build). This includes 12 transactional
+ACK admission tests, 12 ACK scans, 54 explorer helper/regression tests, 19 live
+context tests, 15 live model tests, 24 optional-context tests, 14 optional-model
+tests and eight staged-recovery controls. The registered-model subprocess passed
+in 34.056 seconds with its completion marker. Receipt
+`20260922-rainyforest-ae296-db-core-tests.log` has SHA-256
+`34c97aa62cc5f37c29e397896e61d59c46c4147f7982aec14ed1a1887a25e4cd`;
+metadata-only remote inspection identified three unchanged test executables,
+with hashes in `20260922-rainyforest-ae296-test-elf.sha256`. The server ACK-worker
+and ATC admission test run remains pending. Its old default-feature target cache
+no longer contains the necessary compiled artifacts and requires a cold build.
+An earlier combined server/optional-search attempt was cancelled before tests
+when feature unification forced a cold rebuild; that attempt has no verdict.
+The final 13-file UBS comparison against the
+incoming base exits 0 with zero new critical, 265 warning and 25 informational
+findings. Warnings were reviewed as fixture assertions/setup, bounded cloning
+and location diagnostics; exact test-only panic annotations preserve the
+assertions. The full historical scan is still not a release clearance.
+
 RainyForest read all 1,350 lines of current AGENTS.md and 2,053 lines of README.md.
 The current vision, durability, threat, browser and ATC contracts were compared
 with source, the verification ledger, dependency upgrade log, previous full
