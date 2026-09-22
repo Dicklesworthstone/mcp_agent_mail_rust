@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{Read, Write};
@@ -1379,45 +1380,332 @@ pub fn ensure_gitignore_entries(
 // TOML section merge
 // ---------------------------------------------------------------------------
 
+/// Keys the desired HTTP section owns outright, not only the keys present in
+/// a particular invocation. If the server switches from stdio to HTTP, or
+/// from bearer auth to no-auth, preserving an omitted managed key leaves
+/// Codex on a conflicting transport or stale credential and makes setup's
+/// status/self-heal loop unable to converge.
+const TOML_SETUP_MANAGED_KEYS: [&str; 12] = [
+    "url",
+    "httpUrl",
+    "startup_timeout_sec",
+    "http_headers",
+    "env_http_headers",
+    "bearer_token_env_var",
+    "command",
+    "args",
+    "cwd",
+    "env",
+    "environment",
+    "transport",
+];
+
+const TOML_CANONICAL_SERVER_TABLE: &str = "mcp_servers.mcp_agent_mail";
+const TOML_ALIAS_SERVER_TABLE: &str = "mcp_servers.\"mcp-agent-mail\"";
+const TOML_ALIAS_SERVER_KEY: &str = "mcp-agent-mail";
+
+fn toml_setup_managed_key(key: &str, target_keys: &HashSet<&str>) -> bool {
+    target_keys.contains(key) || TOML_SETUP_MANAGED_KEYS.contains(&key)
+}
+
 /// Merge or append a TOML section, replacing keys in the target section.
 ///
 /// Codex's canonical spelling is `mcp_agent_mail`; rewrite the quoted hyphen
 /// alias when setup encounters it so clients do not retain two server names.
+///
+/// A parseable document is merged structurally through `toml_edit`, so a
+/// managed key is replaced however the client last serialized it: as an
+/// inline value, as a standard sub-table such as
+/// `[mcp_servers.mcp_agent_mail.http_headers]` (Codex rewrites every server
+/// entry in that form on `codex mcp add`/`remove`), or as dotted keys.
+/// Unmanaged keys and sub-tables (`tools.*`) survive in place. A document
+/// that does not parse, for example one an earlier setup left with a
+/// duplicated `http_headers` definition, falls back to a line-oriented merge
+/// that also drops descendant tables of managed keys, so a rerun converges
+/// on valid TOML instead of corrupting the file again (GH #328). Whatever
+/// the path, output that does not parse is an error rather than a write.
 fn merge_toml_section(
     existing: Option<&str>,
     section_header: &str,
     key_values: &[(String, String)],
-) -> String {
-    use std::collections::HashSet;
-
-    let mut section_lines = Vec::with_capacity(key_values.len() + 1);
-    section_lines.push(section_header.to_string());
-    section_lines.extend(key_values.iter().map(|(k, v)| format!("{k} = {v}")));
-
-    match existing {
+) -> Result<String, SetupError> {
+    let merged = match existing {
         Some(text) if !text.trim().is_empty() => {
-            let target_keys: HashSet<&str> = key_values.iter().map(|(k, _)| k.as_str()).collect();
-            let mut merged = Vec::new();
-            let mut in_target_section = false;
-            let mut saw_target_section = false;
-            let mut preserved_target_lines = Vec::new();
-            let mut preserved_target_keys = HashSet::new();
+            merge_toml_section_document(text, section_header, key_values)
+                .unwrap_or_else(|| merge_toml_section_lines(text, section_header, key_values))
+        }
+        _ => {
+            // No existing file — create fresh.
+            let mut section = section_header.to_string();
+            for (key, value) in key_values {
+                section.push('\n');
+                section.push_str(key);
+                section.push_str(" = ");
+                section.push_str(value);
+            }
+            section.push('\n');
+            section
+        }
+    };
+    match toml::from_str::<toml::Value>(&merged) {
+        Ok(_) => Ok(merged),
+        Err(error) => Err(SetupError::Other(toml_merge_refusal(
+            section_header,
+            existing,
+            &error,
+        ))),
+    }
+}
 
-            for raw_line in text.lines() {
-                if let Some(section) = parse_toml_section_header(raw_line) {
-                    in_target_section = toml_section_matches_target(section, section_header);
-                    saw_target_section |= in_target_section;
-                    if !in_target_section {
-                        merged.push(raw_line.to_string());
+/// Explain why a merged TOML document was not written. When the input was
+/// already unparseable outside the managed section, say so: the user has to
+/// repair the file, and rerunning setup will not help.
+fn toml_merge_refusal(
+    section_header: &str,
+    existing: Option<&str>,
+    error: &toml::de::Error,
+) -> String {
+    existing
+        .and_then(|text| toml::from_str::<toml::Value>(text).err())
+        .map_or_else(
+            || format!("refusing to write {section_header}: merged TOML does not parse: {error}"),
+            |existing_error| {
+                format!(
+                    "refusing to write {section_header}: the existing config is not valid TOML \
+                     outside the section setup manages, so setup cannot repair it \
+                     ({existing_error}); fix the file by hand and rerun setup"
+                )
+            },
+        )
+}
+
+/// Split a `[a.b."c-d"]` header into its key path.
+fn parse_toml_header_path(section_header: &str) -> Option<Vec<String>> {
+    let inner = section_header
+        .trim()
+        .strip_prefix('[')?
+        .strip_suffix(']')?
+        .trim();
+    let keys = toml_edit::Key::parse(inner).ok()?;
+    if keys.is_empty() {
+        return None;
+    }
+    Some(keys.iter().map(|key| key.get().to_string()).collect())
+}
+
+/// Structural merge for documents `toml_edit` can parse. Returns `None` when
+/// the document, the header, or a managed value does not parse, or when a
+/// parent of the target holds a non-table value; the caller then falls back
+/// to the line-oriented merge.
+fn merge_toml_section_document(
+    text: &str,
+    section_header: &str,
+    key_values: &[(String, String)],
+) -> Option<String> {
+    use toml_edit::{DocumentMut, Item, Table, TableLike, Value as TomlValue};
+
+    let mut doc: DocumentMut = text.parse().ok()?;
+    let target_path = parse_toml_header_path(section_header)?;
+    let (target_key, parent_path) = target_path.split_last()?;
+    let alias_key = (target_path
+        .iter()
+        .map(String::as_str)
+        .eq(["mcp_servers", "mcp_agent_mail"]))
+    .then_some(TOML_ALIAS_SERVER_KEY);
+
+    let mut values = Vec::with_capacity(key_values.len());
+    for (key, raw) in key_values {
+        let value: TomlValue = raw.parse().ok()?;
+        values.push((key.as_str(), value));
+    }
+    let target_keys: HashSet<&str> = key_values.iter().map(|(k, _)| k.as_str()).collect();
+
+    let mut parent: &mut dyn TableLike = doc.as_table_mut();
+    for segment in parent_path {
+        let item = parent.entry(segment).or_insert_with(|| {
+            let mut table = Table::new();
+            table.set_implicit(true);
+            Item::Table(table)
+        });
+        parent = item.as_table_like_mut()?;
+    }
+
+    // Fold the quoted alias into the canonical entry, then drop it, so the
+    // client never retains two server names.
+    let alias_entries: Vec<(String, Item)> = alias_key
+        .and_then(|alias| parent.remove(alias))
+        .and_then(|item| {
+            item.as_table_like().map(|table| {
+                table
+                    .iter()
+                    .map(|(key, item)| (key.to_string(), item.clone()))
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+
+    let target_item = parent
+        .entry(target_key)
+        .or_insert_with(|| Item::Table(Table::new()));
+    if target_item.as_table_like().is_none() {
+        *target_item = Item::Table(Table::new());
+    }
+    if let Some(table) = target_item.as_table_mut() {
+        table.set_implicit(false);
+    }
+    let target = target_item.as_table_like_mut()?;
+
+    // Drop every managed key however it was serialized: inline value,
+    // standard sub-table, or dotted keys all live under the same entry.
+    let stale: Vec<String> = target
+        .iter()
+        .map(|(key, _)| key.to_string())
+        .filter(|key| toml_setup_managed_key(key, &target_keys))
+        .collect();
+    for key in &stale {
+        target.remove(key);
+    }
+    for (key, item) in alias_entries {
+        if !toml_setup_managed_key(&key, &target_keys) && !target.contains_key(&key) {
+            target.insert(&key, item);
+        }
+    }
+    for (key, value) in values {
+        target.insert(key, Item::Value(value));
+    }
+
+    let mut out = doc.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// How a `[header]` relates to the section setup manages.
+enum TomlSectionRelation {
+    /// The target table itself, in either spelling.
+    Target,
+    /// A descendant table such as `[target.http_headers]` or
+    /// `[target.tools.x]`; carries the first child key.
+    Descendant(String),
+    Other,
+}
+
+fn toml_section_relation(section: &str, section_header: &str) -> TomlSectionRelation {
+    // Arrays of tables keep one extra bracket pair after the header strip.
+    let section = section.trim().trim_matches(['[', ']']).trim();
+    let target = section_header.trim().trim_matches(['[', ']']).trim();
+    let mut spellings = vec![target];
+    if target == TOML_CANONICAL_SERVER_TABLE {
+        spellings.push(TOML_ALIAS_SERVER_TABLE);
+    }
+    for spelling in spellings {
+        if section == spelling {
+            return TomlSectionRelation::Target;
+        }
+        if let Some(rest) = section
+            .strip_prefix(spelling)
+            .and_then(|rest| rest.strip_prefix('.'))
+        {
+            return TomlSectionRelation::Descendant(toml_first_key_segment(rest).to_string());
+        }
+    }
+    TomlSectionRelation::Other
+}
+
+/// First segment of a dotted key, unquoted. `http_headers.Authorization`
+/// yields `http_headers`; `"quoted.name".x` yields `quoted.name`.
+fn toml_first_key_segment(key: &str) -> &str {
+    let key = key.trim();
+    for quote in ['"', '\''] {
+        if let Some(rest) = key.strip_prefix(quote) {
+            if let Some(end) = rest.find(quote) {
+                return &rest[..end];
+            }
+            return rest;
+        }
+    }
+    key.split('.').next().unwrap_or(key).trim()
+}
+
+/// Which part of the document the line-oriented merge is currently reading.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TomlMergeCursor {
+    Other,
+    Target,
+    DropDescendant,
+    KeepDescendant,
+}
+
+/// Line-oriented merge for documents `toml_edit` rejects. Keeps every
+/// unrelated line verbatim, coalesces both spellings of the target table into
+/// one canonical section, drops descendant tables of managed keys (the
+/// duplicate `http_headers` shape from GH #328), and re-emits unmanaged
+/// descendant tables after the rebuilt target section.
+fn merge_toml_section_lines(
+    text: &str,
+    section_header: &str,
+    key_values: &[(String, String)],
+) -> String {
+    let target_keys: HashSet<&str> = key_values.iter().map(|(k, _)| k.as_str()).collect();
+    let canonical_prefix = section_header.trim().trim_matches(['[', ']']).trim();
+
+    let mut merged = Vec::new();
+    let mut cursor = TomlMergeCursor::Other;
+    let mut saw_target_section = false;
+    let mut preserved_target_lines = Vec::new();
+    let mut preserved_target_keys = HashSet::new();
+    let mut preserved_descendant_lines: Vec<String> = Vec::new();
+
+    for raw_line in text.lines() {
+        if let Some(section) = parse_toml_section_header(raw_line) {
+            match toml_section_relation(section, section_header) {
+                TomlSectionRelation::Target => {
+                    cursor = TomlMergeCursor::Target;
+                    saw_target_section = true;
+                }
+                TomlSectionRelation::Descendant(child) => {
+                    saw_target_section = true;
+                    if toml_setup_managed_key(&child, &target_keys) {
+                        cursor = TomlMergeCursor::DropDescendant;
+                    } else {
+                        cursor = TomlMergeCursor::KeepDescendant;
+                        // Re-spell an alias descendant under the canonical
+                        // table so the document keeps a single server name.
+                        let rewritten = if canonical_prefix == TOML_CANONICAL_SERVER_TABLE {
+                            raw_line.replacen(
+                                TOML_ALIAS_SERVER_TABLE,
+                                TOML_CANONICAL_SERVER_TABLE,
+                                1,
+                            )
+                        } else {
+                            raw_line.to_string()
+                        };
+                        if !preserved_descendant_lines.is_empty()
+                            && !preserved_descendant_lines
+                                .last()
+                                .is_some_and(String::is_empty)
+                        {
+                            preserved_descendant_lines.push(String::new());
+                        }
+                        preserved_descendant_lines.push(rewritten);
                     }
-                    continue;
                 }
-
-                if !in_target_section {
+                TomlSectionRelation::Other => {
+                    cursor = TomlMergeCursor::Other;
                     merged.push(raw_line.to_string());
-                    continue;
                 }
+            }
+            continue;
+        }
 
+        match cursor {
+            TomlMergeCursor::Other => merged.push(raw_line.to_string()),
+            TomlMergeCursor::DropDescendant => {}
+            TomlMergeCursor::KeepDescendant => {
+                preserved_descendant_lines.push(raw_line.to_string());
+            }
+            TomlMergeCursor::Target => {
                 // Coalesce every matching spelling of the target table into
                 // one canonical section. Keeping the aliases in place would
                 // emit duplicate TOML table headers when both spellings were
@@ -1428,63 +1716,49 @@ fn merge_toml_section(
                     continue;
                 };
                 let key = lhs.trim();
-                // The desired HTTP section owns every transport/auth key, not
-                // only the keys present in this particular invocation. If the
-                // server switches from stdio to HTTP, or from bearer auth to
-                // no-auth, preserving an omitted managed key leaves Codex on a
-                // conflicting transport or stale credential and makes setup's
-                // status/self-heal loop unable to converge.
-                let setup_managed_key = target_keys.contains(key)
-                    || matches!(
-                        key,
-                        "url"
-                            | "httpUrl"
-                            | "startup_timeout_sec"
-                            | "http_headers"
-                            | "env_http_headers"
-                            | "bearer_token_env_var"
-                            | "command"
-                            | "args"
-                            | "cwd"
-                            | "env"
-                            | "environment"
-                            | "transport"
-                    );
-                if !setup_managed_key && preserved_target_keys.insert(key.to_string()) {
+                // A dotted key such as `http_headers.Authorization` belongs
+                // to the managed `http_headers` entry.
+                let owner = toml_first_key_segment(key);
+                if !toml_setup_managed_key(owner, &target_keys)
+                    && preserved_target_keys.insert(key.to_string())
+                {
                     preserved_target_lines.push(raw_line.to_string());
                 }
             }
-
-            if !merged.is_empty() && !merged.last().is_some_and(String::is_empty) {
-                merged.push(String::new());
-            }
-            if saw_target_section {
-                merged.push(section_header.to_string());
-                merged.extend(preserved_target_lines);
-                merged.extend(key_values.iter().map(|(k, v)| format!("{k} = {v}")));
-            } else {
-                merged.extend(section_lines);
-            }
-
-            let mut out = merged.join("\n");
-            if text.ends_with('\n') || !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out
-        }
-        _ => {
-            // No existing file — create fresh.
-            let mut section = section_lines.join("\n");
-            section.push('\n');
-            section
         }
     }
-}
 
-fn toml_section_matches_target(section: &str, section_header: &str) -> bool {
-    let target = section_header.trim_matches(['[', ']']);
-    section == target
-        || (target == "mcp_servers.mcp_agent_mail" && section == "mcp_servers.\"mcp-agent-mail\"")
+    while preserved_target_lines
+        .last()
+        .is_some_and(|line| line.trim().is_empty())
+    {
+        preserved_target_lines.pop();
+    }
+    while preserved_descendant_lines
+        .last()
+        .is_some_and(|line| line.trim().is_empty())
+    {
+        preserved_descendant_lines.pop();
+    }
+
+    if !merged.is_empty() && !merged.last().is_some_and(String::is_empty) {
+        merged.push(String::new());
+    }
+    merged.push(section_header.to_string());
+    if saw_target_section {
+        merged.extend(preserved_target_lines);
+    }
+    merged.extend(key_values.iter().map(|(k, v)| format!("{k} = {v}")));
+    if !preserved_descendant_lines.is_empty() {
+        merged.push(String::new());
+        merged.extend(preserved_descendant_lines);
+    }
+
+    let mut out = merged.join("\n");
+    if text.ends_with('\n') || !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 fn strip_toml_inline_comment(line: &str) -> &str {
@@ -4170,7 +4444,7 @@ fn write_config_atomic_inner(
             ConfigContent::TomlSection {
                 section_header,
                 key_values,
-            } => Ok(merge_toml_section(existing, section_header, key_values)),
+            } => merge_toml_section(existing, section_header, key_values),
         },
     )
 }
@@ -6665,70 +6939,145 @@ fn analyze_toml_config_content(
     }
 }
 
+/// Where the status reader files subsequent key/value lines.
+#[derive(Clone, Copy)]
+enum TomlStatusCursor {
+    /// Not inside the server entry or any of its descendants.
+    None,
+    /// Directly inside the server entry at `sections[index]`.
+    Entry(usize),
+    /// Inside `[<entry>.http_headers]`, which Codex emits in place of the
+    /// inline `http_headers = { ... }` whenever it rewrites its config.
+    Headers(usize),
+    /// Inside an unmanaged descendant such as `[<entry>.tools.x]`.
+    Descendant,
+}
+
 fn collect_toml_server_sections(content: &str) -> Vec<TomlServerSection> {
-    let mut sections = Vec::new();
-    let mut current_index: Option<usize> = None;
+    let mut sections: Vec<TomlServerSection> = Vec::new();
+    // Sections declared only through a descendant header (`[a.b.http_headers]`
+    // before `[a.b]`) are implicit; the explicit header later adopts them
+    // instead of registering a duplicate entry.
+    let mut explicit: Vec<bool> = Vec::new();
+    let mut cursor = TomlStatusCursor::None;
 
     for raw_line in content.lines() {
         if let Some(section) = parse_toml_section_header(raw_line) {
-            if matches!(
-                section,
-                "mcp_servers.mcp_agent_mail" | "mcp_servers.\"mcp-agent-mail\""
-            ) {
-                sections.push(TomlServerSection {
-                    section: section.to_string(),
-                    entry: Map::new(),
-                    url: None,
-                    authorization: None,
-                    startup_timeout: None,
-                    legacy_stdio: false,
-                });
-                current_index = Some(sections.len() - 1);
-            } else {
-                current_index = None;
-            }
+            cursor = toml_status_header_cursor(section, &mut sections, &mut explicit);
             continue;
         }
 
-        let Some(index) = current_index else {
-            continue;
-        };
         let Some((key, value)) = parse_toml_key_value(raw_line) else {
             continue;
         };
 
-        match key.as_str() {
-            "url" | "httpUrl" => {
-                if let Some(url) = value.as_str() {
-                    sections[index].url = Some(url.to_string());
+        match cursor {
+            TomlStatusCursor::None | TomlStatusCursor::Descendant => {}
+            TomlStatusCursor::Headers(index) => {
+                if key == "Authorization" {
+                    sections[index].authorization = value.as_str().map(str::to_string);
+                }
+                let headers = sections[index]
+                    .entry
+                    .entry("http_headers".to_string())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if let Some(headers) = headers.as_object_mut() {
+                    headers.insert(key, value);
                 }
             }
-            "http_headers" => {
-                sections[index].authorization = value
-                    .as_object()
-                    .and_then(|headers| headers.get("Authorization"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
+            TomlStatusCursor::Entry(index) => {
+                record_toml_server_entry_key(&mut sections[index], key, value);
             }
-            "startup_timeout_sec" => {
-                sections[index].startup_timeout = value.as_u64();
-            }
-            "command" | "args" => {
-                sections[index].legacy_stdio = true;
-            }
-            "transport"
-                if value
-                    .as_str()
-                    .is_some_and(|transport| transport.eq_ignore_ascii_case("stdio")) =>
-            {
-                sections[index].legacy_stdio = true;
-            }
-            _ => {}
         }
-        sections[index].entry.insert(key, value);
     }
 
     sections
+}
+
+/// Resolve a `[header]` to the section its following lines belong to,
+/// registering the server entry when the header introduces it.
+fn toml_status_header_cursor(
+    section: &str,
+    sections: &mut Vec<TomlServerSection>,
+    explicit: &mut Vec<bool>,
+) -> TomlStatusCursor {
+    let (owner, child) = match toml_section_relation(section, "[mcp_servers.mcp_agent_mail]") {
+        TomlSectionRelation::Target => (Some(section.trim().trim_matches(['[', ']']).trim()), None),
+        TomlSectionRelation::Descendant(child) => {
+            let section = section.trim().trim_matches(['[', ']']).trim();
+            let owner = [TOML_CANONICAL_SERVER_TABLE, TOML_ALIAS_SERVER_TABLE]
+                .into_iter()
+                .find(|spelling| section.starts_with(spelling));
+            (owner, Some(child))
+        }
+        TomlSectionRelation::Other => (None, None),
+    };
+    let Some(owner) = owner else {
+        return TomlStatusCursor::None;
+    };
+    let declared = child.is_none();
+    let existing = sections
+        .iter()
+        .enumerate()
+        .find(|(idx, candidate)| candidate.section == owner && (!declared || !explicit[*idx]))
+        .map(|(idx, _)| idx);
+    let index = if let Some(idx) = existing {
+        if declared {
+            explicit[idx] = true;
+        }
+        idx
+    } else {
+        sections.push(TomlServerSection {
+            section: owner.to_string(),
+            entry: Map::new(),
+            url: None,
+            authorization: None,
+            startup_timeout: None,
+            legacy_stdio: false,
+        });
+        explicit.push(declared);
+        sections.len() - 1
+    };
+    match child.as_deref() {
+        None => TomlStatusCursor::Entry(index),
+        Some("http_headers") => TomlStatusCursor::Headers(index),
+        Some(_) => TomlStatusCursor::Descendant,
+    }
+}
+
+fn record_toml_server_entry_key(section: &mut TomlServerSection, key: String, value: Value) {
+    match key.as_str() {
+        "url" | "httpUrl" => {
+            if let Some(url) = value.as_str() {
+                section.url = Some(url.to_string());
+            }
+        }
+        "http_headers" => {
+            section.authorization = value
+                .as_object()
+                .and_then(|headers| headers.get("Authorization"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        "http_headers.Authorization" => {
+            section.authorization = value.as_str().map(str::to_string);
+        }
+        "startup_timeout_sec" => {
+            section.startup_timeout = value.as_u64();
+        }
+        "command" | "args" => {
+            section.legacy_stdio = true;
+        }
+        "transport"
+            if value
+                .as_str()
+                .is_some_and(|transport| transport.eq_ignore_ascii_case("stdio")) =>
+        {
+            section.legacy_stdio = true;
+        }
+        _ => {}
+    }
+    section.entry.insert(key, value);
 }
 
 fn parse_toml_key_value(line: &str) -> Option<(String, Value)> {
@@ -13338,7 +13687,8 @@ http_headers = { Authorization = "Bearer tok" }
                 ),
                 ("startup_timeout_sec".to_string(), "15".to_string()),
             ],
-        );
+        )
+        .unwrap();
 
         assert!(merged.contains("[mcp_servers.mcp_agent_mail]"));
         assert!(!merged.contains("mcp-agent-mail"));
@@ -13369,7 +13719,8 @@ http_headers = { Authorization = "Bearer tok" }
                 ),
                 ("startup_timeout_sec".to_string(), "30".to_string()),
             ],
-        );
+        )
+        .unwrap();
 
         for stale_key in [
             "command",
@@ -13417,7 +13768,8 @@ http_headers = { Authorization = "Bearer tok" }
                 ),
                 ("startup_timeout_sec".to_string(), "15".to_string()),
             ],
-        );
+        )
+        .unwrap();
 
         // TOML rejects a table header when the same table was already
         // declared. One canonical header proves setup did not emit the invalid
@@ -13436,6 +13788,389 @@ http_headers = { Authorization = "Bearer tok" }
         assert!(merged.contains("custom_setting = \"keep-first\""));
         assert!(!merged.contains("custom_setting = \"drop-duplicate\""));
         assert!(merged.contains("[other]\nenabled = true"));
+    }
+
+    /// Codex re-serializes every server entry through its own TOML writer on
+    /// `codex mcp add`/`remove`, turning `http_headers = { ... }` into a
+    /// standard sub-table. Setup must replace that sub-table instead of
+    /// leaving it behind next to a fresh inline key (GH #328).
+    const CODEX_RESERIALIZED_CONFIG: &str = "\
+[mcp_servers.mcp_agent_mail]
+url = \"http://127.0.0.1:8766/mcp/\"
+startup_timeout_sec = 30
+
+[mcp_servers.mcp_agent_mail.http_headers]
+Authorization = \"Bearer scratch\"
+
+[mcp_servers.mcp_agent_mail.tools.send_message]
+approval = \"never\"
+
+[mcp_servers.context7]
+command = \"true\"
+";
+
+    fn codex_http_key_values(token: &str) -> Vec<(String, String)> {
+        vec![
+            (
+                "url".to_string(),
+                "\"http://127.0.0.1:8766/mcp/\"".to_string(),
+            ),
+            ("startup_timeout_sec".to_string(), "30".to_string()),
+            (
+                "http_headers".to_string(),
+                format!("{{ Authorization = \"Bearer {token}\" }}"),
+            ),
+        ]
+    }
+
+    fn count_toml_key(merged: &str, key: &str) -> usize {
+        merged
+            .lines()
+            .filter(|line| {
+                let line = line.trim();
+                line.split_once('=')
+                    .is_some_and(|(lhs, _)| lhs.trim() == key)
+                    || line.ends_with(&format!(".{key}]"))
+            })
+            .count()
+    }
+
+    #[test]
+    fn setup_replaces_codex_sub_table_http_headers_without_duplicate_keys() {
+        let merged = merge_toml_section(
+            Some(CODEX_RESERIALIZED_CONFIG),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("rotated"),
+        )
+        .unwrap();
+
+        let parsed: toml::Value = toml::from_str(&merged)
+            .unwrap_or_else(|error| panic!("merged config must parse: {error}\n{merged}"));
+        let entry = &parsed["mcp_servers"]["mcp_agent_mail"];
+        assert_eq!(
+            entry["http_headers"]["Authorization"].as_str(),
+            Some("Bearer rotated")
+        );
+        assert_eq!(entry["url"].as_str(), Some("http://127.0.0.1:8766/mcp/"));
+        assert_eq!(entry["startup_timeout_sec"].as_integer(), Some(30));
+        assert_eq!(
+            count_toml_key(&merged, "http_headers"),
+            1,
+            "exactly one http_headers definition may remain\n{merged}"
+        );
+        assert!(!merged.contains("Bearer scratch"), "{merged}");
+        // Unmanaged descendants and unrelated servers survive untouched.
+        assert_eq!(
+            entry["tools"]["send_message"]["approval"].as_str(),
+            Some("never")
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["context7"]["command"].as_str(),
+            Some("true")
+        );
+
+        let sections = collect_toml_server_sections(&merged);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].authorization.as_deref(), Some("Bearer rotated"));
+    }
+
+    #[test]
+    fn setup_repairs_document_with_duplicated_http_headers_definition() {
+        // The exact shape an earlier setup wrote in GH #328: a sub-table left
+        // at its old position plus a fresh inline key. Codex refuses to load
+        // this file, and toml_edit refuses to parse it, so the line-oriented
+        // fallback has to converge on a valid document.
+        let corrupted = "\
+[mcp_servers.mcp_agent_mail.http_headers]
+Authorization = \"Bearer scratch\"
+
+[mcp_servers.context7]
+command = \"true\"
+
+[mcp_servers.mcp_agent_mail]
+
+url = \"http://127.0.0.1:8766/mcp/\"
+startup_timeout_sec = 30
+http_headers = { Authorization = \"Bearer scratch\" }
+";
+        assert!(toml::from_str::<toml::Value>(corrupted).is_err());
+
+        let merged = merge_toml_section(
+            Some(corrupted),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("scratch"),
+        )
+        .unwrap();
+
+        let parsed: toml::Value = toml::from_str(&merged)
+            .unwrap_or_else(|error| panic!("repaired config must parse: {error}\n{merged}"));
+        assert_eq!(
+            parsed["mcp_servers"]["mcp_agent_mail"]["http_headers"]["Authorization"].as_str(),
+            Some("Bearer scratch")
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["context7"]["command"].as_str(),
+            Some("true")
+        );
+        assert_eq!(count_toml_key(&merged, "http_headers"), 1, "{merged}");
+    }
+
+    #[test]
+    fn setup_line_fallback_keeps_unmanaged_descendant_tables_and_drops_alias_headers() {
+        // Unparseable input (duplicate key in an unrelated table) forces the
+        // fallback; it must still keep `tools.*` and fold the alias spelling.
+        let corrupted = "\
+[other]
+enabled = true
+
+[mcp_servers.\"mcp-agent-mail\"]
+url = \"http://127.0.0.1:8766/old/\"
+url = \"http://127.0.0.1:8766/older/\"
+custom_setting = \"keep\"
+
+[mcp_servers.\"mcp-agent-mail\".http_headers]
+Authorization = \"Bearer stale\"
+
+[mcp_servers.\"mcp-agent-mail\".tools.send_message]
+approval = \"never\"
+";
+        assert!(toml::from_str::<toml::Value>(corrupted).is_err());
+
+        let merged = merge_toml_section(
+            Some(corrupted),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("fresh"),
+        )
+        .unwrap();
+
+        assert!(!merged.contains("mcp-agent-mail"), "{merged}");
+        assert!(!merged.contains("Bearer stale"), "{merged}");
+        assert!(merged.contains("custom_setting = \"keep\""), "{merged}");
+        assert!(
+            merged
+                .contains("[mcp_servers.mcp_agent_mail.tools.send_message]\napproval = \"never\""),
+            "{merged}"
+        );
+        assert_eq!(count_toml_key(&merged, "http_headers"), 1, "{merged}");
+        assert!(merged.contains("[other]\nenabled = true"), "{merged}");
+        let parsed: toml::Value = toml::from_str(&merged).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["mcp_agent_mail"]["url"].as_str(),
+            Some("http://127.0.0.1:8766/mcp/")
+        );
+    }
+
+    #[test]
+    fn setup_refuses_to_rewrite_config_corrupt_outside_its_section() {
+        let corrupted = "\
+[other]
+enabled = true
+enabled = false
+
+[mcp_servers.mcp_agent_mail]
+url = \"http://127.0.0.1:8766/old/\"
+";
+        let error = merge_toml_section(
+            Some(corrupted),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("fresh"),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("not valid TOML"), "{message}");
+        assert!(message.contains("duplicate key"), "{message}");
+    }
+
+    #[test]
+    fn setup_replaces_dotted_key_http_headers() {
+        let merged = merge_toml_section(
+            Some(
+                "[mcp_servers.mcp_agent_mail]\n\
+                 url = \"http://127.0.0.1:8766/mcp/\"\n\
+                 http_headers.Authorization = \"Bearer stale\"\n\
+                 http_headers.X-Extra = \"keep-me-not\"\n",
+            ),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("fresh"),
+        )
+        .unwrap();
+
+        let parsed: toml::Value = toml::from_str(&merged).unwrap();
+        let headers = parsed["mcp_servers"]["mcp_agent_mail"]["http_headers"]
+            .as_table()
+            .unwrap();
+        assert_eq!(headers.len(), 1, "{merged}");
+        assert_eq!(headers["Authorization"].as_str(), Some("Bearer fresh"));
+    }
+
+    #[test]
+    fn setup_structural_merge_preserves_comments_and_unrelated_layout() {
+        let existing = "\
+# global settings
+model = \"gpt-5\" # keep this comment
+
+[mcp_servers.mcp_agent_mail]
+url = \"http://127.0.0.1:8766/old/\" # stale
+tool_timeout_sec = 45
+
+[projects.\"/tmp/x\"]
+trust_level = \"trusted\"
+";
+        let merged = merge_toml_section(
+            Some(existing),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("fresh"),
+        )
+        .unwrap();
+
+        assert!(merged.starts_with("# global settings\nmodel = \"gpt-5\" # keep this comment\n"));
+        assert!(
+            merged.contains("[projects.\"/tmp/x\"]\ntrust_level = \"trusted\""),
+            "{merged}"
+        );
+        assert!(merged.contains("tool_timeout_sec = 45"), "{merged}");
+        assert!(!merged.contains("/old/"), "{merged}");
+        let parsed: toml::Value = toml::from_str(&merged).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["mcp_agent_mail"]["url"].as_str(),
+            Some("http://127.0.0.1:8766/mcp/")
+        );
+    }
+
+    #[test]
+    fn setup_creates_server_table_when_only_other_servers_exist() {
+        let merged = merge_toml_section(
+            Some("[mcp_servers.context7]\ncommand = \"true\"\n"),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("fresh"),
+        )
+        .unwrap();
+        let parsed: toml::Value = toml::from_str(&merged).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["context7"]["command"].as_str(),
+            Some("true")
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["mcp_agent_mail"]["http_headers"]["Authorization"].as_str(),
+            Some("Bearer fresh")
+        );
+        assert_eq!(
+            merged.matches("[mcp_servers.mcp_agent_mail]").count(),
+            1,
+            "{merged}"
+        );
+    }
+
+    #[test]
+    fn setup_appends_server_table_to_document_without_mcp_servers() {
+        let merged = merge_toml_section(
+            Some("model = \"gpt-5\"\n\n[projects.\"/tmp/x\"]\ntrust_level = \"trusted\"\n"),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("fresh"),
+        )
+        .unwrap();
+        let parsed: toml::Value = toml::from_str(&merged).unwrap();
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5"));
+        assert_eq!(
+            parsed["projects"]["/tmp/x"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["mcp_agent_mail"]["url"].as_str(),
+            Some("http://127.0.0.1:8766/mcp/")
+        );
+        assert_eq!(
+            merged.matches("[mcp_servers.mcp_agent_mail]").count(),
+            1,
+            "{merged}"
+        );
+        assert!(!merged.contains("[mcp_servers]\n"), "{merged}");
+        let sections = collect_toml_server_sections(&merged);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].authorization.as_deref(), Some("Bearer fresh"));
+    }
+
+    #[test]
+    fn setup_replaces_root_level_dotted_server_keys() {
+        let merged = merge_toml_section(
+            Some(
+                "mcp_servers.mcp_agent_mail.url = \"http://127.0.0.1:8766/old/\"\n\
+                 mcp_servers.mcp_agent_mail.http_headers = { Authorization = \"Bearer stale\" }\n\
+                 mcp_servers.mcp_agent_mail.tool_timeout_sec = 45\n",
+            ),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("fresh"),
+        )
+        .unwrap();
+        let parsed: toml::Value = toml::from_str(&merged).unwrap();
+        let entry = &parsed["mcp_servers"]["mcp_agent_mail"];
+        assert_eq!(entry["url"].as_str(), Some("http://127.0.0.1:8766/mcp/"));
+        assert_eq!(
+            entry["http_headers"]["Authorization"].as_str(),
+            Some("Bearer fresh")
+        );
+        assert_eq!(entry["tool_timeout_sec"].as_integer(), Some(45));
+        assert!(!merged.contains("stale"), "{merged}");
+    }
+
+    #[test]
+    fn setup_status_reads_codex_sub_table_http_headers_without_drift() {
+        let analysis = analyze_toml_config_content(
+            CODEX_RESERIALIZED_CONFIG,
+            "http://127.0.0.1:8766/mcp/",
+            Some("Bearer scratch"),
+            Some(30),
+            None,
+        );
+        assert!(analysis.has_server_entry);
+        assert!(analysis.url_matches);
+        assert!(
+            analysis.drift_reasons.is_empty(),
+            "Codex's own serialization must not read as drift: {:?}",
+            analysis.drift_reasons
+        );
+        assert_eq!(analysis.entry_locations, vec!["mcp_servers.mcp_agent_mail"]);
+        let entry = analysis.current_entry.unwrap();
+        assert_eq!(
+            entry["entry"]["http_headers"]["Authorization"].as_str(),
+            Some("Bearer <redacted>")
+        );
+    }
+
+    #[test]
+    fn setup_status_adopts_sub_table_declared_before_its_parent_header() {
+        let content = "\
+[mcp_servers.mcp_agent_mail.http_headers]
+Authorization = \"Bearer scratch\"
+
+[mcp_servers.context7]
+command = \"true\"
+
+[mcp_servers.mcp_agent_mail]
+url = \"http://127.0.0.1:8766/mcp/\"
+startup_timeout_sec = 30
+";
+        let sections = collect_toml_server_sections(content);
+        assert_eq!(sections.len(), 1, "{sections:?}");
+        assert_eq!(sections[0].authorization.as_deref(), Some("Bearer scratch"));
+        assert_eq!(
+            sections[0].url.as_deref(),
+            Some("http://127.0.0.1:8766/mcp/")
+        );
+        assert_eq!(sections[0].startup_timeout, Some(30));
+    }
+
+    #[test]
+    fn setup_status_still_reports_repeated_server_headers_as_duplicates() {
+        let content = "\
+[mcp_servers.mcp_agent_mail]
+url = \"http://127.0.0.1:8766/mcp/\"
+
+[mcp_servers.mcp_agent_mail]
+url = \"http://127.0.0.1:8766/other/\"
+";
+        let sections = collect_toml_server_sections(content);
+        assert_eq!(sections.len(), 2, "{sections:?}");
     }
 
     #[test]

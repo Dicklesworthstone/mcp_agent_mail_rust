@@ -446,6 +446,80 @@ mod tests {
     }
 
     #[test]
+    fn durable_attachment_content_digest_recovers_uncommitted_image_after_database_reopen() {
+        fixture(|cx, pool, config| {
+            let config = Config {
+                keep_original_images: true,
+                ..config.clone()
+            };
+            let archive = crate::ensure_archive(&config, "project").unwrap();
+            let source = config.storage_root.join("accepted-image.png");
+            image::RgbImage::new(2, 2).save(&source).unwrap();
+            let original_bytes = std::fs::read(&source).unwrap();
+            let stored =
+                crate::store_attachment(&archive, &config, &source, crate::EmbedPolicy::File)
+                    .unwrap();
+            let webp_relative = stored.meta.path.as_ref().unwrap();
+            let encoded_bytes = std::fs::read(archive.repo_root.join(webp_relative)).unwrap();
+            let attachments = json!([stored.meta]);
+            let repo = git2::Repository::open(&archive.repo_root).unwrap();
+            assert!(
+                repo.head()
+                    .unwrap()
+                    .peel_to_tree()
+                    .unwrap()
+                    .get_path(std::path::Path::new(webp_relative))
+                    .is_err()
+            );
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let created = outcome(runtime.block_on(
+                mcp_agent_mail_db::queries::create_message_with_recipients_topic(
+                    cx,
+                    pool,
+                    101,
+                    101,
+                    "Accepted image",
+                    "Keep this exact body.\n",
+                    Some("conversation-root"),
+                    None,
+                    None,
+                    "normal",
+                    true,
+                    &attachments.to_string(),
+                    &[(102, "to"), (103, "bcc"), (104, "cc")],
+                ),
+            ))
+            .unwrap();
+            let reopened = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
+            let prepared = read_source(created.id.unwrap(), |sql, params| {
+                reopened.query_sync(sql, params).map_err(source_error)
+            })
+            .unwrap();
+            drop(reopened);
+            assert_eq!(prepared.message["attachments"], attachments);
+            assert_exact_recovered_bundle(&config, &prepared, None);
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            for (relative, expected) in [
+                (webp_relative, &encoded_bytes),
+                (stored.meta.original_path.as_ref().unwrap(), &original_bytes),
+            ] {
+                let entry = tree.get_path(std::path::Path::new(relative)).unwrap();
+                assert_eq!(
+                    repo.find_blob(entry.id()).unwrap().content(),
+                    expected.as_slice()
+                );
+                assert_eq!(
+                    std::fs::read(archive.repo_root.join(relative)).unwrap(),
+                    *expected
+                );
+            }
+            assert_eq!(std::fs::read(&source).unwrap(), original_bytes);
+        });
+    }
+
+    #[test]
     fn durable_reply_metadata_is_unchanged_by_idempotent_replay_or_conflict() {
         fixture(|cx, pool, config| {
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
