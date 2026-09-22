@@ -556,11 +556,6 @@ fn idempotency_lookup_is_read_only_and_preserves_scope_and_expired_rows() {
     let pid = setup_project(&pool);
     let other_pid = setup_project(&pool);
     let agent = setup_agent(&pool, pid, "GreenCastle");
-    let IdempotentOutcome::Fresh(original) =
-        reserve_idem(&pool, pid, agent, "src/lib.rs", "LOOKUP", "fp-A")
-    else {
-        panic!("first reservation is fresh");
-    };
     let read_pool = DbPool::new_query_only(&DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
         storage_root: Some(db_path.parent().expect("db parent").join("storage")),
@@ -571,6 +566,32 @@ fn idempotency_lookup_is_read_only_and_preserves_scope_and_expired_rows() {
         ..DbPoolConfig::default()
     })
     .expect("query-only idempotency pool");
+
+    // Keep a real pooled reader alive across the writer's commit. Opening the
+    // reader only after the key exists misses obsolete pager snapshots.
+    let replay_pool = &read_pool;
+    let missing = block_on(|cx| async move {
+        queries::lookup_idempotency_result::<serde_json::Value>(
+            &cx,
+            replay_pool,
+            IdempotencyClaim {
+                project_id: pid,
+                tool: "file_reservation_paths",
+                key: "LOOKUP",
+                fingerprint: "fp-A",
+            },
+        )
+        .await
+    })
+    .into_result()
+    .expect("prime read-only lookup before the key is committed");
+    assert!(missing.is_none(), "uncommitted key cannot replay");
+
+    let IdempotentOutcome::Fresh(original) =
+        reserve_idem(&pool, pid, agent, "src/lib.rs", "LOOKUP", "fp-A")
+    else {
+        panic!("first reservation is fresh");
+    };
 
     let replay_pool = &read_pool;
     block_on(|cx| async move {
