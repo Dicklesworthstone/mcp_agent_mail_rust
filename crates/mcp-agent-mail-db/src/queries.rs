@@ -1077,11 +1077,9 @@ const MAX_IN_CLAUSE_ITEMS: usize = 500;
 // very large IN-clause updates on file_reservations. Keep release-path chunks
 // conservative until the engine-side planner/executor bug is fixed.
 const MAX_RELEASE_RESERVATION_CHUNK_ITEMS: usize = 128;
-// release_reservations executes both:
-// - SELECT ... WHERE project_id, agent_id, filters...
-// - UPDATE ... SET released_ts = ? WHERE project_id, agent_id, filters...
-// The UPDATE has one extra bind (released_ts), so total binds are:
-// 3 + reservation_ids.len() + paths.len()
+// The largest selection reserves binds for project_id, agent_id, and the
+// optional creation cutoff used by durable release replay. Final writes use
+// per-id eligibility checks, independently of the selection's filter size.
 const RELEASE_RESERVATION_BASE_BIND_PARAMS: usize = 3;
 const MAX_RELEASE_RESERVATION_FILTER_ITEMS: usize =
     SQLITE_MAX_BIND_PARAMS - RELEASE_RESERVATION_BASE_BIND_PARAMS;
@@ -13319,11 +13317,7 @@ async fn create_file_reservations_impl(
     reason: &str,
     idempotency: Option<IdempotencyClaim<'_>>,
 ) -> Outcome<IdempotentOutcome<Vec<FileReservationRow>>, DbError> {
-    let now = now_micros();
     let lease_extension = ttl_seconds.saturating_mul(1_000_000);
-    let expires = now.saturating_add(lease_extension);
-    let idempotency_expires_ts =
-        now.saturating_add(idempotency_retention_secs().saturating_mul(1_000_000));
 
     run_with_mvcc_retry(cx, "create_file_reservations", || async {
         let conn = match acquire_conn(cx, pool).await {
@@ -13338,6 +13332,16 @@ async fn create_file_reservations_impl(
         // Batch all reservation inserts in a single transaction (1 fsync instead of N).
         // Use IMMEDIATE transaction to serialize reservation checks and prevent TOCTOU races.
         try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+
+        // Date a new lease when its write attempt is admitted. A request may
+        // wait through an outage before obtaining this transaction; backdating
+        // it to request start would let an older queued release consume it.
+        // Retries also receive a fresh TTL and idempotency retention window.
+        // Renewing an existing lease below preserves its original created_ts.
+        let now = now_micros();
+        let expires = now.saturating_add(lease_extension);
+        let idempotency_expires_ts =
+            now.saturating_add(idempotency_retention_secs().saturating_mul(1_000_000));
 
         // Idempotency key check (br-idempotency-keys-mutating-tools-h0x9k): a
         // matching prior key replays the original reservation rows without
@@ -13857,6 +13861,13 @@ enum ReleaseReservationExpiryConstraint {
     Exact(i64),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ReleaseReservationScope {
+    project_id: i64,
+    agent_id: i64,
+    created_at_or_before: Option<i64>,
+}
+
 fn release_reservation_chunk_plan(
     path_count: usize,
     reservation_id_count: usize,
@@ -13952,8 +13963,8 @@ fn apply_release_markers(
     reservations
 }
 
-/// Release file reservations
-#[allow(clippy::too_many_lines, clippy::must_use_candidate)]
+/// Release file reservations.
+#[allow(clippy::must_use_candidate)]
 pub fn release_reservations<'a>(
     cx: &'a Cx,
     pool: &'a DbPool,
@@ -13961,6 +13972,36 @@ pub fn release_reservations<'a>(
     agent_id: i64,
     paths: Option<&'a [&'a str]>,
     reservation_ids: Option<&'a [i64]>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Outcome<Vec<FileReservationRow>, DbError>> + Send + 'a>,
+> {
+    release_reservations_with_created_cutoff(
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        paths,
+        reservation_ids,
+        None,
+    )
+}
+
+/// Release reservations that belonged to the request's scope at its creation
+/// cutoff. Degraded release replay supplies the durable intent timestamp so an
+/// old release-all or path filter cannot release leases acquired afterward.
+///
+/// The final write transaction rechecks the owner and cutoff: candidate IDs
+/// selected before a concurrent replacement are never sufficient authority.
+/// `None` retains the ordinary direct-release behavior.
+#[allow(clippy::too_many_lines, clippy::must_use_candidate)]
+pub fn release_reservations_with_created_cutoff<'a>(
+    cx: &'a Cx,
+    pool: &'a DbPool,
+    project_id: i64,
+    agent_id: i64,
+    paths: Option<&'a [&'a str]>,
+    reservation_ids: Option<&'a [i64]>,
+    created_at_or_before: Option<i64>,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Outcome<Vec<FileReservationRow>, DbError>> + Send + 'a>,
 > {
@@ -13977,13 +14018,14 @@ pub fn release_reservations<'a>(
                 ReleaseReservationChunkTarget::ReservationIds => {
                     if let Some(ids) = reservation_ids {
                         for chunk in ids.chunks(chunk_size) {
-                            let rows = match release_reservations(
+                            let rows = match release_reservations_with_created_cutoff(
                                 cx,
                                 pool,
                                 project_id,
                                 agent_id,
                                 paths,
                                 Some(chunk),
+                                created_at_or_before,
                             )
                             .await
                             {
@@ -13999,13 +14041,14 @@ pub fn release_reservations<'a>(
                 ReleaseReservationChunkTarget::Paths => {
                     if let Some(pats) = paths {
                         for chunk in pats.chunks(chunk_size) {
-                            let rows = match release_reservations(
+                            let rows = match release_reservations_with_created_cutoff(
                                 cx,
                                 pool,
                                 project_id,
                                 agent_id,
                                 Some(chunk),
                                 reservation_ids,
+                                created_at_or_before,
                             )
                             .await
                             {
@@ -14044,6 +14087,10 @@ pub fn release_reservations<'a>(
             );
             let mut filter_params: Vec<Value> =
                 vec![Value::BigInt(project_id), Value::BigInt(agent_id)];
+            if let Some(cutoff) = created_at_or_before {
+                filter_sql.push_str(" AND created_ts <= ?");
+                filter_params.push(Value::BigInt(cutoff));
+            }
             append_release_reservation_filters(
                 &mut filter_sql,
                 &mut filter_params,
@@ -14114,13 +14161,25 @@ pub fn release_reservations<'a>(
             return Outcome::Ok(reservations);
         }
 
-        let released_markers =
-            match release_reservations_by_ids_matching_expiry(cx, pool, &target_ids, None).await {
-                Outcome::Ok(markers) => markers,
-                Outcome::Err(e) => return Outcome::Err(e),
-                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                Outcome::Panicked(p) => return Outcome::Panicked(p),
-            };
+        let scope = ReleaseReservationScope {
+            project_id,
+            agent_id,
+            created_at_or_before,
+        };
+        let released_markers = match release_reservations_by_ids_with_constraints(
+            cx,
+            pool,
+            &target_ids,
+            ReleaseReservationExpiryConstraint::Any,
+            Some(scope),
+        )
+        .await
+        {
+            Outcome::Ok(markers) => markers,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
 
         Outcome::Ok(apply_release_markers(reservations, &released_markers))
     }) // Box::pin(async move {
@@ -14138,16 +14197,18 @@ async fn release_reservations_by_ids_matching_expiry(
         .map_or(ReleaseReservationExpiryConstraint::Any, |cutoff| {
             ReleaseReservationExpiryConstraint::OnOrBefore(cutoff)
         });
-    release_reservations_by_ids_with_expiry_constraint(cx, pool, ids, expiry_constraint).await
+    release_reservations_by_ids_with_constraints(cx, pool, ids, expiry_constraint, None).await
 }
 
 /// Internal release primitive that supports exact-match and cutoff-based
-/// expiry guards without changing the public DB API.
-async fn release_reservations_by_ids_with_expiry_constraint(
+/// expiry guards, plus transaction-time ownership/creation checks for scoped
+/// releases and durable release replay.
+async fn release_reservations_by_ids_with_constraints(
     cx: &Cx,
     pool: &DbPool,
     ids: &[i64],
     expiry_constraint: ReleaseReservationExpiryConstraint,
+    scope: Option<ReleaseReservationScope>,
 ) -> Outcome<Vec<ReleasedReservationMarker>, DbError> {
     if ids.is_empty() {
         return Outcome::Ok(Vec::new());
@@ -14198,6 +14259,12 @@ async fn release_reservations_by_ids_with_expiry_constraint(
                 check_sql.push_str(" AND expires_ts = ?");
             }
         }
+        if let Some(scope) = scope {
+            check_sql.push_str(" AND project_id = ? AND agent_id = ?");
+            if scope.created_at_or_before.is_some() {
+                check_sql.push_str(" AND created_ts <= ?");
+            }
+        }
         check_sql.push_str(" LIMIT 1");
 
         // Record the release in both the base row and the sidecar ledger. The
@@ -14218,6 +14285,13 @@ async fn release_reservations_by_ids_with_expiry_constraint(
                 ReleaseReservationExpiryConstraint::OnOrBefore(expiry_cutoff)
                 | ReleaseReservationExpiryConstraint::Exact(expiry_cutoff) => {
                     check_params.push(Value::BigInt(expiry_cutoff));
+                }
+            }
+            if let Some(scope) = scope {
+                check_params.push(Value::BigInt(scope.project_id));
+                check_params.push(Value::BigInt(scope.agent_id));
+                if let Some(cutoff) = scope.created_at_or_before {
+                    check_params.push(Value::BigInt(cutoff));
                 }
             }
             let eligible_rows = try_in_tx!(
@@ -15620,11 +15694,12 @@ pub async fn force_release_reservation(
         .map_or(ReleaseReservationExpiryConstraint::Any, |expires_ts| {
             ReleaseReservationExpiryConstraint::Exact(expires_ts)
         });
-    match release_reservations_by_ids_with_expiry_constraint(
+    match release_reservations_by_ids_with_constraints(
         cx,
         pool,
         &[reservation_id],
         expiry_constraint,
+        None,
     )
     .await
     {
@@ -25274,6 +25349,350 @@ mod tests {
             .expect("list numeric thread roots with replies");
 
             assert_eq!(roots, vec![root_with_reply_id]);
+        });
+    }
+
+    #[test]
+    fn release_reservations_created_cutoff_preserves_grant_waiting_for_pool_admission() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (_cx, pool, _dir) = setup_test_pool("release-cutoff-waiting-grant.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let project = ensure_project(&cx, &pool, "/tmp/release-cutoff-admission")
+                .await
+                .into_result()
+                .expect("project");
+            let project_id = project.id.expect("project id");
+            let agent = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("agent");
+            let agent_id = agent.id.expect("agent id");
+            let held = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("hold only pool checkout");
+            let mut grant = std::pin::pin!(create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["src/after-outage.rs"],
+                3600,
+                true,
+                "pending while release is queued",
+            ));
+            {
+                let mut context = Context::from_waker(Waker::noop());
+                assert!(
+                    matches!(grant.as_mut().poll(&mut context), Poll::Pending),
+                    "first acquisition must wait behind the sole held checkout"
+                );
+            }
+            let queued_release_ts = now_micros();
+            drop(held);
+            let granted =
+                asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(5), grant)
+                    .await
+                    .expect("pending grant resumes within watchdog")
+                    .into_result()
+                    .expect("grant after release intent was queued");
+            assert_eq!(granted.len(), 1);
+            assert!(
+                granted[0].created_ts > queued_release_ts,
+                "a newly admitted lease cannot be backdated across a queued release"
+            );
+            assert_eq!(granted[0].expires_ts - granted[0].created_ts, 3_600_000_000);
+            let replayed = release_reservations_with_created_cutoff(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                None,
+                None,
+                Some(queued_release_ts),
+            )
+            .await
+            .into_result()
+            .expect("replay older release");
+            assert!(
+                replayed.is_empty(),
+                "waiting acquisition belongs to later work"
+            );
+            let active = get_active_reservations(&cx, &pool, project_id)
+                .await
+                .into_result()
+                .expect("new lease remains active");
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].id, granted[0].id);
+        });
+    }
+
+    #[test]
+    fn release_reservations_created_cutoff_preserves_new_leases_and_chunk_filters() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        for filter in ["all", "paths", "chunked_ids", "chunked_paths"] {
+            let (_cx, pool, _dir) = setup_test_pool(&format!("release-cutoff-{filter}.db"));
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let project = ensure_project(&cx, &pool, "/tmp/release-cutoff")
+                    .await
+                    .into_result()
+                    .expect("project");
+                let project_id = project.id.expect("project id");
+                let agent = register_agent(
+                    &cx,
+                    &pool,
+                    project_id,
+                    "BlueLake",
+                    "codex-cli",
+                    "gpt-5",
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .into_result()
+                .expect("agent");
+                let agent_id = agent.id.expect("agent id");
+                let cutoff = now_micros();
+                let rows = create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    &[
+                        "src/old.rs",
+                        "src/boundary.rs",
+                        "src/new.rs",
+                        "other/held.rs",
+                    ],
+                    3600,
+                    true,
+                    "cutoff regression",
+                )
+                .await
+                .into_result()
+                .expect("create real leases");
+                let ids: Vec<i64> = rows.iter().map(|row| row.id.expect("lease id")).collect();
+                {
+                    let conn = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("fixture connection");
+                    for (id, created) in
+                        ids.iter().zip([cutoff - 1, cutoff, cutoff + 1, cutoff - 1])
+                    {
+                        conn.execute_sync(
+                            "UPDATE file_reservations SET created_ts = ? WHERE id = ?",
+                            &[Value::BigInt(created), Value::BigInt(*id)],
+                        )
+                        .expect("set deterministic creation boundary");
+                    }
+                }
+                let path_filter = ["src/old.rs", "src/boundary.rs", "src/new.rs"];
+                let mut chunked_ids = vec![i64::MAX; MAX_RELEASE_RESERVATION_CHUNK_ITEMS];
+                chunked_ids.extend_from_slice(&ids[..3]);
+                let mut chunked_paths = vec!["absent.rs"; MAX_RELEASE_RESERVATION_CHUNK_ITEMS];
+                chunked_paths.extend_from_slice(&path_filter);
+                let paths = match filter {
+                    "paths" => Some(path_filter.as_slice()),
+                    "chunked_paths" => Some(chunked_paths.as_slice()),
+                    _ => None,
+                };
+                let released = release_reservations_with_created_cutoff(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    paths,
+                    (filter == "chunked_ids").then_some(chunked_ids.as_slice()),
+                    Some(cutoff),
+                )
+                .await
+                .into_result()
+                .expect("release only leases within intent boundary");
+                let mut released_ids: Vec<i64> = released.iter().filter_map(|row| row.id).collect();
+                released_ids.sort_unstable();
+                let mut expected = ids[..2].to_vec();
+                if filter == "all" {
+                    expected.push(ids[3]);
+                }
+                expected.sort_unstable();
+                assert_eq!(
+                    released_ids, expected,
+                    "creation cutoff with {filter} filter"
+                );
+                assert!(
+                    released
+                        .iter()
+                        .all(|row| row.released_ts.is_some_and(|ts| ts > 0))
+                );
+
+                let active = get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .expect("remaining leases");
+                assert!(
+                    active.iter().any(|row| row.id == Some(ids[2])),
+                    "post-intent lease survives every filter, including recursive chunks"
+                );
+                // The unchanged direct API must still release this later lease
+                // when the agent explicitly requests release now.
+                let direct = release_reservations(&cx, &pool, project_id, agent_id, None, None)
+                    .await
+                    .into_result()
+                    .expect("ordinary direct release");
+                assert_eq!(direct.len(), active.len());
+            });
+        }
+    }
+
+    #[test]
+    fn release_reservations_created_cutoff_rechecks_stale_candidates_in_write_transaction() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (_cx, pool, _dir) = setup_test_pool("release-cutoff-final-write.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let project = ensure_project(&cx, &pool, "/tmp/release-cutoff-write")
+                .await
+                .into_result()
+                .expect("project");
+            let project_id = project.id.expect("project id");
+            let holder = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("holder");
+            let peer = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("peer");
+            let holder_id = holder.id.expect("holder id");
+            let peer_id = peer.id.expect("peer id");
+            let rows = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                holder_id,
+                &["src/old.rs", "src/replaced.rs", "src/transferred.rs"],
+                3600,
+                true,
+                "stale candidate regression",
+            )
+            .await
+            .into_result()
+            .expect("original reservations");
+            let ids: Vec<i64> = rows.iter().map(|row| row.id.expect("lease id")).collect();
+            let cutoff = now_micros();
+            // The selected IDs are already known. Change one row to a later
+            // identity and another to a different owner before invoking the
+            // actual write primitive; a tool-side filter cannot protect this.
+            {
+                let conn = pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("fixture connection");
+                conn.execute_sync(
+                    "UPDATE file_reservations SET created_ts = ? WHERE id = ?",
+                    &[Value::BigInt(cutoff + 1), Value::BigInt(ids[1])],
+                )
+                .expect("replacement after selection");
+                conn.execute_sync(
+                    "UPDATE file_reservations SET agent_id = ? WHERE id = ?",
+                    &[Value::BigInt(peer_id), Value::BigInt(ids[2])],
+                )
+                .expect("owner changed after selection");
+            }
+            let released = release_reservations_by_ids_with_constraints(
+                &cx,
+                &pool,
+                &ids,
+                ReleaseReservationExpiryConstraint::Any,
+                Some(ReleaseReservationScope {
+                    project_id,
+                    agent_id: holder_id,
+                    created_at_or_before: Some(cutoff),
+                }),
+            )
+            .await
+            .into_result()
+            .expect("guarded write transaction");
+            assert_eq!(released.len(), 1);
+            assert_eq!(released[0].id, ids[0]);
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("verify connection");
+            let ledger = conn
+                .query_sync(
+                    "SELECT reservation_id FROM file_reservation_releases ORDER BY reservation_id",
+                    &[],
+                )
+                .expect("release ledger");
+            assert_eq!(
+                ledger.len(),
+                1,
+                "rejected candidates must not acquire release markers"
+            );
+            assert_eq!(
+                ledger[0].get_named::<i64>("reservation_id").unwrap(),
+                ids[0]
+            );
+            for id in &ids[1..] {
+                let row = conn
+                    .query_sync(
+                        "SELECT released_ts FROM file_reservations WHERE id = ?",
+                        &[Value::BigInt(*id)],
+                    )
+                    .expect("preserved lease");
+                assert_eq!(
+                    row[0].get_named::<Option<i64>>("released_ts").unwrap(),
+                    None
+                );
+            }
         });
     }
 

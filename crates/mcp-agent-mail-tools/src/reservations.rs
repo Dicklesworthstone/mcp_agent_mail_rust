@@ -1143,13 +1143,17 @@ async fn replay_single_release_intent(
         None
     };
 
-    let released_rows = match mcp_agent_mail_db::queries::release_reservations(
+    // A durable release expresses the leases held when it was queued, not a
+    // standing instruction to release this agent's future work. Enforce its
+    // timestamp in the DB write transaction as well as the current filters.
+    let released_rows = match mcp_agent_mail_db::queries::release_reservations_with_created_cutoff(
         ctx.cx(),
         pool,
         project_id,
         agent_id,
         None,
         ids_to_release.as_deref(),
+        Some(intent.created_ts),
     )
     .await
     {
@@ -5590,6 +5594,188 @@ mod tests {
                 );
             });
         });
+    }
+
+    fn assert_release_replay_preserves_later_same_agent_leases(filter: &str) {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project_key =
+                    format!("/tmp/release-replay-cutoff-{filter}-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let holder = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let holder_id = holder.id.expect("holder id");
+                let ctx = McpContext::new(cx.clone(), 1);
+                let original = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &holder.name,
+                    &["src/old.rs", "src/reused.rs", "other/held.rs"],
+                    None,
+                )
+                .await;
+                let original_grants = original["granted"].as_array().expect("original grants");
+                assert_eq!(original_grants.len(), 3);
+                let original_ids: Vec<i64> = original_grants
+                    .iter()
+                    .map(|grant| grant["id"].as_i64().expect("grant id"))
+                    .collect();
+                let (paths, ids) = match filter {
+                    "all" => (None, None),
+                    "paths" => (Some(vec!["src/**".to_string()]), None),
+                    "ids" => (None, Some(original_ids[..2].to_vec())),
+                    other => panic!("unexpected filter {other}"),
+                };
+                let receipt = append_release_intent(
+                    &config,
+                    &project_key,
+                    &holder.name,
+                    paths,
+                    ids,
+                    "injected_db_unavailable",
+                    "database is locked",
+                )
+                .expect("durable release intent");
+                let intent = read_queued_release_intents(&config)
+                    .expect("verified journal")
+                    .into_iter()
+                    .find(|intent| intent.intent_id == receipt.intent_id)
+                    .expect("queued intent");
+
+                // Releasing directly leaves the queued tool intent outstanding.
+                // A subsequent same-agent grant is a new lease on this path.
+                queries::release_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    None,
+                    Some(&[original_ids[1]]),
+                )
+                .await
+                .into_result()
+                .expect("release original path before reacquiring");
+                let later = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &holder.name,
+                    &["src/reused.rs", "src/new.rs", "other/new.rs"],
+                    None,
+                )
+                .await;
+                let later_grants = later["granted"].as_array().expect("later grants");
+                assert_eq!(later_grants.len(), 3);
+                let later_ids: Vec<i64> = later_grants
+                    .iter()
+                    .map(|grant| grant["id"].as_i64().expect("grant id"))
+                    .collect();
+                assert_ne!(
+                    later_ids[0], original_ids[1],
+                    "reacquisition creates a new lease"
+                );
+                let before = queries::get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .expect("current leases");
+                assert!(
+                    before
+                        .iter()
+                        .filter(|row| row.id.is_some_and(|id| later_ids.contains(&id)))
+                        .all(|row| row.created_ts > intent.created_ts),
+                    "new grants must follow the durable intent, without clock sleeps"
+                );
+
+                mcp_agent_mail_storage::wbq_flush();
+                mcp_agent_mail_storage::flush_async_commits();
+                let reservation_dir = config
+                    .storage_root
+                    .join("projects")
+                    .join(&project.slug)
+                    .join("file_reservations");
+                let later_artifacts: Vec<_> = later_ids
+                    .iter()
+                    .map(|id| {
+                        let path =
+                            mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                                &reservation_dir,
+                                *id,
+                            )
+                            .expect("later lease artifact");
+                        let bytes = std::fs::read(&path).expect("later lease bytes");
+                        (path, bytes)
+                    })
+                    .collect();
+
+                replay_queued_release_intents(&ctx, &pool, &config).await;
+                mcp_agent_mail_storage::wbq_flush();
+                mcp_agent_mail_storage::flush_async_commits();
+                assert!(
+                    read_queued_release_intents(&config)
+                        .expect("completed journal")
+                        .is_empty(),
+                    "successful replay must consume its intent"
+                );
+                let active = queries::get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .expect("remaining live leases");
+                let mut actual_ids: Vec<i64> = active.iter().filter_map(|row| row.id).collect();
+                actual_ids.sort_unstable();
+                let mut expected_ids = later_ids;
+                if filter != "all" {
+                    expected_ids.push(original_ids[2]);
+                }
+                expected_ids.sort_unstable();
+                assert_eq!(
+                    actual_ids, expected_ids,
+                    "replay must preserve later same-agent work"
+                );
+                for (path, bytes) in later_artifacts {
+                    assert_eq!(
+                        std::fs::read(path).expect("later artifact preserved"),
+                        bytes
+                    );
+                }
+                let released_path =
+                    mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                        &reservation_dir,
+                        original_ids[0],
+                    )
+                    .expect("released original artifact");
+                let released: Value = serde_json::from_slice(
+                    &std::fs::read(released_path).expect("release artifact bytes"),
+                )
+                .expect("release artifact JSON");
+                assert!(
+                    released["released_ts"].as_str().is_some(),
+                    "original lease release is archived"
+                );
+                // No second replay may revisit new leases or rewrite artifacts.
+                replay_queued_release_intents(&ctx, &pool, &config).await;
+                let remaining = queries::get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .expect("leases after repeated replay");
+                assert_eq!(remaining.len(), expected_ids.len());
+            });
+        });
+    }
+
+    #[test]
+    fn replay_release_intent_preserves_later_same_agent_leases_unfiltered() {
+        assert_release_replay_preserves_later_same_agent_leases("all");
+    }
+
+    #[test]
+    fn replay_release_intent_preserves_later_same_agent_leases_path_filtered() {
+        assert_release_replay_preserves_later_same_agent_leases("paths");
+    }
+
+    #[test]
+    fn replay_release_intent_preserves_later_same_agent_leases_id_filtered() {
+        assert_release_replay_preserves_later_same_agent_leases("ids");
     }
 
     // -----------------------------------------------------------------------
