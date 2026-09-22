@@ -312,6 +312,145 @@ mod tests {
     }
 
     #[test]
+    fn staged_replies_survive_commits_and_process_restarts() {
+        const CHILD_ROOT: &str = "AM_TEST_STAGED_REPAIR_ROOT";
+        const CHILD_INPUT: &str = "AM_TEST_STAGED_REPAIR_INPUT";
+        const COMPLETED: &str = "staged reply repair completed";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let input: Value = serde_json::from_str(&std::env::var(CHILD_INPUT).unwrap()).unwrap();
+            let prepared = PreparedMessage {
+                message: input["message"].clone(),
+                body: input["body"].as_str().unwrap().to_string(),
+                sender: input["sender"].as_str().unwrap().to_string(),
+                project_slug: input["project_slug"].as_str().unwrap().to_string(),
+                recipients: serde_json::from_value(input["recipients"].clone()).unwrap(),
+                payload_bytes: 512,
+            };
+            let config = mcp_agent_mail_core::Config {
+                storage_root: root.into(),
+                ..mcp_agent_mail_core::Config::default()
+            };
+            let result = reconcile_prepared(&config, &prepared).unwrap();
+            assert_eq!(
+                result.files_created,
+                usize::try_from(input["expected_created"].as_u64().unwrap()).unwrap()
+            );
+            assert_eq!(result.git_commit_needed, result.files_created != 0);
+            println!("{COMPLETED}");
+            return;
+        }
+
+        for ordinary_commit_first in [false, true] {
+            let (_temp, config, original, archive) = git_fixture();
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let mut messages = Vec::new();
+            // More than one reconciliation batch; no snapshot or Rust state
+            // from one repair process can rescue the next process's metadata.
+            for id in 9..15 {
+                let mut message = original.message.clone();
+                message["id"] = json!(id);
+                let mut full = message.clone();
+                full["reply_to"] = json!(7);
+                full["future_metadata"] = json!({"opaque": ["retain", id]});
+                let paths = crate::message_paths_for_bundle(
+                    &archive,
+                    &message,
+                    &original.sender,
+                    &original.recipients,
+                )
+                .unwrap()
+                .0;
+                let evidence = config.storage_root.join(format!("retained-reply-{id}.md"));
+                let bytes = stage_and_retain(
+                    &repo,
+                    &archive,
+                    &paths.canonical,
+                    &full,
+                    &original.body,
+                    &evidence,
+                );
+                let input = json!({
+                    "message": message,
+                    "body": original.body,
+                    "sender": original.sender,
+                    "project_slug": original.project_slug,
+                    "recipients": original.recipients,
+                    "expected_created": 4,
+                });
+                messages.push((input, full, paths, evidence, bytes));
+            }
+            drop(repo);
+            if ordinary_commit_first {
+                let unrelated = archive.root.join("recovery-witness.txt");
+                std::fs::write(&unrelated, "ordinary archive activity").unwrap();
+                let relative =
+                    crate::rel_path_cached(&archive.canonical_repo_root, &unrelated).unwrap();
+                crate::commit_paths_with_retry(
+                    &archive.repo_root,
+                    &config,
+                    "unrelated archive activity",
+                    &[relative.as_str()],
+                )
+                .unwrap();
+            }
+            for (input, full, paths, evidence, bytes) in &messages {
+                let run_child = |input: &Value| {
+                    let output = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "recovery::message_reconcile::database::staged::tests::staged_replies_survive_commits_and_process_restarts",
+                            "--nocapture",
+                        ])
+                        .env(CHILD_ROOT, &config.storage_root)
+                        .env(CHILD_INPUT, serde_json::to_string(input).unwrap())
+                        .output()
+                        .unwrap();
+                    assert!(
+                        output.status.success(),
+                        "ordinary_commit_first={ordinary_commit_first}, id={}: {}{}",
+                        input["message"]["id"],
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    );
+                    assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETED));
+                };
+                run_child(input);
+                for path in [&paths.canonical, &paths.outbox] {
+                    let (restored, body) = read_surviving_message(path).unwrap().unwrap();
+                    assert_eq!(&restored, full);
+                    assert_eq!(body, original.body);
+                }
+                for path in &paths.inbox {
+                    let (restored, body) = read_surviving_message(path).unwrap().unwrap();
+                    assert_eq!(restored, crate::redact_message_bcc_for_inbox(full));
+                    assert_eq!(restored["bcc"], json!([]));
+                    assert_eq!(body, original.body);
+                }
+                assert_eq!(&std::fs::read(evidence).unwrap(), bytes);
+                let repo = Repository::open(&archive.repo_root).unwrap();
+                let head = repo.head().unwrap().target().unwrap();
+                let tree = repo.find_commit(head).unwrap().tree().unwrap();
+                for path in [&paths.canonical, &paths.outbox]
+                    .into_iter()
+                    .chain(paths.inbox.iter())
+                {
+                    let relative =
+                        crate::rel_path_cached(&archive.canonical_repo_root, path).unwrap();
+                    let entry = tree.get_path(Path::new(&relative)).unwrap();
+                    assert_eq!(
+                        repo.find_blob(entry.id()).unwrap().content(),
+                        std::fs::read(path).unwrap(),
+                    );
+                }
+                let mut repeated = input.clone();
+                repeated["expected_created"] = json!(0);
+                run_child(&repeated);
+                assert_eq!(repo.head().unwrap().target().unwrap(), head);
+            }
+        }
+    }
+
+    #[test]
     fn staged_disagreement_preserves_head_index_and_all_retained_evidence() {
         let (_temp, config, original, archive) = git_fixture();
         let paths = crate::message_paths_for_bundle(

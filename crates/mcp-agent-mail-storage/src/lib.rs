@@ -6847,6 +6847,12 @@ where
     };
     tx.set_target(&refname, commit_oid, Some(sig), &final_message)?;
     tx.commit()?;
+    // The archive commit is durable even when an operator or an interrupted
+    // writer owns staged evidence. Index maintenance must never discard it or
+    // turn an already-committed operation into a retryable commit failure.
+    if let Err(error) = sync_clean_index_after_commit(repo, parent.as_ref(), &tree) {
+        tracing::warn!("failed to synchronize clean archive index: {error}");
+    }
     Ok(())
 }
 fn commit_paths_lockfree(
@@ -6897,12 +6903,6 @@ fn commit_paths_lockfree(
             .and_then(|p| p.tree().ok());
         build_tree_with_updates(repo, base_tree.as_ref(), &updates).map(Some)
     })?;
-
-    // Lock-free commits bypass the index by design; sync index to HEAD so
-    // status/porcelain views remain clean for tooling and tests.
-    if let Err(err) = try_restore_index_to_head(repo) {
-        tracing::warn!("[git-lockfree] failed to sync index after commit: {err}");
-    }
 
     Ok(())
 }
@@ -11686,34 +11686,92 @@ fn reset_index_to_head(repo: &Repository, index: &mut git2::Index) -> Result<()>
     Ok(())
 }
 
-/// Best-effort cleanup of staged/index state after a failed commit attempt.
+/// Update an unstaged index without consuming an interrupted writer's evidence.
 ///
-/// Previously had a `git -C <workdir> read-tree HEAD` shell-out as a
-/// "try CLI git first, fall back to libgit2" path. Removed under bead
-/// br-8ujfs.3.5 (C5): the CLI git branch was redundant with the
-/// libgit2 recovery below (`reset_index_to_head` + `index.write`) and
-/// added a race surface against the 2.51.0 `.git/index` bug. The
-/// libgit2 path handles every case we care about — regular repos,
-/// unborn HEAD (via `try_clear_for_empty_head`), detached HEAD,
-/// submodules. See `docs/GIT_SHELLOUT_AUDIT.md` #2.
-fn try_restore_index_to_head(repo: &Repository) -> Result<()> {
-    if let Some(workdir) = repo.workdir() {
-        // Heal stale lock artifacts so the libgit2 write has a clean
-        // `.git/index` to acquire.
-        let _ = try_clean_stale_git_lock(workdir, 300.0);
+/// Hold Git's exclusive index lock from observation through atomic replacement.
+/// Dirty, conflicted, corrupt, oversized or locked indexes remain untouched.
+/// This maintenance is best-effort: the caller has already committed its tree.
+fn sync_clean_index_after_commit(
+    repo: &Repository,
+    parent: Option<&git2::Commit<'_>>,
+    committed: &git2::Tree<'_>,
+) -> Result<()> {
+    const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+    let index_path = repo.path().join("index");
+    let lock_path = repo.path().join("index.lock");
+    if path_existing_prefix_has_symlink(&index_path)?
+        || path_existing_prefix_has_symlink(&lock_path)?
+    {
+        return Err(StorageError::InvalidPath(
+            "archive index synchronization refuses symlinked paths".to_string(),
+        ));
     }
-
-    // Re-open to avoid stale ref views from long-lived handles.
-    let reopened = Repository::open(repo.path())?;
-    let mut index = reopened.index()?;
-    reset_index_to_head(&reopened, &mut index)?;
+    let lock_file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    // Adopt only the lock we just created; dropping it never touches another
+    // writer's lock. On success persist consumes it by renaming it to index.
+    let mut lock = tempfile::NamedTempFile::from_parts(
+        lock_file,
+        tempfile::TempPath::try_from_path(lock_path)?,
+    );
+    let scratch = tempfile::tempdir()?;
+    let scratch_path = scratch.path().join("index");
+    match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        &index_path,
+        MAX_INDEX_BYTES,
+    ) {
+        Ok(bytes) => {
+            let metadata = fs::symlink_metadata(&index_path)?;
+            if !metadata.is_file() {
+                return Err(StorageError::InvalidPath(
+                    "archive index is not a regular file".to_string(),
+                ));
+            }
+            lock.as_file().set_permissions(metadata.permissions())?;
+            let header = bytes.get(..12).ok_or_else(|| {
+                StorageError::InvalidPath("archive index header is incomplete".to_string())
+            })?;
+            if &header[..4] != b"DIRC"
+                || u32::from_be_bytes([header[8], header[9], header[10], header[11]]) > 100_000
+            {
+                return Err(StorageError::InvalidPath(
+                    "archive index format or entry budget is invalid".to_string(),
+                ));
+            }
+            fs::write(&scratch_path, bytes)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut index = git2::Index::open_ext(&scratch_path, repo.object_format())?;
+    let parent_tree = parent.map(git2::Commit::tree).transpose()?;
+    if index.has_conflicts()
+        || repo
+            .diff_tree_to_index(parent_tree.as_ref(), Some(&index), None)?
+            .deltas()
+            .len()
+            != 0
+    {
+        return Ok(());
+    }
+    index.read_tree(committed)?;
     index.write()?;
+    let bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        &scratch_path,
+        MAX_INDEX_BYTES,
+    )?;
+    lock.write_all(&bytes)?;
+    lock.as_file().sync_all()?;
+    lock.persist(&index_path)
+        .map_err(|error| StorageError::Io(error.error))?;
     Ok(())
-}
-
-/// Best-effort cleanup of staged/index state after a failed commit attempt.
-fn try_restore_index(repo: &Repository) {
-    let _ = try_restore_index_to_head(repo);
 }
 
 /// Add files to the git index and create a commit.
@@ -11732,12 +11790,13 @@ fn commit_paths(
 
     let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
 
-    // Index reset → stage → tree all run under the HEAD reference-transaction
-    // lock so the committed tree is built against a parent read in the same
-    // critical section that moves the ref (cross-process lost-update guard).
-    let result = commit_tree_advancing_head(repo, &sig, message, |repo| {
-        let mut index = repo.index()?;
-        reset_index_to_head(repo, &mut index)?;
+    // Build against the locked HEAD in a private index. The shared index may
+    // contain the only surviving reply metadata for a different message.
+    commit_tree_advancing_head(repo, &sig, message, |repo| {
+        let private_repo = Repository::open(repo.path())?;
+        let mut index = git2::Index::new_ext(repo.object_format())?;
+        private_repo.set_index(&mut index)?;
+        reset_index_to_head(&private_repo, &mut index)?;
         let mut any_added = false;
         for path in rel_paths {
             let path = validate_repo_relative_path("commit path", path)?;
@@ -11762,21 +11821,13 @@ fn commit_paths(
             }
             any_added = true;
         }
-        index.write()?;
         if !any_added {
             // Every requested path was already absent from disk and index —
             // nothing to commit (historical early-out preserved).
             return Ok(None);
         }
         Ok(Some(index.write_tree()?))
-    });
-
-    if result.is_err() {
-        try_restore_index(repo);
-        return result;
-    }
-
-    Ok(())
+    })
 }
 
 /// Add all changed files to the git index and create a commit.
@@ -11790,16 +11841,17 @@ fn commit_all(repo: &Repository, config: &Config, message: &str) -> Result<()> {
 
     let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
 
-    // Same cross-process guard as `commit_paths`: the whole reset → add-all
-    // → tree sequence is a full-state snapshot built under the HEAD ref lock.
+    // The full worktree snapshot also uses a private index: overload recovery
+    // must not discard or publish unrelated staged-only message evidence.
     commit_tree_advancing_head(repo, &sig, message, |repo| {
-        let mut index = repo.index()?;
-        reset_index_to_head(repo, &mut index)?;
+        let private_repo = Repository::open(repo.path())?;
+        let mut index = git2::Index::new_ext(repo.object_format())?;
+        private_repo.set_index(&mut index)?;
+        reset_index_to_head(&private_repo, &mut index)?;
 
         // Respect .gitignore, add all changes under the workdir.
         index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)?;
 
-        index.write()?;
         Ok(Some(index.write_tree()?))
     })?;
 
@@ -20409,6 +20461,93 @@ mod tests {
     }
 
     // ── Lock-free commit tests ────────────────────────────────────────
+
+    #[test]
+    fn archive_commit_strategies_preserve_staged_locked_and_corrupt_indexes() {
+        for strategy in 0..3 {
+            for state in ["clean", "staged", "locked", "corrupt"] {
+                let tmp = TempDir::new().unwrap();
+                let retained = TempDir::new().unwrap();
+                let config = test_config(tmp.path());
+                let archive = ensure_archive(&config, "index-preservation").unwrap();
+                let repo = Repository::open(&archive.repo_root).unwrap();
+                let mut index = repo.index().unwrap();
+                if state == "staged" {
+                    let staged = archive.root.join("staged-only.txt");
+                    fs::write(&staged, "irreplaceable staged evidence").unwrap();
+                    let relative = rel_path_cached(&archive.canonical_repo_root, &staged).unwrap();
+                    index.add_path(Path::new(&relative)).unwrap();
+                    fs::rename(&staged, retained.path().join("evidence.txt")).unwrap();
+                }
+                index.write().unwrap();
+                drop(index);
+                let index_path = repo.path().join("index");
+                let lock_path = repo.path().join("index.lock");
+                if state == "corrupt" {
+                    fs::write(&index_path, "invalid retained index evidence").unwrap();
+                }
+                if state == "locked" {
+                    fs::write(&lock_path, "another writer owns this lock").unwrap();
+                }
+                let before_index = fs::read(&index_path).unwrap();
+                let before_head = resolve_head_commit_oid(&repo).unwrap();
+                let commit = |paths: &[&str]| match strategy {
+                    0 => commit_paths_lockfree(&repo, &config, "private tree commit", paths),
+                    1 => commit_paths(&repo, &config, "private index commit", paths),
+                    _ => commit_all(&repo, &config, "private full commit"),
+                };
+                if strategy != 2 {
+                    assert!(commit(&["../foreign.txt"]).is_err());
+                    assert_eq!(fs::read(&index_path).unwrap(), before_index);
+                    assert_eq!(resolve_head_commit_oid(&repo).unwrap(), before_head);
+                }
+                let ordinary = archive.root.join("ordinary.txt");
+                fs::write(&ordinary, "ordinary committed content").unwrap();
+                let relative = rel_path_cached(&archive.canonical_repo_root, &ordinary).unwrap();
+                commit(&[relative.as_str()]).unwrap();
+                let tree = repo.head().unwrap().peel_to_tree().unwrap();
+                assert!(tree.get_path(Path::new(&relative)).is_ok());
+                let staged_relative = rel_path_cached(
+                    &archive.canonical_repo_root,
+                    &archive.root.join("staged-only.txt"),
+                )
+                .unwrap();
+                assert!(tree.get_path(Path::new(&staged_relative)).is_err());
+                if state == "clean" {
+                    let reopened = Repository::open(&archive.repo_root).unwrap();
+                    assert_eq!(
+                        reopened
+                            .diff_tree_to_index(Some(&tree), None, None)
+                            .unwrap()
+                            .deltas()
+                            .len(),
+                        0,
+                        "strategy {strategy} must keep an unstaged index clean",
+                    );
+                } else {
+                    assert_eq!(
+                        fs::read(&index_path).unwrap(),
+                        before_index,
+                        "strategy {strategy}, state {state}",
+                    );
+                }
+                if state == "staged" {
+                    assert_eq!(
+                        fs::read(retained.path().join("evidence.txt")).unwrap(),
+                        b"irreplaceable staged evidence",
+                    );
+                }
+                if state == "locked" {
+                    assert_eq!(
+                        fs::read(&lock_path).unwrap(),
+                        b"another writer owns this lock",
+                    );
+                } else {
+                    assert!(!lock_path.exists());
+                }
+            }
+        }
+    }
 
     #[test]
     fn lockfree_commit_single_file_success() {
