@@ -170,7 +170,7 @@ Publication remains pending. Upstream `2f7ee9ed` adds exhaustive ACK page-bound
 regressions and retryable model discovery; those are the next fixed integration
 cut. Search helper tests alone will not establish real-model loading coverage.
 
-**Live search follow-through (`br-drpda`, in progress):** tracing the imports
+**Live search follow-through (`br-drpda`, closed):** tracing the imports
 revealed that the newer discovery fix modified only the optional `search-core`
 module. The mailbox actually uses DB `search_model2vec` and `search_auto_init`;
 neither the loader's permanent negative cache nor the context's permanent
@@ -237,16 +237,45 @@ in 34.056 seconds with its completion marker. Receipt
 `20260922-rainyforest-ae296-db-core-tests.log` has SHA-256
 `34c97aa62cc5f37c29e397896e61d59c46c4147f7982aec14ed1a1887a25e4cd`;
 metadata-only remote inspection identified three unchanged test executables,
-with hashes in `20260922-rainyforest-ae296-test-elf.sha256`. The server ACK-worker
-and ATC admission test run remains pending. Its old default-feature target cache
-no longer contains the necessary compiled artifacts and requires a cold build.
-An earlier combined server/optional-search attempt was cancelled before tests
-when feature unification forced a cold rebuild; that attempt has no verdict.
+with hashes in `20260922-rainyforest-ae296-test-elf.sha256`.
+
+The server ACK-worker and ATC admission selection subsequently passed **59/59**
+through strict RCH on the same worker at 11:46:40 UTC: 42 ACK-worker tests and
+17 ATC admission tests, with 4,866 outside the selection. Run
+`d0c9cc41-3b21-4101-b281-22b80ad24e78` took 47.582 seconds after a 117m31s cold
+build. Receipt `20260922-rainyforest-ae296-server-only-tests.log` has SHA-256
+`61983c9d1486b07bf02c34b69ad5c9176ddf7f9427337cf4183ebccd665b8763`.
+The command was `cargo nextest run --locked --build-jobs 1 -j 1 --no-fail-fast
+--success-output final -p mcp-agent-mail-server --lib -E
+'test(ack_ttl::tests) | test(atc::admission_boundary_tests)'`, executed with
+`RCH_WORKER=vmi1264463 RCH_REQUIRE_REMOTE=1 rch exec --` and 7,200-second build
+and test limits. The executed server binary is recorded in
+`20260922-rainyforest-server-test-elf.sha256`; all 29 recorded source/lock hashes
+still match the worker. This brings the two current-source selections to 217
+passing native tests, without claiming a full workspace or release gate.
+
+The old default-feature target cache no longer contained the necessary compiled
+artifacts. The initial command kept the prior four-package set for cache reuse,
+but manifest/lock review then showed
+that it needlessly built the CLI's embedded Beads engine and older async runtime.
+That build was stopped before tests and the same two test-module selections were
+narrowed to the server crate. An earlier combined server/optional-search attempt
+was also cancelled before tests when feature unification forced a cold rebuild.
+Both cancelled attempts have no runtime verdict; their logs are retained.
 The final 13-file UBS comparison against the
 incoming base exits 0 with zero new critical, 265 warning and 25 informational
 findings. Warnings were reviewed as fixture assertions/setup, bounded cloning
 and location diagnostics; exact test-only panic annotations preserve the
 assertions. The full historical scan is still not a release clearance.
+
+The live discovery/context bead is closed on this evidence, published in
+`169143db` to main and its required mirror. The broader `br-8j6cb` recovery
+acceptance remains open. In particular, source review confirms that the ordinary
+successful commit path calls
+`try_restore_index_to_head`, while staged metadata is snapshotted per message.
+A real multi-message test is still needed to establish whether the first repair
+discards another message's only staged metadata; a per-pass cache alone would
+not address later batches or restarts. No runtime loss or fix is claimed here.
 
 RainyForest read all 1,350 lines of current AGENTS.md and 2,053 lines of README.md.
 The current vision, durability, threat, browser and ATC contracts were compared
