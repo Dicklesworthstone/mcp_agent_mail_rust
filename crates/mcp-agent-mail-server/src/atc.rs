@@ -5,6 +5,8 @@
 //! neither Live mode nor restarting grants permission to append mailbox rows.
 //! Only actionable notifications cross the delivery admission boundary.
 //! Population hydration yields between bounded slices before inference resumes.
+//! A reset invalidates in-flight reports before replacing planning state. Old
+//! reports cannot spend the new epoch's budget or publish reservation actions.
 
 #[path = "atc_engine.rs"]
 mod engine;
@@ -23,9 +25,13 @@ mod delivery;
 pub use delivery::AtcDeliveryStats;
 use delivery::{Admission, Notification, NotificationAdmission, NotificationClass};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 struct DeliveryState {
+    // An in-flight caller retains its Arc, so reset cannot reuse its identity.
+    // This is process-local admission identity, not a database generation stamp.
+    epoch: Arc<()>,
+    reset_in_progress: bool,
     admission: NotificationAdmission,
     last_tick_count: Option<u64>,
     last_effect_count: usize,
@@ -35,11 +41,17 @@ struct DeliveryState {
 impl DeliveryState {
     fn new(probe_interval_micros: i64) -> Self {
         Self {
+            epoch: Arc::new(()),
+            reset_in_progress: false,
             admission: NotificationAdmission::new(probe_interval_micros),
             last_tick_count: None,
             last_effect_count: 0,
             last_notification_key: None,
         }
+    }
+
+    fn accepts_epoch(&self, epoch: &Arc<()>) -> bool {
+        !self.reset_in_progress && Arc::ptr_eq(&self.epoch, epoch)
     }
 }
 
@@ -53,23 +65,53 @@ fn delivery_state() -> &'static Mutex<DeliveryState> {
     })
 }
 
-fn reset_delivery(probe_interval_micros: i64) {
-    *delivery_state()
+fn capture_delivery_epoch() -> Option<Arc<()>> {
+    let state = delivery_state()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-        DeliveryState::new(probe_interval_micros);
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    (!state.reset_in_progress).then(|| Arc::clone(&state.epoch))
+}
+
+fn delivery_epoch_is_current(epoch: &Arc<()>) -> bool {
+    delivery_state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .accepts_epoch(epoch)
+}
+
+fn reset_with_delivery(probe_interval_micros: i64, reset_engine: impl FnOnce()) {
+    // The hydration lock serializes concurrent resets and inference. Invalidate
+    // delivery BEFORE changing the engine, then publish fresh admission BEFORE
+    // releasing hydration. No delivery lock is held across engine callbacks.
+    population::reset_with(|| {
+        {
+            let mut state = delivery_state()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.reset_in_progress = true;
+        }
+        // If this unwinds, leave admission closed. Poison recovery alone is
+        // not evidence of a complete reset; a subsequent successful reset heals it.
+        reset_engine();
+        *delivery_state()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            DeliveryState::new(probe_interval_micros);
+    });
 }
 
 /// Initialize planning, hydration, and process-local delivery admission together.
 pub fn init_global_atc(config: &mcp_agent_mail_core::Config) {
-    population::reset_with(|| engine::init_global_atc(config));
-    reset_delivery(AtcEngine::config_from_env(config).probe_interval_micros);
+    reset_with_delivery(AtcEngine::config_from_env(config).probe_interval_micros, || {
+        engine::init_global_atc(config);
+    });
 }
 
 #[cfg(test)]
 pub(crate) fn reset_global_atc_state_for_test(config: &mcp_agent_mail_core::Config) {
-    population::reset_with(|| engine::reset_global_atc_state_for_test(config));
-    reset_delivery(AtcEngine::config_from_env(config).probe_interval_micros);
+    reset_with_delivery(AtcEngine::config_from_env(config).probe_interval_micros, || {
+        engine::reset_global_atc_state_for_test(config);
+    });
 }
 
 /// Passive checks and suppression are counted in memory, not as replacement
@@ -85,14 +127,29 @@ pub fn atc_delivery_stats() -> AtcDeliveryStats {
 
 /// Advance bounded hydration or inference, then admit actionable notifications.
 ///
-/// Inference yields while a population refresh is incomplete; already-generated
-/// reservation mutations and their outcome notices retain their delivery policy.
+/// Inference yields while a population refresh is incomplete. A concurrent reset
+/// cancels this call's publication, including critical reservation actions; their
+/// optional-mail exemption is not permission to cross a planning reset.
 #[must_use]
 pub fn atc_tick_report(now_micros: i64) -> Option<AtcTickReport> {
-    let mut report = population::tick_report(now_micros)?;
+    let epoch = capture_delivery_epoch()?;
+    let report = population::tick_report(now_micros)?;
+    admit_report(&epoch, report, now_micros)
+}
+
+fn admit_report(
+    epoch: &Arc<()>,
+    mut report: AtcTickReport,
+    now_micros: i64,
+) -> Option<AtcTickReport> {
     let mut state = delivery_state()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !state.accepts_epoch(epoch) {
+        // Do not start a tick, consume cooldowns, move fairness, or overwrite
+        // the successor epoch's summary for a discarded planning result.
+        return None;
+    }
     let before = state.admission.stats();
     state.admission.begin_tick(now_micros);
     let generated = report.effects.len();
@@ -115,6 +172,9 @@ pub fn atc_tick_report(now_micros: i64) -> Option<AtcTickReport> {
     state.last_tick_count = Some(report.summary.tick_count);
     state.last_effect_count = report.effects.len();
     let after = state.admission.stats();
+    drop(state);
+    // Subscribers may inspect delivery metrics. Never invoke them under the
+    // admission mutex, including the first capacity warning.
     if before.capacity_suppressed == 0 && after.capacity_suppressed > 0 {
         tracing::warn!(
             tracked_keys = after.tracked_keys,
@@ -145,16 +205,27 @@ pub fn atc_tick(now_micros: i64) -> Vec<AtcTickAction> {
 /// Keep the standalone snapshot consistent with admission and hydration progress.
 #[must_use]
 pub fn atc_summary() -> Option<AtcSummarySnapshot> {
+    let epoch = capture_delivery_epoch()?;
     let mut summary = engine::atc_summary()?;
+    finish_summary(&epoch, &mut summary)?;
+    Some(summary)
+}
+
+fn finish_summary(epoch: &Arc<()>, summary: &mut AtcSummarySnapshot) -> Option<()> {
     let state = delivery_state()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !state.accepts_epoch(epoch) {
+        return None;
+    }
     if state.last_tick_count == Some(summary.tick_count) {
         summary.kernel.pending_effects = state.last_effect_count;
     }
     drop(state);
-    population::annotate_summary(&mut summary);
-    Some(summary)
+    population::annotate_summary(summary);
+    // Annotation takes a different lock. A reset between those observations
+    // must not combine one engine's summary with another population's status.
+    delivery_epoch_is_current(epoch).then_some(())
 }
 
 fn notification_class(kind: &str, family: &str, high_risk: bool) -> Option<NotificationClass> {
@@ -291,6 +362,161 @@ mod fair_admission_tests;
 #[cfg(test)]
 mod admission_boundary_tests {
     use super::*;
+
+    fn enabled_config() -> mcp_agent_mail_core::Config {
+        mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            atc_probe_interval_secs: 1,
+            ..Default::default()
+        }
+    }
+
+    fn staged_report(now: i64) -> AtcTickReport {
+        let mut report = population::tick_report(now).expect("enabled planning report");
+        let release = AtcEffectPlan {
+            decision_id: 1,
+            effect_id: "release:BlueFox".into(),
+            experience_id: None,
+            claim_id: "claim".into(),
+            evidence_id: "evidence".into(),
+            trace_id: "trace".into(),
+            timestamp_micros: now,
+            kind: "release_reservations_requested".into(),
+            category: "coordination".into(),
+            agent: "BlueFox".into(),
+            project_key: Some("/project".into()),
+            policy_id: None,
+            policy_revision: 1,
+            message: None,
+            expected_loss: None,
+            semantics: AtcEffectSemantics {
+                family: "reservation_release".into(),
+                risk_level: "high".into(),
+                utility_model: "test".into(),
+                operator_action: "test".into(),
+                remediation: "test".into(),
+                escalation_policy: "test".into(),
+                evidence_summary: "test".into(),
+                cooldown_key: "release:project:BlueFox".into(),
+                cooldown_micros: 1_000_000,
+                requires_project: true,
+                ack_required: false,
+                high_risk_intervention: true,
+                preconditions: Vec::new(),
+            },
+        };
+        report.effects = vec![release];
+        report.actions = vec![AtcTickAction::ReleaseReservations {
+            agent: "BlueFox".into(),
+        }];
+        report
+    }
+
+    #[test]
+    fn pre_reset_critical_report_cannot_enter_successor_admission() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let old_epoch = capture_delivery_epoch().unwrap();
+        let old_report = staged_report(200_000_000);
+        assert_eq!(old_report.effects.len(), 1);
+        assert_eq!(old_report.actions.len(), 1);
+        reset_global_atc_state_for_test(&config);
+        let new_epoch = capture_delivery_epoch().unwrap();
+        assert!(!Arc::ptr_eq(&old_epoch, &new_epoch));
+        assert!(admit_report(&old_epoch, old_report, 201_000_000).is_none());
+        {
+            let state = delivery_state()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(state.last_tick_count.is_none());
+            assert!(state.last_notification_key.is_none());
+            assert_eq!(state.last_effect_count, 0);
+            assert_eq!(state.admission.stats(), AtcDeliveryStats::default());
+        }
+        // This is an actual report from the replacement engine, not an old
+        // report silently rebound to a fresh token. Critical work still runs.
+        let fresh = admit_report(&new_epoch, staged_report(202_000_000), 202_000_000)
+            .expect("current epoch admission");
+        assert_eq!(fresh.effects.len(), 1);
+        assert_eq!(fresh.actions.len(), 1);
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn in_progress_reset_is_inert_without_holding_the_delivery_mutex() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        let report = staged_report(200_000_000);
+        reset_with_delivery(1_000_000, || {
+            assert!(capture_delivery_epoch().is_none());
+            assert!(!delivery_epoch_is_current(&epoch));
+            assert!(admit_report(&epoch, report, 201_000_000).is_none());
+            // These must stop before acquiring the hydration/engine locks
+            // already owned by reset. Metrics remain callable by observers.
+            assert!(atc_tick_report(201_000_000).is_none());
+            assert!(atc_tick(201_000_000).is_empty());
+            assert!(atc_summary().is_none());
+            assert_eq!(atc_delivery_stats(), AtcDeliveryStats::default());
+            engine::reset_global_atc_state_for_test(&config);
+        });
+        assert!(capture_delivery_epoch().is_some());
+        assert!(atc_tick_report(202_000_000).is_some());
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn unwound_reset_stays_closed_until_an_entire_reset_succeeds() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let old_epoch = capture_delivery_epoch().unwrap();
+        assert!(std::panic::catch_unwind(|| {
+            reset_with_delivery(1_000_000, || panic!("interrupted engine reset"));
+        }).is_err());
+        for _ in 0..3 {
+            assert!(capture_delivery_epoch().is_none());
+            assert!(atc_tick_report(200_000_000).is_none());
+            assert!(atc_summary().is_none());
+            assert!(!delivery_epoch_is_current(&old_epoch));
+        }
+        reset_global_atc_state_for_test(&config);
+        let replacement = capture_delivery_epoch().unwrap();
+        assert!(!Arc::ptr_eq(&old_epoch, &replacement));
+        assert!(atc_tick_report(201_000_000).is_some());
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn equal_tick_counts_do_not_join_summaries_across_reset() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        let mut summary = engine::atc_summary().expect("enabled summary");
+        let original_pending = summary.kernel.pending_effects;
+        reset_global_atc_state_for_test(&config);
+        {
+            let mut state = delivery_state()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.last_tick_count = Some(summary.tick_count);
+            state.last_effect_count = 77;
+        }
+        assert!(finish_summary(&epoch, &mut summary).is_none());
+        assert_eq!(summary.kernel.pending_effects, original_pending);
+        reset_global_atc_state_for_test(&config);
+    }
 
     #[test]
     fn critical_and_unknown_effects_cannot_be_admission_limited() {
