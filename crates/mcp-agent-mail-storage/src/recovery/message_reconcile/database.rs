@@ -240,6 +240,9 @@ struct PreparedMessage {
     project_slug: String,
     recipients: Vec<String>,
     payload_bytes: usize,
+    // NULL legacy metadata cannot distinguish a reply from a threaded send.
+    // Fresh writes persist either the exact parent or authoritative absence.
+    archive_metadata_known: bool,
 }
 
 fn validate_surviving_message(
@@ -311,6 +314,14 @@ fn validate_surviving_message(
             .is_none_or(|parent| parent <= 0 || Some(parent) == observed["id"].as_i64())
     {
         return Err("surviving archive reply parent is invalid; preserved".to_string());
+    }
+    if expected.archive_metadata_known
+        && observed.get("reply_to") != expected.message.get("reply_to")
+    {
+        return Err(
+            "surviving archive reply parent conflicts with durable message metadata; preserved"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -448,10 +459,12 @@ fn reconcile_prepared(
     }
     let message = match surviving {
         Some(message) => message,
-        None if prepared.message["thread_id"].is_null() => prepared.message.clone(),
+        None if prepared.archive_metadata_known || prepared.message["thread_id"].is_null() => {
+            prepared.message.clone()
+        }
         None => {
-            // SQLite stores the thread, not the immediate reply parent. A
-            // fabricated payload can collide with a delayed original WBQ write.
+            // Legacy SQLite rows store only the thread. A fabricated parent
+            // can collide with a delayed original WBQ write.
             return Err("threaded message has no surviving authoritative bundle; reply metadata cannot be inferred".to_string());
         }
     };
@@ -675,6 +688,7 @@ mod tests {
             project_slug: "project".into(),
             recipients: vec!["GreenStone".into(), "RedFox".into()],
             payload_bytes: 512,
+            archive_metadata_known: false,
         }
     }
 

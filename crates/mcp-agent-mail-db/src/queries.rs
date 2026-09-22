@@ -7596,8 +7596,8 @@ pub async fn create_message(
 
         // Insert message with an explicit id (mcp_agent_mail#176).
         let sql = "INSERT INTO messages \
-	               (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-	               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+	               (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments, archive_metadata_json) \
+	               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}')";
         let params = [
             Value::BigInt(message_id),
             Value::BigInt(project_id),
@@ -7825,6 +7825,7 @@ pub async fn create_message_with_recipients(
         body_md,
         thread_id,
         None,
+        None,
         importance,
         ack_required,
         attachments,
@@ -7833,7 +7834,11 @@ pub async fn create_message_with_recipients(
     .await
 }
 
-/// Create a message with an optional topic and all recipients atomically.
+/// Create a message with an optional topic, exact reply parent and all recipients atomically.
+///
+/// `reply_to` is the immediate parent, never inferred from `thread_id`. `None`
+/// records authoritative absence, allowing a fresh threaded send to recover
+/// even if its first archive write and journal enqueue both fail.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_message_with_recipients_topic(
     cx: &Cx,
@@ -7844,6 +7849,7 @@ pub async fn create_message_with_recipients_topic(
     body_md: &str,
     thread_id: Option<&str>,
     topic: Option<&str>,
+    reply_to: Option<i64>,
     importance: &str,
     ack_required: bool,
     attachments: &str,
@@ -7858,6 +7864,7 @@ pub async fn create_message_with_recipients_topic(
         body_md,
         thread_id,
         topic,
+        reply_to,
         importance,
         ack_required,
         attachments,
@@ -7915,6 +7922,7 @@ pub async fn create_message_with_recipients_idempotent(
         body_md,
         thread_id,
         None,
+        None,
         importance,
         ack_required,
         attachments,
@@ -7935,6 +7943,7 @@ pub async fn create_message_with_recipients_idempotent_topic(
     body_md: &str,
     thread_id: Option<&str>,
     topic: Option<&str>,
+    reply_to: Option<i64>,
     importance: &str,
     ack_required: bool,
     attachments: &str,
@@ -7950,6 +7959,7 @@ pub async fn create_message_with_recipients_idempotent_topic(
         body_md,
         thread_id,
         topic,
+        reply_to,
         importance,
         ack_required,
         attachments,
@@ -7969,12 +7979,22 @@ async fn create_message_with_recipients_impl(
     body_md: &str,
     thread_id: Option<&str>,
     topic: Option<&str>,
+    reply_to: Option<i64>,
     importance: &str,
     ack_required: bool,
     attachments: &str,
     recipients: &[(i64, &str)], // (agent_id, kind)
     idempotency: Option<IdempotencyClaim<'_>>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
+    if reply_to.is_some_and(|parent| parent <= 0)
+        || (reply_to.is_some() && thread_id.is_none_or(str::is_empty))
+    {
+        return Outcome::Err(DbError::InvalidArgument {
+            field: "reply_to",
+            message: "a reply requires a positive immediate parent and a nonempty thread"
+                .to_string(),
+        });
+    }
     // Use the owned guard because this critical section intentionally spans
     // async database and archive I/O. The borrowed guard is deliberately
     // thread-affine, which would make this public future non-Send.
@@ -8073,6 +8093,7 @@ async fn create_message_with_recipients_impl(
                     body_md,
                     thread_id,
                     topic,
+                    reply_to,
                     importance,
                     ack_required,
                     attachments,
@@ -8363,6 +8384,7 @@ async fn create_message_with_recipients_tx(
     body_md: &str,
     thread_id: Option<&str>,
     topic: Option<&str>,
+    reply_to: Option<i64>,
     importance: &str,
     ack_required: bool,
     attachments: &str,
@@ -8443,6 +8465,13 @@ async fn create_message_with_recipients_tx(
         tracked,
         elect_message_id_in_tx(cx, tracked, archive_seed).await
     );
+    if reply_to == Some(message_id) {
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(DbError::InvalidArgument {
+            field: "reply_to",
+            message: "a message cannot be its own reply parent".to_string(),
+        });
+    }
 
     // Fetch recipient names to build recipients_json
     let mut to_names = Vec::new();
@@ -8485,6 +8514,13 @@ async fn create_message_with_recipients_tx(
     })
     .to_string();
 
+    // Persist before COMMIT and inside the idempotency gate. A replay neither
+    // invents a missing legacy parent nor rewrites the original lineage.
+    let archive_metadata_json = reply_to.map_or_else(
+        || "{}".to_string(),
+        |parent| serde_json::json!({"reply_to": parent}).to_string(),
+    );
+
     // Insert the message with an EXPLICIT id (mcp_agent_mail#176). We do not
     // rely on AUTOINCREMENT + a deterministic read-back here: the id was
     // allocated by the process-wide monotonic allocator in the caller, so it
@@ -8494,8 +8530,8 @@ async fn create_message_with_recipients_tx(
     // engine state. (Inserting an explicit id > the current sequence also
     // advances `sqlite_sequence`, keeping any non-explicit path consistent.)
     let sql = "INSERT INTO messages \
-               (id, project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+               (id, project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments, archive_metadata_json) \
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     let params = [
         Value::BigInt(message_id),
         Value::BigInt(project_id),
@@ -8509,6 +8545,7 @@ async fn create_message_with_recipients_tx(
         Value::BigInt(now),
         Value::Text(recipients_json_val.clone()),
         Value::Text(attachments.to_string()),
+        Value::Text(archive_metadata_json),
     ];
 
     try_in_tx!(
@@ -30613,6 +30650,7 @@ mod tests {
                 "body A",
                 Some("THREAD-A"),
                 Some("br-search.1"),
+                None,
                 "normal",
                 false,
                 "[]",
@@ -31364,6 +31402,7 @@ mod tests {
                 "topic body",
                 Some("topic-thread"),
                 Some("Br-Abc.1"),
+                None,
                 "normal",
                 false,
                 "[]",

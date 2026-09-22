@@ -324,6 +324,7 @@ mod tests {
                 sender: input["sender"].as_str().unwrap().to_string(),
                 project_slug: input["project_slug"].as_str().unwrap().to_string(),
                 recipients: serde_json::from_value(input["recipients"].clone()).unwrap(),
+                archive_metadata_known: false,
                 payload_bytes: 512,
             };
             let config = mcp_agent_mail_core::Config {

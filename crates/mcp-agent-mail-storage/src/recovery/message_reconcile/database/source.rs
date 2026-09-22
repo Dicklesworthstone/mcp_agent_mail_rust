@@ -11,12 +11,50 @@ use asupersync::Cx;
 use fastmcp_core::block_on;
 use mcp_agent_mail_db::DbPool;
 use mcp_agent_mail_db::sqlmodel_core::{Row, Value as SqlValue};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::super::MAX_RECIPIENTS;
 use super::{MAX_DB_PAYLOAD_BYTES, PreparedMessage, outcome, source_error};
 
 const MAX_RECIPIENT_NAME_BYTES: i64 = 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveMetadata {
+    // Absence proves a send. An explicit null, duplicate key, unknown field,
+    // string or fractional number is conflicting evidence, never that absence.
+    #[serde(default, deserialize_with = "deserialize_reply_parent")]
+    reply_to: Option<i64>,
+}
+
+fn deserialize_reply_parent<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<i64>, D::Error> {
+    i64::deserialize(deserializer).map(Some)
+}
+
+fn decode_archive_metadata(
+    raw: &str,
+    id: i64,
+    thread_id: Option<&str>,
+) -> Result<Option<i64>, String> {
+    // Serde's derived struct visitor also accepts sequence encodings.
+    // Durable metadata must be an object; [] cannot prove a fresh send.
+    if !raw.trim_start().starts_with('{') {
+        return Err("message archive metadata is not an object; repair deferred".to_string());
+    }
+    let metadata: ArchiveMetadata = serde_json::from_str(raw).map_err(|_| {
+        "message archive metadata is not a supported reply record; repair deferred".to_string()
+    })?;
+    if metadata
+        .reply_to
+        .is_some_and(|parent| parent <= 0 || parent == id || thread_id.is_none_or(str::is_empty))
+    {
+        return Err("message archive metadata has an invalid reply parent or thread".to_string());
+    }
+    Ok(metadata.reply_to)
+}
 
 // UNION ALL gives the message one row and each delivery one small row. Both
 // arms belong to the same statement/snapshot. LEFT JOIN is intentional: a
@@ -26,6 +64,7 @@ const MAX_RECIPIENT_NAME_BYTES: i64 = 1024;
 const SOURCE_SQL: &str = "\
 SELECT 0 AS row_kind, m.id, m.project_id, m.subject, m.body_md, m.thread_id, m.topic, \
        m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
+       m.archive_metadata_json, \
        p.slug AS project_slug, p.human_key AS project_key, a.name AS sender, \
        NULL AS recipient_id, NULL AS recipient_project_id, \
        NULL AS recipient_name, NULL AS recipient_kind \
@@ -37,9 +76,10 @@ WHERE m.id = ?1 AND \
       length(CAST(m.importance AS BLOB)) + length(CAST(p.slug AS BLOB)) + \
       length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
       COALESCE(length(CAST(m.thread_id AS BLOB)), 0) + \
-      COALESCE(length(CAST(m.topic AS BLOB)), 0) <= ?2 \
+      COALESCE(length(CAST(m.topic AS BLOB)), 0) + \
+      COALESCE(length(CAST(m.archive_metadata_json AS BLOB)), 0) <= ?2 \
 UNION ALL \
-SELECT 1, mr.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+SELECT 1, mr.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
        NULL, NULL, NULL, mr.agent_id, a.project_id, \
        CASE WHEN length(CAST(a.name AS BLOB)) <= ?3 THEN a.name ELSE NULL END, \
        CASE WHEN length(CAST(mr.kind AS BLOB)) <= 3 THEN mr.kind ELSE NULL END \
@@ -106,7 +146,7 @@ fn read_source(
         return Err("message attachment metadata is not an array".to_string());
     }
     let recipients = routing_names(&routing)?;
-    let message = json!({
+    let mut message = json!({
         "id": id,
         "from": sender,
         "to": routing["to"],
@@ -122,6 +162,14 @@ fn read_source(
         "ack_required": ack != 0,
         "attachments": attachments,
     });
+    let archive_metadata = row
+        .get_named::<Option<String>>("archive_metadata_json")
+        .map_err(source_error)?;
+    if let Some(metadata) = &archive_metadata
+        && let Some(parent) = decode_archive_metadata(metadata, id, message["thread_id"].as_str())?
+    {
+        message["reply_to"] = json!(parent);
+    }
     let payload_bytes = body.len().saturating_add(message.to_string().len());
     Ok(PreparedMessage {
         message,
@@ -130,6 +178,7 @@ fn read_source(
         project_slug,
         recipients,
         payload_bytes,
+        archive_metadata_known: archive_metadata.is_some(),
     })
 }
 
@@ -278,6 +327,337 @@ mod tests {
                 ..Config::default()
             };
             test(&cx, &pool, &config);
+        });
+    }
+
+    fn assert_exact_recovered_bundle(
+        config: &Config,
+        original: &PreparedMessage,
+        parent: Option<i64>,
+    ) {
+        let archive = crate::ensure_archive(config, "project").unwrap();
+        let paths = crate::message_paths_for_bundle(
+            &archive,
+            &original.message,
+            &original.sender,
+            &original.recipients,
+        )
+        .unwrap()
+        .0;
+        assert!(!paths.canonical.exists());
+        assert!(!paths.outbox.exists());
+        assert!(paths.inbox.iter().all(|path| !path.exists()));
+        let repaired = reconcile_prepared(config, original).unwrap();
+        assert_eq!(repaired.files_created, 5);
+        assert!(repaired.git_commit_needed);
+        let repo = git2::Repository::open(&archive.repo_root).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        for path in [&paths.canonical, &paths.outbox]
+            .into_iter()
+            .chain(&paths.inbox)
+        {
+            let (message, body) = read_surviving_message(path).unwrap().unwrap();
+            assert_eq!(body, "Keep this exact body.\n");
+            assert_eq!(message.get("reply_to").and_then(Value::as_i64), parent);
+            assert_eq!(message["thread_id"], "conversation-root");
+            if paths.inbox.contains(path) {
+                assert_eq!(message["bcc"], json!([]));
+            } else {
+                assert_eq!(message["bcc"], json!(["RedFox"]));
+            }
+            let relative = crate::rel_path_cached(&archive.canonical_repo_root, path).unwrap();
+            let entry = tree.get_path(std::path::Path::new(&relative)).unwrap();
+            assert_eq!(
+                repo.find_blob(entry.id()).unwrap().content(),
+                std::fs::read(path).unwrap()
+            );
+        }
+        assert_eq!(
+            reconcile_prepared(config, original).unwrap(),
+            ReconcileResult::default()
+        );
+    }
+
+    #[test]
+    fn durable_reply_metadata_recovers_db_only_threaded_sends_and_replies() {
+        fixture(|cx, pool, config| {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            for parent in [None, Some(901)] {
+                let created = outcome(runtime.block_on(
+                    mcp_agent_mail_db::queries::create_message_with_recipients_topic(
+                        cx,
+                        pool,
+                        101,
+                        101,
+                        "Durable lineage",
+                        "Keep this exact body.\n",
+                        Some("conversation-root"),
+                        Some("release"),
+                        parent,
+                        "normal",
+                        true,
+                        "[]",
+                        &[(102, "to"), (103, "bcc"), (104, "cc")],
+                    ),
+                ))
+                .unwrap();
+                let id = created.id.unwrap();
+                // Reopen the real runtime driver: recovery must not depend on
+                // the writer's pooled connection, returned row or archive queue.
+                let reopened = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
+                let original = read_source(id, |sql, params| {
+                    reopened.query_sync(sql, params).map_err(source_error)
+                })
+                .unwrap();
+                drop(reopened);
+                assert!(original.archive_metadata_known);
+                assert_eq!(
+                    original.message.get("reply_to").and_then(Value::as_i64),
+                    parent
+                );
+                assert_eq!(original.message["thread_id"], "conversation-root");
+                assert_exact_recovered_bundle(config, &original, parent);
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                let deliveries = conn
+                    .query_sync(
+                        "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
+                        &[id.into()],
+                    )
+                    .unwrap();
+                assert_eq!(deliveries.len(), 3);
+                for delivery in deliveries {
+                    assert!(
+                        delivery
+                            .get_named::<Option<i64>>("read_ts")
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert!(
+                        delivery
+                            .get_named::<Option<i64>>("ack_ts")
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn durable_reply_metadata_is_unchanged_by_idempotent_replay_or_conflict() {
+        fixture(|cx, pool, config| {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let create = |fingerprint| {
+                outcome(runtime.block_on(
+                    mcp_agent_mail_db::queries::create_message_with_recipients_idempotent_topic(
+                        cx,
+                        pool,
+                        101,
+                        101,
+                        "Reply once",
+                        "Exact reply",
+                        Some("root"),
+                        None,
+                        Some(901),
+                        "normal",
+                        false,
+                        "[]",
+                        &[(102, "to")],
+                        mcp_agent_mail_db::IdempotencyClaim {
+                            project_id: 101,
+                            tool: "reply_message",
+                            key: "durable-reply",
+                            fingerprint,
+                        },
+                    ),
+                ))
+                .unwrap()
+            };
+            let mcp_agent_mail_db::IdempotentOutcome::Fresh(original) = create("original") else {
+                panic!("first reply must be fresh");
+            };
+            let mcp_agent_mail_db::IdempotentOutcome::Replayed(replayed) = create("original")
+            else {
+                panic!("same key must replay");
+            };
+            assert_eq!(replayed.id, original.id);
+            assert!(matches!(
+                create("different"),
+                mcp_agent_mail_db::IdempotentOutcome::Conflict(_)
+            ));
+            let prepared = prepare_message(cx, pool, original.id.unwrap()).unwrap();
+            assert!(prepared.archive_metadata_known);
+            assert_eq!(prepared.message["reply_to"], 901);
+            assert_eq!(
+                reconcile_prepared(config, &prepared).unwrap().files_created,
+                3
+            );
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let rows = conn
+                .query_sync(
+                    "SELECT id, archive_metadata_json FROM messages ORDER BY id",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(rows.len(), 2, "replay and conflict must not add messages");
+            assert_eq!(
+                rows[1]
+                    .get_named::<String>("archive_metadata_json")
+                    .unwrap(),
+                "{\"reply_to\":901}"
+            );
+        });
+    }
+
+    #[test]
+    fn durable_reply_metadata_rejects_invalid_parent_without_consuming_message_id() {
+        fixture(|cx, pool, _| {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            for (parent, thread) in [
+                (0, Some("root")),
+                (-1, Some("root")),
+                (901, None),
+                (901, Some("")),
+                (902, Some("root")),
+            ] {
+                let error = outcome(runtime.block_on(
+                    mcp_agent_mail_db::queries::create_message_with_recipients_topic(
+                        cx,
+                        pool,
+                        101,
+                        101,
+                        "Rejected reply",
+                        "body",
+                        thread,
+                        None,
+                        Some(parent),
+                        "normal",
+                        false,
+                        "[]",
+                        &[(102, "to")],
+                    ),
+                ))
+                .unwrap_err();
+                assert!(error.contains("reply_to"), "{error}");
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                let rows = conn
+                    .query_sync("SELECT id FROM messages ORDER BY id", &[])
+                    .unwrap();
+                assert_eq!(rows.len(), 1, "invalid lineage must roll back the message");
+                assert_eq!(rows[0].get_as::<i64>(0).unwrap(), 901);
+            }
+            let accepted = outcome(runtime.block_on(
+                mcp_agent_mail_db::queries::create_message_with_recipients_topic(
+                    cx,
+                    pool,
+                    101,
+                    101,
+                    "Fresh send",
+                    "body",
+                    Some("root"),
+                    None,
+                    None,
+                    "normal",
+                    false,
+                    "[]",
+                    &[(102, "to")],
+                ),
+            ))
+            .unwrap();
+            assert_eq!(
+                accepted.id,
+                Some(902),
+                "rejected self-parent must roll back ID election"
+            );
+        });
+    }
+
+    #[test]
+    fn durable_reply_metadata_refuses_malformed_or_conflicting_authority() {
+        fixture(|cx, pool, config| {
+            for metadata in [
+                "null",
+                "[]",
+                "broken",
+                "{\"reply_to\":null}",
+                "{\"reply_to\":0}",
+                "{\"reply_to\":901}",
+                "{\"reply_to\":\"7\"}",
+                "{\"reply_to\":7,\"reply_to\":8}",
+                "{\"reply_to\":7.5}",
+                "{\"subject\":\"spoof\"}",
+            ] {
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                conn.execute_sync("UPDATE messages SET thread_id = 'root', archive_metadata_json = ? WHERE id = 901", &[metadata.into()]).unwrap();
+                drop(conn);
+                let error = prepare_message(cx, pool, 901).err().unwrap();
+                assert!(error.contains("archive metadata"), "{metadata}: {error}");
+            }
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE messages SET thread_id = 'root', archive_metadata_json = NULL WHERE id = 901").unwrap();
+            drop(conn);
+            let legacy = prepare_message(cx, pool, 901).unwrap();
+            assert!(!legacy.archive_metadata_known);
+            assert!(
+                reconcile_prepared(config, &legacy)
+                    .unwrap_err()
+                    .contains("reply metadata cannot be inferred")
+            );
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(
+                "UPDATE messages SET archive_metadata_json = '{\"reply_to\":7}' WHERE id = 901",
+            )
+            .unwrap();
+            drop(conn);
+            let prepared = prepare_message(cx, pool, 901).unwrap();
+            let archive = crate::ensure_archive(config, "project").unwrap();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &prepared.message,
+                &prepared.sender,
+                &prepared.recipients,
+            )
+            .unwrap()
+            .0;
+            let mut conflicting = prepared.message.clone();
+            conflicting["reply_to"] = json!(8);
+            let bytes = crate::render_message_bundle_content(&conflicting, &prepared.body).unwrap();
+            crate::ensure_parent_dir(&paths.canonical).unwrap();
+            std::fs::write(&paths.canonical, &bytes).unwrap();
+            let error = reconcile_prepared(config, &prepared).unwrap_err();
+            assert!(
+                error.contains("conflicts with durable message metadata"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read_to_string(&paths.canonical).unwrap(), bytes);
+            assert!(!paths.outbox.exists());
+            assert!(paths.inbox.iter().all(|path| !path.exists()));
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE messages SET archive_metadata_json = '{}' WHERE id = 901")
+                .unwrap();
+            drop(conn);
+            let known_send = prepare_message(cx, pool, 901).unwrap();
+            assert!(known_send.archive_metadata_known);
+            assert!(
+                !known_send
+                    .message
+                    .as_object()
+                    .unwrap()
+                    .contains_key("reply_to")
+            );
+            let error = reconcile_prepared(config, &known_send).unwrap_err();
+            assert!(
+                error.contains("conflicts with durable message metadata"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read_to_string(&paths.canonical).unwrap(), bytes);
+            assert!(!paths.outbox.exists());
         });
     }
 
