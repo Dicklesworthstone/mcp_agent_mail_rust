@@ -53,6 +53,367 @@ const MAX_FRONTMATTER_PREFIX_BYTES: u64 = 256 * 1024;
 /// JSON, or message-id failure encountered in the canonical archive layout.
 /// An incomplete scan is never safe to publish as an authoritative zero floor.
 pub fn max_message_id_in_archive(storage_root: &Path) -> DbResult<Option<i64>> {
+    #[cfg(unix)]
+    {
+        descriptor_scan::scan(storage_root, &mut |_, _| {})
+    }
+    #[cfg(not(unix))]
+    {
+        scan_archive_by_path(storage_root)
+    }
+}
+
+/// Keep every open relative to a retained directory. Generation checks reject
+/// replacement during acquisition and changes while reading each directory or
+/// file. This is not a transaction snapshot of concurrent archive appends:
+/// completed branches are released. Descriptor use depends on path depth, not
+/// the number of archived messages.
+#[cfg(unix)]
+mod descriptor_scan {
+    use std::ffi::OsStr;
+    use std::fs::File;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::Component;
+
+    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat};
+
+    use super::{DbResult, Path, PathBuf, archive_scan_error, read_message_id_from_frontmatter};
+
+    const READ_FLAGS: OFlags = OFlags::RDONLY
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::NONBLOCK)
+        .union(OFlags::CLOEXEC);
+    // Ancestors and project directories need search permission, not listing
+    // permission. Acquire readable handles only for actual enumeration.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const DIRECTORY_FLAGS: OFlags = OFlags::PATH
+        .union(OFlags::DIRECTORY)
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::CLOEXEC);
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const DIRECTORY_FLAGS: OFlags = READ_FLAGS.union(OFlags::DIRECTORY);
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Phase {
+        Classified,
+        Opened,
+        Scanned,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Level {
+        Root,
+        Projects,
+        Project,
+        Messages,
+        Year,
+        Month,
+    }
+
+    struct Opened {
+        file: File,
+        path: PathBuf,
+        stat: Stat,
+    }
+
+    fn same_object(left: &Stat, right: &Stat) -> bool {
+        left.st_dev == right.st_dev
+            && left.st_ino == right.st_ino
+            && FileType::from_raw_mode(left.st_mode) == FileType::from_raw_mode(right.st_mode)
+    }
+
+    fn same_generation(left: &Stat, right: &Stat) -> bool {
+        same_object(left, right)
+            && left.st_size == right.st_size
+            && left.st_mtime == right.st_mtime
+            && left.st_mtime_nsec == right.st_mtime_nsec
+            && left.st_ctime == right.st_ctime
+            && left.st_ctime_nsec == right.st_ctime_nsec
+    }
+
+    fn stat_opened(file: &File, path: &Path) -> DbResult<Stat> {
+        rustix::fs::fstat(file)
+            .map_err(|error| archive_scan_error(path, "inspect retained archive authority", error))
+    }
+
+    fn validate_entry(parent: &Opened, name: &OsStr, child: &Opened) -> DbResult<()> {
+        let current = rustix::fs::statat(&parent.file, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| archive_scan_error(&child.path, "revalidate archive entry", error))?;
+        if !same_object(&child.stat, &current) {
+            return Err(archive_scan_error(
+                &child.path,
+                "revalidate archive entry",
+                "archive identity changed during scan",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_generation(opened: &Opened) -> DbResult<()> {
+        if !same_generation(&opened.stat, &stat_opened(&opened.file, &opened.path)?) {
+            return Err(archive_scan_error(
+                &opened.path,
+                "revalidate archive generation",
+                "archive contents changed during scan; retry with a stable archive",
+            ));
+        }
+        Ok(())
+    }
+
+    fn open_child(
+        parent: &Opened,
+        name: &OsStr,
+        kind: FileType,
+        optional: bool,
+        skip_non_directory: bool,
+        hook: &mut impl FnMut(&Path, Phase),
+    ) -> DbResult<Option<Opened>> {
+        let path = parent.path.join(name);
+        let before = match rustix::fs::statat(&parent.file, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(error) if optional && error == rustix::io::Errno::NOENT => {
+                hook(&path, Phase::Classified);
+                // A missing root/projects/messages is ordinary, but a newly
+                // appeared directory cannot be cached as an empty archive.
+                if !matches!(
+                    rustix::fs::statat(&parent.file, name, AtFlags::SYMLINK_NOFOLLOW),
+                    Err(error) if error == rustix::io::Errno::NOENT
+                ) {
+                    return Err(archive_scan_error(
+                        &path,
+                        "revalidate absent archive directory",
+                        "archive entry appeared during scan",
+                    ));
+                }
+                return Ok(None);
+            }
+            Err(error) => return Err(archive_scan_error(&path, "classify archive entry", error)),
+        };
+        let actual_kind = FileType::from_raw_mode(before.st_mode);
+        if actual_kind == FileType::Symlink {
+            return Err(archive_scan_error(
+                &path,
+                "classify canonical archive entry",
+                "symlinks are not authoritative archive entries",
+            ));
+        }
+        if actual_kind != kind {
+            if skip_non_directory {
+                return Ok(None);
+            }
+            return Err(archive_scan_error(
+                &path,
+                "classify canonical archive entry",
+                if kind == FileType::Directory {
+                    "expected a directory"
+                } else {
+                    "expected a regular file"
+                },
+            ));
+        }
+        hook(&path, Phase::Classified);
+        let flags = if kind == FileType::Directory {
+            DIRECTORY_FLAGS
+        } else {
+            READ_FLAGS
+        };
+        let file = File::from(
+            rustix::fs::openat(&parent.file, name, flags, Mode::empty()).map_err(|error| {
+                archive_scan_error(&path, "open archive entry without following", error)
+            })?,
+        );
+        let stat = stat_opened(&file, &path)?;
+        if !same_generation(&before, &stat) {
+            return Err(archive_scan_error(
+                &path,
+                "acquire archive authority",
+                "archive entry changed between classification and open",
+            ));
+        }
+        hook(&path, Phase::Opened);
+        Ok(Some(Opened { file, path, stat }))
+    }
+
+    fn scan_child(
+        parent: &Opened,
+        name: &OsStr,
+        level: Level,
+        hook: &mut impl FnMut(&Path, Phase),
+    ) -> DbResult<Option<i64>> {
+        let is_message = level == Level::Month;
+        let Some(child) = open_child(
+            parent,
+            name,
+            if is_message {
+                FileType::RegularFile
+            } else {
+                FileType::Directory
+            },
+            matches!(level, Level::Root | Level::Project),
+            level == Level::Projects,
+            hook,
+        )?
+        else {
+            return Ok(None);
+        };
+        let result = if is_message {
+            let id = read_message_id_from_frontmatter(&child.path, &child.file)?;
+            hook(&child.path, Phase::Scanned);
+            validate_generation(&child)?;
+            Some(id)
+        } else {
+            let next = match level {
+                Level::Root => Level::Projects,
+                Level::Projects => Level::Project,
+                Level::Project => Level::Messages,
+                Level::Messages => Level::Year,
+                Level::Year | Level::Month => Level::Month,
+            };
+            scan_directory(&child, next, hook)?
+        };
+        validate_entry(parent, name, &child)?;
+        Ok(result)
+    }
+
+    fn scan_directory(
+        directory: &Opened,
+        level: Level,
+        hook: &mut impl FnMut(&Path, Phase),
+    ) -> DbResult<Option<i64>> {
+        let result = match level {
+            Level::Root => scan_child(directory, OsStr::new("projects"), level, hook)?,
+            Level::Project => scan_child(directory, OsStr::new("messages"), level, hook)?,
+            _ => {
+                let readable = rustix::fs::openat(
+                    &directory.file,
+                    ".",
+                    READ_FLAGS | OFlags::DIRECTORY,
+                    Mode::empty(),
+                )
+                .map_err(|error| {
+                    archive_scan_error(
+                        &directory.path,
+                        "open retained directory for reading",
+                        error,
+                    )
+                })?;
+                let entries = Dir::new(readable).map_err(|error| {
+                    archive_scan_error(&directory.path, "read retained directory", error)
+                })?;
+                let mut max_id = None;
+                for entry in entries {
+                    let entry = entry.map_err(|error| {
+                        archive_scan_error(&directory.path, "walk retained directory", error)
+                    })?;
+                    let name = OsStr::from_bytes(entry.file_name().to_bytes());
+                    if name == "." || name == ".." {
+                        continue;
+                    }
+                    let valid = match level {
+                        Level::Messages => {
+                            name.as_bytes().len() == 4
+                                && name.as_bytes().iter().all(u8::is_ascii_digit)
+                        }
+                        Level::Year => {
+                            name.as_bytes().len() == 2
+                                && name.as_bytes().iter().all(u8::is_ascii_digit)
+                        }
+                        Level::Month => Path::new(name).extension() == Some(OsStr::new("md")),
+                        _ => true,
+                    };
+                    if valid {
+                        max_id = max_id.max(scan_child(directory, name, level, hook)?);
+                    }
+                }
+                max_id
+            }
+        };
+        hook(&directory.path, Phase::Scanned);
+        validate_generation(directory)?;
+        Ok(result)
+    }
+
+    pub(super) fn scan(
+        storage_root: &Path,
+        hook: &mut impl FnMut(&Path, Phase),
+    ) -> DbResult<Option<i64>> {
+        let absolute = if storage_root.is_absolute() {
+            storage_root.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| {
+                    archive_scan_error(storage_root, "resolve archive location", error)
+                })?
+                .join(storage_root)
+        };
+        // Preserve the narrowly trusted macOS system aliases without following
+        // any caller-controlled ancestor during the descriptor walk itself.
+        #[cfg(target_os = "macos")]
+        let absolute = {
+            let mut checked = absolute.clone();
+            for (alias, target) in [
+                ("/var", "/private/var"),
+                ("/tmp", "/private/tmp"),
+                ("/etc", "/private/etc"),
+            ] {
+                let alias = Path::new(alias);
+                if let Ok(tail) = absolute.strip_prefix(alias)
+                    && mcp_agent_mail_core::disk::is_trusted_system_directory_alias(alias)
+                {
+                    checked = Path::new(target).join(tail);
+                    break;
+                }
+            }
+            checked
+        };
+        let file = File::from(
+            rustix::fs::open("/", DIRECTORY_FLAGS, Mode::empty()).map_err(|error| {
+                archive_scan_error(Path::new("/"), "open filesystem root", error)
+            })?,
+        );
+        let stat = stat_opened(&file, Path::new("/"))?;
+        let mut ancestors = vec![Opened {
+            file,
+            path: PathBuf::from("/"),
+            stat,
+        }];
+        let mut missing = false;
+        for component in absolute.components() {
+            let name = match component {
+                Component::RootDir | Component::CurDir => continue,
+                Component::Normal(name) => name,
+                Component::ParentDir => OsStr::new(".."),
+                Component::Prefix(_) => unreachable!("Unix paths have no prefix components"),
+            };
+            let parent = &ancestors[ancestors.len() - 1];
+            let Some(child) = open_child(parent, name, FileType::Directory, true, false, hook)?
+            else {
+                validate_generation(parent)?;
+                missing = true;
+                break;
+            };
+            ancestors.push(child);
+        }
+        let result = if missing {
+            None
+        } else {
+            scan_directory(&ancestors[ancestors.len() - 1], Level::Root, hook)?
+        };
+        // Revalidate against the retained parents, never a freshly resolved
+        // pathname. Changes outside the archive need identity checks only:
+        // unrelated activity in /tmp must not invalidate an otherwise stable scan.
+        for pair in ancestors.windows(2) {
+            let name = pair[1].path.strip_prefix(&pair[0].path).map_err(|error| {
+                archive_scan_error(&pair[1].path, "revalidate archive ancestor", error)
+            })?;
+            validate_entry(&pair[0], name.as_os_str(), &pair[1])?;
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(not(unix))]
+fn scan_archive_by_path(storage_root: &Path) -> DbResult<Option<i64>> {
     let projects_dir = storage_root.join("projects");
     let Some(entries) = read_optional_dir(&projects_dir)? else {
         return Ok(None);
@@ -84,6 +445,7 @@ pub fn max_message_id_in_archive(storage_root: &Path) -> DbResult<Option<i64>> {
     Ok(max_id)
 }
 
+#[cfg(not(unix))]
 fn read_optional_dir(path: &Path) -> DbResult<Option<std::fs::ReadDir>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -116,6 +478,7 @@ fn archive_scan_error(path: &Path, operation: &str, error: impl std::fmt::Displa
     ))
 }
 
+#[cfg(not(unix))]
 fn scan_messages_dir_max_id(dir: &Path) -> DbResult<Option<i64>> {
     let mut max_id: Option<i64> = None;
     let Some(years) = read_optional_dir(dir)? else {
@@ -221,10 +584,15 @@ fn scan_messages_dir_max_id(dir: &Path) -> DbResult<Option<i64>> {
     Ok(max_id)
 }
 
+#[cfg(any(not(unix), test))]
 fn extract_message_id_from_frontmatter(path: &Path) -> DbResult<i64> {
     let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path).map_err(|error| {
         archive_scan_error(path, "open canonical message without following", error)
     })?;
+    read_message_id_from_frontmatter(path, &file)
+}
+
+fn read_message_id_from_frontmatter(path: &Path, file: &std::fs::File) -> DbResult<i64> {
     let mut prefix = Vec::with_capacity(8 * 1024);
     let mut reader = BufReader::new(file).take(MAX_FRONTMATTER_PREFIX_BYTES + 1);
     let frontmatter_end = loop {
@@ -898,6 +1266,263 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn assert_archive_swaps_are_refused(phase: descriptor_scan::Phase) {
+        use std::os::unix::fs::symlink;
+
+        const MESSAGE: &str = "ancestor/storage/projects/proj/messages/2026/05/01__97.md";
+        for seam in [
+            "ancestor",
+            "ancestor/storage",
+            "ancestor/storage/projects",
+            "ancestor/storage/projects/proj",
+            "ancestor/storage/projects/proj/messages",
+            "ancestor/storage/projects/proj/messages/2026",
+            "ancestor/storage/projects/proj/messages/2026/05",
+            MESSAGE,
+        ] {
+            for replace_with_symlink in [false, true] {
+                let dir = tempdir().unwrap();
+                let base = dir.path().canonicalize().unwrap();
+                let root = base.join("ancestor/storage");
+                let foreign = base.join("foreign");
+                write_canonical_message(&root, "proj", "2026", "05", "01__97.md", 97);
+                write_canonical_message(
+                    &foreign.join("ancestor/storage"),
+                    "proj",
+                    "2026",
+                    "05",
+                    "01__97.md",
+                    7,
+                );
+                let original_bytes = fs::read(base.join(MESSAGE)).unwrap();
+                let foreign_bytes = fs::read(foreign.join(MESSAGE)).unwrap();
+                let target = base.join(seam);
+                let replacement = foreign.join(seam);
+                let displaced = base.join("displaced");
+                // External ancestors are revalidated after the complete
+                // archive walk. Replace one at that final boundary as well.
+                let hook_path = if seam == "ancestor" && phase == descriptor_scan::Phase::Scanned {
+                    &root
+                } else {
+                    &target
+                };
+                let mut injected = false;
+                let result = descriptor_scan::scan(&root, &mut |path, observed_phase| {
+                    if !injected && path == hook_path && observed_phase == phase {
+                        injected = true;
+                        fs::rename(&target, &displaced).unwrap();
+                        if replace_with_symlink {
+                            symlink(&replacement, &target).unwrap();
+                        } else {
+                            fs::rename(&replacement, &target).unwrap();
+                        }
+                    }
+                });
+                assert!(injected, "swap seam was not reached: {seam}, {phase:?}");
+                assert!(
+                    result.is_err(),
+                    "a replaced archive must never publish a floor: {seam}, {phase:?}, symlink={replace_with_symlink}: {result:?}"
+                );
+                let tail = Path::new(MESSAGE).strip_prefix(seam).unwrap();
+                let original_message = if tail.as_os_str().is_empty() {
+                    displaced.clone()
+                } else {
+                    displaced.join(tail)
+                };
+                let replacement_message = if tail.as_os_str().is_empty() {
+                    target.clone()
+                } else {
+                    target.join(tail)
+                };
+                assert_eq!(fs::read(original_message).unwrap(), original_bytes);
+                assert_eq!(fs::read(replacement_message).unwrap(), foreign_bytes);
+                // Restore by rename, retaining both versions. A later stable
+                // retry must still discover the original high ID.
+                fs::rename(&target, base.join("retained-replacement")).unwrap();
+                fs::rename(&displaced, &target).unwrap();
+                assert_eq!(max_message_id_in_archive(&root).unwrap(), Some(97));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_scan_refuses_swaps_between_classification_and_open() {
+        assert_archive_swaps_are_refused(descriptor_scan::Phase::Classified);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_scan_refuses_swaps_after_descriptor_acquisition() {
+        assert_archive_swaps_are_refused(descriptor_scan::Phase::Opened);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_scan_refuses_swaps_before_scan_publication() {
+        assert_archive_swaps_are_refused(descriptor_scan::Phase::Scanned);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_scan_rejects_directory_enumeration_drift() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        write_canonical_message(&root, "proj", "2026", "05", "01__7.md", 7);
+        let month = root.join("projects/proj/messages/2026/05");
+        let mut injected = false;
+        let result = descriptor_scan::scan(&root, &mut |path, phase| {
+            if path == month && phase == descriptor_scan::Phase::Scanned && !injected {
+                injected = true;
+                write_canonical_message(&root, "proj", "2026", "05", "02__97.md", 97);
+            }
+        });
+        assert!(injected);
+        let error = result.expect_err("an ID added during enumeration must not be omitted");
+        assert!(error.to_string().contains("contents changed during scan"));
+        assert_eq!(max_message_id_in_archive(&root).unwrap(), Some(97));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_scan_rejects_in_place_frontmatter_change() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        write_canonical_message(&root, "proj", "2026", "05", "01__7.md", 7);
+        let message = root.join("projects/proj/messages/2026/05/01__7.md");
+        let mut injected = false;
+        let result = descriptor_scan::scan(&root, &mut |path, phase| {
+            if path == message && phase == descriptor_scan::Phase::Scanned && !injected {
+                injected = true;
+                fs::write(path, "---json\n{\"id\":97}\n---\n").unwrap();
+            }
+        });
+        assert!(injected);
+        assert!(
+            result.is_err(),
+            "changed frontmatter cannot publish a stale floor"
+        );
+        assert_eq!(max_message_id_in_archive(&root).unwrap(), Some(97));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_scan_rejects_creation_at_an_absent_directory_seam() {
+        for absent in ["", "projects", "projects/proj/messages"] {
+            let dir = tempdir().unwrap();
+            let base = dir.path().canonicalize().unwrap();
+            let root = base.join("storage");
+            if !absent.is_empty() {
+                fs::create_dir_all(root.join(absent).parent().unwrap()).unwrap();
+            }
+            assert_eq!(max_message_id_in_archive(&root).unwrap(), None);
+            let target = root.join(absent);
+            let mut injected = false;
+            let result = descriptor_scan::scan(&root, &mut |path, phase| {
+                if path == target && phase == descriptor_scan::Phase::Classified && !injected {
+                    injected = true;
+                    write_canonical_message(&root, "proj", "2026", "05", "01__97.md", 97);
+                }
+            });
+            assert!(injected, "absent seam must be reached: {absent}");
+            assert!(
+                result.is_err(),
+                "a newly created archive cannot publish an empty floor"
+            );
+            assert_eq!(max_message_id_in_archive(&root).unwrap(), Some(97));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_scan_allows_unrelated_ancestor_directory_activity() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let root = base.join("storage");
+        write_canonical_message(&root, "proj", "2026", "05", "01__97.md", 97);
+        let mut injected = false;
+        let result = descriptor_scan::scan(&root, &mut |path, phase| {
+            if path == root && phase == descriptor_scan::Phase::Scanned && !injected {
+                injected = true;
+                fs::write(
+                    base.join("unrelated-sibling"),
+                    b"unrelated ancestor activity",
+                )
+                .unwrap();
+            }
+        });
+        assert!(injected);
+        assert_eq!(result.unwrap(), Some(97));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn archive_scan_only_requires_search_permission_on_unlisted_ancestors() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("ancestor/storage");
+        write_canonical_message(&root, "proj", "2026", "05", "01__97.md", 97);
+        let unlisted = [
+            dir.path().join("ancestor"),
+            root.clone(),
+            root.join("projects/proj"),
+        ];
+        for path in &unlisted {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o111)).unwrap();
+        }
+        let result = max_message_id_in_archive(&root);
+        for path in &unlisted {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert_eq!(result.unwrap(), Some(97));
+    }
+
+    #[test]
+    fn archive_scan_rejects_oversized_frontmatter_and_invalid_ids() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("projects/proj/messages/2026/05/01__97.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut prefix = b"---json\n".to_vec();
+        prefix.extend(std::iter::repeat_n(
+            b' ',
+            usize::try_from(MAX_FRONTMATTER_PREFIX_BYTES).unwrap(),
+        ));
+        prefix.extend_from_slice(b"{\"id\":97}\n---\n");
+        fs::write(&path, prefix).unwrap();
+        let error = max_message_id_in_archive(dir.path())
+            .expect_err("oversized frontmatter must fail closed");
+        assert!(error.to_string().contains("scan bound"));
+
+        for json in [
+            "{}",
+            "{\"id\":0}",
+            "{\"id\":-1}",
+            "{\"id\":1.5}",
+            "{\"id\":\"97\"}",
+            "{",
+        ] {
+            fs::write(&path, format!("---json\n{json}\n---\n")).unwrap();
+            assert!(
+                max_message_id_in_archive(dir.path()).is_err(),
+                "invalid ID: {json}"
+            );
+        }
+        fs::write(&path, "---json\r\n{\"id\":97}\r\n---\r\n").unwrap();
+        assert_eq!(max_message_id_in_archive(dir.path()).unwrap(), Some(97));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn archive_scan_accepts_trusted_macos_temporary_directory_aliases() {
+        for alias in ["/tmp", "/var/tmp"] {
+            let dir = tempfile::tempdir_in(alias).unwrap();
+            write_canonical_message(dir.path(), "proj", "2026", "05", "01__97.md", 97);
+            assert_eq!(max_message_id_in_archive(dir.path()).unwrap(), Some(97));
+        }
+    }
+
     #[test]
     fn advance_messages_id_floor_bumps_sequence_and_next_insert() {
         let dir = tempdir().unwrap();
@@ -1277,6 +1902,47 @@ mod tests {
 
         assert_eq!(expect_seeded(seed_from_archive(&alloc, good.path())), 88);
         assert!(!alloc.needs_archive_seed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_seed_does_not_publish_a_floor_from_a_replaced_year() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let root = base.join("storage");
+        let foreign = base.join("foreign");
+        write_canonical_message(&root, "proj", "2026", "05", "01__97.md", 97);
+        write_canonical_message(&foreign, "proj", "2026", "05", "01__7.md", 7);
+        let year = root.join("projects/proj/messages/2026");
+        let displaced = base.join("retained-year");
+        let alloc = MessageIdAllocator::new();
+        let cx = Cx::for_testing();
+        let injected = std::cell::Cell::new(false);
+
+        let first = block_on(alloc.archive_seed_with(&cx, || async {
+            match descriptor_scan::scan(&root, &mut |path, phase| {
+                if path == year
+                    && phase == descriptor_scan::Phase::Classified
+                    && !injected.replace(true)
+                {
+                    fs::rename(&year, &displaced).unwrap();
+                    std::os::unix::fs::symlink(foreign.join("projects/proj/messages/2026"), &year)
+                        .unwrap();
+                }
+            }) {
+                Ok(floor) => Outcome::Ok(floor.unwrap_or(0)),
+                Err(error) => Outcome::Err(error),
+            }
+        }));
+
+        assert!(injected.get());
+        assert!(matches!(first, Outcome::Err(_)));
+        assert!(alloc.needs_archive_seed());
+        assert_eq!(alloc.cached_archive_seed().unwrap(), None);
+        fs::rename(&year, base.join("retained-year-link")).unwrap();
+        fs::rename(&displaced, &year).unwrap();
+        assert_eq!(expect_seeded(seed_from_archive(&alloc, &root)), 97);
+        assert_eq!(alloc.cached_archive_seed().unwrap(), Some(97));
     }
 
     #[test]
