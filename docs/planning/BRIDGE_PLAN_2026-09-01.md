@@ -1,5 +1,301 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## September 22, 2026 assessment
+
+**Agent Mail is a substantial working product. Its remaining critical work is
+reliable operation across failures and delivery of one fully qualified current
+candidate. It is not finished, and the latest source is not the released binary.**
+This assessment supersedes the dated judgments below without changing their
+receipts or treating old failures as present failures.
+
+### Scope and current evidence
+
+- Reread all 1,372 lines of repository `AGENTS.md`, all 2,063 lines of
+  `README.md`, and all 663 lines of the governing suite instructions. Reviewed
+  the current vision, durability, security, browser, verification and release
+  contracts. The full historical plan/spec survey recorded below is reused,
+  not represented as a fresh reread of every historical document. Since its
+  September 21 source cut, the only changed Markdown files are AGENTS, README
+  and this bridge plan.
+- Source cut: `41bf1305c5d1554a3e4edc0ad53ff302d8ba7e03`. Both remote branch
+  tips matched it during this assessment. The working source was clean;
+  existing Beads changes and `.rch-tmp/` were preserved.
+- Live GitHub API still reports **v0.3.36**, published September 16 at
+  10:14:19 UTC, with 15 uploaded assets. Local `am --version` also reports
+  0.3.36; a version string does not establish source or executable identity.
+  Main is 305 commits after the local release tag. The release's reported
+  17,547 passing tests and 36 skips belong to its pre-version-bump candidate,
+  not this source cut. No release was installed or published in this audit.
+- Current JSONL contains **44 open, 93 in progress, 12 blocked and 2,363
+  closed** issues, plus 208 tombstones. `br doctor` identified a local
+  materialization mismatch; ordinary `br sync --import-only` imported the
+  missing `br-q8z1r` without changing the existing issues. Unfinished total is
+  **149**. Stale titles, ownership flags and closure counts are not correctness
+  evidence. No existing implementation owner is displaced by this assessment.
+- Fresh live MCP coordination persisted message 42912 for both addressed
+  peers; its delivery receipt reports persisted, not signaled or acknowledged.
+  The live health call returned `status=ok` and **health_level=red**: critical
+  verdicts green, pressure red. WBQ p95 was 1,049 ms; commit-queue p95 was
+  4,195 ms. Message inventories were 42,306 archive / 42,335 DB, within the
+  configured tolerance, not row-level equality. These are live observations,
+  not a controlled performance experiment or current-source test.
+- Local `am doctor health` exited 1 for `local_config_unattested` with 32
+  reservation-field differences. It did not attest the live server target;
+  do not combine that result with the MCP health result. No shared repair ran.
+  CASS reports a stale, incomplete August 14 checkpoint, so current history
+  comes from Git, Beads and retained receipts, not claimed fresh CASS coverage.
+  The bounded current-task CASS search timed out after 20 seconds without a
+  result; its index was not rebuilt during this assessment.
+
+### What has materially improved
+
+The following are implemented repairs with retained, bounded evidence, not
+additional work to reimplement:
+
+| Change | Evidence and boundary |
+|---|---|
+| Idle stdio archive reconciliation | `ce784836` starts the existing maintenance worker; real idle and accepted-send/outbox-failure/restart subprocess cases passed at their recorded cuts. |
+| Reply metadata survives repair and ordinary Git commits | `7352a3d3`; 80/80 selected tests, including six staged-only replies repaired in fresh processes. This does not prove the transport batch cursor. |
+| Live model discovery recovers after late installation | `br-drpda`, published through `169143db`; real registered-model discovery/context/embedding passed. It does not certify full semantic indexing or retrieval. |
+| Queue configuration reaches the implementation | `640831a3`, `br-dqbpk`; the enqueue-deadline counterexample and 32/32 focused tests passed. Idle-poll configuration reached its consumer in source review; no separate nondefault idle-poll timing measurement ran. |
+| Idempotency retries retire obsolete pooled readers | `167b7815`, `br-9m5il`; 7/7 focused native tests, workspace check and strict Clippy passed on the recorded matching source. |
+| Lost lifecycle profile writes have background repair | `41bf1305`; bounded 32-identity/four-repair passes, project locking and reconstruction support exist. Seven isolated helper tests and ten SQL checks are narrower than native DB/Git or transport acceptance; those remain unverified. |
+
+Receipts for the September 22 work are retained under
+`/data/projects/am-release-20260912/`, particularly
+`20260922-rainyforest-staged-final-receipt.json`,
+`20260922-rainyforest-wbq-timing-receipt.json`,
+`20260922-rainyforest-idempotency-stale-reader-receipt.json`, and
+`20260922-rainyforest-pressure-stdio-receipt.json`.
+
+The pressure fixture is preserved outside the primary source at
+`/data/projects/am-release-20260912/wbq-publication-ff0346/` in
+`crates/mcp-agent-mail-cli/tests/integration_runs.rs`. Final frozen candidate
+`08755a914763a35e50e5c840c03d8f6688d4c2d2` is unpublished. Formatting and scoped
+static review passed; **zero native pressure tests executed**. A smaller worker
+ran out of memory, the larger worker timed out during compilation, and final
+admission was refused. The timeout's cleanup was subsequently verified and
+worker health restored. These are infrastructure limitations, not a test pass
+or a demonstrated failure of the fixture. No own build remains active.
+
+### Vision checklist and gap coverage
+
+The 12-crate architecture is coherent: CLI/server entrypoints feed FastMCP and
+shared tools; FrankenSQLite holds live operational rows; storage queues and Git
+hold recoverable artifacts; core owns contracts/configuration; search, guard,
+share, robot, TUI and authenticated HTML are consumers. Asupersync is the runtime.
+The embedded Beads engine is separate from the mailbox engine. Optional hybrid
+source builds and lexical portable releases are distinct products to qualify.
+
+`PARTIAL` below means implementation exists but the complete promise still has
+known work or missing decisive evidence. It does not mean the whole surface is
+broken. The existing 25-goal matrix below remains the detailed inventory; this
+table updates its acceptance groups against current code.
+
+| Goals | Current reality | Remaining work and existing owner beads |
+|---|---|---|
+| 1–3: tools/resources and explicit messaging | Real handlers and fresh persisted coordination; broadcast refusal remains intentional. Current complete conformance UNPROVEN. | `br-s3xbp`, `br-w9v59.1`, `br-kp1in.1/.2` |
+| 4–5: durability and safe retry | DB-first acknowledgement, metadata persistence, bounded repair and stale-reader fix implemented; fault/restart composition PARTIAL. | `br-8j6cb`, `br-q8z1r`, `br-kp1in.2/.9/.10` |
+| 6–7: recovery authority and engine lifetime | Real generation, descriptor, snapshot and recovery machinery; latest whole-candidate qualification UNPROVEN. | `br-5lgwn`, `br-xzgcj`, `br-jgieq`, `br-qfvd6`, existing recovery owners |
+| 8: identity/contact/topic | Real lifecycle tools and newly wired profile repair; whole imported-mailbox lifecycle round trip PARTIAL. | `br-sgaee`, `br-g6c0z`, `br-qayvs` |
+| 9–10: leases/guard/product/build slots | Real coordination; keyed empty-grant conflict race remains a source-supported defect awaiting a runtime reproducer. | `br-q8z1r`, `br-9bwnb`, `br-ssog9`, `br-kp1in.2` |
+| 11–12: setup and credentials | Discovery/setup and authority hardening exist; race and exact-install acceptance PARTIAL. | `br-db75q`, `br-fphbm`, `br-6u4hx`, `br-x2jf5`, existing setup/installer owners |
+| 13–16: operator surfaces, share and doctor | Real FTUI, HTML, robot, crypto and reversible repair; selected older evidence is substantial, combined candidate UNPROVEN. | `br-ivgot`, `br-l4fk6`, `br-ji2f0`, `br-qdgio`, `br-kp1in.2/.5/.6` |
+| 17–18: search and optional quality | Lexical path real; model discovery now tested. Late-model vector-index identity and real transport quality remain PARTIAL. | `br-kp1in.7/.8`, `br-7x5fm`; preserve lexical fallback |
+| 19: quiet ATC and learning | Runtime hooks, persistence and snapshots exist; defaults remain shadow/write-off. Sustained mixed-workflow acceptance UNPROVEN. | `br-hwney`, `br-au76r`, `br-kp1in.1/.2` |
+| 20–22: release, import and complete gates | Published v0.3.36 exists. New dependency/recovery work is source-only; manual scorecard and installed parity PARTIAL. | `br-5lgwn`, `br-bx73n`, `br-kp1in.3/.4`, `br-nq2kb`, existing legacy/platform owners |
+| 23: performance | Historical budgets and real benchmark paths exist. Today's latency/resource targets UNPROVEN; MVCC is still opt-in with an explicit drift warning. | `br-kp1in.5/.6`, `br-eru3j`, health/stress owners |
+| 24–25: truthful scope and browser replay | Public replay uses the real screen with synthetic identifying data. Live browser parity is deliberately deferred. Active vision prose still conflicts with newer safe startup/release policy. | `br-4meup`, `br-f9avw.10`, `br-mq9q1`; cutover/crates.io remain explicit decisions |
+
+**Would completing the existing Beads finish the project?** They cover every
+current feature family found in this review. Literal execution of stale task
+descriptions would not: some ask for already-landed wiring or obsolete dependency
+migrations. Completing their updated behavioral acceptance, including actual
+installed artifacts and sustained runs, would close the known scoped gaps.
+That is not proof against undiscovered bugs. No new feature family or new audit
+epic is justified. Missing acceptance connections belong in the existing graph.
+
+### Ordered bridge and granular execution TODO
+
+1. **Finish the current recovery candidate (M, critical).**
+   - [ ] `br-8j6cb`: execute the preserved real pressure/restart fixture through
+     strict RCH on a memory-adequate admitted worker, using the exact final
+     source/features and a functioning nextest runner. Do not restart a cold
+     multi-package build merely to obtain another queue refusal.
+   - [ ] Verify actual journal-enqueue failure, backlog exhaustion, seven
+     accepted messages spanning the four-repair limit, idle restart and exact
+     canonical/outbox/inbox Git bytes; no read/resend trigger or read/ack change.
+   - [ ] Retain attachment, topic, exact reply, wrong-generation, interruption,
+     foreign-path and missing-byte cases from the original acceptance. The
+     existing pressure fixture alone does not cover all of them.
+   - [ ] `br-sgaee`: execute the new production DB/Git lifecycle tests and a
+     mounted retire/restart/unretire/deregister/reconstruct history. Verify
+     routing/roster agreement and no resurrection, not only helper serialization.
+2. **Fix the remaining exact-retry hole (S–M).**
+   - [ ] `br-q8z1r`: deterministically interleave the tool's precheck with a real
+     competing DB grant; show the successful empty result currently loses its
+     key, then record/replay that result atomically. Releasing the competitor
+     must not let an old key acquire a new lease. Preserve changed-payload
+     conflicts, partial grants, retention expiry and concurrent same-key winner.
+   - [ ] Carry that negative case into `br-kp1in.2/.9/.10`; authoring may proceed
+     now, but full workflow certification must wait for the product fix.
+3. **Qualify one combined revision (M–L).**
+   - [ ] `br-5lgwn`: freeze main, lockfile, feature selection and worker target;
+     reuse one admitted remote build lane for focused tests and mandatory
+     workspace/all-target check, Clippy, formatting and full nextest.
+   - [ ] Reclassify the earlier 36 skips against current dependencies. Preserve
+     every failed attempt; selected old green runs do not qualify the latest
+     lifecycle/reconstruction additions. No local fallback or inferred ELF.
+   - [ ] Existing recovery/setup/import owners supply their named positive and
+     adversarial probes at that candidate; do not duplicate their implementations.
+4. **Prove the composed user workflow (L).**
+   - [ ] `br-kp1in.1/.2/.9/.10`: bounded real stdio/HTTP smoke, then owned faults
+     and restart, then the existing two-host 24-hour, 90-client, 13-project,
+     300-message/hour profiles. Keep receipts, scopes, cursor semantics, quiet
+     ATC, resource slopes and legal operation histories separate from counts.
+5. **Qualify optional quality and performance in parallel (M each).**
+   - [ ] `.7/.8`: real transport indexing/query after a model appears late;
+     preserve model/dimension identity, privacy canaries and truthful fallback.
+     Existing real discovery/embedding results are prerequisites, not retrieval
+     proof. Unselected optional models do not block a lexical-only candidate.
+   - [ ] `.5/.6`: measure offered/admitted/completed work, tail latency, retries,
+     archive convergence and FD/RSS growth on the actual selected route. Keep
+     cold startup separate from steady state; do not relax historical budgets.
+6. **Deliver the verified candidate (M).**
+   - [ ] `br-kp1in.3/.4` and `br-bx73n`: finish executed-child identity and
+     selected-capability evidence, candidate-bound reliability scorecard and
+     installed-binary parity. The mtime-selection bug is already repaired.
+   - [ ] `br-nq2kb` and release owners: existing manual DSR/RCH gates, six target
+     packages, signatures, actual install/update, applicable containers and
+     ACFS checksum refresh. No Actions enablement or publication in this audit.
+7. **Correct active guidance while preserving scope (S).**
+   - [ ] `br-4meup`: distinguish new DB `archive_metadata_json` from legacy
+     unknown reply metadata; current idempotency schemas from old prose;
+     opt-in setup from the old auto-rewrite vision; lexical releases from
+     optional hybrid; historical skip counts from present acceptance.
+   - [ ] Keep deliberate non-goals: broadcast, hostile same-account isolation,
+     federation and deferred live browser parity. No new scope is needed to
+     finish the current product.
+
+### Ambition round 1: prove the recovery workers together
+
+Separate message and profile passes can each succeed while their shared Git,
+locking or reconstruction interactions remain wrong. Extend the existing
+`br-kp1in.2` private workflow with both missing message artifacts and lost
+retire/deregister profile writes in one mailbox. Use enough accepted messages
+and changed identities to cross each four-repair bound; keep adding ordinary
+activity while older records wait. Observe actual progress for both classes,
+then restart and reconstruct privately. Verify exact reply/topic/recipient
+metadata and lifecycle authorization together, preserving BCC and registration
+token confidentiality. Heartbeat-only changes must not create commit churn.
+This extends the existing runner and product tests, not a second chaos system.
+`br-8j6cb` and `br-sgaee` retain their original acceptance and cannot close merely
+because a helper or one type of repair passes.
+
+### Ambition round 2: check the contract the user actually observes
+
+Use the existing bounded history checker to distinguish durable results from
+fresh observations. A replay must preserve message or grant identity, original
+expiry and the recorded empty/partial result; its live conflict snapshot may
+legitimately change. Never infer reacquisition from an old expired grant or a
+durability guarantee from an acknowledgement receipt alone. Challenge that
+predicate with `br-q8z1r`'s competing grant/release schedule and independent
+hand-labeled histories, alongside actual retained DB/Git evidence.
+
+For source-to-release completion, bind acceptance to the executable that will
+ship, including its feature and engine closure. Reuse one admitted build and
+the existing scorecard/parity machinery; do not create a new certification
+framework. The current helper-only lifecycle validation and unexecuted pressure
+fixture make combined candidate qualification a real prerequisite of release
+acceptance. Keep the larger two-host swarm goal distinct from the selected
+release policy: this audit neither silently adds a new release gate nor waives
+an existing one. Runtime capability, static checks, qualification and publication
+remain four different outcomes.
+
+### Refinement passes
+
+1. **Scope and superseded assumptions:** rewrote `br-8j6cb`'s current
+   description to stop requesting completed stdio wiring. It now distinguishes
+   new transactional reply metadata, legacy unknown metadata, preserved staged
+   evidence and the unexecuted transport-pressure fixture. All original positive
+   and negative acceptance remains; no task was closed or reassigned.
+2. **Behavior and test realism:** checked production message metadata, the
+   reservation conflict return, real lifecycle test setup and semantic bridge
+   construction. Added an actual late-model indexing/query case to `.8`, with
+   lexical fallback and vector-space negatives. Isolated embeddings, plausible
+   backend names and empty results cannot qualify retrieval. The model-dimension
+   concern is source-supported and still awaits a runtime reproducer. Existing
+   pressure coverage cannot absorb attachment/reply acceptance it never executes.
+3. **Causal dependency order:** added four blocking edges with `br` only:
+   `.2 -> br-q8z1r`, `.2 -> br-sgaee`, `br-bx73n -> br-5lgwn`, and
+   `br-bx73n -> br-kp1in.4`. The left task depends on the right. Mixed-workflow
+   certification now explicitly waits for the remaining retry/lifecycle
+   contracts; installed-candidate acceptance waits for combined qualification
+   and its evidence tests. Harness authoring need not wait. No blanket epic
+   barrier or new sustained-run release prerequisite was introduced. The
+   post-batch `br dep cycles --json` check reports no active cycles.
+4. **Evidence and release scope:** reread the retained pressure and timing
+   receipts and the current release requirements. Corrected the queue summary
+   to separate measured enqueue timing from reviewed idle-poll wiring. The
+   pressure receipt's original candidate limitation predates its final-candidate
+   integration record; the final `08755a91` includes `41bf1305`, but neither
+   candidate ran its pressure tests. Live health, unattested local doctor output,
+   stale CASS, historical release tests and current source remain distinct.
+   Selected lexical and optional hybrid acceptance stay separate; existing
+   release gates and larger project goals are neither combined nor waived.
+   Updated `.3/.4`'s stale descriptions: exact producer-receipt/run/digest
+   selection is already implemented. Their unchanged acceptance now clearly
+   targets executed-child identity, complete joins and real adversarial tests;
+   manual release venue selection is no longer presented as unresolved.
+5. **Convergence:** reviewed the affected task descriptions, acceptance,
+   comments and graph after those corrections. No further scope, test or
+   dependency changes were justified. All 14 updated issues retain their
+   status, assignee, priority, original acceptance fields and prior comments;
+   no issue was created, removed or closed. All referenced IDs resolve and
+   JSONL has no duplicate IDs. Final `br dep cycles --json` reports zero cycles;
+   `bv --robot-triage` also reports an acyclic graph with 149 unfinished issues.
+   Its 124 structurally actionable items include in-progress work and stale
+   titles, not 124 unowned implementation opportunities. Its top mirror-sync
+   suggestion is already satisfied at this source cut and is not new work.
+
+### Requested assessment workflow
+
+- [x] Full governing-document reread, current source/release/tracker comparison,
+  live bounded probes, vision-to-code map and initial bridge.
+- [x] Phase 3a: reconcile existing Beads using the frozen prompt retained below.
+- [x] Two ambition rounds, revising this section in place; regenerate Beads.
+- [x] Five refinement passes, ending without further changes; validate with
+  `br dep cycles` and `bv --robot-triage`.
+- [x] Review the exact assessment diff and prepare only the intended plan/tracker
+  changes. Record actual publication and reservation release in the final handoff.
+
+Creation-gate worksheet: this is PROCESS, requested explicitly by the user for
+implementation steering. The consumer is that user; the decision is which
+remaining product work to do next. Observed defects are stale tracker/source
+assumptions and unexecuted combined recovery acceptance. This section retires
+as active guidance at the next assessment; historical evidence is retained.
+The integrity-control exception is unnecessary. Ready `br-q8z1r` and remaining
+`br-8j6cb` acceptance offer more runtime value than extending this report after
+the requested phases finish. This assessment earns zero capability credit.
+
+Real-work audit and honesty disposition: this requested turn changed one
+existing plan and existing tracker records, with four new causal dependencies.
+It contains no product implementation, performance improvement, test execution,
+new runtime validation or release qualification. Recent code fixes and their
+bounded receipts are credited separately above. No test, gate, assertion,
+golden, default, source file or tool configuration was changed; no subagent
+was delegated this audit, and persisted peer mail is not independent review.
+The risk is extending planning while real recovery work waits; the correction
+is to stop after this requested assessment and use the existing code-bearing
+tasks. Future status must not count these planning edits as product progress.
+
+Validation of this documentation/tracker change: whitespace checks and semantic
+JSONL review passed; existing issue ownership and acceptance were preserved.
+The required scoped UBS invocation returned exit 3 because Markdown/JSONL are
+unsupported: **nothing was scanned, and this is not a scanner pass**. No
+allow-no-scan override was used. No compiled checks were run for this audit;
+the source and release verdicts above remain unchanged.
+
 ## September 21, 2026 assessment
 
 **The product is substantial and useful, and its ordinary workspace gate has
