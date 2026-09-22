@@ -1082,8 +1082,9 @@ fn read_lexical_backfill_state_file(
 
 /// How the process-global lexical index relates to one pool's database.
 ///
-/// Only [`Self::Foreign`] short-circuits a search to the SQL scan (GH#162):
-/// the index demonstrably belongs to *another* database that still exists
+/// Only [`Self::Foreign`] requires an isolated lexical index (or the SQL
+/// fallback in builds without Tantivy): the index demonstrably belongs to
+/// *another* database that still exists
 /// (a reconstructed-archive snapshot pool while the bridge serves the live
 /// mailbox, or vice versa). [`Self::Rebind`] means the index belongs to an
 /// earlier generation of *this* mailbox, a vanished database, or a previous
@@ -4310,13 +4311,16 @@ pub async fn execute_search(
         return resp;
     }
 
-    // A private snapshot has its own source authority even when its reported
-    // mailbox identity matches the live pool. Keep lexical syntax and ranking
+    // A private snapshot or another mailbox has its own source authority even
+    // when it shares the live index directory. Keep lexical syntax and ranking
     // in a private Tantivy index; never backfill the shared live index from an
-    // older materialization. Semantic indexes remain bound to the live source,
-    // so snapshot reads use their own lexical candidates.
+    // older or foreign materialization. Semantic indexes remain bound to the
+    // live source, so these reads use their own lexical candidates.
     #[cfg(feature = "tantivy-engine")]
-    if needs_lexical_freshness && pool.search_identity_path() != pool.sqlite_path() {
+    if needs_lexical_freshness
+        && (pool.search_identity_path() != pool.sqlite_path()
+            || lexical_index_is_foreign_to_pool(pool))
+    {
         let mut snapshot_query = query.clone();
         snapshot_query.limit = Some(pagination_fetch_limit(
             query,
@@ -4341,20 +4345,19 @@ pub async fn execute_search(
         let explain = query
             .explain
             .then(|| build_v3_query_explain(query, SearchEngine::Lexical, None));
+        let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+        if options.track_telemetry {
+            record_query("search_service_private_tantivy", latency_us);
+        }
+        global_metrics().search.record_v3_query(latency_us, false);
         return finish_scoped_response(raw_results, query, options, assistance, explain);
     }
 
-    // GH#162: When reads are served from a reconstructed archive snapshot
-    // (durability_state=degraded_read_only), the process-global Search V3 lexical
-    // bridge stays bound to the *live* database, so this pool's lexical index is
-    // foreign/empty and the Tantivy candidate path would silently return [] for
-    // messages that exist in the snapshot's relational tables. `state == "stale"`
-    // from `lexical_backfill_health` is exactly the "index belongs to a different
-    // database than this pool" signal (path / identity / active-bridge mismatch).
-    // Fall back to the SQL message scan (same path the Legacy engine uses), which
-    // reads straight from THIS pool, so plain-keyword search keeps returning real
-    // results through the degraded window. Count drift ("partial"/"delayed") is NOT
-    // foreign and is handled by the existing backfill-on-empty retry below.
+    // Builds without Tantivy retain the GH#162 SQL fallback for a foreign
+    // lexical index. Read only this pool; a shared index owned by another
+    // mailbox must never supply its candidates. Tantivy-enabled builds use
+    // the isolated index above to preserve phrase, Boolean and prefix syntax.
+    #[cfg(not(feature = "tantivy-engine"))]
     if matches!(
         engine,
         SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
@@ -4665,7 +4668,8 @@ pub async fn execute_search(
 ///
 /// True is the reconstructed-archive-snapshot case (GH#162): the process-global
 /// Tantivy bridge cannot serve this pool, so lexical / hybrid candidate retrieval
-/// must fall back to a SQL message scan. Only [`LexicalIndexAffinity::Foreign`]
+/// must use an isolated index or the feature-disabled SQL fallback.
+/// Only [`LexicalIndexAffinity::Foreign`]
 /// counts — a marker or active bridge bound to another *existing* database.
 /// An index bound to an earlier generation of this same mailbox, to a vanished
 /// database, or to a previous pool generation in this process is
@@ -5726,12 +5730,12 @@ mod tests {
     }
 
     #[test]
-    fn execute_search_falls_back_to_sql_when_lexical_index_is_foreign_snapshot() {
+    fn execute_search_keeps_results_when_lexical_index_is_foreign_snapshot() {
         // GH#162: while reads are served from a reconstructed archive snapshot, the
         // process-global Search V3 lexical bridge stays bound to the *live* DB, so
         // this pool's lexical index is foreign (lexical_backfill_health == "stale").
         // A plain-keyword Lexical-engine search must still return the matching
-        // message via the SQL fallback instead of silently returning [].
+        // message through its own source instead of silently returning [].
         let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5743,7 +5747,7 @@ mod tests {
             .expect("build runtime");
 
         runtime.block_on(async {
-            let cx = Cx::for_testing();
+            let cx = Cx::current().expect("runtime installs foreign-index search context");
             let project = match crate::queries::ensure_project(
                 &cx,
                 &pool,
@@ -5827,10 +5831,192 @@ mod tests {
                     .iter()
                     .any(|row| row.result.id == message.id.unwrap_or(0)),
                 "plain-keyword search over a foreign-lexical-index (snapshot) pool must \
-                 return the matching message via the SQL fallback, got {} results",
+                 return the matching message from its own source, got {} results",
                 response.results.len()
             );
         });
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    #[cfg(feature = "tantivy-engine")]
+    fn foreign_mailbox_search_preserves_lexical_syntax_scope_and_live_index() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::search_v3::reset_bridge_for_tests();
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("foreign mailbox fixture");
+        let owner_pool = temp_file_pool(root.path(), "owner.sqlite3");
+        let foreign_pool = temp_file_pool(root.path(), "foreign.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("search runtime");
+
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime installs search context");
+            for pool in [&owner_pool, &foreign_pool] {
+                let conn = pool.acquire(&cx).await.expect("seed mailbox connection");
+                conn.execute_raw(
+                    "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+                     (1, 'first', '/data/projects/first', 1), \
+                     (2, 'second', '/data/projects/second', 1)",
+                )
+                .expect("seed projects");
+                conn.execute_raw(
+                    "INSERT INTO agents \
+                     (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES \
+                     (1, 1, 'RedPeak', 'test', 'test', 1, 1), \
+                     (2, 2, 'BlueLake', 'test', 'test', 1, 1)",
+                )
+                .expect("seed senders");
+            }
+            let owner = owner_pool.acquire(&cx).await.expect("owner connection");
+            owner
+                .execute_raw(
+                    "INSERT INTO messages \
+                     (id, project_id, sender_id, subject, body_md, created_ts) \
+                     VALUES (1, 1, 1, 'ownerarchive', 'owner-only content', 100)",
+                )
+                .expect("seed owner message");
+            drop(owner);
+            let foreign = foreign_pool
+                .acquire(&cx)
+                .await
+                .expect("foreign connection");
+            foreign
+                .execute_raw(
+                    "INSERT INTO messages \
+                     (id, project_id, sender_id, subject, body_md, created_ts, thread_id, topic) \
+                     VALUES \
+                     (1, 1, 1, 'alpha beta', 'foreign exact content', 100, 'thread-one', 'release'), \
+                     (2, 1, 1, 'alpha intervening beta', 'non-phrase content', 200, NULL, NULL), \
+                     (3, 2, 2, 'alpha beta gamma', 'other project content', 300, NULL, NULL), \
+                     (4, 1, 1, 'alphabetic delta', 'prefix content', 400, NULL, NULL), \
+                     (5, 1, 1, 'alpha beta gamma', 'excluded content', 500, NULL, NULL)",
+                )
+                .expect("seed foreign messages with overlapping IDs");
+            drop(foreign);
+
+            let options = SearchOptions {
+                search_engine: Some(SearchEngine::Lexical),
+                ..Default::default()
+            };
+            let owner_query = SearchQuery::messages("ownerarchive", 1);
+            let initial = execute_search(&cx, &owner_pool, &owner_query, &options)
+                .await
+                .expect("initialize owner index");
+            assert_eq!(initial.results.len(), 1);
+            let owner_bridge = crate::search_v3::get_bridge().expect("owner bridge");
+            let marker = owner_bridge.index_dir().join("backfill_state.json");
+            let metadata = owner_bridge.index_dir().join("meta.json");
+            let marker_before = std::fs::read(&marker).expect("owner marker");
+            let metadata_before = std::fs::read(&metadata).expect("owner metadata");
+            let cache_epoch_before = global_search_cache().current_epoch();
+            assert!(
+                lexical_index_is_foreign_to_pool(&foreign_pool),
+                "both existing mailboxes share an index owned by the first"
+            );
+
+            let cases: &[(&str, Option<i64>, &[i64])] = &[
+                ("\"alpha beta\"", None, &[1, 3, 5]),
+                ("\"alpha beta\" NOT gamma", None, &[1]),
+                ("alphabet*", None, &[4]),
+                ("\"alpha beta\"", Some(1), &[1, 5]),
+                ("ownerarchive", None, &[]),
+                ("latearrival", None, &[]),
+            ];
+            for &(text, project_id, expected) in cases {
+                let query = SearchQuery {
+                    text: text.to_string(),
+                    project_id,
+                    explain: true,
+                    ..Default::default()
+                };
+                let response = execute_search(&cx, &foreign_pool, &query, &options)
+                    .await
+                    .expect("foreign lexical search");
+                let mut ids: Vec<_> = response.results.iter().map(|r| r.result.id).collect();
+                ids.sort_unstable();
+                assert_eq!(ids, expected, "query {text:?} in {project_id:?}");
+                assert!(response.results.iter().all(|r| r.result.score.is_some()));
+                if let Some(hit) = response.results.iter().find(|r| r.result.id == 1) {
+                    assert_eq!(hit.result.body, "foreign exact content");
+                    assert_eq!(hit.result.topic.as_deref(), Some("release"));
+                    assert_eq!(hit.result.thread_id.as_deref(), Some("thread-one"));
+                }
+            }
+
+            let scoped_options = SearchOptions {
+                scope_ctx: Some(ScopeContext {
+                    viewer: Some(ViewerIdentity {
+                        project_id: 1,
+                        agent_id: 1,
+                    }),
+                    viewer_project_ids: vec![1],
+                    ..default_scope_context()
+                }),
+                ..options.clone()
+            };
+            let scoped = execute_search(
+                &cx,
+                &foreign_pool,
+                &SearchQuery {
+                    text: "\"alpha beta\"".to_string(),
+                    ..Default::default()
+                },
+                &scoped_options,
+            )
+            .await
+            .expect("foreign search applies caller scope");
+            let mut scoped_ids: Vec<_> = scoped.results.iter().map(|r| r.result.id).collect();
+            scoped_ids.sort_unstable();
+            assert_eq!(scoped_ids, [1, 5]);
+            assert_eq!(
+                scoped.audit_summary.expect("scope audit").denied_count,
+                1,
+                "other-project result must remain denied"
+            );
+
+            let foreign = foreign_pool
+                .acquire(&cx)
+                .await
+                .expect("update foreign source");
+            foreign
+                .execute_raw("UPDATE messages SET subject = 'latearrival' WHERE id = 4")
+                .expect("commit new source content");
+            drop(foreign);
+            let refreshed = execute_search(
+                &cx,
+                &foreign_pool,
+                &SearchQuery {
+                    text: "latearrival".to_string(),
+                    explain: true,
+                    ..Default::default()
+                },
+                &options,
+            )
+            .await
+            .expect("foreign index observes committed edits after an earlier miss");
+            assert_eq!(refreshed.results.len(), 1);
+            assert_eq!(refreshed.results[0].result.id, 4);
+            assert_eq!(std::fs::read(&marker).expect("owner marker"), marker_before);
+            assert_eq!(
+                std::fs::read(&metadata).expect("owner metadata"),
+                metadata_before
+            );
+            assert_eq!(global_search_cache().current_epoch(), cache_epoch_before);
+            assert!(Arc::ptr_eq(
+                &crate::search_v3::get_bridge().expect("owner bridge retained"),
+                &owner_bridge
+            ));
+            let owner_after = execute_search(&cx, &owner_pool, &owner_query, &options)
+                .await
+                .expect("owner still searches its own index");
+            assert_eq!(owner_after.results.len(), 1);
+            assert_eq!(owner_after.results[0].result.body, "owner-only content");
+        });
+        crate::search_v3::reset_bridge_for_tests();
         reset_lexical_bootstrap_tracking();
     }
 
