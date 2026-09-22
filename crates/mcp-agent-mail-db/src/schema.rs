@@ -5165,12 +5165,13 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
+            let repeated = run_specific_migrations(&cx, &conn, schema_migrations())
+                .await
+                .into_result()
+                .unwrap();
             assert!(
-                run_specific_migrations(&cx, &conn, schema_migrations())
-                    .await
-                    .into_result()
-                    .unwrap()
-                    .is_empty()
+                repeated.is_empty(),
+                "completed migrations must not run again: {repeated:?}"
             );
         });
     }
