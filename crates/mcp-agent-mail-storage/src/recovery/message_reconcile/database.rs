@@ -5,6 +5,7 @@
 //! worker must supply its live pool for the same configured mailbox/root.
 
 mod source;
+mod staged;
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -428,6 +429,22 @@ fn reconcile_prepared(
                 )?;
             }
         }
+    }
+    // Staging writes the exact blob before Git commits it. If every disk and
+    // HEAD copy was lost, a bounded index snapshot can still retain reply and
+    // extension metadata. It must agree with the live DB and with every other
+    // staged copy; it never overrides unavailable/conflicting stronger evidence.
+    if surviving.is_none()
+        && let Some(committed) = &committed
+    {
+        surviving = staged::read_metadata(
+            &committed.repo,
+            &archive,
+            prepared,
+            &paths.canonical,
+            &paths.outbox,
+            &paths.inbox,
+        )?;
     }
     let message = match surviving {
         Some(message) => message,
@@ -886,7 +903,7 @@ mod tests {
         .unwrap()
     }
 
-    fn git_fixture() -> (tempfile::TempDir, Config, PreparedMessage, ProjectArchive) {
+    pub(super) fn git_fixture() -> (tempfile::TempDir, Config, PreparedMessage, ProjectArchive) {
         let temp = tempfile::tempdir().unwrap();
         let config = Config {
             storage_root: temp.path().to_path_buf(),

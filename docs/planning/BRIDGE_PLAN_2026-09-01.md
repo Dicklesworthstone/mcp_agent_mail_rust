@@ -130,6 +130,45 @@ checks pass. These selected checks do not close
 the original journal/backlog transport acceptance, independent review, or the
 full release gate; the broader recovery bead remains open.
 
+**Further upstream integration:** checkpoint `3979cf4e` retains the verified
+117-test result above. Incoming ACK pagination and canonical-identity recovery
+through `e5b1e7bf` initially failed compilation because pool acquisition returned
+the driver error instead of `DbError`. After correcting that conversion, the
+real pinned-engine ACK tests ran on `vmi1264463` at 04:01:22 UTC: eight failed
+with `bind parameter index out of range: 1`; only the page-size guard passed.
+The terminal log is `20260922-rainyforest-ack-native-initial.log` in the artifact
+directory above. The engine evaluates compound-query LIMIT without bindings.
+Local integration checkpoint `84f01e5c` renders only the validated integer page
+bound and uses numbered bindings for mailbox values, retaining one statement,
+the metadata row, overflow witness, and every existing assertion. A fresh rebuilt
+binary passed all nine ACK tests at 04:08:06 UTC (0.674 seconds;
+`20260922-rainyforest-ack-native-fresh.log`). An intervening rerun executed stale
+code and is excluded: source bytes matched, but their preserved edit timestamp
+preceded the completed baseline artifact. Refreshing that source timestamp
+forced a real rebuild without changing bytes. Newer `8b6e0276` adds surviving staged Git
+copies as a last-resort source of reply/extension metadata; this is merged for
+the same combined gate. Formatting passes; the five-file UBS comparison against
+`8b6e0276` exits 0 with zero new critical, 80 warning and seven informational
+findings, all reviewed as test fixtures/assertions and formatting shifts. The
+all-target check also exposed two incoming ACK test compile errors: pooled
+connections lack `Debug`. Using `Outcome::expect` preserves the failure checks
+without formatting the success value. Strict workspace/all-target Clippy with
+warnings denied then passed at 04:19:07 UTC; the terminal receipt is
+`20260922-rainyforest-combined-clippy-final.log`. The combined runtime run ended
+at 05:08:15 UTC: 115/116 passed (11,611 outside selection; 110.807 seconds),
+including both real stdio cases, nine ACK query tests, all 35 ACK worker tests
+and 69 storage controls. The one failure occurred during a new staged fixture's
+setup: libgit2 rejected a missing object when adding to a repository-owned index,
+before reconciliation ran. The fixture now opens its index without an attached
+object database and asserts the object is absent, so the original refusal and
+preservation assertions can execute. This test-only correction awaits rerun.
+The failed terminal log remains `20260922-rainyforest-combined-runtime.log`;
+the executed `am` SHA-256 was
+`804383fc0242465041af0fdaa4054177dd6ec971011d4937a2b21af11d5d70a3`.
+Publication remains pending. Upstream `2f7ee9ed` adds exhaustive ACK page-bound
+regressions and retryable model discovery; those are the next fixed integration
+cut. Search helper tests alone will not establish real-model loading coverage.
+
 RainyForest read all 1,350 lines of current AGENTS.md and 2,053 lines of README.md.
 The current vision, durability, threat, browser and ATC contracts were compared
 with source, the verification ledger, dependency upgrade log, previous full

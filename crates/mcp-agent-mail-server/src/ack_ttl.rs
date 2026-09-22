@@ -1455,10 +1455,7 @@ mod tests {
         original: &queries::UnackedMessageRow,
         offsets: std::ops::RangeInclusive<i64>,
     ) {
-        let conn = match block_on(pool.acquire(cx)) {
-            Outcome::Ok(conn) => conn,
-            other => panic!("acquire seed connection: {other:?}"),
-        };
+        let conn = block_on(pool.acquire(cx)).expect("acquire seed connection");
         conn.execute_sync("BEGIN IMMEDIATE", &[]).unwrap();
         for offset in offsets {
             let id = original.message_id.checked_add(offset).unwrap();
@@ -1477,10 +1474,7 @@ mod tests {
     }
 
     fn set_test_generation(cx: &Cx, pool: &DbPool, generation: &str) {
-        let conn = match block_on(pool.acquire(cx)) {
-            Outcome::Ok(conn) => conn,
-            other => panic!("acquire generation fixture: {other:?}"),
-        };
+        let conn = block_on(pool.acquire(cx)).expect("acquire generation fixture");
         assert_eq!(
             conn.execute_sync(
                 "UPDATE db_identity SET generation_id = ? WHERE singleton = 0",
