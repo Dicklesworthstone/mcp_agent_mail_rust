@@ -74,6 +74,38 @@ complete UBS baseline comparison exited 0 with zero new critical findings;
 fixed paths, bounded polling and shifted pre-existing occurrences. The full
 historical scan remains nonzero. All verification here was self-executed.
 
+**Integration with newer main:** before pushing, origin/main had advanced by 18
+commits to `5e5a73d4`. The clean merge includes new durable-recipient authority,
+legacy/cross-project routing, exact attachment recovery, journal authority,
+bounded Git/retry admission and ATC population scoping. These are existing
+upstream implementations to qualify, not missing features to duplicate. The
+pre-merge results above do not qualify this combined candidate. Selected
+recovery/stdio tests passed; workspace compiler/lint checks are running through
+the same strict RCH lane. Incoming formatting drift was corrected manually; two
+delegates handled eight files and the parent reviewed their full diffs and
+reran formatting checks. One intentional, caught test panic needed a documented
+same-line UBS false-positive exception after formatting changed its fingerprint.
+The 14-file comparison against incoming main exited 0: zero new critical,
+230 warning and 66 informational findings, reviewed as test setup/assertions,
+fixed-path heuristics and unchanged production statements moved by formatting.
+The untriaged report is retained; no broad scanner rules or test gates changed.
+
+The first merged stdio run exposed a real integration defect: the new compound
+source query deferred every repair with `bind parameter index out of range: 1`.
+The pinned engine evaluates compound `LIMIT` without the supplied bindings.
+The source query now renders only the fixed internal row budget as an integer
+literal, with explicit bound indices for IDs and size limits across both arms.
+Single-statement observation, payload limits and the excess-recipient witness
+remain intact. The failing terminal run is retained as
+`20260922-rainyforest-merged-source-bind-failure.log`: one failed, 58 not run,
+3,404 outside selection. After the fix, all 59 selected tests passed in 83.884
+seconds (57 storage controls and two stdio subprocess cases; 3,404 outside
+selection), terminal September 22 at 02:17:16 UTC on `vmi1264463`. Fail-fast was
+disabled to execute every selected control; assertions and pass conditions were
+unchanged. Receipt: `20260922-rainyforest-merged-recovery-pass.log`. Fifteen
+source/lock hashes matched the worker; the executed `am` SHA-256 was
+`64c301bd33bfe5160f688fb0496c98c1ee7cb132b2bf053f6c3a5856e0dbc0a9`.
+
 RainyForest read all 1,350 lines of current AGENTS.md and 2,053 lines of README.md.
 The current vision, durability, threat, browser and ATC contracts were compared
 with source, the verification ledger, dependency upgrade log, previous full

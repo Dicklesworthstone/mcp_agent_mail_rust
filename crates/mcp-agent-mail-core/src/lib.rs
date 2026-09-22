@@ -50,6 +50,7 @@ pub mod git_lock;
 pub mod host_health;
 pub mod identity;
 pub mod intern;
+pub mod journal_io;
 pub mod kpi;
 pub mod lock_order;
 pub mod mailbox_durability;

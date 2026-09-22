@@ -4,6 +4,8 @@
 //! archive snapshot for the live source and never modifies mailbox rows. The
 //! worker must supply its live pool for the same configured mailbox/root.
 
+mod source;
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -12,8 +14,11 @@ use fastmcp_core::block_on;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::{DbError, DbPool, corruption_circuit_breaker};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 
+use self::source::prepare_message;
 use super::{ReconcileResult, read_surviving_message, reconcile_message_bundle};
 use crate::{MessageBundleBatchEntry, ProjectArchive};
 
@@ -234,102 +239,6 @@ struct PreparedMessage {
     project_slug: String,
     recipients: Vec<String>,
     payload_bytes: usize,
-}
-
-/// One joined SELECT binds message, project and sender to one observation.
-/// The size predicate bounds the payload returned to this application.
-fn prepare_message(cx: &Cx, pool: &DbPool, id: i64) -> Result<PreparedMessage, String> {
-    let conn = outcome(block_on(pool.acquire(cx)))?;
-    let rows = conn
-        .query_sync(
-            "SELECT m.id, m.subject, m.body_md, m.thread_id, m.topic, m.importance, \
-             m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
-             p.slug AS project_slug, p.human_key AS project_key, a.name AS sender \
-             FROM messages m JOIN projects p ON p.id = m.project_id \
-             JOIN agents a ON a.id = m.sender_id AND a.project_id = m.project_id \
-             WHERE m.id = ? AND \
-             length(CAST(m.body_md AS BLOB)) + length(CAST(m.subject AS BLOB)) + \
-             length(CAST(m.recipients_json AS BLOB)) + length(CAST(m.attachments AS BLOB)) + \
-             length(CAST(m.importance AS BLOB)) + length(CAST(p.slug AS BLOB)) + \
-             length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
-             COALESCE(length(CAST(m.thread_id AS BLOB)), 0) + \
-             COALESCE(length(CAST(m.topic AS BLOB)), 0) <= ?",
-            &[id.into(), MAX_DB_PAYLOAD_BYTES.into()],
-        )
-        .map_err(source_error)?;
-    if rows.len() != 1 {
-        return Err(
-            "message missing, oversized, or lacking an unambiguous project/sender".to_string(),
-        );
-    }
-    let row = &rows[0];
-    let text = |name| row.get_named::<String>(name).map_err(source_error);
-    let body = text("body_md")?;
-    let sender = text("sender")?;
-    let project_slug = text("project_slug")?;
-    let created = row.get_named::<i64>("created_ts").map_err(source_error)?;
-    if chrono::DateTime::from_timestamp_micros(created).is_none() {
-        return Err("message creation timestamp cannot be represented faithfully".to_string());
-    }
-    let ack = row.get_named::<i64>("ack_required").map_err(source_error)?;
-    if !matches!(ack, 0 | 1) {
-        return Err("message acknowledgment flag is not boolean".to_string());
-    }
-    let routing: Value = serde_json::from_str(&text("recipients_json")?)
-        .map_err(|_| "message recipient metadata is not valid JSON".to_string())?;
-    let attachments: Value = serde_json::from_str(&text("attachments")?)
-        .map_err(|_| "message attachment metadata is not valid JSON".to_string())?;
-    if !attachments.is_array() {
-        return Err("message attachment metadata is not an array".to_string());
-    }
-    let mut recipients = Vec::new();
-    for kind in ["to", "cc", "bcc"] {
-        for name in routing
-            .get(kind)
-            .and_then(Value::as_array)
-            .ok_or_else(|| format!("message recipient metadata lacks {kind} array"))?
-        {
-            let name = name
-                .as_str()
-                .ok_or_else(|| "non-string message recipient".to_string())?;
-            crate::validate_archive_component("recipient", name)
-                .map_err(|error| error.to_string())?;
-            recipients.push(name.to_string());
-            if recipients.len() > super::MAX_RECIPIENTS {
-                return Err("message recipient budget exceeded".to_string());
-            }
-        }
-    }
-    if recipients.is_empty() {
-        return Err("message has no authoritative recipients".to_string());
-    }
-    recipients.sort_unstable();
-    recipients.dedup();
-    let message = json!({
-        "id": id,
-        "from": sender,
-        "to": routing["to"],
-        "cc": routing["cc"],
-        "bcc": routing["bcc"],
-        "subject": text("subject")?,
-        "created": mcp_agent_mail_db::micros_to_iso(created),
-        "thread_id": row.get_named::<Option<String>>("thread_id").map_err(source_error)?,
-        "topic": row.get_named::<Option<String>>("topic").map_err(source_error)?,
-        "project": text("project_key")?,
-        "project_slug": project_slug,
-        "importance": text("importance")?,
-        "ack_required": ack != 0,
-        "attachments": attachments,
-    });
-    let payload_bytes = body.len().saturating_add(message.to_string().len());
-    Ok(PreparedMessage {
-        message,
-        body,
-        sender,
-        project_slug,
-        recipients,
-        payload_bytes,
-    })
 }
 
 fn validate_surviving_message(

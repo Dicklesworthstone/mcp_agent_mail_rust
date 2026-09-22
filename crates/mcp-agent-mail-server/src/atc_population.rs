@@ -7,12 +7,18 @@
 //! instead of releasing reservations against an only-partially-refreshed roster.
 //! A failed refresh also blocks inference until a new database read succeeds:
 //! inability to observe activity is not evidence that an agent has died.
+//! Once a database population has been installed, remembered engine agents
+//! outside that population cannot authorize automatic effects or legacy actions.
 
 use super::engine::{self, AtcPopulationSyncStats, AtcSummarySnapshot, AtcTickReport};
 use mcp_agent_mail_db::models::AtcPopulationAgentRow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
+
+#[path = "atc_population_scope.rs"]
+mod scope;
+use scope::PopulationScope;
 
 /// A count bound as well as a cooperative elapsed-time bound. The latter cannot
 /// preempt an individual engine update or database operation.
@@ -37,6 +43,13 @@ pub struct AtcPopulationHydrationStats {
     pub refresh_failed: bool,
     /// A population read is running without holding the hydration mutex.
     pub refresh_in_flight: bool,
+    /// Invalid or multi-project names in the current bounded population.
+    pub scope_unresolved_names: usize,
+    /// Lifetime proposal/action counts withheld by population scope, not delivery failures.
+    pub scope_effects_withheld: u64,
+    pub scope_actions_withheld: u64,
+    pub last_scope_effects_withheld: usize,
+    pub last_scope_actions_withheld: usize,
 }
 
 #[derive(Default)]
@@ -46,6 +59,10 @@ struct HydrationState {
     // A new refresh cannot replace an unfinished one, so this represents fully
     // applied rows whenever it is consulted for unchanged-row suppression.
     previous_snapshot: HashMap<AgentKey, AtcPopulationAgentRow>,
+    // None preserves standalone engine use before the first DB population.
+    // Some(empty) is different: a successful empty read withdraws all automatic
+    // target authority. Failed or unfinished refreshes already suspend inference.
+    scope: Option<PopulationScope>,
     snapshot_stats: AtcPopulationSyncStats,
     progress: AtcPopulationHydrationStats,
     resume_pending: bool,
@@ -90,6 +107,10 @@ impl HydrationState {
                 return Err(error);
             }
         };
+        // Build scope from the actual projection before deduplicating cache
+        // keys. Conflicting duplicate identities must not become last-row-wins.
+        let next_scope = PopulationScope::from_rows(&rows);
+        let unresolved_names = next_scope.unresolved_names();
         let mut projects = HashSet::new();
         let mut stats = AtcPopulationSyncStats::default();
         let mut next_snapshot = HashMap::with_capacity(rows.len());
@@ -109,6 +130,7 @@ impl HydrationState {
         }
         stats.projects = projects.len();
         self.previous_snapshot = next_snapshot;
+        self.scope = Some(next_scope);
         self.pending = pending;
         self.snapshot_stats = stats;
         self.progress = AtcPopulationHydrationStats {
@@ -118,6 +140,9 @@ impl HydrationState {
             deferred_refreshes: self.progress.deferred_refreshes,
             snapshot_started_at_micros: now_micros,
             refresh_failures: self.progress.refresh_failures,
+            scope_unresolved_names: unresolved_names,
+            scope_effects_withheld: self.progress.scope_effects_withheld,
+            scope_actions_withheld: self.progress.scope_actions_withheld,
             ..AtcPopulationHydrationStats::default()
         };
         self.resume_pending = !self.pending.is_empty();
@@ -166,6 +191,24 @@ impl HydrationState {
         )
     }
 
+    fn filter_report_scope(&mut self, report: &mut AtcTickReport) {
+        let Some(scope) = self.scope.as_ref() else {
+            return;
+        };
+        let disposition = scope.retain_authorized(&mut report.effects, &mut report.actions);
+        self.progress.last_scope_effects_withheld = disposition.effects_withheld;
+        self.progress.last_scope_actions_withheld = disposition.actions_withheld;
+        self.progress.scope_effects_withheld = self
+            .progress
+            .scope_effects_withheld
+            .saturating_add(u64::try_from(disposition.effects_withheld).unwrap_or(u64::MAX));
+        self.progress.scope_actions_withheld = self
+            .progress
+            .scope_actions_withheld
+            .saturating_add(u64::try_from(disposition.actions_withheld).unwrap_or(u64::MAX));
+        report.summary.kernel.pending_effects = report.effects.len();
+    }
+
     fn annotate(&self, summary: &mut AtcSummarySnapshot, now_micros: i64) {
         if self.active_refresh.is_some() {
             annotate_incomplete_summary(summary, None, "population_refresh_in_progress");
@@ -180,6 +223,18 @@ impl HydrationState {
                 Some(now_micros),
                 "population_hydration_incomplete",
             );
+        } else if self.progress.scope_unresolved_names > 0
+            || self.progress.last_scope_effects_withheld > 0
+            || self.progress.last_scope_actions_withheld > 0
+        {
+            // Unambiguous in-scope proposals may continue. Do not report full
+            // coverage, invent delivery failures, or overwrite a stronger guard
+            // reason while stale/ambiguous engine proposals are being withheld.
+            summary.completeness = engine::SnapshotCompleteness::Partial;
+            summary.policy.fallback_active = true;
+            if summary.policy.fallback_reason.is_none() {
+                summary.policy.fallback_reason = Some("population_scope_restricted".to_string());
+            }
         }
     }
 }
@@ -267,6 +322,8 @@ pub fn atc_population_hydration_stats() -> AtcPopulationHydrationStats {
 /// new refresh is admitted. Frequent changing snapshots cannot starve it.
 /// A failed read suspends inference, without clearing the last good snapshot,
 /// until a later read succeeds. Errors are still returned to the operator.
+/// Every installed DB population also replaces the scope for automatic effects;
+/// missing agents are withheld, never classified as dead or deleted by omission.
 pub fn atc_sync_population_from_db(
     pool: &mcp_agent_mail_db::DbPool,
 ) -> Result<AtcPopulationSyncStats, String> {
@@ -356,7 +413,12 @@ pub(super) fn tick_report(now_micros: i64) -> Option<AtcTickReport> {
     if state.pending.is_empty() {
         state.resume_pending = false;
         state.progress.last_slice_agents = 0;
-        return engine::atc_tick_report(now_micros);
+        let mut report = engine::atc_tick_report(now_micros)?;
+        // Validate while holding the same lease that installs population scope.
+        // The delivery gate later budgets optional mail; it cannot grant scope.
+        state.filter_report_scope(&mut report);
+        state.annotate(&mut report.summary, now_micros);
+        return Some(report);
     }
     state.drain_slice();
     partial_report(&state, now_micros, started)
