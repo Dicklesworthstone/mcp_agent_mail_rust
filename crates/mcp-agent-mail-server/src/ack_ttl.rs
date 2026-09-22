@@ -1,31 +1,36 @@
-//! Background worker for ACK TTL scanning and escalation.
+//! Background worker for bounded ACK TTL scanning and escalation.
 //!
 //! Mirrors legacy Python `_worker_ack_ttl` in `http.py`:
 //! - Scan unacknowledged `ack_required` messages
 //! - Log warnings for overdue acks
 //! - Optionally escalate via file reservations
 //!
-//! Warning suppression is separate from escalation reconciliation: active
-//! claims are checked again on later scans, including after an earlier error.
-//! Attempts are coalesced per recipient/month within each scan, and lookup
-//! failures never authorize a broader inbox pattern or a different holder.
+//! Each lap freezes its cutoff and message high-water mark. Fresh keyset pages
+//! and consumed-prefix continuations prevent new mail or acknowledgments from
+//! starving old deliveries. The worker yields its generation/write lease between
+//! slices instead of retaining it while processing the whole backlog.
 //!
-//! The worker runs on a dedicated OS thread with `std::thread::sleep` between
-//! iterations, matching the pattern in `cleanup.rs`.
+//! Warning suppression is bounded and separate from escalation reconciliation:
+//! active claims are checked again on later laps, including after an error.
+//! Attempts are coalesced per recipient/month within each slice, and lookup
+//! failures never authorize a broader inbox pattern or a different holder.
 
 #![forbid(unsafe_code)]
 
 use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_db::{
-    DbPool, DbPoolConfig, create_pool, micros_to_iso, now_micros,
-    queries::{self, list_overdue_unacknowledged_messages},
-};
+use mcp_agent_mail_db::ack_scan::{AckScanCursor, MAX_ACK_SCAN_PAGE_SIZE, overdue_ack_page};
+use mcp_agent_mail_db::{DbPool, DbPoolConfig, create_pool, micros_to_iso, now_micros, queries};
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+const ACK_SCAN_SLICE_BUDGET: Duration = Duration::from_millis(25);
+const ACK_SCAN_CONTINUATION_PAUSE: Duration = Duration::from_millis(250);
+const MAX_ACK_WARNING_KEYS: usize = 4096;
 
 /// Global shutdown flag for the ACK TTL worker.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -89,8 +94,8 @@ pub fn shutdown() {
 }
 
 fn ack_ttl_loop(config: &Config) {
-    let interval = std::time::Duration::from_secs(config.ack_ttl_scan_interval_seconds.max(5));
-    let startup_delay = interval.min(std::time::Duration::from_secs(8));
+    let interval = Duration::from_secs(config.ack_ttl_scan_interval_seconds.max(5));
+    let startup_delay = interval.min(Duration::from_secs(8));
 
     let mut pool_config = DbPoolConfig::from_env();
     pool_config.database_url.clone_from(&config.database_url);
@@ -116,7 +121,7 @@ fn ack_ttl_loop(config: &Config) {
         "ACK TTL scan worker started"
     );
 
-    if startup_delay > std::time::Duration::ZERO {
+    if startup_delay > Duration::ZERO {
         info!(
             startup_delay_secs = startup_delay.as_secs(),
             "ACK TTL worker startup delay engaged"
@@ -126,84 +131,159 @@ fn ack_ttl_loop(config: &Config) {
         }
     }
 
-    let mut previously_overdue: HashSet<OverdueAckKey> = HashSet::new();
-
+    let mut state = AckScanState::default();
     loop {
         if SHUTDOWN.load(Ordering::Acquire) {
             info!("ACK TTL scan worker shutting down");
             return;
         }
-
-        match run_ack_ttl_cycle_with_state(config, &pool, &mut previously_overdue) {
+        let started = Instant::now();
+        let result = run_ack_ttl_slice(
+            config,
+            &pool,
+            &mut state,
+            || SHUTDOWN.load(Ordering::Acquire),
+            || started.elapsed() < ACK_SCAN_SLICE_BUDGET,
+        );
+        let failed = result.is_err();
+        match result {
             Ok((scanned, overdue)) => {
                 if overdue > 0 {
                     info!(
                         event = "ack_ttl_scan",
-                        scanned, overdue, "ACK TTL scan completed"
+                        scanned,
+                        overdue,
+                        lap_incomplete = state.cursor.is_some(),
+                        "ACK TTL scan slice completed"
                     );
                 }
             }
-            Err(e) => {
-                warn!(error = %e, "ACK TTL scan cycle failed");
+            Err(error) => {
+                warn!(error = %error, "ACK TTL scan slice failed; retaining continuation");
             }
         }
-
-        // Sleep in small increments to allow quick shutdown.
-        let mut remaining = interval;
-        while !remaining.is_zero() {
-            if SHUTDOWN.load(Ordering::Acquire) {
-                return;
-            }
-            let chunk = remaining.min(std::time::Duration::from_secs(1));
-            std::thread::sleep(chunk);
-            remaining = remaining.saturating_sub(chunk);
+        // No database/write lease survives the slice call. A failed read must
+        // not inherit the fast continuation cadence and create a retry storm.
+        let delay = next_ack_scan_delay(interval, state.cursor.is_some(), failed);
+        if sleep_with_shutdown(delay) {
+            return;
         }
     }
 }
 
-fn sleep_with_shutdown(duration: std::time::Duration) -> bool {
+fn sleep_with_shutdown(duration: Duration) -> bool {
     let mut remaining = duration;
     while !remaining.is_zero() {
         if SHUTDOWN.load(Ordering::Acquire) {
             return true;
         }
-        let chunk = remaining.min(std::time::Duration::from_secs(1));
+        let chunk = remaining.min(Duration::from_secs(1));
         std::thread::sleep(chunk);
         remaining = remaining.saturating_sub(chunk);
     }
     false
 }
 
-/// Run a single ACK TTL scan cycle.
-///
-/// Returns `(scanned, overdue_count)`.
+/// Run one bounded page without wall-clock scheduling noise in legacy fixtures.
 #[cfg(test)]
 fn run_ack_ttl_cycle(config: &Config, pool: &DbPool) -> Result<(usize, usize), String> {
-    let mut previously_overdue = HashSet::new();
-    run_ack_ttl_cycle_with_state(config, pool, &mut previously_overdue)
+    run_ack_ttl_cycle_with_state(config, pool, &mut AckScanState::default())
+}
+
+#[cfg(test)]
+fn run_ack_ttl_cycle_with_state(
+    config: &Config,
+    pool: &DbPool,
+    state: &mut AckScanState,
+) -> Result<(usize, usize), String> {
+    run_ack_ttl_slice(config, pool, state, || false, || true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct OverdueAckKey {
     message_id: i64,
     agent_id: i64,
+    created_ts: i64,
 }
 
-fn run_ack_ttl_cycle_with_state(
+impl From<&queries::UnackedMessageRow> for OverdueAckKey {
+    fn from(row: &queries::UnackedMessageRow) -> Self {
+        Self {
+            message_id: row.message_id,
+            agent_id: row.agent_id,
+            created_ts: row.created_ts,
+        }
+    }
+}
+
+/// Only cursor metadata and two bounded sets survive a slice. Warning history
+/// is observational: it never suppresses an escalation attempt. Once the lap
+/// completes, its observed keys replace the preceding lap's history. Large
+/// backlogs can produce repeated warnings beyond the cache bound, not lost work.
+#[derive(Default)]
+struct AckScanState {
+    cursor: Option<AckScanCursor>,
+    identity: Option<(String, Option<String>)>,
+    warned: HashSet<OverdueAckKey>,
+    current: HashSet<OverdueAckKey>,
+}
+
+impl AckScanState {
+    fn bind_scope(&mut self, scope: &str, generation: Option<&str>) {
+        if self.identity.as_ref().is_some_and(|(old_scope, old_generation)| {
+            old_scope == scope && old_generation.as_deref() == generation
+        }) {
+            return;
+        }
+        self.identity = Some((scope.to_string(), generation.map(str::to_string)));
+        self.warned.clear();
+        self.current.clear();
+    }
+
+    fn should_warn(&mut self, key: OverdueAckKey) -> bool {
+        let already_seen = self.current.contains(&key);
+        if self.current.len() < MAX_ACK_WARNING_KEYS {
+            self.current.insert(key);
+        }
+        !already_seen && !self.warned.contains(&key)
+    }
+
+    fn finish_page(&mut self, cursor: Option<AckScanCursor>) {
+        self.cursor = cursor;
+        if self.cursor.is_none() {
+            self.warned = std::mem::take(&mut self.current);
+        }
+    }
+}
+
+fn next_ack_scan_delay(interval: Duration, pending: bool, failed: bool) -> Duration {
+    if pending && !failed {
+        interval.min(ACK_SCAN_CONTINUATION_PAUSE)
+    } else {
+        interval
+    }
+}
+
+/// One fresh observation and a consumed prefix. The time budget is cooperative:
+/// it does not interrupt an individual query, escalation or archive operation.
+/// Make one row of progress even if the query spends the processing budget, but
+/// never override shutdown. Do not carry fetched payloads across recovery/yield.
+fn run_ack_ttl_slice(
     config: &Config,
     pool: &DbPool,
-    previously_overdue: &mut HashSet<OverdueAckKey>,
+    state: &mut AckScanState,
+    mut stop: impl FnMut() -> bool,
+    mut has_time: impl FnMut() -> bool,
 ) -> Result<(usize, usize), String> {
-    // #219: escalations insert system agents and file reservations into the
-    // live mailbox; hold the in-process write lease for the whole cycle so a
-    // recovery promotion cannot swap the database mid-escalation.
+    if stop() {
+        return Ok((0, 0));
+    }
+    // #219: keep generation exclusion through this page's escalations only.
+    // Returning releases it BEFORE the worker pauses or reads its next page.
     let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
-    // This worker runs on a dedicated OS thread outside the async runtime, so
-    // there is no parent Cx to derive from. Rather than forge a full-capability
-    // Cx with the test-only `Cx::for_testing()` (gated behind `test-internals`),
-    // borrow the runtime-backed ambient Cx<cap::All> (INFINITE budget) that
-    // `Runtime::block_on` installs. It is Arc-backed, so the clone returned here
-    // stays valid across the subsequent block_on calls in this function.
+    if stop() {
+        return Ok((0, 0));
+    }
     let cx = block_on(async {
         Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
     });
@@ -211,48 +291,40 @@ fn run_ack_ttl_cycle_with_state(
     let ttl_us = i64::try_from(config.ack_ttl_seconds)
         .unwrap_or(1800)
         .saturating_mul(1_000_000);
-    let overdue_before_ts = now.saturating_sub(ttl_us);
-
-    let rows = match block_on(async {
-        list_overdue_unacknowledged_messages(&cx, pool, overdue_before_ts).await
-    }) {
-        Outcome::Ok(r) => r,
-        other => return Err(format!("failed to list unacked messages: {other:?}")),
+    let page = match block_on(overdue_ack_page(
+        &cx,
+        pool,
+        state.cursor.as_ref(),
+        now.saturating_sub(ttl_us),
+        MAX_ACK_SCAN_PAGE_SIZE,
+    )) {
+        Outcome::Ok(page) => page,
+        other => return Err(format!("failed to read overdue ACK page: {other:?}")),
     };
-
-    let scanned = rows.len();
-    let mut overdue = 0usize;
-    let mut currently_overdue: HashSet<OverdueAckKey> = HashSet::with_capacity(rows.len());
+    // Failed reads above preserve the continuation and warning history. A
+    // successful changed-generation read has already restarted the DB cursor.
+    state.bind_scope(page.database_scope(), page.generation_id());
+    let scanned = page.rows.len();
+    let mut consumed = 0;
     let mut attempted_escalations = HashSet::new();
-
-    for row in &rows {
-        let key = OverdueAckKey {
-            message_id: row.message_id,
-            agent_id: row.agent_id,
-        };
-        currently_overdue.insert(key);
-        overdue = overdue.saturating_add(1);
-
-        // Suppress repeated warnings, not recovery attempts. A previous scan
-        // seeing this row proves neither that escalation succeeded nor that its
-        // reservation is still active after expiry or explicit release.
-        if !previously_overdue.contains(&key) {
-            let age_seconds = now.saturating_sub(row.created_ts) / 1_000_000;
+    for row in &page.rows {
+        if stop() || (consumed > 0 && !has_time()) {
+            break;
+        }
+        if state.should_warn(OverdueAckKey::from(row)) {
             warn!(
                 event = "ack_overdue",
                 message_id = row.message_id,
                 project_id = row.project_id,
                 agent_id = row.agent_id,
-                age_s = age_seconds,
+                age_s = now.saturating_sub(row.created_ts) / 1_000_000,
                 ttl_s = config.ack_ttl_seconds,
                 "ACK overdue"
             );
         }
-
-        // Several messages can share the same monthly inbox claim. Attempt
-        // that claim once per cycle even on failure, so one broken recipient
-        // cannot consume a retry per message. The next scan retries naturally;
-        // the durable active-reservation check prevents duplicate grants.
+        // Coalesce by claim within this bounded slice, not by warning history.
+        // A failed claim must not pin the cursor or be mistaken for success;
+        // later laps retry it and the durable claim check prevents duplication.
         if config.ack_escalation_enabled
             && attempted_escalations.insert((
                 row.project_id,
@@ -270,10 +342,14 @@ fn run_ack_ttl_cycle_with_state(
                 "ACK escalation failed; will retry on a later overdue scan"
             );
         }
+        consumed += 1;
     }
-
-    *previously_overdue = currently_overdue;
-    Ok((scanned, overdue))
+    let continuation = page
+        .continuation_after(consumed)
+        .map_err(|error| error.to_string())?;
+    state.finish_page(continuation);
+    // These counts describe this slice, not the size of the whole backlog.
+    Ok((scanned, consumed))
 }
 
 fn inbox_month_path(created_ts: i64) -> String {
@@ -668,7 +744,7 @@ mod tests {
         config.ack_escalation_claim_exclusive = true;
         config.ack_escalation_claim_holder_name.clear();
 
-        let mut previously_overdue = std::collections::HashSet::new();
+        let mut previously_overdue = AckScanState::default();
 
         let (first_scanned, first_overdue) =
             run_ack_ttl_cycle_with_state(&config, &pool, &mut previously_overdue)
@@ -703,11 +779,11 @@ mod tests {
         config.ack_escalation_claim_holder_name.clear();
 
         // First run with fresh in-memory state.
-        let mut first_state = std::collections::HashSet::new();
+        let mut first_state = AckScanState::default();
         run_ack_ttl_cycle_with_state(&config, &pool, &mut first_state).expect("first cycle");
 
         // Simulate process restart: fresh state map, same overdue row still exists.
-        let mut second_state = std::collections::HashSet::new();
+        let mut second_state = AckScanState::default();
         run_ack_ttl_cycle_with_state(&config, &pool, &mut second_state).expect("second cycle");
 
         let reservations = match block_on(async {
@@ -1186,7 +1262,7 @@ mod tests {
         config.ack_escalation_enabled = true;
         config.ack_escalation_mode = "file_reservation".to_string();
         config.ack_escalation_claim_holder_name = "../invalid-holder".to_string();
-        let mut state = HashSet::new();
+        let mut state = AckScanState::default();
 
         for _ in 0..2 {
             assert_eq!(
@@ -1194,10 +1270,7 @@ mod tests {
                 (1, 1)
             );
         }
-        assert!(state.contains(&OverdueAckKey {
-            message_id: unacked.message_id,
-            agent_id: unacked.agent_id,
-        }));
+        assert!(state.warned.contains(&OverdueAckKey::from(&unacked)));
         let before = match block_on(async {
             queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
         }) {
@@ -1236,7 +1309,7 @@ mod tests {
         config.ack_escalation_enabled = true;
         config.ack_escalation_mode = "file_reservation".to_string();
         config.ack_escalation_claim_holder_name.clear();
-        let mut state = HashSet::new();
+        let mut state = AckScanState::default();
         run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap();
 
         match block_on(async {
@@ -1296,7 +1369,9 @@ mod tests {
             run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(),
             (0, 0)
         );
-        assert!(state.is_empty());
+        assert!(state.warned.is_empty());
+        assert!(state.current.is_empty());
+        assert!(state.cursor.is_none());
         let active = match block_on(async {
             queries::list_file_reservations(&cx, &pool, unacked.project_id, true).await
         }) {
@@ -1365,5 +1440,254 @@ mod tests {
         };
         assert!(claims.is_empty());
         assert!(!config.storage_root.exists());
+    }
+
+    fn seed_more_overdue(
+        cx: &Cx,
+        pool: &DbPool,
+        original: &queries::UnackedMessageRow,
+        offsets: std::ops::RangeInclusive<i64>,
+    ) {
+        let conn = match block_on(pool.acquire(cx)) {
+            Outcome::Ok(conn) => conn,
+            other => panic!("acquire seed connection: {other:?}"),
+        };
+        conn.execute_sync("BEGIN IMMEDIATE", &[]).unwrap();
+        for offset in offsets {
+            let id = original.message_id.checked_add(offset).unwrap();
+            conn.execute_sync(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, attachments, recipients_json) SELECT ?, project_id, sender_id, 'bounded scan', 'Body', 'normal', 1, ?, '[]', '{}' FROM messages WHERE id = ?",
+                &[id.into(), original.created_ts.into(), original.message_id.into()],
+            )
+            .unwrap();
+            conn.execute_sync(
+                "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, 'to')",
+                &[id.into(), original.agent_id.into()],
+            )
+            .unwrap();
+        }
+        conn.execute_sync("COMMIT", &[]).unwrap();
+    }
+
+    fn set_test_generation(cx: &Cx, pool: &DbPool, generation: &str) {
+        let conn = match block_on(pool.acquire(cx)) {
+            Outcome::Ok(conn) => conn,
+            other => panic!("acquire generation fixture: {other:?}"),
+        };
+        assert_eq!(
+            conn.execute_sync(
+                "UPDATE db_identity SET generation_id = ? WHERE singleton = 0",
+                &[mcp_agent_mail_db::sqlmodel_core::Value::Text(generation.to_string())],
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    fn seeded_generation(cx: &Cx, pool: &DbPool) -> String {
+        match block_on(queries::db_generation_id(cx, pool)) {
+            Outcome::Ok(Some(generation)) => generation,
+            other => panic!("seed database generation: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warning_history_is_bounded_and_completed_laps_remove_stale_keys() {
+        let mut state = AckScanState::default();
+        state.bind_scope("db", Some("generation"));
+        for index in 0..MAX_ACK_WARNING_KEYS * 3 {
+            let key = OverdueAckKey {
+                message_id: i64::try_from(index).unwrap() + 1,
+                agent_id: 1,
+                created_ts: 10,
+            };
+            assert!(state.should_warn(key));
+        }
+        assert_eq!(state.current.len(), MAX_ACK_WARNING_KEYS);
+        state.finish_page(None);
+        assert_eq!(state.warned.len(), MAX_ACK_WARNING_KEYS);
+        assert!(state.current.is_empty());
+        let retained = OverdueAckKey { message_id: 1, agent_id: 1, created_ts: 10 };
+        assert!(!state.should_warn(retained));
+        state.finish_page(None);
+        assert_eq!(state.warned, HashSet::from([retained]));
+        state.finish_page(None);
+        assert!(state.warned.is_empty());
+    }
+
+    #[test]
+    fn warning_history_never_crosses_mailbox_generation_or_reused_creation_time() {
+        let key = OverdueAckKey { message_id: 1, agent_id: 1, created_ts: 10 };
+        let mut state = AckScanState::default();
+        for (scope, generation) in [("one", "a"), ("two", "a"), ("two", "b")] {
+            state.bind_scope(scope, Some(generation));
+            assert!(state.should_warn(key));
+            assert!(!state.should_warn(key));
+            state.finish_page(None);
+            state.bind_scope(scope, Some(generation));
+            assert!(!state.should_warn(key));
+        }
+        assert!(state.should_warn(OverdueAckKey { created_ts: 11, ..key }));
+    }
+
+    #[test]
+    fn failed_pages_do_not_get_the_fast_continuation_cadence() {
+        let interval = Duration::from_secs(60);
+        assert_eq!(next_ack_scan_delay(interval, true, false), ACK_SCAN_CONTINUATION_PAUSE);
+        for (pending, failed) in [(false, false), (false, true), (true, true)] {
+            assert_eq!(next_ack_scan_delay(interval, pending, failed), interval);
+        }
+    }
+
+    #[test]
+    fn actual_worker_pages_and_partial_slices_visit_the_whole_backlog() {
+        let (tmp, pool, cx, original) = seed_unacked_message();
+        let additional = i64::try_from(MAX_ACK_SCAN_PAGE_SIZE * 2 + 2).unwrap();
+        seed_more_overdue(&cx, &pool, &original, 1..=additional);
+        let mut config = test_config(&tmp);
+        config.ack_ttl_seconds = 0;
+        config.ack_escalation_enabled = false;
+        let mut state = AckScanState::default();
+        assert_eq!(
+            run_ack_ttl_slice(&config, &pool, &mut state, || false, || false).unwrap(),
+            (MAX_ACK_SCAN_PAGE_SIZE, 1)
+        );
+        assert!(state.cursor.is_some());
+        assert_eq!(state.current.len(), 1);
+        let mut processed = 1;
+        let mut slices = 1;
+        while state.cursor.is_some() {
+            let (scanned, consumed) =
+                run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap();
+            assert!(scanned <= MAX_ACK_SCAN_PAGE_SIZE);
+            assert!(consumed > 0);
+            processed += consumed;
+            slices += 1;
+            assert!(slices <= 4, "continuation must not restart from the first page");
+        }
+        assert_eq!(processed, usize::try_from(additional).unwrap() + 1);
+        assert_eq!(state.warned.len(), processed);
+        for offset in 0..=additional {
+            assert!(state.warned.contains(&OverdueAckKey {
+                message_id: original.message_id + offset,
+                agent_id: original.agent_id,
+                created_ts: original.created_ts,
+            }));
+        }
+    }
+
+    #[test]
+    fn failed_observation_preserves_cursor_and_retries_the_unconsumed_tail() {
+        let (tmp, pool, cx, original) = seed_unacked_message();
+        let generation = seeded_generation(&cx, &pool);
+        seed_more_overdue(&cx, &pool, &original, 1..=2);
+        let mut config = test_config(&tmp);
+        config.ack_ttl_seconds = 0;
+        config.ack_escalation_enabled = false;
+        let mut state = AckScanState::default();
+        run_ack_ttl_slice(&config, &pool, &mut state, || false, || false).unwrap();
+        let cursor = state.cursor.clone();
+        let current = state.current.clone();
+        set_test_generation(&cx, &pool, "");
+        let error = run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap_err();
+        assert!(error.contains("ACK_SCAN"), "{error}");
+        assert_eq!(state.cursor, cursor);
+        assert_eq!(state.current, current);
+        set_test_generation(&cx, &pool, &generation);
+        assert_eq!(
+            run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(),
+            (2, 2)
+        );
+        assert!(state.cursor.is_none());
+        assert_eq!(state.warned.len(), 3);
+    }
+
+    #[test]
+    fn actual_generation_change_restarts_the_worker_lap() {
+        let (tmp, pool, cx, original) = seed_unacked_message();
+        let generation = seeded_generation(&cx, &pool);
+        seed_more_overdue(&cx, &pool, &original, 1..=2);
+        let mut config = test_config(&tmp);
+        config.ack_ttl_seconds = 0;
+        config.ack_escalation_enabled = false;
+        let mut state = AckScanState::default();
+        run_ack_ttl_slice(&config, &pool, &mut state, || false, || false).unwrap();
+        set_test_generation(&cx, &pool, &format!("{generation}-replacement"));
+        assert_eq!(
+            run_ack_ttl_slice(&config, &pool, &mut state, || false, || false).unwrap(),
+            (3, 1)
+        );
+        assert_eq!(state.current, HashSet::from([OverdueAckKey::from(&original)]));
+        assert_eq!(
+            run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(),
+            (2, 2)
+        );
+        assert!(state.cursor.is_none());
+    }
+
+    #[test]
+    fn shutdown_between_rows_does_not_consume_a_fetched_tail() {
+        let (tmp, pool, cx, original) = seed_unacked_message();
+        seed_more_overdue(&cx, &pool, &original, 1..=2);
+        let mut config = test_config(&tmp);
+        config.ack_ttl_seconds = 0;
+        config.ack_escalation_enabled = false;
+        let mut state = AckScanState::default();
+        assert_eq!(
+            run_ack_ttl_slice(&config, &pool, &mut state, || true, || true).unwrap(),
+            (0, 0)
+        );
+        assert!(state.identity.is_none());
+        let mut checks = 0;
+        let result = run_ack_ttl_slice(
+            &config,
+            &pool,
+            &mut state,
+            || { checks += 1; checks >= 4 },
+            || true,
+        )
+        .unwrap();
+        assert_eq!(result, (3, 1));
+        assert_eq!(checks, 4);
+        assert_eq!(state.current.len(), 1);
+        assert_eq!(
+            run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(),
+            (2, 2)
+        );
+        assert_eq!(state.warned.len(), 3);
+    }
+
+    #[test]
+    fn worker_observes_new_acks_without_chasing_new_mail_in_the_same_lap() {
+        let (tmp, pool, cx, original) = seed_unacked_message();
+        seed_more_overdue(&cx, &pool, &original, 1..=2);
+        let mut config = test_config(&tmp);
+        config.ack_ttl_seconds = 0;
+        config.ack_escalation_enabled = false;
+        let mut state = AckScanState::default();
+        run_ack_ttl_slice(&config, &pool, &mut state, || false, || false).unwrap();
+        match block_on(queries::acknowledge_message(
+            &cx, &pool, original.agent_id, original.message_id + 1,
+        )) {
+            Outcome::Ok(_) => {}
+            other => panic!("ack between slices: {other:?}"),
+        }
+        seed_more_overdue(&cx, &pool, &original, 3..=3);
+        assert_eq!(
+            run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(),
+            (1, 1)
+        );
+        assert!(state.cursor.is_none());
+        assert_eq!(state.warned.len(), 2);
+        assert!(!state.warned.contains(&OverdueAckKey {
+            message_id: original.message_id + 3,
+            agent_id: original.agent_id,
+            created_ts: original.created_ts,
+        }));
+        assert_eq!(
+            run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(),
+            (3, 3)
+        );
+        assert_eq!(state.warned.len(), 3);
     }
 }
