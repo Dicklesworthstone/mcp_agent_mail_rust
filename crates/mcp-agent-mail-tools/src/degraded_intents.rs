@@ -71,8 +71,11 @@ pub const RELEASE_INTENT_KIND: &str = "release_file_reservations_intent";
 /// Release-intent replay marker kind.
 pub const RELEASE_INTENT_REPLAY_KIND: &str = "release_file_reservations_replay";
 
-/// Ack-intent schema version.
+/// Original unkeyed ack-intent schema version.
 pub const ACK_INTENT_SCHEMA_VERSION: u32 = 1;
+/// Keyed ack-intent schema version. Its hash includes the retry claim, so an
+/// older reader cannot silently replay it as an unkeyed acknowledgement.
+pub const KEYED_ACK_INTENT_SCHEMA_VERSION: u32 = 2;
 /// Ack-intent log filename.
 pub const ACK_INTENT_LOG_FILE: &str = "acknowledge_message.jsonl";
 /// Ack-intent advisory lock filename.
@@ -107,6 +110,41 @@ pub struct IntentFailure {
     pub error_detail: String,
 }
 
+/// The exact normalized retry claim supplied with a queued acknowledgement.
+///
+/// Key and fingerprint travel together: a partial claim must never degrade to
+/// an unkeyed mutation. The raw key is written only to the private intent log;
+/// diagnostics and robot summaries must not expose it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AckIntentIdempotency {
+    /// Original normalized client key.
+    pub key: String,
+    /// Original normalized request fingerprint, preserved across restarts.
+    pub fingerprint: String,
+}
+
+impl std::fmt::Debug for AckIntentIdempotency {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AckIntentIdempotency")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AckIntentIdempotency {
+    fn is_valid(&self) -> bool {
+        !self.key.is_empty()
+            && self.key.trim() == self.key
+            && self.key.chars().count() <= crate::idempotency::MAX_IDEMPOTENCY_KEY_LEN
+            && self.fingerprint.len() == 64
+            && self
+                .fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+    }
+}
+
 /// A queued (un-replayed) acknowledge-message intent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuedAckIntent {
@@ -126,6 +164,10 @@ pub struct QueuedAckIntent {
     pub agent_name: String,
     /// Message id that was being acknowledged.
     pub message_id: i64,
+    /// Original retry claim. Omitted from generic diagnostic serialization;
+    /// the durable writer explicitly includes it in the private hashed record.
+    #[serde(default, skip_serializing)]
+    pub idempotency: Option<AckIntentIdempotency>,
     /// Failure context that forced queuing.
     pub failure: IntentFailure,
 }
@@ -460,7 +502,7 @@ impl<T> OutstandingIntents<T> {
 // ── Ack-intent canonical hashing ────────────────────────────────────────────
 
 fn ack_intent_hash_payload(record: &Value) -> Value {
-    json!({
+    let mut payload = json!({
         "schema_version": record["schema_version"].clone(),
         "kind": record["kind"].clone(),
         "created_ts": record["created_ts"].clone(),
@@ -468,7 +510,26 @@ fn ack_intent_hash_payload(record: &Value) -> Value {
         "agent_name": record["agent_name"].clone(),
         "message_id": record["message_id"].clone(),
         "failure": record["failure"].clone(),
-    })
+    });
+    if record["schema_version"].as_u64() == Some(u64::from(KEYED_ACK_INTENT_SCHEMA_VERSION)) {
+        payload["idempotency"] = record["idempotency"].clone();
+    }
+    payload
+}
+
+fn ack_intent_has_supported_schema(record: &Value) -> bool {
+    match record["schema_version"].as_u64() {
+        Some(version) if version == u64::from(ACK_INTENT_SCHEMA_VERSION) => {
+            // Reject an attached claim even when it was omitted from a v1
+            // hash. It must never be accepted as an unkeyed instruction.
+            record.get("idempotency").is_none()
+        }
+        Some(version) if version == u64::from(KEYED_ACK_INTENT_SCHEMA_VERSION) => record
+            .get("idempotency")
+            .and_then(|value| serde_json::from_value::<AckIntentIdempotency>(value.clone()).ok())
+            .is_some_and(|claim| claim.is_valid()),
+        _ => false,
+    }
 }
 
 fn ack_replay_hash_payload(record: &Value) -> Value {
@@ -497,6 +558,9 @@ fn record_has_valid_intent_hash(record: &Value, hash_payload: fn(&Value) -> Valu
 }
 
 fn ack_replay_record_has_valid_hash(record: &Value) -> bool {
+    if record["schema_version"].as_u64() != Some(u64::from(ACK_INTENT_SCHEMA_VERSION)) {
+        return false;
+    }
     let Some(content_sha256) = record.get("content_sha256").and_then(Value::as_str) else {
         return false;
     };
@@ -522,10 +586,22 @@ pub fn append_ack_intent(
     message_id: i64,
     failure_stage: &str,
     error_detail: &str,
+    idempotency: Option<&AckIntentIdempotency>,
 ) -> std::io::Result<IntentReceipt> {
+    if idempotency.is_some_and(|claim| !claim.is_valid()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid acknowledgement idempotency claim",
+        ));
+    }
     let created_ts = mcp_agent_mail_db::now_micros();
-    let payload = json!({
-        "schema_version": ACK_INTENT_SCHEMA_VERSION,
+    let schema_version = if idempotency.is_some() {
+        KEYED_ACK_INTENT_SCHEMA_VERSION
+    } else {
+        ACK_INTENT_SCHEMA_VERSION
+    };
+    let mut payload = json!({
+        "schema_version": schema_version,
         "kind": ACK_INTENT_KIND,
         "created_ts": created_ts,
         "project_key": project_key,
@@ -536,19 +612,14 @@ pub fn append_ack_intent(
             "error_detail": error_detail,
         },
     });
+    if let Some(claim) = idempotency {
+        payload["idempotency"] = json!(claim);
+    }
     let content_sha256 = hash_json_value(&payload);
     let intent_id = content_sha256.chars().take(16).collect::<String>();
-    let record = json!({
-        "schema_version": ACK_INTENT_SCHEMA_VERSION,
-        "kind": ACK_INTENT_KIND,
-        "intent_id": intent_id,
-        "content_sha256": content_sha256,
-        "created_ts": created_ts,
-        "project_key": project_key,
-        "agent_name": agent_name,
-        "message_id": message_id,
-        "failure": payload["failure"].clone(),
-    });
+    let mut record = payload;
+    record["intent_id"] = json!(intent_id);
+    record["content_sha256"] = json!(content_sha256);
     let intent_path = append_jsonl(config, ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE, &record)?;
     Ok(IntentReceipt {
         intent_id,
@@ -622,6 +693,10 @@ pub fn read_queued_ack_intents(config: &Config) -> std::io::Result<Vec<QueuedAck
                 }
             }
             Some(ACK_INTENT_KIND) => {
+                if !ack_intent_has_supported_schema(&value) {
+                    tracing::warn!("skipping ack intent with unsupported schema or retry claim");
+                    continue;
+                }
                 if !record_has_valid_intent_hash(&value, ack_intent_hash_payload) {
                     tracing::warn!("skipping ack intent with invalid content hash");
                     continue;
@@ -753,6 +828,7 @@ mod tests {
             42,
             "acknowledge_message",
             "database disk image is malformed",
+            None,
         )
         .expect("append ack intent");
         assert_eq!(receipt.intent_id.len(), 16);
@@ -765,6 +841,142 @@ mod tests {
         assert_eq!(queued[0].agent_name, "BlueLake");
         assert_eq!(queued[0].failure.stage, "acknowledge_message");
         assert_eq!(queued[0].intent_id, receipt.intent_id);
+        assert_eq!(queued[0].schema_version, 1);
+        assert_eq!(queued[0].idempotency, None);
+        let record: Value = serde_json::from_slice(
+            &std::fs::read(&receipt.intent_path).expect("original journal bytes"),
+        )
+        .expect("legacy record");
+        assert!(record.get("idempotency").is_none());
+        assert_eq!(
+            receipt.content_sha256,
+            hash_json_value(&json!({
+                "schema_version": 1,
+                "kind": ACK_INTENT_KIND,
+                "created_ts": queued[0].created_ts,
+                "project_key": "/abs/project",
+                "agent_name": "BlueLake",
+                "message_id": 42,
+                "failure": {
+                    "stage": "acknowledge_message",
+                    "error_detail": "database disk image is malformed",
+                },
+            })),
+            "unkeyed hashes must preserve the original on-disk contract"
+        );
+    }
+
+    #[test]
+    fn keyed_ack_intent_binds_claim_and_redacts_diagnostics() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tmp.path());
+        let claim = AckIntentIdempotency {
+            key: "private-ack-retry-token".to_string(),
+            fingerprint: "a".repeat(64),
+        };
+        let receipt = append_ack_intent(&config, "/p", "BlueLake", 42, "ack", "busy", Some(&claim))
+            .expect("keyed intent");
+        let queued = read_queued_ack_intents(&config).expect("read keyed intent");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].schema_version, KEYED_ACK_INTENT_SCHEMA_VERSION);
+        assert_eq!(queued[0].idempotency.as_ref(), Some(&claim));
+        assert!(!format!("{:?}", queued[0]).contains(&claim.key));
+        assert!(
+            serde_json::to_value(&queued[0])
+                .unwrap()
+                .get("idempotency")
+                .is_none()
+        );
+
+        let record: Value = serde_json::from_slice(
+            &std::fs::read(&receipt.intent_path).expect("private journal bytes"),
+        )
+        .expect("journal JSON");
+        assert_eq!(record["idempotency"]["key"], claim.key);
+        let mut legacy_payload = ack_intent_hash_payload(&record);
+        legacy_payload
+            .as_object_mut()
+            .unwrap()
+            .remove("idempotency");
+        assert_ne!(
+            hash_json_value(&legacy_payload),
+            receipt.content_sha256,
+            "a legacy reader must reject a keyed intent rather than replay it unkeyed"
+        );
+        for field in ["key", "fingerprint"] {
+            let mut tampered = record.clone();
+            tampered["idempotency"][field] = json!("b".repeat(64));
+            append_jsonl(
+                &config,
+                ACK_INTENT_LOG_FILE,
+                ACK_INTENT_LOCK_FILE,
+                &tampered,
+            )
+            .expect("tampered fixture");
+        }
+        assert_eq!(read_queued_ack_intents(&config).unwrap(), queued);
+    }
+
+    #[test]
+    fn ack_intent_reader_rejects_partial_claims_downgrades_and_unknown_schemas() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tmp.path());
+        let valid_claim = json!({"key": "private-retry-key", "fingerprint": "a".repeat(64)});
+        for (version, claim) in [
+            (1, Some(valid_claim.clone())),
+            (2, None),
+            (2, Some(Value::Null)),
+            (2, Some(json!({"key": "partial-claim"}))),
+            (2, Some(json!({"fingerprint": "a".repeat(64)}))),
+            (2, Some(json!({"key": " ", "fingerprint": "a".repeat(64)}))),
+            (2, Some(json!({"key": "key", "fingerprint": "invalid"}))),
+            (3, Some(valid_claim)),
+        ] {
+            let mut record = json!({
+                "schema_version": version,
+                "kind": ACK_INTENT_KIND,
+                "created_ts": 1,
+                "project_key": "/p",
+                "agent_name": "BlueLake",
+                "message_id": 42,
+                "failure": { "stage": "ack", "error_detail": "busy" },
+            });
+            if let Some(claim) = claim {
+                record["idempotency"] = claim;
+            }
+            let hash = hash_json_value(&ack_intent_hash_payload(&record));
+            record["intent_id"] = json!(&hash[..16]);
+            record["content_sha256"] = json!(hash);
+            append_jsonl(&config, ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE, &record)
+                .expect("unsupported record fixture");
+        }
+        assert!(read_queued_ack_intents(&config).unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_ack_idempotency_claim_is_not_queued() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tmp.path());
+        for (key, fingerprint) in [
+            (String::new(), "a".repeat(64)),
+            (" key ".to_string(), "a".repeat(64)),
+            (
+                "k".repeat(crate::idempotency::MAX_IDEMPOTENCY_KEY_LEN + 1),
+                "a".repeat(64),
+            ),
+            ("key".to_string(), "not-a-fingerprint".to_string()),
+        ] {
+            let claim = AckIntentIdempotency { key, fingerprint };
+            let error =
+                append_ack_intent(&config, "/p", "BlueLake", 42, "ack", "busy", Some(&claim))
+                    .expect_err("invalid retry claim");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "invalid acknowledgement idempotency claim"
+            );
+        }
+        assert!(!log_path(&config, ACK_INTENT_LOG_FILE).exists());
     }
 
     #[test]
@@ -779,6 +991,7 @@ mod tests {
             1,
             "acknowledge_message",
             "database disk image is malformed",
+            None,
         )
         .expect("append intent 1");
 
@@ -801,6 +1014,7 @@ mod tests {
             2,
             "acknowledge_message",
             "database disk image is malformed",
+            None,
         )
         .expect("append intent 2");
 
@@ -825,6 +1039,7 @@ mod tests {
             7,
             "resolve_agent",
             "pool exhausted",
+            None,
         )
         .expect("append");
         assert_eq!(read_queued_ack_intents(&config).expect("read").len(), 1);
@@ -847,9 +1062,16 @@ mod tests {
     fn failed_replay_marker_keeps_intent_outstanding() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config = test_config(tmp.path());
-        let receipt =
-            append_ack_intent(&config, "/p", "RedPeak", 3, "release_reservations", "busy")
-                .expect("append");
+        let receipt = append_ack_intent(
+            &config,
+            "/p",
+            "RedPeak",
+            3,
+            "release_reservations",
+            "busy",
+            None,
+        )
+        .expect("append");
         append_ack_replay_record(
             &config,
             &receipt.intent_id,
@@ -868,8 +1090,16 @@ mod tests {
     fn abandoned_replay_marker_clears_intent() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config = test_config(tmp.path());
-        let receipt = append_ack_intent(&config, "/p", "RedPeak", 99, "acknowledge_message", "x")
-            .expect("append");
+        let receipt = append_ack_intent(
+            &config,
+            "/p",
+            "RedPeak",
+            99,
+            "acknowledge_message",
+            "x",
+            None,
+        )
+        .expect("append");
         append_ack_replay_record(
             &config,
             &receipt.intent_id,
@@ -926,7 +1156,7 @@ mod tests {
     fn duplicate_ack_intent_dedupes_by_content_hash() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config = test_config(tmp.path());
-        let receipt = append_ack_intent(&config, "/p", "A", 1, "stage", "e").expect("append");
+        let receipt = append_ack_intent(&config, "/p", "A", 1, "stage", "e", None).expect("append");
         let original = std::fs::read(&receipt.intent_path).unwrap();
         let record: Value = serde_json::from_slice(&original).unwrap();
         append_jsonl(&config, ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE, &record).unwrap();
@@ -939,8 +1169,8 @@ mod tests {
     fn distinct_ack_intents_preserve_append_order() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config = test_config(tmp.path());
-        let r1 = append_ack_intent(&config, "/p", "A", 1, "stage", "e").expect("append");
-        let r2 = append_ack_intent(&config, "/p", "A", 2, "stage", "e").expect("append");
+        let r1 = append_ack_intent(&config, "/p", "A", 1, "stage", "e", None).expect("append");
+        let r2 = append_ack_intent(&config, "/p", "A", 2, "stage", "e", None).expect("append");
         assert_ne!(r1.intent_id, r2.intent_id);
         let queued = read_queued_ack_intents(&config).unwrap();
         assert_eq!(queued.len(), 2);
@@ -1147,10 +1377,10 @@ mod tests {
     fn torn_utf8_does_not_disable_ack_recovery_or_terminal_markers() {
         let tmp = tempfile::tempdir().unwrap();
         let config = test_config(tmp.path());
-        let first = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").unwrap();
+        let first = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy", None).unwrap();
         append_torn_unicode(&first.intent_path);
         assert!(std::fs::read_to_string(&first.intent_path).is_err());
-        append_ack_intent(&config, "/p", "BlueLake", 2, "ack", "busy").unwrap();
+        append_ack_intent(&config, "/p", "BlueLake", 2, "ack", "busy", None).unwrap();
         let queued = read_queued_ack_intents(&config).unwrap();
         assert_eq!(
             queued
@@ -1353,17 +1583,18 @@ mod tests {
     fn contended_append_times_out_without_record_and_retry_recovers() {
         let tmp = tempfile::tempdir().unwrap();
         let config = test_config(tmp.path());
-        let first = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").unwrap();
+        let first = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy", None).unwrap();
         let before = std::fs::read(&first.intent_path).unwrap();
         let held = open_test_lock(&config);
         fs2::FileExt::lock_exclusive(&held).unwrap();
         let started = Instant::now();
-        let error = append_ack_intent(&config, "/p", "BlueLake", 2, "ack", "busy").unwrap_err();
+        let error =
+            append_ack_intent(&config, "/p", "BlueLake", 2, "ack", "busy", None).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(std::fs::read(&first.intent_path).unwrap(), before);
         drop(held);
-        append_ack_intent(&config, "/p", "BlueLake", 2, "ack", "busy").unwrap();
+        append_ack_intent(&config, "/p", "BlueLake", 2, "ack", "busy", None).unwrap();
         let queued = read_queued_ack_intents(&config).unwrap();
         assert_eq!(
             queued
@@ -1378,7 +1609,7 @@ mod tests {
     fn replay_marker_contention_does_not_clear_pending_intent() {
         let tmp = tempfile::tempdir().unwrap();
         let config = test_config(tmp.path());
-        let receipt = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").unwrap();
+        let receipt = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy", None).unwrap();
         let before = std::fs::read(&receipt.intent_path).unwrap();
         let held = open_test_lock(&config);
         fs2::FileExt::lock_exclusive(&held).unwrap();
@@ -1500,7 +1731,7 @@ mod tests {
     fn ack_replay_marker_before_intent_still_clears_it() {
         let tmp = tempfile::tempdir().unwrap();
         let config = test_config(tmp.path());
-        let receipt = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").unwrap();
+        let receipt = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy", None).unwrap();
         append_ack_replay_record(
             &config,
             &receipt.intent_id,
@@ -1531,7 +1762,7 @@ mod tests {
     fn valid_marker_for_different_full_hash_does_not_clear_intent() {
         let tmp = tempfile::tempdir().unwrap();
         let config = test_config(tmp.path());
-        let receipt = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").unwrap();
+        let receipt = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy", None).unwrap();
         let mut other_hash = receipt.content_sha256.clone();
         let replacement = if other_hash.ends_with('0') { "1" } else { "0" };
         other_hash.replace_range(63..64, replacement);
@@ -1552,7 +1783,7 @@ mod tests {
     fn malformed_terminal_marker_cannot_discard_pending_payload() {
         let tmp = tempfile::tempdir().unwrap();
         let config = test_config(tmp.path());
-        let receipt = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").unwrap();
+        let receipt = append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy", None).unwrap();
         append_jsonl(
             &config,
             ACK_INTENT_LOG_FILE,
@@ -1581,7 +1812,7 @@ mod tests {
         let source = tmp.path().join("source-evidence");
         std::fs::write(&source, b"preserved evidence").unwrap();
         std::fs::hard_link(&source, &path).unwrap();
-        assert!(append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").is_err());
+        assert!(append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy", None).is_err());
         assert_eq!(std::fs::read(&source).unwrap(), b"preserved evidence");
         assert!(read_queued_ack_intents(&config).is_err());
     }
@@ -1595,7 +1826,7 @@ mod tests {
         let source = tmp.path().join("source-evidence");
         std::fs::write(&source, b"preserved lock evidence").unwrap();
         std::fs::hard_link(&source, &path).unwrap();
-        assert!(append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").is_err());
+        assert!(append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy", None).is_err());
         assert_eq!(std::fs::read(&source).unwrap(), b"preserved lock evidence");
         assert!(!log_path(&config, ACK_INTENT_LOG_FILE).exists());
     }
@@ -1627,7 +1858,7 @@ mod tests {
             let source = tmp.path().join("source-evidence");
             std::fs::write(&source, b"unchanged").unwrap();
             std::os::unix::fs::symlink(&source, &path).unwrap();
-            assert!(append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy").is_err());
+            assert!(append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy", None).is_err());
             assert_eq!(std::fs::read(&source).unwrap(), b"unchanged");
         }
     }

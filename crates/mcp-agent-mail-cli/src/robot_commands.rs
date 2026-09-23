@@ -16621,6 +16621,10 @@ mod tests {
         assert!(build_queued_intents_for_config(&config).is_empty());
 
         // Queue an ack intent through the real durable-intent writer.
+        let idempotency = mcp_agent_mail_tools::degraded_intents::AckIntentIdempotency {
+            key: "private-queued-ack-retry-key".to_string(),
+            fingerprint: "a".repeat(64),
+        };
         mcp_agent_mail_tools::degraded_intents::append_ack_intent(
             &config,
             "/abs/project",
@@ -16628,6 +16632,7 @@ mod tests {
             1234,
             "acknowledge_message",
             "database disk image is malformed",
+            Some(&idempotency),
         )
         .expect("append ack intent");
 
@@ -16642,6 +16647,12 @@ mod tests {
         .expect("write pending send");
 
         let intents = build_queued_intents_for_config(&config);
+        assert!(
+            !serde_json::to_string(&intents)
+                .expect("robot summaries")
+                .contains(&idempotency.key),
+            "robot summaries must not expose the stored acknowledgement retry key"
+        );
         assert_eq!(
             intents.len(),
             2,
