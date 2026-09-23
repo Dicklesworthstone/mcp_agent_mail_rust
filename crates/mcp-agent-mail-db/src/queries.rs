@@ -13999,8 +13999,10 @@ pub fn release_reservations<'a>(
 }
 
 /// Release reservations that belonged to the request's scope at its creation
-/// cutoff. Degraded release replay supplies the durable intent timestamp so an
-/// old release-all or path filter cannot release leases acquired afterward.
+/// cutoff.
+///
+/// Degraded release replay supplies the durable intent timestamp so an old
+/// release-all or path filter cannot release leases acquired afterward.
 ///
 /// The final write transaction rechecks the owner and cutoff: candidate IDs
 /// selected before a concurrent replacement are never sufficient authority.

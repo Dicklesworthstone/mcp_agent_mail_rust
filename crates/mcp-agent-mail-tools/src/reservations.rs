@@ -3518,8 +3518,8 @@ mod tests {
     fn grant_peer_after_precheck(cx: &Cx, project_id: i64, peer_id: i64, path: &'static str) {
         let config = Config::get();
         let peer_pool = DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
-            database_url: config.database_url.clone(),
-            storage_root: Some(config.storage_root.clone()),
+            database_url: config.database_url,
+            storage_root: Some(config.storage_root),
             run_migrations: false,
             ..Default::default()
         })
@@ -3563,7 +3563,7 @@ mod tests {
                 .await;
                 assert_eq!(first["granted"], json!([]));
                 assert_eq!(first["conflicts"][0]["holders"][0]["agent"], peer.name);
-                assert!(AFTER_RESERVATION_PRECHECK.with_borrow(|hook| hook.is_none()));
+                assert!(AFTER_RESERVATION_PRECHECK.with_borrow(Option::is_none));
 
                 let config = Config::get();
                 let conn = mcp_agent_mail_db::DbConn::open_file(
@@ -3646,9 +3646,9 @@ mod tests {
                 let winner_cx = cx.clone();
                 AFTER_RESERVATION_CONFLICT.with_borrow_mut(|hook| {
                     *hook = Some(Box::pin(async move {
-                        let winner_ctx = McpContext::new(winner_cx, 2);
+                        let request_context = McpContext::new(winner_cx, 2);
                         release_file_reservations(
-                            &winner_ctx,
+                            &request_context,
                             winner_project.clone(),
                             peer.name,
                             None,
@@ -3658,7 +3658,7 @@ mod tests {
                         .expect("release peer before the competing same-key request");
                         let winner: Value = serde_json::from_str(
                             &file_reservation_paths(
-                                &winner_ctx,
+                                &request_context,
                                 winner_project,
                                 winner_name,
                                 vec!["src/raced.rs".to_string()],
@@ -3694,7 +3694,7 @@ mod tests {
                     .expect("winner witness")
                     .take()
                     .expect("real competing request executed");
-                assert!(AFTER_RESERVATION_CONFLICT.with_borrow(|hook| hook.is_none()));
+                assert!(AFTER_RESERVATION_CONFLICT.with_borrow(Option::is_none));
                 if change_ttl {
                     let error =
                         result.expect_err("changed-payload winner must reject this request");

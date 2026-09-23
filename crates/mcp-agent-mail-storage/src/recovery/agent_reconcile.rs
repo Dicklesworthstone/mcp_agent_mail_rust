@@ -766,7 +766,7 @@ mod tests {
             )
             .unwrap();
             let reconstructed =
-                mcp_agent_mail_db::DbConn::open_file(&retired_copy.to_string_lossy()).unwrap();
+                mcp_agent_mail_db::DbConn::open_file(retired_copy.to_string_lossy()).unwrap();
             let rows = reconstructed
                 .query_sync(
                     "SELECT retired_at, reaper_exempt FROM agents WHERE name = 'BlueLake'",
@@ -807,7 +807,7 @@ mod tests {
             )
             .unwrap();
             let reconstructed =
-                mcp_agent_mail_db::DbConn::open_file(&deregistered_copy.to_string_lossy()).unwrap();
+                mcp_agent_mail_db::DbConn::open_file(deregistered_copy.to_string_lossy()).unwrap();
             let rows = reconstructed.query_sync("SELECT d.deregistered_at FROM agent_deregistrations d JOIN agents a ON a.id = d.agent_id WHERE a.name = 'BlueLake'", &[]).unwrap();
             assert_eq!(
                 rows[0].get_named::<i64>("deregistered_at").unwrap(),
