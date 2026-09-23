@@ -14664,7 +14664,6 @@ pub async fn renew_reservations(
     paths: Option<&[&str]>,
     reservation_ids: Option<&[i64]>,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
-    let now = now_micros();
     let extend = extend_seconds.saturating_mul(1_000_000);
 
     // Retry the whole read-modify-write with an attempt-local connection.
@@ -14678,8 +14677,12 @@ pub async fn renew_reservations(
 
     let tracked = tracked(&*conn);
 
-    // Partial renewals cannot occur if the process crashes or is cancelled.
-        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    // Serialize admission with fresh grants and releases. A renewal queued
+    // behind checkout/writer contention must not revive a lease that expired
+    // while another holder acquired the path. Each retry gets a fresh cutoff
+    // only after admission, just like create_file_reservations.
+        try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+        let now = now_micros();
 
         // Fetch candidate reservations first (so tools can report old/new expiry).
         let mut sql = format!(
@@ -14754,8 +14757,19 @@ pub async fn renew_reservations(
             }
         };
 
+        let update_sql = format!(
+            "UPDATE file_reservations SET expires_ts = ? \
+             WHERE id = ? AND project_id = ? AND agent_id = ? \
+               AND expires_ts = ? AND expires_ts > ? AND ({ACTIVE_RESERVATION_PREDICATE})"
+        );
+        let verify_sql = format!(
+            "SELECT expires_ts FROM file_reservations \
+             WHERE id = ? AND project_id = ? AND agent_id = ? \
+               AND ({ACTIVE_RESERVATION_PREDICATE})"
+        );
         for row in &mut reservations {
-            let base = row.expires_ts.max(now);
+            let old_expires = row.expires_ts;
+            let base = old_expires.max(now);
             row.expires_ts = base.saturating_add(extend);
             let Some(id) = row.id else {
                 rollback_tx(cx, &tracked).await;
@@ -14764,13 +14778,37 @@ pub async fn renew_reservations(
                 ));
             };
 
-            let sql = "UPDATE file_reservations SET expires_ts = ? WHERE id = ?";
-            let params = [Value::BigInt(row.expires_ts), Value::BigInt(id)];
+            let params = [
+                Value::BigInt(row.expires_ts),
+                Value::BigInt(id),
+                Value::BigInt(project_id),
+                Value::BigInt(agent_id),
+                Value::BigInt(old_expires),
+                Value::BigInt(now),
+            ];
             try_in_tx!(
                 cx,
                 &tracked,
-                map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+                map_sql_outcome(traw_execute(cx, &tracked, &update_sql, &params).await)
             );
+            // The backend can under-report rows_affected. Require the actual
+            // stored expiry before returning a successful renewal to archive.
+            let stored = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(
+                    cx,
+                    &tracked,
+                    &verify_sql,
+                    &[Value::BigInt(id), Value::BigInt(project_id), Value::BigInt(agent_id)],
+                ).await)
+            );
+            if stored.first().and_then(row_first_i64) != Some(row.expires_ts) {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "renew_reservations: eligible lease expiry was not stored".to_string(),
+                ));
+            }
         }
 
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
@@ -27223,6 +27261,183 @@ mod tests {
             assert_eq!(active[0].id, Some(reservation_id));
             assert!(active[0].released_ts.is_none());
             assert_eq!(active[0].expires_ts, original_expires.saturating_sub(1));
+        });
+    }
+
+    #[test]
+    fn renew_reservations_does_not_revive_expired_lease_after_pool_wait() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (_cx, pool, _dir) = setup_test_pool("renew-after-pool-wait.db");
+        let competing_pool = DbPool::new(&crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", pool.sqlite_path()),
+            storage_root: Some(pool.storage_root().to_path_buf()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("independent pool for competing holder");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let project = ensure_project(&cx, &pool, "/tmp/renew-after-pool-wait")
+                .await
+                .into_result()
+                .expect("project");
+            let project_id = project.id.expect("project id");
+            let holder = register_agent(
+                &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("holder");
+            let competitor = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "test",
+                "test",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("competing holder");
+            let holder_id = holder.id.expect("holder id");
+            let competitor_id = competitor.id.expect("competitor id");
+            let original = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                holder_id,
+                &["src/raced.rs"],
+                3600,
+                true,
+                "old lease",
+            )
+            .await
+            .into_result()
+            .expect("initial grant");
+            let old_id = original[0].id.expect("old reservation id");
+            // Initialize the independent pool before forcing the interleaving.
+            drop(
+                competing_pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("competing connection"),
+            );
+
+            let held = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("hold sole checkout");
+            let ids = [old_id];
+            let paths = ["src/raced.rs"];
+            let mut renewal = std::pin::pin!(renew_reservations(
+                &cx,
+                &pool,
+                project_id,
+                holder_id,
+                600,
+                Some(&paths),
+                Some(&ids),
+            ));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(
+                matches!(renewal.as_mut().poll(&mut context), Poll::Pending),
+                "renewal must wait behind the held checkout"
+            );
+
+            // The old implementation has already sampled `now` at this point.
+            // Move expiry just after that poll without sleeping, then make a
+            // real competing grant before allowing the renewal to proceed.
+            let expired_at = now_micros().saturating_add(1);
+            held.execute_sync(
+                "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
+                &[Value::BigInt(expired_at), Value::BigInt(old_id)],
+            )
+            .expect("lease expires during checkout wait");
+            let granted = asupersync::time::timeout(
+                cx.now(),
+                std::time::Duration::from_secs(5),
+                create_file_reservations(
+                    &cx,
+                    &competing_pool,
+                    project_id,
+                    competitor_id,
+                    &["src/raced.rs"],
+                    3600,
+                    true,
+                    "new holder after expiry",
+                ),
+            )
+            .await
+            .expect("competing grant watchdog")
+            .into_result()
+            .expect("competing grant succeeds after expiry");
+            assert_eq!(granted.len(), 1);
+            assert!(granted[0].created_ts > expired_at);
+            drop(held);
+
+            let renewed =
+                asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(5), renewal)
+                    .await
+                    .expect("pending renewal watchdog")
+                    .into_result()
+                    .expect("stale renewal safely completes");
+            assert!(
+                renewed.is_empty(),
+                "expired work must not become a second exclusive holder"
+            );
+            let active = get_active_reservations(&cx, &competing_pool, project_id)
+                .await
+                .into_result()
+                .expect("current exclusive ownership");
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].id, granted[0].id);
+            assert_eq!(active[0].agent_id, competitor_id);
+
+            // Live same-row renewal still extends from its original expiry,
+            // preserving the reservation identity and creation timestamp.
+            let current_ids = [granted[0].id.expect("current reservation id")];
+            let current = renew_reservations(
+                &cx,
+                &competing_pool,
+                project_id,
+                competitor_id,
+                600,
+                Some(&paths),
+                Some(&current_ids),
+            )
+            .await
+            .into_result()
+            .expect("live holder renewal");
+            assert_eq!(current.len(), 1);
+            assert_eq!(current[0].id, granted[0].id);
+            assert_eq!(current[0].created_ts, granted[0].created_ts);
+            assert_eq!(current[0].expires_ts, granted[0].expires_ts + 600_000_000);
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("old row unchanged");
+            let old = conn
+                .query_sync(
+                    "SELECT created_ts, expires_ts FROM file_reservations WHERE id = ?",
+                    &[Value::BigInt(old_id)],
+                )
+                .expect("read expired reservation");
+            assert_eq!(old[0].get_as::<i64>(0).unwrap(), original[0].created_ts);
+            assert_eq!(old[0].get_as::<i64>(1).unwrap(), expired_at);
         });
     }
 

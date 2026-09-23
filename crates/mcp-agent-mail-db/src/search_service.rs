@@ -9028,7 +9028,7 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Release);
         assert!(bridge.search(&query, 8).is_empty());
         assert!(bridge.enqueue_document(7002, SearchDocKind::Message, Some(77), "new", "body"));
-        assert_eq!(bridge.refresh_worker.run_cycle(), 1);
+        assert_eq!(bridge.runner.process_batch().unwrap().retryable, 1);
         assert_eq!(bridge.metrics_snapshot().total_succeeded, 1);
         assert_eq!(bridge.metrics_snapshot().total_retryable, 1);
         assert_eq!(bridge.index().len(), 1);
@@ -9051,7 +9051,7 @@ mod tests {
                 worker.join().unwrap();
             }
             assert!(bridge.enqueue_document(7003, SearchDocKind::Message, Some(77), "new", "body"));
-            assert_eq!(bridge.refresh_worker.run_cycle(), 1);
+            assert_eq!(bridge.runner.process_batch().unwrap().retryable, 1);
             assert_eq!(bridge.metrics_snapshot().total_succeeded, 0);
             assert_eq!(bridge.metrics_snapshot().total_retryable, 1);
             assert_eq!(bridge.index().bound_model_id(), None);
