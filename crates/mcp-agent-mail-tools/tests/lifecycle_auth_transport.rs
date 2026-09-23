@@ -102,6 +102,43 @@ fn opt(value: Option<&str>) -> Option<String> {
     value.map(str::to_string)
 }
 
+async fn assert_lifecycle_discovery(ctx: &McpContext, project_key: &str, name: &str, state: &str) {
+    let directory: Value = serde_json::from_str(
+        &mcp_agent_mail_tools::agents_list(ctx, project_key.to_string())
+            .await
+            .expect("agent directory resource"),
+    )
+    .expect("agent directory JSON");
+    let project: Value = serde_json::from_str(
+        &mcp_agent_mail_tools::project_details(ctx, project_key.to_string())
+            .await
+            .expect("project discovery resource"),
+    )
+    .expect("project resource JSON");
+    let tool_roster: Value = serde_json::from_str(
+        &mcp_agent_mail_tools::list_agents(ctx, project_key.to_string(), None, None)
+            .await
+            .expect("agent discovery tool"),
+    )
+    .expect("agent tool JSON");
+    let contains = |rows: &Value| {
+        rows.as_array()
+            .expect("agent rows")
+            .iter()
+            .any(|agent| agent["name"] == name)
+    };
+    assert_eq!(contains(&directory["agents"]), state == "active");
+    assert_eq!(contains(&directory["retired_agents"]), state == "retired");
+    assert_eq!(contains(&project["agents"]), state == "active");
+    assert_eq!(contains(&tool_roster), state == "active");
+    for payload in [&directory, &project, &tool_roster] {
+        assert!(
+            !payload.to_string().contains("registration_token"),
+            "discovery must not disclose registration credentials"
+        );
+    }
+}
+
 #[test]
 fn http_pane_context_without_token_is_refused_with_guidance() {
     run_with_fresh_state(|cx, project_key| async move {
@@ -167,6 +204,7 @@ fn http_with_valid_token_is_allowed_for_every_lifecycle_tool() {
             .await
             .expect("ensure_project");
         let token = register(&ctx, &project_key, "GreenCastle").await;
+        assert_lifecycle_discovery(&ctx, &project_key, "GreenCastle", "active").await;
 
         let retired = retire_agent(
             &ctx,
@@ -181,6 +219,7 @@ fn http_with_valid_token_is_allowed_for_every_lifecycle_tool() {
         .expect("HTTP retire with the token");
         let retired: Value = serde_json::from_str(&retired).expect("retire JSON");
         assert_eq!(retired["status"], "retired");
+        assert_lifecycle_discovery(&ctx, &project_key, "GreenCastle", "retired").await;
 
         let active = unretire_agent(
             &ctx,
@@ -195,6 +234,7 @@ fn http_with_valid_token_is_allowed_for_every_lifecycle_tool() {
         .expect("HTTP unretire with the token");
         let active: Value = serde_json::from_str(&active).expect("unretire JSON");
         assert_eq!(active["status"], "active");
+        assert_lifecycle_discovery(&ctx, &project_key, "GreenCastle", "active").await;
 
         let gone = deregister_agent(
             &ctx,
@@ -209,6 +249,7 @@ fn http_with_valid_token_is_allowed_for_every_lifecycle_tool() {
         .expect("HTTP deregister with the token");
         let gone: Value = serde_json::from_str(&gone).expect("deregister JSON");
         assert_eq!(gone["status"], "deregistered");
+        assert_lifecycle_discovery(&ctx, &project_key, "GreenCastle", "deregistered").await;
     });
 }
 

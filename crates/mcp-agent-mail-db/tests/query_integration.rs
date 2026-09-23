@@ -224,6 +224,112 @@ fn send_msg(
 }
 
 #[test]
+fn agent_discovery_roster_preserves_canonical_lifecycle_with_legacy_aliases() {
+    let (pool, _dir) = make_pool();
+    let project_id = setup_project(&pool);
+    let active_id = setup_agent(&pool, project_id, "BlueLake");
+    let retired_id = setup_agent(&pool, project_id, "GreenCastle");
+    let deregistered_id = setup_agent(&pool, project_id, "RedStone");
+    let foreign_project = setup_project(&pool);
+    let foreign_id = setup_agent(&pool, foreign_project, "GreenCastle");
+
+    block_on(|cx| async move {
+        let now = mcp_agent_mail_db::now_micros();
+        queries::set_agent_retired_at(&cx, &pool, retired_id, Some(now))
+            .await
+            .into_result()
+            .expect("retire canonical identity");
+        queries::deregister_agent(&cx, &pool, deregistered_id, now)
+            .await
+            .into_result()
+            .expect("deregister canonical identity");
+        {
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("legacy fixture connection");
+            // Imported databases may predate the case-insensitive uniqueness
+            // guard. A newer active alias must not change the routing identity.
+            conn.execute_raw("DROP INDEX IF EXISTS idx_agents_project_name_nocase")
+                .expect("represent pre-guard legacy schema");
+            for name in ["bluelake", "greencastle", "redstone"] {
+                conn.execute_sync(
+                    "INSERT INTO agents (project_id, name, program, model, task_description, \
+                     inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt) \
+                     VALUES (?, ?, 'legacy-alias', 'alias-model', '', ?, ?, 'auto', 'auto', 0)",
+                    &[
+                        Value::BigInt(project_id),
+                        Value::Text(name.to_string()),
+                        Value::BigInt(now.saturating_add(1)),
+                        Value::BigInt(now.saturating_add(1)),
+                    ],
+                )
+                .expect("insert newer active case alias");
+            }
+        }
+
+        let roster = queries::list_agent_roster(&cx, &pool, project_id)
+            .await
+            .into_result()
+            .expect("load canonical roster");
+        assert_eq!(roster.len(), 2);
+        assert!(
+            roster
+                .iter()
+                .any(|agent| agent.id == Some(active_id) && agent.retired_at.is_none())
+        );
+        assert!(
+            roster
+                .iter()
+                .any(|agent| agent.id == Some(retired_id) && agent.retired_at == Some(now))
+        );
+        for agent in &roster {
+            let routed = queries::get_agent(&cx, &pool, project_id, &agent.name)
+                .await
+                .into_result()
+                .expect("resolve advertised name");
+            assert_eq!(agent.id, routed.id);
+        }
+        assert!(
+            roster
+                .iter()
+                .all(|agent| !agent.name.eq_ignore_ascii_case("RedStone"))
+        );
+        let foreign_roster = queries::list_agent_roster(&cx, &pool, foreign_project)
+            .await
+            .into_result()
+            .expect("load independent project roster");
+        assert_eq!(foreign_roster.len(), 1);
+        assert_eq!(foreign_roster[0].id, Some(foreign_id));
+
+        queries::set_agent_retired_at(&cx, &pool, retired_id, None)
+            .await
+            .into_result()
+            .expect("reactivate canonical identity");
+        let restored = queries::list_agent_roster(&cx, &pool, project_id)
+            .await
+            .into_result()
+            .expect("load restored roster");
+        assert!(
+            restored
+                .iter()
+                .any(|agent| agent.id == Some(retired_id) && agent.retired_at.is_none())
+        );
+        queries::deregister_agent(&cx, &pool, retired_id, now.saturating_add(2))
+            .await
+            .into_result()
+            .expect("permanently remove canonical identity");
+        let final_roster = queries::list_agent_roster(&cx, &pool, project_id)
+            .await
+            .into_result()
+            .expect("load final roster");
+        assert_eq!(final_roster.len(), 1);
+        assert_eq!(final_roster[0].id, Some(active_id));
+    });
+}
+
+#[test]
 fn agent_lifecycle_preserves_history_and_gates_routing_atomically() {
     let (pool, _dir) = make_pool();
     let project_id = setup_project(&pool);

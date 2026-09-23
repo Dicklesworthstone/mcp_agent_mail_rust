@@ -6332,6 +6332,62 @@ pub async fn list_agents(
     list_agents_bounded(cx, pool, project_id, None, None).await
 }
 
+/// List canonical registered identities, including retired agents.
+///
+/// Discovery must resolve case variants exactly like `get_agent`: the first
+/// registered row owns the name even when a newer alias is active. Apply that
+/// identity rule before excluding permanent deregistrations. One statement
+/// observes identity and lifecycle state together; callers may partition the
+/// result into active and retired rosters without a second ledger read.
+pub async fn list_agent_roster(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+) -> Outcome<Vec<AgentRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    // Avoid per-row correlated aggregate/EXISTS fallbacks in the runtime
+    // engine. Canonicalize the ordered project rows in Rust, retaining the
+    // lifecycle ledger value from the same statement as the agent profile.
+    let sql = "SELECT a.id, a.project_id, a.name, a.program, a.model, a.task_description, \
+               a.inception_ts, a.last_active_ts, a.attachments_policy, a.contact_policy, \
+               a.reaper_exempt, a.registration_token, a.retired_at, d.agent_id \
+               FROM agents a LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
+               WHERE a.project_id = ? ORDER BY a.id ASC";
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &[Value::BigInt(project_id)]).await) {
+        Outcome::Ok(rows) => {
+            let mut seen_names = HashSet::new();
+            let mut agents: Vec<_> = rows
+                .iter()
+                .filter_map(|row| {
+                    let agent = decode_agent_row_indexed(row);
+                    if !seen_names.insert(agent.name.to_ascii_lowercase())
+                        || row.get(13).and_then(value_as_i64).is_some()
+                    {
+                        return None;
+                    }
+                    Some(agent)
+                })
+                .collect();
+            agents.sort_by(|left, right| {
+                right
+                    .last_active_ts
+                    .cmp(&left.last_active_ts)
+                    .then_with(|| right.id.cmp(&left.id))
+            });
+            Outcome::Ok(agents)
+        }
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
 /// Load the bounded, recent agent population needed by the ATC operator.
 ///
 /// This deliberately performs one joined query for the entire mailbox. The

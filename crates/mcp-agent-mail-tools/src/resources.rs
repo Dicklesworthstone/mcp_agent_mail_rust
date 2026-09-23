@@ -889,13 +889,10 @@ pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<Str
 
     let project_id = project.id.unwrap_or(0);
 
-    // List agents in project
+    // Read canonical identity and lifecycle together so discovery agrees with
+    // recipient resolution, including imported case-variant identities.
     let agents = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
-    )?;
-
-    let deregistered_agent_ids = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_deregistered_agent_ids(ctx.cx(), &pool, project_id).await,
+        mcp_agent_mail_db::queries::list_agent_roster(ctx.cx(), &pool, project_id).await,
     )?;
 
     // Get unread counts for all agents in one query
@@ -924,9 +921,6 @@ pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<Str
     let mut retired_agents = Vec::new();
     for agent in agents {
         let agent_id = agent.id.unwrap_or(0);
-        if deregistered_agent_ids.contains(&agent_id) {
-            continue;
-        }
         let retired_at = agent.retired_at.map(micros_to_iso);
         let is_retired = retired_at.is_some();
         let entry = AgentListEntry {
@@ -2621,9 +2615,10 @@ pub async fn project_details(ctx: &McpContext, slug: String) -> McpResult<String
 
     let project_id = project.id.unwrap_or(0);
 
-    // List agents in project
+    // This resource advertises available recipients, so use the same canonical
+    // lifecycle snapshot as the agent directory and omit retired identities.
     let agents = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
+        mcp_agent_mail_db::queries::list_agent_roster(ctx.cx(), &pool, project_id).await,
     )?;
 
     let response = ProjectDetailResponse {
@@ -2633,6 +2628,7 @@ pub async fn project_details(ctx: &McpContext, slug: String) -> McpResult<String
         created_at: Some(micros_to_iso(project.created_at)),
         agents: agents
             .into_iter()
+            .filter(|agent| agent.retired_at.is_none())
             .map(|a| ProjectAgentEntry {
                 id: a.id.unwrap_or(0),
                 name: a.name,
