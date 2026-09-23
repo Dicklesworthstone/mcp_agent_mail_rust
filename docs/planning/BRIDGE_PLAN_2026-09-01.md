@@ -1,6 +1,386 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
-## September 22, 2026 assessment
+## September 23, 2026 assessment (black-box A/B)
+
+**The coordination product is real and its core loop works end to end, but
+neither artifact a user can obtain today is fit for sustained multi-agent use.**
+The shipped v0.3.36 leaks SQLite descriptors until it fails (EMFILE within one
+minute of ordinary mixed load at the default 1,024 limit; the live host daemon
+is at 13.9k and will exhaust its manually raised 32k limit around October 1–2)
+and never repairs archive copies orphaned by a crash. Source HEAD bounds the
+descriptors, but under the same black-box load its archive write-behind drain
+blocked indefinitely while health reported archive lag green. The missing
+piece is not another feature or audit: it is a bounded, black-box, release-mode
+acceptance run between "the fix landed" and "users receive it." Neither defect
+is caught by the default in-process stress suites (HEAD: `stress_pipeline` 9/9);
+only an ignored sustained 100-agent test times out, and it may be the same stall.
+310 commits since v0.3.36 are unreleased.
+
+This section supersedes the September 22 judgment. Unlike the September 21/22
+desk reviews, its central evidence is fresh execution by this assessment:
+the shipped and HEAD binaries driven side by side on the same host through the
+MCP HTTP protocol, as an agent would drive them.
+
+### What was actually run
+
+- **Governing documents:** all of AGENTS.md (1,372 lines), README.md (2,063),
+  VISION.md, the suite-wide rules, and this plan's September 21/22 sections were
+  read in full. Source cut `e7744d7a` (main = master = origin), tree clean apart
+  from untracked `.rch-tmp/`.
+- **Tracker:** local `beads.db` was schema v17 while br 0.6.0 requires v19; the
+  reviewed, reversible `br doctor migrate-schema` (17→19) was applied (undo id
+  `20260923T161910.038668Z-3818208-0`), `br doctor` then reported JSONL/DB in sync
+  at 2,720 records. 43 open + 93 in progress + 12 blocked = **148 unfinished**,
+  2,364 closed, `br dep cycles` empty.
+- **Black-box harness** (session scratchpad, not committed): Python MCP-over-HTTP
+  client doing `initialize` → tools; isolated `HOME`/`STORAGE_ROOT`/`DATABASE_URL`
+  per server; ports 18765 (installed **v0.3.36**, SHA-256 `e6cf98a3…`, identical
+  to the live daemon's executable) and 18766/18767 (**HEAD `e7744d7a` debug build**,
+  SHA-256 prefix `c5922763`). Phases: README coordination flow (27 checks), 16-client
+  send storms (240 sends), SIGKILL mid-storm + restart + read-back of every
+  server-acknowledged id, 10-minute mixed soak (2 senders, 2 inbox readers,
+  search, health) sampling `/proc/<pid>/fd`, and archive convergence observed with
+  no client reads.
+- **Live host (read-only):** MCP `health_check`, `/proc` of the port-8765 owner,
+  timed `am robot`/`am doctor` read verbs, `doctor fix --only … --list`.
+- **Tests:** a full default-feature workspace nextest was attempted twice and is
+  **NO_VERDICT**: the RCH fleet had 3/14 then 0/12 slots (hz3 queue timeout), and
+  the local attempt was stopped by me at 59 GB free (97% disk, shared host) before
+  linking completed. Focused HEAD suites, run per package through nextest in the
+  same private target under a 50 GB free-disk watchdog, are reported below with
+  their exact counts. No release, publication or live repair was performed.
+- **Source moved during the assessment:** origin/main advanced to `e538b0dd`
+  (5 commits, 16:27–16:46 local: agent-discovery routing, late-model search
+  recovery, ACK idempotency across outages, committed-archive proof before
+  retention pruning with `message_reconcile/database.rs` +640 lines, reservation
+  renewal ownership). **No finding here was re-run against them.** The drain wedge
+  (`br-kp1in.13`) must be re-reproduced on the newest main before attribution.
+- **Parallel read-only audits** (four subagents, results spot-checked): documented
+  surface counts, stub/ignored-test scan, 12 open + 6 recently closed GitHub
+  issues against HEAD, and all 39 P0 in-progress beads against code.
+
+### Findings, ranked by user impact
+
+1. **Shipped v0.3.36 exhausts file descriptors (REGRESSED in the field; fixed in
+   source, unreleased).** Isolated 0.3.36 under the mixed soak: `storage.sqlite3`
+   descriptors 277 → 609 → 763 in 60 s; at the 1,024 soft limit (systemd user-unit
+   default, and the installer-generated unit sets no `LimitNOFILE`) the process
+   logged `No file descriptors available` 597×, restarted its HTTP server 257×,
+   failed 58 post-commit durability probes, fell back to archive snapshots for
+   inbox reads, and hit `archive HEAD points at a missing/corrupt object … re-root`
+   66× (`git fsck` afterwards: only dangling trees); the 10-minute soak ended at
+   995 descriptors with 34,960 client-visible errors. Live daemon PID 1685075 (bare `am`,
+   TUI; the supervised `agent-mail.service` has been inactive since September 17):
+   13,835 → 13,886 descriptors on `storage.sqlite3` over 6.08 days of uptime,
+   ≈2,000–2,300/day, soft limit 32,768 (raised by hand after the September 18
+   2,048-limit outage recorded on `br-8r6dl`). **HEAD under the identical soak held
+   2 descriptors throughout.** Owner: `br-8r6dl`; defense in depth: `br-kp1in.17`.
+2. **HEAD's archive write-behind drain wedges under mixed load (NEW, P0, blocks
+   release; `br-kp1in.13`, health verdict `br-kp1in.23`).** HEAD instance with a SIGKILL history: WBQ `drained_total` frozen at
+   414 from about 16:37Z to the end of the session (≥19 minutes, including after
+   load stopped) while `enqueued_total` rose to 3,870 (depth 3,453); no archive
+   commit after 16:36:54 while the DB grew to 3,927 messages against 692 archived;
+   the `wbq-drain` thread sat in `futex_do_wait` with zero CPU ticks over 10 s
+   (blocked, not slow — a debug build cannot explain zero progress). 41
+   `fetch_inbox` dispatches hit the 30 s deadline and became zombies holding
+   admission capacity (zero successful reads in the 10-minute soak);
+   `read-only WAL admission refused pending recovery` ×28.
+   Health stayed `archive_lag: green, oldest_unmaterialized_ms: 0` — the lag
+   contributor does not observe WBQ backlog. Clean-instance reproduction (no crash
+   history): see the reproduction record below.
+3. **Crash orphans are never repaired by the shipped binary (fixed in source,
+   unreleased).** After SIGKILL, 0.3.36's two kill-orphaned messages were never
+   archived (DB 311 / archive 309 at restart; the gap persisted for the ~30 minutes
+   observed, with 23 uncommitted archive files); DB→archive
+   reconciliation (`br-8j6cb`, `0c906599`/`8b631146`) is not in v0.3.36. **Zero
+   acknowledged messages were lost on either binary** (305/305 on 0.3.36, 297/297
+   on HEAD, all ids distinct) and full integrity passed after restart on both.
+4. **Cross-project messaging silently misdelivers (NEW; had no bead, now
+   `br-kp1in.15`).** After a
+   successful cross-project `macro_contact_handshake`, `send_message` from project
+   A to the linked agent's name auto-registered a placeholder `BronzeHare
+   (unknown/unknown)` **in project A**, delivered there, and returned a receipt with
+   `persisted: true`; the real recipient in project B received nothing. The
+   handshake itself drops `welcome_subject/body` for cross-project pairs with only
+   a debug log (`tools/src/macros.rs:765`, "messaging across projects not yet
+   supported"). README's Quick Start shows exactly that handshake and says
+   separate repos can "link agents, then message directly"; the FAQ repeats it.
+   Python never supported this either; the promise is simply unimplemented.
+5. **Write concurrency mode is implicit (NEW; had no bead, now `br-kp1in.16`).** VISION/README say
+   `BEGIN CONCURRENT` is opt-in and off. That is true only for explicit
+   transactions: the pinned engine's autocommit path uses
+   `TransactionMode::Concurrent` whenever `concurrent_mode_default` is true, which
+   is its default (`fsqlite-core/src/connection.rs:14649, 56669` at `db458bfb`), and
+   the runtime never sets `PRAGMA fsqlite.concurrent_mode = OFF` (only two tests
+   do). HEAD logged `MVCC write conflict … snapshot conflict on pages` under a
+   16-client storm. `pool.rs:2618` still cites "≥10 concurrent autocommit writers
+   UNSUPPORTED (bd-9inpb)" while the engine's own test says the bd-9inpb fix
+   landed. The effective mode for the durability claim must be decided and pinned.
+6. **HEAD admission/latency under writers is unqualified.** 2 of 720 HEAD sends
+   returned `RESOURCE_BUSY: database is busy (recovery in progress)` (0 of 480 on
+   0.3.36 — not statistically distinguishable at this n, but a release gate must
+   measure it); HEAD's engine logged `correlated_exists_fallback` ("in-memory
+   fallback path while parity-cert mode is enabled"). Debug-build latencies are
+   not release evidence; they are why a release-mode run is mandatory.
+7. **CLI reads contend with the live daemon.** On the 42k-message live mailbox:
+   `am robot search` 36.5 s (Tantivy `LockBusy` → private-snapshot fallback with an
+   `error` alert), `am robot health` 6.6 s, `am doctor health` 7.7 s and exit 1.
+   Other read verbs 0.1–2.6 s. GH#298's residual (health_check walks the archive
+   per call; CLI read verbs are not proxied) had no owner; now `br-kp1in.18`.
+8. **Live reservation archive drift is persistent and semantic.** `am doctor
+   health` exits 1 on 16 reservations whose `released_ts`/`active_status` differ
+   between DB (4,102 rows) and archive (2,960), the same count as September 22.
+   The auto-fixer exists but nothing converges it automatically, and the
+   pre-commit guard reads archive state. No mutation was applied (`br-kp1in.19`).
+9. **Release plumbing points at a path that never runs.** Repository Actions are
+   disabled; releases go through DSR with minisign. Several release-integrity beads
+   were satisfied only in `dist.yml`/`docker.yml` (static tests in
+   `tests/docs_drift_ci.rs`); nothing on the DSR path consumes a zero-failure gate
+   (`br-nq2kb`; v0.3.34 shipped with 12 failing tests). One-shot "landing"
+   workflows (`land-atc-reliability-20260918.yml`, `gh326-private-export.yml`,
+   `gh274-overview.yml`, `installer-exit.yml`) and `patches/` were committed for a
+   CI that cannot run; the GH#326 patch series was never applied (`br-kp1in.22`,
+   `br-kp1in.27`).
+10. **Smaller verified defects:** GH#329 (`file_reservations release/renew
+    --paths/--ids` accept one value) and GH#330 (robot reservation times only
+    humanized) are unfixed and unowned; the engine emits
+    `WAL-FEC requires a caller-owned native runtime` at WARN once per connection
+    open (≈8,000 lines in 20 minutes on each server); 8 config variables are parsed
+    and never read (`LLM_DEFAULT_MODEL` — LLM calls use a hard-coded `gpt-5.4` —,
+    `LOG_LEVEL`, `LOG_INCLUDE_TRACE`, `DATABASE_ECHO`, `HTTP_OTEL_*`,
+    `AM_EPHEMERAL_TTL_HOURS`, `AM_TUI_TREE_STYLE`) and three are parsed twice with
+    divergent defaults (`FSQLITE_CONCURRENT_RETRIES` 5 vs 16, `AM_COALESCER_*`);
+    `MCP_AGENT_MAIL_LLM_STUB=1` makes release builds return canned LLM output
+    (`br-kp1in.24`, `.25`, `.26`, `.20`, `.21` respectively).
+
+### What is verifiably working
+
+- **Surface:** 45 tools (`tools/list` = 45 on both binaries), 25 resource URIs
+  (33 registrations incl. query variants), 16 screens, 19 robot verbs, 28 doctor
+  verbs, 65 fixers / 27 auto-fixable, 42 themes, 12 members, no Tokio family in
+  either lockfile. Zero `todo!`/`unimplemented!`; every tool handler has a real body.
+- **Coordination loop (27/27 on both binaries):** register, symmetric-glob
+  reservation conflict, release and re-grant, send/fetch/ack/reply,
+  delivery receipt, search, thread summary, `resource://inbox`, inbox-event cursors,
+  broadcast refusal, invalid-name refusal, `file_reservation_paths` idempotent
+  replay and `IDEMPOTENCY_KEY_CONFLICT`.
+- **Durability of acknowledged writes across SIGKILL** on both binaries (above).
+- **All robot/doctor/mail verbs** answer in 0.02–1.2 s on a small mailbox.
+- **HEAD focused suites:** storage `stress_pipeline` 9/9 passed (6 ignored
+  skipped), including the 30-agent pipeline, WBQ saturation and 120-agent
+  multi-project cases — the in-process sources of README's stress table. Further
+  focused-suite results are recorded below.
+- **Six GitHub defects have source fixes** (#326, #328, #323, #264, #258, #274
+  partial) — none is released. #319/#318/#321 fixes are released.
+- **Stale P0 wave:** of 39 P0 in-progress beads, 15 have code plus tests for every
+  acceptance item, 21 are partial (often only a missing run or negative test),
+  3 are obsolete (`br-ivcmf`, `br-rch-frankensearch-closure-jdgvg`, `br-l1z6f`),
+  none is untouched. `br-c2is6` (master mirror) is already satisfied at `e7744d7a`.
+
+### Reproduction record for the HEAD drain wedge
+
+| Instance | History | Drain froze at | Queued at last sample | After load stopped | Health `archive_lag` |
+|---|---|---|---|---|---|
+| A (port 18766) | SIGKILL + restart, 3 storms, 10-min soak | 414 (~16:37Z) | 3,453 | still 414 at 16:56Z; zombies 41 | green, `oldest_unmaterialized_ms: 0` |
+| B (port 18767) | fresh, no crash; flow, 2 storms, 5-min soak | 679 (~16:48Z, ~90 s into soak) | 1,624 | still 679 at 16:56Z; zombies 20 | warning, 104–228 s |
+| v0.3.36 control | same workload | never | 2 | drains normally | — |
+
+The wedge is permanent once reached (no recovery after load removal) and does not
+require a crash. `am` still accepts and acknowledges sends into SQLite, so no
+acknowledged message is lost, but reads time out, zombies accumulate, and the
+archive, search backfill and every Git-backed guarantee stop advancing.
+
+### Vision checklist delta (the September 21 25-goal matrix remains the inventory)
+
+Only goals re-exercised in this pass change status; all others keep their
+September 21/22 status (`UNPROVEN`/`PARTIAL`) and were **not** re-verified.
+
+| # | Goal | Sept 22 | This pass | Evidence |
+|---|---|---|---|---|
+| 1 | 45 tools / 25 resources | PARTIAL | **WORKING** (both binaries) | `tools/list`=45 black-box; source counts |
+| 2 | Explicit send/reply/read/ack, receipts | PARTIAL | **WORKING** at small scale | 27/27 flow on both binaries |
+| 3 | Broadcast refused | implemented | **WORKING** | `BROADCAST_DISABLED` black-box |
+| 4 | DB→Git convergence | PARTIAL | **REGRESSED on HEAD (wedge)**, NOT_SHIPPED fix on 0.3.36 | findings 2–3 |
+| 5 | No lost/duplicate accepted mail under concurrency | UNPROVEN | **WORKING at 16 clients incl. SIGKILL**; swarm scale UNPROVEN | 602/602 acked ids survive; distinct ids |
+| 7 | Bounded engine/pool lifetime | PARTIAL | **REGRESSED in shipped** (EMFILE), **WORKING on HEAD** (2 fds) | finding 1 |
+| 8 | Identity/contact/topic | PARTIAL | PARTIAL + **new misdelivery defect** | finding 4 |
+| 9 | Leases, conflicts, guard | PARTIAL | **WORKING** (tool path) / live archive drift persists | flow + finding 8, GH#329 |
+| 15 | Fast, truthful robot/doctor health | PARTIAL | PARTIAL: fast on small mailbox; 36 s search, 7.7 s doctor health, lag verdict wrong under wedge | findings 2, 7 |
+| 17 | Scoped Search V3 | PARTIAL | PARTIAL: MCP search 0.15 s small; CLI 36 s live | finding 7 |
+| 20 | Signed install/update | PARTIAL | PARTIAL: installed binary = release asset; 310 commits unreleased | GitHub API, SHA |
+| 22 | Complete gate | UNPROVEN | **NO_VERDICT, now explained**: ~100 GB of test executables | `br-kp1in.28` |
+| 23 | Latency/resource budgets | UNPROVEN | UNPROVEN; README's 27 ms send baseline is not what users see (2.6–3.5 s observed sequential on a loaded shared host, confounded) | finding 10, `br-kp1in.5` |
+| 24 | Honest active docs | PARTIAL | PARTIAL: ten verified drifts appended to `br-4meup` | `br-4meup` comment |
+
+### Bead coverage (skill questions 4 and 5)
+
+**If every open and in-progress bead were completed as written, would the gap
+close?** Before this pass: **no**. Nothing owned the HEAD drain wedge, the
+cross-project misdelivery, the implicit concurrency mode, the lag verdict, the
+runnable full gate, or a bounded black-box release gate — and several release
+beads target a pipeline (Actions) that is disabled. The long-horizon soak beads
+(`br-kp1in.1/.2`) would eventually have exercised the wedge, but they are scoped
+as 24-hour two-host programs blocked on four other beads.
+
+**Vision goals with no bead before this pass (now created, parent `br-kp1in`):**
+
+| New bead | P | Gap |
+|---|---|---|
+| `br-kp1in.13` | P0 | HEAD archive drain wedge (release blocker) |
+| `br-kp1in.14` | P0 | Bounded black-box release smoke with previous-release control (release blocker) |
+| `br-kp1in.15` | P1 | Cross-project send misdelivery / handshake welcome drop / README promise |
+| `br-kp1in.16` | P1 | Explicit effective write-concurrency mode for autocommit writes |
+| `br-kp1in.17` | P1 | Descriptor-limit defense in depth (soft-limit raise, unit `LimitNOFILE`, doctor) |
+| `br-kp1in.22` | P1 | Decision: canonical release path; re-scope dist.yml-only release beads |
+| `br-kp1in.23` | P1 | `archive_lag` verdict ignores WBQ backlog |
+| `br-kp1in.28` | P1 | Consolidate 137 integration-test binaries so the full gate can run |
+| `br-kp1in.29` | P1 | Liveness instruments: lockdep-lite, holder dumps, progress/slope watchdogs |
+| `br-kp1in.30` | P1 | Un-ignore the passing 100-agent lifecycle test; classify the 600 s sustained timeout |
+| `br-kp1in.18` | P2 | CLI read verbs contend with the daemon (36 s search), GH#298 residual |
+| `br-kp1in.19` | P2 | Reservation DB/archive semantic drift without automatic convergence |
+| `br-kp1in.20` | P2 | Config surface honesty (8 dead + 3 double-parsed variables) |
+| `br-kp1in.21` | P2 | `MCP_AGENT_MAIL_LLM_STUB` honored by release builds |
+| `br-kp1in.24` | P2 | GH#329 multi-value `--paths/--ids` |
+| `br-kp1in.26` | P2 | WAL-FEC WARN once per connection open |
+| `br-kp1in.25` | P3 | GH#330 absolute reservation timestamps |
+| `br-kp1in.27` | P3 | Repo detritus (removal needs maintainer approval under RULE 1) |
+
+New blocking edges (left depends on right): `br-bx73n` → `.13`, `.14`, `.22`, `.23`,
+`.28`; `br-nq2kb` → `.22`. Related links tie the new beads to `br-8r6dl`,
+`br-8j6cb`, `br-0flbu`, `br-es9fm`, `br-vsj5s`, `br-kp1in.1/.2/.7`. Evidence comments
+were added to `br-8r6dl`, `br-8j6cb`, `br-5lgwn`, `br-4meup`, `br-nq2kb`, `br-0flbu`,
+`br-c2is6` (already satisfied) and the three obsolete beads (`br-ivcmf`,
+`br-rch-frankensearch-closure-jdgvg`, `br-l1z6f`). No existing bead was closed,
+reassigned or re-prioritized; closure is left to owners with the cited evidence.
+
+### Bridge: the shortest route from here to a release users can trust
+
+1. **Unwedge HEAD (`br-kp1in.13`, P0, M).** Reproduce in a spawned-binary test
+   (the clean instance B recipe needs no crash), take stacks with the server as a
+   harness child (ptrace allowed), fix the blocking wait at its root. Add the
+   drain-progress verdict (`br-kp1in.23`) in the same change set so the next stall
+   cannot report green.
+2. **Commit the bounded black-box release smoke (`br-kp1in.14`, P0, M) in
+   parallel.** It must fail today on both artifacts for the stated reasons; that
+   failing receipt is the proof the gate works.
+3. **Make the full gate runnable (`br-kp1in.28`, P1, M–L).** Consolidating test
+   binaries is what turns every future "full gate NO_VERDICT" into a verdict.
+4. **Pin the concurrency mode (`br-kp1in.16`)** before the release-mode run, so the
+   durability numbers mean something.
+5. **Release.** Decide the path (`br-kp1in.22`), run consolidated full gate +
+   smoke on a release-mode build of the exact candidate, installed-binary parity
+   (`br-bx73n`), publish. This ships the descriptor fix, DB→archive
+   reconciliation, and the six unreleased GitHub fixes.
+6. **Operational, now (maintainer's call — not done by this assessment):** the
+   live daemon PID 1685075 will hit its 32,768 descriptor limit around October
+   1–2. A restart resets the count (and the supervised unit is available but
+   inactive); the durable fix is step 5. Consider `LimitNOFILE` on the unit
+   meanwhile (`br-kp1in.17`).
+7. **Then, in parallel:** cross-project correctness (`.15`), CLI read contention
+   (`.18`), reservation drift convergence (`.19`), liveness instruments (`.29`),
+   config honesty (`.20`, `.21`), GH#329/#330, log flood, docs (`br-4meup`).
+8. **Keep the long-horizon program** (`br-kp1in.1/.2/.9/.10`, swarm-scale
+   GH#257/#278) — but it is not a prerequisite for shipping steps 1–5.
+
+### Ambition round 1: liveness is a first-class property
+
+Both release blockers are liveness failures — resource exhaustion and a blocked
+drain — in a codebase whose ~17k tests are overwhelmingly safety checks. The plan
+therefore treats "keeps making progress with bounded resources" as a product
+invariant with instruments, not an emergent property: named-lock order recording
+and holder dumps so the next wedge diagnoses itself without ptrace; per-queue
+progress watchdogs; resource-slope detection against completed work using the
+anytime-valid e-process/CUSUM machinery the ATC core already contains; and a
+time-to-exhaustion projection ("EMFILE in ~9 days") in `am robot health` and
+`am doctor`. The September 18 outage was predictable from data the process
+already had. Recorded in `br-kp1in.29`; the release smoke asserts the same
+predicates, and gains randomized crash-point iterations (≥20 kills at random
+offsets, offsets recorded for replay) instead of one hand-timed SIGKILL.
+
+### Ambition round 2: make verdicts cheap enough to get every time
+
+The recurring NO_VERDICT on the full gate is not bad luck: ~137 integration-test
+executables at ~700 MB each is ~100 GB per build, more than this host or most
+workers have free. Consolidation per crate (`br-kp1in.28`) and a minutes-long
+black-box smoke (`br-kp1in.14`) make a trustworthy verdict affordable on one
+machine, which in turn makes small, frequent releases possible (`br-kp1in.22`
+records cadence with the path decision). Health reports time-to-drain from
+measured arrival and drain rates (Little's law), so "behind but converging" and
+"wedged" are different colors (`br-kp1in.23`).
+
+### Ambition round 3 (considered, deliberately bounded)
+
+Lock-order graphs (lockdep), anytime-valid sequential tests for leak slopes, and
+Little's-law drain estimates are the mathematically grounded pieces that pay for
+themselves here, each tied to an observed defect. A general model checker or a
+new chaos framework was considered and rejected for this bridge: the existing
+bounded history checker (`br-kp1in.9/.10`) already owns trace legality, and adding
+more checks without an observed defect class would be the "conformance
+metastasis" pattern AGENTS.md forbids.
+
+### Focused HEAD test results (cargo nextest, default profile, debug line-tables-only)
+
+| Suite | Result | Notes |
+|---|---|---|
+| storage `stress_pipeline` (default) | **9/9 passed**, 6 ignored skipped, 201.6 s | thundering herd, coalescer batching, inbox during storm, 30-agent pipeline, mixed reservations+messages, 120-agent multi-project, multi-project concurrency, stale git lock, WBQ saturation |
+| `stress_100_agent_full_lifecycle` (ignored) | **passed**, 105.9 s | its "un-ignore on fsqlite bump" condition is met → `br-kp1in.30` |
+| `stress_sustained_100_agents_60s` (ignored) | **TIMEOUT at 600.1 s** (nominal 60 s) | unclassified: same stall class or debug slowness → `br-kp1in.30` |
+| db/tools suites (stress, pool exhaustion, fault injection, idempotency, nocase backup) | queued behind per-package rebuilds at handoff | results, if any, recorded on `br-kp1in` |
+
+The full default-feature workspace gate remains **NO_VERDICT** for the reasons above;
+no count is projected for it.
+
+### Refinement record (Phase 3a and five Phase 5 passes)
+
+Phase 3a used the frozen bead-generation instruction retained verbatim in the
+September 21 section; Phase 5 used the frozen refinement instruction. Beads carry
+background, reasoning, acceptance, unit/E2E tests and logging requirements so they
+are self-contained without this document.
+
+1. **Ownership:** `.13`, `.23` and `.29` each proposed a drain watchdog. Assigned one
+   owner each (root-cause fix / health verdict / cross-cutting instruments); added
+   structured-logging and E2E requirements to `.13`, `.16`, `.19`, `.23`, `.24`, `.29`.
+2. **Duplicates and links:** `bv --robot-suggest` flagged nothing for the new beads;
+   a manual sweep found no existing owner for test consolidation; linked `.20` to
+   `br-yzk37` (inert pragma knobs) and `.14` to `.15`/`.29`.
+3. **Dependency semantics:** corrected `.13`'s prose — it blocks release acceptance
+   (`br-bx73n`) but deliberately not `.14`, whose failing run against the wedge is
+   its proof of usefulness.
+4. **Evidence accuracy:** corrected `.14`'s description of the live outage (observed:
+   2,048 limit exhausted within about a day of the 09-17 start; the October 1–2 date
+   is a projection). Scanned the plan and JSONL for the local bearer token that
+   appeared in this session's terminal output: absent.
+5. **Convergence:** added `.30` from the final suite result; re-read all 18 new beads
+   and the graph; no further change warranted. `br dep cycles` empty; `bv
+   --robot-triage`: 166 unfinished, acyclic, top picks `br-kp1in.13` then
+   `br-kp1in.14` (previously `br-c2is6`, which is already satisfied).
+
+### Real-work and honesty disposition
+
+This was a user-requested assessment (PROCESS), but unlike the three preceding
+desk assessments most of its weight is fresh execution: two binaries driven
+black-box through the real protocol, a same-host A/B, a crash test, a soak, live
+`/proc` measurements, and focused suites. It changed no product code, test, gate,
+golden, default or configuration; it made one reversible local tracker schema
+migration, created 18 beads, added 11 evidence comments and 11 dependency edges,
+and revised this plan in place. No bead was closed or reassigned; peers' obsolete
+or satisfied beads received evidence for their owners to act on.
+
+Limits stated plainly: HEAD was a **debug** build — its latencies are not release
+evidence, though the zero-CPU blocked drain thread is a wedge, not slowness; the
+full gate is NO_VERDICT; sample sizes for the RESOURCE_BUSY comparison are small;
+the harness lives in the session scratchpad (to be ported by `br-kp1in.14`), and
+its storm/soak shapes are mine, not a standard workload. Surface counts, the stub
+scan, the GitHub audit and the P0 audit came from read-only subagents; I
+spot-checked the concurrency-mode, cross-project and reservation-drift claims
+myself and reproduced two of them black-box.
+
+What this assessment left behind on the host: a 58 GB private build target at
+`~/.cache/rc0923-target` (RULE 1: not deleted without the maintainer's approval),
+isolated fixture mailboxes under the session scratchpad, and stopped test servers.
+No shared mailbox was modified.
+
+## September 22, 2026 assessment (superseded by September 23)
 
 **Agent Mail is a substantial working product. Its remaining critical work is
 reliable operation across failures and delivery of one fully qualified current
