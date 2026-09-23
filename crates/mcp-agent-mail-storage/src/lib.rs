@@ -6972,6 +6972,10 @@ pub fn commit_paths_with_retry(
 ) -> Result<()> {
     const MAX_INDEX_LOCK_RETRIES: usize = 5;
 
+    // Retain the fence through fallback/retries. Otherwise the fallback commit
+    // lock could be held while commit_paths waits for this fence, reversing the
+    // order used by bundle writers and message reconciliation.
+    let _mutation = ArchiveMutationGuard::begin_at(repo_root);
     let sm = &mcp_agent_mail_core::global_metrics().storage;
     sm.commit_attempts_total.inc();
     sm.commit_batch_size_last.set(rel_paths.len() as u64);

@@ -1816,20 +1816,11 @@ impl SemanticBridge {
         }
     }
 
-    /// Create a semantic bridge using the available model's dimension.
-    /// An empty index adopts the first real model if discovery succeeds later.
+    /// Create the queue and worker without loading a model on the caller.
+    /// The first real embedding binds the empty index's model and dimension.
     #[must_use]
     pub fn default_config() -> Self {
-        let ctx = get_two_tier_context();
-        let mut config = VectorIndexConfig::default();
-        config.dimension = ctx.fast_info().map_or_else(
-            || {
-                ctx.quality_info()
-                    .map_or(config.dimension, |info| info.dimension)
-            },
-            |info| info.dimension,
-        );
-        Self::new(config)
+        Self::new(VectorIndexConfig::default())
     }
 
     /// Get a reference to the vector index (for reads).
@@ -2300,11 +2291,21 @@ pub fn enqueue_semantic_document(
     title: &str,
     body: &str,
 ) -> bool {
-    // Avoid heavyweight model initialization on normal write paths.
-    // If semantic indexing has not been initialized, skip enqueue and let
-    // lexical search remain available.
-    let Some(bridge) = get_semantic_bridge() else {
-        return false;
+    // Preserve explicitly initialized bridges. Automatic startup requires the
+    // runtime opt-in and only creates a queue/worker; model I/O stays off the
+    // write caller. Mail sent before the first search must not be discarded.
+    let bridge = match get_semantic_bridge() {
+        Some(bridge) => bridge,
+        None if mcp_agent_mail_core::Config::get()
+            .search_rollout
+            .semantic_enabled =>
+        {
+            let Some(bridge) = get_or_init_semantic_bridge() else {
+                return false;
+            };
+            bridge
+        }
+        None => return false,
     };
     bridge.enqueue_document(
         doc_id,
@@ -8858,11 +8859,8 @@ mod tests {
     #[cfg(feature = "hybrid")]
     #[test]
     fn semantic_enqueue_auto_initializes_bridge_and_tracks_dedup() {
-        // The bridge must be initialized before enqueue_semantic_document will
-        // accept documents (it deliberately avoids heavyweight auto-init on
-        // normal write paths).  If the OnceLock was already set by a previous
-        // test in the same process, init_semantic_bridge_default returns Err
-        // — that's fine; the bridge is usable either way.
+        // Explicit initialization remains usable even if automatic semantic
+        // indexing is disabled by the rollout configuration.
         let _ = init_semantic_bridge_default();
 
         assert!(enqueue_semantic_document(
@@ -9119,6 +9117,7 @@ mod tests {
                 .env_remove("FRANKENSEARCH_DATA_DIR")
                 .env("XDG_DATA_HOME", root.path().join("data"))
                 .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("AM_SEARCH_SEMANTIC_ENABLED", "true")
                 .env("AM_SEARCH_RERANK_ENABLED", "false")
                 .output()
                 .unwrap();
@@ -9137,19 +9136,27 @@ mod tests {
             return;
         }
 
-        let context = get_two_tier_context();
-        assert_eq!(context.availability(), TwoTierAvailability::None);
-        let bridge = get_or_init_semantic_bridge().unwrap();
-        assert_eq!(bridge.index().config().dimension, 384);
-        assert_eq!(bridge.index().bound_model_id(), None);
-        assert!(!bridge.has_real_embedder());
+        assert!(get_semantic_bridge().is_none());
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_SEARCH_SEMANTIC_ENABLED", "false")],
+            || {
+                assert!(!enqueue_semantic_document(
+                    DocKind::Message,
+                    7099,
+                    Some(1),
+                    "disabled",
+                    "body"
+                ));
+                assert!(get_semantic_bridge().is_none());
+            },
+        );
 
         let root = tempfile::tempdir().unwrap();
         let pool = temp_file_pool(root.path(), "late-model.sqlite3");
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
-        let (project_id, scope) = runtime.block_on(async {
+        let (project_id, scope, bridge) = runtime.block_on(async {
             let cx = Cx::for_testing();
             let project = crate::queries::ensure_project(&cx, &pool, "/late-model-visible")
                 .await.into_result().unwrap();
@@ -9178,6 +9185,7 @@ mod tests {
                 recipient_map: Vec::new(),
             };
             let conn = crate::DbConn::open_file(pool.sqlite_path()).unwrap();
+            assert!(get_semantic_bridge().is_none());
             for (id, pid, sender_id, subject, body) in [
                 (7101, project_id, sender.id.unwrap(), "mailbox recovery", "repair the mail delivery service"),
                 (7102, project_id, blocked.id.unwrap(), "restricted sender", "privateblockedpayload"),
@@ -9191,6 +9199,8 @@ mod tests {
                 ).unwrap();
                 assert!(enqueue_semantic_document(DocKind::Message, id, Some(pid), subject, body));
             }
+            let bridge = get_semantic_bridge().expect("the first enabled write initializes its queue");
+            assert_eq!(bridge.queue_stats().total_enqueued, 3);
             let query = SearchQuery::messages("mailbox recovery", project_id);
             for engine in [SearchEngine::Lexical, SearchEngine::Hybrid, SearchEngine::Auto] {
                 let response = execute_search(&cx, &pool, &query, &SearchOptions {
@@ -9207,8 +9217,13 @@ mod tests {
                 }).await.into_result().unwrap();
                 assert!(response.results.is_empty());
             }
-            (project_id, scope)
+            (project_id, scope, bridge)
         });
+        let context = get_two_tier_context();
+        assert_eq!(context.availability(), TwoTierAvailability::None);
+        assert_eq!(bridge.index().config().dimension, 384);
+        assert_eq!(bridge.index().bound_model_id(), None);
+        assert!(!bridge.has_real_embedder());
         assert_eq!(bridge.queue_stats().pending_count, 3);
         assert_eq!(bridge.metrics_snapshot().total_skipped, 0);
         assert_eq!(bridge.metrics_snapshot().total_failed, 0);
@@ -9392,20 +9407,14 @@ mod tests {
 
     #[cfg(feature = "hybrid")]
     #[test]
-    fn semantic_bridge_default_dimension_matches_auto_init_context() {
-        let ctx = get_two_tier_context();
-        let expected_dimension = ctx.fast_info().map_or_else(
-            || {
-                ctx.quality_info().map_or_else(
-                    || VectorIndexConfig::default().dimension,
-                    |info| info.dimension,
-                )
-            },
-            |info| info.dimension,
-        );
-
+    fn semantic_bridge_default_defers_model_selection() {
         let bridge = SemanticBridge::default_config();
-        assert_eq!(bridge.index().config().dimension, expected_dimension);
+        assert_eq!(
+            bridge.index().config().dimension,
+            VectorIndexConfig::default().dimension
+        );
+        assert_eq!(bridge.index().bound_model_id(), None);
+        assert!(bridge.index().is_empty());
     }
 
     #[cfg(feature = "hybrid")]

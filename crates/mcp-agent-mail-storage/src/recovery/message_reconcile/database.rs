@@ -1878,7 +1878,7 @@ mod tests {
             let relative = "projects/project/attachments/files/evidence.bin";
             let attachment = json!([{
                 "type": "file", "path": relative, "bytes": bytes.len(),
-                "sha1": format!("{:x}", Sha1::digest(bytes)),
+                "sha1": hex::encode(Sha1::digest(bytes)),
             }]);
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
             conn.execute_raw(&format!(
