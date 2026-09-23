@@ -8690,6 +8690,9 @@ pub fn write_message_batch_bundle(
     );
 
     let repo_root = archive_repo_root_checked(archive)?;
+    // Direct callers need the same fence-before-project-lock order as WBQ.
+    // Nested guards reuse the outer mutation window on the current thread.
+    let _mutation = ArchiveMutationGuard::begin_at(repo_root);
     let estimated_rel_paths = entries
         .iter()
         .map(|entry| {
@@ -8844,8 +8847,11 @@ pub fn write_message_bundle(
     extra_paths: &[String],
     commit_text: Option<&str>,
 ) -> Result<()> {
+    let repo_root = archive_repo_root_checked(archive)?;
+    // Retention holds the publication fence through its project-locked proof
+    // and DB commit. Acquire that fence before this writer's project lock too.
+    let _mutation = ArchiveMutationGuard::begin_at(repo_root);
     with_project_lock(archive, || {
-        let repo_root = archive_repo_root_checked(archive)?;
         let mut rel_paths = Vec::with_capacity(
             2 + recipients.len()
                 + extra_paths.len()

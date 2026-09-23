@@ -167,6 +167,10 @@ pub fn reconcile_message_bundle(
     targets.extend(paths.inbox.into_iter().map(|path| (path, inbox.as_bytes())));
     let message_target_count = targets.len();
     let repo_root = crate::archive_repo_root_checked(archive)?;
+    // Missing-file publication creates parent directories inside the project
+    // lock. Enter their mutation fence first, matching ordinary bundle writes
+    // and archive-verified retention, so repair cannot invert that lock order.
+    let _mutation = crate::ArchiveMutationGuard::begin_at(repo_root);
     let repo = Repository::open(repo_root)?;
     let attachment_files =
         attachments::prepare(&repo, archive, entry.message, MAX_BUNDLE_BYTES - bytes)?;

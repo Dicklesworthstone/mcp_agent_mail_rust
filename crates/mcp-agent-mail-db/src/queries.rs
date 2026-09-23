@@ -11986,6 +11986,231 @@ const SETTLED_MESSAGE_PREDICATE: &str = "NOT EXISTS (\
        AND (r.read_ts IS NULL \
             OR (m.ack_required != 0 AND r.ack_ts IS NULL)))";
 
+/// Maximum message payload admitted to an archive observation.
+pub const MESSAGE_ARCHIVE_MAX_PAYLOAD_BYTES: i64 = 4 * 1024 * 1024;
+/// Maximum delivery fan-out admitted to an archive observation.
+pub const MESSAGE_ARCHIVE_MAX_RECIPIENTS: usize = 1024;
+/// Maximum recipient-name bytes admitted to an archive observation.
+pub const MESSAGE_ARCHIVE_MAX_RECIPIENT_NAME_BYTES: i64 = 1024;
+/// Maximum candidate IDs examined in one destructive retention pass.
+pub const MESSAGE_PRUNE_MAX_CANDIDATES: usize = 32;
+
+/// One bounded statement observes the complete archive source and its routing.
+///
+/// The message occupies one row, followed by its durable deliveries, so a large
+/// body is not repeated for every recipient. Archive verification and the final
+/// retention transaction use this same projection. The final identity/receipt
+/// columns also detect changes that do not alter a rendered recipient name.
+/// Callers bind message ID, payload-byte limit, and recipient-name-byte limit,
+/// then append the fixed recipient limit plus two rows as an overflow witness.
+pub const MESSAGE_ARCHIVE_SOURCE_SQL: &str = "\
+SELECT 0 AS row_kind, m.id, m.project_id, m.subject, m.body_md, m.thread_id, m.topic, \
+       m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
+       m.archive_metadata_json, \
+       p.slug AS project_slug, p.human_key AS project_key, a.name AS sender, \
+       NULL AS recipient_id, NULL AS recipient_project_id, \
+       NULL AS recipient_name, NULL AS recipient_kind, \
+       m.sender_id, a.project_id AS sender_project_id, \
+       NULL AS recipient_read_ts, NULL AS recipient_ack_ts \
+FROM messages m JOIN projects p ON p.id = m.project_id \
+JOIN agents a ON a.id = m.sender_id \
+WHERE m.id = ?1 AND \
+      length(CAST(m.body_md AS BLOB)) + length(CAST(m.subject AS BLOB)) + \
+      length(CAST(m.recipients_json AS BLOB)) + length(CAST(m.attachments AS BLOB)) + \
+      length(CAST(m.importance AS BLOB)) + length(CAST(p.slug AS BLOB)) + \
+      length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
+      COALESCE(length(CAST(m.thread_id AS BLOB)), 0) + \
+      COALESCE(length(CAST(m.topic AS BLOB)), 0) + \
+      COALESCE(length(CAST(m.archive_metadata_json AS BLOB)), 0) <= ?2 \
+UNION ALL \
+SELECT 1, mr.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+       NULL, NULL, NULL, mr.agent_id, a.project_id, \
+       CASE WHEN length(CAST(a.name AS BLOB)) <= ?3 THEN a.name ELSE NULL END, \
+       CASE WHEN length(CAST(mr.kind AS BLOB)) <= 3 THEN mr.kind ELSE NULL END, \
+       NULL, NULL, \
+       CASE WHEN mr.read_ts IS NULL OR typeof(mr.read_ts) = 'integer' \
+            THEN mr.read_ts ELSE 'invalid_receipt' END, \
+       CASE WHEN mr.ack_ts IS NULL OR typeof(mr.ack_ts) = 'integer' \
+            THEN mr.ack_ts ELSE 'invalid_receipt' END \
+FROM message_recipients mr LEFT JOIN agents a ON a.id = mr.agent_id \
+WHERE mr.message_id = ?1 \
+ORDER BY row_kind, recipient_id";
+
+const MESSAGE_ARCHIVE_SOURCE_COLUMNS: usize = 24;
+
+fn message_archive_source_sql() -> String {
+    // The pinned compound-select executor requires a literal LIMIT. All
+    // request/source values remain bound parameters.
+    format!(
+        "{MESSAGE_ARCHIVE_SOURCE_SQL} LIMIT {}",
+        MESSAGE_ARCHIVE_MAX_RECIPIENTS + 2
+    )
+}
+
+fn message_archive_source_params(id: i64) -> [Value; 3] {
+    [
+        Value::BigInt(id),
+        Value::BigInt(MESSAGE_ARCHIVE_MAX_PAYLOAD_BYTES),
+        Value::BigInt(MESSAGE_ARCHIVE_MAX_RECIPIENT_NAME_BYTES),
+    ]
+}
+
+/// Immutable DB observation supplied to the archive verifier before pruning.
+///
+/// Capturing this value does not establish archive durability. Only pass it to
+/// [`prune_verified_settled_messages`] after verifying the canonical message,
+/// every mailbox copy, and attachment evidence against these exact rows.
+#[derive(Debug)]
+pub struct MessagePruneCandidate {
+    id: i64,
+    source_identity: String,
+    source_rows: Vec<SqlRow>,
+}
+
+impl MessagePruneCandidate {
+    #[must_use]
+    pub const fn id(&self) -> i64 {
+        self.id
+    }
+
+    #[must_use]
+    pub fn source_rows(&self) -> &[SqlRow] {
+        &self.source_rows
+    }
+}
+
+/// Bounded age/settlement candidates within one finite ID range. Failed
+/// archive proofs can be revisited after the caller completes this range.
+#[derive(Debug, Default)]
+pub struct MessagePruneIdPage {
+    pub ids: Vec<i64>,
+    pub ceiling: i64,
+    pub more: bool,
+}
+
+pub async fn list_prunable_message_ids(
+    cx: &Cx,
+    pool: &DbPool,
+    older_than_us: i64,
+    after_id: i64,
+    ceiling: Option<i64>,
+    max_messages: usize,
+) -> Outcome<MessagePruneIdPage, DbError> {
+    if max_messages == 0 {
+        return Outcome::Ok(MessagePruneIdPage {
+            ceiling: ceiling.unwrap_or(0),
+            ..Default::default()
+        });
+    }
+    let limit = max_messages.min(MESSAGE_PRUNE_MAX_CANDIDATES);
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let ceiling = match ceiling {
+        Some(ceiling) => ceiling,
+        None => match map_sql_outcome(
+            traw_query(
+                cx,
+                &tracked,
+                "SELECT COALESCE(MAX(id), 0) FROM messages",
+                &[],
+            )
+            .await,
+        ) {
+            Outcome::Ok(rows) => rows.first().and_then(row_first_i64).unwrap_or(0),
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        },
+    };
+    let sql = format!(
+        "SELECT m.id FROM messages m WHERE m.id > ? AND m.id <= ? \
+         AND m.created_ts <= ? AND {SETTLED_MESSAGE_PREDICATE} ORDER BY m.id LIMIT ?"
+    );
+    let params = [
+        Value::BigInt(after_id.max(0)),
+        Value::BigInt(ceiling),
+        Value::BigInt(older_than_us),
+        Value::BigInt(i64::try_from(limit + 1).unwrap_or(i64::MAX)),
+    ];
+    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => Outcome::Ok(MessagePruneIdPage {
+            ids: rows.iter().take(limit).filter_map(row_first_i64).collect(),
+            ceiling,
+            more: rows.len() > limit,
+        }),
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+/// Capture exactly the bounded source projection that archive verification
+/// must inspect. Missing, oversized, or excessive-fan-out messages are retained.
+pub async fn capture_message_prune_candidate(
+    cx: &Cx,
+    pool: &DbPool,
+    id: i64,
+) -> Outcome<Option<MessagePruneCandidate>, DbError> {
+    if id <= 0 {
+        return Outcome::Ok(None);
+    }
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let rows = match map_sql_outcome(
+        traw_query(
+            cx,
+            &tracked,
+            &message_archive_source_sql(),
+            &message_archive_source_params(id),
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let complete = rows.len() <= MESSAGE_ARCHIVE_MAX_RECIPIENTS + 1
+        && rows.first().is_some_and(|row| {
+            row.get(0).and_then(value_as_i64) == Some(0)
+                && row.get(1).and_then(value_as_i64) == Some(id)
+        })
+        && rows.iter().skip(1).all(|row| {
+            [22, 23].into_iter().all(|index| {
+                row.get(index).is_some_and(|value| {
+                    matches!(value, Value::Null) || value_as_i64(value).is_some()
+                })
+            })
+        });
+    if !complete {
+        return Outcome::Ok(None);
+    }
+    Outcome::Ok(Some(MessagePruneCandidate {
+        id,
+        source_identity: pool.sqlite_identity_key(),
+        source_rows: rows,
+    }))
+}
+
+fn message_archive_source_matches(expected: &[SqlRow], current: &[SqlRow]) -> bool {
+    expected.len() == current.len()
+        && expected.iter().zip(current).all(|(expected, current)| {
+            (0..MESSAGE_ARCHIVE_SOURCE_COLUMNS).all(|index| {
+                expected.get(index).is_some() && expected.get(index) == current.get(index)
+            })
+        })
+}
+
 /// Count settled messages older than `older_than_us` (GH#273).
 ///
 /// "Settled" means read by every recipient and acked where the message
@@ -12031,84 +12256,56 @@ pub struct MessagePruneReport {
     pub more: bool,
 }
 
-/// Retention sweep: hard-`DELETE` settled messages older than `older_than_us`
-/// (GH#273, the demand-side twin of [`prune_released_file_reservations`]).
+/// Delete only the exact message observations already verified in the archive.
 ///
-/// A message is eligible when BOTH:
-///   1. it is settled — every recipient has `read_ts`, and every recipient
-///      has `ack_ts` when the message has `ack_required` — so unread or
-///      unacknowledged mail is NEVER pruned, AND
-///   2. `created_ts <= older_than_us`.
+/// The caller must verify committed canonical, outbox, inbox, and attachment
+/// evidence against each candidate's source rows, while holding its live-source
+/// write activity guard. This function then checks pool identity, age, settled
+/// receipts, and the entire source projection again inside the write transaction
+/// before removing any children. Changed candidates remain in SQLite for a later
+/// pass. An empty verified list authorizes no deletion.
 ///
-/// The per-project git archive (`projects/<slug>/messages/YYYY/MM/*.md` plus
-/// mailbox copies) retains the full message history independently, so the DB
-/// delete is non-destructive to the durable record — the same precedent as
-/// the file-reservation retention prune (GH#154).
-///
-/// Deletes are executed oldest-first in bounded batches of `batch_size`
-/// messages, each in its own transaction (fsqlite-friendly: bounded write
-/// sets, never one giant transaction), with at most `max_messages` messages
-/// removed per sweep. Rows referencing each pruned message are removed in
-/// FK-safe order inside the same transaction: signal receipts and delivery
-/// events first, then recipient rows, then the message itself (the
-/// `messages_ad` trigger clears `fts_messages`). Affected agents'
-/// `inbox_stats` are rebuilt in-transaction and their cached counts
-/// invalidated post-commit.
-pub async fn prune_settled_messages(
+/// Each bounded transaction removes signal receipts, delivery events,
+/// recipients, and messages in FK-safe order, rebuilds affected inbox counters,
+/// and invalidates their caches only after commit. `more` reports candidates
+/// skipped because their source or eligibility changed; the caller combines
+/// this with its bounded candidate page and unverified archive backlog.
+pub async fn prune_verified_settled_messages(
     cx: &Cx,
     pool: &DbPool,
     older_than_us: i64,
     batch_size: usize,
-    max_messages: usize,
+    candidates: &[MessagePruneCandidate],
 ) -> Outcome<MessagePruneReport, DbError> {
     let mut report = MessagePruneReport::default();
-    if max_messages == 0 {
+    if candidates.is_empty() {
         return Outcome::Ok(report);
     }
-    let batch_size = batch_size.clamp(1, MAX_IN_CLAUSE_ITEMS);
-
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-    let tracked = tracked(&*conn);
-
-    // Select eligible ids first (mirrors prune_released_file_reservations —
-    // never trust a correlated DELETE), over-fetching by one so the report
-    // can state whether backlog remains past the per-sweep cap.
-    let select_sql = format!(
-        "SELECT m.id FROM messages m \
-         WHERE m.created_ts <= ? AND {SETTLED_MESSAGE_PREDICATE} \
-         ORDER BY m.id LIMIT ?"
+    if candidates.len() > MESSAGE_PRUNE_MAX_CANDIDATES {
+        return Outcome::Err(DbError::InvalidArgument {
+            field: "candidates",
+            message: "message retention candidate limit exceeded".to_string(),
+        });
+    }
+    let source_identity = pool.sqlite_identity_key();
+    let mut unique_ids = HashSet::with_capacity(candidates.len());
+    if candidates.iter().any(|candidate| {
+        candidate.source_identity != source_identity || !unique_ids.insert(candidate.id)
+    }) {
+        return Outcome::Err(DbError::InvalidArgument {
+            field: "candidates",
+            message: "message retention requires unique candidates from the same live pool"
+                .to_string(),
+        });
+    }
+    let batch_size = batch_size.clamp(1, MESSAGE_PRUNE_MAX_CANDIDATES);
+    let source_sql = message_archive_source_sql();
+    let eligibility_sql = format!(
+        "SELECT m.id FROM messages m WHERE m.id = ? AND m.created_ts <= ? \
+         AND {SETTLED_MESSAGE_PREDICATE}"
     );
-    let overfetch = i64::try_from(max_messages.saturating_add(1)).unwrap_or(i64::MAX);
-    let params = [Value::BigInt(older_than_us), Value::BigInt(overfetch)];
-    let rows = match map_sql_outcome(traw_query(cx, &tracked, &select_sql, &params).await) {
-        Outcome::Ok(rows) => rows,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-    let mut ids: Vec<i64> = Vec::with_capacity(rows.len().min(max_messages));
-    for row in &rows {
-        if let Some(id) = row_first_i64(row)
-            && ids.len() < max_messages
-        {
-            ids.push(id);
-        }
-    }
-    report.more = rows.len() > max_messages;
-    if ids.is_empty() {
-        return Outcome::Ok(report);
-    }
-    drop(conn);
 
-    for chunk in ids.chunks(batch_size) {
-        let ph = placeholders(chunk.len());
-        let chunk_params: Vec<Value> = chunk.iter().copied().map(Value::BigInt).collect();
-
+    for chunk in candidates.chunks(batch_size) {
         let batch_outcome = run_with_mvcc_retry(cx, "prune_settled_messages_batch", || async {
             let conn = match acquire_conn(cx, pool).await {
                 Outcome::Ok(c) => c,
@@ -12117,7 +12314,60 @@ pub async fn prune_settled_messages(
                 Outcome::Panicked(p) => return Outcome::Panicked(p),
             };
             let tracked = self::tracked(&*conn);
-            try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+            // The source/eligibility check and cascade must serialize against
+            // payload edits and new recipients, including phantom insertions.
+            try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+
+            if pool.sqlite_identity_key() != source_identity {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::InvalidArgument {
+                    field: "candidates",
+                    message: "message retention source pool changed".to_string(),
+                });
+            }
+
+            let mut ids = Vec::with_capacity(chunk.len());
+            for candidate in chunk {
+                let eligible = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(
+                        traw_query(
+                            cx,
+                            &tracked,
+                            &eligibility_sql,
+                            &[Value::BigInt(candidate.id), Value::BigInt(older_than_us)],
+                        )
+                        .await
+                    )
+                );
+                if eligible.first().and_then(row_first_i64) != Some(candidate.id) {
+                    continue;
+                }
+                let current = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(
+                        traw_query(
+                            cx,
+                            &tracked,
+                            &source_sql,
+                            &message_archive_source_params(candidate.id),
+                        )
+                        .await
+                    )
+                );
+                if message_archive_source_matches(&candidate.source_rows, &current) {
+                    ids.push(candidate.id);
+                }
+            }
+            let skipped = ids.len() != chunk.len();
+            if ids.is_empty() {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Ok((0, 0, Vec::new(), skipped));
+            }
+            let ph = placeholders(ids.len());
+            let chunk_params: Vec<Value> = ids.into_iter().map(Value::BigInt).collect();
 
             // Capture affected recipients before their rows are removed so
             // inbox_stats can be rebuilt from ground truth in this
@@ -12178,15 +12428,16 @@ pub async fn prune_settled_messages(
             }
 
             try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-            Outcome::Ok((messages_deleted, recipients_deleted, agent_ids))
+            Outcome::Ok((messages_deleted, recipients_deleted, agent_ids, skipped))
         })
         .await;
 
         let chunk_agents = match batch_outcome {
-            Outcome::Ok((messages_deleted, recipients_deleted, agent_ids)) => {
+            Outcome::Ok((messages_deleted, recipients_deleted, agent_ids, skipped)) => {
                 report.deleted_messages = report.deleted_messages.saturating_add(messages_deleted);
                 report.deleted_recipients =
                     report.deleted_recipients.saturating_add(recipients_deleted);
+                report.more |= skipped;
                 agent_ids
             }
             Outcome::Err(e) => return Outcome::Err(e),
@@ -24083,7 +24334,7 @@ mod tests {
     /// the boundary — cascades FK-safely through recipient/delivery/receipt
     /// rows, respects the per-sweep cap, and reports would-prune counts.
     #[test]
-    fn prune_settled_messages_eligibility_cascade_and_cap() {
+    fn prune_verified_settled_messages_eligibility_cascade_and_cap() {
         use asupersync::runtime::RuntimeBuilder;
 
         let rt = RuntimeBuilder::current_thread()
@@ -24188,16 +24439,53 @@ mod tests {
                 .expect("count prunable");
             assert_eq!(would_prune, 3, "m1, m3, m6 are settled and past the horizon");
 
-            // Per-sweep cap: only the oldest eligible message goes, more=true.
-            let capped = prune_settled_messages(&cx, &pool, horizon, 500, 1)
+            let unverified = prune_verified_settled_messages(&cx, &pool, horizon, 500, &[])
+                .await
+                .into_result()
+                .expect("no archive proofs");
+            assert_eq!(unverified.deleted_messages, 0);
+
+            // The archive layer admits only verified observations from the
+            // bounded ID page. This DB fixture supplies that admission directly;
+            // storage tests exercise the real committed-archive gate.
+            let page = list_prunable_message_ids(&cx, &pool, horizon, 0, None, 1)
+                .await
+                .into_result()
+                .expect("capped candidate page");
+            assert_eq!(page.ids, vec![1]);
+            assert!(page.more, "eligible backlog remains past the candidate cap");
+            let first = capture_message_prune_candidate(&cx, &pool, 1)
+                .await
+                .into_result()
+                .expect("capture source")
+                .expect("complete source");
+            let capped = prune_verified_settled_messages(&cx, &pool, horizon, 500, &[first])
                 .await
                 .into_result()
                 .expect("capped prune");
             assert_eq!(capped.deleted_messages, 1);
-            assert!(capped.more, "eligible backlog remains past the cap");
+            assert!(!capped.more, "the verified source did not change");
 
             // Drain with a small batch size to exercise multi-batch commits.
-            let report = prune_settled_messages(&cx, &pool, horizon, 1, 500)
+            let next = list_prunable_message_ids(
+                &cx, &pool, horizon, 1, Some(page.ceiling), 500,
+            )
+            .await
+            .into_result()
+            .expect("remaining candidate page");
+            assert_eq!(next.ids, vec![3, 6]);
+            assert!(!next.more);
+            let mut verified = Vec::new();
+            for id in next.ids {
+                verified.push(
+                    capture_message_prune_candidate(&cx, &pool, id)
+                        .await
+                        .into_result()
+                        .expect("capture source")
+                        .expect("complete source"),
+                );
+            }
+            let report = prune_verified_settled_messages(&cx, &pool, horizon, 1, &verified)
                 .await
                 .into_result()
                 .expect("full prune");
@@ -24267,6 +24555,179 @@ mod tests {
                 )
                 .expect("count unread");
             assert_eq!(unread_b[0].get_named::<i64>("c").unwrap(), 1, "m2 stays unread for B");
+        });
+    }
+
+    async fn seed_message_prune_source_fixture(cx: &Cx, pool: &DbPool) {
+        let conn = acquire_conn(cx, pool)
+            .await
+            .into_result()
+            .expect("seed connection");
+        for sql in [
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'prune-source', '/tmp/prune-source', 1), (2, 'other-source', '/tmp/other-source', 1)",
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES (1, 1, 'BlueLake', 'test', 'test', 1, 1), (2, 1, 'GreenStone', 'test', 'test', 1, 1), (3, 1, 'AmberHill', 'test', 'test', 1, 1), (4, 2, 'RedPeak', 'test', 'test', 1, 1)",
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments, archive_metadata_json) VALUES (1, 1, 1, 'thread', 'topic', 'subject', 'body', 'normal', 1, 1, '{\"to\":[\"GreenStone\"],\"cc\":[],\"bcc\":[]}', '[]', '{}')",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (1, 2, 'to', 2, 3)",
+            "INSERT INTO message_delivery_signal_receipts (message_id, agent_id, delivery_route, signal_path_digest, observed_ts) VALUES (1, 2, 'signal_file', 'digest', 4)",
+        ] {
+            conn.execute_raw(sql).expect("seed retention source");
+        }
+    }
+
+    #[test]
+    fn prune_verified_messages_rechecks_source_and_settlement_before_cascade() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("prune_verified_source_changes.db");
+        rt.block_on(async {
+            seed_message_prune_source_fixture(&cx, &pool).await;
+            let cases = [
+                ("body", "UPDATE messages SET body_md = 'new body' WHERE id = 1", "UPDATE messages SET body_md = 'body' WHERE id = 1"),
+                ("subject", "UPDATE messages SET subject = 'new subject' WHERE id = 1", "UPDATE messages SET subject = 'subject' WHERE id = 1"),
+                ("thread", "UPDATE messages SET thread_id = 'new thread' WHERE id = 1", "UPDATE messages SET thread_id = 'thread' WHERE id = 1"),
+                ("topic", "UPDATE messages SET topic = 'new topic' WHERE id = 1", "UPDATE messages SET topic = 'topic' WHERE id = 1"),
+                ("importance", "UPDATE messages SET importance = 'urgent' WHERE id = 1", "UPDATE messages SET importance = 'normal' WHERE id = 1"),
+                ("attachment", "UPDATE messages SET attachments = '[{\"path\":\"new.bin\"}]' WHERE id = 1", "UPDATE messages SET attachments = '[]' WHERE id = 1"),
+                ("reply parent", "UPDATE messages SET archive_metadata_json = '{\"reply_to\":99}' WHERE id = 1", "UPDATE messages SET archive_metadata_json = '{}' WHERE id = 1"),
+                ("unknown reply authority", "UPDATE messages SET archive_metadata_json = NULL WHERE id = 1", "UPDATE messages SET archive_metadata_json = '{}' WHERE id = 1"),
+                ("recipient cache", "UPDATE messages SET recipients_json = '{}' WHERE id = 1", "UPDATE messages SET recipients_json = '{\"to\":[\"GreenStone\"],\"cc\":[],\"bcc\":[]}' WHERE id = 1"),
+                ("message project", "UPDATE messages SET project_id = 2 WHERE id = 1", "UPDATE messages SET project_id = 1 WHERE id = 1"),
+                ("sender identity", "UPDATE messages SET sender_id = 4 WHERE id = 1", "UPDATE messages SET sender_id = 1 WHERE id = 1"),
+                ("sender name", "UPDATE agents SET name = 'NewSender' WHERE id = 1", "UPDATE agents SET name = 'BlueLake' WHERE id = 1"),
+                ("sender project", "UPDATE agents SET project_id = 2 WHERE id = 1", "UPDATE agents SET project_id = 1 WHERE id = 1"),
+                ("project slug", "UPDATE projects SET slug = 'new-slug' WHERE id = 1", "UPDATE projects SET slug = 'prune-source' WHERE id = 1"),
+                ("project key", "UPDATE projects SET human_key = '/tmp/new-key' WHERE id = 1", "UPDATE projects SET human_key = '/tmp/prune-source' WHERE id = 1"),
+                ("recipient name", "UPDATE agents SET name = 'NewRecipient' WHERE id = 2", "UPDATE agents SET name = 'GreenStone' WHERE id = 2"),
+                ("recipient project", "UPDATE agents SET project_id = 2 WHERE id = 2", "UPDATE agents SET project_id = 1 WHERE id = 2"),
+                ("BCC routing", "UPDATE message_recipients SET kind = 'bcc' WHERE message_id = 1", "UPDATE message_recipients SET kind = 'to' WHERE message_id = 1"),
+                ("new settled delivery", "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (1, 3, 'cc', 2, 3)", "DELETE FROM message_recipients WHERE message_id = 1 AND agent_id = 3"),
+                ("read reset", "UPDATE message_recipients SET read_ts = NULL WHERE message_id = 1", "UPDATE message_recipients SET read_ts = 2 WHERE message_id = 1"),
+                ("ack reset", "UPDATE message_recipients SET ack_ts = NULL WHERE message_id = 1", "UPDATE message_recipients SET ack_ts = 3 WHERE message_id = 1"),
+                ("read timestamp", "UPDATE message_recipients SET read_ts = 5 WHERE message_id = 1", "UPDATE message_recipients SET read_ts = 2 WHERE message_id = 1"),
+                ("ack timestamp", "UPDATE message_recipients SET ack_ts = 5 WHERE message_id = 1", "UPDATE message_recipients SET ack_ts = 3 WHERE message_id = 1"),
+                ("age", "UPDATE messages SET created_ts = 101 WHERE id = 1", "UPDATE messages SET created_ts = 1 WHERE id = 1"),
+                ("ack policy", "UPDATE messages SET ack_required = 0 WHERE id = 1", "UPDATE messages SET ack_required = 1 WHERE id = 1"),
+            ];
+            for (name, mutation, restore) in cases {
+                let candidate = capture_message_prune_candidate(&cx, &pool, 1)
+                    .await.into_result().expect("capture source").expect("complete source");
+                let conn = acquire_conn(&cx, &pool).await.into_result().expect("mutation connection");
+                conn.execute_raw(mutation).expect("change after archive verification");
+                let recipient_count = conn.query_sync("SELECT COUNT(*) FROM message_recipients WHERE message_id = 1", &[])
+                    .expect("recipient count")[0].get_as::<i64>(0).expect("integer count");
+                drop(conn);
+
+                let report = prune_verified_settled_messages(&cx, &pool, 100, 32, &[candidate])
+                    .await.into_result().expect("recheck stale verification");
+                assert_eq!(report.deleted_messages, 0, "{name} invalidates archive proof");
+                assert_eq!(report.deleted_recipients, 0, "{name} preserves deliveries");
+                assert!(report.more, "{name} remains for another verification pass");
+                let conn = acquire_conn(&cx, &pool).await.into_result().expect("verify connection");
+                for (table, expected) in [
+                    ("messages", 1),
+                    ("message_recipients", recipient_count),
+                    ("message_delivery_signal_receipts", 1),
+                ] {
+                    let sql = format!("SELECT COUNT(*) FROM {table}");
+                    let count = conn.query_sync(&sql, &[]).expect("count preserved rows")[0]
+                        .get_as::<i64>(0).expect("integer count");
+                    assert_eq!(count, expected, "{name}: {table} remains intact");
+                }
+                conn.execute_raw(restore).expect("restore source for next case");
+            }
+
+            // A foreign sender is valid for contact notices. The proof binds
+            // that identity without imposing a new same-project restriction.
+            let conn = acquire_conn(&cx, &pool).await.into_result().expect("foreign sender");
+            conn.execute_raw("UPDATE messages SET sender_id = 4 WHERE id = 1").unwrap();
+            drop(conn);
+            let candidate = capture_message_prune_candidate(&cx, &pool, 1)
+                .await.into_result().unwrap().unwrap();
+            let report = prune_verified_settled_messages(&cx, &pool, 100, 32, &[candidate])
+                .await.into_result().expect("unchanged source control");
+            assert_eq!(report.deleted_messages, 1);
+            assert_eq!(report.deleted_recipients, 1);
+            assert!(!report.more);
+        });
+    }
+
+    #[test]
+    fn prune_verified_messages_rejects_other_pool_and_keeps_unverified_rows() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("prune_verified_pool.db");
+        let (_, other_pool, _other_dir) = setup_test_pool("prune_other_pool.db");
+        rt.block_on(async {
+            seed_message_prune_source_fixture(&cx, &pool).await;
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw("INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts, archive_metadata_json) VALUES (2, 1, 1, 'unverified', 'only in SQLite', 1, '{}')").unwrap();
+            drop(conn);
+            let verified = [capture_message_prune_candidate(&cx, &pool, 1)
+                .await.into_result().unwrap().unwrap()];
+            assert!(matches!(
+                prune_verified_settled_messages(&cx, &other_pool, 100, 32, &verified).await,
+                Outcome::Err(DbError::InvalidArgument { field: "candidates", .. })
+            ));
+            let report = prune_verified_settled_messages(&cx, &pool, 100, 32, &verified)
+                .await.into_result().expect("verified source prune");
+            assert_eq!(report.deleted_messages, 1);
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            let rows = conn.query_sync("SELECT id, body_md FROM messages", &[]).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get_as::<i64>(0).unwrap(), 2);
+            assert_eq!(rows[0].get_as::<String>(1).unwrap(), "only in SQLite");
+        });
+    }
+
+    #[test]
+    fn message_prune_candidates_are_bounded_and_finish_finite_rounds() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("prune_candidate_bounds.db");
+        rt.block_on(async {
+            seed_message_prune_source_fixture(&cx, &pool).await;
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            for id in 2..=40 {
+                conn.execute_raw(&format!("INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES ({id}, 1, 1, 'old', 'body', 1)")).unwrap();
+            }
+            drop(conn);
+            let page = list_prunable_message_ids(&cx, &pool, 100, 0, None, 5000)
+                .await.into_result().expect("bounded page");
+            assert_eq!(page.ids, (1..=32).collect::<Vec<_>>());
+            assert_eq!(page.ceiling, 40);
+            assert!(page.more);
+
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw("INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES (41, 1, 1, 'late old import', 'body', 1)").unwrap();
+            drop(conn);
+            let tail = list_prunable_message_ids(&cx, &pool, 100, 32, Some(page.ceiling), 5000)
+                .await.into_result().expect("finite round tail");
+            assert_eq!(tail.ids, (33..=40).collect::<Vec<_>>());
+            assert!(!tail.more, "later imports cannot prevent revisiting deferred rows");
+            let restarted = list_prunable_message_ids(&cx, &pool, 100, 0, None, 1)
+                .await.into_result().unwrap();
+            assert_eq!(restarted.ids, vec![1]);
+            assert_eq!(restarted.ceiling, 41);
+
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw("UPDATE message_recipients SET ack_ts = 'not a timestamp' WHERE message_id = 1").unwrap();
+            drop(conn);
+            assert!(capture_message_prune_candidate(&cx, &pool, 1)
+                .await.into_result().expect("invalid receipt observation").is_none());
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw("UPDATE message_recipients SET ack_ts = 3 WHERE message_id = 1").unwrap();
+            conn.execute_raw(&format!("UPDATE messages SET body_md = zeroblob({}) WHERE id = 1", MESSAGE_ARCHIVE_MAX_PAYLOAD_BYTES + 1)).unwrap();
+            drop(conn);
+            assert!(capture_message_prune_candidate(&cx, &pool, 1)
+                .await.into_result().expect("oversize observation").is_none());
+            assert!(capture_message_prune_candidate(&cx, &pool, 999)
+                .await.into_result().expect("missing observation").is_none());
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            let exists = conn.query_sync("SELECT id FROM messages WHERE id = 1", &[]).unwrap();
+            assert_eq!(exists.len(), 1, "unverifiable payload retains its SQLite copy");
         });
     }
 

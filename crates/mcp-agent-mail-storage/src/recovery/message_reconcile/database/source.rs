@@ -61,31 +61,7 @@ fn decode_archive_metadata(
 // missing recipient identity must be reported, not silently dropped by a join.
 // The extra row beyond the recipient limit is an overflow witness, not mail
 // that the recovery worker is allowed to discard.
-const SOURCE_SQL: &str = "\
-SELECT 0 AS row_kind, m.id, m.project_id, m.subject, m.body_md, m.thread_id, m.topic, \
-       m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
-       m.archive_metadata_json, \
-       p.slug AS project_slug, p.human_key AS project_key, a.name AS sender, \
-       NULL AS recipient_id, NULL AS recipient_project_id, \
-       NULL AS recipient_name, NULL AS recipient_kind \
-FROM messages m JOIN projects p ON p.id = m.project_id \
-JOIN agents a ON a.id = m.sender_id \
-WHERE m.id = ?1 AND \
-      length(CAST(m.body_md AS BLOB)) + length(CAST(m.subject AS BLOB)) + \
-      length(CAST(m.recipients_json AS BLOB)) + length(CAST(m.attachments AS BLOB)) + \
-      length(CAST(m.importance AS BLOB)) + length(CAST(p.slug AS BLOB)) + \
-      length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
-      COALESCE(length(CAST(m.thread_id AS BLOB)), 0) + \
-      COALESCE(length(CAST(m.topic AS BLOB)), 0) + \
-      COALESCE(length(CAST(m.archive_metadata_json AS BLOB)), 0) <= ?2 \
-UNION ALL \
-SELECT 1, mr.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
-       NULL, NULL, NULL, mr.agent_id, a.project_id, \
-       CASE WHEN length(CAST(a.name AS BLOB)) <= ?3 THEN a.name ELSE NULL END, \
-       CASE WHEN length(CAST(mr.kind AS BLOB)) <= 3 THEN mr.kind ELSE NULL END \
-FROM message_recipients mr LEFT JOIN agents a ON a.id = mr.agent_id \
-WHERE mr.message_id = ?1 \
-ORDER BY row_kind, recipient_id";
+const SOURCE_SQL: &str = mcp_agent_mail_db::queries::MESSAGE_ARCHIVE_SOURCE_SQL;
 
 pub(super) fn prepare_message(cx: &Cx, pool: &DbPool, id: i64) -> Result<PreparedMessage, String> {
     let conn = outcome(block_on(pool.acquire(cx)))?;
@@ -111,6 +87,13 @@ fn read_source(
             MAX_RECIPIENT_NAME_BYTES.into(),
         ],
     )?;
+    prepare_source_rows(id, &rows)
+}
+
+/// Retention verifies the exact projection captured by the database, then the
+/// deletion transaction rechecks that same projection. A second independent
+/// read here could otherwise verify different content from the deletion witness.
+pub(super) fn prepare_source_rows(id: i64, rows: &[Row]) -> Result<PreparedMessage, String> {
     let row = rows
         .first()
         .filter(|row| row.get_named::<i64>("row_kind").ok() == Some(0))

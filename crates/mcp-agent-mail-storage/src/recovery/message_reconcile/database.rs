@@ -1,8 +1,9 @@
 //! Bounded live-DB to archive convergence for the maintenance worker.
 //!
-//! This is not the archive-to-DB reconstruction path. It never substitutes an
-//! archive snapshot for the live source and never modifies mailbox rows. The
-//! worker must supply its live pool for the same configured mailbox/root.
+//! Repair never substitutes an archive snapshot for the live source or modifies
+//! mailbox rows. Separately enabled retention deletes settled rows only after
+//! verifying their complete archive and rechecking the live source. Both paths
+//! require the server's writable pool for the same configured mailbox/root.
 
 mod source;
 mod staged;
@@ -13,6 +14,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
 use mcp_agent_mail_core::Config;
+use mcp_agent_mail_db::queries::{
+    MessagePruneReport, capture_message_prune_candidate, list_prunable_message_ids,
+    prune_verified_settled_messages,
+};
 use mcp_agent_mail_db::{DbError, DbPool, corruption_circuit_breaker};
 use serde::Serialize;
 use serde_json::Value;
@@ -66,6 +71,30 @@ pub struct ReconcileReport {
     pub payload_bytes: usize,
     pub interrupted: bool,
     pub budget_exhausted: bool,
+}
+
+/// A finite retention round revisits unavailable archive evidence without
+/// allowing one broken old message or continuous imports to pin progress.
+#[derive(Debug, Default)]
+pub struct ArchivePruneCursor {
+    source_identity: String,
+    after: i64,
+    ceiling: Option<i64>,
+}
+
+/// Archive verification is separate from age/read/ack eligibility. A deferred
+/// message remains in SQLite even when it is otherwise old enough to prune.
+#[derive(Debug, Default)]
+pub struct ArchivePruneReport {
+    pub scanned: usize,
+    pub deferred: usize,
+    pub payload_bytes: usize,
+    /// Unique bundle content admitted, including failed verification attempts.
+    /// Git validation and disk comparison can read each artifact more than once.
+    pub archive_bytes: usize,
+    pub interrupted: bool,
+    pub budget_exhausted: bool,
+    pub pruned: MessagePruneReport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -510,6 +539,39 @@ impl CommittedMessages {
         Ok(Self { repo, tree_id })
     }
 
+    fn file_identity(
+        &self,
+        archive: &ProjectArchive,
+        path: &std::path::Path,
+    ) -> Result<(git2::Oid, usize), String> {
+        let tree_id = self
+            .tree_id
+            .ok_or("retention requires a committed archive")?;
+        let relative = crate::rel_path_cached(&archive.canonical_repo_root, path)
+            .map_err(|error| error.to_string())?;
+        let tree = self
+            .repo
+            .find_tree(tree_id)
+            .map_err(|error| error.to_string())?;
+        let entry = tree
+            .get_path(std::path::Path::new(&relative))
+            .map_err(|error| format!("retention archive is missing {relative}: {error}"))?;
+        if entry.kind() != Some(git2::ObjectType::Blob)
+            || !matches!(entry.filemode(), 0o100644 | 0o100755)
+        {
+            return Err("retention archive evidence is not a regular-file blob".into());
+        }
+        let (size, kind) = self
+            .repo
+            .odb()
+            .and_then(|odb| odb.read_header(entry.id()))
+            .map_err(|error| error.to_string())?;
+        if kind != git2::ObjectType::Blob {
+            return Err("retention archive evidence is not a blob".into());
+        }
+        Ok((entry.id(), size))
+    }
+
     fn read(
         &self,
         archive: &ProjectArchive,
@@ -666,6 +728,278 @@ pub fn reconcile_message_batch(
             }
         }
         cursor.advance(id, tail);
+    }
+    Ok(report)
+}
+
+/// Verify all message copies and referenced attachments against one committed
+/// tree, then check that those exact objects remain in HEAD and on disk. Git
+/// staging or working-tree files alone cannot authorize deleting the DB source.
+/// `None` means the complete bundle fits a fresh pass but not its remaining budget.
+fn verify_retention_archive(
+    archive: &ProjectArchive,
+    prepared: &PreparedMessage,
+    admitted_bytes: &mut usize,
+) -> Result<Option<usize>, String> {
+    let paths = crate::message_paths_for_bundle(
+        archive,
+        &prepared.message,
+        &prepared.sender,
+        &prepared.recipients,
+    )
+    .map_err(|error| error.to_string())?
+    .0;
+    let attachments = super::attachments::required_paths(archive, &prepared.message)
+        .map_err(|error| error.to_string())?;
+    let committed = CommittedMessages::open(archive)?;
+    let mut expected = Vec::new();
+    let mut bundle_bytes = 0_usize;
+    let mut message_bytes = 0_usize;
+    for (path, message) in std::iter::once((&paths.canonical, true))
+        .chain(std::iter::once((&paths.outbox, true)))
+        .chain(paths.inbox.iter().map(|path| (path, true)))
+        .chain(attachments.iter().map(|path| (path, false)))
+    {
+        let (oid, size) = committed.file_identity(archive, path)?;
+        if message && size > super::MAX_MESSAGE_ARTIFACT_BYTES {
+            return Err("retention message exceeds the archive artifact byte bound".into());
+        }
+        bundle_bytes = bundle_bytes
+            .checked_add(size)
+            .filter(|bytes| *bytes <= super::MAX_BUNDLE_BYTES)
+            .ok_or("retention bundle exceeds the archive byte bound")?;
+        if message {
+            message_bytes += size;
+        }
+        expected.push((path, oid));
+    }
+    if bundle_bytes > super::MAX_BUNDLE_BYTES.saturating_sub(*admitted_bytes) {
+        return Ok(None);
+    }
+    // Failed/conflicting candidates consume their read admission too. Charging
+    // only successful proofs would let corrupt large bundles bypass the budget.
+    *admitted_bytes += bundle_bytes;
+    let mut surviving = None;
+    for path in [&paths.canonical, &paths.outbox] {
+        let (message, body) = committed
+            .read(archive, path)?
+            .ok_or("retention requires committed canonical and outbox copies")?;
+        validate_surviving_message(prepared, &message, &body)?;
+        merge_surviving_metadata(
+            &mut surviving,
+            message,
+            "retention canonical and outbox metadata disagree",
+        )?;
+    }
+    for path in &paths.inbox {
+        let (message, body) = committed
+            .read(archive, path)?
+            .ok_or("retention requires every committed recipient inbox copy")?;
+        let message = restore_inbox_metadata(prepared, message, &body)?;
+        merge_surviving_metadata(
+            &mut surviving,
+            message,
+            "retention canonical and inbox metadata disagree",
+        )?;
+    }
+    // Reuse attachment path, size and content-digest validation. The preceding
+    // inventory requires committed blobs even when repair could use a proven
+    // uncommitted original. This verifier never creates or commits files.
+    let files = super::attachments::prepare(
+        &committed.repo,
+        archive,
+        &prepared.message,
+        bundle_bytes - message_bytes,
+    )
+    .map_err(|error| error.to_string())?;
+    for (path, bytes) in files {
+        let (oid, _) = committed.file_identity(archive, &path)?;
+        if git2::Oid::hash_object_ext(git2::ObjectType::Blob, &bytes, oid.object_format())
+            .map_err(|error| error.to_string())?
+            != oid
+        {
+            return Err("retention attachment differs from its committed authority".into());
+        }
+    }
+    let current = CommittedMessages::open(archive)?;
+    for (path, oid) in expected {
+        if current.file_identity(archive, path)?.0 != oid {
+            return Err("retention archive changed during verification".into());
+        }
+        let blob = committed
+            .repo
+            .find_blob(oid)
+            .map_err(|error| error.to_string())?;
+        if git2::Oid::hash_object_ext(git2::ObjectType::Blob, blob.content(), oid.object_format())
+            .map_err(|error| error.to_string())?
+            != oid
+            || super::artifact_missing(path, blob.content()).map_err(|error| error.to_string())?
+        {
+            return Err("retention requires intact committed and on-disk archive copies".into());
+        }
+    }
+    Ok(Some(bundle_bytes))
+}
+
+enum PruneAttempt {
+    Pruned(MessagePruneReport),
+    NextBatch,
+    Interrupted,
+}
+
+fn prune_retention_candidate(
+    cx: &Cx,
+    pool: &DbPool,
+    config: &Config,
+    older_than_us: i64,
+    id: i64,
+    report: &mut ArchivePruneReport,
+    stop: &AtomicBool,
+) -> Result<PruneAttempt, String> {
+    let candidate = outcome(block_on(capture_message_prune_candidate(cx, pool, id)))?
+        .ok_or("retention source is missing, oversized or incomplete")?;
+    let prepared = source::prepare_source_rows(id, candidate.source_rows())?;
+    match payload_admission(report.payload_bytes, prepared.payload_bytes) {
+        PayloadAdmission::NextBatch => return Ok(PruneAttempt::NextBatch),
+        PayloadAdmission::Oversized => {
+            return Err("retention source exceeds the payload byte bound".into());
+        }
+        PayloadAdmission::Fits => report.payload_bytes += prepared.payload_bytes,
+    }
+    // Match archive writers' lock order: publication fence, then project lock.
+    // Keep both through the DB commit so cooperating archive writes cannot
+    // invalidate the evidence between verification and destructive retention.
+    let _mutation = crate::ArchiveMutationGuard::begin_at(&config.storage_root);
+    let archive = crate::open_archive(config, &prepared.project_slug)
+        .map_err(|error| error.to_string())?
+        .ok_or("retention requires an existing authoritative project archive")?;
+    crate::with_project_lock(&archive, || {
+        if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+            return Ok(PruneAttempt::Interrupted);
+        }
+        if verify_retention_archive(&archive, &prepared, &mut report.archive_bytes)
+            .map_err(super::invalid)?
+            .is_none()
+        {
+            return Ok(PruneAttempt::NextBatch);
+        }
+        if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+            return Ok(PruneAttempt::Interrupted);
+        }
+        let pruned = outcome(block_on(prune_verified_settled_messages(
+            cx,
+            pool,
+            older_than_us,
+            1,
+            std::slice::from_ref(&candidate),
+        )))
+        .map_err(super::invalid)?;
+        Ok(PruneAttempt::Pruned(pruned))
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// Prune only settled messages whose complete archive has been verified.
+///
+/// Each pass inspects at most 32 IDs and admits 16 MiB of prepared DB payload
+/// plus 64 MiB of unique archive bundle content. Raw SQL projections have a
+/// separate per-candidate bound; invalid projections still count toward the ID
+/// limit. Some objects are read repeatedly for Git and disk validation.
+/// Missing, conflicting or oversized evidence leaves the
+/// DB row intact for the repair worker. The deletion transaction rechecks the
+/// exact source projection and settlement observed before archive I/O.
+/// Connections are released during archive reads. One write-activity lease
+/// excludes recovery promotion from source selection through deletion; each
+/// candidate also retains the archive publication fence and project lock.
+pub fn prune_archived_message_batch(
+    cx: &Cx,
+    pool: &DbPool,
+    config: &Config,
+    older_than_us: i64,
+    cursor: &mut ArchivePruneCursor,
+    stop: &AtomicBool,
+) -> Result<ArchivePruneReport, String> {
+    let mut report = ArchivePruneReport::default();
+    if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+        report.interrupted = true;
+        return Ok(report);
+    }
+    if corruption_circuit_breaker().is_tripped() {
+        return Err("archive-verified retention refused: source corruption breaker is open".into());
+    }
+    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+    validate_pool_binding(pool, config)?;
+    {
+        let conn = outcome(block_on(pool.acquire(cx)))?;
+        let rows = conn
+            .query_sync("PRAGMA query_only", &[])
+            .map_err(source_error)?;
+        if rows.first().and_then(|row| row.get_as::<i64>(0).ok()) != Some(0) {
+            return Err("query-only snapshots cannot authorize message retention".into());
+        }
+    }
+    let identity = pool.sqlite_identity_key();
+    if cursor.source_identity != identity {
+        *cursor = ArchivePruneCursor {
+            source_identity: identity,
+            ..Default::default()
+        };
+    }
+    let page = outcome(block_on(list_prunable_message_ids(
+        cx,
+        pool,
+        older_than_us,
+        cursor.after,
+        cursor.ceiling,
+        mcp_agent_mail_db::queries::MESSAGE_PRUNE_MAX_CANDIDATES,
+    )))?;
+    cursor.ceiling = Some(page.ceiling);
+    let mut completed_page = true;
+    for id in page.ids {
+        if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+            report.interrupted = true;
+            completed_page = false;
+            break;
+        }
+        if corruption_circuit_breaker().is_tripped() {
+            return Err("archive-verified retention stopped: source corruption observed".into());
+        }
+        let result =
+            prune_retention_candidate(cx, pool, config, older_than_us, id, &mut report, stop);
+        match result {
+            Ok(PruneAttempt::NextBatch) => {
+                report.budget_exhausted = true;
+                completed_page = false;
+                break;
+            }
+            Ok(PruneAttempt::Interrupted) => {
+                report.interrupted = true;
+                completed_page = false;
+                break;
+            }
+            Ok(PruneAttempt::Pruned(pruned)) => {
+                report.pruned.deleted_messages += pruned.deleted_messages;
+                report.pruned.deleted_recipients += pruned.deleted_recipients;
+                if pruned.deleted_messages == 0 {
+                    report.deferred += 1;
+                }
+            }
+            Err(reason) => {
+                report.deferred += 1;
+                tracing::warn!(
+                    target: "maintenance", event = "message_retention_archive_deferred",
+                    message_id = id, reason = %reason,
+                    "settled message retained until complete archive evidence is available"
+                );
+            }
+        }
+        report.scanned += 1;
+        cursor.after = id;
+    }
+    report.pruned.more = page.more || !completed_page || report.deferred > 0;
+    if completed_page && !page.more {
+        cursor.after = 0;
+        cursor.ceiling = None;
     }
     Ok(report)
 }
@@ -1304,6 +1638,306 @@ mod tests {
                 receipts[0].get_named::<Option<i64>>("ack_ts").unwrap(),
                 None
             );
+        });
+    }
+
+    fn retention_fixture(count: i64, test: impl FnOnce(&Cx, &DbPool, &Config)) {
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
+            let temp = tempfile::tempdir().unwrap();
+            let storage_root = temp.path().join("archive");
+            std::fs::create_dir_all(&storage_root).unwrap();
+            let database_url =
+                mcp_agent_mail_core::disk::sqlite_url_from_path(&temp.path().join("mail.sqlite3"));
+            let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: database_url.clone(),
+                storage_root: Some(storage_root.clone()),
+                min_connections: 1,
+                max_connections: 1,
+                ..Default::default()
+            })
+            .unwrap();
+            let cx = Cx::for_testing();
+            let conn = outcome(block_on(pool.acquire(&cx))).unwrap();
+            conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(101, 'project', '/project', 1)").unwrap();
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts) \
+                VALUES(101, 101, 'BlueLake', 'test', 'test', '', 1, 1), \
+                (102, 101, 'GreenStone', 'test', 'test', '', 1, 1), \
+                (103, 101, 'RedFox', 'test', 'test', '', 1, 1)").unwrap();
+            for id in 901..901 + count {
+                conn.execute_raw(&format!(
+                    "INSERT INTO messages(id, project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments, archive_metadata_json) \
+                    VALUES({id}, 101, 101, 'retained-thread', 'handoffs', 'handoff-{id}', 'Keep every body.', 'high', 1, 1000000, \
+                    '{{\"to\":[\"GreenStone\"],\"cc\":[],\"bcc\":[\"RedFox\"]}}', '[]', '{{\"reply_to\":700}}')"
+                )).unwrap();
+                conn.execute_raw(&format!(
+                    "INSERT INTO message_recipients(message_id, agent_id, kind, read_ts, ack_ts) \
+                    VALUES({id}, 102, 'to', 2000000, 2500000), ({id}, 103, 'bcc', 2000000, 2500000)"
+                ))
+                .unwrap();
+            }
+            drop(conn);
+            test(
+                &cx,
+                &pool,
+                &Config {
+                    database_url,
+                    storage_root,
+                    ..Config::default()
+                },
+            );
+        });
+    }
+
+    fn retained_message_ids(cx: &Cx, pool: &DbPool) -> Vec<i64> {
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.query_sync("SELECT id FROM messages ORDER BY id", &[])
+            .unwrap()
+            .iter()
+            .map(|row| row.get_named("id").unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn retention_backlog_never_outpaces_complete_archive_repair() {
+        retention_fixture(7, |cx, pool, config| {
+            let originals = (901..908)
+                .map(|id| prepare_message(cx, pool, id).unwrap())
+                .collect::<Vec<_>>();
+            let stop = AtomicBool::new(false);
+            let mut prune_cursor = ArchivePruneCursor::default();
+            let missing =
+                prune_archived_message_batch(cx, pool, config, 3_000_000, &mut prune_cursor, &stop)
+                    .unwrap();
+            assert_eq!(missing.pruned.deleted_messages, 0);
+            assert_eq!(missing.deferred, 7);
+            assert_eq!(retained_message_ids(cx, pool).len(), 7);
+
+            let mut repair_cursor = ReconcileCursor::default();
+            let first =
+                reconcile_message_batch(cx, pool, config, &mut repair_cursor, &stop).unwrap();
+            assert_eq!(first.repaired, MAX_REPAIRS_PER_BATCH);
+            let pruned =
+                prune_archived_message_batch(cx, pool, config, 3_000_000, &mut prune_cursor, &stop)
+                    .unwrap();
+            assert_eq!(pruned.pruned.deleted_messages, 4);
+            assert_eq!(pruned.pruned.deleted_recipients, 8);
+            assert_eq!(pruned.deferred, 3);
+            assert_eq!(retained_message_ids(cx, pool).len(), 3);
+            let rest =
+                reconcile_message_batch(cx, pool, config, &mut repair_cursor, &stop).unwrap();
+            assert_eq!(rest.repaired, 3);
+            let pruned =
+                prune_archived_message_batch(cx, pool, config, 3_000_000, &mut prune_cursor, &stop)
+                    .unwrap();
+            assert_eq!(pruned.pruned.deleted_messages, 3);
+            assert_eq!(pruned.deferred, 0);
+            assert!(retained_message_ids(cx, pool).is_empty());
+
+            let archive = crate::open_archive(config, "project").unwrap().unwrap();
+            for original in originals {
+                assert!(
+                    verify_retention_archive(&archive, &original, &mut 0)
+                        .unwrap()
+                        .is_some()
+                );
+                let paths = crate::message_paths_for_bundle(
+                    &archive,
+                    &original.message,
+                    &original.sender,
+                    &original.recipients,
+                )
+                .unwrap()
+                .0;
+                let (full, body) = read_surviving_message(&paths.canonical).unwrap().unwrap();
+                assert_eq!(body, "Keep every body.");
+                assert_eq!(full["reply_to"], 700);
+                assert_eq!(full["topic"], "handoffs");
+                assert_eq!(full["thread_id"], "retained-thread");
+                assert_eq!(full["bcc"], json!(["RedFox"]));
+                for inbox in paths.inbox {
+                    let (message, _) = read_surviving_message(&inbox).unwrap().unwrap();
+                    assert_eq!(message["bcc"], json!([]));
+                    assert_eq!(message["reply_to"], 700);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn retention_requires_writable_source_committed_copies_and_intact_disk() {
+        retention_fixture(1, |cx, pool, config| {
+            let mut cursor = ArchivePruneCursor::default();
+            let stopped = prune_archived_message_batch(
+                cx,
+                pool,
+                config,
+                3_000_000,
+                &mut cursor,
+                &AtomicBool::new(true),
+            )
+            .unwrap();
+            assert!(stopped.interrupted);
+            assert_eq!(stopped.scanned, 0);
+            let readonly = DbPool::new_query_only(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: config.database_url.clone(),
+                storage_root: Some(config.storage_root.clone()),
+                min_connections: 1,
+                max_connections: 1,
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(
+                prune_archived_message_batch(
+                    cx,
+                    &readonly,
+                    config,
+                    3_000_000,
+                    &mut cursor,
+                    &AtomicBool::new(false),
+                )
+                .unwrap_err()
+                .contains("query-only snapshots")
+            );
+            drop(readonly);
+            let original = prepare_message(cx, pool, 901).unwrap();
+            let archive = crate::ensure_archive(config, "project").unwrap();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &original.message,
+                &original.sender,
+                &original.recipients,
+            )
+            .unwrap()
+            .0;
+            let full =
+                crate::render_message_bundle_content(&original.message, &original.body).unwrap();
+            let inbox = crate::render_message_bundle_content(
+                &crate::redact_message_bcc_for_inbox(&original.message),
+                &original.body,
+            )
+            .unwrap();
+            for (path, bytes) in [&paths.canonical, &paths.outbox]
+                .into_iter()
+                .map(|path| (path, &full))
+                .chain(paths.inbox.iter().map(|path| (path, &inbox)))
+            {
+                crate::ensure_parent_dir(path).unwrap();
+                std::fs::write(path, bytes).unwrap();
+            }
+            let stop = AtomicBool::new(false);
+            let uncommitted =
+                prune_archived_message_batch(cx, pool, config, 3_000_000, &mut cursor, &stop)
+                    .unwrap();
+            assert_eq!(uncommitted.deferred, 1);
+            assert_eq!(uncommitted.pruned.deleted_messages, 0);
+            assert!(
+                reconcile_prepared(config, &original)
+                    .unwrap()
+                    .git_commit_needed
+            );
+
+            let held = paths.inbox[0].with_extension("held");
+            std::fs::rename(&paths.inbox[0], &held).unwrap();
+            let missing =
+                prune_archived_message_batch(cx, pool, config, 3_000_000, &mut cursor, &stop)
+                    .unwrap();
+            assert_eq!(missing.deferred, 1);
+            assert_eq!(missing.pruned.deleted_messages, 0);
+            std::fs::rename(&held, &paths.inbox[0]).unwrap();
+            std::fs::write(&paths.outbox, "conflicting working evidence").unwrap();
+            let conflict =
+                prune_archived_message_batch(cx, pool, config, 3_000_000, &mut cursor, &stop)
+                    .unwrap();
+            assert_eq!(conflict.deferred, 1);
+            assert_eq!(conflict.pruned.deleted_messages, 0);
+            assert_eq!(retained_message_ids(cx, pool), [901]);
+            std::fs::write(&paths.outbox, &full).unwrap();
+
+            let mut used = super::super::MAX_BUNDLE_BYTES;
+            assert!(
+                verify_retention_archive(&archive, &original, &mut used)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(used, super::super::MAX_BUNDLE_BYTES);
+            let complete =
+                prune_archived_message_batch(cx, pool, config, 3_000_000, &mut cursor, &stop)
+                    .unwrap();
+            assert_eq!(complete.pruned.deleted_messages, 1);
+            assert_eq!(complete.pruned.deleted_recipients, 2);
+            assert_eq!(complete.deferred, 0);
+        });
+    }
+
+    #[test]
+    fn retention_preserves_source_until_referenced_attachment_is_durable() {
+        use sha1::{Digest as _, Sha1};
+
+        retention_fixture(1, |cx, pool, config| {
+            let bytes = b"irreplaceable attachment";
+            let relative = "projects/project/attachments/files/evidence.bin";
+            let attachment = json!([{
+                "type": "file", "path": relative, "bytes": bytes.len(),
+                "sha1": format!("{:x}", Sha1::digest(bytes)),
+            }]);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(&format!(
+                "UPDATE messages SET attachments = '{attachment}' WHERE id = 901"
+            ))
+            .unwrap();
+            drop(conn);
+            let original = prepare_message(cx, pool, 901).unwrap();
+            let archive = crate::ensure_archive(config, "project").unwrap();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &original.message,
+                &original.sender,
+                &original.recipients,
+            )
+            .unwrap()
+            .0;
+            let inbox = crate::redact_message_bcc_for_inbox(&original.message);
+            commit_survivors(
+                &archive,
+                &[
+                    (&paths.canonical, &original.message),
+                    (&paths.outbox, &original.message),
+                    (&paths.inbox[0], &inbox),
+                    (&paths.inbox[1], &inbox),
+                ],
+                &original.body,
+            );
+            let path = archive.repo_root.join(relative);
+            crate::ensure_parent_dir(&path).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            let mut cursor = ArchivePruneCursor::default();
+            let stop = AtomicBool::new(false);
+            let uncommitted =
+                prune_archived_message_batch(cx, pool, config, 3_000_000, &mut cursor, &stop)
+                    .unwrap();
+            assert_eq!(uncommitted.pruned.deleted_messages, 0);
+            assert_eq!(uncommitted.deferred, 1);
+            assert!(
+                reconcile_prepared(config, &original)
+                    .unwrap()
+                    .git_commit_needed
+            );
+
+            let held = path.with_extension("held");
+            std::fs::rename(&path, &held).unwrap();
+            let missing =
+                prune_archived_message_batch(cx, pool, config, 3_000_000, &mut cursor, &stop)
+                    .unwrap();
+            assert_eq!(missing.pruned.deleted_messages, 0);
+            assert_eq!(missing.deferred, 1);
+            assert_eq!(retained_message_ids(cx, pool), [901]);
+            std::fs::rename(&held, &path).unwrap();
+            let complete =
+                prune_archived_message_batch(cx, pool, config, 3_000_000, &mut cursor, &stop)
+                    .unwrap();
+            assert_eq!(complete.pruned.deleted_messages, 1);
+            assert_eq!(complete.deferred, 0);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
         });
     }
 

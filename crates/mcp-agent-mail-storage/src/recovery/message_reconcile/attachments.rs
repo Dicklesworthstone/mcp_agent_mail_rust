@@ -229,6 +229,20 @@ pub(super) fn prepare(
     Ok(prepared)
 }
 
+/// The same validated, deduplicated attachment set used by repair. Retention
+/// inventories its committed blob sizes before reading any bytes, so neither
+/// uncommitted files nor large originals can bypass archive verification.
+pub(super) fn required_paths(
+    archive: &ProjectArchive,
+    message: &Value,
+) -> crate::Result<Vec<PathBuf>> {
+    let root = crate::archive_repo_root_checked(archive)?;
+    Ok(required_files(archive, message)?
+        .into_keys()
+        .map(|relative| root.join(relative))
+        .collect())
+}
+
 fn read_attachment(
     repo: &Repository,
     tree: Option<&git2::Tree<'_>>,

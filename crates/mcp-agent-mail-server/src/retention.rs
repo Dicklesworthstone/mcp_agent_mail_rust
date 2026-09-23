@@ -10,7 +10,8 @@
 //! `MESSAGES_RETENTION_DAYS` > 0, each cycle hard-deletes settled messages
 //! (read by every recipient, acknowledged by every recipient where the
 //! message requires it) older than the horizon from the live SQLite tables in
-//! bounded batches — the per-project git archive retains the durable history,
+//! bounded batches after verifying their complete committed archive — the
+//! per-project git archive retains the durable history,
 //! following the `prune_released_file_reservations` precedent (GH#154). When
 //! the knob is off, the phase stays report-only and logs what WOULD be pruned
 //! at the `retention_max_age_days` horizon.
@@ -32,12 +33,11 @@ use asupersync::Cx;
 use fastmcp_core::block_on;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::{
-    DbPool, DbPoolConfig, create_pool, now_micros,
-    queries::{MessagePruneReport, count_prunable_messages, prune_settled_messages},
+    DbPool, DbPoolConfig, create_pool, now_micros, queries::count_prunable_messages,
 };
 use mcp_agent_mail_storage::recovery::agent_reconcile::{self, AgentReconcileCursor};
 use mcp_agent_mail_storage::recovery::message_reconcile::database::{
-    self as message_archive_reconcile, ReconcileCursor,
+    self as message_archive_reconcile, ArchivePruneCursor, ArchivePruneReport, ReconcileCursor,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -45,15 +45,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
-
-/// Maximum messages removed per delete transaction (GH#273). Bounded so a
-/// single prune transaction never holds a large write set (fsqlite-friendly).
-const MESSAGE_PRUNE_BATCH_SIZE: usize = 500;
-
-/// Maximum messages removed per retention sweep (GH#273). A backlog larger
-/// than this drains across successive cycles instead of monopolizing the
-/// writer; the sweep logs `more=true` when it leaves eligible backlog behind.
-const MESSAGE_PRUNE_MAX_PER_SWEEP: usize = 5_000;
 
 const ARTIFACT_REPORT_SCHEMA_VERSION: u32 = 1;
 const LARGE_ARTIFACT_ROOT_WARN_BYTES: u64 = 512 * 1024 * 1024;
@@ -169,6 +160,7 @@ fn retention_loop(config: &Config) {
     let mut pool: Option<DbPool> = None;
     let mut cursor = ReconcileCursor::default();
     let mut agent_cursor = AgentReconcileCursor::default();
+    let mut prune_cursor = ArchivePruneCursor::default();
     let mut last_report: Option<Instant> = None;
 
     info!(
@@ -322,7 +314,7 @@ fn retention_loop(config: &Config) {
             // GH#273: keep the explicitly opted-in retention behavior separate
             // from the non-destructive, per-message archive repair result.
             if let Some(pool) = pool.as_ref() {
-                run_message_retention_phase(config, pool);
+                run_message_retention_phase(config, pool, &mut prune_cursor);
             }
             last_report = Some(Instant::now());
         }
@@ -336,28 +328,31 @@ fn retention_loop(config: &Config) {
 /// Run the per-cycle message retention phase against the live DB (GH#273).
 ///
 /// - `messages_retention_days > 0`: hard-delete settled messages older than
-///   the horizon in bounded batches (up to [`MESSAGE_PRUNE_MAX_PER_SWEEP`]
-///   messages per sweep, [`MESSAGE_PRUNE_BATCH_SIZE`] per transaction) and
-///   log the pruned counts.
+///   the horizon after complete archive verification, inspecting at most 32
+///   candidates per sweep, one source-rechecked deletion per transaction.
 /// - knob off, `retention_report_enabled` with `retention_max_age_days > 0`:
-///   report-only — count what a prune at the report horizon WOULD delete.
+///   report-only — count age/receipt-eligible messages at the report horizon.
+///   Archive verification is still required before any deletion.
 ///
 /// Errors are logged and swallowed (legacy worker contract: never crash).
-fn run_message_retention_phase(config: &Config, pool: &DbPool) {
+fn run_message_retention_phase(config: &Config, pool: &DbPool, cursor: &mut ArchivePruneCursor) {
     if config.messages_retention_days > 0 {
-        match message_retention_prune(config, pool) {
+        match message_retention_prune(config, pool, cursor) {
             Ok(report) => {
-                if report.deleted_messages > 0 || report.more {
+                if report.scanned > 0 || report.pruned.more || report.interrupted {
                     info!(
                         target: "maintenance",
                         event = "messages_retention_prune",
-                        deleted_messages = report.deleted_messages,
-                        deleted_recipients = report.deleted_recipients,
-                        more = report.more,
+                        deleted_messages = report.pruned.deleted_messages,
+                        deleted_recipients = report.pruned.deleted_recipients,
+                        more = report.pruned.more,
+                        scanned = report.scanned,
+                        archive_deferred = report.deferred,
+                        archive_bytes = report.archive_bytes,
+                        interrupted = report.interrupted,
+                        budget_exhausted = report.budget_exhausted,
                         retention_days = config.messages_retention_days,
-                        batch_size = MESSAGE_PRUNE_BATCH_SIZE,
-                        per_sweep_cap = MESSAGE_PRUNE_MAX_PER_SWEEP,
-                        "pruned settled messages past retention horizon (git archive retains history)"
+                        "pruned archive-verified settled messages; incomplete archive evidence remains in SQLite"
                     );
                 }
             }
@@ -374,8 +369,9 @@ fn run_message_retention_phase(config: &Config, pool: &DbPool) {
                         event = "messages_retention_report",
                         would_prune,
                         report_horizon_days = config.retention_max_age_days,
-                        "settled messages past the report horizon would be pruned; \
-                         set MESSAGES_RETENTION_DAYS > 0 to enable pruning"
+                        "settled messages meet the report age/receipt criteria; \
+                         complete archive verification is required before pruning; \
+                         set MESSAGES_RETENTION_DAYS > 0 to enable verified pruning"
                     );
                 }
             }
@@ -404,30 +400,26 @@ fn worker_cx() -> Cx {
     })
 }
 
-/// Prune settled messages past the `messages_retention_days` horizon.
-fn message_retention_prune(config: &Config, pool: &DbPool) -> Result<MessagePruneReport, String> {
-    // Message prune DELETEs hit the live mailbox; hold the in-process write
-    // lease so a recovery promotion cannot swap the database mid-write (#219).
-    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+/// Verify durable archive copies before pruning each age-eligible message.
+fn message_retention_prune(
+    config: &Config,
+    pool: &DbPool,
+    cursor: &mut ArchivePruneCursor,
+) -> Result<ArchivePruneReport, String> {
     let cx = worker_cx();
     let older_than_us = horizon_older_than_us(config.messages_retention_days);
-    match block_on(async {
-        prune_settled_messages(
-            &cx,
-            pool,
-            older_than_us,
-            MESSAGE_PRUNE_BATCH_SIZE,
-            MESSAGE_PRUNE_MAX_PER_SWEEP,
-        )
-        .await
-    }) {
-        asupersync::Outcome::Ok(report) => Ok(report),
-        other => Err(format!("prune_settled_messages failed: {other:?}")),
-    }
+    message_archive_reconcile::prune_archived_message_batch(
+        &cx,
+        pool,
+        config,
+        older_than_us,
+        cursor,
+        &SHUTDOWN,
+    )
 }
 
-/// Count what a prune at the `retention_max_age_days` report horizon WOULD
-/// delete (report-only path when `MESSAGES_RETENTION_DAYS` is off).
+/// Count age/receipt eligibility at the report horizon without archive reads.
+/// This report-only count does not establish that deletion can proceed.
 fn message_retention_would_prune(config: &Config, pool: &DbPool) -> Result<u64, String> {
     let cx = worker_cx();
     let older_than_us = horizon_older_than_us(config.retention_max_age_days);
@@ -1466,6 +1458,8 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("retention-messages.sqlite3");
+        let storage_root = tmp.path().join("archive");
+        std::fs::create_dir_all(&storage_root).unwrap();
         let pool_config = DbPoolConfig {
             database_url: format!(
                 "sqlite:////{}",
@@ -1473,6 +1467,7 @@ mod tests {
             ),
             min_connections: 1,
             max_connections: 1,
+            storage_root: Some(storage_root.clone()),
             ..Default::default()
         };
         let pool = create_pool(&pool_config).expect("create pool");
@@ -1512,14 +1507,15 @@ mod tests {
         let read_ts = now - day_us;
         let seed_conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
             .expect("open seed conn");
-        // Message 1: old + read by its only recipient → prunable.
+        // Message 1: old + read by its only recipient → age/receipt eligible,
+        // but its archive has not survived and must be repaired before pruning.
         // Message 2: old + unread → must survive any prune.
         for (id, read_expr) in [(9001_i64, format!("{read_ts}")), (9002, "NULL".to_string())] {
             seed_conn
                 .execute_raw(&format!(
                     "INSERT INTO messages \
-                     (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-                     VALUES ({id}, {project_id}, {sender_id}, 'ret', 's{id}', 'b', 'normal', 0, {old_ts}, '[]')"
+                     (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments, archive_metadata_json) \
+                     VALUES ({id}, {project_id}, {sender_id}, 'ret', 's{id}', 'b', 'normal', 0, {old_ts}, '[]', '{{}}')"
                 ))
                 .expect("insert message");
             seed_conn
@@ -1531,8 +1527,10 @@ mod tests {
         }
         drop(seed_conn);
 
-        // Knob off + report enabled: counts what WOULD be pruned, deletes nothing.
+        // Knob off + report enabled: counts age/receipt eligibility without deletion.
         let mut config = Config {
+            database_url: pool_config.database_url.clone(),
+            storage_root,
             retention_report_enabled: true,
             retention_max_age_days: 30,
             messages_retention_days: 0,
@@ -1541,7 +1539,8 @@ mod tests {
         let would_prune = message_retention_would_prune(&config, &pool).expect("would-prune count");
         assert_eq!(would_prune, 1, "only the settled old message is eligible");
 
-        run_message_retention_phase(&config, &pool);
+        let mut cursor = ArchivePruneCursor::default();
+        run_message_retention_phase(&config, &pool, &mut cursor);
         let check_conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
             .expect("open check conn");
         let count = check_conn
@@ -1554,9 +1553,25 @@ mod tests {
         );
         drop(check_conn);
 
-        // Knob on: the settled message is pruned; unread mail survives.
+        // Knob on cannot delete a DB-only message after a lost archive write.
         config.messages_retention_days = 30;
-        run_message_retention_phase(&config, &pool);
+        let deferred = message_retention_prune(&config, &pool, &mut cursor).unwrap();
+        assert_eq!(deferred.pruned.deleted_messages, 0);
+        assert_eq!(deferred.deferred, 1);
+        let repaired = message_archive_reconcile::reconcile_message_batch(
+            &cx,
+            &pool,
+            &config,
+            &mut ReconcileCursor::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(repaired.repaired, 2);
+        assert_eq!(repaired.deferred, 0);
+
+        // Once real archive repair commits every copy, the settled message is
+        // pruned while the unread message remains in the live mailbox.
+        run_message_retention_phase(&config, &pool, &mut cursor);
         let check_conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
             .expect("reopen check conn");
         let rows = check_conn
