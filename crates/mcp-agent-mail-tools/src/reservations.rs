@@ -2052,7 +2052,11 @@ pub async fn file_reservation_paths(
         };
         match create_outcome {
             asupersync::Outcome::Ok(rows) => (rows, conflicts),
-            asupersync::Outcome::Err(mcp_agent_mail_db::DbError::ResourceBusy(msg)) => {
+            // Busy storage is an acquire failure, not a successful empty grant.
+            // Only the DB's actual lease-conflict response can take this path.
+            asupersync::Outcome::Err(mcp_agent_mail_db::DbError::ResourceBusy(msg))
+                if msg.starts_with("Reservation conflict:") =>
+            {
                 // The DB layer detected a conflict that the tool layer's
                 // index check missed.  Re-read active reservations to
                 // build a fresh, accurate conflict response.
@@ -2134,7 +2138,53 @@ pub async fn file_reservation_paths(
                         });
                     }
                 }
-                (vec![], db_conflicts)
+                #[cfg(test)]
+                tests::after_reservation_conflict().await;
+
+                // The failed transaction rolled back its key along with the
+                // grants. Before returning an empty success, record that result
+                // atomically through the existing idempotent entry point. Pass
+                // no paths: a peer releasing its lease now must not turn this
+                // response into an acquisition. A concurrent same-key winner
+                // still takes precedence, including a changed-payload conflict.
+                let rows = if let Some(key) = idempotency_key.as_deref()
+                    && let Some(fingerprint) = idempotency_fingerprint.as_deref()
+                {
+                    let claim = mcp_agent_mail_db::IdempotencyClaim {
+                        project_id,
+                        tool: "file_reservation_paths",
+                        key,
+                        fingerprint,
+                    };
+                    match acquire_outcome(
+                        mcp_agent_mail_db::queries::create_file_reservations_idempotent(
+                            ctx.cx(),
+                            &pool,
+                            project_id,
+                            agent_id,
+                            &[],
+                            ttl,
+                            is_exclusive,
+                            &reason_str,
+                            claim,
+                        )
+                        .await,
+                        &paths,
+                        "file_reservation_paths",
+                    )? {
+                        mcp_agent_mail_db::IdempotentOutcome::Fresh(rows) => rows,
+                        mcp_agent_mail_db::IdempotentOutcome::Replayed(rows) => {
+                            idempotent_replay = true;
+                            rows
+                        }
+                        mcp_agent_mail_db::IdempotentOutcome::Conflict(info) => {
+                            return Err(crate::idempotency::idempotency_conflict_error(&info));
+                        }
+                    }
+                } else {
+                    vec![]
+                };
+                (rows, db_conflicts)
             }
             other => {
                 // F5: a grant failure that is not a recoverable conflict still
@@ -3217,10 +3267,19 @@ mod tests {
         // before its write transaction. No database result is substituted.
         static AFTER_RESERVATION_PRECHECK: std::cell::RefCell<Option<ReservationInterleaving>> =
             const { std::cell::RefCell::new(None) };
+        static AFTER_RESERVATION_CONFLICT: std::cell::RefCell<Option<ReservationInterleaving>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     pub(super) async fn after_reservation_precheck() {
         let action = AFTER_RESERVATION_PRECHECK.with_borrow_mut(Option::take);
+        if let Some(action) = action {
+            action.await;
+        }
+    }
+
+    pub(super) async fn after_reservation_conflict() {
+        let action = AFTER_RESERVATION_CONFLICT.with_borrow_mut(Option::take);
         if let Some(action) = action {
             action.await;
         }
@@ -3339,6 +3398,7 @@ mod tests {
                 || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
                     AFTER_RESERVATION_PRECHECK.with_borrow_mut(|hook| *hook = None);
+                    AFTER_RESERVATION_CONFLICT.with_borrow_mut(|hook| *hook = None);
                     mcp_agent_mail_storage::wbq_flush();
                     mcp_agent_mail_storage::flush_async_commits();
                     let stats = mcp_agent_mail_storage::wbq_stats();
@@ -3455,6 +3515,26 @@ mod tests {
         .expect("reservation response JSON")
     }
 
+    fn grant_peer_after_precheck(cx: &Cx, project_id: i64, peer_id: i64, path: &'static str) {
+        let config = Config::get();
+        let peer_pool = DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+            database_url: config.database_url.clone(),
+            storage_root: Some(config.storage_root.clone()),
+            run_migrations: false,
+            ..Default::default()
+        })
+        .expect("independent peer connections to the same real database");
+        let peer_cx = cx.clone();
+        AFTER_RESERVATION_PRECHECK.with_borrow_mut(|hook| {
+            *hook = Some(Box::pin(async move {
+                create_test_reservation(
+                    &peer_cx, &peer_pool, project_id, peer_id, path, 3600, true,
+                )
+                .await;
+            }));
+        });
+    }
+
     #[test]
     fn reservation_key_records_empty_grants_after_database_conflict_race() {
         with_serialized_reservations(|| {
@@ -3465,30 +3545,12 @@ mod tests {
                 let project_id = project.id.expect("project id");
                 let caller = register_agent(&cx, &pool, project_id, "GreenCastle").await;
                 let peer = register_agent(&cx, &pool, project_id, "BlueLake").await;
-                let peer_id = peer.id.expect("peer id");
-                let config = Config::get();
-                let peer_pool = DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
-                    database_url: config.database_url.clone(),
-                    storage_root: Some(config.storage_root.clone()),
-                    run_migrations: false,
-                    ..Default::default()
-                })
-                .expect("independent peer connections to the same real database");
-                let peer_cx = cx.clone();
-                AFTER_RESERVATION_PRECHECK.with_borrow_mut(|hook| {
-                    *hook = Some(Box::pin(async move {
-                        create_test_reservation(
-                            &peer_cx,
-                            &peer_pool,
-                            project_id,
-                            peer_id,
-                            "src/raced.rs",
-                            3600,
-                            true,
-                        )
-                        .await;
-                    }));
-                });
+                grant_peer_after_precheck(
+                    &cx,
+                    project_id,
+                    peer.id.expect("peer id"),
+                    "src/raced.rs",
+                );
                 let ctx = McpContext::new(cx.clone(), 1);
                 let paths = ["src/raced.rs"];
                 let first = keyed_reservation_response(
@@ -3503,6 +3565,28 @@ mod tests {
                 assert_eq!(first["conflicts"][0]["holders"][0]["agent"], peer.name);
                 assert!(AFTER_RESERVATION_PRECHECK.with_borrow(|hook| hook.is_none()));
 
+                let config = Config::get();
+                let conn = mcp_agent_mail_db::DbConn::open_file(
+                    config
+                        .database_url
+                        .strip_prefix("sqlite://")
+                        .expect("test database path"),
+                )
+                .expect("independent durable-key witness");
+                let recorded = conn
+                    .query_sync(
+                        "SELECT result_json FROM idempotency_keys \
+                         WHERE tool = 'file_reservation_paths' AND idempotency_key = 'conflict-race'",
+                        &[],
+                    )
+                    .expect("read recorded empty result");
+                assert_eq!(recorded.len(), 1);
+                assert_eq!(
+                    recorded[0].get_as::<String>(0).expect("recorded result"),
+                    "[]"
+                );
+                drop(conn);
+
                 release_file_reservations(&ctx, project_key.clone(), peer.name, None, None)
                     .await
                     .expect("release the racing peer's lease");
@@ -3511,6 +3595,7 @@ mod tests {
                     .into_result()
                     .expect("active rows after peer release");
                 assert!(active.is_empty());
+                let enqueued = mcp_agent_mail_storage::wbq_stats().enqueued;
                 let replay = keyed_reservation_response(
                     &ctx,
                     &project_key,
@@ -3525,6 +3610,7 @@ mod tests {
                 );
                 assert_eq!(replay["idempotent_replay"], true);
                 assert_eq!(replay["conflicts"], json!([]));
+                assert_eq!(mcp_agent_mail_storage::wbq_stats().enqueued, enqueued);
                 let active = queries::get_active_reservations(&cx, &pool, project_id)
                     .await
                     .into_result()
@@ -3535,6 +3621,118 @@ mod tests {
                 );
             });
         });
+    }
+
+    fn reservation_conflict_race_with_key_winner(change_ttl: bool) {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/reservation-key-winner-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let caller = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let peer = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                grant_peer_after_precheck(
+                    &cx,
+                    project_id,
+                    peer.id.expect("peer id"),
+                    "src/raced.rs",
+                );
+
+                let observed = std::sync::Arc::new(Mutex::new(None));
+                let observed_winner = observed.clone();
+                let winner_project = project_key.clone();
+                let winner_name = caller.name.clone();
+                let winner_cx = cx.clone();
+                AFTER_RESERVATION_CONFLICT.with_borrow_mut(|hook| {
+                    *hook = Some(Box::pin(async move {
+                        let winner_ctx = McpContext::new(winner_cx, 2);
+                        release_file_reservations(
+                            &winner_ctx,
+                            winner_project.clone(),
+                            peer.name,
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect("release peer before the competing same-key request");
+                        let winner: Value = serde_json::from_str(
+                            &file_reservation_paths(
+                                &winner_ctx,
+                                winner_project,
+                                winner_name,
+                                vec!["src/raced.rs".to_string()],
+                                change_ttl.then_some(7200),
+                                None,
+                                None,
+                                Some("winner-race".to_string()),
+                            )
+                            .await
+                            .expect("competing request commits the key and its lease"),
+                        )
+                        .expect("winner response JSON");
+                        assert_eq!(winner["granted"].as_array().expect("winner grant").len(), 1);
+                        *observed_winner.lock().expect("record winner") =
+                            Some((winner, mcp_agent_mail_storage::wbq_stats().enqueued));
+                    }));
+                });
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let result = file_reservation_paths(
+                    &ctx,
+                    project_key,
+                    caller.name,
+                    vec!["src/raced.rs".to_string()],
+                    None,
+                    None,
+                    None,
+                    Some("winner-race".to_string()),
+                )
+                .await;
+                let (winner, enqueued) = observed
+                    .lock()
+                    .expect("winner witness")
+                    .take()
+                    .expect("real competing request executed");
+                assert!(AFTER_RESERVATION_CONFLICT.with_borrow(|hook| hook.is_none()));
+                if change_ttl {
+                    let error =
+                        result.expect_err("changed-payload winner must reject this request");
+                    assert_eq!(
+                        error.data.expect("typed key conflict")["error"]["type"],
+                        "IDEMPOTENCY_KEY_CONFLICT"
+                    );
+                } else {
+                    let response: Value = serde_json::from_str(&result.expect("replay the winner"))
+                        .expect("replay response JSON");
+                    assert_eq!(response["idempotent_replay"], true);
+                    assert_eq!(response["granted"], winner["granted"]);
+                }
+                assert_eq!(mcp_agent_mail_storage::wbq_stats().enqueued, enqueued);
+                let active = queries::get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .expect("actual active leases");
+                assert_eq!(active.len(), 1);
+                assert_eq!(active[0].id, winner["granted"][0]["id"].as_i64());
+                assert_eq!(
+                    micros_to_iso(active[0].expires_ts),
+                    winner["granted"][0]["expires_ts"]
+                        .as_str()
+                        .expect("winner expiry")
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn reservation_key_conflict_race_replays_concurrent_winner() {
+        reservation_conflict_race_with_key_winner(false);
+    }
+
+    #[test]
+    fn reservation_key_conflict_race_rejects_changed_payload_winner() {
+        reservation_conflict_race_with_key_winner(true);
     }
 
     #[test]
